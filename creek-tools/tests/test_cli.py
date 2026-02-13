@@ -25,7 +25,7 @@ def test_process_command() -> None:
     """Test that process command runs with required args."""
     result = runner.invoke(
         app,
-        ["process", "--source", "/tmp/test", "--vault", "/tmp/vault"],
+        ["process", "--source", "/fake/test", "--vault", "/fake/vault"],
     )
     assert result.exit_code == 0
 
@@ -46,9 +46,9 @@ def test_ingest_command() -> None:
             "--type",
             "markdown",
             "--input",
-            "/tmp/in",
+            "/fake/in",
             "--vault",
-            "/tmp/vault",
+            "/fake/vault",
         ],
     )
     assert result.exit_code == 0
@@ -65,7 +65,7 @@ def test_redact_scan() -> None:
     """Test that redact command runs with --scan flag."""
     result = runner.invoke(
         app,
-        ["redact", "--scan", "--source", "/tmp/src", "--vault", "/tmp/vault"],
+        ["redact", "--scan", "--source", "/fake/src", "--vault", "/fake/vault"],
     )
     assert result.exit_code == 0
 
@@ -74,7 +74,7 @@ def test_redact_apply() -> None:
     """Test that redact command runs with --apply flag."""
     result = runner.invoke(
         app,
-        ["redact", "--apply", "--source", "/tmp/src", "--vault", "/tmp/vault"],
+        ["redact", "--apply", "--source", "/fake/src", "--vault", "/fake/vault"],
     )
     assert result.exit_code == 0
 
@@ -87,9 +87,9 @@ def test_redact_review() -> None:
             "redact",
             "--review",
             "--source",
-            "/tmp/src",
+            "/fake/src",
             "--vault",
-            "/tmp/vault",
+            "/fake/vault",
         ],
     )
     assert result.exit_code == 0
@@ -104,9 +104,9 @@ def test_redact_report() -> None:
             "--scan",
             "--report",
             "--source",
-            "/tmp/src",
+            "/fake/src",
             "--vault",
-            "/tmp/vault",
+            "/fake/vault",
         ],
     )
     assert result.exit_code == 0
@@ -121,7 +121,7 @@ def test_classify_help() -> None:
 
 def test_classify_command() -> None:
     """Test that classify command runs with required args."""
-    result = runner.invoke(app, ["classify", "--vault", "/tmp/vault"])
+    result = runner.invoke(app, ["classify", "--vault", "/fake/vault"])
     assert result.exit_code == 0
 
 
@@ -132,7 +132,7 @@ def test_classify_with_options() -> None:
         [
             "classify",
             "--vault",
-            "/tmp/vault",
+            "/fake/vault",
             "--method",
             "llm",
             "--batch-size",
@@ -151,7 +151,7 @@ def test_link_help() -> None:
 
 def test_link_command() -> None:
     """Test that link command runs with required args."""
-    result = runner.invoke(app, ["link", "--vault", "/tmp/vault"])
+    result = runner.invoke(app, ["link", "--vault", "/fake/vault"])
     assert result.exit_code == 0
 
 
@@ -159,7 +159,7 @@ def test_link_with_method() -> None:
     """Test that link command runs with --method option."""
     result = runner.invoke(
         app,
-        ["link", "--vault", "/tmp/vault", "--method", "graph"],
+        ["link", "--vault", "/fake/vault", "--method", "graph"],
     )
     assert result.exit_code == 0
 
@@ -182,7 +182,7 @@ def test_report_command() -> None:
             "--period",
             "weekly",
             "--vault",
-            "/tmp/vault",
+            "/fake/vault",
         ],
     )
     assert result.exit_code == 0
@@ -197,7 +197,7 @@ def test_review_help() -> None:
 
 def test_review_command() -> None:
     """Test that review command runs with required args."""
-    result = runner.invoke(app, ["review", "--vault", "/tmp/vault"])
+    result = runner.invoke(app, ["review", "--vault", "/fake/vault"])
     assert result.exit_code == 0
 
 
@@ -212,7 +212,7 @@ def test_purge_command() -> None:
     """Test that purge command runs with required args."""
     result = runner.invoke(
         app,
-        ["purge", "--vault", "/tmp/vault", "--target", "fragments"],
+        ["purge", "--vault", "/fake/vault", "--target", "fragments"],
     )
     assert result.exit_code == 0
 
@@ -228,7 +228,7 @@ def test_gdrive_command() -> None:
     """Test that gdrive command runs with --download flag."""
     result = runner.invoke(
         app,
-        ["gdrive", "--download", "--staging", "/tmp/staging"],
+        ["gdrive", "--download", "--staging", "/fake/staging"],
     )
     assert result.exit_code == 0
 
@@ -248,9 +248,9 @@ def test_skills_command() -> None:
             "skills",
             "--generate",
             "--vault",
-            "/tmp/vault",
+            "/fake/vault",
             "--output",
-            "/tmp/out",
+            "/fake/out",
         ],
     )
     assert result.exit_code == 0
@@ -265,7 +265,7 @@ def test_mine_help() -> None:
 
 def test_mine_command() -> None:
     """Test that mine command runs with required args."""
-    result = runner.invoke(app, ["mine", "--vault", "/tmp/vault"])
+    result = runner.invoke(app, ["mine", "--vault", "/fake/vault"])
     assert result.exit_code == 0
 
 
@@ -273,6 +273,6 @@ def test_mine_with_strategy() -> None:
     """Test that mine command runs with --strategy option."""
     result = runner.invoke(
         app,
-        ["mine", "--vault", "/tmp/vault", "--strategy", "frequency"],
+        ["mine", "--vault", "/fake/vault", "--strategy", "frequency"],
     )
     assert result.exit_code == 0
