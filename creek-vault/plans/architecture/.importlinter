@@ -1,0 +1,27 @@
+[importlinter]
+root_package = creek_vault
+
+[importlinter:contract:layers]
+name = Enforce layered architecture
+type = layers
+layers =
+    presentation
+    application
+    domain
+    infrastructure
+
+[importlinter:contract:independence]
+name = Domain layer independence
+type = forbidden
+source_modules =
+    creek_vault.domain
+forbidden_modules =
+    creek_vault.presentation
+    creek_vault.application
+    creek_vault.infrastructure
+
+[importlinter:contract:no-cycles]
+name = Prevent circular dependencies
+type = independence
+modules =
+    creek_vault

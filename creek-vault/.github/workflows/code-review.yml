@@ -1,0 +1,77 @@
+name: Code Review
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Please review this pull request and provide feedback using the following template:
+
+            ## Summary
+            Brief overview (2-3 sentences)
+
+            ## Strengths
+            What's done well?
+
+            ## Security Concerns
+            Vulnerabilities? 🔴 BLOCKING | 🟡 HIGH | 🟢 LOW
+
+            ## Problems
+            Critical issues blocking merge (mark 🔴)
+            Consider priority greater than Minor as "Blocking"
+
+            ## Code Quality
+            Non-blocking improvements for educational purposes or for future GitHub Issues
+
+            ## CLAUDE.md Adherence
+            ✅/❌ Coverage, linting, types, patterns, commits
+
+            ## Testing
+            Test quality evaluation
+            Insufficient testing is Blocking (mark 🔴)
+
+            ## Documentation
+            Docs completeness
+
+
+            ## Verdict
+            ✅ LGTM | 🔄 CHANGES_REQUESTED | 💬 COMMENTS
+            **Reasoning:** Specific references
+
+            Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+
+            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+
+          # Security: Restrict Claude to read-only GitHub CLI commands
+          # Wildcard patterns (e.g., "gh pr view:*") allow any arguments to the specified command
+          # but the action enforces read-only permissions (pull-requests: read, issues: read)
+          # preventing write operations even if attempted.
+          #
+          # Note: gh pr comment is the ONLY write operation allowed and is required for
+          # Claude to post automated review results as PR comments. All other commands
+          # are read-only (view, list, diff, search).
+          #
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # for allowed-tools syntax and security model.
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'

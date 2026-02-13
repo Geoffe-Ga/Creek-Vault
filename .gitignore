@@ -1,0 +1,82 @@
+# ============================================================
+# WHITELIST GITIGNORE — SENSITIVE DATA PROTECTION
+# ============================================================
+# This repo will contain/reference an Obsidian vault with highly
+# sensitive personal data (journal entries, chat history, recovery
+# content). Safety-first: everything is ignored by default.
+# Only explicitly approved paths are tracked.
+# ============================================================
+
+# Ignore everything at the top level by default
+/*
+
+# --- Explicitly tracked root files ---
+!.gitignore
+!CLAUDE.md
+
+# --- Explicitly tracked directories ---
+!creek-vault/
+!scripts/
+
+# ============================================================
+# OBSIDIAN VAULT — SENSITIVE CONTENT (NEVER TRACK)
+# ============================================================
+# If the Creek-Vault Obsidian structure is created in or linked
+# from this repo, these patterns ensure sensitive content stays
+# out of version control regardless of where it appears.
+# Only 00-Creek-Meta/Scripts/ should ever be tracked.
+# ============================================================
+
+# Vault content directories (personal data, fragments, journals)
+**/01-Fragments/
+**/02-Threads/
+**/03-Eddies/
+**/04-Praxis/
+**/05-Wavelength/
+**/06-Frequencies/
+**/07-Voice/
+**/08-Decisions/
+**/09-Reference/
+**/10-Liminal/
+
+# Vault meta directories (except Scripts/)
+**/00-Creek-Meta/Templates/
+**/00-Creek-Meta/Ontology/
+**/00-Creek-Meta/Processing-Log/
+
+# ============================================================
+# DEVELOPMENT ARTIFACTS
+# ============================================================
+
+# Python
+**/__pycache__/
+**/.venv/
+**/venv/
+**/virtualenv/
+**/*.py[cod]
+**/*.egg-info/
+**/dist/
+**/build/
+**/*.egg
+**/.eggs/
+**/htmlcov/
+**/.coverage
+**/.coverage.*
+**/coverage.xml
+**/reports/
+
+# Secrets & credentials
+**/.env
+**/.env.*
+**/*.pem
+**/credentials.json
+**/token.json
+**/.secrets.baseline
+
+# OS & IDE
+**/.DS_Store
+**/Thumbs.db
+**/.idea/
+**/.vscode/
+**/*.swp
+**/*.swo
