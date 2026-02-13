@@ -26,7 +26,7 @@ Runs:
   1. Linting (Ruff)
   2. Formatting (Black + isort)
   3. Type checking (MyPy)
-  4. Security checks (Bandit + Safety)
+  4. Security checks (Bandit + pip-audit)
   5. Complexity analysis (Radon)
   6. Unit tests
   7. Coverage report

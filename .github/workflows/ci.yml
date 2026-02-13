@@ -52,7 +52,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install pytest pytest-cov pytest-xdist pytest-timeout
           pip install ruff pylint mypy
-          pip install bandit safety
+          pip install bandit pip-audit
           pip install interrogate
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
@@ -96,10 +96,10 @@ jobs:
           bandit -r . -ll
         continue-on-error: false
 
-      - name: Run Safety dependency check
+      - name: Run pip-audit dependency check
         run: |
-          safety check --json --output reports/safety-report.json || true
-          safety check --bare
+          pip-audit --format=json --output=reports/pip-audit-report.json || true
+          pip-audit
         continue-on-error: false
 
       - name: Run tests with coverage
@@ -173,7 +173,7 @@ jobs:
           name: security-reports-${{ matrix.python-version }}
           path: |
             creek-tools/reports/bandit-report.json
-            creek-tools/reports/safety-report.json
+            creek-tools/reports/pip-audit-report.json
           retention-days: 30
 
   complexity-analysis:

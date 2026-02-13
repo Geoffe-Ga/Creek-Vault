@@ -64,10 +64,6 @@ repos:
     - pyproject.toml
     additional_dependencies:
     - bandit[toml]
-- repo: https://github.com/Lucas-C/pre-commit-hooks-safety
-  rev: v1.3.3
-  hooks:
-  - id: python-safety-dependencies-check
 - repo: https://github.com/compilerla/conventional-pre-commit
   rev: v3.0.0
   hooks:
