@@ -196,9 +196,9 @@ class TestCreekConfig:
 
     def test_env_var_override_vault_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """CREEK_VAULT_PATH env var should override the default."""
-        monkeypatch.setenv("CREEK_VAULT_PATH", "/tmp/my-vault")
+        monkeypatch.setenv("CREEK_VAULT_PATH", "/tmp/my-vault")  # nosec B108
         cfg = CreekConfig()
-        assert cfg.vault_path == Path("/tmp/my-vault")
+        assert cfg.vault_path == Path("/tmp/my-vault")  # nosec B108
 
     def test_env_var_override_timezone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """CREEK_TIMEZONE env var should override the default."""
