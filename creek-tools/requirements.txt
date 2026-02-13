@@ -1,2 +1,2 @@
 # Runtime dependencies
-# Add your production dependencies here
+pydantic>=2.0.0
