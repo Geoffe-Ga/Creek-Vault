@@ -1,7 +1,6 @@
-# creek-vault
+# creek-tools
 
-Creek Vault - A quality-controlled Python project generated with
-Start Green Stay Green.
+Creek Tools — processing pipeline for the Creek knowledge organization system.
 
 ## Description
 
@@ -9,7 +8,7 @@ This project was generated with maximum quality standards from day one, includin
 
 - ✅ Comprehensive testing infrastructure (pytest with 90%+ coverage requirement)
 - ✅ Code quality tools (ruff, black, isort, mypy)
-- ✅ Security scanning (bandit, safety)
+- ✅ Security scanning (bandit, pip-audit)
 - ✅ Complexity analysis (radon, xenon)
 - ✅ Pre-commit hooks (32 quality checks)
 - ✅ CI/CD pipeline (GitHub Actions)
@@ -20,7 +19,7 @@ This project was generated with maximum quality standards from day one, includin
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd creek-vault
+cd creek-tools
 
 # Install dependencies
 pip install -r requirements-dev.txt
@@ -34,12 +33,12 @@ pre-commit install
 Run the Hello World application:
 
 ```bash
-python -m creek_vault.main
+python -m creek.main
 ```
 
 Expected output:
 ```
-Hello from creek-vault!
+Hello from creek!
 ```
 
 ## Development
@@ -68,15 +67,15 @@ This project includes:
 - **isort**: Import sorting
 - **mypy**: Static type checker
 - **bandit**: Security linter
-- **safety**: Dependency vulnerability scanner
+- **pip-audit**: Dependency vulnerability scanner
 - **radon/xenon**: Code complexity analysis (≤10 cyclomatic complexity)
 - **pre-commit**: Git hooks framework (32 quality checks)
 
 ### Project Structure
 
 ```
-creek-vault/
-├── creek_vault/     # Main package
+creek-tools/
+├── creek/           # Main package
 │   ├── __init__.py
 │   └── main.py
 ├── tests/                # Test suite

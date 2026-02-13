@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/security.sh - Run security checks with Bandit and Safety
+# scripts/security.sh - Run security checks with Bandit and pip-audit
 # Usage: ./scripts/security.sh [--full] [--verbose] [--help]
 
 set -euo pipefail
@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
             cat << EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Run security checks using Bandit and Safety.
+Run security checks using Bandit and pip-audit.
 
 OPTIONS:
     --full      Run comprehensive security scan
@@ -64,20 +64,15 @@ echo "=== Security Checks (Bandit) ==="
 if $VERBOSE; then
     echo "Running Bandit security scanner..."
 fi
-bandit -r start_green_stay_green/ || { echo "✗ Bandit found issues" >&2; exit 1; }
+bandit -r creek/ || { echo "✗ Bandit found issues" >&2; exit 1; }
 
-echo "=== Security Checks (Safety) ==="
+echo "=== Dependency Vulnerability Check (pip-audit) ==="
 
-# Run Safety with policy file
+# Run pip-audit
 if $VERBOSE; then
-    echo "Running Safety dependency checker..."
+    echo "Running pip-audit dependency checker..."
 fi
-if [ -f "$PROJECT_ROOT/.safety-policy.yml" ]; then
-    safety check --policy-file "$PROJECT_ROOT/.safety-policy.yml" || \
-        { echo "✗ Safety found issues" >&2; exit 1; }
-else
-    safety check || { echo "✗ Safety found issues" >&2; exit 1; }
-fi
+pip-audit || { echo "✗ pip-audit found vulnerable dependencies" >&2; exit 1; }
 
 if $FULL; then
     echo "=== Comprehensive Security Scan ==="

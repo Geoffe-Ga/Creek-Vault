@@ -55,7 +55,7 @@ creek-tools/              # Monorepo root
 | Document parsing | python-docx, python-pptx, openpyxl, pdfminer.six, pytesseract |
 | Vault output | Markdown + YAML frontmatter (Obsidian-compatible) |
 | CI/CD | GitHub Actions — lint, type check, test, security scan, complexity analysis |
-| Quality | Ruff, Black, MyPy (strict), Bandit, Safety, Radon/Xenon, pytest (90%+ coverage) |
+| Quality | Ruff, Black, MyPy (strict), Bandit, pip-audit, Radon/Xenon, pytest (90%+ coverage) |
 
 ## Development
 
@@ -73,7 +73,7 @@ pre-commit install
 ./scripts/test.sh --coverage # Tests with coverage report
 ./scripts/lint.sh            # Ruff + MyPy
 ./scripts/format.sh --fix    # Auto-format
-./scripts/security.sh        # Bandit + Safety
+./scripts/security.sh        # Bandit + pip-audit
 ```
 
 ### Quality Standards
@@ -81,7 +81,7 @@ pre-commit install
 - **Test coverage:** ≥90% (branch coverage)
 - **Type safety:** MyPy strict mode, all functions typed
 - **Complexity:** ≤10 cyclomatic complexity per function
-- **Security:** Zero Bandit/Safety findings
+- **Security:** Zero Bandit/pip-audit findings
 - **Style:** Ruff + Black + isort, zero violations
 
 ### Workflow

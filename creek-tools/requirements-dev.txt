@@ -15,7 +15,7 @@ mypy>=1.5.0
 
 # Security
 bandit>=1.7.5
-safety>=2.3.0
+pip-audit>=2.6.0
 
 # Complexity analysis
 radon>=6.0.0

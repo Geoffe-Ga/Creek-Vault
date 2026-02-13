@@ -6,16 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `creek-tools` is a monorepo containing tooling for the Creek knowledge organization system:
 
-- **`creek-vault/`** — Python subproject for secure vault functionality. Has its own detailed `CLAUDE.md` with quality standards and workflow documentation. **Always read `creek-vault/CLAUDE.md` before working in that directory.**
+- **`creek-tools/`** — Python subproject for the Creek processing pipeline. Has its own detailed `CLAUDE.md` with quality standards and workflow documentation. **Always read `creek-tools/CLAUDE.md` before working in that directory.**
 - **`scripts/Ontology/`** — Contains `creek_ontology_agent_prompt.md`, the master specification for the Creek Ontology: a personal knowledge organization system built around Obsidian, the APTITUDE frequency framework, and the Archetypal Wavelength mapping.
 
-## creek-vault Development
+## creek-tools Development
 
-All commands run from the `creek-vault/` directory.
+All commands run from the `creek-tools/` directory.
 
 ### Setup
 ```bash
-cd creek-vault
+cd creek-tools
 pip install -r requirements-dev.txt
 pre-commit install
 ```
@@ -31,13 +31,13 @@ pre-commit install
 ./scripts/lint.sh               # Ruff linting (--fix to auto-fix)
 ./scripts/format.sh --check     # Check formatting (--fix to apply)
 ./scripts/typecheck.sh          # MyPy strict type checking
-./scripts/security.sh           # Bandit + Safety scans
+./scripts/security.sh           # Bandit + pip-audit scans
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
 ```
 
 ### Running a Single Test
 ```bash
-cd creek-vault
+cd creek-tools
 pytest tests/test_main.py -v
 pytest tests/test_main.py::test_main_runs -v
 ```
@@ -51,18 +51,18 @@ pytest tests/test_main.py::test_main_runs -v
 
 ### Commit Conventions
 - Uses [Conventional Commits](https://www.conventionalcommits.org/) enforced by pre-commit hook
-- Pre-commit runs hooks including ruff, black, isort, mypy (strict), bandit, safety, shellcheck, interrogate, vulture, detect-secrets, and more
+- Pre-commit runs hooks including ruff, black, isort, mypy (strict), bandit, shellcheck, interrogate, vulture, detect-secrets, and more
 - Direct commits to `main` are blocked by pre-commit; use feature branches
 
 ## Architecture
 
-### creek-vault
+### creek-tools
 - **Python >=3.11** (CI tests 3.11, 3.12, 3.13)
-- Package source: `creek_vault/` (flat layout, not src/)
+- Package source: `creek/` (flat layout, not src/)
 - Tests: `tests/` (pytest with markers: `integration`, `e2e`)
 - Config: `pyproject.toml` contains all tool configs (pytest, coverage, mypy, ruff, bandit)
-- CI: `/.github/workflows/ci.yml` (at repo root; jobs use `working-directory: creek-vault`)
-- Pre-commit: `creek-vault/.pre-commit-config.yaml` (install with `pre-commit install -c creek-vault/.pre-commit-config.yaml`)
+- CI: `/.github/workflows/ci.yml` (at repo root; jobs use `working-directory: creek-tools`)
+- Pre-commit: `creek-tools/.pre-commit-config.yaml` (install with `pre-commit install -c creek-tools/.pre-commit-config.yaml`)
 
 ### The Creek Ontology (scripts/Ontology/)
 The ontology prompt defines a complete system for organizing personal data into an Obsidian vault using five ontological primitives: **Fragments** (atomic content units), **Resonances** (semantic connections), **Threads** (narrative currents), **Eddies** (topic clusters), and **Praxis** (actionable insights). Content is classified along the 10-frequency APTITUDE system and the 6-phase Archetypal Wavelength cycle. This prompt is reference material for building the creek-tools pipeline (ingestion, classification, linking, voice proxy generation).

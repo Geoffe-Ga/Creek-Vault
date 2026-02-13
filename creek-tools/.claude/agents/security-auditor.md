@@ -67,7 +67,7 @@ See [common-constraints.md](../shared/common-constraints.md) for minimal changes
 
 ## Example
 
-**Task:** Review data validation component for security vulnerabilities in creek-vault quality control system.
+**Task:** Review data validation component for security vulnerabilities in creek-tools quality control system.
 
 **Actions:**
 

@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: creek-vault
+        working-directory: creek-tools
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +52,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install pytest pytest-cov pytest-xdist pytest-timeout
           pip install ruff pylint mypy
-          pip install bandit safety
+          pip install bandit pip-audit
           pip install interrogate
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
@@ -96,10 +96,11 @@ jobs:
           bandit -r . -ll
         continue-on-error: false
 
-      - name: Run Safety dependency check
+      - name: Run pip-audit dependency check
         run: |
-          safety check --json --output reports/safety-report.json || true
-          safety check --bare
+          # PYSEC-2022-42969: ReDoS in py.path.svnwc (transitive dep of interrogate, not exploitable here)
+          pip-audit --format=json --output=reports/pip-audit-report.json --ignore-vuln PYSEC-2022-42969 || true
+          pip-audit --ignore-vuln PYSEC-2022-42969
         continue-on-error: false
 
       - name: Run tests with coverage
@@ -141,7 +142,7 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
-          files: creek-vault/reports/coverage.xml
+          files: creek-tools/reports/coverage.xml
           flags: python-${{ matrix.python-version }}
           name: python-${{ matrix.python-version }}
           fail_ci_if_error: false
@@ -152,7 +153,7 @@ jobs:
         if: always()
         with:
           name: test-results-${{ matrix.python-version }}
-          path: creek-vault/reports/junit.xml
+          path: creek-tools/reports/junit.xml
           retention-days: 30
 
       - name: Upload coverage reports
@@ -161,9 +162,9 @@ jobs:
         with:
           name: coverage-reports-${{ matrix.python-version }}
           path: |
-            creek-vault/reports/coverage.xml
-            creek-vault/reports/coverage.json
-            creek-vault/reports/htmlcov
+            creek-tools/reports/coverage.xml
+            creek-tools/reports/coverage.json
+            creek-tools/reports/htmlcov
           retention-days: 30
 
       - name: Upload security reports
@@ -172,8 +173,8 @@ jobs:
         with:
           name: security-reports-${{ matrix.python-version }}
           path: |
-            creek-vault/reports/bandit-report.json
-            creek-vault/reports/safety-report.json
+            creek-tools/reports/bandit-report.json
+            creek-tools/reports/pip-audit-report.json
           retention-days: 30
 
   complexity-analysis:
@@ -181,7 +182,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: creek-vault
+        working-directory: creek-tools
     needs: quality
 
     steps:
@@ -217,7 +218,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: complexity-reports
-          path: creek-vault/reports/complexity-*.json
+          path: creek-tools/reports/complexity-*.json
           retention-days: 30
 
   build:
@@ -225,7 +226,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: creek-vault
+        working-directory: creek-tools
     needs: quality
 
     steps:
@@ -254,7 +255,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: distribution
-          path: creek-vault/dist/
+          path: creek-tools/dist/
           retention-days: 90
 
   quality-gate:
