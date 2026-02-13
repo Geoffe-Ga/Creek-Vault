@@ -12,7 +12,7 @@ receives_from: []
 
 ## Identity
 
-Level 0 meta-orchestrator responsible for strategic decisions across the entire creek-vault repository
+Level 0 meta-orchestrator responsible for strategic decisions across the entire creek-tools repository
 ecosystem. Set system-wide quality control patterns, select validation standards, and coordinate all 6 section
 orchestrators.
 

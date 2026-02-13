@@ -1,4 +1,4 @@
-# Claude Code Project Context: creek-vault
+# Claude Code Project Context: creek-tools
 
 **Table of Contents**
 - [1. Critical Principles](#1-critical-principles)
@@ -147,9 +147,9 @@ See [10. Common Pitfalls & Troubleshooting](#10-common-pitfalls--troubleshooting
 
 ## 2. Project Overview
 
-**creek-vault** is a Python project focused on providing secure vault functionality with maximum quality engineering standards.
+**creek-tools** is a Python project providing the processing pipeline for the Creek knowledge organization system, built with maximum quality engineering standards.
 
-**Purpose**: To deliver a production-ready, secure, and thoroughly tested vault implementation that demonstrates excellence in Python software engineering practices.
+**Purpose**: To deliver a production-ready, secure, and thoroughly tested tooling pipeline that ingests, classifies, links, and organizes personal knowledge into an Obsidian vault.
 
 **Key Features**:
 - Comprehensive test coverage (≥90%)
@@ -282,7 +282,7 @@ Before creating/updating a PR:
 ### 5.2 Component Structure
 
 ```
-creek-vault/
+creek-tools/
 ├── .github/
 │   ├── workflows/
 │   │   ├── ci.yml                    # Continuous Integration (lives at repo root /.github/)
@@ -307,10 +307,9 @@ creek-vault/
 │   ├── lint.sh                       # Run linters and type checkers
 │   ├── format.sh                     # Format code
 │   └── security.sh                   # Security scanning
-├── src/
-│   └── creek_vault/                  # Main package
-│       ├── __init__.py
-│       └── ...                       # Package modules
+├── creek/                            # Main package
+│   ├── __init__.py
+│   └── ...                           # Package modules
 ├── tests/
 │   ├── unit/                         # Unit tests
 │   ├── integration/                  # Integration tests

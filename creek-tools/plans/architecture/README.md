@@ -1,6 +1,6 @@
 # Architecture Enforcement
 
-This directory contains architecture enforcement rules for **creek-vault**.
+This directory contains architecture enforcement rules for **creek-tools**.
 
 ## Purpose
 

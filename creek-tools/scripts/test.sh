@@ -105,7 +105,7 @@ esac
 if $COVERAGE; then
     echo "Coverage enabled"
     PYTEST_ARGS+=(
-        --cov=creek_vault
+        --cov=creek
         --cov-branch
         --cov-report=term-missing
         --cov-report=html

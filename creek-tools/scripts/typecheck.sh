@@ -54,7 +54,7 @@ fi
 echo "=== Type Checking (MyPy) ==="
 
 if command -v mypy &> /dev/null; then
-    mypy creek_vault/ || {
+    mypy creek/ || {
         echo "✗ Type checking failed" >&2
         exit 1
     }

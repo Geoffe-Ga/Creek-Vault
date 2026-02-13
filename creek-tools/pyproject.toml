@@ -1,7 +1,7 @@
 # pyproject.toml - Python project configuration
 
 [project]
-name = "creek-vault"
+name = "creek-tools"
 version = "0.1.0"
 description = "A quality-controlled Python project"
 readme = "README.md"
@@ -58,7 +58,7 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    "--cov=creek_vault",
+    "--cov=creek",
     "--cov-branch",
     "--cov-report=term-missing:skip-covered",
     "--cov-report=html",
@@ -71,7 +71,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [tool.coverage.run]
-source = ["creek_vault"]
+source = ["creek"]
 branch = true
 omit = [
     "*/tests/*",
