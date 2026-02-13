@@ -114,8 +114,7 @@ def gdrive(
 ) -> None:
     """Download from Google Drive."""
     console.print(
-        f"[bold green]Would gdrive: download={download}, "
-        f"staging={staging}[/bold green]"
+        f"[bold green]Would gdrive: download={download}, staging={staging}[/bold green]"
     )
 
 
