@@ -31,7 +31,7 @@ pre-commit install
 ./scripts/lint.sh               # Ruff linting (--fix to auto-fix)
 ./scripts/format.sh --check     # Check formatting (--fix to apply)
 ./scripts/typecheck.sh          # MyPy strict type checking
-./scripts/security.sh           # Bandit + Safety scans
+./scripts/security.sh           # Bandit + pip-audit scans
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
 ```
 
@@ -51,7 +51,7 @@ pytest tests/test_main.py::test_main_runs -v
 
 ### Commit Conventions
 - Uses [Conventional Commits](https://www.conventionalcommits.org/) enforced by pre-commit hook
-- Pre-commit runs hooks including ruff, black, isort, mypy (strict), bandit, safety, shellcheck, interrogate, vulture, detect-secrets, and more
+- Pre-commit runs hooks including ruff, black, isort, mypy (strict), bandit, shellcheck, interrogate, vulture, detect-secrets, and more
 - Direct commits to `main` are blocked by pre-commit; use feature branches
 
 ## Architecture

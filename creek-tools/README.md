@@ -8,7 +8,7 @@ This project was generated with maximum quality standards from day one, includin
 
 - ✅ Comprehensive testing infrastructure (pytest with 90%+ coverage requirement)
 - ✅ Code quality tools (ruff, black, isort, mypy)
-- ✅ Security scanning (bandit, safety)
+- ✅ Security scanning (bandit, pip-audit)
 - ✅ Complexity analysis (radon, xenon)
 - ✅ Pre-commit hooks (32 quality checks)
 - ✅ CI/CD pipeline (GitHub Actions)
@@ -67,7 +67,7 @@ This project includes:
 - **isort**: Import sorting
 - **mypy**: Static type checker
 - **bandit**: Security linter
-- **safety**: Dependency vulnerability scanner
+- **pip-audit**: Dependency vulnerability scanner
 - **radon/xenon**: Code complexity analysis (≤10 cyclomatic complexity)
 - **pre-commit**: Git hooks framework (32 quality checks)
 

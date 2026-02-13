@@ -359,7 +359,7 @@ All code must meet these standards before merging to main:
 - **isort**: Import sorting per configuration
 - **Pylint**: Score of 9.0+ required
 - **Bandit**: Security scanning with zero exceptions
-- **Safety**: Dependency vulnerability checking
+- **pip-audit**: Dependency vulnerability checking
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs
