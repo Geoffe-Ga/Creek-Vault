@@ -13,6 +13,7 @@
 # --- Explicitly tracked root files ---
 !.gitignore
 !CLAUDE.md
+!README.md
 
 # --- Explicitly tracked directories ---
 !.claude/
