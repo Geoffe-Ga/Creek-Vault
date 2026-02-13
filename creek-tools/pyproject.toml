@@ -38,6 +38,9 @@ dev = [
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["creek", "creek.*"]
+
 [tool.black]
 line-length = 88
 target-version = ["py311", "py312", "py313"]
