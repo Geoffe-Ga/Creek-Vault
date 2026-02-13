@@ -58,7 +58,6 @@ jobs:
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
           if [ -f setup.py ]; then pip install -e .; fi
           if [ -f pyproject.toml ]; then pip install -e .; fi
-          pip uninstall -y py 2>/dev/null || true
 
       - name: Create necessary directories
         run: |
@@ -99,8 +98,9 @@ jobs:
 
       - name: Run pip-audit dependency check
         run: |
-          pip-audit --format=json --output=reports/pip-audit-report.json || true
-          pip-audit
+          # PYSEC-2022-42969: ReDoS in py.path.svnwc (transitive dep of interrogate, not exploitable here)
+          pip-audit --format=json --output=reports/pip-audit-report.json --ignore-vuln PYSEC-2022-42969 || true
+          pip-audit --ignore-vuln PYSEC-2022-42969
         continue-on-error: false
 
       - name: Run tests with coverage
