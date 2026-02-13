@@ -285,8 +285,8 @@ Before creating/updating a PR:
 creek-vault/
 ├── .github/
 │   ├── workflows/
-│   │   ├── ci.yml                    # Continuous Integration
-│   │   └── security.yml              # Security scanning
+│   │   ├── ci.yml                    # Continuous Integration (lives at repo root /.github/)
+│   │   └── code-review.yml          # AI code review (lives at repo root /.github/)
 │   └── CODEOWNERS
 ├── docs/
 │   ├── skills/                       # Development skills & guidelines

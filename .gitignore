@@ -15,6 +15,7 @@
 !CLAUDE.md
 
 # --- Explicitly tracked directories ---
+!.github/
 !creek-vault/
 !scripts/
 

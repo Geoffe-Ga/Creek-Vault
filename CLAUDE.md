@@ -61,7 +61,8 @@ pytest tests/test_main.py::test_main_runs -v
 - Package source: `creek_vault/` (flat layout, not src/)
 - Tests: `tests/` (pytest with markers: `integration`, `e2e`)
 - Config: `pyproject.toml` contains all tool configs (pytest, coverage, mypy, ruff, bandit)
-- CI: `.github/workflows/ci.yml` — quality checks, complexity analysis, build
+- CI: `/.github/workflows/ci.yml` (at repo root; jobs use `working-directory: creek-vault`)
+- Pre-commit: `creek-vault/.pre-commit-config.yaml` (install with `pre-commit install -c creek-vault/.pre-commit-config.yaml`)
 
 ### The Creek Ontology (scripts/Ontology/)
 The ontology prompt defines a complete system for organizing personal data into an Obsidian vault using five ontological primitives: **Fragments** (atomic content units), **Resonances** (semantic connections), **Threads** (narrative currents), **Eddies** (topic clusters), and **Praxis** (actionable insights). Content is classified along the 10-frequency APTITUDE system and the 6-phase Archetypal Wavelength cycle. This prompt is reference material for building the creek-tools pipeline (ingestion, classification, linking, voice proxy generation).

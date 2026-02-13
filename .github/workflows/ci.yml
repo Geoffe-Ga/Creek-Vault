@@ -17,11 +17,14 @@ jobs:
   quality:
     name: Code Quality & Testing
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: creek-vault
     strategy:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12', '3.13']
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -138,7 +141,7 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
-          files: ./reports/coverage.xml
+          files: creek-vault/reports/coverage.xml
           flags: python-${{ matrix.python-version }}
           name: python-${{ matrix.python-version }}
           fail_ci_if_error: false
@@ -149,7 +152,7 @@ jobs:
         if: always()
         with:
           name: test-results-${{ matrix.python-version }}
-          path: reports/junit.xml
+          path: creek-vault/reports/junit.xml
           retention-days: 30
 
       - name: Upload coverage reports
@@ -158,9 +161,9 @@ jobs:
         with:
           name: coverage-reports-${{ matrix.python-version }}
           path: |
-            reports/coverage.xml
-            reports/coverage.json
-            reports/htmlcov
+            creek-vault/reports/coverage.xml
+            creek-vault/reports/coverage.json
+            creek-vault/reports/htmlcov
           retention-days: 30
 
       - name: Upload security reports
@@ -169,15 +172,18 @@ jobs:
         with:
           name: security-reports-${{ matrix.python-version }}
           path: |
-            reports/bandit-report.json
-            reports/safety-report.json
+            creek-vault/reports/bandit-report.json
+            creek-vault/reports/safety-report.json
           retention-days: 30
 
   complexity-analysis:
     name: Code Complexity Analysis
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: creek-vault
     needs: quality
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -211,14 +217,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: complexity-reports
-          path: reports/complexity-*.json
+          path: creek-vault/reports/complexity-*.json
           retention-days: 30
 
   build:
     name: Build Distribution
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: creek-vault
     needs: quality
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -245,7 +254,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: distribution
-          path: dist/
+          path: creek-vault/dist/
           retention-days: 90
 
   quality-gate:
