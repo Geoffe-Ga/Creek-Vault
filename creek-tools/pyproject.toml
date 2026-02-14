@@ -22,6 +22,13 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+creek = "creek.cli:app"
 
 [project.optional-dependencies]
 dev = [
@@ -141,6 +148,7 @@ ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S101"]  # Allow assert in tests
+"creek/cli.py" = ["B008"]  # typer.Option() calls in function defaults are idiomatic
 
 [tool.bandit]
 exclude_dirs = ["tests", "venv", "virtualenv"]
