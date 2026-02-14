@@ -23,31 +23,88 @@
 **/git-issues/
 !scripts/
 
+# --- Obsidian vault folder structure ---
+# Allow top-level vault folders (scaffold only — .gitkeep files)
+!00-Creek-Meta/
+!01-Fragments/
+!02-Threads/
+!03-Eddies/
+!04-Praxis/
+!05-Wavelength/
+!06-Frequencies/
+!07-Voice/
+!08-Decisions/
+!09-Reference/
+!10-Liminal/
+
+# --- Obsidian configuration ---
+!.obsidian/
+.obsidian/workspace.json
+.obsidian/cache
+
 # ============================================================
 # OBSIDIAN VAULT — SENSITIVE CONTENT (NEVER TRACK)
 # ============================================================
-# If the Creek-Vault Obsidian structure is created in or linked
-# from this repo, these patterns ensure sensitive content stays
-# out of version control regardless of where it appears.
-# Only 00-Creek-Meta/Scripts/ should ever be tracked.
+# Vault directories are whitelisted above so the folder scaffold
+# (.gitkeep files) is tracked.  Everything EXCEPT .gitkeep inside
+# those directories is ignored below to protect sensitive content.
+# Only 00-Creek-Meta/Scripts/ content should ever be tracked.
 # ============================================================
 
-# Vault content directories (personal data, fragments, journals)
-**/01-Fragments/
-**/02-Threads/
-**/03-Eddies/
-**/04-Praxis/
-**/05-Wavelength/
-**/06-Frequencies/
-**/07-Voice/
-**/08-Decisions/
-**/09-Reference/
-**/10-Liminal/
+# Vault content directories — ignore everything except .gitkeep
+01-Fragments/**
+!01-Fragments/**/
+!01-Fragments/**/.gitkeep
 
-# Vault meta directories (except Scripts/)
-**/00-Creek-Meta/Templates/
-**/00-Creek-Meta/Ontology/
-**/00-Creek-Meta/Processing-Log/
+02-Threads/**
+!02-Threads/**/
+!02-Threads/**/.gitkeep
+
+03-Eddies/**
+!03-Eddies/**/
+!03-Eddies/**/.gitkeep
+
+04-Praxis/**
+!04-Praxis/**/
+!04-Praxis/**/.gitkeep
+
+05-Wavelength/**
+!05-Wavelength/**/
+!05-Wavelength/**/.gitkeep
+
+06-Frequencies/**
+!06-Frequencies/**/
+!06-Frequencies/**/.gitkeep
+
+07-Voice/**
+!07-Voice/**/
+!07-Voice/**/.gitkeep
+
+08-Decisions/**
+!08-Decisions/**/
+!08-Decisions/**/.gitkeep
+
+09-Reference/**
+!09-Reference/**/
+!09-Reference/**/.gitkeep
+
+10-Liminal/**
+!10-Liminal/**/
+!10-Liminal/**/.gitkeep
+
+# 00-Creek-Meta — track Scripts/ fully, .gitkeep in others, Ontology prompt
+00-Creek-Meta/Templates/**
+!00-Creek-Meta/Templates/**/
+!00-Creek-Meta/Templates/**/.gitkeep
+
+00-Creek-Meta/Processing-Log/**
+!00-Creek-Meta/Processing-Log/**/
+!00-Creek-Meta/Processing-Log/**/.gitkeep
+
+00-Creek-Meta/Ontology/**
+!00-Creek-Meta/Ontology/**/
+!00-Creek-Meta/Ontology/**/.gitkeep
+!00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md
 
 # ============================================================
 # DEVELOPMENT ARTIFACTS
