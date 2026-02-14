@@ -1,9 +1,11 @@
 """Main entry point for creek."""
 
+from creek.cli import app
+
 
 def main() -> None:
     """Run the main application."""
-    print("Hello from creek!")
+    app()
 
 
 if __name__ == "__main__":

@@ -1,2 +1,3 @@
 # Runtime dependencies
-# Add your production dependencies here
+typer>=0.9.0
+rich>=13.0.0
