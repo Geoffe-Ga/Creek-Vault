@@ -742,11 +742,11 @@ class TestIngestPackage:
 
         assert isinstance(INGESTOR_REGISTRY, dict)
 
-    def test_registry_initially_empty(self) -> None:
-        """The registry should be empty initially (no concrete ingestors yet)."""
+    def test_registry_contains_claude(self) -> None:
+        """The registry should contain the Claude ingestor."""
         from creek.ingest import INGESTOR_REGISTRY
 
-        assert len(INGESTOR_REGISTRY) == 0
+        assert "claude" in INGESTOR_REGISTRY
 
     def test_base_classes_importable(self) -> None:
         """Core classes should be importable from creek.ingest."""

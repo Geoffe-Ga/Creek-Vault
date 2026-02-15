@@ -507,8 +507,8 @@ class TestPipelineIntegration:
     ):
         """Run the Pipeline with JSON fixture files in source directory.
 
-        Verifies that JSON files are scanned without errors even though
-        no ingestor can parse them yet.
+        Verifies that JSON files are scanned and the Claude ingestor
+        picks up the Claude export file while ignoring non-Claude JSON.
         """
         src = tmp_path / "json_source"
         src.mkdir()
@@ -519,7 +519,8 @@ class TestPipelineIntegration:
         result = pipeline.run(source_path=src, vault_path=vault_path)
 
         assert result.files_scanned == 2
-        assert result.fragments_created == 0
+        # Claude ingestor now picks up the Claude export fixture
+        assert result.fragments_created >= 1
         assert result.indexes_generated >= 4
 
     def test_pipeline_result_consistency(self, config, vault_path, source_path):
