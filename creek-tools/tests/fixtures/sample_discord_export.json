@@ -1,0 +1,36 @@
+{
+  "channel": {
+    "id": "123456789",
+    "name": "knowledge-sharing",
+    "type": "text"
+  },
+  "messages": [
+    {
+      "id": "msg-001",
+      "author": {
+        "id": "user-001",
+        "name": "Alice"
+      },
+      "content": "Has anyone tried using Obsidian for personal knowledge management?",
+      "timestamp": "2024-11-10T14:00:00Z"
+    },
+    {
+      "id": "msg-002",
+      "author": {
+        "id": "user-002",
+        "name": "Bob"
+      },
+      "content": "Yes, I use it daily. The linking between notes is powerful for building connections.",
+      "timestamp": "2024-11-10T14:02:30Z"
+    },
+    {
+      "id": "msg-003",
+      "author": {
+        "id": "user-001",
+        "name": "Alice"
+      },
+      "content": "I should give it a try. The graph view sounds interesting for seeing patterns.",
+      "timestamp": "2024-11-10T14:05:00Z"
+    }
+  ]
+}

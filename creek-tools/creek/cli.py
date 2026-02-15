@@ -5,6 +5,9 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from creek.config import load_config
+from creek.pipeline import Pipeline
+
 app = typer.Typer(name="creek", help="Creek knowledge organization pipeline")
 console = Console()
 
@@ -15,10 +18,23 @@ def process(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
     """Full pipeline: ingest, redact, classify, link, index."""
+    config = load_config()
+    source_path = source or config.source_drive
+    vault_path = vault or config.vault_path
+
     console.print(
-        f"[bold green]Would run full pipeline: "
-        f"source={source}, vault={vault}[/bold green]"
+        f"[bold green]Running full pipeline: "
+        f"source={source_path}, vault={vault_path}[/bold green]"
     )
+
+    pipeline = Pipeline(config=config)
+    result = pipeline.run(source_path=source_path, vault_path=vault_path)
+
+    console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")
+    console.print(f"[bold]Fragments created:[/bold] {result.fragments_created}")
+    console.print(f"[bold]Classifications made:[/bold] {result.classifications_made}")
+    console.print(f"[bold]Links found:[/bold] {result.links_found}")
+    console.print(f"[bold]Indexes generated:[/bold] {result.indexes_generated}")
 
 
 @app.command()

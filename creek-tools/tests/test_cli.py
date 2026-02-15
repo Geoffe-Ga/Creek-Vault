@@ -1,8 +1,15 @@
 """Tests for creek CLI module."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from typer.testing import CliRunner
 
 from creek.cli import app
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 runner = CliRunner()
 
@@ -21,11 +28,22 @@ def test_process_help() -> None:
     assert "process" in result.output.lower()
 
 
-def test_process_command() -> None:
+def test_process_command(tmp_path: Path) -> None:
     """Test that process command runs with required args."""
+    source = tmp_path / "source"
+    source.mkdir()
+    vault = tmp_path / "vault"
+    for d in [
+        "00-Creek-Meta",
+        "01-Fragments",
+        "02-Threads",
+        "03-Eddies",
+    ]:
+        (vault / d).mkdir(parents=True, exist_ok=True)
+
     result = runner.invoke(
         app,
-        ["process", "--source", "/fake/test", "--vault", "/fake/vault"],
+        ["process", "--source", str(source), "--vault", str(vault)],
     )
     assert result.exit_code == 0
 
