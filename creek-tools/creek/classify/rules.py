@@ -28,7 +28,12 @@ FREQUENCY_SIGNALS: dict[Frequency, list[str]] = {
     Frequency.F7: ["systems", "patterns", "complexity", "integrate"],
     Frequency.F8: ["community", "ecology", "holistic", "collective"],
 }
-"""Mapping of APTITUDE frequencies to their keyword signals."""
+"""Stub mapping of APTITUDE frequencies to keyword signals.
+
+Only F1, F3, F5, F7, F8 are covered in this stub. The remaining
+frequencies (F2, F4, F6, F9, F10) will be added when the full
+classification rule set is implemented in later issues.
+"""
 
 WAVELENGTH_PHASE_SIGNALS: dict[Phase, list[str]] = {
     Phase.RISING: ["emerging", "building", "growing", "momentum"],
@@ -107,7 +112,7 @@ class RuleClassifier:
         """
         for freq, keywords in FREQUENCY_SIGNALS.items():
             for keyword in keywords:
-                if keyword.lower() in content_lower:
+                if keyword in content_lower:
                     return freq
         return Frequency.UNCLASSIFIED
 
@@ -122,7 +127,7 @@ class RuleClassifier:
         """
         for phase, keywords in WAVELENGTH_PHASE_SIGNALS.items():
             for keyword in keywords:
-                if keyword.lower() in content_lower:
+                if keyword in content_lower:
                     return phase
         return Phase.UNCLASSIFIED
 
@@ -137,6 +142,6 @@ class RuleClassifier:
         """
         for mode, keywords in MODE_SIGNALS.items():
             for keyword in keywords:
-                if keyword.lower() in content_lower:
+                if keyword in content_lower:
                     return mode
         return Mode.UNCLASSIFIED
