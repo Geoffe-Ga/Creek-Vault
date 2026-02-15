@@ -121,6 +121,10 @@ strict_equality = true
 strict_concatenate = true
 
 [[tool.mypy.overrides]]
+module = "frontmatter"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 
