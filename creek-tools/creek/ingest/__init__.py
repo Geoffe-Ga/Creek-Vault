@@ -14,9 +14,11 @@ Exports:
 
 from creek.ingest.base import Ingestor, IngestResult, ParsedFragment, RawDocument
 from creek.ingest.discord import DiscordIngestor
+from creek.ingest.markdown import MarkdownIngestor
 
 INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
     "discord": DiscordIngestor,
+    "markdown": MarkdownIngestor,
 }
 """Registry mapping ingestor names to their concrete classes.
 
@@ -31,6 +33,7 @@ __all__ = [
     "DiscordIngestor",
     "IngestResult",
     "Ingestor",
+    "MarkdownIngestor",
     "ParsedFragment",
     "RawDocument",
 ]
