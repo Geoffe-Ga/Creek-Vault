@@ -199,7 +199,8 @@ class TestPipelineRunEmpty:
     def test_no_ingestors_registered(self, config, vault_path, source_path):
         """Test that pipeline handles empty INGESTOR_REGISTRY gracefully."""
         pipeline = Pipeline(config=config)
-        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", {}):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
         # No ingestors registered, so no fragments created
         assert result.fragments_created == 0
         # But files should still be scanned for redaction
@@ -208,7 +209,8 @@ class TestPipelineRunEmpty:
     def test_no_fragments_skips_classification(self, config, vault_path, source_path):
         """Test that classification is skipped when no fragments exist."""
         pipeline = Pipeline(config=config)
-        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", {}):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
         assert result.classifications_made == 0
 
     def test_no_fragments_skips_linking(self, config, vault_path, source_path):
@@ -384,7 +386,8 @@ class TestPipelinePrivateMethods:
         """Test _run_ingestion returns empty list when registry is empty."""
         pipeline = Pipeline(config=config)
         result = PipelineResult()
-        fragments = pipeline._run_ingestion(source_path, result)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", {}):
+            fragments = pipeline._run_ingestion(source_path, result)
         assert fragments == []
 
     def test_run_classification_no_fragments(self, config, vault_path):
@@ -489,9 +492,9 @@ class TestPipelineIntegration:
 
         # Pipeline should complete without errors
         assert result.files_scanned >= 3  # 3 original + 1 copied
-        # No ingestors, so 0 fragments
-        assert result.fragments_created == 0
-        assert result.classifications_made == 0
+        # Markdown ingestor finds .md files
+        assert result.fragments_created >= 3
+        assert result.classifications_made >= 3
         assert result.links_found == 0
         # Indexes should be generated
         assert result.indexes_generated >= 4
@@ -525,16 +528,15 @@ class TestPipelineIntegration:
     def test_pipeline_result_consistency(self, config, vault_path, source_path):
         """Verify that PipelineResult counts are internally consistent.
 
-        With no ingestors registered, classifications and links must be zero,
-        while file scanning and indexing should still produce counts.
+        With the markdown ingestor registered, it processes .md files.
+        Classifications should equal fragments, and linking/indexing work.
         """
         pipeline = Pipeline(config=config)
         result = pipeline.run(source_path=source_path, vault_path=vault_path)
 
-        # No ingestors => no fragments => no classifications => no links
-        assert result.fragments_created == 0
-        assert result.classifications_made == 0
-        assert result.links_found == 0
+        # Markdown ingestor processes the .md source files
+        assert result.fragments_created > 0
+        assert result.classifications_made == result.fragments_created
 
         # Redaction and indexing should still work
         assert result.files_scanned > 0

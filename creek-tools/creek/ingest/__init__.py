@@ -13,8 +13,11 @@ Exports:
 """
 
 from creek.ingest.base import Ingestor, IngestResult, ParsedFragment, RawDocument
+from creek.ingest.markdown import MarkdownIngestor
 
-INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {}
+INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
+    "markdown": MarkdownIngestor,
+}
 """Registry mapping ingestor names to their concrete classes.
 
 Concrete ingestors should register themselves here upon import, e.g.::
@@ -27,6 +30,7 @@ __all__ = [
     "INGESTOR_REGISTRY",
     "IngestResult",
     "Ingestor",
+    "MarkdownIngestor",
     "ParsedFragment",
     "RawDocument",
 ]
