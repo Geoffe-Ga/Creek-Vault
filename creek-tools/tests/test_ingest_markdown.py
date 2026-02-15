@@ -730,7 +730,7 @@ class TestMarkdownIngestorEdgeCases:
         """Should handle files with malformed frontmatter gracefully."""
         bad_fm = tmp_path / "bad_fm.md"
         bad_fm.write_text(
-            "---\n" "title: [invalid yaml\n" "---\n\n" "# Content\n",
+            "---\ntitle: [invalid yaml\n---\n\n# Content\n",
             encoding="utf-8",
         )
         docs = md_ingestor.discover(tmp_path)
