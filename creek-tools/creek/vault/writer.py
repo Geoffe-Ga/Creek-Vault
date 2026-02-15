@@ -59,6 +59,9 @@ _PRAXIS_SUBFOLDER: dict[str, str] = {
 }
 
 # Decision statuses that are considered "active" (go to Active/)
+_MAX_FILENAME_LENGTH = 80
+"""Maximum character length for sanitised filename components."""
+
 _ACTIVE_DECISION_STATUSES: set[str] = {
     DecisionStatus.SENSING,
     DecisionStatus.DELIBERATING,
@@ -78,9 +81,10 @@ def _sanitize_title(title: str) -> str:
     Returns:
         A sanitised string suitable for use in a filename.
     """
+    # \w includes unicode word chars — intentional for international content
     cleaned = re.sub(r"[^\w\s-]", "", title)
     cleaned = cleaned.strip().replace(" ", "-")
-    return cleaned[:80]
+    return cleaned[:_MAX_FILENAME_LENGTH]
 
 
 def _extract_date_str(model: BaseModel) -> str:
