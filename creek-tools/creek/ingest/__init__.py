@@ -13,6 +13,7 @@ Exports:
 """
 
 from creek.ingest.base import Ingestor, IngestResult, ParsedFragment, RawDocument
+from creek.ingest.chatgpt import ChatGPTIngestor
 
 INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {}
 """Registry mapping ingestor names to their concrete classes.
@@ -23,8 +24,12 @@ Concrete ingestors should register themselves here upon import, e.g.::
     INGESTOR_REGISTRY["claude"] = ClaudeIngestor
 """
 
+# Register concrete ingestors
+INGESTOR_REGISTRY["chatgpt"] = ChatGPTIngestor
+
 __all__ = [
     "INGESTOR_REGISTRY",
+    "ChatGPTIngestor",
     "IngestResult",
     "Ingestor",
     "ParsedFragment",

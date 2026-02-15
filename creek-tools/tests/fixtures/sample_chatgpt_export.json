@@ -1,0 +1,116 @@
+[
+  {
+    "title": "Knowledge Organization Discussion",
+    "create_time": 1700042400.0,
+    "update_time": 1700042500.0,
+    "mapping": {
+      "msg-root": {
+        "id": "msg-root",
+        "message": null,
+        "parent": null,
+        "children": ["msg-system"]
+      },
+      "msg-system": {
+        "id": "msg-system",
+        "message": {
+          "id": "msg-system",
+          "author": {"role": "system"},
+          "content": {"content_type": "text", "parts": ["You are a helpful assistant."]},
+          "create_time": 1700042400.0
+        },
+        "parent": "msg-root",
+        "children": ["msg-user-1"]
+      },
+      "msg-user-1": {
+        "id": "msg-user-1",
+        "message": {
+          "id": "msg-user-1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["How do you think about organizing personal knowledge?"]},
+          "create_time": 1700042410.0
+        },
+        "parent": "msg-system",
+        "children": ["msg-assistant-1"]
+      },
+      "msg-assistant-1": {
+        "id": "msg-assistant-1",
+        "message": {
+          "id": "msg-assistant-1",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Knowledge organization works best when it mirrors how you naturally think."]},
+          "create_time": 1700042420.0
+        },
+        "parent": "msg-user-1",
+        "children": ["msg-user-2"]
+      },
+      "msg-user-2": {
+        "id": "msg-user-2",
+        "message": {
+          "id": "msg-user-2",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["That makes sense. I want something that grows with me over time."]},
+          "create_time": 1700042430.0
+        },
+        "parent": "msg-assistant-1",
+        "children": ["msg-assistant-2"]
+      },
+      "msg-assistant-2": {
+        "id": "msg-assistant-2",
+        "message": {
+          "id": "msg-assistant-2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["A growing system needs organic structure, not rigid categories."]},
+          "create_time": 1700042440.0
+        },
+        "parent": "msg-user-2",
+        "children": []
+      }
+    }
+  },
+  {
+    "title": "Simple Chat",
+    "create_time": 1700128800.0,
+    "update_time": 1700128900.0,
+    "mapping": {
+      "root-2": {
+        "id": "root-2",
+        "message": null,
+        "parent": null,
+        "children": ["sys-2"]
+      },
+      "sys-2": {
+        "id": "sys-2",
+        "message": {
+          "id": "sys-2",
+          "author": {"role": "system"},
+          "content": {"content_type": "text", "parts": ["You are a helpful assistant."]},
+          "create_time": 1700128800.0
+        },
+        "parent": "root-2",
+        "children": ["user-2"]
+      },
+      "user-2": {
+        "id": "user-2",
+        "message": {
+          "id": "user-2",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What is the meaning of life?"]},
+          "create_time": 1700128810.0
+        },
+        "parent": "sys-2",
+        "children": ["assist-2"]
+      },
+      "assist-2": {
+        "id": "assist-2",
+        "message": {
+          "id": "assist-2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["The meaning of life is a deeply personal question."]},
+          "create_time": 1700128820.0
+        },
+        "parent": "user-2",
+        "children": []
+      }
+    }
+  }
+]
