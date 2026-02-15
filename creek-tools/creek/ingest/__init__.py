@@ -10,13 +10,16 @@ Exports:
     ParsedFragment: Pydantic model for parsed fragment data.
     IngestResult: Pydantic model for ingest pipeline results.
     Ingestor: Abstract base class for all ingestors.
+    ClaudeIngestor: Concrete ingestor for Claude conversation exports.
 """
 
 from creek.ingest.base import Ingestor, IngestResult, ParsedFragment, RawDocument
+from creek.ingest.claude import ClaudeIngestor
 from creek.ingest.discord import DiscordIngestor
 from creek.ingest.markdown import MarkdownIngestor
 
 INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
+    "claude": ClaudeIngestor,
     "discord": DiscordIngestor,
     "markdown": MarkdownIngestor,
 }
@@ -25,11 +28,12 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
 Concrete ingestors should register themselves here upon import, e.g.::
 
     from creek.ingest import INGESTOR_REGISTRY
-    INGESTOR_REGISTRY["claude"] = ClaudeIngestor
+    INGESTOR_REGISTRY["my_source"] = MySourceIngestor
 """
 
 __all__ = [
     "INGESTOR_REGISTRY",
+    "ClaudeIngestor",
     "DiscordIngestor",
     "IngestResult",
     "Ingestor",

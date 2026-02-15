@@ -743,9 +743,10 @@ class TestIngestPackage:
         assert isinstance(INGESTOR_REGISTRY, dict)
 
     def test_registry_contains_ingestors(self) -> None:
-        """The registry should contain registered ingestors."""
+        """The registry should contain all registered ingestors."""
         from creek.ingest import INGESTOR_REGISTRY
 
+        assert "claude" in INGESTOR_REGISTRY
         assert "discord" in INGESTOR_REGISTRY
         assert "markdown" in INGESTOR_REGISTRY
 
