@@ -364,7 +364,7 @@ def _pair_messages_to_fragments(
                         else conversation_timestamp
                     )
                     content = (
-                        f"**User**: {user_text}\n\n" f"**Assistant**: {assistant_text}"
+                        f"**User**: {user_text}\n\n**Assistant**: {assistant_text}"
                     )
                     fragments.append(
                         ParsedFragment(
