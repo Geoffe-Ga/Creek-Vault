@@ -78,9 +78,7 @@ class RedactionScanner:
         Returns:
             Hex-encoded SHA-256 digest of ``salt + text.encode()``.
         """
-        return hashlib.sha256(  # nosec B324
-            self.salt + text.encode()
-        ).hexdigest()
+        return hashlib.sha256(self.salt + text.encode()).hexdigest()  # nosec B324
 
     def _is_allowlisted(self, text: str) -> bool:
         """Check whether *text* appears in the false-positive allowlist.

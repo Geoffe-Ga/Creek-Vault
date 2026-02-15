@@ -45,9 +45,9 @@ class TestRedactionPatterns:
     def test_patterns_are_compiled_regex(self) -> None:
         """Each pattern value should be a compiled regex."""
         for name, pattern in REDACTION_PATTERNS.items():
-            assert isinstance(pattern, re.Pattern), (
-                f"Pattern '{name}' is not a compiled regex"
-            )
+            assert isinstance(
+                pattern, re.Pattern
+            ), f"Pattern '{name}' is not a compiled regex"
 
     def test_api_key_pattern_matches(self) -> None:
         """api_key pattern should match common API key formats."""
@@ -128,9 +128,9 @@ class TestRedactionMatch:
         fields = RedactionMatch.model_fields
         forbidden = {"matched_text", "text", "value", "content", "raw", "match_text"}
         for field_name in forbidden:
-            assert field_name not in fields, (
-                f"RedactionMatch must NOT store matched text (found '{field_name}')"
-            )
+            assert (
+                field_name not in fields
+            ), f"RedactionMatch must NOT store matched text (found '{field_name}')"
 
     def test_serializable(self) -> None:
         """RedactionMatch should be JSON-serializable."""

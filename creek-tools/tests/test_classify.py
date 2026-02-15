@@ -13,20 +13,14 @@ from creek.classify import (
 from creek.classify.llm import (
     CLASSIFICATION_PROMPT,
 )
-from creek.classify.llm import (
-    LLMClassifier as LLMClassifierDirect,
-)
-from creek.classify.review import (
-    ReviewQueueGenerator as ReviewQueueGeneratorDirect,
-)
+from creek.classify.llm import LLMClassifier as LLMClassifierDirect
+from creek.classify.review import ReviewQueueGenerator as ReviewQueueGeneratorDirect
 from creek.classify.rules import (
     FREQUENCY_SIGNALS,
     MODE_SIGNALS,
     WAVELENGTH_PHASE_SIGNALS,
 )
-from creek.classify.rules import (
-    RuleClassifier as RuleClassifierDirect,
-)
+from creek.classify.rules import RuleClassifier as RuleClassifierDirect
 from creek.config import ClassificationConfig, LLMConfig
 from creek.models import (
     Fragment,

@@ -1,0 +1,22 @@
+{
+  "conversation_id": "conv-test-001",
+  "title": "Discussion about knowledge organization",
+  "create_time": "2024-11-15T10:30:00Z",
+  "messages": [
+    {
+      "role": "human",
+      "content": "How do you think about organizing personal knowledge?",
+      "timestamp": "2024-11-15T10:30:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Knowledge organization works best when it mirrors how you naturally think. Consider using a system that captures both the content and the connections between ideas.",
+      "timestamp": "2024-11-15T10:30:15Z"
+    },
+    {
+      "role": "human",
+      "content": "That makes sense. I want something that grows with me over time.",
+      "timestamp": "2024-11-15T10:31:00Z"
+    }
+  ]
+}
