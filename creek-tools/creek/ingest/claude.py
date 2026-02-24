@@ -23,6 +23,7 @@ from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
     RawDocument,
+    normalize_encoding,
     normalize_timestamp,
 )
 
@@ -215,6 +216,8 @@ class ClaudeIngestor(Ingestor):
         Returns:
             A list of ``RawDocument`` objects for each valid export file.
         """
+        if not source_path.is_dir():
+            return []
         docs: list[RawDocument] = []
         for json_path in sorted(source_path.glob("*.json")):
             raw = self._try_read_export(json_path)
@@ -327,11 +330,12 @@ class ClaudeIngestor(Ingestor):
         if not self._is_claude_export(data):
             return None
 
+        _, detected = normalize_encoding(content)
         return RawDocument(
             path=json_path,
             content=content,
             metadata={},
-            detected_encoding="utf-8",
+            detected_encoding=detected,
         )
 
     @staticmethod

@@ -25,10 +25,11 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
 }
 """Registry mapping ingestor names to their concrete classes.
 
-Concrete ingestors should register themselves here upon import, e.g.::
+Built-in ingestors are registered automatically on import. To look up
+a registered ingestor by name::
 
     from creek.ingest import INGESTOR_REGISTRY
-    INGESTOR_REGISTRY["my_source"] = MySourceIngestor
+    ingestor_cls = INGESTOR_REGISTRY["claude"]
 """
 
 __all__ = [

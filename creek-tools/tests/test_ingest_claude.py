@@ -188,7 +188,7 @@ class TestDiscover:
         doc = docs[0]
         assert isinstance(doc.path, Path)
         assert isinstance(doc.content, bytes)
-        assert doc.detected_encoding == "utf-8"
+        assert doc.detected_encoding in {"utf-8", "ascii"}
 
     def test_ignores_non_claude_json(
         self, ingestor: ClaudeIngestor, tmp_path: Path
@@ -232,6 +232,16 @@ class TestDiscover:
             (tmp_path / f"export_{i}.json").write_bytes(data)
         docs = ingestor.discover(tmp_path)
         assert len(docs) == 3
+
+    def test_returns_empty_for_file_path(
+        self, ingestor: ClaudeIngestor, tmp_path: Path
+    ) -> None:
+        """discover() should return empty list when given a file path."""
+        file_path = tmp_path / "claude_export.json"
+        conv = _make_single_conversation()
+        file_path.write_bytes(_make_claude_export([conv]))
+        docs = ingestor.discover(file_path)
+        assert docs == []
 
     def test_single_conversation_format(
         self, ingestor: ClaudeIngestor, tmp_path: Path
