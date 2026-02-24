@@ -23,11 +23,14 @@ SUBCOMMANDS:
     view ID [ID...]                      View workflow run conclusions
     watch ID [ID...]                     Watch runs until complete
     checks PR_NUMBER                     Show PR check status
-    status PR_NUMBER                     Full PR verdict (CI + Claude review)
+    status PR_NUMBER [--workflow FILE]   Full PR verdict (CI + Claude review)
 
 OPTIONS:
     --verbose   Show detailed output
     --help      Display this help message
+
+STATUS OPTIONS:
+    --workflow FILE   CI workflow filename (default: ci.yml)
 
 EXIT CODES:
     0           Success / ready to merge
@@ -56,6 +59,10 @@ cmd_list() {
                 shift 2
                 ;;
             --limit)
+                if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    echo "Error: --limit requires a numeric value, got '$2'" >&2
+                    exit 2
+                fi
                 limit="$2"
                 shift 2
                 ;;
@@ -109,11 +116,14 @@ cmd_view() {
         local run_json
         run_json="$(gh run view "$run_id" --repo "$repo" --json "status,conclusion,workflowName,headBranch,jobs")"
 
+        if $VERBOSE; then
+            echo "Fetched run data for #${run_id}"
+        fi
+
         local status conclusion workflow branch
-        status="$(echo "$run_json" | jq -r '.status')"
-        conclusion="$(echo "$run_json" | jq -r '.conclusion // "—"')"
-        workflow="$(echo "$run_json" | jq -r '.workflowName')"
-        branch="$(echo "$run_json" | jq -r '.headBranch')"
+        read -r workflow branch status conclusion < <(
+            echo "$run_json" | jq -r '[.workflowName, .headBranch, .status, (.conclusion // "—")] | @tsv'
+        )
 
         echo "Workflow:   $workflow"
         echo "Branch:     $branch"
@@ -150,6 +160,10 @@ cmd_watch() {
         echo "=== Watching Run #${run_id} ==="
         echo ""
 
+        if $VERBOSE; then
+            echo "Watching run #${run_id} in repo $repo"
+        fi
+
         if ! gh run watch "$run_id" --repo "$repo" --exit-status; then
             any_failed=true
             echo "✗ Run #${run_id} failed" >&2
@@ -178,6 +192,10 @@ cmd_checks() {
     echo "=== PR #${pr_number} Checks ==="
     echo ""
 
+    if $VERBOSE; then
+        echo "Fetching checks for PR #${pr_number} in repo $repo"
+    fi
+
     gh pr checks "$pr_number" --repo "$repo"
 }
 
@@ -189,6 +207,22 @@ cmd_status() {
     fi
 
     local pr_number="$1"
+    shift
+    local workflow="ci.yml"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --workflow)
+                workflow="$2"
+                shift 2
+                ;;
+            *)
+                echo "Error: Unknown option for status: $1" >&2
+                exit 2
+                ;;
+        esac
+    done
+
     local repo
     repo="$(get_repo)"
 
@@ -209,7 +243,11 @@ cmd_status() {
     local ci_pass=false
 
     local run_json
-    run_json="$(gh run list --repo "$repo" --branch "$pr_branch" --workflow ci.yml --limit 1 --json "databaseId,conclusion,status" 2>/dev/null || echo "[]")"
+    if $VERBOSE; then
+        echo "Looking for workflow: $workflow on branch: $pr_branch"
+    fi
+
+    run_json="$(gh run list --repo "$repo" --branch "$pr_branch" --workflow "$workflow" --limit 1 --json "databaseId,conclusion,status" 2>/dev/null || echo "[]")"
 
     local run_count
     run_count="$(echo "$run_json" | jq 'length')"
@@ -217,6 +255,8 @@ cmd_status() {
     if [[ "$run_count" -eq 0 ]]; then
         ci_status="NO RUNS"
         ci_detail="No CI runs found for branch $pr_branch"
+        echo "Warning: No runs found for workflow '$workflow' on branch '$pr_branch'." >&2
+        echo "  Check workflow filename or use --workflow <file> to specify." >&2
     else
         local run_id run_conclusion run_status
         run_id="$(echo "$run_json" | jq -r '.[0].databaseId')"
@@ -281,7 +321,7 @@ cmd_status() {
                 review_status="CHANGES_REQUESTED"
 
                 # Extract problems section
-                review_issues="$(echo "$body" | sed -n '/^## Problems/,/^## [^P]/p' | head -n -1)"
+                review_issues="$(echo "$body" | sed -n '/^## Problems/,/^## [^P]/p' | sed '$d')"
                 if [[ -z "$review_issues" ]]; then
                     # Try alternate format: lines starting with 🔴
                     review_issues="$(echo "$body" | grep '🔴' || true)"
@@ -289,6 +329,7 @@ cmd_status() {
                 break
             elif echo "$body" | grep -qE '💬\s*COMMENTS|Verdict:.*COMMENTS'; then
                 review_status="COMMENTS"
+                review_pass=true
                 break
             fi
         done
