@@ -47,7 +47,9 @@ class ChatGPTIngestor(Ingestor):
         """Find ChatGPT JSON export files in the given directory.
 
         Scans *source_path* for ``.json`` files and returns a
-        ``RawDocument`` for each one.
+        ``RawDocument`` for each one whose content is a JSON list of
+        dicts (the ChatGPT export format).  Files that contain other
+        JSON structures (e.g. a top-level dict) are silently skipped.
 
         Args:
             source_path: Directory to search for JSON export files.
@@ -62,6 +64,9 @@ class ChatGPTIngestor(Ingestor):
         for json_file in sorted(source_path.glob("*.json")):
             raw_bytes = json_file.read_bytes()
             _text, encoding = normalize_encoding(raw_bytes)
+            if not _is_chatgpt_export(raw_bytes, encoding):
+                logger.debug("Skipping non-ChatGPT JSON file: %s", json_file)
+                continue
             docs.append(
                 RawDocument(
                     path=json_file,
@@ -125,13 +130,17 @@ class ChatGPTIngestor(Ingestor):
         Returns:
             A dict of frontmatter key-value pairs.
         """
+        source: dict[str, Any] = {
+            "platform": "chatgpt",
+            "original_file": fragment.source_path,
+        }
+        conv_id = fragment.metadata.get("conversation_id")
+        if conv_id is not None:
+            source["conversation_id"] = conv_id
         return {
             "title": fragment.metadata.get("title", "Untitled Conversation"),
             "created": fragment.timestamp.isoformat(),
-            "source": {
-                "platform": "chatgpt",
-                "original_file": fragment.source_path,
-            },
+            "source": source,
         }
 
     # ---- Private helpers ----
@@ -161,15 +170,50 @@ class ChatGPTIngestor(Ingestor):
         title = conv.get("title", "Untitled Conversation")
         create_time = conv.get("create_time", 0.0)
         timestamp = _epoch_to_la_datetime(create_time)
+        conversation_id: str | None = conv.get("id")
 
         ordered_messages = _linearize_tree(mapping)
         return _pair_messages_to_fragments(
-            ordered_messages, title, timestamp, source_path
+            ordered_messages, title, timestamp, source_path, conversation_id
         )
+
+
+def _is_chatgpt_export(raw_bytes: bytes, encoding: str) -> bool:
+    """Check whether *raw_bytes* looks like a ChatGPT conversation export.
+
+    A valid ChatGPT export is a JSON array whose elements are dicts
+    (each representing a conversation).  Any other top-level JSON
+    structure (e.g. a dict from a Claude export) is rejected.
+
+    Args:
+        raw_bytes: The raw file content.
+        encoding: The detected character encoding.
+
+    Returns:
+        ``True`` if the content is a JSON list of dicts, ``False`` otherwise.
+    """
+    try:
+        data = json.loads(raw_bytes.decode(encoding, errors="replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+    if not isinstance(data, list):
+        return False
+
+    # An empty list is technically valid (no conversations)
+    return all(isinstance(item, dict) for item in data)
+
+
+_MISSING_TIMESTAMP_SENTINEL = datetime(2000, 1, 1, tzinfo=LA_TZ)
+"""Fixed sentinel datetime used when a ChatGPT export has no timestamp."""
 
 
 def _epoch_to_la_datetime(epoch: float | None) -> datetime:
     """Convert a Unix epoch float to a timezone-aware LA datetime.
+
+    Returns a fixed sentinel value (``2000-01-01T00:00:00-08:00``)
+    when *epoch* is ``None`` or ``0.0``, rather than using the
+    current wall-clock time, to keep output deterministic.
 
     Args:
         epoch: Unix timestamp as a float, or None.
@@ -178,7 +222,7 @@ def _epoch_to_la_datetime(epoch: float | None) -> datetime:
         A datetime in America/Los_Angeles timezone.
     """
     if epoch is None or epoch == 0.0:
-        return datetime.now(tz=LA_TZ)
+        return _MISSING_TIMESTAMP_SENTINEL
     utc_dt = datetime.fromtimestamp(epoch, tz=UTC)
     return utc_dt.astimezone(LA_TZ)
 
@@ -323,23 +367,27 @@ def _pair_messages_to_fragments(
     title: str,
     conversation_timestamp: datetime,
     source_path: str,
+    conversation_id: str | None = None,
 ) -> list[ParsedFragment]:
     """Pair consecutive user+assistant messages into fragments.
 
     Iterates through the ordered message list, pairing each user
     message with the following assistant message. System messages
-    and unpaired user messages at the end are skipped.
+    and unpaired user messages at the end are skipped. Each fragment
+    title includes a turn index to prevent collisions.
 
     Args:
         messages: Ordered list of ChatGPT message dicts.
         title: The conversation title.
         conversation_timestamp: The conversation creation timestamp.
         source_path: The source file path.
+        conversation_id: Optional ChatGPT conversation ID for metadata.
 
     Returns:
         A list of ``ParsedFragment`` objects, one per pair.
     """
     fragments: list[ParsedFragment] = []
+    turn_idx = 0
     i = 0
     while i < len(messages):
         msg = messages[i]
@@ -366,14 +414,22 @@ def _pair_messages_to_fragments(
                     content = (
                         f"**User**: {user_text}\n\n**Assistant**: {assistant_text}"
                     )
+                    turn_title = f"{title} (turn {turn_idx})"
+                    meta: dict[str, Any] = {
+                        "title": turn_title,
+                        "platform": "chatgpt",
+                    }
+                    if conversation_id is not None:
+                        meta["conversation_id"] = conversation_id
                     fragments.append(
                         ParsedFragment(
                             content=content,
-                            metadata={"title": title, "platform": "chatgpt"},
+                            metadata=meta,
                             source_path=source_path,
                             timestamp=fragment_ts,
                         )
                     )
+                    turn_idx += 1
                     i += 2
                     continue
             # No assistant follows: skip this user message

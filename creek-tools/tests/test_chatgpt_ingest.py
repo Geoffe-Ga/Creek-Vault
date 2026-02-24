@@ -198,6 +198,35 @@ class TestChatGPTDiscover:
         docs = ingestor.discover(tmp_path)
         assert isinstance(docs[0].detected_encoding, str)
 
+    def test_skips_non_list_json(self, tmp_path: Path) -> None:
+        """discover() should skip JSON files that are not a list of dicts."""
+        # A Claude-style dict export should be rejected
+        (tmp_path / "claude_export.json").write_text('{"conversations": []}')
+        ingestor = ChatGPTIngestor()
+        docs = ingestor.discover(tmp_path)
+        assert docs == []
+
+    def test_skips_json_with_non_dict_items(self, tmp_path: Path) -> None:
+        """discover() should skip JSON files whose list contains non-dicts."""
+        (tmp_path / "strings.json").write_text('["a", "b", "c"]')
+        ingestor = ChatGPTIngestor()
+        docs = ingestor.discover(tmp_path)
+        assert docs == []
+
+    def test_skips_invalid_json(self, tmp_path: Path) -> None:
+        """discover() should skip files with invalid JSON."""
+        (tmp_path / "broken.json").write_text("{not valid json")
+        ingestor = ChatGPTIngestor()
+        docs = ingestor.discover(tmp_path)
+        assert docs == []
+
+    def test_accepts_valid_chatgpt_export(self, tmp_path: Path) -> None:
+        """discover() should accept a JSON list of dicts."""
+        (tmp_path / "valid.json").write_text('[{"title": "test"}]')
+        ingestor = ChatGPTIngestor()
+        docs = ingestor.discover(tmp_path)
+        assert len(docs) == 1
+
 
 # ---- parse() Tests ----
 
@@ -263,13 +292,13 @@ class TestChatGPTParse:
         fragments = ingestor.parse(raw)
         assert fragments[0].source_path == "/data/conversations.json"
 
-    def test_fragment_metadata_has_title(self) -> None:
-        """parse() should include conversation title in fragment metadata."""
+    def test_fragment_metadata_has_title_with_turn_index(self) -> None:
+        """parse() should include conversation title with turn index."""
         conv = _minimal_conversation(title="My Chat")
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert fragments[0].metadata["title"] == "My Chat"
+        assert fragments[0].metadata["title"] == "My Chat (turn 0)"
 
     def test_fragment_metadata_has_platform(self) -> None:
         """parse() should include platform in fragment metadata."""
@@ -814,8 +843,8 @@ class TestChatGPTEdgeCases:
         fragments = ingestor.parse(raw)
         assert fragments == []
 
-    def test_missing_create_time_uses_fallback(self) -> None:
-        """parse() should handle conversations with no create_time."""
+    def test_missing_create_time_uses_sentinel(self) -> None:
+        """parse() should use a fixed sentinel for missing create_time."""
         conv: dict[str, Any] = {
             "title": "No Create Time",
             "mapping": {
@@ -857,8 +886,135 @@ class TestChatGPTEdgeCases:
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
         assert len(fragments) == 1
-        # Should have a valid LA timezone timestamp (fallback)
-        assert str(fragments[0].timestamp.tzinfo) == "America/Los_Angeles"
+        # Should use the fixed sentinel: 2000-01-01 in LA timezone
+        assert fragments[0].timestamp == datetime(2000, 1, 1, tzinfo=LA_TZ)
+
+    def test_zero_epoch_uses_sentinel(self) -> None:
+        """parse() should use a fixed sentinel when create_time is 0.
+
+        When the conversation create_time is 0 and message-level
+        timestamps are also missing, the sentinel should be used.
+        """
+        conv: dict[str, Any] = {
+            "title": "Zero Epoch",
+            "create_time": 0.0,
+            "mapping": {
+                "root": {
+                    "id": "root",
+                    "message": None,
+                    "parent": None,
+                    "children": ["u1"],
+                },
+                "u1": {
+                    "id": "u1",
+                    "message": {
+                        "id": "u1",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Hi"]},
+                    },
+                    "parent": "root",
+                    "children": ["a1"],
+                },
+                "a1": {
+                    "id": "a1",
+                    "message": {
+                        "id": "a1",
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["Hey"]},
+                    },
+                    "parent": "u1",
+                    "children": [],
+                },
+            },
+        }
+        raw = _make_raw_doc([conv])
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        # Conversation create_time=0 -> sentinel; no message create_time -> fallback
+        assert fragments[0].timestamp == datetime(2000, 1, 1, tzinfo=LA_TZ)
+
+    def test_conversation_id_in_metadata(self) -> None:
+        """parse() should include conversation_id from export in metadata."""
+        conv = _minimal_conversation()
+        conv["id"] = "conv-abc-123"
+        raw = _make_raw_doc([conv])
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(raw)
+        assert fragments[0].metadata["conversation_id"] == "conv-abc-123"
+
+    def test_conversation_id_absent_when_not_in_export(self) -> None:
+        """parse() should omit conversation_id when not present in export."""
+        conv = _minimal_conversation()
+        # No "id" key in conv
+        raw = _make_raw_doc([conv])
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(raw)
+        assert "conversation_id" not in fragments[0].metadata
+
+    def test_turn_index_increments_for_multi_turn(self) -> None:
+        """parse() should increment turn index for each fragment."""
+        conv: dict[str, Any] = {
+            "title": "Multi",
+            "create_time": 1700042400.0,
+            "mapping": {
+                "root": {
+                    "id": "root",
+                    "message": None,
+                    "parent": None,
+                    "children": ["u1"],
+                },
+                "u1": {
+                    "id": "u1",
+                    "message": {
+                        "id": "u1",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Q1"]},
+                        "create_time": 1700042410.0,
+                    },
+                    "parent": "root",
+                    "children": ["a1"],
+                },
+                "a1": {
+                    "id": "a1",
+                    "message": {
+                        "id": "a1",
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["A1"]},
+                        "create_time": 1700042420.0,
+                    },
+                    "parent": "u1",
+                    "children": ["u2"],
+                },
+                "u2": {
+                    "id": "u2",
+                    "message": {
+                        "id": "u2",
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["Q2"]},
+                        "create_time": 1700042430.0,
+                    },
+                    "parent": "a1",
+                    "children": ["a2"],
+                },
+                "a2": {
+                    "id": "a2",
+                    "message": {
+                        "id": "a2",
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["A2"]},
+                        "create_time": 1700042440.0,
+                    },
+                    "parent": "u2",
+                    "children": [],
+                },
+            },
+        }
+        raw = _make_raw_doc([conv])
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(raw)
+        assert fragments[0].metadata["title"] == "Multi (turn 0)"
+        assert fragments[1].metadata["title"] == "Multi (turn 1)"
 
     def test_discover_non_directory_path(self, tmp_path: Path) -> None:
         """discover() should return empty list for non-directory path."""
@@ -991,6 +1147,34 @@ class TestChatGPTGenerateFrontmatter:
         )
         result = ingestor.generate_frontmatter(fragment)
         assert result["source"]["original_file"] == "/fake/conv.json"
+
+    def test_has_conversation_id_when_present(self) -> None:
+        """Frontmatter source should include conversation_id when in metadata."""
+        ingestor = ChatGPTIngestor()
+        fragment = ParsedFragment(
+            content="content",
+            metadata={
+                "title": "Test",
+                "platform": "chatgpt",
+                "conversation_id": "conv-xyz",
+            },
+            source_path="/fake/conv.json",
+            timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=LA_TZ),
+        )
+        result = ingestor.generate_frontmatter(fragment)
+        assert result["source"]["conversation_id"] == "conv-xyz"
+
+    def test_omits_conversation_id_when_absent(self) -> None:
+        """Frontmatter source should omit conversation_id when not in metadata."""
+        ingestor = ChatGPTIngestor()
+        fragment = ParsedFragment(
+            content="content",
+            metadata={"title": "Test", "platform": "chatgpt"},
+            source_path="/fake/conv.json",
+            timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=LA_TZ),
+        )
+        result = ingestor.generate_frontmatter(fragment)
+        assert "conversation_id" not in result["source"]
 
 
 # ---- Registry Tests ----
