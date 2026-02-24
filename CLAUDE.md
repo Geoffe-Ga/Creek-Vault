@@ -33,6 +33,11 @@ pre-commit install
 ./scripts/typecheck.sh          # MyPy strict type checking
 ./scripts/security.sh           # Bandit + pip-audit scans
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
+./scripts/pr-status.sh list        # List recent CI workflow runs
+./scripts/pr-status.sh view ID     # View workflow run results
+./scripts/pr-status.sh watch ID    # Watch workflow run progress
+./scripts/pr-status.sh checks PR#  # Show PR check status
+./scripts/pr-status.sh status PR#  # Full PR verdict (CI + Claude review)
 ```
 
 ### Running a Single Test
