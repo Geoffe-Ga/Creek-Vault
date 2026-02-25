@@ -312,12 +312,12 @@ cmd_status() {
             local body
             body="$(echo "$pr_json" | jq -r ".comments[$i].body")"
 
-            # Check for verdict patterns
-            if echo "$body" | grep -qE '✅\s*LGTM|Verdict:.*LGTM'; then
+            # Check for verdict patterns (handles bold markdown: **LGTM**)
+            if echo "$body" | grep -qE '✅\s*\*{0,2}LGTM|Verdict.*LGTM'; then
                 review_status="LGTM"
                 review_pass=true
                 break
-            elif echo "$body" | grep -qE '🔄\s*CHANGES_REQUESTED|Verdict:.*CHANGES_REQUESTED'; then
+            elif echo "$body" | grep -qE '🔄\s*\*{0,2}CHANGES_REQUESTED|Verdict.*CHANGES_REQUESTED'; then
                 review_status="CHANGES_REQUESTED"
 
                 # Extract problems section
@@ -327,7 +327,7 @@ cmd_status() {
                     review_issues="$(echo "$body" | grep '🔴' || true)"
                 fi
                 break
-            elif echo "$body" | grep -qE '💬\s*COMMENTS|Verdict:.*COMMENTS'; then
+            elif echo "$body" | grep -qE '💬\s*\*{0,2}COMMENTS|Verdict.*COMMENTS'; then
                 review_status="COMMENTS"
                 review_pass=true
                 break
