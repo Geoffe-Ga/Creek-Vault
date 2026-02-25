@@ -1223,3 +1223,64 @@ class TestChatGPTIngestPipeline:
         result = ingestor.ingest(tmp_path)
         assert isinstance(result, IngestResult)
         assert result.fragments == []
+
+
+# ---- Robustness Tests ----
+
+
+class TestLinearizeTreeCycleGuard:
+    """Tests that _linearize_tree handles cycles in malformed data."""
+
+    def test_cycle_does_not_loop_forever(self) -> None:
+        """_linearize_tree should terminate on a mapping with a cycle."""
+        from creek.ingest.chatgpt import _linearize_tree
+
+        # A -> B -> C -> A (cycle back to root)
+        mapping: dict[str, Any] = {
+            "a": {
+                "parent": None,
+                "children": ["b"],
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Hi"]}},
+            },
+            "b": {
+                "parent": "a",
+                "children": ["c"],
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Hello"]},
+                },
+            },
+            "c": {
+                "parent": "b",
+                "children": ["a"],  # cycle back to root
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["Again"]},
+                },
+            },
+        }
+        messages = _linearize_tree(mapping)
+        # Should get exactly 3 messages (a, b, c) and stop at cycle
+        assert len(messages) == 3
+
+
+class TestCountDescendantsDeepTree:
+    """Tests that _count_descendants handles deep trees without recursion errors."""
+
+    def test_deep_tree_does_not_hit_recursion_limit(self) -> None:
+        """_count_descendants works on trees deeper than recursion limit."""
+        from creek.ingest.chatgpt import _count_descendants
+
+        depth = 2000  # well beyond default recursion limit of ~1000
+        mapping: dict[str, Any] = {}
+        for i in range(depth):
+            node_id = f"node_{i}"
+            child_id = f"node_{i + 1}" if i < depth - 1 else None
+            mapping[node_id] = {
+                "parent": f"node_{i - 1}" if i > 0 else None,
+                "children": [child_id] if child_id else [],
+                "message": None,
+            }
+
+        count = _count_descendants("node_0", mapping)
+        assert count == depth

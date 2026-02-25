@@ -1,9 +1,9 @@
-"""Creek ingest package — registry of available ingestors and base classes.
+"""Creek ingest package --- registry of available ingestors and base classes.
 
 This package provides the abstract ``Ingestor`` base class and shared
-utilities for building source-specific ingestors. All concrete ingestor
-classes are registered in ``INGESTOR_REGISTRY`` via a single declarative
-dict literal — no imperative ``INGESTOR_REGISTRY["key"] = Value`` lines.
+utilities for building source-specific ingestors.  Concrete ingestor
+classes are registered declaratively in the ``INGESTOR_REGISTRY`` dict
+literal below.
 
 Exports:
     INGESTOR_REGISTRY: A dict mapping ingestor names to their classes.
@@ -31,11 +31,8 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
 }
 """Registry mapping ingestor names to their concrete classes.
 
-Built-in ingestors are registered automatically on import. To look up
-a registered ingestor by name::
-
-    from creek.ingest import INGESTOR_REGISTRY
-    ingestor_cls = INGESTOR_REGISTRY["claude"]
+To add a new ingestor, import its class above and add an entry to this
+dict literal.  All registrations should live in this single declaration.
 """
 
 __all__ = [

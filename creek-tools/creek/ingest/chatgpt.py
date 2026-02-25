@@ -247,9 +247,15 @@ def _linearize_tree(
         return []
 
     messages: list[dict[str, Any]] = []
+    visited: set[str] = set()
     current_id: str | None = root_id
 
     while current_id is not None:
+        if current_id in visited:
+            logger.warning("Cycle detected at node %s; stopping traversal", current_id)
+            break
+        visited.add(current_id)
+
         node = mapping.get(current_id)
         if node is None:
             break
@@ -311,7 +317,11 @@ def _pick_longest_branch(
 
 
 def _count_descendants(node_id: str, mapping: dict[str, Any]) -> int:
-    """Count the total number of descendants of a node.
+    """Count the total number of descendants of a node (iterative BFS).
+
+    Uses an iterative breadth-first approach with a ``visited`` set to
+    avoid infinite loops on malformed data and to handle arbitrarily
+    deep trees without hitting Python's recursion limit.
 
     Args:
         node_id: The ID of the node to count descendants for.
@@ -320,12 +330,21 @@ def _count_descendants(node_id: str, mapping: dict[str, Any]) -> int:
     Returns:
         The total number of descendant nodes (including the node itself).
     """
-    node = mapping.get(node_id)
-    if node is None:
-        return 0
-    count = 1
-    for child_id in node.get("children", []):
-        count += _count_descendants(child_id, mapping)
+    count = 0
+    stack: list[str] = [node_id]
+    visited: set[str] = set()
+
+    while stack:
+        nid = stack.pop()
+        if nid in visited:
+            continue
+        visited.add(nid)
+        node = mapping.get(nid)
+        if node is None:
+            continue
+        count += 1
+        stack.extend(node.get("children", []))
+
     return count
 
 
