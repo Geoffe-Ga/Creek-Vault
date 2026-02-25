@@ -278,6 +278,7 @@ class ClaudeIngestor(Ingestor):
         - ``created``: ISO timestamp in America/Los_Angeles
         - ``source.platform``: ``"claude"``
         - ``source.conversation_id``: The conversation UUID
+        - ``source.original_file``: Path to the source export file
         - ``source.model``: The model used (if available)
 
         Args:
@@ -295,6 +296,7 @@ class ClaudeIngestor(Ingestor):
         source: dict[str, Any] = {
             "platform": "claude",
             "conversation_id": conv_id,
+            "original_file": fragment.source_path,
         }
         if model is not None:
             source["model"] = model

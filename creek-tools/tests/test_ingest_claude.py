@@ -707,6 +707,17 @@ class TestGenerateFrontmatter:
         fm = ingestor.generate_frontmatter(fragments[0])
         assert fm["source"]["conversation_id"] == "conv-fm-test"
 
+    def test_source_original_file(self, ingestor: ClaudeIngestor) -> None:
+        """Frontmatter should include the original_file path."""
+        conv = _make_single_conversation()
+        raw = _raw_doc_from_export(
+            _make_claude_export([conv]),
+            path="/fake/export/my_claude.json",
+        )
+        fragments = ingestor.parse(raw)
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert fm["source"]["original_file"] == "/fake/export/my_claude.json"
+
     def test_timestamp_in_la_timezone(self, ingestor: ClaudeIngestor) -> None:
         """Frontmatter created timestamp should be in LA timezone."""
         conv = _make_single_conversation(
