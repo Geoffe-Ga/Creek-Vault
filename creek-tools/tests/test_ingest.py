@@ -746,6 +746,7 @@ class TestIngestPackage:
         """The registry should contain all registered ingestors."""
         from creek.ingest import INGESTOR_REGISTRY
 
+        assert "chatgpt" in INGESTOR_REGISTRY
         assert "claude" in INGESTOR_REGISTRY
         assert "discord" in INGESTOR_REGISTRY
         assert "markdown" in INGESTOR_REGISTRY
