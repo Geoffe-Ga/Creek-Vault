@@ -656,7 +656,7 @@ class TestSecondaryFrequencies:
         classifier = RuleClassifier()
         classifier.PRIMARY_THRESHOLD = 2
         classifier.SECONDARY_THRESHOLD = 2
-        content = "survival safety security\n\n" "power dominance control"
+        content = "survival safety security\n\npower dominance control"
         frag = _make_fragment()
         result = classifier.classify(frag, content=content)
         assert result.frequency.primary != Frequency.UNCLASSIFIED
@@ -759,7 +759,7 @@ class TestVoiceRegisterClassification:
         classifier = RuleClassifier()
         classifier.SECONDARY_THRESHOLD = 2
         content = (
-            "maybe perhaps I'm wondering what if\n\n" "could be not sure possibly might"
+            "maybe perhaps I'm wondering what if\n\ncould be not sure possibly might"
         )
         frag = _make_fragment()
         result = classifier.classify(frag, content=content)
