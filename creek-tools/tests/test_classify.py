@@ -16,13 +16,16 @@ from creek.classify.llm import (
 from creek.classify.llm import LLMClassifier as LLMClassifierDirect
 from creek.classify.review import ReviewQueueGenerator as ReviewQueueGeneratorDirect
 from creek.classify.rules import (
+    CONFIDENCE_SIGNALS,
     FREQUENCY_SIGNALS,
     MODE_SIGNALS,
+    VOICE_REGISTER_SIGNALS,
     WAVELENGTH_PHASE_SIGNALS,
 )
 from creek.classify.rules import RuleClassifier as RuleClassifierDirect
 from creek.config import ClassificationConfig, LLMConfig
 from creek.models import (
+    Confidence,
     Fragment,
     FragmentSource,
     Frequency,
@@ -31,6 +34,7 @@ from creek.models import (
     Phase,
     SourcePlatform,
     VoiceClassification,
+    VoiceRegister,
 )
 
 # ---- Helpers ----
@@ -147,6 +151,7 @@ class TestRuleClassifier:
     def test_classify_matches_frequency_keywords(self) -> None:
         """classify() should set primary frequency on keyword match."""
         classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 1
         first_freq = next(iter(FREQUENCY_SIGNALS))
         keyword = FREQUENCY_SIGNALS[first_freq][0]
         frag = _make_fragment()
@@ -157,6 +162,7 @@ class TestRuleClassifier:
     def test_classify_matches_phase_keywords(self) -> None:
         """classify() should set wavelength phase on keyword match."""
         classifier = RuleClassifier()
+        classifier.SECONDARY_THRESHOLD = 1
         first_phase = next(iter(WAVELENGTH_PHASE_SIGNALS))
         keyword = WAVELENGTH_PHASE_SIGNALS[first_phase][0]
         frag = _make_fragment()
@@ -167,6 +173,7 @@ class TestRuleClassifier:
     def test_classify_matches_mode_keywords(self) -> None:
         """classify() should set wavelength mode on keyword match."""
         classifier = RuleClassifier()
+        classifier.SECONDARY_THRESHOLD = 1
         first_mode = next(iter(MODE_SIGNALS))
         keyword = MODE_SIGNALS[first_mode][0]
         frag = _make_fragment()
@@ -187,6 +194,7 @@ class TestRuleClassifier:
     def test_classify_case_insensitive(self) -> None:
         """classify() keyword matching should be case-insensitive."""
         classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 1
         first_freq = next(iter(FREQUENCY_SIGNALS))
         keyword = FREQUENCY_SIGNALS[first_freq][0]
         frag = _make_fragment()
@@ -505,3 +513,262 @@ class TestReviewQueueGenerator:
         content = result.read_text()
         assert "Needs Review" in content
         assert "Already Classified" not in content
+
+
+# ---- Expanded Signal Dictionaries (Issue #23) ----
+
+
+class TestExpandedSignalDictionaries:
+    """Tests that all frequencies, phases, and modes have keyword lists."""
+
+    def test_all_ten_frequencies_present(self) -> None:
+        """FREQUENCY_SIGNALS should cover all 10 frequencies."""
+        expected = {
+            Frequency.F1,
+            Frequency.F2,
+            Frequency.F3,
+            Frequency.F4,
+            Frequency.F5,
+            Frequency.F6,
+            Frequency.F7,
+            Frequency.F8,
+            Frequency.F9,
+            Frequency.F10,
+        }
+        assert set(FREQUENCY_SIGNALS.keys()) == expected
+
+    def test_each_frequency_has_enough_keywords(self) -> None:
+        """Each frequency should have at least 9 keywords."""
+        for freq, keywords in FREQUENCY_SIGNALS.items():
+            assert len(keywords) >= 9, f"{freq} has only {len(keywords)}"
+
+    def test_all_six_phases_present(self) -> None:
+        """WAVELENGTH_PHASE_SIGNALS should cover all 6 phases."""
+        expected = {
+            Phase.RISING,
+            Phase.PEAKING,
+            Phase.WITHDRAWAL,
+            Phase.DIMINISHING,
+            Phase.BOTTOMING_OUT,
+            Phase.RESTORATION,
+        }
+        assert set(WAVELENGTH_PHASE_SIGNALS.keys()) == expected
+
+    def test_each_phase_has_enough_keywords(self) -> None:
+        """Each phase should have at least 7 keywords."""
+        for phase, keywords in WAVELENGTH_PHASE_SIGNALS.items():
+            assert len(keywords) >= 7, f"{phase} has only {len(keywords)}"
+
+    def test_all_five_modes_present(self) -> None:
+        """MODE_SIGNALS should cover all 5 modes."""
+        expected = {
+            Mode.INHABIT,
+            Mode.EXPRESS,
+            Mode.COLLABORATE,
+            Mode.INTEGRATE,
+            Mode.ABSORB,
+        }
+        assert set(MODE_SIGNALS.keys()) == expected
+
+    def test_each_mode_has_enough_keywords(self) -> None:
+        """Each mode should have at least 8 keywords."""
+        for mode, keywords in MODE_SIGNALS.items():
+            assert len(keywords) >= 8, f"{mode} has only {len(keywords)}"
+
+
+# ---- Voice Register & Confidence Signals ----
+
+
+class TestVoiceRegisterSignals:
+    """Tests for voice register and confidence signal dictionaries."""
+
+    def test_voice_register_signals_exist(self) -> None:
+        """VOICE_REGISTER_SIGNALS should be a non-empty dict."""
+        assert isinstance(VOICE_REGISTER_SIGNALS, dict)
+        assert len(VOICE_REGISTER_SIGNALS) >= 5
+
+    def test_voice_register_keys_are_valid(self) -> None:
+        """All keys should be valid VoiceRegister values."""
+        for key in VOICE_REGISTER_SIGNALS:
+            assert isinstance(key, VoiceRegister)
+
+    def test_confidence_signals_exist(self) -> None:
+        """CONFIDENCE_SIGNALS should be a non-empty dict."""
+        assert isinstance(CONFIDENCE_SIGNALS, dict)
+        assert len(CONFIDENCE_SIGNALS) >= 4
+
+    def test_confidence_keys_are_valid(self) -> None:
+        """All keys should be valid Confidence values."""
+        for key in CONFIDENCE_SIGNALS:
+            assert isinstance(key, Confidence)
+
+
+# ---- Scoring Classifier ----
+
+
+class TestScoringClassifier:
+    """Tests for the scoring-based classify mechanism."""
+
+    def test_title_match_weighted_higher(self) -> None:
+        """Title keyword matches should score higher than body."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 2
+        frag = _make_fragment(title="survival safety threat")
+        result = classifier.classify(frag, content="unrelated body text")
+        assert result.frequency.primary == Frequency.F1
+
+    def test_multiple_keywords_increase_score(self) -> None:
+        """More keyword matches should produce a classification."""
+        classifier = RuleClassifier()
+        frag = _make_fragment()
+        content = (
+            "survival safety security threat danger\n\n"
+            "shelter hunger thirst instinct primal"
+        )
+        result = classifier.classify(frag, content=content)
+        assert result.frequency.primary == Frequency.F1
+
+    def test_below_threshold_leaves_unclassified(self) -> None:
+        """A single body keyword should not trigger classification."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 5
+        frag = _make_fragment()
+        result = classifier.classify(frag, content="survival")
+        assert result.frequency.primary == Frequency.UNCLASSIFIED
+
+    def test_configurable_thresholds(self) -> None:
+        """Thresholds should be configurable per instance."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 1
+        frag = _make_fragment()
+        result = classifier.classify(frag, content="survival")
+        assert result.frequency.primary == Frequency.F1
+
+
+# ---- Secondary Frequencies ----
+
+
+class TestSecondaryFrequencies:
+    """Tests for multi-frequency tagging."""
+
+    def test_secondary_frequencies_populated(self) -> None:
+        """Fragments with mixed signals should get secondaries."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 2
+        classifier.SECONDARY_THRESHOLD = 2
+        content = "survival safety security\n\n" "power dominance control"
+        frag = _make_fragment()
+        result = classifier.classify(frag, content=content)
+        assert result.frequency.primary != Frequency.UNCLASSIFIED
+        assert len(result.frequency.secondary) >= 1
+
+    def test_no_secondaries_when_only_primary(self) -> None:
+        """No secondaries when only one frequency scores."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 2
+        classifier.SECONDARY_THRESHOLD = 2
+        frag = _make_fragment()
+        content = "survival safety security threat"
+        result = classifier.classify(frag, content=content)
+        assert result.frequency.secondary == []
+
+
+# ---- Confidence Score ----
+
+
+class TestConfidenceScore:
+    """Tests for the confidence_score() method."""
+
+    def test_confidence_score_returns_float(self) -> None:
+        """confidence_score() should return a float."""
+        classifier = RuleClassifier()
+        frag = _make_fragment()
+        score = classifier.confidence_score(frag, content="some text")
+        assert isinstance(score, float)
+
+    def test_confidence_score_range(self) -> None:
+        """confidence_score() should be between 0.0 and 1.0."""
+        classifier = RuleClassifier()
+        frag = _make_fragment()
+        score = classifier.confidence_score(frag, content="random text")
+        assert 0.0 <= score <= 1.0
+
+    def test_high_confidence_for_clear_signals(self) -> None:
+        """Strong signals across dimensions should yield high confidence."""
+        classifier = RuleClassifier()
+        content = (
+            "survival safety security threat danger shelter\n\n"
+            "emerging building growing momentum ascending\n\n"
+            "dwelling immersed inhabiting living in being with"
+        )
+        frag = _make_fragment(title="survival and safety")
+        score = classifier.confidence_score(frag, content=content)
+        assert score > 0.3
+
+    def test_low_confidence_for_no_signals(self) -> None:
+        """No matching signals should yield low confidence."""
+        classifier = RuleClassifier()
+        frag = _make_fragment()
+        score = classifier.confidence_score(frag, content="xyzzy plugh")
+        assert score < 0.1
+
+
+# ---- Word Boundary Matching ----
+
+
+class TestWordBoundaryMatching:
+    """Tests that keyword matching uses word boundaries."""
+
+    def test_power_matches_standalone(self) -> None:
+        """'power' should match as a standalone word."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 1
+        frag = _make_fragment()
+        result = classifier.classify(frag, content="raw power")
+        assert result.frequency.primary == Frequency.F3
+
+    def test_empower_does_not_match_power(self) -> None:
+        """'empower' should NOT match F3 keyword 'power'."""
+        classifier = RuleClassifier()
+        classifier.PRIMARY_THRESHOLD = 1
+        frag = _make_fragment(title="unrelated title")
+        result = classifier.classify(frag, content="empower yourself")
+        assert result.frequency.primary != Frequency.F3
+
+
+# ---- Voice Register Classification ----
+
+
+class TestVoiceRegisterClassification:
+    """Tests for voice register and confidence classification."""
+
+    def test_voice_register_detected(self) -> None:
+        """Voice register should be set from keyword signals."""
+        classifier = RuleClassifier()
+        classifier.SECONDARY_THRESHOLD = 2
+        content = (
+            "I confess I must admit this is deeply personal\n\n"
+            "I reveal my vulnerable honest truth"
+        )
+        frag = _make_fragment()
+        result = classifier.classify(frag, content=content)
+        assert result.voice.voice_register is not None
+
+    def test_confidence_detected(self) -> None:
+        """Confidence level should be set from keyword signals."""
+        classifier = RuleClassifier()
+        classifier.SECONDARY_THRESHOLD = 2
+        content = (
+            "maybe perhaps I'm wondering what if\n\n" "could be not sure possibly might"
+        )
+        frag = _make_fragment()
+        result = classifier.classify(frag, content=content)
+        assert result.voice.confidence is not None
+
+    def test_no_voice_on_ambiguous_content(self) -> None:
+        """Voice register should be None for ambiguous content."""
+        classifier = RuleClassifier()
+        frag = _make_fragment()
+        result = classifier.classify(frag, content="xyzzy plugh")
+        if result.voice is not None:
+            assert result.voice.voice_register is None

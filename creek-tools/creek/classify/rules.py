@@ -1,19 +1,27 @@
 """Rule-based classification using keyword/pattern matching.
 
-Provides a simple keyword-matching classifier that scans fragment content
+Provides a scoring-based keyword classifier that scans fragment content
 for signal words associated with APTITUDE frequencies, wavelength phases,
-and engagement modes. This is intended as a fast first-pass classifier
-before optional LLM refinement.
+engagement modes, voice registers, and confidence levels.  This is intended
+as a fast first-pass classifier before optional LLM refinement.
+
+Scoring uses positional weighting: title matches count 3x, first-paragraph
+matches count 2x, and body matches count 1x.  Word-boundary matching
+(via ``re.findall``) prevents partial-word false positives.
 """
 
 import logging
+import re
 
 from creek.models import (
+    Confidence,
     Fragment,
     Frequency,
     FrequencyClassification,
     Mode,
     Phase,
+    VoiceClassification,
+    VoiceRegister,
     WavelengthClassification,
 )
 
@@ -22,126 +30,819 @@ logger = logging.getLogger(__name__)
 # ---- Signal Dictionaries ----
 
 FREQUENCY_SIGNALS: dict[Frequency, list[str]] = {
-    Frequency.F1: ["survival", "safety", "security", "threat"],
-    Frequency.F3: ["power", "ambition", "drive", "dominance"],
-    Frequency.F5: ["achievement", "strategy", "success", "goal"],
-    Frequency.F7: ["systems", "patterns", "complexity", "integrate"],
-    Frequency.F8: ["community", "ecology", "holistic", "collective"],
+    Frequency.F1: [
+        "survival",
+        "safety",
+        "security",
+        "threat",
+        "danger",
+        "shelter",
+        "hunger",
+        "thirst",
+        "instinct",
+        "primal",
+        "basic needs",
+        "fight or flight",
+    ],
+    Frequency.F2: [
+        "belonging",
+        "ritual",
+        "tradition",
+        "ancestors",
+        "sacred",
+        "tribe",
+        "loyalty",
+        "kinship",
+        "ceremony",
+        "mystical",
+        "spirits",
+        "elders",
+    ],
+    Frequency.F3: [
+        "power",
+        "dominance",
+        "control",
+        "conquest",
+        "force",
+        "aggression",
+        "bold",
+        "fearless",
+        "warrior",
+        "rage",
+        "impulsive",
+        "rebellion",
+    ],
+    Frequency.F4: [
+        "order",
+        "discipline",
+        "rules",
+        "duty",
+        "authority",
+        "morality",
+        "righteousness",
+        "structure",
+        "hierarchy",
+        "obedience",
+        "law",
+    ],
+    Frequency.F5: [
+        "achievement",
+        "success",
+        "strategy",
+        "competition",
+        "innovation",
+        "progress",
+        "efficiency",
+        "ambition",
+        "goal",
+        "winning",
+        "profit",
+        "excellence",
+    ],
+    Frequency.F6: [
+        "community",
+        "equality",
+        "consensus",
+        "empathy",
+        "feelings",
+        "harmony",
+        "inclusion",
+        "diversity",
+        "caring",
+        "sharing",
+        "sustainability",
+        "social justice",
+    ],
+    Frequency.F7: [
+        "systems",
+        "complexity",
+        "integration",
+        "patterns",
+        "emergence",
+        "adaptive",
+        "flexibility",
+        "knowledge",
+        "synthesis",
+        "meta",
+        "perspective",
+        "paradox",
+    ],
+    Frequency.F8: [
+        "holistic",
+        "collective",
+        "ecology",
+        "global",
+        "consciousness",
+        "interconnection",
+        "transcendence",
+        "integral",
+        "planetary",
+        "evolution",
+        "awakening",
+        "wholeness",
+    ],
+    Frequency.F9: [
+        "cosmic",
+        "infinite",
+        "nondual",
+        "unity",
+        "source",
+        "dissolution",
+        "beyond",
+        "transpersonal",
+        "absolute",
+        "ineffable",
+        "primordial",
+    ],
+    Frequency.F10: [
+        "clear light",
+        "emptiness",
+        "suchness",
+        "luminosity",
+        "groundless",
+        "unborn",
+        "buddha nature",
+        "rigpa",
+        "dzogchen",
+    ],
 }
-"""Stub mapping of APTITUDE frequencies to keyword signals.
-
-Only F1, F3, F5, F7, F8 are covered in this stub. The remaining
-frequencies (F2, F4, F6, F9, F10) will be added when the full
-classification rule set is implemented in later issues.
-"""
+"""Full APTITUDE frequency keyword signals (F1-F10)."""
 
 WAVELENGTH_PHASE_SIGNALS: dict[Phase, list[str]] = {
-    Phase.RISING: ["emerging", "building", "growing", "momentum"],
-    Phase.PEAKING: ["peak", "climax", "intense", "maximum"],
-    Phase.WITHDRAWAL: ["retreating", "pulling back", "withdrawing", "receding"],
+    Phase.RISING: [
+        "emerging",
+        "building",
+        "growing",
+        "momentum",
+        "ascending",
+        "intensifying",
+        "gathering",
+        "awakening",
+        "stirring",
+        "kindling",
+    ],
+    Phase.PEAKING: [
+        "peak",
+        "climax",
+        "intense",
+        "maximum",
+        "fullness",
+        "overflow",
+        "culmination",
+        "apex",
+        "zenith",
+        "crest",
+    ],
+    Phase.WITHDRAWAL: [
+        "retreating",
+        "pulling back",
+        "withdrawing",
+        "receding",
+        "contracting",
+        "fading",
+        "letting go",
+    ],
+    Phase.DIMINISHING: [
+        "diminishing",
+        "declining",
+        "waning",
+        "subsiding",
+        "settling",
+        "calming",
+        "quieting",
+        "releasing",
+    ],
+    Phase.BOTTOMING_OUT: [
+        "bottoming",
+        "void",
+        "stillness",
+        "dormant",
+        "fallow",
+        "desolate",
+        "exhausted",
+        "depleted",
+    ],
+    Phase.RESTORATION: [
+        "restoring",
+        "renewing",
+        "recovering",
+        "regenerating",
+        "healing",
+        "replenishing",
+        "reviving",
+        "returning",
+    ],
 }
 """Mapping of wavelength phases to their keyword signals."""
 
 MODE_SIGNALS: dict[Mode, list[str]] = {
-    Mode.INHABIT: ["dwelling", "immersed", "inhabiting", "living in"],
-    Mode.EXPRESS: ["expressing", "creating", "articulating", "voicing"],
-    Mode.ABSORB: ["absorbing", "receiving", "taking in", "learning"],
+    Mode.INHABIT: [
+        "dwelling",
+        "immersed",
+        "inhabiting",
+        "living in",
+        "being with",
+        "sitting with",
+        "resting in",
+        "holding",
+        "containing",
+        "marinating",
+    ],
+    Mode.EXPRESS: [
+        "expressing",
+        "creating",
+        "articulating",
+        "voicing",
+        "manifesting",
+        "outputting",
+        "projecting",
+        "communicating",
+        "generating",
+        "producing",
+    ],
+    Mode.COLLABORATE: [
+        "collaborating",
+        "co-creating",
+        "partnering",
+        "dialoguing",
+        "engaging with",
+        "building together",
+        "sharing",
+        "mutual",
+        "reciprocal",
+    ],
+    Mode.INTEGRATE: [
+        "integrating",
+        "synthesizing",
+        "weaving",
+        "combining",
+        "reconciling",
+        "harmonizing",
+        "unifying",
+        "bridging",
+        "connecting",
+        "merging",
+    ],
+    Mode.ABSORB: [
+        "absorbing",
+        "receiving",
+        "taking in",
+        "learning",
+        "studying",
+        "digesting",
+        "processing",
+        "contemplating",
+        "reflecting",
+        "listening",
+    ],
 }
 """Mapping of engagement modes to their keyword signals."""
+
+VOICE_REGISTER_SIGNALS: dict[VoiceRegister, list[str]] = {
+    VoiceRegister.CONFESSIONAL: [
+        "confess",
+        "admit",
+        "reveal",
+        "vulnerable",
+        "honest truth",
+        "deeply",
+        "personally",
+        "shame",
+        "guilt",
+        "bare",
+    ],
+    VoiceRegister.ANALYTICAL: [
+        "analyze",
+        "examine",
+        "consider",
+        "therefore",
+        "evidence",
+        "hypothesis",
+        "framework",
+        "systematically",
+        "data",
+        "observe",
+    ],
+    VoiceRegister.PLAYFUL: [
+        "play",
+        "fun",
+        "silly",
+        "joke",
+        "laugh",
+        "whimsy",
+        "delightful",
+        "absurd",
+        "quirky",
+        "tease",
+    ],
+    VoiceRegister.PROPHETIC: [
+        "prophesy",
+        "vision",
+        "calling",
+        "destiny",
+        "must",
+        "shall",
+        "truth is",
+        "mark my words",
+        "revelation",
+    ],
+    VoiceRegister.INSTRUCTIONAL: [
+        "step",
+        "guide",
+        "how to",
+        "method",
+        "practice",
+        "technique",
+        "approach",
+        "follow",
+        "instruction",
+        "tip",
+    ],
+    VoiceRegister.RAW: [
+        "raw",
+        "unfiltered",
+        "painful",
+        "gut",
+        "visceral",
+        "real",
+        "ugly",
+        "broken",
+        "screaming",
+        "bleeding",
+    ],
+    VoiceRegister.CONVERSATIONAL: [
+        "chat",
+        "you know",
+        "anyway",
+        "honestly",
+        "right",
+        "thing is",
+        "basically",
+        "kind of",
+        "sort of",
+    ],
+}
+"""Mapping of voice registers to keyword signals."""
+
+CONFIDENCE_SIGNALS: dict[Confidence, list[str]] = {
+    Confidence.MUSING: [
+        "maybe",
+        "perhaps",
+        "wondering",
+        "what if",
+        "could be",
+        "not sure",
+        "possibly",
+        "might",
+    ],
+    Confidence.EXPLORING: [
+        "exploring",
+        "investigating",
+        "looking into",
+        "trying to understand",
+        "curious about",
+        "digging into",
+    ],
+    Confidence.FORMING: [
+        "starting to see",
+        "beginning to",
+        "it seems like",
+        "leaning toward",
+        "crystallizing",
+        "taking shape",
+    ],
+    Confidence.SETTLED: [
+        "i believe",
+        "i know",
+        "clearly",
+        "certainly",
+        "definitely",
+        "without doubt",
+        "convinced",
+    ],
+    Confidence.CONVICTION: [
+        "absolutely",
+        "undeniably",
+        "truth is",
+        "i am certain",
+        "this is",
+        "fundamental",
+        "non-negotiable",
+    ],
+}
+"""Mapping of confidence levels to keyword signals."""
+
+
+def _count_keyword_matches(text: str, keywords: list[str]) -> int:
+    """Count word-boundary keyword matches in text.
+
+    Uses ``re.findall`` with word boundaries to prevent partial-word
+    matches (e.g. 'power' won't match inside 'empower').
+
+    Args:
+        text: The text to search (should already be lowercased).
+        keywords: List of keywords to look for.
+
+    Returns:
+        Total number of keyword matches found.
+    """
+    count = 0
+    for keyword in keywords:
+        escaped = re.escape(keyword)
+        count += len(re.findall(rf"\b{escaped}\b", text, re.IGNORECASE))
+    return count
+
+
+def _split_content_sections(
+    content: str,
+) -> tuple[str, str]:
+    """Split content into first paragraph and body.
+
+    The first paragraph is everything before the first blank line
+    (``\\n\\n``).  The body is everything after.
+
+    Args:
+        content: Full content string.
+
+    Returns:
+        Tuple of (first_paragraph, body).
+    """
+    parts = content.split("\n\n", maxsplit=1)
+    first_para = parts[0]
+    body = parts[1] if len(parts) > 1 else ""
+    return first_para, body
 
 
 class RuleClassifier:
     """Keyword-based classifier for Creek fragments.
 
     Scans fragment content for signal words and updates frequency,
-    wavelength phase, and engagement mode classifications accordingly.
-    Uses simple case-insensitive substring matching.
+    wavelength phase, engagement mode, voice register, and confidence
+    classifications.  Uses word-boundary matching with positional
+    weighting (title 3x, first paragraph 2x, body 1x).
+
+    Class Attributes:
+        PRIMARY_THRESHOLD: Minimum score for primary frequency assignment.
+        SECONDARY_THRESHOLD: Minimum score for secondary frequency.
+        TITLE_WEIGHT: Score multiplier for title matches.
+        FIRST_PARA_WEIGHT: Score multiplier for first-paragraph matches.
+        BODY_WEIGHT: Score multiplier for body matches.
     """
 
-    def classify(self, fragment: Fragment, content: str = "") -> Fragment:
+    PRIMARY_THRESHOLD: int = 3
+    SECONDARY_THRESHOLD: int = 2
+    TITLE_WEIGHT: int = 3
+    FIRST_PARA_WEIGHT: int = 2
+    BODY_WEIGHT: int = 1
+
+    def classify(
+        self,
+        fragment: Fragment,
+        content: str = "",
+        title: str = "",
+    ) -> Fragment:
         """Apply keyword/pattern matching to classify a fragment.
 
-        Scans the provided content string for keywords associated with
-        each frequency, phase, and mode. The first match wins for each
-        classification dimension. The original fragment is not mutated.
+        Scans the provided content and title for keywords associated
+        with each frequency, phase, mode, voice register, and confidence
+        level.  Uses scoring with positional weighting.
 
         Args:
             fragment: The fragment to classify.
             content: The markdown body text to scan for keywords.
+            title: Optional title text (weighted 3x).  Falls back to
+                ``fragment.title`` if empty.
 
         Returns:
             A new Fragment with updated classification fields.
         """
-        content_lower = content.lower()
+        if not title:
+            title = fragment.title
 
-        frequency = self._match_frequency(content_lower)
-        phase = self._match_phase(content_lower)
-        mode = self._match_mode(content_lower)
+        first_para, body = _split_content_sections(content)
 
-        updates: dict[str, object] = {}
+        freq_scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            FREQUENCY_SIGNALS,
+        )
+        phase_scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            WAVELENGTH_PHASE_SIGNALS,
+        )
+        mode_scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            MODE_SIGNALS,
+        )
 
-        if frequency != Frequency.UNCLASSIFIED:
-            updates["frequency"] = FrequencyClassification(primary=frequency)
-            logger.info("Rule classifier matched frequency %s", frequency)
+        primary, secondaries = self._pick_primary_secondary(freq_scores)
+        phase = self._pick_phase(phase_scores)
+        mode = self._pick_mode(mode_scores)
+        voice_register = self._match_voice_register(
+            title,
+            first_para,
+            body,
+        )
+        confidence = self._match_confidence(title, first_para, body)
 
-        if phase != Phase.UNCLASSIFIED or mode != Mode.UNCLASSIFIED:
-            wl_phase = phase if phase != Phase.UNCLASSIFIED else Phase.UNCLASSIFIED
-            wl_mode = mode if mode != Mode.UNCLASSIFIED else Mode.UNCLASSIFIED
-            if phase != Phase.UNCLASSIFIED:
-                logger.info("Rule classifier matched phase %s", phase)
-            if mode != Mode.UNCLASSIFIED:
-                logger.info("Rule classifier matched mode %s", mode)
-            updates["wavelength"] = WavelengthClassification(
-                phase=wl_phase,
-                mode=wl_mode,
-            )
+        updates = self._build_updates(
+            primary,
+            secondaries,
+            phase,
+            mode,
+            voice_register,
+            confidence,
+        )
 
         if updates:
             return fragment.model_copy(update=updates)
 
         return fragment.model_copy()
 
-    def _match_frequency(self, content_lower: str) -> Frequency:
-        """Match content against frequency signal keywords.
+    def confidence_score(
+        self,
+        fragment: Fragment,
+        content: str = "",
+        title: str = "",
+    ) -> float:
+        """Return a 0.0-1.0 confidence score for rule-based classification.
+
+        Score is based on: number of matching keywords, spread across
+        classification dimensions, and gap between primary and secondary
+        frequency scores.
 
         Args:
-            content_lower: Lowercased content string to scan.
+            fragment: The fragment to evaluate.
+            content: The markdown body text to scan.
+            title: Optional title text.
 
         Returns:
-            The first matching Frequency, or UNCLASSIFIED if none match.
+            A float between 0.0 and 1.0.
         """
-        for freq, keywords in FREQUENCY_SIGNALS.items():
-            for keyword in keywords:
-                if keyword in content_lower:
-                    return freq
-        return Frequency.UNCLASSIFIED
+        if not title:
+            title = fragment.title
 
-    def _match_phase(self, content_lower: str) -> Phase:
-        """Match content against wavelength phase signal keywords.
+        first_para, body = _split_content_sections(content)
+
+        freq_scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            FREQUENCY_SIGNALS,
+        )
+        phase_scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            WAVELENGTH_PHASE_SIGNALS,
+        )
+        mode_scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            MODE_SIGNALS,
+        )
+
+        dimensions_matched = 0
+        max_freq = max(freq_scores.values()) if freq_scores else 0
+        max_phase = max(phase_scores.values()) if phase_scores else 0
+        max_mode = max(mode_scores.values()) if mode_scores else 0
+
+        if max_freq >= self.PRIMARY_THRESHOLD:
+            dimensions_matched += 1
+        if max_phase >= self.SECONDARY_THRESHOLD:
+            dimensions_matched += 1
+        if max_mode >= self.SECONDARY_THRESHOLD:
+            dimensions_matched += 1
+
+        # Gap between top two frequency scores
+        sorted_freq = sorted(freq_scores.values(), reverse=True)
+        gap = 0
+        if len(sorted_freq) >= 2:
+            gap = sorted_freq[0] - sorted_freq[1]
+
+        # Normalize components
+        total_matches = max_freq + max_phase + max_mode
+        match_score = min(total_matches / 15.0, 1.0)
+        dimension_score = dimensions_matched / 3.0
+        gap_score = min(gap / 5.0, 1.0)
+
+        return round(
+            0.4 * match_score + 0.3 * dimension_score + 0.3 * gap_score,
+            3,
+        )
+
+    def _score_signals(
+        self,
+        title: str,
+        first_para: str,
+        body: str,
+        signals: (
+            dict[Frequency, list[str]] | dict[Phase, list[str]] | dict[Mode, list[str]]
+        ),
+    ) -> dict[Frequency | Phase | Mode, int]:
+        """Score each signal category by weighted keyword matches.
 
         Args:
-            content_lower: Lowercased content string to scan.
+            title: Title text (weighted by ``TITLE_WEIGHT``).
+            first_para: First paragraph text (weighted by
+                ``FIRST_PARA_WEIGHT``).
+            body: Remaining body text (weighted by ``BODY_WEIGHT``).
+            signals: Mapping of category to keyword list.
 
         Returns:
-            The first matching Phase, or UNCLASSIFIED if none match.
+            Dictionary mapping each category to its total score.
         """
-        for phase, keywords in WAVELENGTH_PHASE_SIGNALS.items():
-            for keyword in keywords:
-                if keyword in content_lower:
-                    return phase
+        scores: dict[Frequency | Phase | Mode, int] = {}
+        for category, keywords in signals.items():
+            score = (
+                _count_keyword_matches(title, keywords) * self.TITLE_WEIGHT
+                + _count_keyword_matches(first_para, keywords) * self.FIRST_PARA_WEIGHT
+                + _count_keyword_matches(body, keywords) * self.BODY_WEIGHT
+            )
+            scores[category] = score
+        return scores
+
+    def _pick_primary_secondary(
+        self,
+        scores: dict[Frequency | Phase | Mode, int],
+    ) -> tuple[Frequency, list[Frequency]]:
+        """Pick primary and secondary frequencies from scores.
+
+        Args:
+            scores: Mapping of frequency to score.
+
+        Returns:
+            Tuple of (primary_frequency, secondary_frequencies).
+        """
+        sorted_items = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        primary = Frequency.UNCLASSIFIED
+        secondaries: list[Frequency] = []
+
+        for i, (freq, score) in enumerate(sorted_items):
+            if i == 0 and score >= self.PRIMARY_THRESHOLD:
+                primary = Frequency(freq)
+            elif score >= self.SECONDARY_THRESHOLD:
+                secondaries.append(Frequency(freq))
+
+        return primary, secondaries
+
+    def _pick_phase(
+        self,
+        scores: dict[Frequency | Phase | Mode, int],
+    ) -> Phase:
+        """Pick the highest-scoring phase if above threshold.
+
+        Args:
+            scores: Mapping of phase to score.
+
+        Returns:
+            The best Phase, or ``Phase.UNCLASSIFIED`` if none meets threshold.
+        """
+        if not scores:
+            return Phase.UNCLASSIFIED
+
+        best_key, best_score = max(scores.items(), key=lambda x: x[1])
+        if best_score >= self.SECONDARY_THRESHOLD:
+            return Phase(best_key)
         return Phase.UNCLASSIFIED
 
-    def _match_mode(self, content_lower: str) -> Mode:
-        """Match content against engagement mode signal keywords.
+    def _pick_mode(
+        self,
+        scores: dict[Frequency | Phase | Mode, int],
+    ) -> Mode:
+        """Pick the highest-scoring mode if above threshold.
 
         Args:
-            content_lower: Lowercased content string to scan.
+            scores: Mapping of mode to score.
 
         Returns:
-            The first matching Mode, or UNCLASSIFIED if none match.
+            The best Mode, or ``Mode.UNCLASSIFIED`` if none meets threshold.
         """
-        for mode, keywords in MODE_SIGNALS.items():
-            for keyword in keywords:
-                if keyword in content_lower:
-                    return mode
+        if not scores:
+            return Mode.UNCLASSIFIED
+
+        best_key, best_score = max(scores.items(), key=lambda x: x[1])
+        if best_score >= self.SECONDARY_THRESHOLD:
+            return Mode(best_key)
         return Mode.UNCLASSIFIED
+
+    def _build_updates(
+        self,
+        primary: Frequency,
+        secondaries: list[Frequency],
+        phase: Phase,
+        mode: Mode,
+        voice_register: VoiceRegister | None,
+        confidence: Confidence | None,
+    ) -> dict[str, object]:
+        """Build a dict of model fields to update on the fragment.
+
+        Only includes fields whose classification produced a result
+        above the configured thresholds.
+
+        Args:
+            primary: Primary frequency.
+            secondaries: Secondary frequencies.
+            phase: Wavelength phase.
+            mode: Engagement mode.
+            voice_register: Matched voice register (or None).
+            confidence: Matched confidence level (or None).
+
+        Returns:
+            Dictionary of field names to new values, suitable for
+            ``fragment.model_copy(update=...)``.
+        """
+        updates: dict[str, object] = {}
+
+        if primary != Frequency.UNCLASSIFIED:
+            updates["frequency"] = FrequencyClassification(
+                primary=primary,
+                secondary=secondaries,
+            )
+
+        if phase != Phase.UNCLASSIFIED or mode != Mode.UNCLASSIFIED:
+            updates["wavelength"] = WavelengthClassification(
+                phase=phase,
+                mode=mode,
+            )
+
+        if voice_register is not None or confidence is not None:
+            updates["voice"] = VoiceClassification(
+                voice_register=voice_register,
+                confidence=confidence,
+            )
+
+        return updates
+
+    def _match_voice_register(
+        self,
+        title: str,
+        first_para: str,
+        body: str,
+    ) -> VoiceRegister | None:
+        """Match content against voice register signal keywords.
+
+        Args:
+            title: Title text.
+            first_para: First paragraph text.
+            body: Remaining body text.
+
+        Returns:
+            The best matching VoiceRegister, or None if none match.
+        """
+        best: VoiceRegister | None = None
+        best_score = 0
+        for register, keywords in VOICE_REGISTER_SIGNALS.items():
+            score = (
+                _count_keyword_matches(title, keywords) * self.TITLE_WEIGHT
+                + _count_keyword_matches(first_para, keywords) * self.FIRST_PARA_WEIGHT
+                + _count_keyword_matches(body, keywords) * self.BODY_WEIGHT
+            )
+            if score > best_score:
+                best_score = score
+                best = register
+        if best_score >= self.SECONDARY_THRESHOLD:
+            return best
+        return None
+
+    def _match_confidence(
+        self,
+        title: str,
+        first_para: str,
+        body: str,
+    ) -> Confidence | None:
+        """Match content against confidence signal keywords.
+
+        Args:
+            title: Title text.
+            first_para: First paragraph text.
+            body: Remaining body text.
+
+        Returns:
+            The best matching Confidence, or None if none match.
+        """
+        best: Confidence | None = None
+        best_score = 0
+        for level, keywords in CONFIDENCE_SIGNALS.items():
+            score = (
+                _count_keyword_matches(title, keywords) * self.TITLE_WEIGHT
+                + _count_keyword_matches(first_para, keywords) * self.FIRST_PARA_WEIGHT
+                + _count_keyword_matches(body, keywords) * self.BODY_WEIGHT
+            )
+            if score > best_score:
+                best_score = score
+                best = level
+        if best_score >= self.SECONDARY_THRESHOLD:
+            return best
+        return None
