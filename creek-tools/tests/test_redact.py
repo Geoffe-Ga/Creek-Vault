@@ -680,3 +680,279 @@ class TestSecurityGuarantees:
             dumped = match.model_dump(mode="json")
             serialized = json.dumps(dumped)
             assert api_key not in serialized
+
+
+# ---------------------------------------------------------------------------
+# New Pattern Tests (Issue #13)
+# ---------------------------------------------------------------------------
+
+
+class TestNewPatterns:
+    """Tests for newly added redaction patterns."""
+
+    # -- credit_card --
+
+    def test_credit_card_visa(self) -> None:
+        """credit_card pattern should match Visa numbers."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert pattern.search("4111111111111111")
+        assert pattern.search("4111-1111-1111-1111")
+        assert pattern.search("4111 1111 1111 1111")
+
+    def test_credit_card_mastercard(self) -> None:
+        """credit_card pattern should match Mastercard numbers."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert pattern.search("5111111111111118")
+        assert pattern.search("5211-1111-1111-1111")
+
+    def test_credit_card_amex(self) -> None:
+        """credit_card pattern should match Amex numbers."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert pattern.search("371111111111114")
+        assert pattern.search("3411-111111-11111")
+
+    def test_credit_card_no_false_positive(self) -> None:
+        """credit_card should not match random numbers."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert not pattern.search("1234567890123456")
+        assert not pattern.search("1234-5678-9012")
+        assert not pattern.search("hello world")
+
+    # -- email_password_combo --
+
+    def test_email_password_combo_matches(self) -> None:
+        """email_password_combo should match email:password pairs."""
+        pattern = REDACTION_PATTERNS["email_password_combo"]
+        assert pattern.search("user@example.com:password123")
+        assert pattern.search("admin@site.org:s3cret!")
+        assert pattern.search("test+tag@domain.co:mypass")
+
+    def test_email_password_combo_no_false_positive(self) -> None:
+        """email_password_combo should not match plain emails."""
+        pattern = REDACTION_PATTERNS["email_password_combo"]
+        assert not pattern.search("user@example.com ")
+        assert not pattern.search("just some text")
+
+    # -- aws_secret_key --
+
+    def test_aws_secret_key_matches(self) -> None:
+        """aws_secret_key should match AWS secret key assignments."""
+        pattern = REDACTION_PATTERNS["aws_secret_key"]
+        fake_key = "A" * 40
+        assert pattern.search(f"aws_secret_access_key={fake_key}")
+        assert pattern.search(f"AWS_SECRET = {fake_key}")
+        assert pattern.search(f"aws_secret={fake_key}")
+
+    def test_aws_secret_key_no_false_positive(self) -> None:
+        """aws_secret_key should not match short values."""
+        pattern = REDACTION_PATTERNS["aws_secret_key"]
+        assert not pattern.search("aws_secret=short")
+        assert not pattern.search("some random text")
+
+    # -- private_key --
+
+    def test_private_key_matches(self) -> None:
+        """private_key should match PEM key headers."""
+        pattern = REDACTION_PATTERNS["private_key"]
+        assert pattern.search("-----BEGIN PRIVATE KEY-----")
+        assert pattern.search("-----BEGIN RSA PRIVATE KEY-----")
+        assert pattern.search("-----BEGIN EC PRIVATE KEY-----")
+        assert pattern.search("-----BEGIN OPENSSH PRIVATE KEY-----")
+
+    def test_private_key_no_false_positive(self) -> None:
+        """private_key should not match public key headers."""
+        pattern = REDACTION_PATTERNS["private_key"]
+        assert not pattern.search("-----BEGIN PUBLIC KEY-----")
+        assert not pattern.search("-----BEGIN CERTIFICATE-----")
+        assert not pattern.search("just some dashes -----")
+
+    # -- bearer_token --
+
+    def test_bearer_token_matches(self) -> None:
+        """bearer_token should match Authorization Bearer headers."""
+        pattern = REDACTION_PATTERNS["bearer_token"]
+        assert pattern.search("Bearer eyJhbGciOiJIUzI1NiJ9")
+        assert pattern.search("bearer abc123def456")
+        assert pattern.search("Authorization: Bearer my-token-value")
+
+    def test_bearer_token_no_false_positive(self) -> None:
+        """bearer_token should not match standalone 'Bearer' word."""
+        pattern = REDACTION_PATTERNS["bearer_token"]
+        assert not pattern.search("The bearer of bad news")
+
+    # -- env_secret --
+
+    def test_env_secret_matches(self) -> None:
+        """env_secret should match secret env var assignments."""
+        pattern = REDACTION_PATTERNS["env_secret"]
+        assert pattern.search("export SECRET_KEY=mysecretvalue")
+        assert pattern.search("API_KEY=abcdef123456")
+        assert pattern.search("TOKEN=some-token-value")
+
+    def test_env_secret_no_false_positive(self) -> None:
+        """env_secret should not match unrelated env vars."""
+        pattern = REDACTION_PATTERNS["env_secret"]
+        assert not pattern.search("export HOME=/Users/me")
+        assert not pattern.search("PATH=/usr/bin")
+
+    # -- slack_token --
+
+    def test_slack_token_matches(self) -> None:
+        """slack_token should match Slack API token formats."""
+        pattern = REDACTION_PATTERNS["slack_token"]
+        assert pattern.search("xoxb-1234567890-abcdefghij")
+        assert pattern.search("xoxp-1234567890-abcdefghij")
+        assert pattern.search("xoxs-1234567890-abcdefghij")
+
+    def test_slack_token_no_false_positive(self) -> None:
+        """slack_token should not match invalid prefixes."""
+        pattern = REDACTION_PATTERNS["slack_token"]
+        assert not pattern.search("xoxz-1234567890")
+        assert not pattern.search("xoxb-short")
+        assert not pattern.search("hello xox world")
+
+    # -- phone_number --
+
+    def test_phone_number_matches(self) -> None:
+        """phone_number should match US phone number formats."""
+        pattern = REDACTION_PATTERNS["phone_number"]
+        assert pattern.search("(555) 123-4567")
+        assert pattern.search("555-123-4567")
+        assert pattern.search("555.123.4567")
+
+    def test_phone_number_no_false_positive(self) -> None:
+        """phone_number should not match SSNs or random digits."""
+        pattern = REDACTION_PATTERNS["phone_number"]
+        assert not pattern.search("123-45-6789")
+        assert not pattern.search("12345")
+        assert not pattern.search("hello world")
+
+    # -- github_token --
+
+    def test_github_token_matches(self) -> None:
+        """github_token should match GitHub token formats."""
+        pattern = REDACTION_PATTERNS["github_token"]
+        suffix = "A" * 36
+        assert pattern.search(f"ghp_{suffix}")
+        assert pattern.search(f"gho_{suffix}")
+        assert pattern.search(f"ghs_{suffix}")
+
+    def test_github_token_no_false_positive(self) -> None:
+        """github_token should not match invalid prefixes."""
+        pattern = REDACTION_PATTERNS["github_token"]
+        assert not pattern.search("ghx_abcdefghij")
+        assert not pattern.search("ghp_short")
+        assert not pattern.search("github is great")
+
+    # -- jwt --
+
+    def test_jwt_matches(self) -> None:
+        """jwt pattern should match JSON Web Token format."""
+        pattern = REDACTION_PATTERNS["jwt"]
+        token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123def456ghi789"
+        assert pattern.search(token)
+
+    def test_jwt_no_false_positive(self) -> None:
+        """jwt should not match non-JWT strings."""
+        pattern = REDACTION_PATTERNS["jwt"]
+        assert not pattern.search("abc.def.ghi")
+        assert not pattern.search("eyJ.short.x")
+        assert not pattern.search("not a jwt at all")
+
+
+# ---------------------------------------------------------------------------
+# Pattern Metadata Tests
+# ---------------------------------------------------------------------------
+
+
+class TestPatternInfo:
+    """Tests for PatternInfo metadata."""
+
+    def test_all_patterns_have_metadata(self) -> None:
+        """Every pattern in REDACTION_PATTERNS should have metadata."""
+        from creek.redact.patterns import PATTERN_METADATA
+
+        for name in REDACTION_PATTERNS:
+            assert name in PATTERN_METADATA, f"Missing metadata: {name}"
+
+    def test_metadata_has_valid_severity(self) -> None:
+        """All pattern metadata should have valid severity levels."""
+        from creek.redact.patterns import _VALID_SEVERITIES, PATTERN_METADATA
+
+        for name, info in PATTERN_METADATA.items():
+            assert info.severity in _VALID_SEVERITIES, (
+                f"Invalid severity '{info.severity}' for {name}"
+            )
+
+    def test_metadata_has_description(self) -> None:
+        """All pattern metadata should have non-empty descriptions."""
+        from creek.redact.patterns import PATTERN_METADATA
+
+        for name, info in PATTERN_METADATA.items():
+            assert info.description, f"Empty description for {name}"
+
+    def test_metadata_has_false_positive_notes(self) -> None:
+        """All pattern metadata should have false positive notes."""
+        from creek.redact.patterns import PATTERN_METADATA
+
+        for name, info in PATTERN_METADATA.items():
+            assert info.false_positive_notes, f"Empty FP notes: {name}"
+
+    def test_pattern_count(self) -> None:
+        """Should have at least 13 patterns."""
+        from creek.redact.patterns import PATTERN_METADATA
+
+        assert len(PATTERN_METADATA) >= 13
+
+
+# ---------------------------------------------------------------------------
+# Catastrophic Backtracking Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCatastrophicBacktracking:
+    """Tests that patterns don't exhibit catastrophic backtracking."""
+
+    def test_long_input_all_patterns(self) -> None:
+        """All patterns should handle long inputs without backtracking."""
+        import time
+
+        long_input = "x" * 10_000
+        for name, pattern in REDACTION_PATTERNS.items():
+            start = time.monotonic()
+            pattern.search(long_input)
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0, f"{name} took {elapsed:.2f}s"
+
+    def test_long_input_credit_card(self) -> None:
+        """credit_card pattern should handle long digit strings."""
+        import time
+
+        pattern = REDACTION_PATTERNS["credit_card"]
+        long_input = "1234 " * 2000
+        start = time.monotonic()
+        pattern.search(long_input)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, f"credit_card took {elapsed:.2f}s"
+
+    def test_long_input_jwt(self) -> None:
+        """jwt pattern should handle long base64-like strings."""
+        import time
+
+        pattern = REDACTION_PATTERNS["jwt"]
+        long_input = "eyJ" + "a" * 10_000
+        start = time.monotonic()
+        pattern.search(long_input)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, f"jwt took {elapsed:.2f}s"
+
+    def test_long_input_phone(self) -> None:
+        """phone_number pattern should handle long digit strings."""
+        import time
+
+        pattern = REDACTION_PATTERNS["phone_number"]
+        long_input = "555-" * 2500
+        start = time.monotonic()
+        pattern.search(long_input)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, f"phone_number took {elapsed:.2f}s"
