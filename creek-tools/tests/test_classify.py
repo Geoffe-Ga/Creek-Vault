@@ -815,3 +815,91 @@ class TestScoreSignalsGeneralized:
             + classifier.CONFIDENCE_GAP_WEIGHT
         )
         assert abs(total - 1.0) < 1e-9
+
+    def test_score_signals_returns_enum_keys_for_frequency(self) -> None:
+        """_score_signals with FREQUENCY_SIGNALS returns Frequency-keyed dict."""
+        classifier = RuleClassifier()
+        scores = classifier._score_signals(
+            "survival",
+            "",
+            "",
+            FREQUENCY_SIGNALS,
+        )
+        assert all(isinstance(k, Frequency) for k in scores)
+
+    def test_score_signals_returns_enum_keys_for_phase(self) -> None:
+        """_score_signals with WAVELENGTH_PHASE_SIGNALS returns Phase-keyed dict."""
+        classifier = RuleClassifier()
+        scores = classifier._score_signals(
+            "emerging",
+            "",
+            "",
+            WAVELENGTH_PHASE_SIGNALS,
+        )
+        assert all(isinstance(k, Phase) for k in scores)
+
+    def test_score_signals_returns_enum_keys_for_mode(self) -> None:
+        """_score_signals with MODE_SIGNALS returns Mode-keyed dict."""
+        classifier = RuleClassifier()
+        scores = classifier._score_signals(
+            "dwelling",
+            "",
+            "",
+            MODE_SIGNALS,
+        )
+        assert all(isinstance(k, Mode) for k in scores)
+
+    def test_score_signals_never_empty_for_nonempty_signals(self) -> None:
+        """_score_signals always returns non-empty dict for non-empty signals."""
+        classifier = RuleClassifier()
+        for signals in (
+            FREQUENCY_SIGNALS,
+            WAVELENGTH_PHASE_SIGNALS,
+            MODE_SIGNALS,
+            VOICE_REGISTER_SIGNALS,
+            CONFIDENCE_SIGNALS,
+        ):
+            scores = classifier._score_signals("", "", "", signals)
+            assert len(scores) > 0
+
+
+class TestMatchVoiceRegisterNoDeadCode:
+    """Tests confirming _match_voice_register works without empty-dict guard."""
+
+    def test_match_voice_register_no_match_returns_none(self) -> None:
+        """_match_voice_register returns None when no keywords match."""
+        classifier = RuleClassifier()
+        result = classifier._match_voice_register("xyzzy", "", "")
+        assert result is None
+
+    def test_match_voice_register_with_match(self) -> None:
+        """_match_voice_register returns a VoiceRegister on match."""
+        classifier = RuleClassifier()
+        classifier.SECONDARY_THRESHOLD = 1
+        result = classifier._match_voice_register(
+            "confess admit",
+            "",
+            "",
+        )
+        assert isinstance(result, VoiceRegister)
+
+
+class TestMatchConfidenceNoDeadCode:
+    """Tests confirming _match_confidence works without empty-dict guard."""
+
+    def test_match_confidence_no_match_returns_none(self) -> None:
+        """_match_confidence returns None when no keywords match."""
+        classifier = RuleClassifier()
+        result = classifier._match_confidence("xyzzy", "", "")
+        assert result is None
+
+    def test_match_confidence_with_match(self) -> None:
+        """_match_confidence returns a Confidence value on match."""
+        classifier = RuleClassifier()
+        classifier.SECONDARY_THRESHOLD = 1
+        result = classifier._match_confidence(
+            "maybe perhaps",
+            "",
+            "",
+        )
+        assert isinstance(result, Confidence)
