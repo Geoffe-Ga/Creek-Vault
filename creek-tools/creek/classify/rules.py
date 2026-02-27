@@ -12,6 +12,7 @@ matches count 2x, and body matches count 1x.  Word-boundary matching
 
 import logging
 import re
+from typing import TypeVar
 
 from creek.models import (
     Confidence,
@@ -26,6 +27,8 @@ from creek.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+_EnumT = TypeVar("_EnumT")
 
 # ---- Signal Dictionaries ----
 
@@ -487,6 +490,9 @@ class RuleClassifier:
         TITLE_WEIGHT: Score multiplier for title matches.
         FIRST_PARA_WEIGHT: Score multiplier for first-paragraph matches.
         BODY_WEIGHT: Score multiplier for body matches.
+        CONFIDENCE_MATCH_WEIGHT: Weight for match component in confidence score.
+        CONFIDENCE_DIMENSION_WEIGHT: Weight for dimension component.
+        CONFIDENCE_GAP_WEIGHT: Weight for gap component.
     """
 
     PRIMARY_THRESHOLD: int = 3
@@ -494,6 +500,9 @@ class RuleClassifier:
     TITLE_WEIGHT: int = 3
     FIRST_PARA_WEIGHT: int = 2
     BODY_WEIGHT: int = 1
+    CONFIDENCE_MATCH_WEIGHT: float = 0.4
+    CONFIDENCE_DIMENSION_WEIGHT: float = 0.3
+    CONFIDENCE_GAP_WEIGHT: float = 0.3
 
     def classify(
         self,
@@ -633,7 +642,9 @@ class RuleClassifier:
         gap_score = min(gap / 5.0, 1.0)
 
         return round(
-            0.4 * match_score + 0.3 * dimension_score + 0.3 * gap_score,
+            self.CONFIDENCE_MATCH_WEIGHT * match_score
+            + self.CONFIDENCE_DIMENSION_WEIGHT * dimension_score
+            + self.CONFIDENCE_GAP_WEIGHT * gap_score,
             3,
         )
 
@@ -642,10 +653,8 @@ class RuleClassifier:
         title: str,
         first_para: str,
         body: str,
-        signals: (
-            dict[Frequency, list[str]] | dict[Phase, list[str]] | dict[Mode, list[str]]
-        ),
-    ) -> dict[Frequency | Phase | Mode, int]:
+        signals: dict[_EnumT, list[str]],
+    ) -> dict[_EnumT, int]:
         """Score each signal category by weighted keyword matches.
 
         Args:
@@ -658,7 +667,7 @@ class RuleClassifier:
         Returns:
             Dictionary mapping each category to its total score.
         """
-        scores: dict[Frequency | Phase | Mode, int] = {}
+        scores: dict[_EnumT, int] = {}
         for category, keywords in signals.items():
             score = (
                 _count_keyword_matches(title, keywords) * self.TITLE_WEIGHT
@@ -670,7 +679,7 @@ class RuleClassifier:
 
     def _pick_primary_secondary(
         self,
-        scores: dict[Frequency | Phase | Mode, int],
+        scores: dict[Frequency, int],
     ) -> tuple[Frequency, list[Frequency]]:
         """Pick primary and secondary frequencies from scores.
 
@@ -691,15 +700,15 @@ class RuleClassifier:
 
         for i, (freq, score) in enumerate(sorted_items):
             if i == 0 and score >= self.PRIMARY_THRESHOLD:
-                primary = Frequency(freq)
+                primary = freq
             elif score >= self.SECONDARY_THRESHOLD:
-                secondaries.append(Frequency(freq))
+                secondaries.append(freq)
 
         return primary, secondaries
 
     def _pick_phase(
         self,
-        scores: dict[Frequency | Phase | Mode, int],
+        scores: dict[Phase, int],
     ) -> Phase:
         """Pick the highest-scoring phase if above threshold.
 
@@ -714,12 +723,12 @@ class RuleClassifier:
 
         best_key, best_score = max(scores.items(), key=lambda x: x[1])
         if best_score >= self.SECONDARY_THRESHOLD:
-            return Phase(best_key)
+            return best_key
         return Phase.UNCLASSIFIED
 
     def _pick_mode(
         self,
-        scores: dict[Frequency | Phase | Mode, int],
+        scores: dict[Mode, int],
     ) -> Mode:
         """Pick the highest-scoring mode if above threshold.
 
@@ -734,7 +743,7 @@ class RuleClassifier:
 
         best_key, best_score = max(scores.items(), key=lambda x: x[1])
         if best_score >= self.SECONDARY_THRESHOLD:
-            return Mode(best_key)
+            return best_key
         return Mode.UNCLASSIFIED
 
     def _build_updates(
@@ -801,19 +810,17 @@ class RuleClassifier:
         Returns:
             The best matching VoiceRegister, or None if none match.
         """
-        best: VoiceRegister | None = None
-        best_score = 0
-        for register, keywords in VOICE_REGISTER_SIGNALS.items():
-            score = (
-                _count_keyword_matches(title, keywords) * self.TITLE_WEIGHT
-                + _count_keyword_matches(first_para, keywords) * self.FIRST_PARA_WEIGHT
-                + _count_keyword_matches(body, keywords) * self.BODY_WEIGHT
-            )
-            if score > best_score:
-                best_score = score
-                best = register
+        scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            VOICE_REGISTER_SIGNALS,
+        )
+        if not scores:
+            return None
+        best_key, best_score = max(scores.items(), key=lambda x: x[1])
         if best_score >= self.SECONDARY_THRESHOLD:
-            return best
+            return best_key
         return None
 
     def _match_confidence(
@@ -832,17 +839,15 @@ class RuleClassifier:
         Returns:
             The best matching Confidence, or None if none match.
         """
-        best: Confidence | None = None
-        best_score = 0
-        for level, keywords in CONFIDENCE_SIGNALS.items():
-            score = (
-                _count_keyword_matches(title, keywords) * self.TITLE_WEIGHT
-                + _count_keyword_matches(first_para, keywords) * self.FIRST_PARA_WEIGHT
-                + _count_keyword_matches(body, keywords) * self.BODY_WEIGHT
-            )
-            if score > best_score:
-                best_score = score
-                best = level
+        scores = self._score_signals(
+            title,
+            first_para,
+            body,
+            CONFIDENCE_SIGNALS,
+        )
+        if not scores:
+            return None
+        best_key, best_score = max(scores.items(), key=lambda x: x[1])
         if best_score >= self.SECONDARY_THRESHOLD:
-            return best
+            return best_key
         return None
