@@ -110,9 +110,9 @@ def test_ontology_file_moved() -> None:
     assert target.is_file(), "Ontology prompt not found in 00-Creek-Meta/Ontology/"
 
     old_location = REPO_ROOT / "scripts" / "Ontology" / "creek_ontology_agent_prompt.md"
-    assert (
-        not old_location.exists()
-    ), "Ontology prompt still exists at old location scripts/Ontology/"
+    assert not old_location.exists(), (
+        "Ontology prompt still exists at old location scripts/Ontology/"
+    )
 
 
 def test_obsidian_directory_exists() -> None:
