@@ -317,19 +317,28 @@ class FragmentationEngine:
     ) -> bool:
         """Check if a fragment can extend the current group.
 
+        A fragment can extend when it is short, shares the same source,
+        and falls within the configured time window of the last fragment.
+
         Args:
             group: Current accumulator of short fragments.
             frag: Candidate fragment.
 
         Returns:
-            True if the fragment is short and shares the source.
+            True if the fragment is short, same source, and within time window.
         """
         if not group:
             return _word_count(frag.content) < self.config.min_words
 
+        time_delta = abs(
+            (frag.timestamp - group[-1].timestamp).total_seconds(),
+        )
+        max_gap = self.config.group_time_window_minutes * 60
+
         return (
             frag.source_path == group[0].source_path
             and _word_count(frag.content) < self.config.min_words
+            and time_delta <= max_gap
         )
 
     def _flush_group(

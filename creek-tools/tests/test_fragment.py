@@ -204,6 +204,20 @@ class TestGrouping:
         ]
         assert engine.should_group(frags) is False
 
+    def test_should_not_group_outside_time_window(self) -> None:
+        """Fragments outside time window should not be grouped."""
+        engine = FragmentationEngine(
+            FragmentationConfig(min_words=50, group_time_window_minutes=5),
+        )
+        t1 = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+        t2 = datetime(2025, 1, 1, 13, 0, tzinfo=UTC)  # 1 hour apart
+        frags = [
+            _make_parsed(content="Short.", source_path="a.md", timestamp=t1),
+            _make_parsed(content="Short.", source_path="a.md", timestamp=t2),
+        ]
+        result = engine.fragment(frags)
+        assert len(result) == 2  # not grouped
+
     def test_group_merges_content(self) -> None:
         """Grouped fragments should have combined content."""
         engine = FragmentationEngine()
