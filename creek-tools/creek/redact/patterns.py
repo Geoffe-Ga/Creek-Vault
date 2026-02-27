@@ -29,6 +29,19 @@ class PatternInfo:
     severity: str
     false_positive_notes: str
 
+    def __post_init__(self) -> None:
+        """Validate severity is one of the allowed values.
+
+        Raises:
+            ValueError: If severity is not in ``_VALID_SEVERITIES``.
+        """
+        if self.severity not in _VALID_SEVERITIES:
+            msg = (
+                f"Invalid severity {self.severity!r}; "
+                f"must be one of {sorted(_VALID_SEVERITIES)}"
+            )
+            raise ValueError(msg)
+
 
 _VALID_SEVERITIES: frozenset[str] = frozenset({"critical", "high", "medium", "low"})
 
@@ -76,7 +89,7 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
             r"|"
             r"3[47]\d{2}[-\s]?\d{6}[-\s]?\d{5}"
             r"|"
-            r"6011[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}"
+            r"6(?:011|5\d{2}|4[4-9]\d)[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}"
             r")\b",
         ),
         description=("Credit card numbers: Visa, Mastercard, Amex, Discover."),
