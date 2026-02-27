@@ -126,9 +126,21 @@ class FragmentationEngine:
             List of child fragments (or single-element list if no split).
         """
         pattern = _heading_pattern(self.config.section_split_level)
+        level = self.config.section_split_level
+        prefix = "#" * level + " "
         parts = pattern.split(fragment.content)
-        # re.split keeps text between matches; filter empties
-        sections = [p.strip() for p in parts if p.strip()]
+        # re.split keeps text between matches; filter empties.
+        # The first element is text before the first heading (no marker).
+        # Subsequent elements had their heading marker consumed by split,
+        # so we re-prepend it.
+        sections: list[str] = []
+        for idx, part in enumerate(parts):
+            stripped = part.strip()
+            if not stripped:
+                continue
+            if idx > 0:
+                stripped = prefix + stripped
+            sections.append(stripped)
 
         if len(sections) <= 1:
             return [fragment]
