@@ -12,6 +12,8 @@ in :data:`PATTERN_METADATA` for reporting and documentation.
 import re
 from dataclasses import dataclass
 
+_VALID_SEVERITIES: frozenset[str] = frozenset({"critical", "high", "medium", "low"})
+
 
 @dataclass(frozen=True)
 class PatternInfo:
@@ -42,8 +44,6 @@ class PatternInfo:
             )
             raise ValueError(msg)
 
-
-_VALID_SEVERITIES: frozenset[str] = frozenset({"critical", "high", "medium", "low"})
 
 PATTERN_METADATA: dict[str, PatternInfo] = {
     "api_key": PatternInfo(
