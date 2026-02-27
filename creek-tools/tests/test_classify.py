@@ -772,3 +772,46 @@ class TestVoiceRegisterClassification:
         result = classifier.classify(frag, content="xyzzy plugh")
         if result.voice is not None:
             assert result.voice.voice_register is None
+
+
+class TestScoreSignalsGeneralized:
+    """Tests for generalized _score_signals accepting any enum key type."""
+
+    def test_score_signals_with_voice_register(self) -> None:
+        """_score_signals should work with VoiceRegister signal dicts."""
+        classifier = RuleClassifier()
+        scores = classifier._score_signals(
+            "confess admit reveal",
+            "",
+            "",
+            VOICE_REGISTER_SIGNALS,
+        )
+        assert isinstance(scores, dict)
+        assert VoiceRegister.CONFESSIONAL in scores
+        assert scores[VoiceRegister.CONFESSIONAL] > 0
+
+    def test_score_signals_with_confidence(self) -> None:
+        """_score_signals should work with Confidence signal dicts."""
+        classifier = RuleClassifier()
+        scores = classifier._score_signals(
+            "maybe perhaps wondering",
+            "",
+            "",
+            CONFIDENCE_SIGNALS,
+        )
+        assert isinstance(scores, dict)
+        assert Confidence.MUSING in scores
+        assert scores[Confidence.MUSING] > 0
+
+    def test_confidence_score_weights_are_class_constants(self) -> None:
+        """Confidence score weights should be configurable class constants."""
+        classifier = RuleClassifier()
+        assert hasattr(classifier, "CONFIDENCE_MATCH_WEIGHT")
+        assert hasattr(classifier, "CONFIDENCE_DIMENSION_WEIGHT")
+        assert hasattr(classifier, "CONFIDENCE_GAP_WEIGHT")
+        total = (
+            classifier.CONFIDENCE_MATCH_WEIGHT
+            + classifier.CONFIDENCE_DIMENSION_WEIGHT
+            + classifier.CONFIDENCE_GAP_WEIGHT
+        )
+        assert abs(total - 1.0) < 1e-9
