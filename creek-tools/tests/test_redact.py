@@ -718,6 +718,26 @@ class TestNewPatterns:
         assert not pattern.search("1234-5678-9012")
         assert not pattern.search("hello world")
 
+    def test_credit_card_discover_65xx(self) -> None:
+        """credit_card pattern should match Discover 65xx prefix."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert pattern.search("6500 1234 5678 9012")
+
+    def test_credit_card_discover_644(self) -> None:
+        """credit_card pattern should match Discover 644 prefix."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert pattern.search("6440 1234 5678 9012")
+
+    def test_credit_card_discover_649(self) -> None:
+        """credit_card pattern should match Discover 649 prefix."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert pattern.search("6490 1234 5678 9012")
+
+    def test_credit_card_discover_643_no_match(self) -> None:
+        """credit_card pattern should NOT match 643 prefix."""
+        pattern = REDACTION_PATTERNS["credit_card"]
+        assert not pattern.search("6430 1234 5678 9012")
+
     # -- email_password_combo --
 
     def test_email_password_combo_matches(self) -> None:
@@ -903,6 +923,18 @@ class TestPatternInfo:
         from creek.redact.patterns import PATTERN_METADATA
 
         assert len(PATTERN_METADATA) >= 13
+
+    def test_invalid_severity_raises_value_error(self) -> None:
+        """PatternInfo with invalid severity should raise ValueError."""
+        from creek.redact.patterns import PatternInfo
+
+        with pytest.raises(ValueError, match="severity"):
+            PatternInfo(
+                pattern=re.compile(r"test"),
+                description="test",
+                severity="invalid",
+                false_positive_notes="test",
+            )
 
 
 # ---------------------------------------------------------------------------
