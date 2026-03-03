@@ -12,6 +12,7 @@ matches count 2x, and body matches count 1x.  Word-boundary matching
 
 import logging
 import re
+from enum import Enum
 from typing import TypeVar
 
 from creek.models import (
@@ -28,7 +29,7 @@ from creek.models import (
 
 logger = logging.getLogger(__name__)
 
-_EnumT = TypeVar("_EnumT")
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
 # ---- Signal Dictionaries ----
 
@@ -816,8 +817,6 @@ class RuleClassifier:
             body,
             VOICE_REGISTER_SIGNALS,
         )
-        if not scores:
-            return None
         best_key, best_score = max(scores.items(), key=lambda x: x[1])
         if best_score >= self.SECONDARY_THRESHOLD:
             return best_key
@@ -845,8 +844,6 @@ class RuleClassifier:
             body,
             CONFIDENCE_SIGNALS,
         )
-        if not scores:
-            return None
         best_key, best_score = max(scores.items(), key=lambda x: x[1])
         if best_score >= self.SECONDARY_THRESHOLD:
             return best_key
