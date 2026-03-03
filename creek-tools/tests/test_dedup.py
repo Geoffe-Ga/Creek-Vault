@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from creek.clean.dedup import DeduplicationResult, Deduplicator
 from creek.ingest.base import generate_fragment_id
+from creek.models import Fragment, FragmentSource
 
 # ---------------------------------------------------------------------------
 # DeduplicationResult model
@@ -458,3 +459,92 @@ class TestFragmentIdGeneration:
         dedup.register(source="a.json", timestamp=ts, content="World")
         # Check that both are stored (neither is duplicate of the other)
         assert dedup.size == 2
+
+
+# ---------------------------------------------------------------------------
+# Integration: Deduplicator with real pipeline types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestDeduplicatorIntegration:
+    """Integration test: Deduplicator with Fragment models from the pipeline."""
+
+    def test_dedup_with_fragment_model(self) -> None:
+        """Deduplicator should detect duplicates using Fragment model fields."""
+        dedup = Deduplicator()
+        ts = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
+        source_file = "notes/journal.md"
+        content = "Today I reflected on the nature of creativity."
+
+        fragment = Fragment(
+            title="Journal Entry",
+            source=FragmentSource(
+                platform="journal",
+                original_file=source_file,
+            ),
+            created=ts,
+        )
+
+        # Register using fields from the Fragment model
+        source_key = fragment.source.original_file or fragment.source.platform
+        first = dedup.register(
+            source=source_key,
+            timestamp=fragment.created,
+            content=content,
+        )
+        assert first.is_duplicate is False
+
+        # Same fragment re-ingested should be exact duplicate
+        second = dedup.register(
+            source=source_key,
+            timestamp=fragment.created,
+            content=content,
+        )
+        assert second.is_duplicate is True
+        assert second.match_type == "exact"
+
+        # Fragment ID should match canonical function
+        expected_id = generate_fragment_id(source_file, ts, content)
+        assert second.matched_fragment_id == expected_id
+
+    def test_dedup_normalized_across_sources(self) -> None:
+        """Normalized dedup catches same content from different sources."""
+        dedup = Deduplicator()
+        ts = datetime(2025, 6, 15, tzinfo=UTC)
+        content_original = "The key insight is that patterns repeat."
+
+        frag_discord = Fragment(
+            title="Discord message",
+            source=FragmentSource(
+                platform="discord",
+                original_file="discord/general.json",
+            ),
+            created=ts,
+        )
+        frag_journal = Fragment(
+            title="Journal note",
+            source=FragmentSource(
+                platform="journal",
+                original_file="notes/journal.md",
+            ),
+            created=ts,
+        )
+
+        discord_key = frag_discord.source.original_file or frag_discord.source.platform
+        journal_key = frag_journal.source.original_file or frag_journal.source.platform
+
+        dedup.register(
+            source=discord_key,
+            timestamp=frag_discord.created,
+            content=content_original,
+        )
+
+        # Same content with minor formatting differences from another source
+        result = dedup.register(
+            source=journal_key,
+            timestamp=frag_journal.created,
+            content="  The Key Insight Is That Patterns Repeat!  ",
+        )
+        assert result.is_duplicate is True
+        assert result.match_type == "normalized"

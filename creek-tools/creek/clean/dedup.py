@@ -147,8 +147,8 @@ class Deduplicator:
     ) -> DeduplicationResult:
         """Check for duplicates and register the fragment if new.
 
-        Computes both the exact and normalized hashes. If a duplicate is
-        found, returns the match information without re-registering. If
+        Computes both the exact and normalized hashes once. If a duplicate
+        is found, returns the match information without re-registering. If
         the fragment is new, adds it to both indexes.
 
         Args:
@@ -160,14 +160,14 @@ class Deduplicator:
             A :class:`DeduplicationResult` indicating whether the fragment
             is a duplicate and, if so, what kind of match was found.
         """
-        result = self._lookup(source, timestamp, content)
+        exact_hash = _compute_exact_hash(source, timestamp, content)
+        normalized_hash = _compute_normalized_hash(content)
+
+        result = self._check_hashes(exact_hash, normalized_hash)
         if result.is_duplicate:
             return result
 
-        exact_hash = _compute_exact_hash(source, timestamp, content)
-        normalized_hash = _compute_normalized_hash(content)
         fragment_id = generate_fragment_id(source, timestamp, content)
-
         self._exact_index[exact_hash] = fragment_id
         self._normalized_index[normalized_hash] = fragment_id
 
@@ -193,33 +193,32 @@ class Deduplicator:
             A :class:`DeduplicationResult` indicating whether the fragment
             would be a duplicate if registered.
         """
-        return self._lookup(source, timestamp, content)
+        exact_hash = _compute_exact_hash(source, timestamp, content)
+        normalized_hash = _compute_normalized_hash(content)
+        return self._check_hashes(exact_hash, normalized_hash)
 
     def clear(self) -> None:
         """Remove all registered fragments from the registry."""
         self._exact_index.clear()
         self._normalized_index.clear()
 
-    def _lookup(
+    def _check_hashes(
         self,
-        source: str,
-        timestamp: datetime,
-        content: str,
+        exact_hash: str,
+        normalized_hash: str,
     ) -> DeduplicationResult:
-        """Perform the dual-hash lookup for duplicates.
+        """Check pre-computed hashes against the indexes.
 
         Checks the exact index first (higher specificity), then falls
         back to the normalized index.
 
         Args:
-            source: The source identifier.
-            timestamp: The fragment timestamp.
-            content: The raw fragment text.
+            exact_hash: Pre-computed exact SHA-256 hash.
+            normalized_hash: Pre-computed normalized content hash.
 
         Returns:
             A :class:`DeduplicationResult` with the match outcome.
         """
-        exact_hash = _compute_exact_hash(source, timestamp, content)
         if exact_hash in self._exact_index:
             return DeduplicationResult(
                 is_duplicate=True,
@@ -227,7 +226,6 @@ class Deduplicator:
                 matched_fragment_id=self._exact_index[exact_hash],
             )
 
-        normalized_hash = _compute_normalized_hash(content)
         if normalized_hash in self._normalized_index:
             return DeduplicationResult(
                 is_duplicate=True,
