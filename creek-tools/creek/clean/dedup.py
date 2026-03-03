@@ -18,12 +18,15 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from creek.ingest.base import generate_fragment_id
+
 
 def _compute_exact_hash(source: str, timestamp: datetime, content: str) -> str:
     """Compute a deterministic SHA-256 hash from source, timestamp, and content.
 
-    Mirrors the ID generation logic in ``creek.ingest.base.generate_fragment_id``
-    to ensure consistency across the pipeline.
+    Uses the same hash-input format as
+    :func:`creek.ingest.base.generate_fragment_id` to ensure consistency
+    across the pipeline.
 
     Args:
         source: The source identifier (e.g., file path).
@@ -89,21 +92,6 @@ def _strip_punctuation(text: str) -> str:
         String with all punctuation characters removed.
     """
     return "".join(ch for ch in text if not unicodedata.category(ch).startswith("P"))
-
-
-def _generate_fragment_id(exact_hash: str) -> str:
-    """Generate a deterministic fragment ID from an exact hash.
-
-    Takes the first 12 characters of the hex digest and prefixes
-    with ``frag-``, matching the convention in ``creek.ingest.base``.
-
-    Args:
-        exact_hash: Full hex-encoded SHA-256 digest.
-
-    Returns:
-        A fragment ID string in the format ``frag-XXXXXXXXXXXX``.
-    """
-    return f"frag-{exact_hash[:12]}"
 
 
 class DeduplicationResult(BaseModel):
@@ -178,7 +166,7 @@ class Deduplicator:
 
         exact_hash = _compute_exact_hash(source, timestamp, content)
         normalized_hash = _compute_normalized_hash(content)
-        fragment_id = _generate_fragment_id(exact_hash)
+        fragment_id = generate_fragment_id(source, timestamp, content)
 
         self._exact_index[exact_hash] = fragment_id
         self._normalized_index[normalized_hash] = fragment_id

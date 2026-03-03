@@ -16,6 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from creek.clean.dedup import DeduplicationResult, Deduplicator
+from creek.ingest.base import generate_fragment_id
 
 # ---------------------------------------------------------------------------
 # DeduplicationResult model
@@ -439,6 +440,15 @@ class TestFragmentIdGeneration:
         result = dedup.register(source="a.json", timestamp=ts, content="Hello")
         assert result.matched_fragment_id is not None
         assert result.matched_fragment_id.startswith("frag-")
+
+    def test_id_matches_canonical_function(self) -> None:
+        """Fragment IDs should match the canonical generate_fragment_id."""
+        dedup = Deduplicator()
+        ts = datetime(2025, 1, 1, tzinfo=UTC)
+        dedup.register(source="a.json", timestamp=ts, content="Hello")
+        result = dedup.register(source="a.json", timestamp=ts, content="Hello")
+        expected_id = generate_fragment_id("a.json", ts, "Hello")
+        assert result.matched_fragment_id == expected_id
 
     def test_different_inputs_different_ids(self) -> None:
         """Different inputs should produce different fragment IDs."""
