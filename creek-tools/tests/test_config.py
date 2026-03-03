@@ -6,15 +6,24 @@ import pytest
 import yaml
 
 from creek.config import (
+    ChatbotCleaningConfig,
     ClassificationConfig,
+    CleaningConfig,
     CreekConfig,
+    DeduplicationConfig,
+    DiscordCleaningConfig,
     EmbeddingsConfig,
+    GoogleDriveCleaningConfig,
     GoogleDriveConfig,
+    HygieneConfig,
     LinkingConfig,
     LLMConfig,
+    MarkdownCleaningConfig,
     OCRConfig,
+    QualityConfig,
     RedactionConfig,
     SourcePaths,
+    ValidationConfig,
     generate_default_config,
     load_config,
 )
@@ -161,6 +170,202 @@ class TestSourcePaths:
 
 
 # ---------------------------------------------------------------------------
+# Cleaning configuration models
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordCleaningConfig:
+    """Tests for DiscordCleaningConfig model."""
+
+    def test_defaults(self) -> None:
+        """DiscordCleaningConfig should have sensible defaults."""
+        cfg = DiscordCleaningConfig()
+        assert cfg.skip_bot_messages is True
+        assert cfg.skip_single_emoji is True
+        assert cfg.skip_commands is True
+        assert cfg.min_message_length == 3
+        assert cfg.include_others_as_context is False
+
+    def test_custom_values(self) -> None:
+        """DiscordCleaningConfig should accept custom values."""
+        cfg = DiscordCleaningConfig(
+            skip_bot_messages=False,
+            min_message_length=10,
+            include_others_as_context=True,
+        )
+        assert cfg.skip_bot_messages is False
+        assert cfg.min_message_length == 10
+        assert cfg.include_others_as_context is True
+
+
+class TestChatbotCleaningConfig:
+    """Tests for ChatbotCleaningConfig model."""
+
+    def test_defaults(self) -> None:
+        """ChatbotCleaningConfig should have sensible defaults."""
+        cfg = ChatbotCleaningConfig()
+        assert cfg.skip_system_prompts is True
+        assert cfg.skip_tool_outputs is True
+        assert cfg.collapse_regenerations is True
+        assert cfg.min_turn_length == 5
+
+    def test_custom_values(self) -> None:
+        """ChatbotCleaningConfig should accept custom values."""
+        cfg = ChatbotCleaningConfig(
+            skip_system_prompts=False,
+            collapse_regenerations=False,
+            min_turn_length=20,
+        )
+        assert cfg.skip_system_prompts is False
+        assert cfg.collapse_regenerations is False
+        assert cfg.min_turn_length == 20
+
+
+class TestMarkdownCleaningConfig:
+    """Tests for MarkdownCleaningConfig model."""
+
+    def test_defaults(self) -> None:
+        """MarkdownCleaningConfig should have sensible defaults."""
+        cfg = MarkdownCleaningConfig()
+        assert cfg.skip_empty_files is True
+        assert cfg.min_body_length == 50
+
+    def test_custom_values(self) -> None:
+        """MarkdownCleaningConfig should accept custom values."""
+        cfg = MarkdownCleaningConfig(skip_empty_files=False, min_body_length=100)
+        assert cfg.skip_empty_files is False
+        assert cfg.min_body_length == 100
+
+
+class TestGoogleDriveCleaningConfig:
+    """Tests for GoogleDriveCleaningConfig model."""
+
+    def test_defaults(self) -> None:
+        """GoogleDriveCleaningConfig should have sensible defaults."""
+        cfg = GoogleDriveCleaningConfig()
+        assert cfg.skip_copy_of_duplicates is True
+        assert cfg.skip_empty_documents is True
+        assert cfg.max_collaborator_ratio == 0.5
+
+    def test_custom_values(self) -> None:
+        """GoogleDriveCleaningConfig should accept custom values."""
+        cfg = GoogleDriveCleaningConfig(
+            skip_copy_of_duplicates=False,
+            max_collaborator_ratio=0.8,
+        )
+        assert cfg.skip_copy_of_duplicates is False
+        assert cfg.max_collaborator_ratio == 0.8
+
+
+class TestValidationConfig:
+    """Tests for ValidationConfig model."""
+
+    def test_defaults(self) -> None:
+        """ValidationConfig should have sensible defaults."""
+        cfg = ValidationConfig()
+        assert cfg.min_content_chars == 10
+        assert cfg.min_content_words == 3
+        assert cfg.max_stop_word_ratio == 0.8
+        assert cfg.require_timestamp is False
+        assert cfg.require_source_platform is True
+
+    def test_custom_values(self) -> None:
+        """ValidationConfig should accept custom values."""
+        cfg = ValidationConfig(
+            min_content_chars=50,
+            min_content_words=10,
+            max_stop_word_ratio=0.6,
+            require_timestamp=True,
+        )
+        assert cfg.min_content_chars == 50
+        assert cfg.min_content_words == 10
+        assert cfg.max_stop_word_ratio == 0.6
+        assert cfg.require_timestamp is True
+
+
+class TestQualityConfig:
+    """Tests for QualityConfig model."""
+
+    def test_defaults(self) -> None:
+        """QualityConfig should have sensible defaults."""
+        cfg = QualityConfig()
+        assert cfg.auto_accept_threshold == 0.9
+        assert cfg.auto_skip_threshold == 0.1
+
+    def test_custom_values(self) -> None:
+        """QualityConfig should accept custom values."""
+        cfg = QualityConfig(auto_accept_threshold=0.95, auto_skip_threshold=0.05)
+        assert cfg.auto_accept_threshold == 0.95
+        assert cfg.auto_skip_threshold == 0.05
+
+
+class TestDeduplicationConfig:
+    """Tests for DeduplicationConfig model."""
+
+    def test_defaults(self) -> None:
+        """DeduplicationConfig should have sensible defaults."""
+        cfg = DeduplicationConfig()
+        assert cfg.exact_match is True
+        assert cfg.normalized_match is True
+        assert cfg.embedding_similarity is False
+        assert cfg.similarity_threshold == 0.95
+
+    def test_custom_values(self) -> None:
+        """DeduplicationConfig should accept custom values."""
+        cfg = DeduplicationConfig(
+            exact_match=False,
+            embedding_similarity=True,
+            similarity_threshold=0.85,
+        )
+        assert cfg.exact_match is False
+        assert cfg.embedding_similarity is True
+        assert cfg.similarity_threshold == 0.85
+
+
+class TestHygieneConfig:
+    """Tests for HygieneConfig model."""
+
+    def test_defaults(self) -> None:
+        """HygieneConfig should have sensible defaults."""
+        cfg = HygieneConfig()
+        assert cfg.orphan_days == 30
+        assert cfg.review_queue_stale_days == 14
+
+    def test_custom_values(self) -> None:
+        """HygieneConfig should accept custom values."""
+        cfg = HygieneConfig(orphan_days=60, review_queue_stale_days=7)
+        assert cfg.orphan_days == 60
+        assert cfg.review_queue_stale_days == 7
+
+
+class TestCleaningConfig:
+    """Tests for CleaningConfig top-level cleaning model."""
+
+    def test_defaults(self) -> None:
+        """CleaningConfig should have all sub-configs with defaults."""
+        cfg = CleaningConfig()
+        assert isinstance(cfg.discord, DiscordCleaningConfig)
+        assert isinstance(cfg.chatbot, ChatbotCleaningConfig)
+        assert isinstance(cfg.markdown, MarkdownCleaningConfig)
+        assert isinstance(cfg.google_drive, GoogleDriveCleaningConfig)
+        assert isinstance(cfg.validation, ValidationConfig)
+        assert isinstance(cfg.quality, QualityConfig)
+        assert isinstance(cfg.deduplication, DeduplicationConfig)
+        assert isinstance(cfg.hygiene, HygieneConfig)
+
+    def test_partial_override(self) -> None:
+        """CleaningConfig should allow partial sub-config overrides."""
+        cfg = CleaningConfig(
+            discord=DiscordCleaningConfig(skip_bot_messages=False),
+            quality=QualityConfig(auto_accept_threshold=0.8),
+        )
+        assert cfg.discord.skip_bot_messages is False
+        # Other sub-configs keep defaults
+        assert cfg.chatbot.skip_system_prompts is True
+        assert cfg.quality.auto_accept_threshold == 0.8
+
+
+# ---------------------------------------------------------------------------
 # Top-level CreekConfig
 # ---------------------------------------------------------------------------
 
@@ -183,6 +388,7 @@ class TestCreekConfig:
         assert isinstance(cfg.redaction, RedactionConfig)
         assert isinstance(cfg.google_drive, GoogleDriveConfig)
         assert isinstance(cfg.sources, SourcePaths)
+        assert isinstance(cfg.cleaning, CleaningConfig)
 
     def test_valid_timezone(self) -> None:
         """CreekConfig should accept a valid timezone string."""
@@ -272,6 +478,39 @@ class TestLoadConfig:
         assert cfg.linking.temporal_window_hours == 48
         assert cfg.linking.thread_min_fragments == 3  # default preserved
 
+    def test_loads_cleaning_config_from_yaml(self, tmp_path: Path) -> None:
+        """load_config() should load cleaning section from YAML."""
+        config_file = tmp_path / "creek_config.yaml"
+        config_data = {
+            "cleaning": {
+                "discord": {"skip_bot_messages": False, "min_message_length": 10},
+                "validation": {"min_content_chars": 50},
+                "deduplication": {"embedding_similarity": True},
+            },
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        cfg = load_config(config_file)
+        assert cfg.cleaning.discord.skip_bot_messages is False
+        assert cfg.cleaning.discord.min_message_length == 10
+        # Unspecified cleaning sub-configs keep defaults
+        assert cfg.cleaning.discord.skip_single_emoji is True
+        assert cfg.cleaning.chatbot.skip_system_prompts is True
+        assert cfg.cleaning.validation.min_content_chars == 50
+        assert cfg.cleaning.deduplication.embedding_similarity is True
+        assert cfg.cleaning.deduplication.exact_match is True  # default preserved
+
+    def test_loads_yaml_without_cleaning_section(self, tmp_path: Path) -> None:
+        """load_config() should provide defaults when cleaning section is absent."""
+        config_file = tmp_path / "creek_config.yaml"
+        config_data = {"vault_path": "/tmp/vault"}  # nosec B108
+        config_file.write_text(yaml.dump(config_data))
+
+        cfg = load_config(config_file)
+        assert isinstance(cfg.cleaning, CleaningConfig)
+        assert cfg.cleaning.discord.skip_bot_messages is True
+        assert cfg.cleaning.quality.auto_accept_threshold == 0.9
+
 
 # ---------------------------------------------------------------------------
 # generate_default_config()
@@ -292,6 +531,7 @@ class TestGenerateDefaultConfig:
         assert isinstance(data, dict)
         assert "vault_path" in data
         assert "timezone" in data
+        assert "cleaning" in data
 
     def test_roundtrip(self, tmp_path: Path) -> None:
         """Generated config should round-trip back through load_config."""
@@ -306,3 +546,11 @@ class TestGenerateDefaultConfig:
         assert cfg.google_drive.scopes == [
             "https://www.googleapis.com/auth/drive.readonly"
         ]
+        # Cleaning section round-trips correctly
+        assert isinstance(cfg.cleaning, CleaningConfig)
+        assert cfg.cleaning.discord.skip_bot_messages is True
+        assert cfg.cleaning.chatbot.skip_system_prompts is True
+        assert cfg.cleaning.validation.min_content_chars == 10
+        assert cfg.cleaning.quality.auto_accept_threshold == 0.9
+        assert cfg.cleaning.deduplication.similarity_threshold == 0.95
+        assert cfg.cleaning.hygiene.orphan_days == 30

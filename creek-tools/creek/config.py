@@ -1,9 +1,10 @@
 """Creek configuration module — loads creek_config.yaml to Pydantic Settings models.
 
 Provides typed configuration for every subsystem in the Creek pipeline:
-LLM, embeddings, OCR, linking, classification, redaction, Google Drive,
-and source paths. Configuration values are loaded from a YAML file and
-can be overridden by environment variables prefixed with ``CREEK_``.
+LLM, embeddings, OCR, linking, classification, redaction, cleaning,
+Google Drive, and source paths. Configuration values are loaded from a
+YAML file and can be overridden by environment variables prefixed with
+``CREEK_``.
 
 API keys (e.g. ``ANTHROPIC_API_KEY``) are **never** stored in the YAML
 file — they must come from environment variables.
@@ -178,6 +179,163 @@ class SourcePaths(BaseModel):
     """Code project directories."""
 
 
+class DiscordCleaningConfig(BaseModel):
+    """Discord-specific cleaning configuration."""
+
+    skip_bot_messages: bool = True
+    """Whether to skip messages from bots."""
+
+    skip_single_emoji: bool = True
+    """Whether to skip messages that contain only a single emoji."""
+
+    skip_commands: bool = True
+    """Whether to skip bot command invocations (e.g. ``!ping``, ``/roll``)."""
+
+    min_message_length: int = 3
+    """Minimum character length for a message to be kept."""
+
+    include_others_as_context: bool = False
+    """Whether to include other users' messages as surrounding context."""
+
+
+class ChatbotCleaningConfig(BaseModel):
+    """Chatbot export cleaning configuration."""
+
+    skip_system_prompts: bool = True
+    """Whether to skip system prompt turns."""
+
+    skip_tool_outputs: bool = True
+    """Whether to skip tool/function call output turns."""
+
+    collapse_regenerations: bool = True
+    """Whether to collapse consecutive regenerated responses into one."""
+
+    min_turn_length: int = 5
+    """Minimum character length for a turn to be kept."""
+
+
+class MarkdownCleaningConfig(BaseModel):
+    """Markdown file cleaning configuration."""
+
+    skip_empty_files: bool = True
+    """Whether to skip files with no meaningful body content."""
+
+    min_body_length: int = 50
+    """Minimum character length of the body (excluding front-matter)."""
+
+
+class GoogleDriveCleaningConfig(BaseModel):
+    """Google Drive document cleaning configuration."""
+
+    skip_copy_of_duplicates: bool = True
+    """Whether to skip files named ``Copy of ...``."""
+
+    skip_empty_documents: bool = True
+    """Whether to skip documents with no content."""
+
+    max_collaborator_ratio: float = 0.5
+    """Maximum ratio of other-author content before skipping the document."""
+
+
+class ValidationConfig(BaseModel):
+    """Content validation thresholds."""
+
+    min_content_chars: int = 10
+    """Minimum character count for content to be considered valid."""
+
+    min_content_words: int = 3
+    """Minimum word count for content to be considered valid."""
+
+    max_stop_word_ratio: float = 0.8
+    """Maximum ratio of stop words before content is flagged as low-quality."""
+
+    require_timestamp: bool = False
+    """Whether a timestamp is required on every fragment."""
+
+    require_source_platform: bool = True
+    """Whether a source platform identifier is required."""
+
+
+class QualityConfig(BaseModel):
+    """Automatic quality-gate thresholds."""
+
+    auto_accept_threshold: float = 0.9
+    """Quality score at or above which fragments are auto-accepted."""
+
+    auto_skip_threshold: float = 0.1
+    """Quality score at or below which fragments are auto-skipped."""
+
+
+class DeduplicationConfig(BaseModel):
+    """Deduplication strategy configuration."""
+
+    exact_match: bool = True
+    """Whether to deduplicate by exact content match."""
+
+    normalized_match: bool = True
+    """Whether to deduplicate by normalised (whitespace/case) match."""
+
+    embedding_similarity: bool = False
+    """Whether to deduplicate by embedding cosine similarity."""
+
+    similarity_threshold: float = 0.95
+    """Cosine similarity threshold for embedding-based deduplication."""
+
+
+class HygieneConfig(BaseModel):
+    """Vault hygiene maintenance configuration."""
+
+    orphan_days: int = 30
+    """Days after which an unlinked fragment is flagged as orphaned."""
+
+    review_queue_stale_days: int = 14
+    """Days after which a review-queue item is considered stale."""
+
+
+class CleaningConfig(BaseModel):
+    """Top-level cleaning configuration grouping all cleaning sub-configs."""
+
+    discord: DiscordCleaningConfig = Field(
+        default_factory=DiscordCleaningConfig,
+    )
+    """Discord message cleaning settings."""
+
+    chatbot: ChatbotCleaningConfig = Field(
+        default_factory=ChatbotCleaningConfig,
+    )
+    """Chatbot export cleaning settings."""
+
+    markdown: MarkdownCleaningConfig = Field(
+        default_factory=MarkdownCleaningConfig,
+    )
+    """Markdown file cleaning settings."""
+
+    google_drive: GoogleDriveCleaningConfig = Field(
+        default_factory=GoogleDriveCleaningConfig,
+    )
+    """Google Drive document cleaning settings."""
+
+    validation: ValidationConfig = Field(
+        default_factory=ValidationConfig,
+    )
+    """Content validation settings."""
+
+    quality: QualityConfig = Field(
+        default_factory=QualityConfig,
+    )
+    """Quality-gate settings."""
+
+    deduplication: DeduplicationConfig = Field(
+        default_factory=DeduplicationConfig,
+    )
+    """Deduplication strategy settings."""
+
+    hygiene: HygieneConfig = Field(
+        default_factory=HygieneConfig,
+    )
+    """Vault hygiene settings."""
+
+
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
 
@@ -226,6 +384,9 @@ class CreekConfig(BaseSettings):
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
+
+    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
+    """Cleaning pipeline settings."""
 
     @field_validator("timezone")
     @classmethod
