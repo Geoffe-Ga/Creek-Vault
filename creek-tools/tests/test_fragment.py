@@ -1,6 +1,6 @@
 """Tests for the creek.fragment fragmentation engine."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from creek.fragment import FragmentationConfig, FragmentationEngine
 from creek.ingest.base import ParsedFragment
@@ -218,6 +218,80 @@ class TestGrouping:
         result = engine.fragment(frags)
         assert len(result) == 2  # not grouped
 
+    def test_should_group_rejects_outside_time_window(self) -> None:
+        """should_group() must return False when timestamps exceed window."""
+        engine = FragmentationEngine(
+            FragmentationConfig(min_words=50, group_time_window_minutes=5),
+        )
+        t1 = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+        t2 = t1 + timedelta(hours=1)  # 60 min apart, window is 5 min
+        frags = [
+            _make_parsed(content="Short.", source_path="a.md", timestamp=t1),
+            _make_parsed(content="Also short.", source_path="a.md", timestamp=t2),
+        ]
+        assert engine.should_group(frags) is False
+
+    def test_should_group_accepts_within_time_window(self) -> None:
+        """should_group() must return True when timestamps are within window."""
+        engine = FragmentationEngine(
+            FragmentationConfig(min_words=50, group_time_window_minutes=5),
+        )
+        t1 = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+        t2 = t1 + timedelta(minutes=3)  # 3 min apart, window is 5 min
+        frags = [
+            _make_parsed(content="Short.", source_path="a.md", timestamp=t1),
+            _make_parsed(content="Also short.", source_path="a.md", timestamp=t2),
+        ]
+        assert engine.should_group(frags) is True
+
+    def test_should_group_boundary_at_exact_window(self) -> None:
+        """should_group() returns True at exactly the time window boundary."""
+        engine = FragmentationEngine(
+            FragmentationConfig(min_words=50, group_time_window_minutes=5),
+        )
+        t1 = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+        t2 = t1 + timedelta(minutes=5)  # exactly 5 min, window is 5 min
+        frags = [
+            _make_parsed(content="Short.", source_path="a.md", timestamp=t1),
+            _make_parsed(content="Also short.", source_path="a.md", timestamp=t2),
+        ]
+        assert engine.should_group(frags) is True
+
+    def test_should_group_three_fragments_middle_outside_window(self) -> None:
+        """should_group() returns False when any consecutive pair exceeds window."""
+        engine = FragmentationEngine(
+            FragmentationConfig(min_words=50, group_time_window_minutes=5),
+        )
+        t1 = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+        t2 = t1 + timedelta(minutes=2)
+        t3 = t2 + timedelta(minutes=10)  # 10 min gap between t2 and t3
+        frags = [
+            _make_parsed(content="A.", source_path="a.md", timestamp=t1),
+            _make_parsed(content="B.", source_path="a.md", timestamp=t2),
+            _make_parsed(content="C.", source_path="a.md", timestamp=t3),
+        ]
+        assert engine.should_group(frags) is False
+
+    def test_group_metadata_last_wins(self) -> None:
+        """group_fragments() metadata merge uses last-wins for key collisions."""
+        engine = FragmentationEngine()
+        frags = [
+            _make_parsed(
+                content="First.",
+                metadata={"key": "value1", "only_first": "a"},
+            ),
+            _make_parsed(
+                content="Second.",
+                metadata={"key": "value2", "only_second": "b"},
+            ),
+        ]
+        result = engine.group_fragments(frags)
+        # Last fragment's value wins on collision
+        assert result.metadata["key"] == "value2"
+        # Non-colliding keys are preserved
+        assert result.metadata["only_first"] == "a"
+        assert result.metadata["only_second"] == "b"
+
     def test_group_merges_content(self) -> None:
         """Grouped fragments should have combined content."""
         engine = FragmentationEngine()
@@ -286,3 +360,33 @@ class TestFragmentEndToEnd:
         """Empty input should return empty output."""
         engine = FragmentationEngine()
         assert engine.fragment([]) == []
+
+    def test_split_falls_through_to_length(self) -> None:
+        """Long content without headings falls through to length-based split."""
+        engine = FragmentationEngine(
+            FragmentationConfig(max_words=10, min_words=2),
+        )
+        # No headings, but exceeds max_words; must fall through to split_by_length
+        content = "\n\n".join([" ".join(["word"] * 8) for _ in range(3)])
+        frag = _make_parsed(content=content)
+        result = engine.fragment([frag])
+        assert len(result) > 1
+
+
+# ---- _can_extend_group edge cases ----
+
+
+class TestCanExtendGroup:
+    """Tests for _can_extend_group edge cases."""
+
+    def test_empty_group_short_fragment(self) -> None:
+        """Empty group accepts a short fragment."""
+        engine = FragmentationEngine(FragmentationConfig(min_words=50))
+        frag = _make_parsed(content="Short.")
+        assert engine._can_extend_group([], frag) is True
+
+    def test_empty_group_long_fragment(self) -> None:
+        """Empty group rejects a long fragment."""
+        engine = FragmentationEngine(FragmentationConfig(min_words=2))
+        frag = _make_parsed(content=" ".join(["word"] * 10))
+        assert engine._can_extend_group([], frag) is False

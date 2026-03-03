@@ -5,6 +5,7 @@ Splits long documents at heading or paragraph boundaries and groups
 short related fragments by source proximity.
 """
 
+import itertools
 import re
 
 from pydantic import BaseModel, Field
@@ -185,7 +186,8 @@ class FragmentationEngine:
         """Check if consecutive short fragments should be merged.
 
         Fragments are eligible for grouping when they all come from
-        the same source and every fragment is below ``min_words``.
+        the same source, every fragment is below ``min_words``, and
+        every consecutive pair falls within ``group_time_window_minutes``.
 
         Args:
             fragments: Candidate fragments to evaluate.
@@ -200,7 +202,14 @@ class FragmentationEngine:
         if len(sources) > 1:
             return False
 
-        return all(_word_count(f.content) < self.config.min_words for f in fragments)
+        if not all(_word_count(f.content) < self.config.min_words for f in fragments):
+            return False
+
+        max_gap = self.config.group_time_window_minutes * 60
+        return all(
+            abs((b.timestamp - a.timestamp).total_seconds()) <= max_gap
+            for a, b in itertools.pairwise(fragments)
+        )
 
     def group_fragments(
         self,
@@ -209,7 +218,9 @@ class FragmentationEngine:
         """Merge related short fragments into one.
 
         Content is joined with double newlines.  The earliest
-        timestamp is preserved and metadata is merged.
+        timestamp is preserved and metadata dicts are merged in
+        order with ``dict.update()``, so later fragments win on
+        key collisions (last-wins semantics).
 
         Args:
             fragments: Fragments to merge (must be non-empty).
