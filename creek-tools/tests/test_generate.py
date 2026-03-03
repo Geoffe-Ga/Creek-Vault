@@ -180,9 +180,9 @@ class TestGenerateFrequencyIndexes:
             content = path.read_text(encoding="utf-8")
             # Extract the frequency code from the parent directory name
             freq_code = path.parent.name.split("-")[0]  # e.g., "F1"
-            assert (
-                f'"{freq_code}"' in content
-            ), f"Query should reference {freq_code}: {path}"
+            assert f'"{freq_code}"' in content, (
+                f"Query should reference {freq_code}: {path}"
+            )
 
     def test_dataview_queries_reference_fragments_folder(
         self, generator: IndexGenerator
