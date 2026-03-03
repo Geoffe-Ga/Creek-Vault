@@ -438,9 +438,9 @@ class TestQualityScorerEdgeCases:
         ]
         for content in test_inputs:
             result = scorer.score(content)
-            assert (
-                0.0 <= result.score <= 1.0
-            ), f"Score {result.score} out of range for: {content!r}"
+            assert 0.0 <= result.score <= 1.0, (
+                f"Score {result.score} out of range for: {content!r}"
+            )
 
     def test_reasons_always_non_empty_for_non_accept(self) -> None:
         """Non-accept results should always have at least one reason."""
@@ -455,6 +455,6 @@ class TestQualityScorerEdgeCases:
         for content in test_inputs:
             result = scorer.score(content)
             if result.action != "accept":
-                assert (
-                    len(result.reasons) >= 1
-                ), f"No reasons for {result.action}: {content!r}"
+                assert len(result.reasons) >= 1, (
+                    f"No reasons for {result.action}: {content!r}"
+                )
