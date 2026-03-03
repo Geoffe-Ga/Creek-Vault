@@ -126,6 +126,33 @@ class TestSplitBySections:
             for child in result:
                 assert "parent_id" in child.metadata
 
+    def test_preserves_heading_markers(self) -> None:
+        """Split sections should retain their heading markers (## prefix)."""
+        engine = FragmentationEngine()
+        content = (
+            "Intro text.\n\n## Section One\n\nBody one.\n\n## Section Two\n\nBody two."
+        )
+        frag = _make_parsed(content=content)
+        result = engine.split_by_sections(frag)
+        assert len(result) == 3
+        # Intro has no heading marker
+        assert not result[0].content.startswith("#")
+        # Section children must start with ## heading marker
+        assert result[1].content.startswith("## ")
+        assert result[2].content.startswith("## ")
+
+    def test_preserves_heading_markers_h3(self) -> None:
+        """Split sections at H3 level should retain ### prefix."""
+        engine = FragmentationEngine(
+            FragmentationConfig(section_split_level=3),
+        )
+        content = "Intro.\n\n### Alpha\n\nAlpha body.\n\n### Beta\n\nBeta body."
+        frag = _make_parsed(content=content)
+        result = engine.split_by_sections(frag)
+        assert len(result) == 3
+        assert result[1].content.startswith("### ")
+        assert result[2].content.startswith("### ")
+
 
 # ---- split_by_length ----
 
