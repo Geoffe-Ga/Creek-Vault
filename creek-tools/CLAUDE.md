@@ -29,7 +29,7 @@ Always invoke tools through `./scripts/*` instead of directly.
 
 | Task | ❌ NEVER | ✅ ALWAYS |
 |------|----------|-----------|
-| Format code | `black .` | `./scripts/format.sh` |
+| Format code | `ruff format .` | `./scripts/format.sh` |
 | Run tests | `pytest` | `./scripts/test.sh` |
 | Type check | `mypy .` | `./scripts/lint.sh` (includes mypy) |
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
@@ -354,9 +354,7 @@ All code must meet these standards before merging to main:
 - **Max Lines per Function**: 50 lines
 
 #### Linting and Formatting
-- **Ruff**: ALL rules enabled (no exceptions unless documented)
-- **Black**: Line length 88 characters
-- **isort**: Import sorting per configuration
+- **Ruff**: ALL rules enabled, formatting + import sorting (no exceptions unless documented)
 - **Pylint**: Score of 9.0+ required
 - **Bandit**: Security scanning with zero exceptions
 - **pip-audit**: Dependency vulnerability checking

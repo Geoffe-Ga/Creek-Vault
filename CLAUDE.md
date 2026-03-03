@@ -52,11 +52,11 @@ pytest tests/test_main.py::test_main_runs -v
 - Docstring coverage: >=95% (interrogate)
 - Cyclomatic complexity: <=10 per function
 - MyPy: strict mode, all functions typed
-- Ruff + Black + isort: zero violations
+- Ruff (linting + formatting): zero violations
 
 ### Commit Conventions
 - Uses [Conventional Commits](https://www.conventionalcommits.org/) enforced by pre-commit hook
-- Pre-commit runs hooks including ruff, black, isort, mypy (strict), bandit, shellcheck, interrogate, vulture, detect-secrets, and more
+- Pre-commit runs hooks including ruff (lint + format), mypy (strict), bandit, shellcheck, interrogate, vulture, detect-secrets, and more
 - Direct commits to `main` are blocked by pre-commit; use feature branches
 
 ## Architecture
