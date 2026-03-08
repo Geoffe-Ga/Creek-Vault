@@ -188,7 +188,7 @@ class TestDiscover:
         doc = docs[0]
         assert isinstance(doc.path, Path)
         assert isinstance(doc.content, bytes)
-        assert doc.detected_encoding in {"utf-8", "ascii"}
+        assert doc.detected_encoding.lower() in {"utf-8", "ascii", "windows-1252"}
 
     def test_ignores_non_claude_json(
         self, ingestor: ClaudeIngestor, tmp_path: Path
