@@ -14,6 +14,7 @@ from creek.classify.llm import LLMClassifier
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
+from creek.decide.pipeline import DecisionPipeline
 from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.link.linker import LinkingPipeline
@@ -31,6 +32,7 @@ class PipelineResult(BaseModel):
         fragments_created: Number of fragments produced by ingestion.
         classifications_made: Number of fragments classified.
         links_found: Total link count across all linking stages.
+        decisions_detected: Number of decision-relevant fragments found.
         indexes_generated: Number of index notes generated.
     """
 
@@ -38,16 +40,17 @@ class PipelineResult(BaseModel):
     fragments_created: int = 0
     classifications_made: int = 0
     links_found: int = 0
+    decisions_detected: int = 0
     indexes_generated: int = 0
 
 
 class Pipeline:
     """Orchestrate the full Creek processing pipeline.
 
-    Wires redaction, ingestion, classification, linking, and indexing
-    stages together.  Handles gracefully the case where no ingestor is
-    registered for a given source type (the INGESTOR_REGISTRY may be
-    empty during the skeleton phase).
+    Wires redaction, ingestion, classification, linking, decision
+    support, and indexing stages together.  Handles gracefully the
+    case where no ingestor is registered for a given source type
+    (the INGESTOR_REGISTRY may be empty during the skeleton phase).
 
     Attributes:
         config: The Creek configuration governing all subsystems.
@@ -56,6 +59,7 @@ class Pipeline:
         llm_classifier: LLM-based classifier stub.
         review_generator: Review queue generator for uncertain fragments.
         linking_pipeline: Orchestrator for all four linking stages.
+        decision_pipeline: Decision detection and context gathering.
     """
 
     def __init__(self, config: CreekConfig) -> None:
@@ -73,6 +77,10 @@ class Pipeline:
             config=config.embeddings,
             linking_config=config.linking,
         )
+        self.decision_pipeline = DecisionPipeline(
+            threshold=config.decision.detection_threshold,
+            min_tag_overlap=config.decision.min_tag_overlap,
+        )
 
     def run(self, source_path: Path, vault_path: Path) -> PipelineResult:
         """Execute the full pipeline from source to vault.
@@ -82,7 +90,8 @@ class Pipeline:
             2. Ingestion (discover ingestors for source type)
             3. Classification (rule -> LLM -> review queue)
             4. Linking (embeddings, temporal, threads, eddies)
-            5. Index generation
+            5. Decision support (detection and context gathering)
+            6. Index generation
 
         Args:
             source_path: Directory containing source files to process.
@@ -109,7 +118,11 @@ class Pipeline:
         link_total = self._run_linking(classified, vault_path, result)
         result.links_found = link_total
 
-        # Stage 5: Indexing
+        # Stage 5: Decision support
+        decision_count = self._run_decisions(classified, result)
+        result.decisions_detected = decision_count
+
+        # Stage 6: Indexing
         index_count = self._run_indexing(vault_path, result)
         result.indexes_generated = index_count
 
@@ -235,6 +248,29 @@ class Pipeline:
             + link_result.thread_count
             + link_result.eddy_count
         )
+
+    def _run_decisions(
+        self,
+        fragments: list[Fragment],
+        result: PipelineResult,
+    ) -> int:
+        """Run decision detection on classified fragments.
+
+        Args:
+            fragments: Classified fragments to scan for decisions.
+            result: Pipeline result (unused directly but kept for symmetry).
+
+        Returns:
+            Number of decision-relevant fragments detected.
+        """
+        if not fragments:
+            logger.info("No fragments for decision detection.")
+            return 0
+
+        decision_result, _decisions, _contexts = self.decision_pipeline.run(
+            fragments,
+        )
+        return decision_result.decisions_detected
 
     def _run_indexing(self, vault_path: Path, result: PipelineResult) -> int:
         """Generate Dataview index notes in the vault.

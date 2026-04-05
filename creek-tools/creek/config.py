@@ -89,6 +89,16 @@ class ClassificationConfig(BaseModel):
     """Sources that require human review after classification."""
 
 
+class DecisionConfig(BaseModel):
+    """Decision support layer configuration."""
+
+    detection_threshold: int = 2
+    """Minimum keyword score for flagging a fragment as decision-relevant."""
+
+    min_tag_overlap: int = 1
+    """Minimum number of shared tags for context matching."""
+
+
 class RedactionConfig(BaseModel):
     """Redaction scanner configuration."""
 
@@ -215,6 +225,9 @@ class CreekConfig(BaseSettings):
         default_factory=ClassificationConfig,
     )
     """Classification pipeline settings."""
+
+    decision: DecisionConfig = Field(default_factory=DecisionConfig)
+    """Decision support layer settings."""
 
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
     """PII redaction scanner settings."""
