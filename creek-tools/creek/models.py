@@ -207,6 +207,11 @@ def _generate_decision_id() -> str:
     return f"decision-{uuid.uuid4().hex[:8]}"
 
 
+def _generate_candidate_id() -> str:
+    """Generate a unique decision candidate ID with prefix 'candidate-'."""
+    return f"candidate-{uuid.uuid4().hex[:8]}"
+
+
 def _generate_wave_id() -> str:
     """Generate a unique wavelength observation ID with prefix 'wave-'."""
     return f"wave-{uuid.uuid4().hex[:8]}"
@@ -289,6 +294,26 @@ class Fragment(BaseModel):
     eddies: list[str] = Field(default_factory=list)
     praxis_potential: PraxisPotential = PraxisPotential.NONE
     tags: list[str] = Field(default_factory=list)
+
+
+class DecisionCandidate(BaseModel):
+    """A candidate fragment flagged as decision-relevant before full Decision creation.
+
+    Decision candidates are detected by keyword and pattern analysis of fragments.
+    They hold the source fragment reference, matched keywords, the detection method,
+    and a confidence score indicating the strength of the signal.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    id: str = Field(default_factory=_generate_candidate_id)
+    fragment_id: str
+    fragment_title: str
+    matched_keywords: list[str] = Field(default_factory=list)
+    detection_method: str = ""
+    confidence_score: float = 0.0
+    wavelength_phase_at_detection: str = ""
+    frequency_context: list[Frequency] = Field(default_factory=list)
 
 
 class Thread(BaseModel):
