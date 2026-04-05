@@ -8,6 +8,14 @@ Tests cover:
 - False positive allowlisting
 - Custom pattern support
 - Security: ensure sensitive data never leaks into match objects
+- Binary file detection (Issue #14)
+- File extension filtering (Issue #14)
+- Directory exclusion patterns (Issue #14)
+- Context extraction (Issue #14)
+- JSON report generation (Issue #14)
+- Markdown summary (Issue #14)
+- Review queue generation (Issue #14)
+- Batch scanning with ScanSummary (Issue #14)
 """
 
 import json
@@ -22,6 +30,7 @@ from creek.redact import (
     RedactionMatch,
     RedactionScanner,
     Redactor,
+    ScanSummary,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,9 +54,9 @@ class TestRedactionPatterns:
     def test_patterns_are_compiled_regex(self) -> None:
         """Each pattern value should be a compiled regex."""
         for name, pattern in REDACTION_PATTERNS.items():
-            assert isinstance(pattern, re.Pattern), (
-                f"Pattern '{name}' is not a compiled regex"
-            )
+            assert isinstance(
+                pattern, re.Pattern
+            ), f"Pattern '{name}' is not a compiled regex"
 
     def test_api_key_pattern_matches(self) -> None:
         """api_key pattern should match common API key formats."""
@@ -128,9 +137,9 @@ class TestRedactionMatch:
         fields = RedactionMatch.model_fields
         forbidden = {"matched_text", "text", "value", "content", "raw", "match_text"}
         for field_name in forbidden:
-            assert field_name not in fields, (
-                f"RedactionMatch must NOT store matched text (found '{field_name}')"
-            )
+            assert (
+                field_name not in fields
+            ), f"RedactionMatch must NOT store matched text (found '{field_name}')"
 
     def test_serializable(self) -> None:
         """RedactionMatch should be JSON-serializable."""
@@ -900,9 +909,9 @@ class TestPatternInfo:
         from creek.redact.patterns import _VALID_SEVERITIES, PATTERN_METADATA
 
         for name, info in PATTERN_METADATA.items():
-            assert info.severity in _VALID_SEVERITIES, (
-                f"Invalid severity '{info.severity}' for {name}"
-            )
+            assert (
+                info.severity in _VALID_SEVERITIES
+            ), f"Invalid severity '{info.severity}' for {name}"
 
     def test_metadata_has_description(self) -> None:
         """All pattern metadata should have non-empty descriptions."""
@@ -988,3 +997,634 @@ class TestCatastrophicBacktracking:
         pattern.search(long_input)
         elapsed = time.monotonic() - start
         assert elapsed < 1.0, f"phone_number took {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Binary File Detection (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestBinaryDetection:
+    """Tests for binary file detection."""
+
+    def test_detects_png(self, tmp_path: Path) -> None:
+        """is_binary should detect PNG files."""
+        f = tmp_path / "image.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        assert RedactionScanner.is_binary(f)
+
+    def test_detects_jpeg(self, tmp_path: Path) -> None:
+        """is_binary should detect JPEG files."""
+        f = tmp_path / "photo.jpg"
+        f.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+        assert RedactionScanner.is_binary(f)
+
+    def test_detects_pdf(self, tmp_path: Path) -> None:
+        """is_binary should detect PDF files."""
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(b"%PDF-1.4" + b"\x00" * 100)
+        assert RedactionScanner.is_binary(f)
+
+    def test_detects_zip(self, tmp_path: Path) -> None:
+        """is_binary should detect ZIP files."""
+        f = tmp_path / "archive.zip"
+        f.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
+        assert RedactionScanner.is_binary(f)
+
+    def test_detects_elf(self, tmp_path: Path) -> None:
+        """is_binary should detect ELF binaries."""
+        f = tmp_path / "program"
+        f.write_bytes(b"\x7fELF" + b"\x00" * 100)
+        assert RedactionScanner.is_binary(f)
+
+    def test_detects_null_bytes(self, tmp_path: Path) -> None:
+        """is_binary should detect files containing null bytes."""
+        f = tmp_path / "binary.dat"
+        f.write_bytes(b"header\x00\x01\x02\x03" + b"\x00" * 100)
+        assert RedactionScanner.is_binary(f)
+
+    def test_text_file_not_binary(self, tmp_path: Path) -> None:
+        """is_binary should return False for plain text files."""
+        f = tmp_path / "text.txt"
+        f.write_text("Hello, this is a normal text file.\n")
+        assert not RedactionScanner.is_binary(f)
+
+    def test_empty_file_not_binary(self, tmp_path: Path) -> None:
+        """is_binary should return False for empty files."""
+        f = tmp_path / "empty.txt"
+        f.write_bytes(b"")
+        assert not RedactionScanner.is_binary(f)
+
+    def test_nonexistent_file_not_binary(self, tmp_path: Path) -> None:
+        """is_binary should return False for nonexistent files."""
+        assert not RedactionScanner.is_binary(tmp_path / "no_such_file")
+
+    def test_scan_directory_skips_binary(self, tmp_path: Path) -> None:
+        """scan_directory should skip binary files with supported extensions."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+        # Use a supported extension (.txt) with binary content
+        binary_file = tmp_path / "binary.txt"
+        binary_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 1
+        assert summary.files_skipped_binary == 1
+        assert len(summary.matches) >= 1
+
+
+# ---------------------------------------------------------------------------
+# File Extension Filtering (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestExtensionFiltering:
+    """Tests for file extension filtering."""
+
+    def test_supported_extensions_scanned(self, tmp_path: Path) -> None:
+        """Files with supported extensions should be scanned."""
+        for ext in (".txt", ".md", ".json", ".py", ".env", ".yaml", ".toml", ".csv"):
+            f = tmp_path / f"data{ext}"
+            f.write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 8
+
+    def test_unsupported_extension_skipped(self, tmp_path: Path) -> None:
+        """Files with unsupported extensions should be skipped."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+        (tmp_path / "style.css").write_text("SSN: 123-45-6789\n")
+        (tmp_path / "script.js").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 1
+        assert summary.files_skipped_extension == 2
+
+    def test_custom_extensions(self, tmp_path: Path) -> None:
+        """Custom supported_extensions should be respected."""
+        (tmp_path / "data.xyz").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig(supported_extensions=[".xyz"])
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 1
+        assert len(summary.matches) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Exclusion Patterns (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestExclusionPatterns:
+    """Tests for directory exclusion patterns."""
+
+    def test_git_directory_excluded(self, tmp_path: Path) -> None:
+        """Files under .git/ should be excluded from scanning."""
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "config.txt").write_text("SSN: 123-45-6789\n")
+        (tmp_path / "data.txt").write_text("SSN: 999-88-7777\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        scanned_files = {str(m.file_path) for m in summary.matches}
+        assert not any(".git" in f for f in scanned_files)
+        assert summary.files_scanned == 1
+
+    def test_node_modules_excluded(self, tmp_path: Path) -> None:
+        """Files under node_modules/ should be excluded from scanning."""
+        nm_dir = tmp_path / "node_modules"
+        nm_dir.mkdir()
+        (nm_dir / "lib.py").write_text("password=secret123\n")
+        (tmp_path / "app.py").write_text("password=secret123\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 1
+
+    def test_custom_exclusion_patterns(self, tmp_path: Path) -> None:
+        """Custom exclusion patterns should be respected."""
+        vendor = tmp_path / "vendor"
+        vendor.mkdir()
+        (vendor / "lib.py").write_text("SSN: 123-45-6789\n")
+        (tmp_path / "main.py").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig(exclude_patterns=[".git", "node_modules", "vendor"])
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 1
+
+
+# ---------------------------------------------------------------------------
+# Context Extraction (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestContextExtraction:
+    """Tests for context line extraction around matches."""
+
+    def test_context_around_middle_line(self, tmp_path: Path) -> None:
+        """extract_context should return lines around the match."""
+        f = tmp_path / "ctx.txt"
+        f.write_text("line 1\nline 2\nSSN: 123-45-6789\nline 4\nline 5\n")
+
+        context = RedactionScanner.extract_context(f, line_number=3, window=2)
+
+        assert len(context) == 5
+        assert "SSN: 123-45-6789" in context
+
+    def test_context_at_file_start(self, tmp_path: Path) -> None:
+        """extract_context should clamp to start of file."""
+        f = tmp_path / "start.txt"
+        f.write_text("SSN: 123-45-6789\nline 2\nline 3\n")
+
+        context = RedactionScanner.extract_context(f, line_number=1, window=2)
+
+        assert len(context) == 3
+        assert context[0] == "SSN: 123-45-6789"
+
+    def test_context_at_file_end(self, tmp_path: Path) -> None:
+        """extract_context should clamp to end of file."""
+        f = tmp_path / "end.txt"
+        f.write_text("line 1\nline 2\nSSN: 123-45-6789\n")
+
+        context = RedactionScanner.extract_context(f, line_number=3, window=2)
+
+        assert len(context) == 3
+        assert "SSN: 123-45-6789" in context
+
+    def test_context_nonexistent_file(self, tmp_path: Path) -> None:
+        """extract_context should return empty list for missing files."""
+        result = RedactionScanner.extract_context(
+            tmp_path / "missing.txt", line_number=1
+        )
+        assert result == []
+
+    def test_context_default_window(self, tmp_path: Path) -> None:
+        """extract_context should use window=2 by default."""
+        lines = [f"line {i}" for i in range(1, 11)]
+        f = tmp_path / "ten.txt"
+        f.write_text("\n".join(lines) + "\n")
+
+        context = RedactionScanner.extract_context(f, line_number=5)
+
+        assert len(context) == 5
+        assert "line 3" in context
+        assert "line 7" in context
+
+
+# ---------------------------------------------------------------------------
+# ScanSummary (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestScanSummary:
+    """Tests for the ScanSummary dataclass."""
+
+    def test_scan_summary_fields(self) -> None:
+        """ScanSummary should have all expected fields."""
+        summary = ScanSummary(
+            matches=[],
+            files_scanned=10,
+            files_skipped_binary=2,
+            files_skipped_extension=3,
+        )
+        assert summary.files_scanned == 10
+        assert summary.files_skipped_binary == 2
+        assert summary.files_skipped_extension == 3
+        assert summary.matches == []
+
+    def test_scan_batch_returns_summary(self, tmp_path: Path) -> None:
+        """scan_batch should return a ScanSummary."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert isinstance(summary, ScanSummary)
+        assert summary.files_scanned >= 1
+        assert len(summary.matches) >= 1
+
+    def test_scan_batch_nonexistent_directory(self) -> None:
+        """scan_batch should raise FileNotFoundError for missing directory."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+
+        with pytest.raises(FileNotFoundError):
+            scanner.scan_batch(Path("/nonexistent/directory"))
+
+    def test_scan_batch_empty_directory(self, tmp_path: Path) -> None:
+        """scan_batch on empty directory should return zeroed summary."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        assert summary.files_scanned == 0
+        assert summary.files_skipped_binary == 0
+        assert summary.files_skipped_extension == 0
+        assert summary.matches == []
+
+    def test_scan_directory_delegates_to_scan_batch(self, tmp_path: Path) -> None:
+        """scan_directory should return the same matches as scan_batch."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+
+        dir_matches = scanner.scan_directory(tmp_path)
+        # Re-create scanner to reset salt (hashes will differ), but check counts
+        scanner2 = RedactionScanner(config=config)
+        summary = scanner2.scan_batch(tmp_path)
+
+        assert len(dir_matches) == len(summary.matches)
+
+
+# ---------------------------------------------------------------------------
+# Progress Bar (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestProgressBar:
+    """Tests for tqdm progress bar during scanning."""
+
+    def test_scan_directory_with_progress(self, tmp_path: Path) -> None:
+        """scan_directory with progress=True should not raise."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        matches = scanner.scan_directory(tmp_path, progress=True)
+
+        assert len(matches) >= 1
+
+    def test_scan_batch_with_progress(self, tmp_path: Path) -> None:
+        """scan_batch with progress=True should not raise."""
+        (tmp_path / "data.txt").write_text("email: test@example.com\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path, progress=True)
+
+        assert summary.files_scanned >= 1
+
+
+# ---------------------------------------------------------------------------
+# JSON Report Generation (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonReport:
+    """Tests for JSON report generation."""
+
+    def test_json_report_created(self, tmp_path: Path) -> None:
+        """generate_json_report should create a JSON file."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        report_path = tmp_path / "report" / "redaction-report.json"
+        scanner.generate_json_report(summary, report_path)
+
+        assert report_path.exists()
+
+    def test_json_report_structure(self, tmp_path: Path) -> None:
+        """JSON report should contain scan_statistics and findings_by_file."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        report_path = tmp_path / "redaction-report.json"
+        scanner.generate_json_report(summary, report_path)
+
+        data = json.loads(report_path.read_text())
+        assert "scan_statistics" in data
+        assert "findings_by_file" in data
+
+        stats = data["scan_statistics"]
+        assert "files_scanned" in stats
+        assert "files_skipped_binary" in stats
+        assert "files_skipped_extension" in stats
+        assert "total_findings" in stats
+        assert "by_severity" in stats
+        assert "by_type" in stats
+
+    def test_json_report_match_metadata(self, tmp_path: Path) -> None:
+        """JSON report findings should contain match metadata."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        report_path = tmp_path / "redaction-report.json"
+        scanner.generate_json_report(summary, report_path)
+
+        data = json.loads(report_path.read_text())
+        findings = data["findings_by_file"]
+        assert len(findings) > 0
+
+        for _file, file_matches in findings.items():
+            for match in file_matches:
+                assert "line_number" in match
+                assert "match_type" in match
+                assert "severity" in match
+                assert "salted_hash" in match
+
+    def test_json_report_creates_parent_dirs(self, tmp_path: Path) -> None:
+        """generate_json_report should create parent directories."""
+        summary = ScanSummary()
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+
+        deep_path = tmp_path / "a" / "b" / "c" / "report.json"
+        scanner.generate_json_report(summary, deep_path)
+
+        assert deep_path.exists()
+
+    def test_json_report_empty_summary(self, tmp_path: Path) -> None:
+        """JSON report for empty summary should have zero totals."""
+        summary = ScanSummary()
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+
+        report_path = tmp_path / "empty-report.json"
+        scanner.generate_json_report(summary, report_path)
+
+        data = json.loads(report_path.read_text())
+        assert data["scan_statistics"]["total_findings"] == 0
+        assert data["findings_by_file"] == {}
+
+    def test_json_report_severity_sorted(self, tmp_path: Path) -> None:
+        """Findings in JSON report should be sorted by severity."""
+        f = tmp_path / "mixed.txt"
+        f.write_text("email: test@example.com\nSSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+
+        report_path = tmp_path / "report.json"
+        scanner.generate_json_report(summary, report_path)
+
+        data = json.loads(report_path.read_text())
+        for _file, file_matches in data["findings_by_file"].items():
+            severities = [m["severity"] for m in file_matches]
+            order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
+            ranks = [order.get(s, 4) for s in severities]
+            assert ranks == sorted(ranks)
+
+
+# ---------------------------------------------------------------------------
+# Markdown Summary (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownSummary:
+    """Tests for markdown summary generation."""
+
+    def test_markdown_summary_no_findings(self) -> None:
+        """Markdown summary with no findings should say so."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = ScanSummary()
+        md = scanner.generate_markdown_summary(summary)
+
+        assert "No findings" in md
+
+    def test_markdown_summary_has_statistics(self, tmp_path: Path) -> None:
+        """Markdown summary should include scan statistics."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        md = scanner.generate_markdown_summary(summary)
+
+        assert "Files scanned" in md
+        assert "Total findings" in md
+
+    def test_markdown_summary_has_severity_breakdown(self, tmp_path: Path) -> None:
+        """Markdown summary should include severity breakdown."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        md = scanner.generate_markdown_summary(summary)
+
+        assert "By Severity" in md
+
+    def test_markdown_summary_grouped_by_file(self, tmp_path: Path) -> None:
+        """Markdown summary should group findings by file."""
+        (tmp_path / "a.txt").write_text("SSN: 123-45-6789\n")
+        (tmp_path / "b.txt").write_text("email: test@example.com\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        md = scanner.generate_markdown_summary(summary)
+
+        assert "a.txt" in md
+        assert "b.txt" in md
+
+    def test_markdown_summary_has_table(self, tmp_path: Path) -> None:
+        """Markdown summary should use table format for findings."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        md = scanner.generate_markdown_summary(summary)
+
+        assert "| Line |" in md
+        assert "| Type |" in md
+        assert "| Severity |" in md
+
+
+# ---------------------------------------------------------------------------
+# Review Queue (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestReviewQueue:
+    """Tests for review queue generation."""
+
+    def test_review_queue_no_findings(self) -> None:
+        """Review queue with no findings should say so."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = ScanSummary()
+        rq = scanner.generate_review_queue(summary)
+
+        assert "No findings to review" in rq
+
+    def test_review_queue_has_checkboxes(self, tmp_path: Path) -> None:
+        """Review queue should have checkboxes for each finding."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        rq = scanner.generate_review_queue(summary)
+
+        assert "- [ ] Confirmed sensitive" in rq
+        assert "- [ ] False positive" in rq
+
+    def test_review_queue_has_context(self, tmp_path: Path) -> None:
+        """Review queue should include context around each finding."""
+        f = tmp_path / "ctx.txt"
+        f.write_text("line 1\nline 2\nSSN: 123-45-6789\nline 4\nline 5\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        rq = scanner.generate_review_queue(summary)
+
+        assert "```" in rq
+        assert "SSN: 123-45-6789" in rq
+
+    def test_review_queue_has_type_and_severity(self, tmp_path: Path) -> None:
+        """Review queue should include pattern type and severity."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        rq = scanner.generate_review_queue(summary)
+
+        assert "**Type**: ssn" in rq
+        assert "**Severity**: critical" in rq
+
+    def test_review_queue_grouped_by_file(self, tmp_path: Path) -> None:
+        """Review queue should group findings by file."""
+        (tmp_path / "a.txt").write_text("SSN: 123-45-6789\n")
+        (tmp_path / "b.txt").write_text("email: test@example.com\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        rq = scanner.generate_review_queue(summary)
+
+        assert "a.txt" in rq
+        assert "b.txt" in rq
+
+    def test_review_queue_has_instructions(self, tmp_path: Path) -> None:
+        """Review queue should include reviewer instructions."""
+        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        rq = scanner.generate_review_queue(summary)
+
+        assert "Review each finding" in rq
+
+    def test_review_queue_finding_numbers(self, tmp_path: Path) -> None:
+        """Review queue findings should be numbered sequentially."""
+        f = tmp_path / "data.txt"
+        f.write_text("SSN: 123-45-6789\nemail: test@example.com\n")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        summary = scanner.scan_batch(tmp_path)
+        rq = scanner.generate_review_queue(summary)
+
+        assert "Finding 1" in rq
+        assert "Finding 2" in rq
+
+
+# ---------------------------------------------------------------------------
+# Config Enhancements (Issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestRedactionConfigEnhancements:
+    """Tests for RedactionConfig new fields."""
+
+    def test_default_supported_extensions(self) -> None:
+        """RedactionConfig should have default supported extensions."""
+        config = RedactionConfig()
+        assert ".txt" in config.supported_extensions
+        assert ".md" in config.supported_extensions
+        assert ".json" in config.supported_extensions
+        assert ".py" in config.supported_extensions
+        assert ".env" in config.supported_extensions
+        assert ".yaml" in config.supported_extensions
+        assert ".toml" in config.supported_extensions
+        assert ".csv" in config.supported_extensions
+
+    def test_default_exclude_patterns(self) -> None:
+        """RedactionConfig should have default exclusion patterns."""
+        config = RedactionConfig()
+        assert ".git" in config.exclude_patterns
+        assert "node_modules" in config.exclude_patterns
+
+    def test_custom_supported_extensions(self) -> None:
+        """RedactionConfig should accept custom extensions."""
+        config = RedactionConfig(supported_extensions=[".xyz", ".abc"])
+        assert config.supported_extensions == [".xyz", ".abc"]
+
+    def test_custom_exclude_patterns(self) -> None:
+        """RedactionConfig should accept custom exclusion patterns."""
+        config = RedactionConfig(exclude_patterns=["vendor", "dist"])
+        assert config.exclude_patterns == ["vendor", "dist"]
