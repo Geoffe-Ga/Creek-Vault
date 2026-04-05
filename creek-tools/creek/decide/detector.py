@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 DECISION_SIGNALS: list[str] = [
     "should I",
-    "should i",
     "trying to decide",
     "weighing options",
     "not sure whether",
@@ -40,7 +39,6 @@ DECISION_SIGNALS: list[str] = [
     "tradeoff",
     "pros and cons",
     "what if I",
-    "what if i",
     "need to decide",
     "can't decide",
     "make up my mind",
