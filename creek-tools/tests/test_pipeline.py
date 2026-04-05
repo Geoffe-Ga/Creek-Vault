@@ -216,7 +216,8 @@ class TestPipelineRunEmpty:
     def test_no_fragments_skips_linking(self, config, vault_path, source_path):
         """Test that linking is skipped when no fragments exist."""
         pipeline = Pipeline(config=config)
-        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", {}):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
         assert result.links_found == 0
 
 

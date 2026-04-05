@@ -95,11 +95,11 @@ class LinkingPipeline:
         )
 
         # Stage 3: Thread detection
-        thread_detector = ThreadDetector()
+        thread_detector = ThreadDetector(config=self.linking_config)
         threads = thread_detector.detect_threads(fragments)
 
         # Stage 4: Eddy detection
-        eddy_detector = EddyDetector()
+        eddy_detector = EddyDetector(config=self.linking_config)
         eddies = eddy_detector.detect_eddies(fragments)
 
         result = LinkingResult(
