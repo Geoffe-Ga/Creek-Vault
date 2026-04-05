@@ -678,8 +678,8 @@ class TestDiscordIngestorParse:
         ]
         ingestor = DiscordIngestor()
         fragments = ingestor.parse(self._raw_doc(messages))
-        # Should still produce a fragment (with Unknown author, empty content)
-        assert len(fragments) == 1
+        # Message has no content — pre-ingestion filter skips it
+        assert len(fragments) == 0
 
     def test_parse_object_format_without_messages_key(self) -> None:
         """Should return empty list for object format without messages key."""

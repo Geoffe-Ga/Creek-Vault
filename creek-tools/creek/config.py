@@ -89,6 +89,48 @@ class ClassificationConfig(BaseModel):
     """Sources that require human review after classification."""
 
 
+class CleaningDiscordConfig(BaseModel):
+    """Discord pre-ingestion filter configuration.
+
+    All filter rules are enabled by default.
+    """
+
+    skip_bots: bool = True
+    """Skip messages where ``author.isBot`` is true."""
+
+    skip_emoji_only: bool = True
+    """Skip messages consisting exclusively of emoji."""
+
+    skip_commands: bool = True
+    """Skip messages starting with a command prefix."""
+
+    skip_media_only: bool = True
+    """Skip attachment-only messages lacking text."""
+
+    skip_below_min_length: bool = True
+    """Skip messages shorter than ``min_length``."""
+
+    flag_link_dumps: bool = True
+    """Skip messages that are exclusively URLs."""
+
+    min_length: int = 3
+    """Minimum content length in characters."""
+
+    command_prefixes: list[str] = Field(
+        default_factory=lambda: ["/", "!", "."],
+    )
+    """Characters that indicate a command invocation."""
+
+
+class CleaningConfig(BaseModel):
+    """Content cleaning and filtering configuration."""
+
+    discord: CleaningDiscordConfig = Field(
+        default_factory=CleaningDiscordConfig,
+    )
+    """Discord-specific pre-ingestion filter settings."""
+
+
 class RedactionConfig(BaseModel):
     """Redaction scanner configuration."""
 
@@ -215,6 +257,9 @@ class CreekConfig(BaseSettings):
         default_factory=ClassificationConfig,
     )
     """Classification pipeline settings."""
+
+    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
+    """Content cleaning and filtering settings."""
 
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
     """PII redaction scanner settings."""
