@@ -6,6 +6,7 @@ source directory, producing a :class:`PipelineResult` with aggregate counts.
 """
 
 import logging
+from datetime import date, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -14,11 +15,14 @@ from creek.classify.llm import LLMClassifier
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
+from creek.decision.detector import DecisionDetector
 from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.link.linker import LinkingPipeline
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from creek.redact.scanner import RedactionScanner
+from creek.voice.analyzer import VoiceAnalyzer
+from creek.wavelength.tracker import WavelengthTracker
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,9 @@ class PipelineResult(BaseModel):
     classifications_made: int = 0
     links_found: int = 0
     indexes_generated: int = 0
+    voice_profiles_generated: int = 0
+    wavelength_reports_generated: int = 0
+    decisions_detected: int = 0
 
 
 class Pipeline:
@@ -56,6 +63,9 @@ class Pipeline:
         llm_classifier: LLM-based classifier stub.
         review_generator: Review queue generator for uncertain fragments.
         linking_pipeline: Orchestrator for all four linking stages.
+        voice_analyzer: Voice analysis and profile generation.
+        wavelength_tracker: Wavelength phase tracking and reporting.
+        decision_detector: Decision detection and note generation.
     """
 
     def __init__(self, config: CreekConfig) -> None:
@@ -73,6 +83,9 @@ class Pipeline:
             config=config.embeddings,
             linking_config=config.linking,
         )
+        self.voice_analyzer: VoiceAnalyzer | None = None
+        self.wavelength_tracker: WavelengthTracker | None = None
+        self.decision_detector: DecisionDetector | None = None
 
     def run(self, source_path: Path, vault_path: Path) -> PipelineResult:
         """Execute the full pipeline from source to vault.
@@ -83,6 +96,9 @@ class Pipeline:
             3. Classification (rule -> LLM -> review queue)
             4. Linking (embeddings, temporal, threads, eddies)
             5. Index generation
+            6. Voice analysis and profile generation
+            7. Wavelength tracking and report generation
+            8. Decision detection and note generation
 
         Args:
             source_path: Directory containing source files to process.
@@ -112,6 +128,18 @@ class Pipeline:
         # Stage 5: Indexing
         index_count = self._run_indexing(vault_path, result)
         result.indexes_generated = index_count
+
+        # Stage 6: Voice analysis
+        voice_count = self._run_voice_analysis(classified, vault_path)
+        result.voice_profiles_generated = voice_count
+
+        # Stage 7: Wavelength tracking
+        wave_count = self._run_wavelength_tracking(classified, vault_path)
+        result.wavelength_reports_generated = wave_count
+
+        # Stage 8: Decision detection
+        decision_count = self._run_decision_detection(classified, vault_path)
+        result.decisions_detected = decision_count
 
         logger.info("Pipeline complete: %s", result)
         return result
@@ -248,4 +276,74 @@ class Pipeline:
         """
         index_gen = IndexGenerator(vault_path=vault_path)
         generated = index_gen.generate_all()
+        return len(generated)
+
+    def _run_voice_analysis(
+        self,
+        fragments: list[Fragment],
+        vault_path: Path,
+    ) -> int:
+        """Run voice analysis and generate profile notes.
+
+        Args:
+            fragments: Classified fragments to analyze.
+            vault_path: Vault root for profile output.
+
+        Returns:
+            Number of voice profile notes generated.
+        """
+        if not fragments:
+            logger.info("No fragments for voice analysis.")
+            return 0
+
+        self.voice_analyzer = VoiceAnalyzer(vault_path=vault_path)
+        content_map: dict[str, str] = {}
+        generated = self.voice_analyzer.run(fragments, content_map)
+        return len(generated)
+
+    def _run_wavelength_tracking(
+        self,
+        fragments: list[Fragment],
+        vault_path: Path,
+    ) -> int:
+        """Run wavelength tracking and generate report notes.
+
+        Args:
+            fragments: Classified fragments to track.
+            vault_path: Vault root for report output.
+
+        Returns:
+            Number of wavelength report notes generated (0 or 1).
+        """
+        if not fragments:
+            logger.info("No fragments for wavelength tracking.")
+            return 0
+
+        self.wavelength_tracker = WavelengthTracker(vault_path=vault_path)
+        period_end = date.today()
+        period_start = period_end - timedelta(days=7)
+        self.wavelength_tracker.run(fragments, period_start, period_end)
+        return 1
+
+    def _run_decision_detection(
+        self,
+        fragments: list[Fragment],
+        vault_path: Path,
+    ) -> int:
+        """Run decision detection and generate decision notes.
+
+        Args:
+            fragments: Classified fragments to scan.
+            vault_path: Vault root for decision note output.
+
+        Returns:
+            Number of decision notes generated.
+        """
+        if not fragments:
+            logger.info("No fragments for decision detection.")
+            return 0
+
+        self.decision_detector = DecisionDetector(vault_path=vault_path)
+        content_map: dict[str, str] = {}
+        generated = self.decision_detector.run(fragments, content_map)
         return len(generated)
