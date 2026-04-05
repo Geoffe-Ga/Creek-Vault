@@ -1,5 +1,6 @@
-"""Creek vault subpackage — write ontological primitives to an Obsidian vault."""
+"""Creek vault subpackage — write and link ontological primitives."""
 
+from creek.vault.linker import BatchLinkResult, VaultLinker
 from creek.vault.writer import VaultWriter
 
-__all__ = ["VaultWriter"]
+__all__ = ["BatchLinkResult", "VaultLinker", "VaultWriter"]
