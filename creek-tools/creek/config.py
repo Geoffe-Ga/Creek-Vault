@@ -150,6 +150,32 @@ class GoogleDriveConfig(BaseModel):
         return v
 
 
+class GoogleDriveFilterConfig(BaseModel):
+    """Google Drive pre-ingestion filter configuration.
+
+    Controls thresholds for the :class:`creek.clean.filters.GoogleDriveFilter`
+    that screens staged Google Drive files before ingestion.
+    """
+
+    staleness_days: int = 365
+    """Days without modification before flagging a file as stale."""
+
+    multi_author_threshold: float = 0.5
+    """Non-owner contribution ratio (0.0--1.0) above which a file is flagged."""
+
+    min_content_length: int = 10
+    """Minimum stripped character count for a file to not be considered empty."""
+
+
+class CleaningConfig(BaseModel):
+    """Data cleaning pipeline configuration."""
+
+    google_drive: GoogleDriveFilterConfig = Field(
+        default_factory=GoogleDriveFilterConfig,
+    )
+    """Google Drive pre-ingestion filter settings."""
+
+
 class SourcePaths(BaseModel):
     """Source data paths (relative to ``source_drive``)."""
 
@@ -223,6 +249,9 @@ class CreekConfig(BaseSettings):
         default_factory=GoogleDriveConfig,
     )
     """Google Drive connector settings."""
+
+    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
+    """Data cleaning pipeline settings."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
