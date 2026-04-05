@@ -113,6 +113,18 @@ module = "frontmatter"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "sentence_transformers"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 

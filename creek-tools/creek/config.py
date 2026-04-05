@@ -45,6 +45,15 @@ class EmbeddingsConfig(BaseModel):
     similarity_threshold: float = 0.75
     """Minimum cosine similarity for linking fragments."""
 
+    cache_dir: str | None = None
+    """Local directory for caching downloaded models."""
+
+    batch_size: int = 32
+    """Number of texts to encode per batch."""
+
+    max_tokens: int = 512
+    """Maximum token length for input texts (truncated by the model)."""
+
 
 class OCRConfig(BaseModel):
     """OCR configuration."""
