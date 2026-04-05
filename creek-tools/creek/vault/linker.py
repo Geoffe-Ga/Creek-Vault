@@ -112,7 +112,7 @@ class VaultLinker:
         post = frontmatter.load(str(file_path))
 
         # Update frontmatter
-        existing: list[str] = list(post.metadata.get("resonances", []))
+        existing: list[str] = list(post.metadata.get("resonances") or [])
         existing_set = set(existing)
         for link in links:
             if link not in existing_set:
@@ -203,6 +203,7 @@ class VaultLinker:
         """
         processed = 0
         skipped = 0
+        total = len(specs)
 
         for file_path, spec in specs.items():
             if not file_path.exists():
@@ -219,8 +220,8 @@ class VaultLinker:
             processed += 1
             logger.info(
                 "Linked fragment %d/%d: %s",
-                processed,
                 processed + skipped,
+                total,
                 file_path.name,
             )
 
@@ -246,12 +247,19 @@ class VaultLinker:
 
         Returns:
             Number of stale links removed.
+
+        Raises:
+            FileNotFoundError: If ``file_path`` does not exist.
         """
+        if not file_path.exists():
+            msg = f"Fragment file not found: {file_path}"
+            raise FileNotFoundError(msg)
+
         post = frontmatter.load(str(file_path))
         removed = 0
 
         for key in ("resonances", "threads", "eddies"):
-            entries: list[str] = list(post.metadata.get(key, []))
+            entries: list[str] = list(post.metadata.get(key) or [])
             kept: list[str] = []
             for entry in entries:
                 match = _WIKILINK_PATTERN.match(entry)
@@ -265,7 +273,7 @@ class VaultLinker:
             post.metadata[key] = kept
 
         # Rebuild body resonances section from cleaned frontmatter
-        resonances: list[str] = post.metadata.get("resonances", [])
+        resonances: list[str] = post.metadata.get("resonances") or []
         post.content = self._update_resonances_section(
             post.content,
             resonances,
@@ -303,7 +311,7 @@ class VaultLinker:
             return
 
         post = frontmatter.load(str(file_path))
-        existing: list[str] = list(post.metadata.get(key, []))
+        existing: list[str] = list(post.metadata.get(key) or [])
         existing_set = set(existing)
         for link in links:
             if link not in existing_set:

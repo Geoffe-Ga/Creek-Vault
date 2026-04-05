@@ -490,3 +490,50 @@ class TestRemoveStaleLinks:
         linker.remove_stale_links(written_fragment)
         content = written_fragment.read_text(encoding="utf-8")
         assert "## Resonances" not in content
+
+    def test_nonexistent_file_raises(
+        self,
+        linker: VaultLinker,
+        vault_path: Path,
+    ) -> None:
+        """remove_stale_links raises FileNotFoundError for missing file."""
+        fake = vault_path / "01-Fragments" / "nonexistent.md"
+        with pytest.raises(FileNotFoundError):
+            linker.remove_stale_links(fake)
+
+    def test_wikilink_with_alias(
+        self,
+        linker: VaultLinker,
+        written_fragment: Path,
+        vault_path: Path,
+    ) -> None:
+        """Wiki-links with aliases resolve to the title portion."""
+        (vault_path / "01-Fragments" / "Aliased Note.md").write_text(
+            "---\ntitle: Aliased Note\n---\n",
+            encoding="utf-8",
+        )
+        linker.add_resonances(
+            written_fragment,
+            ["[[Aliased Note|Display Name]]"],
+        )
+        removed = linker.remove_stale_links(written_fragment)
+        post = frontmatter.load(str(written_fragment))
+        assert "[[Aliased Note|Display Name]]" in post.metadata["resonances"]
+        assert removed == 0
+
+    def test_cross_directory_note_lookup(
+        self,
+        linker: VaultLinker,
+        written_fragment: Path,
+        vault_path: Path,
+    ) -> None:
+        """Notes in 02-Threads/ are found by stale link checker."""
+        (vault_path / "02-Threads" / "Active" / "Thread Note.md").write_text(
+            "---\ntitle: Thread Note\n---\n",
+            encoding="utf-8",
+        )
+        linker.update_threads(written_fragment, ["[[Thread Note]]"])
+        removed = linker.remove_stale_links(written_fragment)
+        post = frontmatter.load(str(written_fragment))
+        assert "[[Thread Note]]" in post.metadata["threads"]
+        assert removed == 0
