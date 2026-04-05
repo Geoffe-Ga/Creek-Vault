@@ -150,6 +150,41 @@ class GoogleDriveConfig(BaseModel):
         return v
 
 
+class ChatbotCleaningConfig(BaseModel):
+    """Chatbot pre-ingestion filter configuration.
+
+    Controls which noise types are filtered from chatbot conversation
+    exports before fragment extraction.
+    """
+
+    min_human_turn_length: int = 20
+    """Minimum character count for human turns (below = skip)."""
+
+    code_block_threshold: float = 0.9
+    """Code-block ratio above which a response is flagged as code-only."""
+
+    max_abandoned_turns: int = 2
+    """Max turn pairs for abandoned conversation detection."""
+
+    skip_system_prompts: bool = True
+    """Whether to skip system prompt messages."""
+
+    skip_tool_outputs: bool = True
+    """Whether to skip tool output messages."""
+
+    collapse_regenerations: bool = True
+    """Whether to collapse consecutive assistant messages."""
+
+
+class CleaningConfig(BaseModel):
+    """Cleaning pipeline configuration."""
+
+    chatbot: ChatbotCleaningConfig = Field(
+        default_factory=ChatbotCleaningConfig,
+    )
+    """Chatbot pre-ingestion filter settings."""
+
+
 class SourcePaths(BaseModel):
     """Source data paths (relative to ``source_drive``)."""
 
@@ -223,6 +258,9 @@ class CreekConfig(BaseSettings):
         default_factory=GoogleDriveConfig,
     )
     """Google Drive connector settings."""
+
+    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
+    """Cleaning pipeline settings."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
