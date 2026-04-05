@@ -89,6 +89,22 @@ class ClassificationConfig(BaseModel):
     """Sources that require human review after classification."""
 
 
+class MarkdownCleaningConfig(BaseModel):
+    """Markdown pre-ingestion filter configuration."""
+
+    min_body_length: int = 10
+    """Minimum body character count after frontmatter removal."""
+
+
+class CleaningConfig(BaseModel):
+    """Content cleaning pipeline configuration."""
+
+    markdown: MarkdownCleaningConfig = Field(
+        default_factory=MarkdownCleaningConfig,
+    )
+    """Markdown pre-ingestion filter settings."""
+
+
 class RedactionConfig(BaseModel):
     """Redaction scanner configuration."""
 
@@ -215,6 +231,9 @@ class CreekConfig(BaseSettings):
         default_factory=ClassificationConfig,
     )
     """Classification pipeline settings."""
+
+    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
+    """Content cleaning pipeline settings."""
 
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
     """PII redaction scanner settings."""
