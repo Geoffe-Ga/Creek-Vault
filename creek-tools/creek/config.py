@@ -252,7 +252,11 @@ class DiscordCleaningConfig(BaseModel):
 
 
 class ChatbotCleaningConfig(BaseModel):
-    """Chatbot export cleaning configuration."""
+    """Chatbot export cleaning configuration.
+
+    Controls which noise types are filtered from chatbot conversation
+    exports before fragment extraction.
+    """
 
     filter_system_prompts: bool = True
     """Whether to filter out system prompt content."""
@@ -262,6 +266,15 @@ class ChatbotCleaningConfig(BaseModel):
 
     filter_regenerations: bool = True
     """Whether to filter out regenerated responses."""
+
+    min_human_turn_length: int = 20
+    """Minimum character count for human turns (below = skip)."""
+
+    code_block_threshold: float = 0.9
+    """Code-block ratio above which a response is flagged as code-only."""
+
+    max_abandoned_turns: int = 2
+    """Max turn pairs for abandoned conversation detection."""
 
 
 class MarkdownCleaningConfig(BaseModel):

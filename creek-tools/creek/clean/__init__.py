@@ -8,6 +8,7 @@ fragments, the :class:`SemanticDeduplicator` for embedding-based
 near-duplicate detection across sources, the :class:`FragmentValidator`
 for post-ingestion field, encoding, and timestamp validation, the
 :class:`ContextExtractor` for handling non-user content, the
+:class:`ChatbotFilter` for pre-ingestion chatbot noise removal, the
 :class:`GoogleDriveFilter` for pre-ingestion filtering of Google Drive
 staged files, and vault hygiene scanners for orphans, stale reviews,
 broken links, duplicates, and health reports.
@@ -15,6 +16,12 @@ broken links, duplicates, and health reports.
 
 from creek.clean.context import ContextExtractor, ContextResult
 from creek.clean.dedup import DeduplicationResult, Deduplicator
+from creek.clean.filters.chatbot import (
+    ChatbotFilter,
+    ChatbotFilterConfig,
+    ConversationFilterResult,
+    MessageVerdict,
+)
 from creek.clean.filters.google_drive import (
     GoogleDriveFilter,
     GoogleDriveFilterResult,
@@ -44,8 +51,11 @@ from creek.clean.validator import FragmentValidator, ValidationResult, Violation
 __all__ = [
     "BrokenLinkResult",
     "BrokenLinkScanner",
+    "ChatbotFilter",
+    "ChatbotFilterConfig",
     "ContextExtractor",
     "ContextResult",
+    "ConversationFilterResult",
     "DeduplicationResult",
     "Deduplicator",
     "DuplicateCandidate",
@@ -56,6 +66,7 @@ __all__ = [
     "GoogleDriveFilterResult",
     "HygieneReport",
     "HygieneReporter",
+    "MessageVerdict",
     "OrphanResult",
     "OrphanScanner",
     "QualityResult",
