@@ -2,10 +2,13 @@
 
 from creek.generate.decisions import DECISION_KEYWORDS, DecisionDetector
 from creek.generate.indexes import FREQUENCY_NAMES, IndexGenerator
+from creek.generate.tags import TagGardenGenerator, TagScanResult
 
 __all__ = [
     "DECISION_KEYWORDS",
-    "FREQUENCY_NAMES",
     "DecisionDetector",
+    "FREQUENCY_NAMES",
     "IndexGenerator",
+    "TagGardenGenerator",
+    "TagScanResult",
 ]
