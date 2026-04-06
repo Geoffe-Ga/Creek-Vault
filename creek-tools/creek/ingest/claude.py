@@ -30,6 +30,8 @@ from creek.ingest.base import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.clean.filters.chatbot import ChatbotFilter
+
 logger = logging.getLogger(__name__)
 
 # ---- Content Extraction ----
@@ -200,7 +202,23 @@ class ClaudeIngestor(Ingestor):
     The ingestor supports both the multi-conversation wrapper format
     (``{"conversations": [...]}``}) and the single-conversation format
     (``{"conversation_id": ..., "messages": [...]}``}).
+
+    An optional :class:`ChatbotFilter` can be provided to filter noise
+    (system prompts, tool outputs, regenerations) before turn pairing.
     """
+
+    def __init__(
+        self,
+        *,
+        chatbot_filter: ChatbotFilter | None = None,
+    ) -> None:
+        """Initialise the Claude ingestor with an optional chatbot filter.
+
+        Args:
+            chatbot_filter: Optional pre-ingestion filter for noise removal.
+                If ``None``, no filtering is applied.
+        """
+        self._chatbot_filter = chatbot_filter
 
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Find all Claude export JSON files in the given directory.
@@ -361,6 +379,8 @@ class ClaudeIngestor(Ingestor):
     ) -> list[ParsedFragment]:
         """Parse a single normalized conversation into fragments.
 
+        Applies the chatbot filter to remove noise before pairing turns.
+
         Args:
             conv: A normalized conversation dict.
             source_path: The original file path string.
@@ -369,6 +389,11 @@ class ClaudeIngestor(Ingestor):
             A list of ParsedFragment objects.
         """
         messages = conv.get("messages", [])
+        if self._chatbot_filter is not None:
+            filter_result = self._chatbot_filter.filter_conversation(
+                messages, platform="claude"
+            )
+            messages = filter_result.messages
         pairs = _pair_turns(messages)
         fallback_ts = conv.get("created_at", "2000-01-01T00:00:00Z")
         conv_id = conv.get("uuid", "unknown")
