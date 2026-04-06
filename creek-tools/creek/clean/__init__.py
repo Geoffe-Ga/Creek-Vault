@@ -1,4 +1,4 @@
-"""Creek content cleaning — quality, deduplication, authorship, and more.
+"""Creek content cleaning — quality, deduplication, authorship, validation, hygiene.
 
 Provides the :class:`QualityScorer` for evaluating content quality using
 entropy, stop-word ratio, length, and content-type heuristics, the
@@ -7,26 +7,51 @@ entropy, stop-word ratio, length, and content-type heuristics, the
 fragments, the :class:`AuthorshipTagger` for classifying fragment
 authorship as self, ai, other, or collaborative, the
 :class:`FragmentValidator` for post-ingestion field, encoding, and
-timestamp validation, and the :class:`ContextExtractor` for handling
-non-user content.
+timestamp validation, the :class:`ContextExtractor` for handling
+non-user content, and vault hygiene scanners for orphans, stale reviews,
+broken links, duplicates, and health reports.
 """
 
 from creek.clean.authorship import AuthorshipResult, AuthorshipTagger
 from creek.clean.context import ContextExtractor, ContextResult
 from creek.clean.dedup import DeduplicationResult, Deduplicator
+from creek.clean.hygiene import (
+    BrokenLinkResult,
+    BrokenLinkScanner,
+    DuplicateCandidate,
+    DuplicateResult,
+    DuplicateScanner,
+    HygieneReport,
+    HygieneReporter,
+    OrphanResult,
+    OrphanScanner,
+    StaleReviewResult,
+    StaleReviewScanner,
+)
 from creek.clean.quality import QualityResult, QualityScorer
 from creek.clean.validator import FragmentValidator, ValidationResult, Violation
 
 __all__ = [
     "AuthorshipResult",
     "AuthorshipTagger",
+    "BrokenLinkResult",
+    "BrokenLinkScanner",
     "ContextExtractor",
     "ContextResult",
     "DeduplicationResult",
     "Deduplicator",
+    "DuplicateCandidate",
+    "DuplicateResult",
+    "DuplicateScanner",
     "FragmentValidator",
+    "HygieneReport",
+    "HygieneReporter",
+    "OrphanResult",
+    "OrphanScanner",
     "QualityResult",
     "QualityScorer",
+    "StaleReviewResult",
+    "StaleReviewScanner",
     "ValidationResult",
     "Violation",
 ]
