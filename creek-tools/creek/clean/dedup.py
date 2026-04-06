@@ -8,17 +8,28 @@ duplicates:
 - **Normalized match**: The fragment content, after stripping whitespace,
   lowercasing, and removing punctuation, hashes to the same value as a
   previously registered fragment.
+
+Supports cross-run persistence via a JSON manifest file stored in the
+vault at ``00-Creek-Meta/dedup-manifest.json``.
 """
 
 import hashlib
+import json
 import re
 import unicodedata
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
 from creek.ingest.base import generate_fragment_id
+
+_MANIFEST_RELATIVE = Path("00-Creek-Meta") / "dedup-manifest.json"
+"""Relative path from vault root to the deduplication manifest file."""
+
+_MANIFEST_VERSION = 1
+"""Current manifest schema version."""
 
 
 def _compute_exact_hash(source: str, timestamp: datetime, content: str) -> str:
@@ -196,6 +207,71 @@ class Deduplicator:
         exact_hash = _compute_exact_hash(source, timestamp, content)
         normalized_hash = _compute_normalized_hash(content)
         return self._check_hashes(exact_hash, normalized_hash)
+
+    def seed_from_vault(self, vault_path: Path) -> int:
+        """Seed the deduplicator from a persisted manifest in the vault.
+
+        Reads the manifest file at
+        ``{vault_path}/00-Creek-Meta/dedup-manifest.json`` and merges
+        its indexes into the current registry.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            The number of fragments seeded from the manifest.
+
+        Raises:
+            ValueError: If the manifest contains invalid JSON or an
+                unsupported version.
+        """
+        manifest_path = vault_path / _MANIFEST_RELATIVE
+        if not manifest_path.exists():
+            return 0
+
+        raw = manifest_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            msg = f"Corrupt dedup manifest at {manifest_path}: {exc}"
+            raise ValueError(msg) from exc
+
+        version = data.get("version")
+        if version != _MANIFEST_VERSION:
+            msg = (
+                f"Unsupported manifest version {version} (expected {_MANIFEST_VERSION})"
+            )
+            raise ValueError(msg)
+
+        exact: dict[str, str] = data.get("exact_index", {})
+        normalized: dict[str, str] = data.get("normalized_index", {})
+
+        self._exact_index.update(exact)
+        self._normalized_index.update(normalized)
+
+        return len(exact)
+
+    def save_manifest(self, vault_path: Path) -> None:
+        """Persist the current indexes to a manifest file in the vault.
+
+        Writes both the exact and normalized indexes to
+        ``{vault_path}/00-Creek-Meta/dedup-manifest.json``.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+        """
+        manifest_path = vault_path / _MANIFEST_RELATIVE
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "version": _MANIFEST_VERSION,
+            "exact_index": dict(self._exact_index),
+            "normalized_index": dict(self._normalized_index),
+        }
+        manifest_path.write_text(
+            json.dumps(data, indent=2),
+            encoding="utf-8",
+        )
 
     def clear(self) -> None:
         """Remove all registered fragments from the registry."""

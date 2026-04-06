@@ -1,10 +1,11 @@
 """Tests for creek.link module — linking pipeline and component linkers.
 
-Tests cover EmbeddingLinker, TemporalLinker, ThreadDetector, EddyDetector,
-LinkingResult, and LinkingPipeline orchestration.
+Tests cover EmbeddingLinker, TemporalLinker (with TemporalLink scoring),
+ThreadDetector, EddyDetector, LinkingResult, and LinkingPipeline orchestration.
 """
 
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,7 @@ from creek.link import (
     EmbeddingLinker,
     LinkingPipeline,
     LinkingResult,
+    TemporalLink,
     TemporalLinker,
     ThreadDetector,
 )
@@ -24,18 +26,44 @@ from creek.link.eddies import EddyDetector as EddyDetectorDirect
 from creek.link.embeddings import EmbeddingLinker as EmbeddingLinkerDirect
 from creek.link.linker import LinkingPipeline as LinkingPipelineDirect
 from creek.link.linker import LinkingResult as LinkingResultDirect
+from creek.link.temporal import TemporalLink as TemporalLinkDirect
 from creek.link.temporal import TemporalLinker as TemporalLinkerDirect
 from creek.link.threads import ThreadDetector as ThreadDetectorDirect
-from creek.models import Fragment, FragmentSource, SourcePlatform
+from creek.models import (
+    Fragment,
+    FragmentSource,
+    Frequency,
+    FrequencyClassification,
+    Mode,
+    Phase,
+    SourcePlatform,
+    WavelengthClassification,
+)
 
 _DIMS = 384
 
 
-def _make_fragment(title: str = "Test Fragment") -> Fragment:
-    """Create a minimal Fragment for testing."""
+def _make_fragment(
+    title: str = "Test Fragment",
+    platform: SourcePlatform = SourcePlatform.CLAUDE,
+    created: datetime | None = None,
+    primary_freq: Frequency = Frequency.UNCLASSIFIED,
+    secondary_freqs: list[Frequency] | None = None,
+    phase: Phase = Phase.UNCLASSIFIED,
+    mode: Mode = Mode.UNCLASSIFIED,
+    emotional_texture: list[str] | None = None,
+) -> Fragment:
+    """Create a Fragment for testing with configurable classification fields."""
     return Fragment(
         title=title,
-        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        source=FragmentSource(platform=platform),
+        created=created or datetime.now(),
+        frequency=FrequencyClassification(
+            primary=primary_freq,
+            secondary=secondary_freqs or [],
+        ),
+        wavelength=WavelengthClassification(phase=phase, mode=mode),
+        emotional_texture=emotional_texture or [],
     )
 
 
@@ -71,6 +99,10 @@ class TestPackageExports:
     def test_embedding_linker_reexported(self) -> None:
         """EmbeddingLinker should be importable from creek.link."""
         assert EmbeddingLinker is EmbeddingLinkerDirect
+
+    def test_temporal_link_reexported(self) -> None:
+        """TemporalLink should be importable from creek.link."""
+        assert TemporalLink is TemporalLinkDirect
 
     def test_temporal_linker_reexported(self) -> None:
         """TemporalLinker should be importable from creek.link."""
@@ -162,34 +194,467 @@ class TestEmbeddingLinker:
         assert any("resonance" in r.message.lower() for r in caplog.records)
 
 
+# ---- TemporalLink Model Tests ----
+
+
+class TestTemporalLink:
+    """Tests for the TemporalLink Pydantic model."""
+
+    def test_creation_with_all_fields(self) -> None:
+        """TemporalLink should accept all required fields."""
+        link = TemporalLink(
+            fragment_a_id="frag-aaaaaaaa",
+            fragment_b_id="frag-bbbbbbbb",
+            time_delta_hours=24.0,
+            overlap_score=0.6,
+            shared_dimensions=["primary_frequency", "wavelength_phase"],
+        )
+        assert link.fragment_a_id == "frag-aaaaaaaa"
+        assert link.fragment_b_id == "frag-bbbbbbbb"
+        assert link.time_delta_hours == 24.0
+        assert link.overlap_score == 0.6
+        assert link.shared_dimensions == ["primary_frequency", "wavelength_phase"]
+
+    def test_model_dump(self) -> None:
+        """TemporalLink model_dump should produce a serializable dict."""
+        link = TemporalLink(
+            fragment_a_id="frag-a",
+            fragment_b_id="frag-b",
+            time_delta_hours=12.5,
+            overlap_score=0.3,
+            shared_dimensions=["mode"],
+        )
+        dump = link.model_dump()
+        assert dump["fragment_a_id"] == "frag-a"
+        assert dump["overlap_score"] == 0.3
+        assert dump["shared_dimensions"] == ["mode"]
+
+    def test_empty_shared_dimensions(self) -> None:
+        """TemporalLink should allow empty shared_dimensions list."""
+        link = TemporalLink(
+            fragment_a_id="frag-a",
+            fragment_b_id="frag-b",
+            time_delta_hours=1.0,
+            overlap_score=0.2,
+            shared_dimensions=[],
+        )
+        assert link.shared_dimensions == []
+
+
 # ---- TemporalLinker Tests ----
 
 
 class TestTemporalLinker:
-    """Tests for the TemporalLinker stub class."""
+    """Tests for the TemporalLinker temporal proximity linking."""
 
-    def test_find_temporal_links_returns_empty_list(self) -> None:
-        """Stub find_temporal_links should return an empty list."""
-        linker = TemporalLinker()
-        fragments = [_make_fragment("A"), _make_fragment("B")]
-        result = linker.find_temporal_links(fragments, window_hours=168)
-        assert result == []
-        assert isinstance(result, list)
-
-    def test_find_temporal_links_empty_input(self) -> None:
+    def test_empty_input_returns_empty_list(self) -> None:
         """find_temporal_links with empty list should return empty list."""
         linker = TemporalLinker()
-        result = linker.find_temporal_links([], window_hours=24)
+        result = linker.find_temporal_links([], window_hours=168)
         assert result == []
 
-    def test_find_temporal_links_custom_window(self) -> None:
-        """find_temporal_links should accept custom window_hours."""
+    def test_single_fragment_returns_empty_list(self) -> None:
+        """A single fragment cannot form a pair."""
         linker = TemporalLinker()
         fragments = [_make_fragment("A")]
-        result = linker.find_temporal_links(fragments, window_hours=48)
+        result = linker.find_temporal_links(fragments, window_hours=168)
         assert result == []
 
-    def test_find_temporal_links_logs_message(self, caplog) -> None:
+    def test_same_source_no_links(self) -> None:
+        """Fragments from the same source should not be linked."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment("A", platform=SourcePlatform.CLAUDE, created=now),
+            _make_fragment("B", platform=SourcePlatform.CLAUDE, created=now),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert result == []
+
+    def test_cross_source_within_window_produces_link(self) -> None:
+        """Fragments from different sources within the window should link."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F1,
+                phase=Phase.RISING,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now + timedelta(hours=12),
+                primary_freq=Frequency.F1,
+                phase=Phase.RISING,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        assert isinstance(result[0], TemporalLink)
+
+    def test_outside_window_no_link(self) -> None:
+        """Fragments outside the time window should not link."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now + timedelta(hours=200),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert result == []
+
+    def test_custom_window_hours(self) -> None:
+        """Custom window_hours parameter should be respected."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F3,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now + timedelta(hours=30),
+                primary_freq=Frequency.F3,
+            ),
+        ]
+        # 24-hour window — fragments are 30 hours apart
+        result = linker.find_temporal_links(fragments, window_hours=24)
+        assert result == []
+
+        # 48-hour window — fragments are 30 hours apart
+        result = linker.find_temporal_links(fragments, window_hours=48)
+        assert len(result) == 1
+
+    def test_time_delta_hours_is_correct(self) -> None:
+        """TemporalLink time_delta_hours should reflect actual gap."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F1,
+                phase=Phase.RISING,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now + timedelta(hours=36),
+                primary_freq=Frequency.F1,
+                phase=Phase.RISING,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        assert result[0].time_delta_hours == 36.0
+
+    def test_score_same_primary_frequency(self) -> None:
+        """Same primary frequency should add +0.3 to overlap_score."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F5,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                primary_freq=Frequency.F5,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        # +0.3 (same primary freq) + 0.2 (different source) = 0.5
+        assert result[0].overlap_score == 0.5
+        assert "primary_frequency" in result[0].shared_dimensions
+
+    def test_score_shared_secondary_frequency(self) -> None:
+        """Shared secondary frequencies should add +0.1 each."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                secondary_freqs=[Frequency.F2, Frequency.F3],
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                secondary_freqs=[Frequency.F2, Frequency.F4],
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        # +0.1 (one shared secondary F2) + 0.2 (different source) = 0.3
+        assert result[0].overlap_score == 0.3
+        assert "secondary_frequency" in result[0].shared_dimensions
+
+    def test_score_same_wavelength_phase(self) -> None:
+        """Same wavelength phase should add +0.2 to overlap_score."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                phase=Phase.PEAKING,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                phase=Phase.PEAKING,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        # +0.2 (same phase) + 0.2 (different source) = 0.4
+        assert result[0].overlap_score == 0.4
+        assert "wavelength_phase" in result[0].shared_dimensions
+
+    def test_score_same_mode(self) -> None:
+        """Same mode should add +0.1 to overlap_score."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                mode=Mode.EXPRESS,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                mode=Mode.EXPRESS,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        # +0.1 (same mode) + 0.2 (different source) = 0.3
+        assert result[0].overlap_score == 0.3
+        assert "mode" in result[0].shared_dimensions
+
+    def test_score_shared_emotional_texture(self) -> None:
+        """Shared emotional_texture tags should add +0.1 each."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                emotional_texture=["joy", "curiosity", "awe"],
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                emotional_texture=["joy", "curiosity", "grief"],
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        # +0.2 (2 shared textures) + 0.2 (different source) = 0.4
+        assert result[0].overlap_score == 0.4
+        assert "emotional_texture" in result[0].shared_dimensions
+
+    def test_score_different_source_bonus(self) -> None:
+        """Different source platforms should add +0.2 to overlap_score."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        # Two fragments with no shared dimensions except cross-source
+        fragments = [
+            _make_fragment("A", platform=SourcePlatform.CLAUDE, created=now),
+            _make_fragment("B", platform=SourcePlatform.DISCORD, created=now),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        # Only +0.2 for different source — below default threshold
+        assert result == []
+
+    def test_combined_scoring(self) -> None:
+        """All scoring dimensions should combine correctly."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F1,
+                secondary_freqs=[Frequency.F2],
+                phase=Phase.RISING,
+                mode=Mode.INHABIT,
+                emotional_texture=["joy"],
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now + timedelta(hours=1),
+                primary_freq=Frequency.F1,
+                secondary_freqs=[Frequency.F2, Frequency.F3],
+                phase=Phase.RISING,
+                mode=Mode.INHABIT,
+                emotional_texture=["joy", "wonder"],
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        link = result[0]
+        # +0.3 (primary freq) + 0.1 (1 shared secondary F2)
+        # +0.2 (same phase) + 0.1 (same mode)
+        # +0.1 (1 shared emotional texture "joy")
+        # +0.2 (different source)
+        expected_score = 0.3 + 0.1 + 0.2 + 0.1 + 0.1 + 0.2
+        assert abs(link.overlap_score - expected_score) < 1e-9
+
+    def test_threshold_filtering(self) -> None:
+        """Links below the combined threshold should be excluded."""
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.5)
+        # Only different source (+0.2) — below 0.5 threshold
+        fragments = [
+            _make_fragment("A", platform=SourcePlatform.CLAUDE, created=now),
+            _make_fragment("B", platform=SourcePlatform.DISCORD, created=now),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert result == []
+
+    def test_threshold_includes_at_boundary(self) -> None:
+        """Links at exactly the threshold should be included."""
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.5)
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        # +0.3 (primary) + 0.2 (cross-source) = 0.5 — exactly at threshold
+        assert len(result) == 1
+
+    def test_multiple_pairs(self) -> None:
+        """Multiple qualifying pairs within window should all be returned."""
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.3)
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now + timedelta(hours=1),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "C",
+                platform=SourcePlatform.JOURNAL,
+                created=now + timedelta(hours=2),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        # A-B, A-C, B-C all cross-source with same freq
+        assert len(result) == 3
+
+    def test_unclassified_dimensions_do_not_score(self) -> None:
+        """UNCLASSIFIED values should not contribute to scoring."""
+        now = datetime.now()
+        linker = TemporalLinker()
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                primary_freq=Frequency.UNCLASSIFIED,
+                phase=Phase.UNCLASSIFIED,
+                mode=Mode.UNCLASSIFIED,
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                primary_freq=Frequency.UNCLASSIFIED,
+                phase=Phase.UNCLASSIFIED,
+                mode=Mode.UNCLASSIFIED,
+            ),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        # Only +0.2 for cross-source, below default threshold
+        assert result == []
+
+    def test_returns_list_of_temporal_links(self) -> None:
+        """Return type should be list[TemporalLink]."""
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.0)
+        fragments = [
+            _make_fragment("A", platform=SourcePlatform.CLAUDE, created=now),
+            _make_fragment("B", platform=SourcePlatform.DISCORD, created=now),
+        ]
+        result = linker.find_temporal_links(fragments, window_hours=168)
+        assert len(result) == 1
+        assert isinstance(result[0], TemporalLink)
+
+    def test_fragment_ids_in_link(self) -> None:
+        """TemporalLink should contain the correct fragment IDs."""
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.0)
+        frag_a = _make_fragment(
+            "A",
+            platform=SourcePlatform.CLAUDE,
+            created=now,
+        )
+        frag_b = _make_fragment(
+            "B",
+            platform=SourcePlatform.DISCORD,
+            created=now,
+        )
+        result = linker.find_temporal_links([frag_a, frag_b], window_hours=168)
+        assert len(result) == 1
+        ids = {result[0].fragment_a_id, result[0].fragment_b_id}
+        assert ids == {frag_a.id, frag_b.id}
+
+    def test_logs_info_message(self, caplog) -> None:
         """find_temporal_links should log an info message."""
         linker = TemporalLinker()
         fragments = [_make_fragment("A")]
