@@ -1,20 +1,22 @@
-"""Discord-specific pre-ingestion filters.
+"""Pre-ingestion content filters for the Creek clean pipeline.
 
-Provides :class:`DiscordFilter` for skipping low-value Discord messages
-(bots, emoji-only, command invocations, media-only, short messages,
-link dumps) before fragment creation.
+Provides :class:`FilterResult`, the common return type for all filters,
+and re-exports concrete filter implementations: :class:`MarkdownFilter`
+for markdown files and :class:`DiscordFilter` for Discord messages.
 """
 
+from creek.clean.filters._result import FilterResult
 from creek.clean.filters.discord import (
     DiscordFilter,
     DiscordFilterConfig,
-    FilterResult,
     FilterStats,
 )
+from creek.clean.filters.markdown import MarkdownFilter
 
 __all__ = [
     "DiscordFilter",
     "DiscordFilterConfig",
     "FilterResult",
     "FilterStats",
+    "MarkdownFilter",
 ]

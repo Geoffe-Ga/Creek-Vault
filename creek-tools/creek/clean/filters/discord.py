@@ -17,6 +17,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from creek.clean.filters._result import FilterResult
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -57,18 +59,6 @@ _COMMAND_PATTERN: re.Pattern[str] = re.compile(
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
-
-
-class FilterResult(BaseModel):
-    """Result of filtering a single Discord message.
-
-    Attributes:
-        keep: Whether to keep the message (``True``) or skip it.
-        reason: The filter rule that caused skipping, or ``None`` if kept.
-    """
-
-    keep: bool
-    reason: str | None = None
 
 
 class FilterStats(BaseModel):

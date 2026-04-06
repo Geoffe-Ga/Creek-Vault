@@ -89,46 +89,64 @@ class ClassificationConfig(BaseModel):
     """Sources that require human review after classification."""
 
 
-class CleaningDiscordConfig(BaseModel):
-    """Discord pre-ingestion filter configuration.
+class ContextConfig(BaseModel):
+    """Non-user content handling configuration.
 
-    All filter rules are enabled by default.
+    Controls how content authored by others (e.g. Discord messages,
+    collaborative documents) is represented in the vault.
     """
 
-    skip_bots: bool = True
-    """Skip messages where ``author.isBot`` is true."""
+    mode: str = "context_metadata"
+    """Handling mode: ``context_metadata``, ``low_priority``, or ``skip``.
 
-    skip_emoji_only: bool = True
-    """Skip messages consisting exclusively of emoji."""
+    - ``context_metadata``: Store others' content as context in the user's
+      fragment; do not index separately.
+    - ``low_priority``: Ingest as separate fragments with ``author: other``
+      and reduced quality scores; exclude from voice proxy.
+    - ``skip``: Drop others' content entirely; preserve only user's words.
+    """
 
-    skip_commands: bool = True
-    """Skip messages starting with a command prefix."""
+    quality_penalty: float = 0.5
+    """Multiplier applied to quality scores for ``low_priority`` fragments."""
 
-    skip_media_only: bool = True
-    """Skip attachment-only messages lacking text."""
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        """Validate that *v* is a recognised content handling mode.
 
-    skip_below_min_length: bool = True
-    """Skip messages shorter than ``min_length``."""
+        Args:
+            v: Mode string to validate.
 
-    flag_link_dumps: bool = True
-    """Skip messages that are exclusively URLs."""
+        Returns:
+            The validated mode string.
 
-    min_length: int = 3
-    """Minimum content length in characters."""
+        Raises:
+            ValueError: If the mode is not one of the allowed values.
+        """
+        allowed = {"context_metadata", "low_priority", "skip"}
+        if v not in allowed:
+            msg = f"Invalid context mode: {v!r}. Must be one of {allowed}"
+            raise ValueError(msg)
+        return v
 
-    command_prefixes: list[str] = Field(
-        default_factory=lambda: ["/", "!", "."],
-    )
-    """Characters that indicate a command invocation."""
+    @field_validator("quality_penalty")
+    @classmethod
+    def validate_quality_penalty(cls, v: float) -> float:
+        """Validate quality penalty is in [0.0, 1.0].
 
+        Args:
+            v: Penalty multiplier to validate.
 
-class CleaningConfig(BaseModel):
-    """Content cleaning and filtering configuration."""
+        Returns:
+            The validated penalty value.
 
-    discord: CleaningDiscordConfig = Field(
-        default_factory=CleaningDiscordConfig,
-    )
-    """Discord-specific pre-ingestion filter settings."""
+        Raises:
+            ValueError: If the penalty is outside the valid range.
+        """
+        if not 0.0 <= v <= 1.0:
+            msg = f"quality_penalty must be in [0.0, 1.0], got {v}"
+            raise ValueError(msg)
+        return v
 
 
 class RedactionConfig(BaseModel):
@@ -145,6 +163,25 @@ class RedactionConfig(BaseModel):
 
     false_positive_allowlist: list[str] = Field(default_factory=list)
     """Strings that should never be flagged as PII."""
+
+    supported_extensions: list[str] = Field(
+        default_factory=lambda: [
+            ".txt",
+            ".md",
+            ".json",
+            ".py",
+            ".env",
+            ".yaml",
+            ".toml",
+            ".csv",
+        ],
+    )
+    """File extensions the scanner will process."""
+
+    exclude_patterns: list[str] = Field(
+        default_factory=lambda: [".git", "node_modules"],
+    )
+    """Directory name patterns to exclude from recursive scanning."""
 
 
 _READONLY_SCOPES: set[str] = {
@@ -190,6 +227,148 @@ class GoogleDriveConfig(BaseModel):
                 msg = f"Only read-only scopes allowed. Got: {scope}"
                 raise ValueError(msg)
         return v
+
+
+class DiscordCleaningConfig(BaseModel):
+    """Discord message cleaning configuration."""
+
+    filter_bot_messages: bool = True
+    """Whether to filter out messages from bots."""
+
+    strip_emoji: bool = False
+    """Whether to strip emoji characters from messages."""
+
+    filter_commands: bool = True
+    """Whether to filter out bot command messages (e.g. ``!help``)."""
+
+    min_message_length: int = 10
+    """Minimum character length for a message to be kept."""
+
+
+class ChatbotCleaningConfig(BaseModel):
+    """Chatbot export cleaning configuration."""
+
+    filter_system_prompts: bool = True
+    """Whether to filter out system prompt content."""
+
+    filter_tool_outputs: bool = True
+    """Whether to filter out tool/function call outputs."""
+
+    filter_regenerations: bool = True
+    """Whether to filter out regenerated responses."""
+
+
+class MarkdownCleaningConfig(BaseModel):
+    """Markdown file cleaning configuration."""
+
+    skip_empty_files: bool = True
+    """Whether to skip files with no meaningful body content."""
+
+    min_body_length: int = 50
+    """Minimum character length for the body to be considered non-empty."""
+
+
+class GoogleDriveCleaningConfig(BaseModel):
+    """Google Drive document cleaning configuration."""
+
+    deduplicate: bool = True
+    """Whether to deduplicate downloaded documents."""
+
+    filter_empty_docs: bool = True
+    """Whether to filter out empty or placeholder documents."""
+
+    max_collaboration_ratio: float = 0.9
+    """Maximum ratio of non-owner edits before a doc is flagged as collaborative."""
+
+
+class ValidationConfig(BaseModel):
+    """Content validation configuration."""
+
+    min_characters: int = 20
+    """Minimum character count for valid content."""
+
+    min_words: int = 5
+    """Minimum word count for valid content."""
+
+    max_stop_word_ratio: float = 0.8
+    """Maximum ratio of stop words before content is flagged as low-quality."""
+
+    require_metadata: bool = True
+    """Whether to require metadata fields (title, date, source)."""
+
+
+class QualityConfig(BaseModel):
+    """Quality scoring configuration."""
+
+    accept_threshold: float = 0.7
+    """Minimum quality score to automatically accept content."""
+
+    skip_threshold: float = 0.3
+    """Quality score below which content is automatically skipped."""
+
+
+class DeduplicationConfig(BaseModel):
+    """Deduplication configuration."""
+
+    strategy: str = "fuzzy"
+    """Matching strategy — ``exact`` or ``fuzzy``."""
+
+    similarity_threshold: float = 0.85
+    """Minimum similarity score for fuzzy deduplication."""
+
+
+class HygieneConfig(BaseModel):
+    """Data hygiene configuration."""
+
+    track_orphans: bool = True
+    """Whether to track orphaned fragments with no connections."""
+
+    staleness_days: int = 90
+    """Number of days before a fragment is considered stale."""
+
+
+class CleaningConfig(BaseModel):
+    """Top-level cleaning pipeline configuration."""
+
+    discord: DiscordCleaningConfig = Field(
+        default_factory=DiscordCleaningConfig,
+    )
+    """Discord message cleaning settings."""
+
+    chatbot: ChatbotCleaningConfig = Field(
+        default_factory=ChatbotCleaningConfig,
+    )
+    """Chatbot export cleaning settings."""
+
+    markdown: MarkdownCleaningConfig = Field(
+        default_factory=MarkdownCleaningConfig,
+    )
+    """Markdown file cleaning settings."""
+
+    google_drive: GoogleDriveCleaningConfig = Field(
+        default_factory=GoogleDriveCleaningConfig,
+    )
+    """Google Drive document cleaning settings."""
+
+    validation: ValidationConfig = Field(
+        default_factory=ValidationConfig,
+    )
+    """Content validation settings."""
+
+    quality: QualityConfig = Field(
+        default_factory=QualityConfig,
+    )
+    """Quality scoring settings."""
+
+    deduplication: DeduplicationConfig = Field(
+        default_factory=DeduplicationConfig,
+    )
+    """Deduplication settings."""
+
+    hygiene: HygieneConfig = Field(
+        default_factory=HygieneConfig,
+    )
+    """Data hygiene settings."""
 
 
 class SourcePaths(BaseModel):
@@ -258,8 +437,8 @@ class CreekConfig(BaseSettings):
     )
     """Classification pipeline settings."""
 
-    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
-    """Content cleaning and filtering settings."""
+    context: ContextConfig = Field(default_factory=ContextConfig)
+    """Non-user content handling settings."""
 
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
     """PII redaction scanner settings."""
@@ -271,6 +450,9 @@ class CreekConfig(BaseSettings):
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
+
+    cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
+    """Data cleaning pipeline settings."""
 
     @field_validator("timezone")
     @classmethod

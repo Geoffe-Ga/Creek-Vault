@@ -175,8 +175,36 @@ class SourcePlatform(StrEnum):
     ESSAY = "essay"
     CODE = "code"
     EMAIL = "email"
+    DOCUMENT = "document"
     IMAGE_OCR = "image_ocr"
     OTHER = "other"
+
+
+class Authorship(StrEnum):
+    """Authorship classification for a fragment's content.
+
+    Determines whose words a fragment contains, used by the
+    :class:`~creek.clean.context.ContextExtractor` to apply non-user
+    content handling rules.
+    """
+
+    SELF = "self"
+    AI = "ai"
+    OTHER = "other"
+    COLLABORATIVE = "collaborative"
+
+
+class PrivacyTier(StrEnum):
+    """Privacy classification tier for fragment content.
+
+    Controls visibility and handling restrictions. ``intimate`` content
+    is reserved exclusively for self-authored fragments.
+    """
+
+    PUBLIC = "public"
+    PERSONAL = "personal"
+    INTIMATE = "intimate"
+    UNCLASSIFIED = "unclassified"
 
 
 # ---- ID Generation Helpers ----
@@ -226,6 +254,7 @@ class FragmentSource(BaseModel):
     conversation_id: str | None = None
     channel: str | None = None
     interlocutor: str | None = None
+    author: Authorship = Authorship.SELF
 
 
 class FrequencyClassification(BaseModel):
@@ -288,6 +317,9 @@ class Fragment(BaseModel):
     threads: list[str] = Field(default_factory=list)
     eddies: list[str] = Field(default_factory=list)
     praxis_potential: PraxisPotential = PraxisPotential.NONE
+    privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED
+    context: list[str] = Field(default_factory=list)
+    voice_proxy_eligible: bool = True
     tags: list[str] = Field(default_factory=list)
 
 
