@@ -115,6 +115,10 @@ module = "frontmatter"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["markdownify", "pdfminer", "pdfminer.*", "docx", "docx.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 
@@ -145,4 +149,3 @@ ignore = []
 [tool.bandit]
 exclude_dirs = ["tests", "venv", "virtualenv"]
 skips = ["B101"]  # Skip assert_used in tests
-
