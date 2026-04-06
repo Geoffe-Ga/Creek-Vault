@@ -412,7 +412,7 @@ class TestLoadConfig:
         config_file = tmp_path / "creek_config.yaml"
         config_data = {
             "vault_path": "/home/user/vault",
-            "timezone": "US/Eastern",
+            "timezone": "America/New_York",
             "llm": {"provider": "anthropic", "model": "claude-3"},
             "embeddings": {"similarity_threshold": 0.85},
         }
@@ -420,7 +420,7 @@ class TestLoadConfig:
 
         cfg = load_config(config_file)
         assert cfg.vault_path == Path("/home/user/vault")
-        assert cfg.timezone == "US/Eastern"
+        assert cfg.timezone == "America/New_York"
         assert cfg.llm.provider == "anthropic"
         assert cfg.llm.model == "claude-3"
         assert cfg.embeddings.similarity_threshold == 0.85

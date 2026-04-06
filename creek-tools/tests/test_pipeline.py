@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from creek.config import CreekConfig
+from creek.consent import ConsentManager
 from creek.pipeline import Pipeline, PipelineResult
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 # Fixtures
 # ---------------------------------------------------------------------------
 
+# Standard vault directories created for every test.
 VAULT_DIRS: list[str] = [
     "00-Creek-Meta/Processing-Log",
     "01-Fragments/Conversations",
@@ -41,7 +43,6 @@ VAULT_DIRS: list[str] = [
     "08-Decisions/Active",
     "08-Decisions/Archive",
 ]
-"""Standard vault directories created for every test."""
 
 
 @pytest.fixture()
@@ -597,3 +598,80 @@ class TestFixtures:
         content = (fixtures_dir / "sample_fragment.md").read_text()
         assert content.startswith("---")
         assert content.count("---") >= 2
+
+
+# ---------------------------------------------------------------------------
+# Pipeline consent gating tests
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineConsent:
+    """Tests for Pipeline consent gating via ConsentManager."""
+
+    def test_no_consent_manager_runs_normally(self, config, vault_path, source_path):
+        """Pipeline without consent_manager should run all stages."""
+        pipeline = Pipeline(config=config)
+        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.files_scanned > 0
+        assert result.fragments_created > 0
+
+    def test_consent_granted_runs_ingestion(
+        self, config, vault_path, source_path, tmp_path
+    ):
+        """Pipeline with granted consent should run ingestion."""
+        log_dir = tmp_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True)
+        cm = ConsentManager(log_dir=log_dir)
+        cm.record_consent(
+            source_type="pipeline",
+            source_path=str(source_path),
+            file_count=3,
+            exclusions=[],
+            operator="test",
+        )
+        pipeline = Pipeline(config=config, consent_manager=cm)
+        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.fragments_created > 0
+
+    def test_consent_denied_skips_ingestion(
+        self, config, vault_path, source_path, tmp_path
+    ):
+        """Pipeline without consent should skip ingestion."""
+        log_dir = tmp_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True)
+        cm = ConsentManager(log_dir=log_dir)
+        # No consent recorded
+        pipeline = Pipeline(config=config, consent_manager=cm)
+        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.fragments_created == 0
+        assert result.classifications_made == 0
+
+    def test_consent_denied_still_scans_files(
+        self, config, vault_path, source_path, tmp_path
+    ):
+        """Pipeline without consent should still scan files for redaction."""
+        log_dir = tmp_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True)
+        cm = ConsentManager(log_dir=log_dir)
+        pipeline = Pipeline(config=config, consent_manager=cm)
+        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.files_scanned > 0
+
+    def test_consent_denied_still_generates_indexes(
+        self, config, vault_path, source_path, tmp_path
+    ):
+        """Pipeline without consent should still generate indexes."""
+        log_dir = tmp_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True)
+        cm = ConsentManager(log_dir=log_dir)
+        pipeline = Pipeline(config=config, consent_manager=cm)
+        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.indexes_generated >= 4
+
+    def test_consent_manager_stored_on_pipeline(self, config, tmp_path):
+        """Pipeline should store the consent_manager attribute."""
+        log_dir = tmp_path / "log"
+        log_dir.mkdir()
+        cm = ConsentManager(log_dir=log_dir)
+        pipeline = Pipeline(config=config, consent_manager=cm)
+        assert pipeline.consent_manager is cm
