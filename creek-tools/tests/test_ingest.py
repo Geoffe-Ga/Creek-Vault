@@ -749,6 +749,7 @@ class TestIngestPackage:
         assert "chatgpt" in INGESTOR_REGISTRY
         assert "claude" in INGESTOR_REGISTRY
         assert "discord" in INGESTOR_REGISTRY
+        assert "generic" in INGESTOR_REGISTRY
         assert "markdown" in INGESTOR_REGISTRY
 
     def test_base_classes_importable(self) -> None:

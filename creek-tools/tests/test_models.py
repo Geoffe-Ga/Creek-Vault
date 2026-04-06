@@ -239,7 +239,7 @@ class TestSourcePlatformEnum:
     """Tests for the SourcePlatform enum."""
 
     def test_all_platforms_exist(self) -> None:
-        """Verify all 9 source platform values exist."""
+        """Verify all 10 source platform values exist."""
         expected = [
             "claude",
             "chatgpt",
@@ -248,6 +248,7 @@ class TestSourcePlatformEnum:
             "essay",
             "code",
             "email",
+            "document",
             "image_ocr",
             "other",
         ]

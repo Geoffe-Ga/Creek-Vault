@@ -164,6 +164,25 @@ class RedactionConfig(BaseModel):
     false_positive_allowlist: list[str] = Field(default_factory=list)
     """Strings that should never be flagged as PII."""
 
+    supported_extensions: list[str] = Field(
+        default_factory=lambda: [
+            ".txt",
+            ".md",
+            ".json",
+            ".py",
+            ".env",
+            ".yaml",
+            ".toml",
+            ".csv",
+        ],
+    )
+    """File extensions the scanner will process."""
+
+    exclude_patterns: list[str] = Field(
+        default_factory=lambda: [".git", "node_modules"],
+    )
+    """Directory name patterns to exclude from recursive scanning."""
+
 
 _READONLY_SCOPES: set[str] = {
     "https://www.googleapis.com/auth/drive.readonly",
