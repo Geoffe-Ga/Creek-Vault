@@ -6,8 +6,8 @@ from creek.generate.tags import TagGardenGenerator, TagScanResult
 
 __all__ = [
     "DECISION_KEYWORDS",
-    "DecisionDetector",
     "FREQUENCY_NAMES",
+    "DecisionDetector",
     "IndexGenerator",
     "TagGardenGenerator",
     "TagScanResult",
