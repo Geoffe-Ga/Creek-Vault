@@ -269,6 +269,24 @@ class TestMarkdownTagging:
         )
         assert result.author == "other"
 
+    def test_journal_with_empty_author_defaults_to_self(self) -> None:
+        """Journal with empty-string author should default to self."""
+        tagger = AuthorshipTagger()
+        result = tagger.tag(
+            platform="journal",
+            metadata={"author": ""},
+        )
+        assert result.author == "self"
+
+    def test_journal_with_whitespace_author_defaults_to_self(self) -> None:
+        """Journal with whitespace-only author should default to self."""
+        tagger = AuthorshipTagger()
+        result = tagger.tag(
+            platform="journal",
+            metadata={"author": "   "},
+        )
+        assert result.author == "self"
+
     def test_markdown_reason_included(self) -> None:
         """Markdown/journal tagging should include a reason."""
         tagger = AuthorshipTagger()

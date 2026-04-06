@@ -192,7 +192,7 @@ class AuthorshipTagger:
         """
         explicit_author = metadata.get("author")
 
-        if explicit_author is not None:
+        if explicit_author is not None and str(explicit_author).strip():
             return AuthorshipResult(
                 author="other",
                 confidence=0.7,
