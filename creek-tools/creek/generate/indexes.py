@@ -6,23 +6,323 @@ YAML frontmatter and Dataview query blocks that dynamically aggregate
 vault content.
 """
 
-from pathlib import Path
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from creek.models import Frequency
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 FREQUENCY_NAMES: dict[Frequency, str] = {
-    Frequency.F1: "Survival/Safety",
-    Frequency.F2: "Connection/Belonging",
-    Frequency.F3: "Power/Agency",
-    Frequency.F4: "Order/Structure",
-    Frequency.F5: "Achievement/Strategy",
-    Frequency.F6: "Community/Harmony",
-    Frequency.F7: "Systems/Integration",
-    Frequency.F8: "Holistic/Global",
-    Frequency.F9: "Cosmic/Transpersonal",
-    Frequency.F10: "Unity/Transcendence",
+    Frequency.F1: "Agency/Survival",
+    Frequency.F2: "Receptivity/Kinship",
+    Frequency.F3: "Self-Love/Power",
+    Frequency.F4: "Community-Love/Conformity",
+    Frequency.F5: "Achievism/Innovation",
+    Frequency.F6: "Pluralism/Empathy",
+    Frequency.F7: "Integration/Systems",
+    Frequency.F8: "True-Self/Transcendence",
+    Frequency.F9: "Unity/Cosmic",
+    Frequency.F10: "Emptiness/Impermanence",
 }
 """Mapping from Frequency enum values to human-readable APTITUDE names."""
+
+FREQUENCY_COLORS: dict[Frequency, str] = {
+    Frequency.F1: "beige",
+    Frequency.F2: "purple",
+    Frequency.F3: "red",
+    Frequency.F4: "blue",
+    Frequency.F5: "orange",
+    Frequency.F6: "green",
+    Frequency.F7: "yellow",
+    Frequency.F8: "teal",
+    Frequency.F9: "ultraviolet",
+    Frequency.F10: "clear_light",
+}
+"""Mapping from Frequency enum values to their ontology color designations."""
+
+FREQUENCY_THEMES: dict[Frequency, str] = {
+    Frequency.F1: "Survival, intentional action, willpower, initiative",
+    Frequency.F2: (
+        "Kinship, receptivity to pleasure and Source,"
+        " intuitive divination, surrender, trust"
+    ),
+    Frequency.F3: (
+        "Self-love as the foundation of healthy power;"
+        " assertion, individuality, strength, confidence"
+    ),
+    Frequency.F4: (
+        "Community love; devotion, moral grounding,"
+        " hierarchy, belonging through shared values"
+    ),
+    Frequency.F5: "Innovation, analysis, goal-setting, material success",
+    Frequency.F6: "Empathy, inclusivity, embodied connection, shadow work",
+    Frequency.F7: "Systems thinking, synthesis, holistic understanding",
+    Frequency.F8: (
+        "Higher self, monad, deep intuition;"
+        " communicating with true self yields alignment"
+    ),
+    Frequency.F9: "Source connection, cosmic harmony, non-dual awareness",
+    Frequency.F10: "Impermanence, no-self, egolessness",
+}
+"""Core thematic descriptions for each frequency from the ontology."""
+
+FREQUENCY_SIGNALS: dict[Frequency, str] = {
+    Frequency.F1: (
+        "Goal-setting, project planning, proactive problem-solving,"
+        " taking charge, discipline, basic needs"
+    ),
+    Frequency.F2: (
+        "Letting go, accepting help, ancestral bonds, community rituals,"
+        " shared myths, slowing down, receiving pleasure,"
+        " divination/tarot/oracle work"
+    ),
+    Frequency.F3: (
+        "Leadership, boundary-setting, authentic confidence,"
+        " self-compassion, healing shame, embodying worth,"
+        " healthy competition, victories"
+    ),
+    Frequency.F4: (
+        "Rules, authority, purpose, faith, discipline, service,"
+        " frustration with rigidity, moral frameworks,"
+        " showing up for others"
+    ),
+    Frequency.F5: (
+        "Theory-building, critical thinking, research,"
+        " experimentation, status, competition"
+    ),
+    Frequency.F6: (
+        "Relationships, community building, vulnerability,"
+        " sensitivity, performative vs. genuine connection"
+    ),
+    Frequency.F7: (
+        "Connecting frameworks, seeing patterns,"
+        " building personal philosophy, meta-cognition,"
+        " creative destruction"
+    ),
+    Frequency.F8: (
+        "Deep intuition, higher-self dialogue, gnosis,"
+        " channeling, synchronicity,"
+        " acting from alignment rather than ego"
+    ),
+    Frequency.F9: (
+        "Mystical experience, oneness,"
+        " dissolution of self/other, devotion, bliss,"
+        " flow with universal will"
+    ),
+    Frequency.F10: (
+        "Buddhist insights, letting go of attainment,"
+        " void, groundlessness, humor about it all"
+    ),
+}
+"""Content classification signals for each frequency."""
+
+_WAVELENGTH_PHASES: list[str] = [
+    "Rising",
+    "Peaking",
+    "Withdrawal",
+    "Diminishing",
+    "Bottoming Out",
+    "Restoration",
+]
+"""Six wavelength phases used in dosage tables."""
+
+_DOSAGE_MEDICINE: dict[Frequency, list[str]] = {
+    Frequency.F1: [
+        "Commitment",
+        "Diligence",
+        "Steadiness",
+        "Security",
+        "Planning",
+        "Next Habit",
+    ],
+    Frequency.F2: [
+        "Inspiration",
+        "Joy",
+        "Introspectivity",
+        "Tranquility",
+        "Convalescence",
+        "Recuperation",
+    ],
+    Frequency.F3: [
+        "Leading",
+        "Power-With",
+        "Stepping Back",
+        "Self-Acceptance",
+        "Following",
+        "Assembling",
+    ],
+    Frequency.F4: [
+        "Ambition",
+        "Attunement",
+        "Discernment",
+        "Conviction",
+        "Surrender",
+        "Catharsis",
+    ],
+    Frequency.F5: [
+        "Hypothesize",
+        "Experiment",
+        "Collect Data",
+        "Analyze",
+        "Synthesize",
+        "Question",
+    ],
+    Frequency.F6: [
+        "Connection",
+        "Belonging",
+        "Retirement",
+        "Unwinding",
+        "Repose",
+        "Vulnerability",
+    ],
+    Frequency.F7: [
+        "Rebellion",
+        "Anarchy",
+        "Organize",
+        "Establish",
+        "Order",
+        "Disintegrate",
+    ],
+    Frequency.F8: [
+        "Epiphany",
+        "Gnosis",
+        "Receptivity",
+        "Absorption",
+        "Metabolism",
+        "Pattern-Seeking",
+    ],
+    Frequency.F9: [
+        "Unification of Mind",
+        "Jhana",
+        "Metta and Meditative Joy",
+        "Sustained Attention",
+        "Pleasure",
+        "Directed Attention",
+    ],
+}
+"""Medicine (right-sized) dosage expressions per frequency and phase.
+
+Note: F10 (Clear Light / Emptiness) has no dosage mapping in the ontology.
+The dosage framework covers F1-F9 colors (Beige through Ultraviolet).
+"""
+
+_DOSAGE_TOXIC: dict[Frequency, list[str]] = {
+    Frequency.F1: [
+        "Overcommitment",
+        "Thriving",
+        "Burnout",
+        "Grasping",
+        "Overwhelm",
+        "New Plan",
+    ],
+    Frequency.F2: [
+        "Grandiosity",
+        "Ecstasy",
+        "Anxiety",
+        "Self-Doubt",
+        "Self-Loathing",
+        "Selfishness",
+    ],
+    Frequency.F3: [
+        "Dominating",
+        "Power-Over",
+        "Crumbling",
+        "Shame",
+        "Subjugation",
+        "Revenge",
+    ],
+    Frequency.F4: [
+        "Voraciousness",
+        "Leprosy",
+        "Self-Medication",
+        "Rage",
+        "Misery",
+        "Self-Repression",
+    ],
+    Frequency.F5: [
+        "Assert",
+        "Crusade",
+        "Overlook Details",
+        "Force it",
+        "Fail",
+        "Presume",
+    ],
+    Frequency.F6: [
+        "Oversharing",
+        "Megalomania",
+        "Social Anxiety",
+        "Alienation",
+        "Isolation",
+        "Bitterness",
+    ],
+    Frequency.F7: [
+        "Mischief",
+        "Chaos",
+        "Discord",
+        "Confusion",
+        "Bureaucracy",
+        "The Aftermath",
+    ],
+    Frequency.F8: [
+        "Delusion",
+        "Psychosis",
+        "Paranoia",
+        "Horror",
+        "Despair",
+        "Belief Salience",
+    ],
+    Frequency.F9: [
+        "Worldly Desire",
+        "Bliss Addiction",
+        "Agitation Due to Worry or Remorse",
+        "Doubt",
+        "Aversion",
+        "Laziness or Lethargy",
+    ],
+}
+"""Toxic (overdose) dosage expressions per frequency and phase.
+
+Note: F10 (Clear Light / Emptiness) has no dosage mapping in the ontology.
+The dosage framework covers F1-F9 colors (Beige through Ultraviolet).
+"""
+
+_CROSS_FREQUENCY_LINKS: dict[Frequency, list[str]] = {
+    Frequency.F1: ["F3 (Power grounded in agency)", "F5 (Strategy from will)"],
+    Frequency.F2: ["F6 (Empathy from kinship)", "F9 (Source from surrender)"],
+    Frequency.F3: [
+        "F1 (Agency fuels power)",
+        "F4 (Self-love grounds community love)",
+    ],
+    Frequency.F4: [
+        "F3 (Power grounded in community)",
+        "F6 (Shared values to empathy)",
+    ],
+    Frequency.F5: ["F1 (Will to achieve)", "F7 (Analysis to integration)"],
+    Frequency.F6: [
+        "F2 (Kinship to community)",
+        "F4 (Belonging through values)",
+    ],
+    Frequency.F7: [
+        "F5 (Analysis to synthesis)",
+        "F8 (Integration to transcendence)",
+    ],
+    Frequency.F8: [
+        "F7 (Systems to true self)",
+        "F9 (Transcendence to unity)",
+    ],
+    Frequency.F9: [
+        "F8 (True self to cosmic harmony)",
+        "F10 (Unity to emptiness)",
+    ],
+    Frequency.F10: [
+        "F9 (Unity dissolves into emptiness)",
+        "F2 (Emptiness returns to receptivity)",
+    ],
+}
+"""Developmental links between frequencies for cross-referencing."""
 
 
 def _build_note(frontmatter: dict[str, str], body: str) -> str:
@@ -42,6 +342,106 @@ def _build_note(frontmatter: dict[str, str], body: str) -> str:
     lines.append("")
     lines.append(body)
     return "\n".join(lines)
+
+
+def _build_frequency_body(freq: Frequency, freq_code: str, name: str) -> str:
+    """Build the full markdown body for a frequency index note.
+
+    Assembles all sections: description, Dataview queries (primary,
+    secondary, threads), statistics, dosage table, and cross-frequency links.
+
+    Args:
+        freq: The Frequency enum member.
+        freq_code: Short code like ``"F1"``.
+        name: Human-readable frequency name.
+
+    Returns:
+        Complete markdown body string.
+    """
+    parts: list[str] = []
+
+    # Title
+    parts.append(f"# {freq_code} — {name}\n")
+
+    # Description
+    parts.append("## Description\n")
+    parts.append(f"**Core Theme:** {FREQUENCY_THEMES[freq]}\n")
+    parts.append(f"**Color:** {FREQUENCY_COLORS[freq].replace('_', ' ').title()}\n")
+    parts.append(f"**Signals:** {FREQUENCY_SIGNALS[freq]}\n")
+
+    # Primary fragments query
+    parts.append("## Fragments\n")
+    parts.append("```dataview")
+    parts.append("TABLE frequency.primary, wavelength.phase, created")
+    parts.append('FROM "01-Fragments"')
+    parts.append(f'WHERE frequency.primary = "{freq_code}"')
+    parts.append("SORT created DESC")
+    parts.append("```\n")
+
+    # Secondary frequency query
+    parts.append("## Secondary Frequency Appearances\n")
+    parts.append("```dataview")
+    parts.append("TABLE frequency.primary, frequency.secondary, created")
+    parts.append('FROM "01-Fragments"')
+    parts.append(f'WHERE contains(frequency.secondary, "{freq_code}")')
+    parts.append("SORT created DESC")
+    parts.append("```\n")
+
+    # Threads by frequency affinity
+    parts.append("## Threads\n")
+    parts.append("```dataview")
+    parts.append("TABLE status, first_seen, last_seen, fragment_count")
+    parts.append('FROM "02-Threads"')
+    parts.append(f'WHERE contains(frequency_affinity, "{freq_code}")')
+    parts.append("SORT last_seen DESC")
+    parts.append("```\n")
+
+    # Statistics
+    parts.append("## Statistics\n")
+    parts.append("```dataview")
+    parts.append("TABLE length(rows) AS count")
+    parts.append('FROM "01-Fragments"')
+    parts.append(f'WHERE frequency.primary = "{freq_code}"')
+    parts.append('GROUP BY dateformat(created, "yyyy-MM") AS month')
+    parts.append("SORT month DESC")
+    parts.append("```\n")
+
+    # Dosage table (F10 has no dosage mapping in the ontology)
+    if freq in _DOSAGE_MEDICINE:
+        parts.append("## Medicine vs. Toxic Dose\n")
+        parts.append(_build_dosage_table(freq))
+
+    # Cross-frequency links
+    parts.append("## Cross-Frequency Links\n")
+    for link in _CROSS_FREQUENCY_LINKS[freq]:
+        parts.append(f"- {link}")
+    parts.append("")
+
+    return "\n".join(parts)
+
+
+def _build_dosage_table(freq: Frequency) -> str:
+    """Build a markdown table comparing medicine and toxic dosage expressions.
+
+    Creates a table with wavelength phases as columns and medicine/toxic
+    rows for the given frequency.
+
+    Args:
+        freq: The Frequency enum member to build the table for.
+
+    Returns:
+        Markdown table string with header, medicine row, and toxic row.
+    """
+    header = "| | " + " | ".join(_WAVELENGTH_PHASES) + " |"
+    separator = "| --- " + "| --- " * len(_WAVELENGTH_PHASES) + "|"
+
+    medicine = _DOSAGE_MEDICINE[freq]
+    toxic = _DOSAGE_TOXIC[freq]
+
+    med_row = "| **Medicine** | " + " | ".join(medicine) + " |"
+    tox_row = "| **Toxic** | " + " | ".join(toxic) + " |"
+
+    return "\n".join([header, separator, med_row, tox_row, ""])
 
 
 class IndexGenerator:
@@ -67,8 +467,9 @@ class IndexGenerator:
         """Generate one index note per frequency in 06-Frequencies/ subdirs.
 
         Scans existing frequency subdirectories (F1 through F10) and creates
-        a markdown index note in each one with a Dataview query that lists
-        fragments classified under that frequency.
+        a markdown index note in each one containing ontology descriptions,
+        Dataview queries for fragments/threads, dosage comparison tables,
+        statistics, and cross-frequency developmental links.
 
         Returns:
             List of paths to the generated frequency index files.
@@ -77,33 +478,20 @@ class IndexGenerator:
         generated: list[Path] = []
 
         for freq, name in FREQUENCY_NAMES.items():
-            freq_code = freq.value  # e.g., "F1"
-            # Find matching subdirectory
+            freq_code = freq.value
             subdir = self._find_frequency_subdir(freq_dir, freq_code)
             if subdir is None:
                 continue
 
+            color = FREQUENCY_COLORS[freq]
             frontmatter = {
                 "type": "frequency-index",
                 "frequency": freq_code,
+                "color": color,
                 "title": f'"{freq_code} — {name} Index"',
             }
 
-            body = f"# {freq_code} — {name}\n\n"
-            body += "## Fragments\n\n"
-            body += "```dataview\n"
-            body += "TABLE frequency.primary, wavelength.phase, created\n"
-            body += 'FROM "01-Fragments"\n'
-            body += f'WHERE frequency.primary = "{freq_code}"\n'
-            body += "SORT created DESC\n"
-            body += "```\n\n"
-            body += "## Secondary Frequency Appearances\n\n"
-            body += "```dataview\n"
-            body += "TABLE frequency.primary, frequency.secondary, created\n"
-            body += 'FROM "01-Fragments"\n'
-            body += f'WHERE contains(frequency.secondary, "{freq_code}")\n'
-            body += "SORT created DESC\n"
-            body += "```\n"
+            body = _build_frequency_body(freq, freq_code, name)
 
             note_path = subdir / f"{freq_code}-Index.md"
             note_path.write_text(_build_note(frontmatter, body), encoding="utf-8")
