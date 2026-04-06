@@ -3,6 +3,9 @@
 The :class:`Pipeline` class initialises every subsystem (redaction, ingestion,
 classification, linking, indexing) and executes them in sequence against a
 source directory, producing a :class:`PipelineResult` with aggregate counts.
+
+Processing is gated on user consent via :class:`~creek.consent.ConsentManager`:
+if consent has not been recorded for a source, the pipeline skips ingestion.
 """
 
 import logging
@@ -14,6 +17,7 @@ from creek.classify.llm import LLMClassifier
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
+from creek.consent import ConsentManager
 from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.link.linker import LinkingPipeline
@@ -49,6 +53,10 @@ class Pipeline:
     registered for a given source type (the INGESTOR_REGISTRY may be
     empty during the skeleton phase).
 
+    Processing is gated on user consent: if a ``consent_manager`` is
+    provided and consent has not been recorded for the source, the
+    pipeline skips ingestion and downstream stages.
+
     Attributes:
         config: The Creek configuration governing all subsystems.
         scanner: The redaction scanner for PII detection.
@@ -56,15 +64,23 @@ class Pipeline:
         llm_classifier: LLM-based classifier stub.
         review_generator: Review queue generator for uncertain fragments.
         linking_pipeline: Orchestrator for all four linking stages.
+        consent_manager: Optional consent manager for gating processing.
     """
 
-    def __init__(self, config: CreekConfig) -> None:
+    def __init__(
+        self,
+        config: CreekConfig,
+        consent_manager: ConsentManager | None = None,
+    ) -> None:
         """Initialise the pipeline and all subsystem components.
 
         Args:
             config: Top-level Creek configuration.
+            consent_manager: Optional consent manager. When provided,
+                ``run()`` checks for prior consent before ingesting.
         """
         self.config = config
+        self.consent_manager = consent_manager
         self.scanner = RedactionScanner(config=config.redaction)
         self.rule_classifier = RuleClassifier()
         self.llm_classifier = LLMClassifier(config=config.llm)
@@ -77,7 +93,12 @@ class Pipeline:
     def run(self, source_path: Path, vault_path: Path) -> PipelineResult:
         """Execute the full pipeline from source to vault.
 
+        If a ``consent_manager`` is configured and no prior consent exists
+        for the source, ingestion and all downstream stages are skipped.
+        Redaction scanning and index generation still run regardless.
+
         Stages:
+            0. Consent check (if consent_manager configured)
             1. Redaction scan on source files
             2. Ingestion (discover ingestors for source type)
             3. Classification (rule -> LLM -> review queue)
@@ -93,9 +114,22 @@ class Pipeline:
         """
         result = PipelineResult()
 
+        # Stage 0: Consent check
+        has_consent = self._check_consent(source_path)
+
         # Stage 1: Redaction scan
         files_scanned = self._run_redaction(source_path, result)
         result.files_scanned = files_scanned
+
+        if not has_consent:
+            logger.warning(
+                "Consent not granted for %s — skipping ingestion.",
+                source_path,
+            )
+            # Still run indexing on existing vault content
+            index_count = self._run_indexing(vault_path, result)
+            result.indexes_generated = index_count
+            return result
 
         # Stage 2: Ingestion
         fragments = self._run_ingestion(source_path, result)
@@ -115,6 +149,25 @@ class Pipeline:
 
         logger.info("Pipeline complete: %s", result)
         return result
+
+    def _check_consent(self, source_path: Path) -> bool:
+        """Check if consent has been granted for the given source.
+
+        If no consent_manager is configured, consent is assumed.
+
+        Args:
+            source_path: The source directory to check consent for.
+
+        Returns:
+            ``True`` if consent exists or no consent_manager is set.
+        """
+        if self.consent_manager is None:
+            return True
+
+        return self.consent_manager.check_consent(
+            source_type="pipeline",
+            source_path=str(source_path),
+        )
 
     def _run_redaction(self, source_path: Path, result: PipelineResult) -> int:
         """Scan source files for sensitive data.
