@@ -4,11 +4,14 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from creek.config import load_config
 from creek.pipeline import Pipeline
 
 app = typer.Typer(name="creek", help="Creek knowledge organization pipeline")
+clean_app = typer.Typer(name="clean", help="Vault hygiene commands")
+app.add_typer(clean_app, name="clean")
 console = Console()
 
 
@@ -166,3 +169,165 @@ def mine(
     console.print(
         f"[bold green]Would mine: vault={vault}, strategy={strategy}[/bold green]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Clean subcommands
+# ---------------------------------------------------------------------------
+
+
+def _resolve_vault(vault: Path | None) -> Path:
+    """Resolve vault path from argument or config.
+
+    Args:
+        vault: Explicit vault path, or None to use config default.
+
+    Returns:
+        Resolved vault path.
+    """
+    if vault is not None:
+        return vault
+    return load_config().vault_path
+
+
+@clean_app.command(name="orphans")
+def clean_orphans(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    age_days: int = typer.Option(30, help="Minimum age in days for orphan detection"),
+    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
+) -> None:
+    """Identify fragments with zero incoming/outgoing links after N days."""
+    from creek.clean.hygiene import OrphanScanner
+
+    vault_path = _resolve_vault(vault)
+    scanner = OrphanScanner(age_days=age_days)
+    result = scanner.scan(vault_path)
+
+    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
+    console.print(f"\n[bold]Orphan Scan[/bold] ({mode})")
+    console.print(f"Total fragments: {result.total_fragments}")
+    console.print(f"Orphans found: {len(result.orphan_paths)}")
+
+    if result.orphan_paths:
+        table = Table(title="Orphaned Fragments")
+        table.add_column("Path", style="dim")
+        for path in result.orphan_paths:
+            table.add_row(path)
+        console.print(table)
+
+
+@clean_app.command(name="stale-reviews")
+def clean_stale_reviews(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    age_days: int = typer.Option(14, help="Maximum age in days for review items"),
+    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
+) -> None:
+    """Find review queue items older than N days."""
+    from creek.clean.hygiene import StaleReviewScanner
+
+    vault_path = _resolve_vault(vault)
+    scanner = StaleReviewScanner(age_days=age_days)
+    result = scanner.scan(vault_path)
+
+    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
+    console.print(f"\n[bold]Stale Review Scan[/bold] ({mode})")
+    console.print(f"Total review files: {result.total_review_files}")
+    console.print(f"Stale files: {len(result.stale_paths)}")
+
+    if result.stale_paths:
+        table = Table(title="Stale Review Files")
+        table.add_column("Path", style="dim")
+        for path in result.stale_paths:
+            table.add_row(path)
+        console.print(table)
+
+
+@clean_app.command(name="broken-links")
+def clean_broken_links(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
+) -> None:
+    """Scan fragments for wiki-links pointing to nonexistent files."""
+    from creek.clean.hygiene import BrokenLinkScanner
+
+    vault_path = _resolve_vault(vault)
+    scanner = BrokenLinkScanner()
+    result = scanner.scan(vault_path)
+
+    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
+    console.print(f"\n[bold]Broken Link Scan[/bold] ({mode})")
+    console.print(f"Files scanned: {result.total_files_scanned}")
+    console.print(f"Broken links: {result.total_broken}")
+
+    if result.broken_links:
+        from rich.markup import escape
+
+        table = Table(title="Broken Links")
+        table.add_column("Source File", style="dim")
+        table.add_column("Broken Target")
+        for source_file, targets in result.broken_links.items():
+            for target in targets:
+                table.add_row(source_file, escape(target))
+        console.print(table)
+
+
+@clean_app.command(name="duplicates")
+def clean_duplicates(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
+) -> None:
+    """Execute normalized dedup sweep and output review report."""
+    from creek.clean.hygiene import DuplicateScanner
+
+    vault_path = _resolve_vault(vault)
+    scanner = DuplicateScanner()
+    result = scanner.scan(vault_path)
+
+    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
+    console.print(f"\n[bold]Duplicate Scan[/bold] ({mode})")
+    console.print(f"Total fragments: {result.total_fragments}")
+    console.print(f"Duplicate candidates: {len(result.candidates)}")
+
+    if result.candidates:
+        table = Table(title="Duplicate Candidates")
+        table.add_column("File A", style="dim")
+        table.add_column("File B", style="dim")
+        table.add_column("Match Type")
+        for candidate in result.candidates:
+            table.add_row(candidate.file_a, candidate.file_b, candidate.match_type)
+        console.print(table)
+
+
+@clean_app.command(name="report")
+def clean_report(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    output: Path | None = typer.Option(None, help="Output markdown report path"),
+) -> None:
+    """Provide summary statistics on vault health."""
+    from creek.clean.hygiene import HygieneReporter
+
+    vault_path = _resolve_vault(vault)
+    reporter = HygieneReporter()
+    hygiene_report = reporter.generate(vault_path)
+
+    table = Table(title="Vault Health Summary")
+    table.add_column("Metric", style="bold")
+    table.add_column("Count", justify="right")
+    table.add_row("Total fragments", str(hygiene_report.total_fragments))
+    table.add_row("Orphaned fragments", str(hygiene_report.orphan_count))
+    table.add_row("Stale review files", str(hygiene_report.stale_review_count))
+    table.add_row("Broken links", str(hygiene_report.broken_link_count))
+    table.add_row("Duplicate candidates", str(hygiene_report.duplicate_candidate_count))
+    console.print(table)
+
+    if hygiene_report.quality_distribution:
+        qtable = Table(title="Quality Distribution")
+        qtable.add_column("Action", style="bold")
+        qtable.add_column("Count", justify="right")
+        for action, count in sorted(hygiene_report.quality_distribution.items()):
+            qtable.add_row(action, str(count))
+        console.print(qtable)
+
+    if output is not None:
+        reporter.write_markdown(hygiene_report, output)
+        console.print(f"\n[green]Report written to {output}[/green]")
