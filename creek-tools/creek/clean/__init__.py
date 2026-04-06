@@ -7,8 +7,10 @@ entropy, stop-word ratio, length, and content-type heuristics, the
 fragments, the :class:`FragmentValidator` for post-ingestion field,
 encoding, and timestamp validation, the :class:`ContextExtractor`
 for handling non-user content, the :class:`ChatbotFilter` for
-pre-ingestion chatbot noise removal, and vault hygiene scanners for
-orphans, stale reviews, broken links, duplicates, and health reports.
+pre-ingestion chatbot noise removal, the :class:`GoogleDriveFilter` for
+pre-ingestion filtering of Google Drive staged files, and vault hygiene
+scanners for orphans, stale reviews, broken links, duplicates, and
+health reports.
 """
 
 from creek.clean.context import ContextExtractor, ContextResult
@@ -18,6 +20,11 @@ from creek.clean.filters.chatbot import (
     ChatbotFilterConfig,
     ConversationFilterResult,
     MessageVerdict,
+)
+from creek.clean.filters.google_drive import (
+    GoogleDriveFilter,
+    GoogleDriveFilterResult,
+    StagedFile,
 )
 from creek.clean.hygiene import (
     BrokenLinkResult,
@@ -49,6 +56,8 @@ __all__ = [
     "DuplicateResult",
     "DuplicateScanner",
     "FragmentValidator",
+    "GoogleDriveFilter",
+    "GoogleDriveFilterResult",
     "HygieneReport",
     "HygieneReporter",
     "MessageVerdict",
@@ -56,6 +65,7 @@ __all__ = [
     "OrphanScanner",
     "QualityResult",
     "QualityScorer",
+    "StagedFile",
     "StaleReviewResult",
     "StaleReviewScanner",
     "ValidationResult",

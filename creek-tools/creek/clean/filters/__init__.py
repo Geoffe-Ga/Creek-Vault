@@ -2,7 +2,8 @@
 
 Provides :class:`FilterResult`, the common return type for all filters,
 and re-exports concrete filter implementations including
-:class:`ChatbotFilter` for chatbot noise removal and
+:class:`ChatbotFilter` for chatbot noise removal,
+:class:`GoogleDriveFilter` for Google Drive staged files, and
 :class:`MarkdownFilter` for markdown file filtering.
 """
 
@@ -13,6 +14,11 @@ from creek.clean.filters.chatbot import (
     ConversationFilterResult,
     MessageVerdict,
 )
+from creek.clean.filters.google_drive import (
+    GoogleDriveFilter,
+    GoogleDriveFilterResult,
+    StagedFile,
+)
 from creek.clean.filters.markdown import MarkdownFilter
 
 __all__ = [
@@ -20,6 +26,9 @@ __all__ = [
     "ChatbotFilterConfig",
     "ConversationFilterResult",
     "FilterResult",
+    "GoogleDriveFilter",
+    "GoogleDriveFilterResult",
     "MarkdownFilter",
     "MessageVerdict",
+    "StagedFile",
 ]
