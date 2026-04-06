@@ -15,6 +15,7 @@ Exports:
     ClaudeIngestor: Concrete ingestor for Claude conversation exports.
     CodeIngestor: Concrete ingestor for code repositories.
     DiscordIngestor: Concrete ingestor for Discord message exports.
+    DocumentIngestor: Concrete ingestor for document files (DOCX, PDF, HTML, TXT).
     GenericIngestor: Fallback ingestor for unrecognized file formats.
     MarkdownIngestor: Concrete ingestor for plain Markdown files.
 """
@@ -24,6 +25,7 @@ from creek.ingest.chatgpt import ChatGPTIngestor
 from creek.ingest.claude import ClaudeIngestor
 from creek.ingest.code import CodeIngestor
 from creek.ingest.discord import DiscordIngestor
+from creek.ingest.documents import DocumentIngestor
 from creek.ingest.generic import GenericIngestor
 from creek.ingest.markdown import MarkdownIngestor
 
@@ -34,6 +36,7 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
     "claude": ClaudeIngestor,
     "code": CodeIngestor,
     "discord": DiscordIngestor,
+    "document": DocumentIngestor,
     "generic": GenericIngestor,
     "markdown": MarkdownIngestor,
 }
@@ -44,6 +47,7 @@ __all__ = [
     "ClaudeIngestor",
     "CodeIngestor",
     "DiscordIngestor",
+    "DocumentIngestor",
     "GenericIngestor",
     "IngestResult",
     "Ingestor",
