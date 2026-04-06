@@ -115,6 +115,18 @@ module = "frontmatter"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "sentence_transformers"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = ["markdownify", "pdfminer", "pdfminer.*", "docx", "docx.*"]
 ignore_missing_imports = true
 
