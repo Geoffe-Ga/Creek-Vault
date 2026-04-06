@@ -63,15 +63,16 @@ class TestLoadModel:
         assert mock_sentence_transformer.call_count == 1
 
     def test_load_model_uses_cache_dir(
-        self, mock_sentence_transformer: MagicMock
+        self, mock_sentence_transformer: MagicMock, tmp_path: Path
     ) -> None:
         """load_model should pass cache_dir from config."""
-        config = EmbeddingsConfig(cache_dir="/tmp/models")
+        cache_dir = str(tmp_path / "models")
+        config = EmbeddingsConfig(cache_dir=cache_dir)
         linker = EmbeddingLinker(config=config)
         linker.load_model()
         mock_sentence_transformer.assert_called_once_with(
             "all-MiniLM-L6-v2",
-            "/tmp/models",
+            cache_dir,
         )
 
 
