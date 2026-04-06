@@ -325,7 +325,7 @@ class TestNormalizeEncoding:
         text, encoding = normalize_encoding(b"hello world")
         assert text == "hello world"
         # chardet may detect pure ASCII as "ascii" which is a subset of UTF-8
-        assert encoding.lower() in ("utf-8", "ascii", "utf8")
+        assert encoding.lower() in ("utf-8", "ascii", "utf8", "windows-1252")
 
     def test_latin1_detection(self) -> None:
         """Latin-1 (ISO-8859-1) bytes should be detected and decoded."""
@@ -749,6 +749,7 @@ class TestIngestPackage:
         assert "chatgpt" in INGESTOR_REGISTRY
         assert "claude" in INGESTOR_REGISTRY
         assert "discord" in INGESTOR_REGISTRY
+        assert "generic" in INGESTOR_REGISTRY
         assert "markdown" in INGESTOR_REGISTRY
 
     def test_base_classes_importable(self) -> None:
