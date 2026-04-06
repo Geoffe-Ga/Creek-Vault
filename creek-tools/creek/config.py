@@ -454,11 +454,11 @@ class CreekConfig(BaseSettings):
     )
     """Google Drive connector settings."""
 
-    sources: SourcePaths = Field(default_factory=SourcePaths)
-    """Source data path mappings."""
-
     cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
     """Data cleaning pipeline settings."""
+
+    sources: SourcePaths = Field(default_factory=SourcePaths)
+    """Source data path mappings."""
 
     @field_validator("timezone")
     @classmethod
