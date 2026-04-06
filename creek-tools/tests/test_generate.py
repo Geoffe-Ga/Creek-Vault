@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from creek.generate.indexes import FREQUENCY_NAMES, IndexGenerator
+from creek.generate.indexes import (
+    FREQUENCY_COLORS,
+    FREQUENCY_NAMES,
+    IndexGenerator,
+)
 from creek.models import Frequency
 
 # ---- Fixtures ----
@@ -92,10 +96,10 @@ class TestFrequencyNames:
         assert len(FREQUENCY_NAMES) == 10
 
     def test_specific_names(self) -> None:
-        """Spot-check some specific frequency name mappings."""
-        assert FREQUENCY_NAMES[Frequency.F1] == "Survival/Safety"
-        assert FREQUENCY_NAMES[Frequency.F5] == "Achievement/Strategy"
-        assert FREQUENCY_NAMES[Frequency.F10] == "Unity/Transcendence"
+        """Spot-check some specific frequency name mappings per ontology."""
+        assert FREQUENCY_NAMES[Frequency.F1] == "Agency/Survival"
+        assert FREQUENCY_NAMES[Frequency.F5] == "Achievism/Innovation"
+        assert FREQUENCY_NAMES[Frequency.F10] == "Emptiness/Impermanence"
 
 
 # ---- IndexGenerator Init Tests ----
@@ -208,6 +212,129 @@ class TestGenerateFrequencyIndexes:
         for p1, p2 in zip(result1, result2, strict=True):
             assert p1 == p2
             assert p1.is_file()
+
+
+# ---- Frequency Colors Tests ----
+
+
+class TestFrequencyColors:
+    """Tests for the FREQUENCY_COLORS mapping."""
+
+    def test_all_classified_frequencies_mapped(self) -> None:
+        """Every non-UNCLASSIFIED Frequency enum member should have a color."""
+        for freq in Frequency:
+            if freq != Frequency.UNCLASSIFIED:
+                assert freq in FREQUENCY_COLORS, f"Missing color for {freq}"
+
+    def test_specific_colors(self) -> None:
+        """Spot-check color mappings against the ontology."""
+        assert FREQUENCY_COLORS[Frequency.F1] == "beige"
+        assert FREQUENCY_COLORS[Frequency.F3] == "red"
+        assert FREQUENCY_COLORS[Frequency.F7] == "yellow"
+        assert FREQUENCY_COLORS[Frequency.F10] == "clear_light"
+
+    def test_correct_count(self) -> None:
+        """There should be exactly 10 frequency colors (F1-F10)."""
+        assert len(FREQUENCY_COLORS) == 10
+
+
+# ---- Enhanced Frequency Index Tests ----
+
+
+class TestFrequencyIndexEnhancements:
+    """Tests for enhanced frequency index notes per issue #34."""
+
+    def test_frontmatter_contains_color(self, generator: IndexGenerator) -> None:
+        """Frontmatter should include a color field from the ontology."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            assert "color:" in content, f"Missing color in frontmatter: {path}"
+
+    def test_contains_description_section(self, generator: IndexGenerator) -> None:
+        """Each note should contain a description section with core theme."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            assert "## Description" in content, f"Missing description section: {path}"
+
+    def test_contains_thread_affinity_query(self, generator: IndexGenerator) -> None:
+        """Each note should have a Dataview query for threads by affinity."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            assert "## Threads" in content, f"Missing threads section: {path}"
+            assert "02-Threads" in content, (
+                f"Thread query should reference 02-Threads: {path}"
+            )
+
+    def test_contains_statistics_section(self, generator: IndexGenerator) -> None:
+        """Each note should have a statistics section with fragment counts."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            assert "## Statistics" in content, f"Missing statistics section: {path}"
+
+    def test_contains_dosage_table(self, generator: IndexGenerator) -> None:
+        """F1-F9 notes should include a medicine vs toxic dosage table.
+
+        F10 (Clear Light / Emptiness) has no dosage mapping in the ontology,
+        so it should not include a dosage table.
+        """
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            freq_code = path.parent.name.split("-")[0]
+            if freq_code == "F10":
+                assert "## Medicine vs. Toxic Dose" not in content, (
+                    f"F10 should not have dosage table: {path}"
+                )
+            else:
+                assert "## Medicine vs. Toxic Dose" in content, (
+                    f"Missing dosage table: {path}"
+                )
+                assert "Medicine" in content
+                assert "Toxic" in content
+
+    def test_dosage_table_has_phases(self, generator: IndexGenerator) -> None:
+        """Dosage table should contain wavelength phase columns."""
+        result = generator.generate_frequency_indexes()
+        first = result[0]
+        content = first.read_text(encoding="utf-8")
+        assert "Rising" in content
+        assert "Peaking" in content
+        assert "Withdrawal" in content
+        assert "Diminishing" in content
+        assert "Bottoming Out" in content
+        assert "Restoration" in content
+
+    def test_contains_cross_frequency_links(self, generator: IndexGenerator) -> None:
+        """Each note should include cross-frequency developmental links."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            assert "## Cross-Frequency Links" in content, (
+                f"Missing cross-frequency links: {path}"
+            )
+
+    def test_contains_signals_section(self, generator: IndexGenerator) -> None:
+        """Each note should include content classification signals."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            assert "**Signals**" in content or "Signals:" in content, (
+                f"Missing signals: {path}"
+            )
+
+    def test_three_dataview_queries(self, generator: IndexGenerator) -> None:
+        """Each note should have at least three Dataview query blocks."""
+        result = generator.generate_frequency_indexes()
+        for path in result:
+            content = path.read_text(encoding="utf-8")
+            query_count = content.count("```dataview")
+            assert query_count >= 3, (
+                f"Expected >=3 dataview queries, got {query_count}: {path}"
+            )
 
 
 # ---- Thread Index Tests ----

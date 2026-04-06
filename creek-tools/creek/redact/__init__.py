@@ -10,11 +10,12 @@ retained so that duplicate detections can be correlated without leaking data.
 
 from creek.redact.patterns import REDACTION_PATTERNS
 from creek.redact.redactor import Redactor
-from creek.redact.scanner import RedactionMatch, RedactionScanner
+from creek.redact.scanner import RedactionMatch, RedactionScanner, ScanSummary
 
 __all__ = [
     "REDACTION_PATTERNS",
     "RedactionMatch",
     "RedactionScanner",
     "Redactor",
+    "ScanSummary",
 ]

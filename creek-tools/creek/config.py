@@ -89,6 +89,66 @@ class ClassificationConfig(BaseModel):
     """Sources that require human review after classification."""
 
 
+class ContextConfig(BaseModel):
+    """Non-user content handling configuration.
+
+    Controls how content authored by others (e.g. Discord messages,
+    collaborative documents) is represented in the vault.
+    """
+
+    mode: str = "context_metadata"
+    """Handling mode: ``context_metadata``, ``low_priority``, or ``skip``.
+
+    - ``context_metadata``: Store others' content as context in the user's
+      fragment; do not index separately.
+    - ``low_priority``: Ingest as separate fragments with ``author: other``
+      and reduced quality scores; exclude from voice proxy.
+    - ``skip``: Drop others' content entirely; preserve only user's words.
+    """
+
+    quality_penalty: float = 0.5
+    """Multiplier applied to quality scores for ``low_priority`` fragments."""
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        """Validate that *v* is a recognised content handling mode.
+
+        Args:
+            v: Mode string to validate.
+
+        Returns:
+            The validated mode string.
+
+        Raises:
+            ValueError: If the mode is not one of the allowed values.
+        """
+        allowed = {"context_metadata", "low_priority", "skip"}
+        if v not in allowed:
+            msg = f"Invalid context mode: {v!r}. Must be one of {allowed}"
+            raise ValueError(msg)
+        return v
+
+    @field_validator("quality_penalty")
+    @classmethod
+    def validate_quality_penalty(cls, v: float) -> float:
+        """Validate quality penalty is in [0.0, 1.0].
+
+        Args:
+            v: Penalty multiplier to validate.
+
+        Returns:
+            The validated penalty value.
+
+        Raises:
+            ValueError: If the penalty is outside the valid range.
+        """
+        if not 0.0 <= v <= 1.0:
+            msg = f"quality_penalty must be in [0.0, 1.0], got {v}"
+            raise ValueError(msg)
+        return v
+
+
 class RedactionConfig(BaseModel):
     """Redaction scanner configuration."""
 
@@ -103,6 +163,25 @@ class RedactionConfig(BaseModel):
 
     false_positive_allowlist: list[str] = Field(default_factory=list)
     """Strings that should never be flagged as PII."""
+
+    supported_extensions: list[str] = Field(
+        default_factory=lambda: [
+            ".txt",
+            ".md",
+            ".json",
+            ".py",
+            ".env",
+            ".yaml",
+            ".toml",
+            ".csv",
+        ],
+    )
+    """File extensions the scanner will process."""
+
+    exclude_patterns: list[str] = Field(
+        default_factory=lambda: [".git", "node_modules"],
+    )
+    """Directory name patterns to exclude from recursive scanning."""
 
 
 _READONLY_SCOPES: set[str] = {
@@ -357,6 +436,9 @@ class CreekConfig(BaseSettings):
         default_factory=ClassificationConfig,
     )
     """Classification pipeline settings."""
+
+    context: ContextConfig = Field(default_factory=ContextConfig)
+    """Non-user content handling settings."""
 
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
     """PII redaction scanner settings."""
