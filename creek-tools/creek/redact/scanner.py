@@ -27,12 +27,12 @@ import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path  # — Pydantic needs Path at runtime
+from pathlib import Path  # noqa: TC003 — Pydantic needs Path at runtime
 
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from creek.config import RedactionConfig  # — used at runtime
+from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
 from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
 
 # Magic bytes for common binary file formats.

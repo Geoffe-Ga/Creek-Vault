@@ -1,11 +1,11 @@
-"""Creek linking pipeline — stubs for embedding, temporal, thread, and eddy linkers.
+"""Creek linking pipeline — embedding, temporal, thread, and eddy linkers.
 
-This package provides stub implementations for the four linking stages
-of the Creek pipeline.  Real implementations will be added in issues #28-33.
+This package provides the four linking stages of the Creek pipeline.
 
 Public API:
     - ``EmbeddingLinker`` — generate embeddings and find semantic resonances
-    - ``TemporalLinker`` — find temporal proximity links
+    - ``TemporalLink`` — scored temporal proximity link between two fragments
+    - ``TemporalLinker`` — find temporal proximity links across sources
     - ``ThreadDetector`` — detect narrative threads
     - ``EddyDetector`` — detect topic cluster eddies
     - ``LinkingResult`` — Pydantic model for pipeline result counts
@@ -15,7 +15,7 @@ Public API:
 from creek.link.eddies import EddyDetector
 from creek.link.embeddings import EmbeddingLinker
 from creek.link.linker import LinkingPipeline, LinkingResult
-from creek.link.temporal import TemporalLinker
+from creek.link.temporal import TemporalLink, TemporalLinker
 from creek.link.threads import ThreadDetector
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "EmbeddingLinker",
     "LinkingPipeline",
     "LinkingResult",
+    "TemporalLink",
     "TemporalLinker",
     "ThreadDetector",
 ]
