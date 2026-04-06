@@ -45,6 +45,12 @@ class EmbeddingsConfig(BaseModel):
     similarity_threshold: float = 0.75
     """Minimum cosine similarity for linking fragments."""
 
+    cache_dir: str | None = None
+    """Local directory for caching downloaded models."""
+
+    batch_size: int = 32
+    """Number of texts to encode per batch."""
+
 
 class OCRConfig(BaseModel):
     """OCR configuration."""
@@ -448,11 +454,11 @@ class CreekConfig(BaseSettings):
     )
     """Google Drive connector settings."""
 
-    sources: SourcePaths = Field(default_factory=SourcePaths)
-    """Source data path mappings."""
-
     cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
     """Data cleaning pipeline settings."""
+
+    sources: SourcePaths = Field(default_factory=SourcePaths)
+    """Source data path mappings."""
 
     @field_validator("timezone")
     @classmethod

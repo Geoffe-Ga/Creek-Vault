@@ -7,7 +7,9 @@ entropy, stop-word ratio, length, and content-type heuristics, the
 fragments, the :class:`FragmentValidator` for post-ingestion field,
 encoding, and timestamp validation, the :class:`ContextExtractor`
 for handling non-user content, the :class:`DiscordFilter` for
-pre-ingestion noise removal from Discord messages, and vault hygiene
+pre-ingestion noise removal from Discord messages, the
+:class:`GoogleDriveFilter` for pre-ingestion filtering of Google Drive
+staged files, and vault hygiene
 scanners for orphans, stale reviews, broken links, duplicates, and
 health reports.
 """
@@ -18,6 +20,11 @@ from creek.clean.filters.discord import (
     DiscordFilter,
     DiscordFilterConfig,
     FilterStats,
+)
+from creek.clean.filters.google_drive import (
+    GoogleDriveFilter,
+    GoogleDriveFilterResult,
+    StagedFile,
 )
 from creek.clean.hygiene import (
     BrokenLinkResult,
@@ -49,12 +56,15 @@ __all__ = [
     "DuplicateScanner",
     "FilterStats",
     "FragmentValidator",
+    "GoogleDriveFilter",
+    "GoogleDriveFilterResult",
     "HygieneReport",
     "HygieneReporter",
     "OrphanResult",
     "OrphanScanner",
     "QualityResult",
     "QualityScorer",
+    "StagedFile",
     "StaleReviewResult",
     "StaleReviewScanner",
     "ValidationResult",
