@@ -101,10 +101,20 @@ def report(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
     """Generate reports on vault state."""
-    console.print(
-        f"[bold green]Would report: type={type}, "
-        f"period={period}, vault={vault}[/bold green]"
-    )
+    config = load_config()
+    vault_path = vault or config.vault_path
+
+    if type == "tags":
+        from creek.generate.tags import TagGardenGenerator
+
+        generator = TagGardenGenerator(vault_path=vault_path)
+        path = generator.generate_garden()
+        console.print(f"[bold green]Tag Garden generated: {path}[/bold green]")
+    else:
+        console.print(
+            f"[bold green]Would report: type={type}, "
+            f"period={period}, vault={vault_path}[/bold green]"
+        )
 
 
 @app.command()
