@@ -2,16 +2,14 @@
 
 Tests cover model loading, single/batch embedding generation,
 disk persistence (save/load), incremental mode, and resonance finding.
-All tests mock the SentenceTransformer to avoid model downloads.
+All tests use the autouse ``mock_sentence_transformer`` fixture from
+conftest.py to avoid model downloads.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
-
-if TYPE_CHECKING:
-    from pathlib import Path
+import logging
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -19,6 +17,10 @@ import pytest
 from creek.config import EmbeddingsConfig
 from creek.link.embeddings import EmbeddingLinker
 from creek.models import Fragment, FragmentSource, SourcePlatform
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from unittest.mock import MagicMock
 
 _DIMS = 384  # all-MiniLM-L6-v2 output dimensions
 
@@ -31,66 +33,43 @@ def _make_fragment(title: str = "Test Fragment") -> Fragment:
     )
 
 
-def _make_mock_model(dims: int = _DIMS) -> MagicMock:
-    """Create a mock SentenceTransformer that returns deterministic embeddings."""
-    model = MagicMock()
-
-    def _encode(
-        sentences: str | list[str],
-        show_progress_bar: bool = False,
-        batch_size: int = 32,
-        **kwargs: Any,
-    ) -> np.ndarray:
-        if isinstance(sentences, str):
-            rng = np.random.default_rng(hash(sentences) % 2**32)
-            return rng.standard_normal(dims).astype(np.float32)
-        rng_batch = [
-            np.random.default_rng(hash(s) % 2**32).standard_normal(dims)
-            for s in sentences
-        ]
-        return np.array(rng_batch, dtype=np.float32)
-
-    model.encode = MagicMock(side_effect=_encode)
-    return model
-
-
 # ---- Model Loading ----
 
 
 class TestLoadModel:
     """Tests for the load_model method."""
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_load_model_creates_instance(self, mock_load: MagicMock) -> None:
+    def test_load_model_creates_instance(
+        self, mock_sentence_transformer: MagicMock
+    ) -> None:
         """load_model should instantiate SentenceTransformer with config."""
-        mock_load.return_value = _make_mock_model()
         config = EmbeddingsConfig(model="all-MiniLM-L6-v2")
         linker = EmbeddingLinker(config=config)
         result = linker.load_model()
-        mock_load.assert_called_once_with(
+        mock_sentence_transformer.assert_called_once_with(
             "all-MiniLM-L6-v2",
             None,
         )
-        assert result is mock_load.return_value
+        assert result is mock_sentence_transformer.return_value
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_load_model_caches_instance(self, mock_load: MagicMock) -> None:
+    def test_load_model_caches_instance(
+        self, mock_sentence_transformer: MagicMock
+    ) -> None:
         """Calling load_model twice should only create one instance."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         first = linker.load_model()
         second = linker.load_model()
         assert first is second
-        assert mock_load.call_count == 1
+        assert mock_sentence_transformer.call_count == 1
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_load_model_uses_cache_dir(self, mock_load: MagicMock) -> None:
+    def test_load_model_uses_cache_dir(
+        self, mock_sentence_transformer: MagicMock
+    ) -> None:
         """load_model should pass cache_dir from config."""
-        mock_load.return_value = _make_mock_model()
         config = EmbeddingsConfig(cache_dir="/tmp/models")
         linker = EmbeddingLinker(config=config)
         linker.load_model()
-        mock_load.assert_called_once_with(
+        mock_sentence_transformer.assert_called_once_with(
             "all-MiniLM-L6-v2",
             "/tmp/models",
         )
@@ -102,27 +81,21 @@ class TestLoadModel:
 class TestGenerateEmbedding:
     """Tests for the generate_embedding method (single text)."""
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_returns_float_list(self, mock_load: MagicMock) -> None:
+    def test_returns_float_list(self) -> None:
         """generate_embedding should return a list of floats."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         result = linker.generate_embedding("hello world")
         assert isinstance(result, list)
         assert all(isinstance(v, float) for v in result)
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_correct_dimensions(self, mock_load: MagicMock) -> None:
+    def test_correct_dimensions(self) -> None:
         """generate_embedding should return vector with correct dimensions."""
-        mock_load.return_value = _make_mock_model(dims=_DIMS)
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         result = linker.generate_embedding("hello world")
         assert len(result) == _DIMS
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_consistent_results(self, mock_load: MagicMock) -> None:
+    def test_consistent_results(self) -> None:
         """Same text should produce the same embedding."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         first = linker.generate_embedding("hello")
         second = linker.generate_embedding("hello")
@@ -135,39 +108,33 @@ class TestGenerateEmbedding:
 class TestGenerateEmbeddings:
     """Tests for the generate_embeddings method (batch fragments)."""
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_returns_dict_with_fragment_ids(self, mock_load: MagicMock) -> None:
+    def test_returns_dict_with_fragment_ids(self) -> None:
         """generate_embeddings should return dict keyed by fragment IDs."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frags = [_make_fragment("A"), _make_fragment("B")]
         result = linker.generate_embeddings(frags)
         assert isinstance(result, dict)
         assert set(result.keys()) == {f.id for f in frags}
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_empty_input_returns_empty_dict(self, mock_load: MagicMock) -> None:
+    def test_empty_input_returns_empty_dict(self) -> None:
         """generate_embeddings with empty list should return empty dict."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         result = linker.generate_embeddings([])
         assert result == {}
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_embeddings_have_correct_dimensions(self, mock_load: MagicMock) -> None:
+    def test_embeddings_have_correct_dimensions(self) -> None:
         """Each embedding vector should have the correct number of dims."""
-        mock_load.return_value = _make_mock_model(dims=_DIMS)
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frags = [_make_fragment("Test")]
         result = linker.generate_embeddings(frags)
         for vec in result.values():
             assert len(vec) == _DIMS
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_uses_fragment_title_for_text(self, mock_load: MagicMock) -> None:
+    def test_uses_fragment_title_for_text(
+        self, mock_sentence_transformer: MagicMock
+    ) -> None:
         """generate_embeddings should encode fragment titles."""
-        mock_model = _make_mock_model()
-        mock_load.return_value = mock_model
+        mock_model = mock_sentence_transformer.return_value
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frags = [_make_fragment("Alpha"), _make_fragment("Beta")]
         linker.generate_embeddings(frags)
@@ -176,11 +143,11 @@ class TestGenerateEmbeddings:
         assert "Alpha" in texts[0]
         assert "Beta" in texts[1]
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_passes_batch_size_from_config(self, mock_load: MagicMock) -> None:
+    def test_passes_batch_size_from_config(
+        self, mock_sentence_transformer: MagicMock
+    ) -> None:
         """generate_embeddings should pass batch_size to model.encode."""
-        mock_model = _make_mock_model()
-        mock_load.return_value = mock_model
+        mock_model = mock_sentence_transformer.return_value
         config = EmbeddingsConfig(batch_size=16)
         linker = EmbeddingLinker(config=config)
         frags = [_make_fragment("A")]
@@ -188,14 +155,18 @@ class TestGenerateEmbeddings:
         call_kwargs = mock_model.encode.call_args[1]
         assert call_kwargs["batch_size"] == 16
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_shows_progress_bar(self, mock_load: MagicMock) -> None:
-        """generate_embeddings should enable the progress bar."""
-        mock_model = _make_mock_model()
-        mock_load.return_value = mock_model
+    def test_progress_bar_follows_log_level(
+        self, mock_sentence_transformer: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """show_progress_bar should reflect whether INFO logging is enabled."""
+        mock_model = mock_sentence_transformer.return_value
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frags = [_make_fragment("A")]
-        linker.generate_embeddings(frags)
+
+        # With INFO enabled, show_progress_bar should be True
+        with caplog.at_level(logging.INFO, logger="creek.link.embeddings"):
+            linker._model = None  # reset cache to force reload
+            linker.generate_embeddings(frags)
         call_kwargs = mock_model.encode.call_args[1]
         assert call_kwargs["show_progress_bar"] is True
 
@@ -206,11 +177,8 @@ class TestGenerateEmbeddings:
 class TestIncrementalMode:
     """Tests for incremental embedding generation."""
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_skips_existing_ids(self, mock_load: MagicMock) -> None:
+    def test_skips_existing_ids(self) -> None:
         """generate_embeddings should skip fragments in existing_ids."""
-        mock_model = _make_mock_model()
-        mock_load.return_value = mock_model
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frag_a = _make_fragment("A")
         frag_b = _make_fragment("B")
@@ -221,19 +189,15 @@ class TestIncrementalMode:
         assert frag_a.id not in result
         assert frag_b.id in result
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_all_existing_returns_empty(self, mock_load: MagicMock) -> None:
+    def test_all_existing_returns_empty(self) -> None:
         """If all fragments are in existing_ids, return empty dict."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frag = _make_fragment("A")
         result = linker.generate_embeddings([frag], existing_ids={frag.id})
         assert result == {}
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
-    def test_no_existing_ids_processes_all(self, mock_load: MagicMock) -> None:
+    def test_no_existing_ids_processes_all(self) -> None:
         """Without existing_ids, all fragments should be processed."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frags = [_make_fragment("A"), _make_fragment("B")]
         result = linker.generate_embeddings(frags)
@@ -382,16 +346,12 @@ class TestFindResonances:
 class TestEmbeddingLinkerLogging:
     """Tests for logging behaviour."""
 
-    @patch("creek.link.embeddings._load_sentence_transformer")
     def test_generate_embeddings_logs_count(
-        self, mock_load: MagicMock, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """generate_embeddings should log the number of fragments."""
-        mock_load.return_value = _make_mock_model()
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         frags = [_make_fragment("A"), _make_fragment("B")]
-        import logging
-
         with caplog.at_level(logging.INFO, logger="creek.link.embeddings"):
             linker.generate_embeddings(frags)
         assert any("2" in r.message for r in caplog.records)
@@ -399,8 +359,6 @@ class TestEmbeddingLinkerLogging:
     def test_find_resonances_logs_count(self, caplog: pytest.LogCaptureFixture) -> None:
         """find_resonances should log the number of embeddings."""
         linker = EmbeddingLinker(config=EmbeddingsConfig())
-        import logging
-
         with caplog.at_level(logging.INFO, logger="creek.link.embeddings"):
             linker.find_resonances({"a": [1.0], "b": [0.0]})
         assert any("2" in r.message for r in caplog.records)

@@ -42,7 +42,7 @@ def _make_mock_model(dims: int = _DIMS) -> MagicMock:
 
 
 @pytest.fixture(autouse=True)
-def _mock_sentence_transformer() -> Iterator[MagicMock]:
+def mock_sentence_transformer() -> Iterator[MagicMock]:
     """Auto-mock sentence-transformer loading to prevent model downloads."""
     mock_model = _make_mock_model()
     with patch(

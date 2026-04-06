@@ -131,9 +131,10 @@ class EmbeddingLinker:
 
         model = self.load_model()
         texts = [f.title for f in to_embed]
+        show_progress = logger.isEnabledFor(logging.INFO)
         raw = model.encode(
             texts,
-            show_progress_bar=True,
+            show_progress_bar=show_progress,
             batch_size=self.config.batch_size,
         )
         vectors = np.asarray(raw, dtype=np.float32)
@@ -155,7 +156,7 @@ class EmbeddingLinker:
         """
         arrays = {k: np.array(v, dtype=np.float32) for k, v in embeddings.items()}
         np.savez_compressed(
-            str(path),
+            path,
             **arrays,
         )
         logger.info("Saved %d embedding(s) to %s", len(embeddings), path)
@@ -176,8 +177,8 @@ class EmbeddingLinker:
             msg = f"Embeddings file not found: {path}"
             raise FileNotFoundError(msg)
 
-        data = np.load(path)
-        result = {key: data[key].tolist() for key in data.files}
+        with np.load(path) as data:
+            result = {key: data[key].tolist() for key in data.files}
         logger.info("Loaded %d embedding(s) from %s", len(result), path)
         return result
 

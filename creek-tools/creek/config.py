@@ -51,9 +51,6 @@ class EmbeddingsConfig(BaseModel):
     batch_size: int = 32
     """Number of texts to encode per batch."""
 
-    max_tokens: int = 512
-    """Maximum token length for input texts (truncated by the model)."""
-
 
 class OCRConfig(BaseModel):
     """OCR configuration."""
