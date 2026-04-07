@@ -6,14 +6,17 @@ Tests cover:
 - SemanticDeduplicator: batch mode (all-pairs comparison)
 - SemanticDeduplicator: incremental mode (new fragment vs. existing index)
 - SemanticDeduplicator: threshold tuning (duplicate vs. resonance vs. distinct)
+- SemanticDeduplicator: threshold validation (invalid threshold combinations)
 - SemanticDeduplicator: review queue generation
 - SemanticDeduplicator: clear/reset
+- SemanticDeduplicator: dimension validation
 - Edge cases: empty embeddings, single fragment, zero vectors, dimension mismatch
-- Cosine similarity correctness
+- Cosine similarity correctness (using numpy)
 """
 
 import math
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
@@ -23,6 +26,16 @@ from creek.clean.semantic_dedup import (
     SemanticDuplicateResult,
     _cosine_similarity,
 )
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _to_np(vec: list[float]) -> np.ndarray:
+    """Convert list to numpy array for _cosine_similarity."""
+    return np.asarray(vec, dtype=np.float64)
+
 
 # ---------------------------------------------------------------------------
 # SemanticDuplicatePair model
@@ -62,11 +75,31 @@ class TestSemanticDuplicatePair:
                 fragment_id_a="frag-aaa11111",
                 fragment_id_b="frag-bbb22222",
                 similarity=0.5,
-                classification="invalid",  # type: ignore[arg-type]
+                classification="invalid",
             )
 
-    def test_similarity_range_validation(self) -> None:
-        """similarity must be in [0.0, 1.0]."""
+    def test_similarity_range_allows_negative(self) -> None:
+        """Cosine similarity can be negative; model should accept [-1, 1]."""
+        pair = SemanticDuplicatePair(
+            fragment_id_a="frag-a",
+            fragment_id_b="frag-b",
+            similarity=-0.5,
+            classification="resonance",
+        )
+        assert pair.similarity == pytest.approx(-0.5)
+
+    def test_similarity_rejects_below_minus_one(self) -> None:
+        """Similarity below -1.0 should be rejected."""
+        with pytest.raises(ValidationError):
+            SemanticDuplicatePair(
+                fragment_id_a="frag-a",
+                fragment_id_b="frag-b",
+                similarity=-1.5,
+                classification="duplicate",
+            )
+
+    def test_similarity_rejects_above_one(self) -> None:
+        """Similarity above 1.0 should be rejected."""
         with pytest.raises(ValidationError):
             SemanticDuplicatePair(
                 fragment_id_a="frag-a",
@@ -77,13 +110,12 @@ class TestSemanticDuplicatePair:
 
     def test_serializable(self) -> None:
         """SemanticDuplicatePair should be JSON-serializable."""
-        pair = SemanticDuplicatePair(
+        data = SemanticDuplicatePair(
             fragment_id_a="frag-aaa",
             fragment_id_b="frag-bbb",
             similarity=0.96,
             classification="duplicate",
-        )
-        data = pair.model_dump(mode="json")
+        ).model_dump(mode="json")
         assert data["fragment_id_a"] == "frag-aaa"
         assert data["similarity"] == pytest.approx(0.96)
 
@@ -102,8 +134,8 @@ class TestSemanticDuplicateResult:
             duplicates=[],
             resonances=[],
         )
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        assert not result.duplicates
+        assert not result.resonances
 
     def test_result_with_pairs(self) -> None:
         """Result should store both duplicate and resonance pairs."""
@@ -125,8 +157,9 @@ class TestSemanticDuplicateResult:
 
     def test_serializable(self) -> None:
         """SemanticDuplicateResult should be JSON-serializable."""
-        result = SemanticDuplicateResult(duplicates=[], resonances=[])
-        data = result.model_dump(mode="json")
+        data = SemanticDuplicateResult(duplicates=[], resonances=[]).model_dump(
+            mode="json"
+        )
         assert data["duplicates"] == []
         assert data["resonances"] == []
 
@@ -141,25 +174,25 @@ class TestCosineSimilarity:
 
     def test_identical_vectors(self) -> None:
         """Identical vectors should have similarity 1.0."""
-        vec = [1.0, 2.0, 3.0]
+        vec = _to_np([1.0, 2.0, 3.0])
         assert _cosine_similarity(vec, vec) == pytest.approx(1.0)
 
     def test_orthogonal_vectors(self) -> None:
         """Orthogonal vectors should have similarity 0.0."""
-        a = [1.0, 0.0]
-        b = [0.0, 1.0]
+        a = _to_np([1.0, 0.0])
+        b = _to_np([0.0, 1.0])
         assert _cosine_similarity(a, b) == pytest.approx(0.0)
 
     def test_opposite_vectors(self) -> None:
         """Opposite vectors should have similarity -1.0."""
-        a = [1.0, 0.0]
-        b = [-1.0, 0.0]
+        a = _to_np([1.0, 0.0])
+        b = _to_np([-1.0, 0.0])
         assert _cosine_similarity(a, b) == pytest.approx(-1.0)
 
     def test_known_value(self) -> None:
         """Cosine similarity of known vectors."""
-        a = [1.0, 2.0, 3.0]
-        b = [4.0, 5.0, 6.0]
+        a = _to_np([1.0, 2.0, 3.0])
+        b = _to_np([4.0, 5.0, 6.0])
         dot = 1 * 4 + 2 * 5 + 3 * 6  # 32
         norm_a = math.sqrt(1 + 4 + 9)  # sqrt(14)
         norm_b = math.sqrt(16 + 25 + 36)  # sqrt(77)
@@ -168,15 +201,107 @@ class TestCosineSimilarity:
 
     def test_zero_vector_returns_zero(self) -> None:
         """Zero vector should return 0.0 similarity."""
-        a = [0.0, 0.0, 0.0]
-        b = [1.0, 2.0, 3.0]
+        a = _to_np([0.0, 0.0, 0.0])
+        b = _to_np([1.0, 2.0, 3.0])
         assert _cosine_similarity(a, b) == pytest.approx(0.0)
 
     def test_both_zero_vectors(self) -> None:
         """Both zero vectors should return 0.0."""
-        a = [0.0, 0.0]
-        b = [0.0, 0.0]
+        a = _to_np([0.0, 0.0])
+        b = _to_np([0.0, 0.0])
         assert _cosine_similarity(a, b) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# SemanticDeduplicator — threshold validation
+# ---------------------------------------------------------------------------
+
+
+class TestThresholdValidation:
+    """Tests for threshold validation on construction."""
+
+    def test_resonance_equals_duplicate_raises(self) -> None:
+        """Equal thresholds should raise ValueError."""
+        with pytest.raises(ValueError, match="resonance_threshold"):
+            SemanticDeduplicator(
+                duplicate_threshold=0.80,
+                resonance_threshold=0.80,
+            )
+
+    def test_resonance_above_duplicate_raises(self) -> None:
+        """Resonance above duplicate should raise ValueError."""
+        with pytest.raises(ValueError, match="resonance_threshold"):
+            SemanticDeduplicator(
+                duplicate_threshold=0.75,
+                resonance_threshold=0.95,
+            )
+
+    def test_zero_resonance_raises(self) -> None:
+        """Zero resonance threshold should raise ValueError."""
+        with pytest.raises(ValueError, match="resonance_threshold"):
+            SemanticDeduplicator(
+                duplicate_threshold=0.95,
+                resonance_threshold=0.0,
+            )
+
+    def test_duplicate_above_one_raises(self) -> None:
+        """Duplicate threshold above 1.0 should raise ValueError."""
+        with pytest.raises(ValueError, match="resonance_threshold"):
+            SemanticDeduplicator(
+                duplicate_threshold=1.5,
+                resonance_threshold=0.75,
+            )
+
+    def test_negative_resonance_raises(self) -> None:
+        """Negative resonance threshold should raise ValueError."""
+        with pytest.raises(ValueError, match="resonance_threshold"):
+            SemanticDeduplicator(
+                duplicate_threshold=0.95,
+                resonance_threshold=-0.1,
+            )
+
+
+# ---------------------------------------------------------------------------
+# SemanticDeduplicator — dimension validation
+# ---------------------------------------------------------------------------
+
+
+class TestDimensionValidation:
+    """Tests for embedding dimension validation."""
+
+    def test_mismatched_add_fragment_raises(self) -> None:
+        """Adding fragments with different dimensions should raise."""
+        dedup = SemanticDeduplicator()
+        dedup.add_fragment("frag-a", [1.0, 0.0, 0.0])
+        with pytest.raises(ValueError, match=r"dimension mismatch.*frag-b"):
+            dedup.add_fragment("frag-b", [1.0, 0.0])
+
+    def test_mismatched_add_batch_raises(self) -> None:
+        """Batch add with inconsistent dimensions should raise."""
+        dedup = SemanticDeduplicator()
+        dedup.add_fragment("frag-a", [1.0, 0.0, 0.0])
+        with pytest.raises(ValueError, match="dimension mismatch"):
+            dedup.add_batch({"frag-b": [1.0, 0.0]})
+
+    def test_mismatched_find_duplicates_raises(self) -> None:
+        """Batch find with inconsistent dimensions should raise."""
+        dedup = SemanticDeduplicator()
+        with pytest.raises(ValueError, match="dimension mismatch"):
+            dedup.find_duplicates(
+                {
+                    "frag-a": [1.0, 0.0, 0.0],
+                    "frag-b": [1.0, 0.0],
+                }
+            )
+
+    def test_clear_resets_dimension(self) -> None:
+        """After clear, a different dimension should be accepted."""
+        dedup = SemanticDeduplicator()
+        dedup.add_fragment("frag-a", [1.0, 0.0, 0.0])
+        dedup.clear()
+        # Should not raise — dimension was reset
+        dedup.add_fragment("frag-b", [1.0, 0.0])
+        assert dedup.size == 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,18 +314,17 @@ class TestBatchMode:
 
     def test_empty_embeddings(self) -> None:
         """Empty embeddings should produce empty result."""
-        dedup = SemanticDeduplicator()
-        result = dedup.find_duplicates({})
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        result = SemanticDeduplicator().find_duplicates({})
+        assert not result.duplicates
+        assert not result.resonances
 
     def test_single_fragment(self) -> None:
         """Single fragment should produce empty result (no pairs)."""
         dedup = SemanticDeduplicator()
         embeddings = {"frag-a": [1.0, 0.0, 0.0]}
         result = dedup.find_duplicates(embeddings)
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        assert not result.duplicates
+        assert not result.resonances
 
     def test_identical_embeddings_are_duplicate(self) -> None:
         """Identical embedding vectors should be classified as duplicates."""
@@ -236,7 +360,7 @@ class TestBatchMode:
         b = [0.8, 0.6, 0.0]  # cosine sim ~0.8
         embeddings = {"frag-a": a, "frag-b": b}
         result = dedup.find_duplicates(embeddings)
-        assert len(result.duplicates) == 0
+        assert not result.duplicates
         assert len(result.resonances) == 1
         assert result.resonances[0].classification == "resonance"
 
@@ -247,8 +371,8 @@ class TestBatchMode:
         b = [0.0, 1.0, 0.0]  # orthogonal, sim=0.0
         embeddings = {"frag-a": a, "frag-b": b}
         result = dedup.find_duplicates(embeddings)
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        assert not result.duplicates
+        assert not result.resonances
 
     def test_multiple_pairs(self) -> None:
         """Should detect multiple duplicate and resonance pairs."""
@@ -265,7 +389,7 @@ class TestBatchMode:
         result = dedup.find_duplicates(embeddings)
         assert len(result.duplicates) == 1  # a-b
         # c has ~0.8 similarity with a and b
-        assert len(result.resonances) >= 1
+        assert result.resonances
 
     def test_pairs_sorted_by_similarity_descending(self) -> None:
         """Duplicate pairs should be sorted by similarity (highest first)."""
@@ -297,10 +421,9 @@ class TestIncrementalMode:
 
     def test_check_against_empty_index(self) -> None:
         """Checking against empty index should return empty result."""
-        dedup = SemanticDeduplicator()
-        result = dedup.check_fragment("frag-new", [1.0, 0.0, 0.0])
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        result = SemanticDeduplicator().check_fragment("frag-new", [1.0, 0.0, 0.0])
+        assert not result.duplicates
+        assert not result.resonances
 
     def test_add_then_check_duplicate(self) -> None:
         """Adding a fragment then checking a duplicate should detect it."""
@@ -327,8 +450,8 @@ class TestIncrementalMode:
         dedup = SemanticDeduplicator(resonance_threshold=0.75)
         dedup.add_fragment("frag-a", [1.0, 0.0, 0.0])
         result = dedup.check_fragment("frag-b", [0.0, 1.0, 0.0])
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        assert not result.duplicates
+        assert not result.resonances
 
     def test_check_does_not_add_to_index(self) -> None:
         """check_fragment should not modify the index."""
@@ -391,12 +514,14 @@ class TestThresholdTuning:
         embeddings = {"frag-a": a, "frag-b": b}
 
         # Lower threshold — should detect as duplicate
-        loose = SemanticDeduplicator(duplicate_threshold=0.90)
-        result_loose = loose.find_duplicates(embeddings)
+        result_loose = SemanticDeduplicator(duplicate_threshold=0.90).find_duplicates(
+            embeddings
+        )
 
         # Higher threshold — may not detect as duplicate
-        strict = SemanticDeduplicator(duplicate_threshold=0.999)
-        result_strict = strict.find_duplicates(embeddings)
+        result_strict = SemanticDeduplicator(duplicate_threshold=0.999).find_duplicates(
+            embeddings
+        )
 
         assert len(result_loose.duplicates) >= len(result_strict.duplicates)
 
@@ -440,7 +565,7 @@ class TestClear:
         dedup.add_fragment("frag-a", [1.0, 0.0, 0.0])
         dedup.clear()
         result = dedup.check_fragment("frag-b", [1.0, 0.0, 0.0])
-        assert len(result.duplicates) == 0
+        assert not result.duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -490,8 +615,8 @@ class TestEdgeCases:
             vec[i] = 1.0
             embeddings[f"frag-{i:03d}"] = vec
         result = dedup.find_duplicates(embeddings)
-        assert len(result.duplicates) == 0
-        assert len(result.resonances) == 0
+        assert not result.duplicates
+        assert not result.resonances
 
 
 # ---------------------------------------------------------------------------

@@ -17,16 +17,20 @@ Two classification tiers:
 All flagged pairs are placed in a review queue — nothing is auto-deleted.
 Supports both **batch** (all-pairs comparison) and **incremental** (new
 fragment vs. existing index) processing modes.
+
+Embedding vectors must all share the same dimensionality.  Mismatched
+dimensions will raise a ``ValueError`` with context about the offending
+fragment and expected size.
 """
 
-import math
 from typing import Literal
 
+import numpy as np
 from pydantic import BaseModel, Field
 
 
-def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
-    """Compute cosine similarity between two vectors.
+def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    """Compute cosine similarity between two numpy vectors.
 
     Returns 0.0 when either vector has zero magnitude, avoiding
     division-by-zero errors.
@@ -39,14 +43,13 @@ def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
         Cosine similarity in the range [-1.0, 1.0], or 0.0 if either
         vector has zero magnitude.
     """
-    dot = sum(a * b for a, b in zip(vec_a, vec_b, strict=True))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
 
-    if norm_a == 0.0 or norm_b == 0.0:
+    if 0.0 in (norm_a, norm_b):
         return 0.0
 
-    return dot / (norm_a * norm_b)
+    return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +70,7 @@ class SemanticDuplicatePair(BaseModel):
 
     fragment_id_a: str
     fragment_id_b: str
-    similarity: float = Field(ge=0.0, le=1.0)
+    similarity: float = Field(ge=-1.0, le=1.0)
     classification: Literal["duplicate", "resonance"]
 
 
@@ -98,6 +101,10 @@ class SemanticDeduplicator:
     modes.  Flagged pairs are classified as either **duplicates** or
     **resonances** based on configurable cosine-similarity thresholds.
 
+    All embedding vectors must have the same dimensionality.  The expected
+    dimension is set by the first vector added and enforced on subsequent
+    additions.
+
     Attributes:
         duplicate_threshold: Minimum cosine similarity for a pair to be
             classified as a near-duplicate.
@@ -120,10 +127,56 @@ class SemanticDeduplicator:
             resonance_threshold: Cosine similarity at or above which
                 (but below ``duplicate_threshold``) a pair is classified
                 as a resonance.
+
+        Raises:
+            ValueError: If ``resonance_threshold`` is not less than
+                ``duplicate_threshold``, or if either is outside (0, 1].
         """
+        if not (0.0 < resonance_threshold < duplicate_threshold <= 1.0):
+            msg = (
+                f"resonance_threshold ({resonance_threshold}) must be "
+                f"less than duplicate_threshold ({duplicate_threshold}) "
+                f"and both must be in (0, 1]"
+            )
+            raise ValueError(msg)
+
         self.duplicate_threshold = duplicate_threshold
         self.resonance_threshold = resonance_threshold
-        self._index: dict[str, list[float]] = {}
+        self._index: dict[str, np.ndarray] = {}
+        self._dimension: int | None = None
+
+    def _validate_embedding(
+        self,
+        fragment_id: str,
+        embedding: list[float],
+    ) -> np.ndarray:
+        """Validate and convert an embedding to a numpy array.
+
+        Checks dimensionality against the expected dimension (set by
+        the first embedding added).
+
+        Args:
+            fragment_id: ID of the fragment (for error messages).
+            embedding: Raw embedding vector as a list of floats.
+
+        Returns:
+            The embedding as a numpy array.
+
+        Raises:
+            ValueError: If the embedding dimension does not match the
+                expected dimension.
+        """
+        vec = np.asarray(embedding, dtype=np.float64)
+        if self._dimension is None:
+            self._dimension = len(embedding)
+        elif len(embedding) != self._dimension:
+            msg = (
+                f"Embedding dimension mismatch for fragment "
+                f"'{fragment_id}': expected {self._dimension}, "
+                f"got {len(embedding)}"
+            )
+            raise ValueError(msg)
+        return vec
 
     @property
     def size(self) -> int:
@@ -143,20 +196,30 @@ class SemanticDeduplicator:
         Args:
             fragment_id: Unique identifier for the fragment.
             embedding: Pre-computed embedding vector.
+
+        Raises:
+            ValueError: If the embedding dimension does not match
+                previously added embeddings.
         """
-        self._index[fragment_id] = embedding
+        self._index[fragment_id] = self._validate_embedding(fragment_id, embedding)
 
     def add_batch(self, embeddings: dict[str, list[float]]) -> None:
         """Add multiple fragment embeddings to the index.
 
         Args:
             embeddings: Mapping of fragment IDs to embedding vectors.
+
+        Raises:
+            ValueError: If any embedding dimension does not match
+                previously added embeddings.
         """
-        self._index.update(embeddings)
+        for fid, emb in embeddings.items():
+            self._index[fid] = self._validate_embedding(fid, emb)
 
     def clear(self) -> None:
-        """Remove all fragments from the index."""
+        """Remove all fragments from the index and reset dimensionality."""
         self._index.clear()
+        self._dimension = None
 
     def find_duplicates(
         self,
@@ -167,20 +230,44 @@ class SemanticDeduplicator:
         Compares all unique pairs and classifies each by cosine
         similarity.  Does **not** modify the internal index.
 
+        All vectors in *embeddings* must have the same dimensionality.
+
         Args:
             embeddings: Mapping of fragment IDs to embedding vectors.
 
         Returns:
             A :class:`SemanticDuplicateResult` with duplicate and
             resonance pairs sorted by similarity descending.
+
+        Raises:
+            ValueError: If embedding dimensions are inconsistent.
         """
         duplicates: list[SemanticDuplicatePair] = []
         resonances: list[SemanticDuplicatePair] = []
 
         ids = sorted(embeddings.keys())
+        if not ids:
+            return SemanticDuplicateResult(
+                duplicates=duplicates,
+                resonances=resonances,
+            )
+
+        # Convert to numpy and validate dimensions
+        dim = len(embeddings[ids[0]])
+        vecs: dict[str, np.ndarray] = {}
+        for fid in ids:
+            emb = embeddings[fid]
+            if len(emb) != dim:
+                msg = (
+                    f"Embedding dimension mismatch for fragment "
+                    f"'{fid}': expected {dim}, got {len(emb)}"
+                )
+                raise ValueError(msg)
+            vecs[fid] = np.asarray(emb, dtype=np.float64)
+
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
-                sim = _cosine_similarity(embeddings[ids[i]], embeddings[ids[j]])
+                sim = _cosine_similarity(vecs[ids[i]], vecs[ids[j]])
                 pair = self._classify_pair(ids[i], ids[j], sim)
                 if pair is not None:
                     if pair.classification == "duplicate":
@@ -218,8 +305,9 @@ class SemanticDeduplicator:
         duplicates: list[SemanticDuplicatePair] = []
         resonances: list[SemanticDuplicatePair] = []
 
+        vec = np.asarray(embedding, dtype=np.float64)
         for indexed_id, indexed_vec in self._index.items():
-            sim = _cosine_similarity(embedding, indexed_vec)
+            sim = _cosine_similarity(vec, indexed_vec)
             pair = self._classify_pair(fragment_id, indexed_id, sim)
             if pair is not None:
                 if pair.classification == "duplicate":
@@ -255,18 +343,21 @@ class SemanticDeduplicator:
             A :class:`SemanticDuplicatePair` if above the resonance
             threshold, or ``None`` if below.
         """
-        if similarity >= self.duplicate_threshold:
+        # Clamp to [-1, 1] to handle floating-point rounding
+        clamped = max(-1.0, min(1.0, similarity))
+
+        if clamped >= self.duplicate_threshold:
             return SemanticDuplicatePair(
                 fragment_id_a=id_a,
                 fragment_id_b=id_b,
-                similarity=similarity,
+                similarity=clamped,
                 classification="duplicate",
             )
-        if similarity >= self.resonance_threshold:
+        if clamped >= self.resonance_threshold:
             return SemanticDuplicatePair(
                 fragment_id_a=id_a,
                 fragment_id_b=id_b,
-                similarity=similarity,
+                similarity=clamped,
                 classification="resonance",
             )
         return None
