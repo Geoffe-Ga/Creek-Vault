@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pathlib import Path
 
+from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -292,7 +293,28 @@ class DiscordIngestor(Ingestor):
     Processes per-channel ``messages.json`` and ``channel.json`` files
     from Discord data exports. Groups messages by reply chains and
     time proximity, then converts each group into a Creek fragment.
+
+    Optionally applies a :class:`DiscordFilter` to skip low-value
+    messages before fragment creation.
+
+    Attributes:
+        discord_filter: The pre-ingestion filter instance.
     """
+
+    def __init__(
+        self,
+        discord_filter_config: DiscordFilterConfig | None = None,
+    ) -> None:
+        """Initialise the ingestor with optional filter configuration.
+
+        Args:
+            discord_filter_config: Configuration for pre-ingestion
+                filtering.  Uses defaults (all filters enabled) if
+                ``None``.
+        """
+        self.discord_filter = DiscordFilter(
+            config=discord_filter_config,
+        )
 
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Find all ``messages.json`` files within channel directories.
@@ -376,6 +398,11 @@ class DiscordIngestor(Ingestor):
         """
         text = raw.content.decode(raw.detected_encoding, errors="replace")
         messages = self._parse_messages_json(text, raw.path)
+        if not messages:
+            return []
+
+        # Apply pre-ingestion filter to remove noise before grouping
+        messages, _stats = self.discord_filter.filter_messages(messages)
         if not messages:
             return []
 

@@ -10,9 +10,10 @@ for classifying fragment authorship as self, ai, other, or collaborative,
 the :class:`FragmentValidator` for post-ingestion field, encoding, and
 timestamp validation, the :class:`ContextExtractor` for handling
 non-user content, the :class:`ChatbotFilter` for pre-ingestion chatbot
-noise removal, the :class:`GoogleDriveFilter` for pre-ingestion filtering
-of Google Drive staged files, and vault hygiene scanners for orphans,
-stale reviews, broken links, duplicates, and health reports.
+noise removal, the :class:`DiscordFilter` for pre-ingestion Discord
+message filtering, the :class:`GoogleDriveFilter` for pre-ingestion
+filtering of Google Drive staged files, and vault hygiene scanners for
+orphans, stale reviews, broken links, duplicates, and health reports.
 """
 
 from creek.clean.authorship import AuthorshipResult, AuthorshipTagger
@@ -23,6 +24,11 @@ from creek.clean.filters.chatbot import (
     ChatbotFilterConfig,
     ConversationFilterResult,
     MessageVerdict,
+)
+from creek.clean.filters.discord import (
+    DiscordFilter,
+    DiscordFilterConfig,
+    FilterStats,
 )
 from creek.clean.filters.google_drive import (
     GoogleDriveFilter,
@@ -62,9 +68,12 @@ __all__ = [
     "ConversationFilterResult",
     "DeduplicationResult",
     "Deduplicator",
+    "DiscordFilter",
+    "DiscordFilterConfig",
     "DuplicateCandidate",
     "DuplicateResult",
     "DuplicateScanner",
+    "FilterStats",
     "FragmentValidator",
     "GoogleDriveFilter",
     "GoogleDriveFilterResult",
