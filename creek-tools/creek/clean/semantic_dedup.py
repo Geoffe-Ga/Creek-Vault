@@ -301,9 +301,21 @@ class SemanticDeduplicator:
         Returns:
             A :class:`SemanticDuplicateResult` with matches found in
             the index.
+
+        Raises:
+            ValueError: If the embedding dimension does not match the
+                index dimension.
         """
         duplicates: list[SemanticDuplicatePair] = []
         resonances: list[SemanticDuplicatePair] = []
+
+        if self._dimension is not None and len(embedding) != self._dimension:
+            msg = (
+                f"Embedding dimension mismatch for fragment "
+                f"'{fragment_id}': expected {self._dimension}, "
+                f"got {len(embedding)}"
+            )
+            raise ValueError(msg)
 
         vec = np.asarray(embedding, dtype=np.float64)
         for indexed_id, indexed_vec in self._index.items():

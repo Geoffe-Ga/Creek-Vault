@@ -294,6 +294,13 @@ class TestDimensionValidation:
                 }
             )
 
+    def test_mismatched_check_fragment_raises(self) -> None:
+        """Checking a fragment with wrong dimension should raise ValueError."""
+        dedup = SemanticDeduplicator()
+        dedup.add_fragment("frag-a", [1.0, 0.0, 0.0])
+        with pytest.raises(ValueError, match=r"dimension mismatch.*frag-b"):
+            dedup.check_fragment("frag-b", [1.0, 0.0])
+
     def test_clear_resets_dimension(self) -> None:
         """After clear, a different dimension should be accepted."""
         dedup = SemanticDeduplicator()
