@@ -32,6 +32,8 @@ from creek.ingest.base import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.clean.filters.chatbot import ChatbotFilter
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +43,23 @@ class ChatGPTIngestor(Ingestor):
     Handles the tree-structured ``mapping`` format used by ChatGPT's
     data export feature, where messages are connected via
     ``parent``/``children`` references.
+
+    An optional :class:`ChatbotFilter` can be provided to filter noise
+    (system prompts, tool outputs, regenerations) before turn pairing.
     """
+
+    def __init__(
+        self,
+        *,
+        chatbot_filter: ChatbotFilter | None = None,
+    ) -> None:
+        """Initialise the ChatGPT ingestor with an optional chatbot filter.
+
+        Args:
+            chatbot_filter: Optional pre-ingestion filter for noise removal.
+                If ``None``, no filtering is applied.
+        """
+        self._chatbot_filter = chatbot_filter
 
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Find ChatGPT JSON export files in the given directory.
@@ -173,9 +191,67 @@ class ChatGPTIngestor(Ingestor):
         conversation_id: str | None = conv.get("id")
 
         ordered_messages = _linearize_tree(mapping)
+
+        # Apply chatbot filter if configured
+        if self._chatbot_filter is not None:
+            normalized = _normalize_chatgpt_messages(ordered_messages)
+            filter_result = self._chatbot_filter.filter_conversation(
+                normalized, platform="chatgpt"
+            )
+            ordered_messages = _denormalize_chatgpt_messages(
+                filter_result.messages, ordered_messages
+            )
+
         return _pair_messages_to_fragments(
             ordered_messages, title, timestamp, source_path, conversation_id
         )
+
+
+def _normalize_chatgpt_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize ChatGPT message dicts for the chatbot filter.
+
+    Converts ChatGPT's ``author.role`` / ``content.parts`` structure
+    into the flat ``role`` / ``content`` format expected by
+    :class:`ChatbotFilter`.
+
+    Args:
+        messages: List of raw ChatGPT message dicts.
+
+    Returns:
+        List of normalized message dicts with ``role`` and ``content`` keys.
+    """
+    normalized: list[dict[str, Any]] = []
+    for msg in messages:
+        role = _get_message_role(msg)
+        text = _extract_message_text(msg)
+        normalized.append({"role": role, "content": text, "_original": msg})
+    return normalized
+
+
+def _denormalize_chatgpt_messages(
+    filtered: list[dict[str, Any]],
+    originals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Map filtered normalized messages back to original ChatGPT format.
+
+    Uses the ``_original`` reference stored during normalization to
+    return the original message dicts that passed filtering.
+
+    Args:
+        filtered: Filtered normalized messages from the chatbot filter.
+        originals: The original unfiltered ChatGPT messages.
+
+    Returns:
+        List of original ChatGPT message dicts that passed filtering.
+    """
+    result: list[dict[str, Any]] = []
+    for msg in filtered:
+        original = msg.get("_original")
+        if original is not None:
+            result.append(original)
+    return result
 
 
 def _is_chatgpt_export(raw_bytes: bytes, encoding: str) -> bool:
