@@ -11,6 +11,10 @@ command registration and keeps :mod:`creek.cli` focused on routing.
 
 from __future__ import annotations
 
+import os
+import tempfile
+from collections import Counter
+from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 import typer
@@ -24,13 +28,9 @@ from creek.redact.redactor import Redactor
 from creek.redact.scanner import RedactionScanner, ScanSummary
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from pathlib import Path
-
     from rich.console import Console
 
     from creek.config import CreekConfig
-    from creek.redact.scanner import RedactionMatch
 
 
 # ---------------------------------------------------------------------------
@@ -74,26 +74,6 @@ def _style_for(severity: str) -> str:
     return _SEVERITY_STYLES.get(severity, "white")
 
 
-def _count_by(
-    matches: list[RedactionMatch],
-    key_fn: Callable[[RedactionMatch], str],
-) -> dict[str, int]:
-    """Count matches by a derived key.
-
-    Args:
-        matches: Redaction matches to aggregate.
-        key_fn: Function extracting the grouping key from a match.
-
-    Returns:
-        Mapping from key to count.
-    """
-    counts: dict[str, int] = {}
-    for match in matches:
-        key = key_fn(match)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
@@ -123,7 +103,7 @@ def _render_severity_table(summary: ScanSummary, console: Console) -> None:
         summary: Scan summary to render.
         console: Rich console sink.
     """
-    by_sev = _count_by(summary.matches, lambda m: _severity(m.match_type))
+    by_sev: Counter[str] = Counter(_severity(m.match_type) for m in summary.matches)
     table = Table(title="Findings by Severity")
     table.add_column("Severity", style="bold")
     table.add_column("Count", justify="right")
@@ -140,7 +120,7 @@ def _render_type_table(summary: ScanSummary, console: Console) -> None:
         summary: Scan summary to render.
         console: Rich console sink.
     """
-    by_type = _count_by(summary.matches, lambda m: m.match_type)
+    by_type: Counter[str] = Counter(m.match_type for m in summary.matches)
     table = Table(title="Findings by Type")
     table.add_column("Type", style="bold")
     table.add_column("Severity", style="bold")
@@ -252,6 +232,34 @@ def _require_existing(console: Console, path: Path, label: str) -> None:
         _error_exit(console, f"{label} not found: {path}")
 
 
+def require_flag(
+    value: Path | None,
+    mode: str,
+    flag: str,
+    console: Console,
+) -> Path:
+    """Return *value* or abort when a required CLI flag is missing.
+
+    Shared helper so that :mod:`creek.cli` and the handlers in this
+    module emit identical, consistently styled error messages.
+
+    Args:
+        value: Candidate path from the CLI.
+        mode: Mode flag that triggered the requirement (e.g. ``--scan``).
+        flag: Required flag name (e.g. ``--source``).
+        console: Rich console sink.
+
+    Returns:
+        The validated, non-``None`` path.
+
+    Raises:
+        typer.Exit: When *value* is ``None``.
+    """
+    if value is None:
+        _error_exit(console, f"{mode} requires {flag}")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Mode: scan
 # ---------------------------------------------------------------------------
@@ -311,6 +319,38 @@ def _files_from_summary(summary: ScanSummary) -> list[Path]:
     return ordered
 
 
+def _atomic_write(file_path: Path, content: str) -> None:
+    """Atomically replace *file_path*'s content.
+
+    Writes to a same-directory temporary file first, then swaps it into
+    place with :func:`os.replace`. The swap is atomic on POSIX and best
+    effort on Windows. If any step fails the temp file is unlinked so
+    the original on-disk file is left untouched.
+
+    Args:
+        file_path: Destination path to rewrite.
+        content: New file contents.
+
+    Raises:
+        OSError: Propagated from filesystem primitives. The original
+            file is never observed in a half-written state.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{file_path.name}.",
+        suffix=".redact-tmp",
+        dir=file_path.parent,
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(content)
+        os.replace(tmp_path, file_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _apply_redactions(
     redactor: Redactor,
     files: list[Path],
@@ -318,16 +358,36 @@ def _apply_redactions(
 ) -> None:
     """Rewrite each file in place with sensitive data replaced.
 
+    Each file is rewritten atomically via :func:`_atomic_write`, so a
+    mid-loop failure cannot leave any single file half-written. If an
+    :class:`OSError` interrupts the batch, already-redacted files keep
+    their redactions and the remaining files remain untouched — the
+    partial progress is reported and the error is surfaced as a
+    non-zero exit code.
+
     Args:
         redactor: Configured :class:`Redactor`.
         files: Files to rewrite.
-        console: Rich console sink for the completion banner.
+        console: Rich console sink for progress and error messages.
+
+    Raises:
+        typer.Exit: With code ``1`` when the batch is interrupted by an
+            I/O failure after reporting how many files were completed.
     """
-    for file_path in files:
-        text = file_path.read_text(encoding="utf-8", errors="replace")
-        redacted = redactor.redact_content(text)
-        file_path.write_text(redacted, encoding="utf-8")
-    console.print(f"[green]Applied redactions to {len(files)} file(s).[/green]")
+    completed = 0
+    try:
+        for file_path in files:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            redacted = redactor.redact_content(text)
+            _atomic_write(file_path, redacted)
+            completed += 1
+    except OSError as exc:
+        console.print(
+            f"[red]I/O error after redacting {completed} of "
+            f"{len(files)} file(s): {exc}[/red]"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Applied redactions to {completed} file(s).[/green]")
 
 
 def _confirm_apply(

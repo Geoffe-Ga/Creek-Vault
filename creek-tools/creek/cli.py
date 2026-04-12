@@ -67,6 +67,11 @@ def _dispatch_redact(
 ) -> None:
     """Route the ``redact`` command to the selected mode handler.
 
+    The caller (:func:`redact`) guarantees that exactly one of ``scan``,
+    ``apply``, or ``review`` is ``True`` before invocation, so the final
+    ``review`` branch is reached by elimination. The invariant is
+    re-asserted defensively below to keep the coupling explicit.
+
     Args:
         scan: ``--scan`` flag.
         apply: ``--apply`` flag.
@@ -78,14 +83,19 @@ def _dispatch_redact(
         verbose: ``--verbose`` flag.
         assume_yes: ``--yes`` flag (apply).
     """
-    from creek.redact.cli_commands import run_apply, run_review, run_scan
+    from creek.redact.cli_commands import (
+        require_flag,
+        run_apply,
+        run_review,
+        run_scan,
+    )
 
     if scan:
-        src = _require_flag(source, "--scan", "--source")
+        src = require_flag(source, "--scan", "--source", console)
         run_scan(src, report=report, verbose=verbose, console=console)
         return
     if apply:
-        src = _require_flag(source, "--apply", "--source")
+        src = require_flag(source, "--apply", "--source", console)
         run_apply(
             src,
             dry_run=dry_run,
@@ -94,28 +104,13 @@ def _dispatch_redact(
             console=console,
         )
         return
-    vlt = _require_flag(vault, "--review", "--vault")
+    # Invariant: redact() rejects any flag combination where review is
+    # not the sole mode flag, so reaching this branch implies review=True.
+    if not review:  # pragma: no cover — defence in depth
+        msg = "dispatch reached without a mode flag"
+        raise RuntimeError(msg)
+    vlt = require_flag(vault, "--review", "--vault", console)
     run_review(vlt, verbose=verbose, console=console)
-
-
-def _require_flag(value: Path | None, mode: str, flag: str) -> Path:
-    """Return *value* or abort when a required flag is missing.
-
-    Args:
-        value: Candidate path.
-        mode: Mode flag that triggered the requirement (e.g. ``--scan``).
-        flag: Required flag name (e.g. ``--source``).
-
-    Returns:
-        The validated path.
-
-    Raises:
-        typer.Exit: When *value* is ``None``.
-    """
-    if value is None:
-        console.print(f"[red]{mode} requires {flag}[/red]")
-        raise typer.Exit(code=2)
-    return value
 
 
 @app.command()

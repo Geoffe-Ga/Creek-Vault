@@ -7,6 +7,7 @@ together with the supporting flags (``--report``, ``--dry-run``,
 
 from __future__ import annotations
 
+import os as real_os
 from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
@@ -15,6 +16,8 @@ from creek.cli import app
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 runner = CliRunner()
 
@@ -280,6 +283,53 @@ def test_redact_apply_no_findings_short_circuits(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert "nothing to redact" in result.output.lower()
+
+
+def test_redact_apply_partial_io_failure_preserves_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An I/O error mid-batch must never leave a file half-written.
+
+    Simulates ``os.replace`` failing on the second file. The first file
+    is expected to be redacted, the second file must retain its
+    original, un-redacted content (i.e. not be a half-written temp
+    file or empty), and no stray temp files may be left behind.
+    """
+    source = _write_sensitive_source(tmp_path)
+    leak = source / "leak.env"
+    notes = source / "notes.md"
+    original_notes = notes.read_text(encoding="utf-8")
+
+    real_replace = real_os.replace
+    call_count = {"n": 0}
+
+    def flaky_replace(src: object, dst: object) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            msg = "simulated disk full"
+            raise OSError(msg)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(
+        "creek.redact.cli_commands.os.replace",
+        flaky_replace,
+    )
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(source), "--yes"],
+    )
+
+    assert result.exit_code != 0
+    assert "I/O error" in result.output
+    # First file was redacted atomically and committed.
+    assert "hunter2" not in leak.read_text(encoding="utf-8")
+    # Second file is exactly as it started — not empty, not partial.
+    assert notes.read_text(encoding="utf-8") == original_notes
+    # No stray temp files left in the source directory.
+    assert not list(source.glob("*.redact-tmp"))
+    assert not list(source.glob(".*.redact-tmp"))
 
 
 def test_redact_apply_verbose_lists_matches(tmp_path: Path) -> None:
