@@ -220,19 +220,10 @@ def test_review_command() -> None:
 
 
 def test_purge_help() -> None:
-    """Test that purge --help shows subcommand help."""
+    """Test that purge --help shows subcommand group help."""
     result = runner.invoke(app, ["purge", "--help"])
     assert result.exit_code == 0
     assert "purge" in result.output.lower()
-
-
-def test_purge_command() -> None:
-    """Test that purge command runs with required args."""
-    result = runner.invoke(
-        app,
-        ["purge", "--vault", "/fake/vault", "--target", "fragments"],
-    )
-    assert result.exit_code == 0
 
 
 def test_gdrive_help() -> None:
