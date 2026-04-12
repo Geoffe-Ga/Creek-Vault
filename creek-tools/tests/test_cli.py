@@ -79,42 +79,44 @@ def test_redact_help() -> None:
     assert "redact" in result.output.lower()
 
 
-def test_redact_scan() -> None:
+def test_redact_scan(tmp_path: Path) -> None:
     """Test that redact command runs with --scan flag."""
+    source = tmp_path / "src"
+    source.mkdir()
     result = runner.invoke(
         app,
-        ["redact", "--scan", "--source", "/fake/src", "--vault", "/fake/vault"],
+        ["redact", "--scan", "--source", str(source)],
     )
     assert result.exit_code == 0
 
 
-def test_redact_apply() -> None:
+def test_redact_apply(tmp_path: Path) -> None:
     """Test that redact command runs with --apply flag."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "ok.md").write_text("nothing interesting\n", encoding="utf-8")
     result = runner.invoke(
         app,
-        ["redact", "--apply", "--source", "/fake/src", "--vault", "/fake/vault"],
+        ["redact", "--apply", "--source", str(source)],
     )
     assert result.exit_code == 0
 
 
-def test_redact_review() -> None:
+def test_redact_review(tmp_path: Path) -> None:
     """Test that redact command runs with --review flag."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
     result = runner.invoke(
         app,
-        [
-            "redact",
-            "--review",
-            "--source",
-            "/fake/src",
-            "--vault",
-            "/fake/vault",
-        ],
+        ["redact", "--review", "--vault", str(vault)],
     )
     assert result.exit_code == 0
 
 
-def test_redact_report() -> None:
+def test_redact_report(tmp_path: Path) -> None:
     """Test that redact command runs with --report flag."""
+    source = tmp_path / "src"
+    source.mkdir()
     result = runner.invoke(
         app,
         [
@@ -122,9 +124,7 @@ def test_redact_report() -> None:
             "--scan",
             "--report",
             "--source",
-            "/fake/src",
-            "--vault",
-            "/fake/vault",
+            str(source),
         ],
     )
     assert result.exit_code == 0

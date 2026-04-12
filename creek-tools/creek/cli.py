@@ -53,20 +53,109 @@ def ingest(
     )
 
 
+def _dispatch_redact(
+    *,
+    scan: bool,
+    apply: bool,
+    review: bool,
+    source: Path | None,
+    vault: Path | None,
+    report: bool,
+    dry_run: bool,
+    verbose: bool,
+    assume_yes: bool,
+) -> None:
+    """Route the ``redact`` command to the selected mode handler.
+
+    The caller (:func:`redact`) guarantees that exactly one of ``scan``,
+    ``apply``, or ``review`` is ``True`` before invocation, so the final
+    ``review`` branch is reached by elimination. The invariant is
+    re-asserted defensively below to keep the coupling explicit.
+
+    Args:
+        scan: ``--scan`` flag.
+        apply: ``--apply`` flag.
+        review: ``--review`` flag.
+        source: ``--source`` path (scan/apply).
+        vault: ``--vault`` path (review).
+        report: ``--report`` flag (scan).
+        dry_run: ``--dry-run`` flag (apply).
+        verbose: ``--verbose`` flag.
+        assume_yes: ``--yes`` flag (apply).
+    """
+    from creek.redact.cli_commands import (
+        require_flag,
+        run_apply,
+        run_review,
+        run_scan,
+    )
+
+    if scan:
+        src = require_flag(source, "--scan", "--source", console)
+        run_scan(src, report=report, verbose=verbose, console=console)
+        return
+    if apply:
+        src = require_flag(source, "--apply", "--source", console)
+        run_apply(
+            src,
+            dry_run=dry_run,
+            verbose=verbose,
+            assume_yes=assume_yes,
+            console=console,
+        )
+        return
+    # Invariant: redact() rejects any flag combination where review is
+    # not the sole mode flag, so reaching this branch implies review=True.
+    if not review:  # pragma: no cover — defence in depth
+        msg = "dispatch reached without a mode flag"
+        raise RuntimeError(msg)
+    vlt = require_flag(vault, "--review", "--vault", console)
+    run_review(vlt, verbose=verbose, console=console)
+
+
 @app.command()
 def redact(
-    scan: bool = typer.Option(False, help="Scan for sensitive content"),
-    apply: bool = typer.Option(False, help="Apply redactions"),
-    review: bool = typer.Option(False, help="Review redactions"),
-    source: Path | None = typer.Option(None, help="Source path"),
-    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    report: bool = typer.Option(False, help="Generate redaction report"),
+    scan: bool = typer.Option(False, "--scan", help="Scan for sensitive content"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Apply redactions to matched files"
+    ),
+    review: bool = typer.Option(
+        False, "--review", help="Render the review queue for a vault"
+    ),
+    source: Path | None = typer.Option(
+        None, "--source", help="Source path (scan/apply)"
+    ),
+    vault: Path | None = typer.Option(None, "--vault", help="Vault path (review)"),
+    report: bool = typer.Option(
+        False, "--report", help="Include the detailed markdown report (scan)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Scan but do not modify files (apply)"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show per-match details"
+    ),
+    assume_yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt (apply)"
+    ),
 ) -> None:
-    """Scan, apply, or review redactions."""
-    console.print(
-        f"[bold green]Would redact: scan={scan}, apply={apply}, "
-        f"review={review}, source={source}, vault={vault}, "
-        f"report={report}[/bold green]"
+    """Scan for sensitive data, apply redactions, or review the queue.
+
+    Exactly one of ``--scan``, ``--apply``, or ``--review`` must be given.
+    """
+    if sum([scan, apply, review]) != 1:
+        console.print("[red]Specify exactly one of --scan, --apply, --review.[/red]")
+        raise typer.Exit(code=2)
+    _dispatch_redact(
+        scan=scan,
+        apply=apply,
+        review=review,
+        source=source,
+        vault=vault,
+        report=report,
+        dry_run=dry_run,
+        verbose=verbose,
+        assume_yes=assume_yes,
     )
 
 
