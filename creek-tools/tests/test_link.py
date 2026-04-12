@@ -1263,22 +1263,56 @@ class TestThreadMergeSuggestions:
 # ---- EddyDetector Tests ----
 
 
-class TestEddyDetector:
-    """Tests for the EddyDetector stub class."""
+def _eddy_fragment(
+    frag_id: str,
+    title: str,
+    *,
+    created: datetime,
+    threads: list[str] | None = None,
+) -> Fragment:
+    """Build a Fragment with an explicit ID (needed to match embeddings)."""
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        created=created,
+        frequency=FrequencyClassification(primary=Frequency.F1),
+        wavelength=WavelengthClassification(phase=Phase.UNCLASSIFIED),
+        threads=threads or [],
+    )
 
-    def test_detect_eddies_returns_empty_list(self) -> None:
-        """Stub detect_eddies should return an empty list."""
+
+def _dense_embeddings(ids: list[str]) -> dict[str, list[float]]:
+    """Return tight-cluster embeddings (all nearly identical)."""
+    return {fid: [1.0, 0.0, 0.0] for fid in ids}
+
+
+class TestEddyDetector:
+    """Tests for the density-clustering EddyDetector."""
+
+    def test_detect_eddies_without_embeddings_returns_empty(self) -> None:
+        """No embeddings supplied → no eddies can be detected."""
         detector = EddyDetector()
-        fragments = [_make_fragment("A"), _make_fragment("B")]
-        result = detector.detect_eddies(fragments)
-        assert result == []
-        assert isinstance(result, list)
+        fragments = [_make_fragment(f"F{i}") for i in range(6)]
+        assert detector.detect_eddies(fragments) == []
 
     def test_detect_eddies_empty_input(self) -> None:
         """detect_eddies with empty list should return empty list."""
         detector = EddyDetector()
         result = detector.detect_eddies([])
         assert result == []
+        assert isinstance(result, list)
+
+    def test_detect_eddies_below_min_fragments_returns_empty(self) -> None:
+        """Fewer embedded fragments than min_fragments yields no eddies."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-e{i}" for i in range(3)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        fragments = [
+            _eddy_fragment(fid, f"Ceramics {i}", created=now - timedelta(days=i))
+            for i, fid in enumerate(ids)
+        ]
+        assert detector.detect_eddies(fragments) == []
 
     def test_detect_eddies_logs_message(self, caplog) -> None:
         """detect_eddies should log an info message."""
@@ -1287,6 +1321,394 @@ class TestEddyDetector:
         with caplog.at_level(logging.INFO, logger="creek.link.eddies"):
             detector.detect_eddies(fragments)
         assert any("edd" in r.message.lower() for r in caplog.records)
+
+    def test_detect_eddies_dense_scattered_cluster_detected(self) -> None:
+        """Dense cluster of temporally scattered fragments forms one eddy."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-s{i}" for i in range(6)]
+        # Spread fragments across 2 years so temporal direction
+        # is diluted vs their near-identical embeddings.
+        day_offsets = [600, 45, 400, 120, 500, 15]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Identity Work",
+                created=now - timedelta(days=day_offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        eddy = result[0]
+        assert eddy.fragment_count == 6
+        assert eddy.title != ""
+
+    def test_detect_eddies_filters_out_directional_clusters(self) -> None:
+        """Clusters whose drift grows monotonically with time are threads."""
+        now = datetime(2026, 4, 1)
+        n = 8
+        ids = [f"frag-d{i}" for i in range(n)]
+        # Embeddings that drift steadily along x-axis with chronological
+        # order — produces a Spearman correlation of 1.0.
+        embeddings = {fid: [1.0 - 0.05 * i, 0.05 * i, 0.0] for i, fid in enumerate(ids)}
+        detector = EddyDetector(
+            embeddings=embeddings,
+            eps=0.9,  # large neighbourhood so all land in one cluster
+            min_samples=3,
+        )
+        fragments = [
+            _eddy_fragment(
+                fid,
+                f"Drift {i}",
+                created=now - timedelta(days=(n - i) * 5),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        assert detector.detect_eddies(fragments) == []
+
+    def test_detect_eddies_sparse_points_return_empty(self) -> None:
+        """Orthogonal embeddings leave every point a DBSCAN noise entry."""
+        now = datetime(2026, 4, 1)
+        embeddings = {
+            "frag-x0": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "frag-x1": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            "frag-x2": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            "frag-x3": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "frag-x4": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "frag-x5": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+        detector = EddyDetector(embeddings=embeddings)
+        fragments = [
+            _eddy_fragment(fid, f"Loner {i}", created=now - timedelta(days=i * 30))
+            for i, fid in enumerate(embeddings)
+        ]
+        assert detector.detect_eddies(fragments) == []
+
+    def test_detect_eddies_ignores_fragments_without_embeddings(self) -> None:
+        """Fragments without an embedding entry are skipped during clustering."""
+        now = datetime(2026, 4, 1)
+        embedded_ids = [f"frag-m{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(embedded_ids))
+        day_offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Creative Practice",
+                created=now - timedelta(days=day_offsets[i]),
+            )
+            for i, fid in enumerate(embedded_ids)
+        ]
+        # Add loose fragments with no embeddings — they must not crash
+        # detection nor become members.
+        fragments.extend(
+            [
+                _make_fragment("Loose 1", created=now - timedelta(days=1)),
+                _make_fragment("Loose 2", created=now - timedelta(days=2)),
+            ],
+        )
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        assert result[0].fragment_count == 6
+
+    def test_detect_eddies_separates_distinct_topic_clusters(self) -> None:
+        """Two disjoint dense clusters yield two eddies."""
+        now = datetime(2026, 4, 1)
+        cluster_a = [f"frag-a{i}" for i in range(6)]
+        cluster_b = [f"frag-b{i}" for i in range(6)]
+        embeddings = {fid: [1.0, 0.0, 0.0] for fid in cluster_a}
+        embeddings.update({fid: [0.0, 1.0, 0.0] for fid in cluster_b})
+        detector = EddyDetector(embeddings=embeddings)
+        offsets_a = [600, 45, 400, 120, 500, 15]
+        offsets_b = [700, 30, 300, 200, 550, 90]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Contemplation",
+                created=now - timedelta(days=offsets_a[i]),
+            )
+            for i, fid in enumerate(cluster_a)
+        ]
+        fragments.extend(
+            _eddy_fragment(
+                fid,
+                "Craftsmanship",
+                created=now - timedelta(days=offsets_b[i]),
+            )
+            for i, fid in enumerate(cluster_b)
+        )
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 2
+        titles = {e.title for e in result}
+        assert titles == {"Contemplation", "Craftsmanship"}
+
+    def test_detect_eddies_title_derived_from_cluster_words(self) -> None:
+        """Titles use the most frequent content words from the cluster."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-t{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        titles = [
+            "Garden Journal Monday",
+            "Garden Notes",
+            "Garden Reflection",
+            "Garden Planning",
+            "Garden Harvest",
+            "Garden Weekend",
+        ]
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, titles[i], created=now - timedelta(days=offsets[i]))
+            for i, fid in enumerate(ids)
+        ]
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        assert "Garden" in result[0].title
+
+    def test_detect_eddies_formed_date_uses_median_created(self) -> None:
+        """Eddy.formed is the median fragment creation date."""
+        now = datetime(2026, 4, 1, 12, 0, 0)
+        ids = [f"frag-f{i}" for i in range(5)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        # Offsets sorted asc: 5, 100, 250, 400, 700 → median index 2 → 250 days ago.
+        offsets = [400, 5, 700, 250, 100]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Voicework Study",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        assert result[0].formed == (now - timedelta(days=250)).date()
+
+    def test_detect_eddies_flowing_threads_identified(self) -> None:
+        """Threads wiki-linked on member fragments flow through the eddy."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-fl{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                ids[0],
+                "Teaching Philosophy",
+                created=now - timedelta(days=offsets[0]),
+                threads=["[[Teaching]]"],
+            ),
+            _eddy_fragment(
+                ids[1],
+                "Teaching Voice",
+                created=now - timedelta(days=offsets[1]),
+                threads=["[[Teaching]]", "[[Voice]]"],
+            ),
+            _eddy_fragment(
+                ids[2],
+                "Teaching Reflection",
+                created=now - timedelta(days=offsets[2]),
+                threads=["[[Voice]]"],
+            ),
+        ]
+        fragments.extend(
+            _eddy_fragment(
+                ids[i],
+                "Teaching Notes",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i in range(3, 6)
+        )
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        assert result[0].threads == ["[[Teaching]]", "[[Voice]]"]
+
+    def test_detect_eddies_sorted_by_formed_ascending(self) -> None:
+        """Multiple eddies are returned sorted by formation date ascending."""
+        now = datetime(2026, 4, 1)
+        # Cluster A: all old (formed earliest median), cluster B: all recent.
+        cluster_a = [f"frag-oa{i}" for i in range(5)]
+        cluster_b = [f"frag-ob{i}" for i in range(5)]
+        embeddings = {fid: [1.0, 0.0, 0.0] for fid in cluster_a}
+        embeddings.update({fid: [0.0, 1.0, 0.0] for fid in cluster_b})
+        detector = EddyDetector(embeddings=embeddings)
+        offsets_old = [800, 650, 700, 720, 680]
+        offsets_new = [30, 15, 60, 90, 45]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Ancient Theme",
+                created=now - timedelta(days=offsets_old[i]),
+            )
+            for i, fid in enumerate(cluster_a)
+        ]
+        fragments.extend(
+            _eddy_fragment(
+                fid,
+                "Recent Theme",
+                created=now - timedelta(days=offsets_new[i]),
+            )
+            for i, fid in enumerate(cluster_b)
+        )
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 2
+        assert result[0].formed < result[1].formed
+
+    def test_eddy_members_property_reports_membership(self) -> None:
+        """The eddy_members property exposes detected memberships."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-mem{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Somatic Work",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        eddies = detector.detect_eddies(fragments)
+        assert len(eddies) == 1
+        members = detector.eddy_members[eddies[0].id]
+        assert set(members) == set(ids)
+
+    def test_eddy_members_resets_on_new_detection(self) -> None:
+        """A fresh detect_eddies run replaces any prior membership map."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-r{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        first = [
+            _eddy_fragment(
+                fid,
+                "Silent Work",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        detector.detect_eddies(first)
+        # Second call with empty fragments clears membership map.
+        detector.detect_eddies([])
+        assert detector.eddy_members == {}
+
+    def test_detect_eddies_untitled_fallback_when_no_content_words(self) -> None:
+        """Pure-punctuation titles fall back to the first fragment's title."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-u{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "!!", created=now - timedelta(days=offsets[i]))
+            for i, fid in enumerate(ids)
+        ]
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        assert result[0].title == "!!"
+
+
+class TestEddyAssignment:
+    """Tests for assign_fragments_to_eddies."""
+
+    def test_assignment_adds_wikilinks(self) -> None:
+        """Fragments belonging to an eddy receive a wiki-link."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-aa{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Rest Practice",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        eddies = detector.detect_eddies(fragments)
+        updated = detector.assign_fragments_to_eddies(fragments, eddies)
+        assert len(eddies) == 1
+        wikilink = f"[[{eddies[0].title}]]"
+        for frag in updated:
+            assert wikilink in frag.eddies
+
+    def test_assignment_updates_eddy_fragment_count(self) -> None:
+        """assign_fragments_to_eddies refreshes each eddy's fragment_count."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-ac{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Ritual Work",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        eddies = detector.detect_eddies(fragments)
+        eddies[0].fragment_count = 0
+        detector.assign_fragments_to_eddies(fragments, eddies)
+        assert eddies[0].fragment_count == 6
+
+    def test_assignment_skips_unassigned_fragments(self) -> None:
+        """Fragments not in any eddy are returned unchanged."""
+        now = datetime(2026, 4, 1)
+        member_ids = [f"frag-am{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(member_ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Nature Study",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(member_ids)
+        ]
+        loner = _make_fragment("Loner", created=now - timedelta(days=1))
+        fragments.append(loner)
+        eddies = detector.detect_eddies(fragments)
+        updated = detector.assign_fragments_to_eddies(fragments, eddies)
+        loner_updated = next(f for f in updated if f.id == loner.id)
+        assert loner_updated is loner
+        assert loner_updated.eddies == []
+
+    def test_assignment_does_not_duplicate_existing_links(self) -> None:
+        """Pre-existing wiki-links are not duplicated."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-ad{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Reflection",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        eddies = detector.detect_eddies(fragments)
+        wikilink = f"[[{eddies[0].title}]]"
+        fragments[0] = fragments[0].model_copy(update={"eddies": [wikilink]})
+        updated = detector.assign_fragments_to_eddies(fragments, eddies)
+        assert updated[0].eddies.count(wikilink) == 1
+
+    def test_assignment_returns_new_fragment_instances(self) -> None:
+        """Assigned fragments are returned as fresh copies (no mutation)."""
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-an{i}" for i in range(6)]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(
+                fid,
+                "Solitude Work",
+                created=now - timedelta(days=offsets[i]),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        eddies = detector.detect_eddies(fragments)
+        updated = detector.assign_fragments_to_eddies(fragments, eddies)
+        for original, new in zip(fragments, updated, strict=True):
+            assert original.eddies == []
+            assert new.eddies != []
 
 
 # ---- LinkingResult Tests ----

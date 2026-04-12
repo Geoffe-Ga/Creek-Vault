@@ -102,9 +102,13 @@ class LinkingPipeline:
         )
         fragments = thread_detector.assign_fragments_to_threads(fragments, threads)
 
-        # Stage 4: Eddy detection
-        eddy_detector = EddyDetector()
-        eddies = eddy_detector.detect_eddies(fragments)
+        # Stage 4: Eddy detection (uses embeddings for density clustering)
+        eddy_detector = EddyDetector(embeddings=embeddings)
+        eddies = eddy_detector.detect_eddies(
+            fragments,
+            min_fragments=self.linking_config.eddy_min_fragments,
+        )
+        fragments = eddy_detector.assign_fragments_to_eddies(fragments, eddies)
 
         result = LinkingResult(
             resonance_count=len(resonances),
