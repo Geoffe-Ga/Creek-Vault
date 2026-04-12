@@ -33,6 +33,8 @@ from creek.models import (
     Mode,
     Phase,
     SourcePlatform,
+    Thread,
+    ThreadStatus,
     WavelengthClassification,
 )
 
@@ -634,10 +636,10 @@ class TestTemporalLinker:
 
 
 class TestThreadDetector:
-    """Tests for the ThreadDetector stub class."""
+    """Tests for the ThreadDetector class (sliding window + topic consistency)."""
 
-    def test_detect_threads_returns_empty_list(self) -> None:
-        """Stub detect_threads should return an empty list."""
+    def test_detect_threads_below_min_fragments_returns_empty_list(self) -> None:
+        """Two fragments with default ``min_fragments=3`` yield no threads."""
         detector = ThreadDetector()
         fragments = [_make_fragment("A"), _make_fragment("B")]
         result = detector.detect_threads(fragments)
@@ -657,6 +659,605 @@ class TestThreadDetector:
         with caplog.at_level(logging.INFO, logger="creek.link.threads"):
             detector.detect_threads(fragments)
         assert any("thread" in r.message.lower() for r in caplog.records)
+
+    def test_detect_threads_simple_cluster(self) -> None:
+        """Three frequency-aligned fragments in window form one thread."""
+        now = datetime(2026, 4, 1, 12, 0, 0)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "Reading Practice",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F4,
+            ),
+            _make_fragment(
+                "Reading Habits",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F4,
+            ),
+            _make_fragment(
+                "Reading Notes",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F4,
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        thread = result[0]
+        assert thread.fragment_count == 3
+        assert thread.first_seen == (now - timedelta(days=10)).date()
+        assert thread.last_seen == (now - timedelta(days=1)).date()
+
+    def test_detect_threads_respects_min_fragments_argument(self) -> None:
+        """min_fragments=2 admits clusters with two members."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "Hiking Logs",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F2,
+            ),
+            _make_fragment(
+                "Hiking Trips",
+                created=now - timedelta(days=2),
+                primary_freq=Frequency.F2,
+            ),
+        ]
+        result = detector.detect_threads(fragments, min_fragments=2)
+        assert len(result) == 1
+        assert result[0].fragment_count == 2
+
+    def test_detect_threads_excludes_unconnected_fragments(self) -> None:
+        """Fragments with non-overlapping frequencies stay separate."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "Topic A One",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Topic A Two",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Topic A Three",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Different",
+                created=now - timedelta(days=2),
+                primary_freq=Frequency.F9,
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert result[0].fragment_count == 3
+
+    def test_detect_threads_secondary_frequency_overlap_links(self) -> None:
+        """Fragments with overlapping secondary frequencies connect."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "Alpha",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F1,
+                secondary_freqs=[Frequency.F5],
+            ),
+            _make_fragment(
+                "Beta",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F2,
+                secondary_freqs=[Frequency.F5],
+            ),
+            _make_fragment(
+                "Gamma",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F3,
+                secondary_freqs=[Frequency.F5],
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+
+    def test_detect_threads_outside_window_does_not_link(self) -> None:
+        """Fragments separated by more than window_days are not linked directly."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now, window_days=10)
+        fragments = [
+            _make_fragment(
+                "A",
+                created=now - timedelta(days=100),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "B",
+                created=now - timedelta(days=80),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "C",
+                created=now - timedelta(days=60),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert result == []
+
+    def test_detect_threads_chains_via_union_find_across_windows(self) -> None:
+        """Overlapping windows transitively merge clusters via union-find."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now, window_days=20)
+        # Fragments at days -40, -25, -10 — A↔B (15d apart) and B↔C (15d
+        # apart) both within the 20-day window, but A↔C (30d) would not
+        # connect on its own. Union-find must chain them via B.
+        fragments = [
+            _make_fragment(
+                "Anchor One",
+                created=now - timedelta(days=40),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Anchor Two",
+                created=now - timedelta(days=25),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Anchor Three",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert result[0].fragment_count == 3
+
+    def test_detect_threads_status_active(self) -> None:
+        """Last seen within ACTIVE_DAYS yields ACTIVE status."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                f"Recent {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert result[0].status == ThreadStatus.ACTIVE.value
+
+    def test_detect_threads_status_dormant(self) -> None:
+        """Last seen between 30 and 180 days yields DORMANT status."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now, window_days=60)
+        fragments = [
+            _make_fragment(
+                f"Older {i}",
+                created=now - timedelta(days=120 - i * 10),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert result[0].status == ThreadStatus.DORMANT.value
+
+    def test_detect_threads_status_resolved(self) -> None:
+        """Last seen more than 180 days ago yields RESOLVED status."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now, window_days=120)
+        fragments = [
+            _make_fragment(
+                f"Ancient {i}",
+                created=now - timedelta(days=400 - i * 30),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert result[0].status == ThreadStatus.RESOLVED.value
+
+    def test_detect_threads_title_from_common_keywords(self) -> None:
+        """Titles are built from the most common non-stopword keywords."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "The Garden Project Begins",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Garden Update Notes",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Garden Harvest Reflection",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert "Garden" in result[0].title
+
+    def test_detect_threads_title_falls_back_to_first_fragment(self) -> None:
+        """No content words → fallback to truncated first-fragment title."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "X",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Y",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Z",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        # First fragment by created order is "X" (oldest)
+        assert result[0].title == "X"
+
+    def test_detect_threads_frequency_affinity_picks_most_common(self) -> None:
+        """Frequency affinity reflects the dominant primary frequency(s)."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "One",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F2,
+                secondary_freqs=[Frequency.F7],
+            ),
+            _make_fragment(
+                "Two",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F2,
+                secondary_freqs=[Frequency.F7],
+            ),
+            _make_fragment(
+                "Three",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F2,
+                secondary_freqs=[Frequency.F7],
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        assert Frequency.F2.value in result[0].frequency_affinity
+
+    def test_detect_threads_uses_embeddings_when_provided(self) -> None:
+        """High-similarity embeddings link frequency-aligned fragments."""
+        now = datetime(2026, 4, 1)
+        embeddings = {
+            "frag-1": [1.0, 0.0, 0.0],
+            "frag-2": [1.0, 0.0, 0.0],
+            "frag-3": [1.0, 0.0, 0.0],
+        }
+        detector = ThreadDetector(embeddings=embeddings, now=now)
+        fragments = [
+            Fragment(
+                id="frag-1",
+                title="Embeds One",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=now - timedelta(days=10),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+            ),
+            Fragment(
+                id="frag-2",
+                title="Embeds Two",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=now - timedelta(days=5),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+            ),
+            Fragment(
+                id="frag-3",
+                title="Embeds Three",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=now - timedelta(days=1),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+
+    def test_detect_threads_low_embedding_similarity_blocks_link(self) -> None:
+        """Orthogonal embeddings prevent topic consistency even with shared freq."""
+        now = datetime(2026, 4, 1)
+        embeddings = {
+            "frag-1": [1.0, 0.0, 0.0],
+            "frag-2": [0.0, 1.0, 0.0],
+            "frag-3": [0.0, 0.0, 1.0],
+        }
+        detector = ThreadDetector(embeddings=embeddings, now=now)
+        fragments = [
+            Fragment(
+                id="frag-1",
+                title="Alpha",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=now - timedelta(days=10),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+            ),
+            Fragment(
+                id="frag-2",
+                title="Beta",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=now - timedelta(days=5),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+            ),
+            Fragment(
+                id="frag-3",
+                title="Gamma",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=now - timedelta(days=1),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+            ),
+        ]
+        result = detector.detect_threads(fragments)
+        assert result == []
+
+    def test_detect_threads_unclassified_frequency_does_not_link(self) -> None:
+        """UNCLASSIFIED frequencies provide no signal for clustering."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                f"Unclassified {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.UNCLASSIFIED,
+            )
+            for i in range(3)
+        ]
+        result = detector.detect_threads(fragments)
+        assert result == []
+
+    def test_detect_threads_threads_sorted_by_first_seen(self) -> None:
+        """Returned threads are ordered by ``first_seen`` ascending."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now, window_days=10)
+        fragments = [
+            # Cluster A around -100 days (frequency F1)
+            _make_fragment(
+                f"Old A {i}",
+                created=now - timedelta(days=100 - i),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ] + [
+            # Cluster B around -10 days (frequency F2)
+            _make_fragment(
+                f"New B {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F2,
+            )
+            for i in range(3)
+        ]
+        result = detector.detect_threads(fragments)
+        assert len(result) == 2
+        assert result[0].first_seen < result[1].first_seen
+
+    def test_thread_members_property_exposes_membership(self) -> None:
+        """The ``thread_members`` property reports detected memberships."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                f"Member {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        threads = detector.detect_threads(fragments)
+        assert len(threads) == 1
+        members = detector.thread_members[threads[0].id]
+        assert set(members) == {f.id for f in fragments}
+
+    def test_thread_members_resets_on_new_detection(self) -> None:
+        """A fresh detect_threads run replaces any prior membership map."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        first = [
+            _make_fragment(
+                f"First {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        detector.detect_threads(first)
+        # Second run with too few fragments should clear membership
+        detector.detect_threads([_make_fragment("Solo")])
+        assert detector.thread_members == {}
+
+
+class TestThreadAssignment:
+    """Tests for assign_fragments_to_threads."""
+
+    def test_assignment_adds_wikilinks(self) -> None:
+        """Fragments belonging to a thread receive a wiki-link."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                "Garden Notes A",
+                created=now - timedelta(days=10),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Garden Notes B",
+                created=now - timedelta(days=5),
+                primary_freq=Frequency.F1,
+            ),
+            _make_fragment(
+                "Garden Notes C",
+                created=now - timedelta(days=1),
+                primary_freq=Frequency.F1,
+            ),
+        ]
+        threads = detector.detect_threads(fragments)
+        updated = detector.assign_fragments_to_threads(fragments, threads)
+        assert len(threads) == 1
+        wikilink = f"[[{threads[0].title}]]"
+        for frag in updated:
+            assert wikilink in frag.threads
+
+    def test_assignment_updates_thread_fragment_count(self) -> None:
+        """assign_fragments_to_threads refreshes each thread's fragment_count."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                f"Pebbles {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F3,
+            )
+            for i in range(3)
+        ]
+        threads = detector.detect_threads(fragments)
+        # Mutate count to ensure it's reset
+        threads[0].fragment_count = 0
+        detector.assign_fragments_to_threads(fragments, threads)
+        assert threads[0].fragment_count == 3
+
+    def test_assignment_skips_unassigned_fragments(self) -> None:
+        """Fragments not in any thread are returned unchanged."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        cluster = [
+            _make_fragment(
+                f"Topic {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        loner = _make_fragment(
+            "Loner",
+            created=now - timedelta(days=2),
+            primary_freq=Frequency.F9,
+        )
+        fragments = [*cluster, loner]
+        threads = detector.detect_threads(fragments)
+        updated = detector.assign_fragments_to_threads(fragments, threads)
+        loner_updated = next(f for f in updated if f.id == loner.id)
+        assert loner_updated is loner
+        assert loner_updated.threads == []
+
+    def test_assignment_does_not_duplicate_existing_links(self) -> None:
+        """Pre-existing wiki-links are not duplicated."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                f"Tea Ceremony {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F4,
+            )
+            for i in range(3)
+        ]
+        threads = detector.detect_threads(fragments)
+        wikilink = f"[[{threads[0].title}]]"
+        # Pre-add the wikilink to one fragment
+        fragments[0] = fragments[0].model_copy(update={"threads": [wikilink]})
+        detector._thread_members[threads[0].id] = [f.id for f in fragments]
+        updated = detector.assign_fragments_to_threads(fragments, threads)
+        assert updated[0].threads.count(wikilink) == 1
+
+    def test_assignment_returns_new_fragment_instances(self) -> None:
+        """Assigned fragments are returned as fresh copies (no mutation)."""
+        now = datetime(2026, 4, 1)
+        detector = ThreadDetector(now=now)
+        fragments = [
+            _make_fragment(
+                f"Sourdough {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F5,
+            )
+            for i in range(3)
+        ]
+        threads = detector.detect_threads(fragments)
+        updated = detector.assign_fragments_to_threads(fragments, threads)
+        for original, new in zip(fragments, updated, strict=True):
+            assert original.threads == []
+            assert new.threads != []
+
+
+class TestThreadMergeSuggestions:
+    """Tests for the suggest_merges heuristic."""
+
+    def test_suggest_merges_flags_overlapping_titles(self) -> None:
+        """Threads with shared title words and frequencies are flagged."""
+        detector = ThreadDetector()
+        thread_a = Thread(
+            title="Garden Project",
+            frequency_affinity=[Frequency.F2],
+        )
+        thread_b = Thread(
+            title="Garden Updates",
+            frequency_affinity=[Frequency.F2],
+        )
+        suggestions = detector.suggest_merges([thread_a, thread_b])
+        assert len(suggestions) == 1
+        assert suggestions[0] == (thread_a, thread_b)
+
+    def test_suggest_merges_ignores_disjoint_titles(self) -> None:
+        """Threads with no shared content words are not suggested."""
+        detector = ThreadDetector()
+        thread_a = Thread(
+            title="Apple Pie Recipe",
+            frequency_affinity=[Frequency.F1],
+        )
+        thread_b = Thread(
+            title="Mountain Hike",
+            frequency_affinity=[Frequency.F1],
+        )
+        suggestions = detector.suggest_merges([thread_a, thread_b])
+        assert suggestions == []
+
+    def test_suggest_merges_requires_frequency_overlap(self) -> None:
+        """Identical titles with disjoint frequency affinities don't merge."""
+        detector = ThreadDetector()
+        thread_a = Thread(
+            title="Cooking Notes",
+            frequency_affinity=[Frequency.F1],
+        )
+        thread_b = Thread(
+            title="Cooking Notes",
+            frequency_affinity=[Frequency.F9],
+        )
+        suggestions = detector.suggest_merges([thread_a, thread_b])
+        assert suggestions == []
+
+    def test_suggest_merges_empty_input(self) -> None:
+        """Empty thread list returns no suggestions."""
+        detector = ThreadDetector()
+        assert detector.suggest_merges([]) == []
+
+    def test_suggest_merges_skips_titles_without_content_words(self) -> None:
+        """Single-letter titles produce no merges."""
+        detector = ThreadDetector()
+        thread_a = Thread(title="X", frequency_affinity=[Frequency.F1])
+        thread_b = Thread(title="X", frequency_affinity=[Frequency.F1])
+        assert detector.suggest_merges([thread_a, thread_b]) == []
 
 
 # ---- EddyDetector Tests ----
