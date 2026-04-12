@@ -28,6 +28,7 @@ not an error to be corrected.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
+import numpy as np
 from pydantic import ValidationError
 
 from creek.models import Fragment
@@ -129,8 +131,10 @@ class UnnamedDigestGenerator:
         Args:
             vault_path: Path to the root of the Obsidian vault.
             week_start: Monday of the target ISO week (inclusive). The
-                window runs through ``week_start + 6`` days, also
-                inclusive.
+                window is ``[week_start, week_start + 7 days)`` in
+                date terms, which equals ``week_start`` through
+                ``week_start + 6`` days inclusive — the convention also
+                reflected in the rendered ``week_end`` frontmatter.
 
         Returns:
             Path to the generated digest markdown file.
@@ -250,6 +254,10 @@ class UnnamedDigestGenerator:
     ) -> list[tuple[int, int]]:
         """Return index pairs whose embeddings meet the similarity threshold.
 
+        Computes cosine similarity inline rather than delegating to
+        :meth:`EmbeddingLinker.find_resonances` to avoid mutating the
+        linker's shared configuration.
+
         Args:
             embeddings: Mapping of fragment ID to embedding vector, in
                 insertion order matching the original fragment list.
@@ -258,15 +266,18 @@ class UnnamedDigestGenerator:
             List of ``(i, j)`` index pairs with ``i < j``.
         """
         ids = list(embeddings)
-        id_to_index = {fid: i for i, fid in enumerate(ids)}
-        linker = self.embedding_linker
-        original_threshold = linker.config.similarity_threshold
-        try:
-            linker.config.similarity_threshold = self.similarity_threshold
-            resonances = linker.find_resonances(embeddings)
-        finally:
-            linker.config.similarity_threshold = original_threshold
-        return [(id_to_index[a], id_to_index[b]) for a, b, _ in resonances]
+        if len(ids) < 2:
+            return []
+        vectors = np.array([embeddings[fid] for fid in ids], dtype=np.float32)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        normalized = vectors / norms
+        similarity_matrix = normalized @ normalized.T
+        pairs: list[tuple[int, int]] = []
+        for i, j in itertools.combinations(range(len(ids)), 2):
+            if float(similarity_matrix[i, j]) >= self.similarity_threshold:
+                pairs.append((i, j))
+        return pairs
 
     def _render_body(
         self,
@@ -309,6 +320,9 @@ class UnnamedDigestGenerator:
     ) -> Path:
         """Serialise the digest note with frontmatter and write it to disk.
 
+        Uses :func:`frontmatter.dumps` for consistency with
+        :class:`creek.vault.writer.VaultWriter`.
+
         Args:
             vault_path: Path to the root of the Obsidian vault.
             week_start: Monday of the target ISO week.
@@ -322,20 +336,15 @@ class UnnamedDigestGenerator:
         iso_year, iso_week, _ = week_start.isocalendar()
         filename = f"{iso_year}-W{iso_week:02d}.md"
         week_end = week_start + timedelta(days=_WEEK_LENGTH_DAYS - 1)
-        front_lines = [
-            "---",
-            "type: unnamed-digest",
-            f"week_start: {week_start.isoformat()}",
-            f"week_end: {week_end.isoformat()}",
-            f"generated: {datetime.now(tz=UTC).isoformat()}",
-            "---",
-            "",
-        ]
-        digest_path = digests_dir / filename
-        digest_path.write_text(
-            "\n".join(front_lines) + body,
-            encoding="utf-8",
+        post = frontmatter.Post(
+            content=body,
+            type="unnamed-digest",
+            week_start=week_start.isoformat(),
+            week_end=week_end.isoformat(),
+            generated=datetime.now(tz=UTC).isoformat(),
         )
+        digest_path = digests_dir / filename
+        digest_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return digest_path
 
     @staticmethod
@@ -366,7 +375,14 @@ class UnnamedDigestGenerator:
         raw = path.read_text(encoding="utf-8").strip()
         if not raw:
             return None
-        entries = json.loads(raw)
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Corrupt unnamed history at %s; treating as no prior data",
+                path,
+            )
+            return None
         if not entries:
             return None
         last = entries[-1]
@@ -394,7 +410,14 @@ class UnnamedDigestGenerator:
         if path.exists():
             raw = path.read_text(encoding="utf-8").strip()
             if raw:
-                entries = json.loads(raw)
+                try:
+                    entries = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Corrupt unnamed history at %s; overwriting with fresh log",
+                        path,
+                    )
+                    entries = []
         entries.append(entry.to_dict())
         path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 

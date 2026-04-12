@@ -24,7 +24,6 @@ from creek.models import Fragment, FragmentSource, SourcePlatform
 
 if TYPE_CHECKING:
     from pathlib import Path
-    from unittest.mock import MagicMock
 
 
 # ---- Fixtures ----
@@ -265,11 +264,16 @@ class TestDetectUnnamedClusters:
         )
         assert gen.detect_unnamed_clusters([frag_a, frag_b]) == []
 
-    def test_distinct_fragments_do_not_cluster(
-        self, mock_sentence_transformer: MagicMock, linker: EmbeddingLinker
-    ) -> None:
-        """Fragments with unrelated titles produce no cluster above 0.7."""
-        del mock_sentence_transformer
+    def test_distinct_fragments_do_not_cluster(self, linker: EmbeddingLinker) -> None:
+        """Unrelated titles produce no cluster at a near-unit threshold.
+
+        The autouse ``mock_sentence_transformer`` fixture returns a
+        deterministic random vector per input string; distinct strings
+        therefore hash to near-orthogonal 384-dim vectors whose cosine
+        similarity is nowhere near ``0.99``. Setting the threshold that
+        high asserts the clustering path is actually evaluating pair
+        similarity (not blindly grouping).
+        """
         gen = UnnamedDigestGenerator(embedding_linker=linker, similarity_threshold=0.99)
         frag_a = Fragment(
             title="alpha",
@@ -329,7 +333,11 @@ class TestGenerateWeeklyDigest:
         generator: UnnamedDigestGenerator,
         vault: Path,
     ) -> None:
-        """Digest frontmatter includes type, week_start, and week_end."""
+        """Digest frontmatter includes type, week_start, and week_end.
+
+        Parses via :mod:`frontmatter` so the assertions are insensitive
+        to the library's quoting style.
+        """
         week_start = _week_start()
         _write_unnamed_fragment(
             vault,
@@ -337,11 +345,10 @@ class TestGenerateWeeklyDigest:
             created=datetime.combine(week_start, datetime.min.time(), tzinfo=UTC),
         )
         path = generator.generate_weekly_digest(vault, week_start)
-        content = path.read_text(encoding="utf-8")
-        assert content.startswith("---\n")
-        assert "type: unnamed-digest" in content
-        assert f"week_start: {week_start.isoformat()}" in content
-        assert f"week_end: {(week_start + timedelta(days=6)).isoformat()}" in content
+        post = frontmatter.load(str(path))
+        assert post.get("type") == "unnamed-digest"
+        assert post.get("week_start") == week_start.isoformat()
+        assert post.get("week_end") == (week_start + timedelta(days=6)).isoformat()
 
     def test_digest_lists_fragments_with_excerpts(
         self,
@@ -535,6 +542,29 @@ class TestGenerateWeeklyDigest:
         assert "Previous week" in content
         # Previous week: 1 fragment, this week: 2 fragments, delta: +1
         assert "Change: +1" in content
+
+    def test_corrupt_history_does_not_abort_generation(
+        self,
+        generator: UnnamedDigestGenerator,
+        vault: Path,
+    ) -> None:
+        """A corrupt unnamed-history.json is tolerated; the digest still writes."""
+        history_path = (
+            vault / "00-Creek-Meta" / "Processing-Log" / "unnamed-history.json"
+        )
+        history_path.write_text("{ not json", encoding="utf-8")
+        week_start = _week_start()
+        _write_unnamed_fragment(
+            vault,
+            "alpha",
+            created=datetime.combine(week_start, datetime.min.time(), tzinfo=UTC),
+        )
+        path = generator.generate_weekly_digest(vault, week_start)
+        assert path.exists()
+        # History is overwritten with a valid JSON array containing this run.
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(history) == 1
+        assert history[0]["week_start"] == week_start.isoformat()
 
     def test_rerun_on_same_week_replaces_digest(
         self,
