@@ -9,10 +9,17 @@ from creek.generate.decisions import (
     decision_from_note,
 )
 from creek.generate.indexes import FREQUENCY_COLORS, FREQUENCY_NAMES, IndexGenerator
+from creek.generate.synchronicity import (
+    DEFAULT_MIN_TIME_GAP_DAYS,
+    DEFAULT_SIMILARITY_THRESHOLD,
+    SynchronicityDetector,
+)
 from creek.generate.tags import TagGardenGenerator, TagScanResult
 
 __all__ = [
     "DECISION_KEYWORDS",
+    "DEFAULT_MIN_TIME_GAP_DAYS",
+    "DEFAULT_SIMILARITY_THRESHOLD",
     "FREQUENCY_COLORS",
     "FREQUENCY_NAMES",
     "PRACTICE_MAP",
@@ -20,6 +27,7 @@ __all__ = [
     "DecisionContextGatherer",
     "DecisionDetector",
     "IndexGenerator",
+    "SynchronicityDetector",
     "TagGardenGenerator",
     "TagScanResult",
     "decision_from_note",
