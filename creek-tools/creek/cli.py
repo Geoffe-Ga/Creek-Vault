@@ -53,20 +53,114 @@ def ingest(
     )
 
 
+def _dispatch_redact(
+    *,
+    scan: bool,
+    apply: bool,
+    review: bool,
+    source: Path | None,
+    vault: Path | None,
+    report: bool,
+    dry_run: bool,
+    verbose: bool,
+    assume_yes: bool,
+) -> None:
+    """Route the ``redact`` command to the selected mode handler.
+
+    Args:
+        scan: ``--scan`` flag.
+        apply: ``--apply`` flag.
+        review: ``--review`` flag.
+        source: ``--source`` path (scan/apply).
+        vault: ``--vault`` path (review).
+        report: ``--report`` flag (scan).
+        dry_run: ``--dry-run`` flag (apply).
+        verbose: ``--verbose`` flag.
+        assume_yes: ``--yes`` flag (apply).
+    """
+    from creek.redact.cli_commands import run_apply, run_review, run_scan
+
+    if scan:
+        src = _require_flag(source, "--scan", "--source")
+        run_scan(src, report=report, verbose=verbose, console=console)
+        return
+    if apply:
+        src = _require_flag(source, "--apply", "--source")
+        run_apply(
+            src,
+            dry_run=dry_run,
+            verbose=verbose,
+            assume_yes=assume_yes,
+            console=console,
+        )
+        return
+    vlt = _require_flag(vault, "--review", "--vault")
+    run_review(vlt, verbose=verbose, console=console)
+
+
+def _require_flag(value: Path | None, mode: str, flag: str) -> Path:
+    """Return *value* or abort when a required flag is missing.
+
+    Args:
+        value: Candidate path.
+        mode: Mode flag that triggered the requirement (e.g. ``--scan``).
+        flag: Required flag name (e.g. ``--source``).
+
+    Returns:
+        The validated path.
+
+    Raises:
+        typer.Exit: When *value* is ``None``.
+    """
+    if value is None:
+        console.print(f"[red]{mode} requires {flag}[/red]")
+        raise typer.Exit(code=2)
+    return value
+
+
 @app.command()
 def redact(
-    scan: bool = typer.Option(False, help="Scan for sensitive content"),
-    apply: bool = typer.Option(False, help="Apply redactions"),
-    review: bool = typer.Option(False, help="Review redactions"),
-    source: Path | None = typer.Option(None, help="Source path"),
-    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    report: bool = typer.Option(False, help="Generate redaction report"),
+    scan: bool = typer.Option(False, "--scan", help="Scan for sensitive content"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Apply redactions to matched files"
+    ),
+    review: bool = typer.Option(
+        False, "--review", help="Render the review queue for a vault"
+    ),
+    source: Path | None = typer.Option(
+        None, "--source", help="Source path (scan/apply)"
+    ),
+    vault: Path | None = typer.Option(None, "--vault", help="Vault path (review)"),
+    report: bool = typer.Option(
+        False, "--report", help="Include the detailed markdown report (scan)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Scan but do not modify files (apply)"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show per-match details"
+    ),
+    assume_yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt (apply)"
+    ),
 ) -> None:
-    """Scan, apply, or review redactions."""
-    console.print(
-        f"[bold green]Would redact: scan={scan}, apply={apply}, "
-        f"review={review}, source={source}, vault={vault}, "
-        f"report={report}[/bold green]"
+    """Scan for sensitive data, apply redactions, or review the queue.
+
+    Exactly one of ``--scan``, ``--apply``, or ``--review`` must be given.
+    """
+    if sum([scan, apply, review]) != 1:
+        console.print("[red]Specify exactly one of --scan, --apply, --review.[/red]")
+        raise typer.Exit(code=2)
+    _dispatch_redact(
+        scan=scan,
+        apply=apply,
+        review=review,
+        source=source,
+        vault=vault,
+        report=report,
+        dry_run=dry_run,
+        verbose=verbose,
+        assume_yes=assume_yes,
     )
 
 
