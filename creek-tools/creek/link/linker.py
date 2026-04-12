@@ -100,7 +100,7 @@ class LinkingPipeline:
             fragments,
             min_fragments=self.linking_config.thread_min_fragments,
         )
-        thread_detector.assign_fragments_to_threads(fragments, threads)
+        fragments = thread_detector.assign_fragments_to_threads(fragments, threads)
 
         # Stage 4: Eddy detection
         eddy_detector = EddyDetector()

@@ -324,7 +324,7 @@ class ThreadDetector:
             similarity_threshold: Cosine similarity threshold for the
                 semantic component of topic consistency. Defaults to 0.6.
             merge_jaccard: Title-token Jaccard threshold used by
-                :meth:`suggest_merges`. Defaults to 0.5.
+                :meth:`suggest_merges`. Defaults to 0.3.
             now: Reference "now" for status calculation; defaults to
                 :func:`datetime.now`. Useful for deterministic tests.
         """
