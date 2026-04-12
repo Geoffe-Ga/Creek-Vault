@@ -245,6 +245,11 @@ def _generate_wave_id() -> str:
     return f"wave-{uuid.uuid4().hex[:8]}"
 
 
+def _generate_sync_id() -> str:
+    """Generate a unique synchronicity ID with prefix 'sync-'."""
+    return f"sync-{uuid.uuid4().hex[:8]}"
+
+
 # ---- Nested Models ----
 
 
@@ -450,3 +455,38 @@ class WavelengthObservation(BaseModel):
     notes: str = ""
     fragment_refs: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+
+
+class Synchronicity(BaseModel):
+    """A meaningful coincidence between two cross-source fragments.
+
+    Synchronicities surface when the linking pass discovers fragments from
+    very different sources and times that are semantically near-identical.
+    They live in ``10-Liminal/Synchronicities/`` and are intended as
+    reflective prompts rather than firm knowledge links.
+
+    Attributes:
+        id: Unique identifier prefixed ``sync-``.
+        fragment_a_id: ID of the earlier fragment in the pair.
+        fragment_b_id: ID of the later fragment in the pair.
+        similarity: Cosine similarity score between the two fragments
+            (must be > 0.9 to qualify as a synchronicity).
+        time_gap_days: Absolute gap in days between the fragments'
+            creation timestamps.
+        source_a: Source platform of the first fragment.
+        source_b: Source platform of the second fragment (must differ
+            from ``source_a``).
+        tags: Obsidian tags applied to the synchronicity note.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    type: str = "synchronicity"
+    id: str = Field(default_factory=_generate_sync_id)
+    fragment_a_id: str
+    fragment_b_id: str
+    similarity: float
+    time_gap_days: int
+    source_a: SourcePlatform
+    source_b: SourcePlatform
+    tags: list[str] = Field(default_factory=lambda: ["synchronicity"])
