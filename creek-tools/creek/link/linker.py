@@ -94,9 +94,13 @@ class LinkingPipeline:
             window_hours=self.linking_config.temporal_window_hours,
         )
 
-        # Stage 3: Thread detection
-        thread_detector = ThreadDetector()
-        threads = thread_detector.detect_threads(fragments)
+        # Stage 3: Thread detection (uses embeddings for semantic clustering)
+        thread_detector = ThreadDetector(embeddings=embeddings)
+        threads = thread_detector.detect_threads(
+            fragments,
+            min_fragments=self.linking_config.thread_min_fragments,
+        )
+        thread_detector.assign_fragments_to_threads(fragments, threads)
 
         # Stage 4: Eddy detection
         eddy_detector = EddyDetector()
