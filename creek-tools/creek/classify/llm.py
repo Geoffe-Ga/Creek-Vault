@@ -1,22 +1,38 @@
-"""LLM-based classification for Creek fragments via Ollama.
+"""LLM-based classification for Creek fragments via Ollama or Anthropic.
 
-Provides an LLM classifier that calls a local Ollama instance to classify
-fragments along frequency, wavelength, and voice dimensions.  Falls back
-gracefully when Ollama is unreachable, returning fragments unchanged.
+Provides an ``LLMClassifier`` that delegates fragment classification to
+either a local Ollama instance (default) or the Anthropic cloud API
+(opt-in).  Falls back gracefully when the configured provider is
+unavailable, returning fragments unchanged.
+
+The Anthropic provider requires two environment variables to be set:
+
+- ``ANTHROPIC_API_KEY``: The API key is **never** stored in the
+  configuration file, logs, or error messages.
+- ``CREEK_ANTHROPIC_CONSENT``: Must be ``"1"`` (or ``"true"`` / ``"yes"``)
+  to acknowledge that fragment content will be sent to Anthropic's
+  servers.
 """
 
+from __future__ import annotations
+
 import logging
+import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import httpx
 import yaml
 from tqdm import tqdm
 
-from creek.config import LLMConfig
+if TYPE_CHECKING:
+    import anthropic
+
+    from creek.config import LLMConfig
+
 from creek.models import (
     Confidence,
     Dosage,
@@ -190,12 +206,154 @@ def _strip_code_fences(text: str) -> str:
     return "\n".join(filtered)
 
 
-class LLMClassifier:
-    """LLM classifier for Creek fragments using a local Ollama instance.
+ANTHROPIC_CLOUD_WARNING: str = (
+    "WARNING: Cloud classification enabled. "
+    "Fragment content will be sent to Anthropic's servers."
+)
+"""Warning displayed when the Anthropic cloud provider is selected."""
 
-    Sends fragments to Ollama for classification along frequency,
-    wavelength, and voice dimensions.  Falls back gracefully when
-    Ollama is unreachable, returning fragments unchanged with a warning.
+
+class AnthropicProvider:
+    """Anthropic API provider for cloud-based fragment classification.
+
+    Sends classification prompts to the Anthropic ``messages`` API using
+    the official Python SDK.  The API key is read exclusively from the
+    ``ANTHROPIC_API_KEY`` environment variable and is never stored in
+    the configuration file, logs, or error messages.
+
+    Attributes:
+        config: The LLM configuration specifying model, batch size, etc.
+    """
+
+    DEFAULT_MODEL: str = "claude-sonnet-4-5-20250929"
+    """Default Anthropic model when the config does not override it."""
+
+    API_KEY_ENV: str = "ANTHROPIC_API_KEY"
+    """Environment variable name for the Anthropic API key."""
+
+    CONSENT_ENV: str = "CREEK_ANTHROPIC_CONSENT"
+    """Environment variable name for cloud-classification consent."""
+
+    CONSENT_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes"})
+    """String values accepted as affirmative consent."""
+
+    MAX_TOKENS: int = 1024
+    """Maximum tokens requested from the Anthropic API per call."""
+
+    _OLLAMA_DEFAULT_MODEL: str = "mistral"
+    """The ``LLMConfig`` default model name (indicates no Anthropic override)."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Validate environment prerequisites and prepare the client.
+
+        The SDK client itself is instantiated lazily on first use to
+        avoid unnecessary network/imports during construction.
+
+        Args:
+            config: LLM provider configuration.
+
+        Raises:
+            RuntimeError: If the API key or consent environment
+                variables are not set.
+        """
+        self.config = config
+        if not os.environ.get(self.API_KEY_ENV, "").strip():
+            msg = (
+                f"{self.API_KEY_ENV} environment variable is not set; "
+                "required for the Anthropic provider."
+            )
+            raise RuntimeError(msg)
+        consent = os.environ.get(self.CONSENT_ENV, "").strip().lower()
+        if consent not in self.CONSENT_TRUTHY:
+            msg = (
+                "Anthropic cloud classification requires explicit consent. "
+                f"Set {self.CONSENT_ENV}=1 to confirm that fragment content "
+                "may be sent to Anthropic's servers."
+            )
+            raise RuntimeError(msg)
+        self._client: anthropic.Anthropic | None = None
+
+    @property
+    def model(self) -> str:
+        """The Anthropic model identifier to use for API calls.
+
+        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` still
+        holds the Ollama default (``"mistral"``) or is empty.
+
+        Returns:
+            The resolved model identifier.
+        """
+        model = (self.config.model or "").strip()
+        if not model or model == self._OLLAMA_DEFAULT_MODEL:
+            return self.DEFAULT_MODEL
+        return model
+
+    @property
+    def client(self) -> anthropic.Anthropic:
+        """The lazily-initialised Anthropic SDK client.
+
+        Returns:
+            An ``anthropic.Anthropic`` client instance.
+        """
+        if self._client is None:
+            import anthropic
+
+            self._client = anthropic.Anthropic()
+        return self._client
+
+    def call(self, prompt: str) -> str:
+        """Send a classification prompt to the Anthropic API.
+
+        Args:
+            prompt: The fully-formatted classification prompt.
+
+        Returns:
+            The concatenated text content of the API response.
+
+        Raises:
+            RuntimeError: If the SDK raises any ``AnthropicError``; the
+                original exception is re-raised as ``RuntimeError`` with
+                its type name to avoid leaking sensitive request state.
+        """
+        import anthropic
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.AnthropicError as exc:
+            msg = f"Anthropic API call failed: {type(exc).__name__}"
+            raise RuntimeError(msg) from None
+        return _extract_anthropic_text(response)
+
+
+def _extract_anthropic_text(response: object) -> str:
+    """Concatenate the textual blocks from an Anthropic API response.
+
+    Args:
+        response: A ``messages.create`` response object.
+
+    Returns:
+        The joined ``text`` attributes of each content block.
+    """
+    content = getattr(response, "content", None) or []
+    parts: list[str] = []
+    for block in content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
+class LLMClassifier:
+    """LLM classifier for Creek fragments.
+
+    Dispatches classification requests to either a local Ollama instance
+    (default) or the Anthropic cloud API (``config.provider ==
+    "anthropic"``).  Falls back gracefully when the configured provider
+    is unreachable, returning fragments unchanged with a warning.
 
     Attributes:
         config: The LLM configuration specifying provider, model, etc.
@@ -216,34 +374,51 @@ class LLMClassifier:
     AVAILABILITY_TIMEOUT: float = 5.0
     """Timeout for the Ollama health check."""
 
+    ANTHROPIC_PROVIDER: str = "anthropic"
+    """Provider identifier for the Anthropic cloud API."""
+
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the LLM classifier.
 
-        Ollama availability is checked lazily on first use.
+        Provider availability is checked lazily on first use.  When the
+        Anthropic provider is selected, a warning is logged immediately
+        so operators see it even before the first classification call.
 
         Args:
             config: LLM provider configuration (provider, model, URL, etc.).
         """
         self.config = config
         self._available: bool | None = None
+        self._anthropic: AnthropicProvider | None = None
+        if config.provider == self.ANTHROPIC_PROVIDER:
+            logger.warning(ANTHROPIC_CLOUD_WARNING)
 
     @property
     def available(self) -> bool:
-        """Whether Ollama is reachable at the configured URL.
+        """Whether the configured LLM provider is reachable.
+
+        For Ollama, checks the HTTP health endpoint; for Anthropic,
+        validates that the required environment variables are present.
 
         Returns:
-            ``True`` if Ollama responded successfully.
+            ``True`` if the provider responded successfully.
         """
         if self._available is None:
             self._available = self._check_availability()
         return self._available
 
     def _check_availability(self) -> bool:
-        """Check if Ollama is reachable at the configured URL.
+        """Check if the configured LLM provider is reachable.
+
+        For the Anthropic provider this validates that the required
+        environment variables are present.  For Ollama it issues a
+        health-check HTTP request against ``/api/tags``.
 
         Returns:
-            ``True`` if Ollama responded with HTTP 200.
+            ``True`` if the provider is ready to service requests.
         """
+        if self.config.provider == self.ANTHROPIC_PROVIDER:
+            return self._check_anthropic_availability()
         try:
             with httpx.Client(
                 timeout=self.AVAILABILITY_TIMEOUT,
@@ -260,6 +435,42 @@ class LLMClassifier:
             self.config.ollama_url,
         )
         return False
+
+    def _check_anthropic_availability(self) -> bool:
+        """Validate that the Anthropic provider can be constructed.
+
+        Returns:
+            ``True`` when the provider initialises successfully.
+        """
+        try:
+            self._get_anthropic_provider()
+        except RuntimeError as exc:
+            logger.warning("Anthropic provider not available: %s", exc)
+            return False
+        return True
+
+    def _get_anthropic_provider(self) -> AnthropicProvider:
+        """Lazily instantiate the :class:`AnthropicProvider`.
+
+        Returns:
+            The cached ``AnthropicProvider`` instance.
+        """
+        if self._anthropic is None:
+            self._anthropic = AnthropicProvider(self.config)
+        return self._anthropic
+
+    def _invoke_llm(self, prompt: str) -> str:
+        """Dispatch a prompt to the configured provider.
+
+        Args:
+            prompt: The fully-formatted classification prompt.
+
+        Returns:
+            Raw response text from the provider.
+        """
+        if self.config.provider == self.ANTHROPIC_PROVIDER:
+            return self._get_anthropic_provider().call(prompt)
+        return self._call_ollama(prompt)
 
     def _build_prompt(
         self,
@@ -354,11 +565,12 @@ class LLMClassifier:
         fragment: Fragment,
         content: str = "",
     ) -> Fragment:
-        """Classify a fragment using the Ollama LLM.
+        """Classify a fragment using the configured LLM provider.
 
-        Builds a prompt, calls Ollama, parses the YAML response, and
-        updates the fragment.  Retries on failure up to ``MAX_RETRIES``
-        times.  Returns the fragment unchanged if Ollama is unavailable
+        Builds a prompt, dispatches it to the configured provider (Ollama
+        or Anthropic), parses the YAML response, and updates the
+        fragment.  Retries on failure up to ``MAX_RETRIES`` times.
+        Returns the fragment unchanged if the provider is unavailable
         or all retries are exhausted.
 
         Args:
@@ -370,7 +582,7 @@ class LLMClassifier:
         """
         if not self.available:
             logger.warning(
-                "Ollama unavailable — returning fragment '%s' unchanged",
+                "LLM provider unavailable — returning fragment '%s' unchanged",
                 fragment.title,
             )
             return fragment
@@ -379,11 +591,12 @@ class LLMClassifier:
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                raw = self._call_ollama(prompt)
+                raw = self._invoke_llm(prompt)
                 data = self.validate_response(raw)
                 return self._apply_classification(fragment, data)
             except (
                 httpx.HTTPError,
+                RuntimeError,
                 ValueError,
                 yaml.YAMLError,
             ) as exc:
@@ -412,7 +625,7 @@ class LLMClassifier:
     ) -> list[Fragment]:
         """Classify a batch of fragments with concurrency and progress.
 
-        Uses a thread pool for concurrent Ollama requests, a tqdm bar
+        Uses a thread pool for concurrent provider requests, a tqdm bar
         for visual feedback, and rate limiting between submissions.
         Logs aggregated statistics on completion.
 
@@ -428,7 +641,7 @@ class LLMClassifier:
 
         if not self.available:
             logger.warning(
-                "Ollama unavailable — returning %d fragments unchanged",
+                "LLM provider unavailable — returning %d fragments unchanged",
                 len(fragments),
             )
             return list(fragments)
