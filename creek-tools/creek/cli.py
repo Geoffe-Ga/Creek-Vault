@@ -1,6 +1,7 @@
 """Creek CLI -- command-line interface for the Creek knowledge organization pipeline."""
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -9,9 +10,17 @@ from rich.table import Table
 from creek.config import load_config
 from creek.pipeline import Pipeline
 
+if TYPE_CHECKING:
+    from creek.purge import PurgeEngine, PurgeResult
+
 app = typer.Typer(name="creek", help="Creek knowledge organization pipeline")
 clean_app = typer.Typer(name="clean", help="Vault hygiene commands")
+purge_app = typer.Typer(
+    name="purge",
+    help="Right-to-be-forgotten deletion operations",
+)
 app.add_typer(clean_app, name="clean")
+app.add_typer(purge_app, name="purge")
 console = Console()
 
 
@@ -215,17 +224,6 @@ def review(
 
 
 @app.command()
-def purge(
-    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    target: str | None = typer.Option(None, help="Target to purge"),
-) -> None:
-    """Delete fragments or classifications."""
-    console.print(
-        f"[bold green]Would purge: vault={vault}, target={target}[/bold green]"
-    )
-
-
-@app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
     staging: Path | None = typer.Option(None, help="Staging directory"),
@@ -420,3 +418,213 @@ def clean_report(
     if output is not None:
         reporter.write_markdown(hygiene_report, output)
         console.print(f"\n[green]Report written to {output}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Purge subcommands
+# ---------------------------------------------------------------------------
+
+
+def _render_purge_result(result: "PurgeResult") -> None:
+    """Render a purge result as a rich table.
+
+    Args:
+        result: The completed purge result.
+    """
+    mode = "[yellow]DRY-RUN[/yellow]" if result.dry_run else "[red]APPLY[/red]"
+    console.print(f"\n[bold]Purge {result.operation}[/bold] ({mode})")
+    console.print(f"Target: {result.target}")
+    console.print(f"Fragments affected: {result.fragments_affected}")
+    console.print(f"Wiki-links removed: {result.wikilinks_removed}")
+    console.print(f"Threads updated: {result.threads_updated}")
+    console.print(f"Eddies updated: {result.eddies_updated}")
+    if result.classifications_reset:
+        console.print(
+            f"Classifications reset: {result.classifications_reset}",
+        )
+
+    if result.deleted_files:
+        table = Table(title="Deleted files")
+        table.add_column("Path", style="dim")
+        for path in result.deleted_files:
+            table.add_row(path)
+        console.print(table)
+
+
+def _confirm(message: str, *, assume_yes: bool) -> bool:
+    """Prompt the user for confirmation unless ``assume_yes`` is set.
+
+    Args:
+        message: Confirmation message to display.
+        assume_yes: If ``True``, skip the prompt and return ``True``.
+
+    Returns:
+        Whether the user confirmed the operation.
+    """
+    if assume_yes:
+        return True
+    return typer.confirm(message, default=False)
+
+
+def _build_engine(
+    vault: Path | None,
+    *,
+    dry_run: bool,
+) -> "PurgeEngine":
+    """Construct a :class:`PurgeEngine` rooted at the resolved vault.
+
+    Args:
+        vault: Optional explicit vault override.
+        dry_run: Whether to preview changes only.
+
+    Returns:
+        A ready-to-use :class:`PurgeEngine`.
+    """
+    from creek.purge import PurgeEngine as _Engine
+
+    vault_path = _resolve_vault(vault)
+    return _Engine(vault_path, dry_run=dry_run)
+
+
+@purge_app.command(name="fragment")
+def purge_fragment(
+    fragment_id: str = typer.Argument(..., help="Fragment ID to purge"),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(False, help="Preview changes without deleting"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip interactive confirmation",
+    ),
+) -> None:
+    """Delete a fragment and scrub every reference to it."""
+    engine = _build_engine(vault, dry_run=dry_run)
+    if not dry_run and not _confirm(
+        f"Purge fragment {fragment_id!r} and all references?",
+        assume_yes=yes,
+    ):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+    result = engine.purge_fragment(fragment_id)
+    _render_purge_result(result)
+
+
+@purge_app.command(name="source")
+def purge_source(
+    source_type: str = typer.Argument(
+        ...,
+        help="Source platform (e.g. claude, discord)",
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(False, help="Preview changes without deleting"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip interactive confirmation",
+    ),
+) -> None:
+    """Delete every fragment ingested from a given source."""
+    engine = _build_engine(vault, dry_run=dry_run)
+    count = engine.count_fragments_from_source(source_type)
+    console.print(
+        f"[bold]This will delete {count} fragments from {source_type!r}.[/bold]",
+    )
+    if not dry_run and not _confirm("Continue?", assume_yes=yes):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+    result = engine.purge_source(source_type)
+    _render_purge_result(result)
+
+
+@purge_app.command(name="classifications")
+def purge_classifications(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(False, help="Preview changes without deleting"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip interactive confirmation",
+    ),
+) -> None:
+    """Reset classification fields on every fragment to unclassified."""
+    engine = _build_engine(vault, dry_run=dry_run)
+    if not dry_run and not _confirm(
+        "Reset classifications on every fragment?",
+        assume_yes=yes,
+    ):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+    result = engine.purge_classifications()
+    _render_purge_result(result)
+
+
+@purge_app.command(name="daterange")
+def purge_daterange(
+    start: str = typer.Argument(..., help="Start date (YYYY-MM-DD, inclusive)"),
+    end: str = typer.Argument(..., help="End date (YYYY-MM-DD, inclusive)"),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(False, help="Preview changes without deleting"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip interactive confirmation",
+    ),
+) -> None:
+    """Delete fragments created within a date range."""
+    from datetime import date as _date
+
+    try:
+        start_date = _date.fromisoformat(start)
+        end_date = _date.fromisoformat(end)
+    except ValueError as exc:
+        console.print(f"[red]Invalid date: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    engine = _build_engine(vault, dry_run=dry_run)
+    if not dry_run and not _confirm(
+        f"Delete fragments created between {start_date} and {end_date}?",
+        assume_yes=yes,
+    ):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+    result = engine.purge_daterange(start_date, end_date)
+    _render_purge_result(result)
+
+
+@purge_app.command(name="vault")
+def purge_vault(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(False, help="Preview changes without deleting"),
+    confirm_text: str = typer.Option(
+        "",
+        help=(
+            "Must equal 'I understand this is irreversible' "
+            "to bypass interactive prompt."
+        ),
+    ),
+) -> None:
+    """Destroy every fragment, thread, and eddy (nuclear option)."""
+    from creek.purge.engine import VAULT_PURGE_CONFIRMATION
+
+    engine = _build_engine(vault, dry_run=dry_run)
+    phrase = confirm_text
+    if not dry_run and phrase != VAULT_PURGE_CONFIRMATION:
+        console.print(
+            "[bold red]This will destroy the entire vault contents.[/bold red]",
+        )
+        phrase = typer.prompt(
+            f"Type exactly {VAULT_PURGE_CONFIRMATION!r} to continue",
+            default="",
+            show_default=False,
+        )
+    try:
+        supplied = VAULT_PURGE_CONFIRMATION if dry_run else phrase
+        result = engine.purge_vault(supplied)
+    except ValueError as exc:
+        console.print(f"[red]Aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    _render_purge_result(result)
