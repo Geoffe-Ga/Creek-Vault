@@ -1,5 +1,10 @@
 """Creek generate package — index and note generation for the Creek vault."""
 
+from creek.generate.compost import (
+    ABANDONMENT_KEYWORDS,
+    CompostCandidate,
+    CompostTracker,
+)
 from creek.generate.decisions import (
     DECISION_KEYWORDS,
     PRACTICE_MAP,
@@ -17,12 +22,15 @@ from creek.generate.synchronicity import (
 from creek.generate.tags import TagGardenGenerator, TagScanResult
 
 __all__ = [
+    "ABANDONMENT_KEYWORDS",
     "DECISION_KEYWORDS",
     "DEFAULT_MIN_TIME_GAP_DAYS",
     "DEFAULT_SIMILARITY_THRESHOLD",
     "FREQUENCY_COLORS",
     "FREQUENCY_NAMES",
     "PRACTICE_MAP",
+    "CompostCandidate",
+    "CompostTracker",
     "DecisionContext",
     "DecisionContextGatherer",
     "DecisionDetector",
