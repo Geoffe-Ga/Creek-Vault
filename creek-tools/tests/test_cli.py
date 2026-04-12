@@ -189,6 +189,33 @@ def test_report_help() -> None:
     assert "report" in result.output.lower()
 
 
+def test_report_unnamed_command(tmp_path: Path) -> None:
+    """Test that report --type unnamed generates a digest."""
+    vault = tmp_path / "vault"
+    for d in (
+        "00-Creek-Meta",
+        "00-Creek-Meta/Processing-Log",
+        "01-Fragments",
+        "10-Liminal",
+        "10-Liminal/Unnamed",
+    ):
+        (vault / d).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "unnamed",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Unnamed digest generated" in result.output
+    assert (vault / "10-Liminal" / "Unnamed" / "Digests").is_dir()
+
+
 def test_report_command() -> None:
     """Test that report command runs with required args."""
     result = runner.invoke(

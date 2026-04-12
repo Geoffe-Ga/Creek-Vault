@@ -208,6 +208,24 @@ def report(
         generator = TagGardenGenerator(vault_path=vault_path)
         path = generator.generate_garden()
         console.print(f"[bold green]Tag Garden generated: {path}[/bold green]")
+    elif type == "unnamed":
+        from datetime import date as _date
+        from datetime import timedelta as _timedelta
+
+        from creek.generate.unnamed import UnnamedDigestGenerator
+        from creek.link.embeddings import EmbeddingLinker
+
+        linker = EmbeddingLinker(config=config.embeddings)
+        digest_generator = UnnamedDigestGenerator(embedding_linker=linker)
+        today = _date.today()
+        week_start = today - _timedelta(days=today.weekday())
+        digest_path = digest_generator.generate_weekly_digest(
+            vault_path,
+            week_start,
+        )
+        console.print(
+            f"[bold green]Unnamed digest generated: {digest_path}[/bold green]",
+        )
     else:
         console.print(
             f"[bold green]Would report: type={type}, "
