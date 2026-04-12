@@ -14,6 +14,12 @@ from creek.generate.decisions import (
     decision_from_note,
 )
 from creek.generate.indexes import FREQUENCY_COLORS, FREQUENCY_NAMES, IndexGenerator
+from creek.generate.paradox import (
+    CONTRADICTION_KEYWORDS,
+    REFLECTION_PROMPT,
+    Paradox,
+    ParadoxDetector,
+)
 from creek.generate.synchronicity import (
     DEFAULT_MIN_TIME_GAP_DAYS,
     DEFAULT_SIMILARITY_THRESHOLD,
@@ -23,18 +29,22 @@ from creek.generate.tags import TagGardenGenerator, TagScanResult
 
 __all__ = [
     "ABANDONMENT_KEYWORDS",
+    "CONTRADICTION_KEYWORDS",
     "DECISION_KEYWORDS",
     "DEFAULT_MIN_TIME_GAP_DAYS",
     "DEFAULT_SIMILARITY_THRESHOLD",
     "FREQUENCY_COLORS",
     "FREQUENCY_NAMES",
     "PRACTICE_MAP",
+    "REFLECTION_PROMPT",
     "CompostCandidate",
     "CompostTracker",
     "DecisionContext",
     "DecisionContextGatherer",
     "DecisionDetector",
     "IndexGenerator",
+    "Paradox",
+    "ParadoxDetector",
     "SynchronicityDetector",
     "TagGardenGenerator",
     "TagScanResult",
