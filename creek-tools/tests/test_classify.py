@@ -14,7 +14,9 @@ from creek.classify import (
     RuleClassifier,
 )
 from creek.classify.llm import (
+    ANTHROPIC_CLOUD_WARNING,
     CLASSIFICATION_PROMPT,
+    AnthropicProvider,
     BatchStats,
     _parse_dosage,
     _parse_enum,
@@ -898,6 +900,423 @@ class TestBatchStats:
         assert stats.total == 10
         assert stats.classified == 8
         assert stats.failed == 2
+
+
+# ---- AnthropicProvider ----
+
+
+def _set_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set the ANTHROPIC_API_KEY and CREEK_ANTHROPIC_CONSENT env vars.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+    monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "1")
+
+
+def _make_mock_anthropic_client(response_text: str) -> MagicMock:
+    """Build a mock anthropic.Anthropic client returning *response_text*.
+
+    Args:
+        response_text: The text to embed in a single content block.
+
+    Returns:
+        A ``MagicMock`` whose ``messages.create`` returns a response.
+    """
+    mock_block = MagicMock()
+    mock_block.text = response_text
+    mock_response = MagicMock()
+    mock_response.content = [mock_block]
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = mock_response
+    return mock_client
+
+
+class TestAnthropicProviderInit:
+    """Tests for AnthropicProvider initialization."""
+
+    def test_raises_when_api_key_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """__init__ raises when ANTHROPIC_API_KEY is not set."""
+        monkeypatch.delenv(AnthropicProvider.API_KEY_ENV, raising=False)
+        monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "1")
+        config = LLMConfig(provider="anthropic")
+        with pytest.raises(RuntimeError, match=AnthropicProvider.API_KEY_ENV):
+            AnthropicProvider(config)
+
+    def test_raises_when_api_key_empty(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """__init__ raises when ANTHROPIC_API_KEY is whitespace only."""
+        monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "   ")
+        monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "1")
+        config = LLMConfig(provider="anthropic")
+        with pytest.raises(RuntimeError, match=AnthropicProvider.API_KEY_ENV):
+            AnthropicProvider(config)
+
+    def test_raises_when_consent_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """__init__ raises when CREEK_ANTHROPIC_CONSENT is not set."""
+        monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+        monkeypatch.delenv(AnthropicProvider.CONSENT_ENV, raising=False)
+        config = LLMConfig(provider="anthropic")
+        with pytest.raises(RuntimeError, match="consent"):
+            AnthropicProvider(config)
+
+    def test_raises_when_consent_not_truthy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """__init__ raises when consent is set to a falsy value."""
+        monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+        monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "no")
+        config = LLMConfig(provider="anthropic")
+        with pytest.raises(RuntimeError, match="consent"):
+            AnthropicProvider(config)
+
+    def test_succeeds_with_valid_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """__init__ stores the config when env vars are set."""
+        _set_anthropic_env(monkeypatch)
+        config = LLMConfig(provider="anthropic")
+        provider = AnthropicProvider(config)
+        assert provider.config is config
+
+    def test_accepts_true_as_consent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Consent value ``true`` should be accepted."""
+        monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+        monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "TRUE")
+        AnthropicProvider(LLMConfig(provider="anthropic"))
+
+    def test_accepts_yes_as_consent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Consent value ``yes`` should be accepted."""
+        monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+        monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "yes")
+        AnthropicProvider(LLMConfig(provider="anthropic"))
+
+    def test_sdk_client_not_built_on_init(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The SDK client should be created lazily on first use."""
+        _set_anthropic_env(monkeypatch)
+        provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+        assert provider._client is None
+
+
+class TestAnthropicProviderModel:
+    """Tests for AnthropicProvider.model resolution."""
+
+    def test_defaults_when_config_uses_ollama_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The Ollama default ``mistral`` should fall back to Anthropic default."""
+        _set_anthropic_env(monkeypatch)
+        provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+        assert provider.model == AnthropicProvider.DEFAULT_MODEL
+
+    def test_uses_config_model_when_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An explicit config model value should be honoured."""
+        _set_anthropic_env(monkeypatch)
+        config = LLMConfig(provider="anthropic", model="claude-custom-model")
+        provider = AnthropicProvider(config)
+        assert provider.model == "claude-custom-model"
+
+    def test_default_model_is_claude_sonnet_4_5(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The default model should be the documented Claude Sonnet 4.5."""
+        _set_anthropic_env(monkeypatch)
+        assert AnthropicProvider.DEFAULT_MODEL == "claude-sonnet-4-5-20250929"
+
+
+class TestAnthropicProviderCall:
+    """Tests for AnthropicProvider.call with a mocked SDK."""
+
+    def test_call_uses_sdk_messages_create(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """call should invoke ``client.messages.create`` with the prompt."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            result = provider.call("hello prompt")
+        assert result == _VALID_YAML_RESPONSE
+        mock_client.messages.create.assert_called_once()
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["model"] == AnthropicProvider.DEFAULT_MODEL
+        assert kwargs["max_tokens"] == AnthropicProvider.MAX_TOKENS
+        assert kwargs["messages"] == [
+            {"role": "user", "content": "hello prompt"},
+        ]
+
+    def test_call_concatenates_multiple_text_blocks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Multiple content blocks should be concatenated in order."""
+        _set_anthropic_env(monkeypatch)
+        block_a = MagicMock()
+        block_a.text = "part-a"
+        block_b = MagicMock()
+        block_b.text = "part-b"
+        response = MagicMock()
+        response.content = [block_a, block_b]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = response
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            result = provider.call("prompt")
+        assert result == "part-apart-b"
+
+    def test_call_ignores_non_text_blocks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Blocks without a string ``text`` attribute should be skipped."""
+        _set_anthropic_env(monkeypatch)
+        text_block = MagicMock()
+        text_block.text = "keep"
+        tool_block = MagicMock(spec=[])  # no text attribute
+        response = MagicMock()
+        response.content = [tool_block, text_block]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = response
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            result = provider.call("prompt")
+        assert result == "keep"
+
+    def test_call_honours_custom_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An explicit config.model value should reach the SDK."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+        config = LLMConfig(provider="anthropic", model="my-claude-variant")
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            AnthropicProvider(config).call("prompt")
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["model"] == "my-claude-variant"
+
+    def test_call_wraps_sdk_errors_without_leaking_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SDK errors should raise RuntimeError with no API key exposure."""
+        import anthropic
+
+        _set_anthropic_env(monkeypatch)
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = anthropic.APIError(
+            message="boom",
+            request=MagicMock(),
+            body=None,
+        )
+        with (
+            patch("anthropic.Anthropic", return_value=mock_client),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            provider.call("prompt")
+        assert "sk-test-not-real" not in str(exc_info.value)
+
+    def test_client_cached_across_calls(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The SDK client should only be instantiated once."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+        with patch("anthropic.Anthropic", return_value=mock_client) as mock_ctor:
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            provider.call("p1")
+            provider.call("p2")
+        assert mock_ctor.call_count == 1
+
+
+# ---- LLMClassifier with Anthropic provider ----
+
+
+class TestLLMClassifierAnthropicDispatch:
+    """Tests for provider dispatching in LLMClassifier."""
+
+    def test_init_logs_warning_when_provider_is_anthropic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Selecting the anthropic provider should log the cloud warning."""
+        _set_anthropic_env(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            LLMClassifier(config=LLMConfig(provider="anthropic"))
+        assert any(
+            "anthropic" in r.message.lower() and "cloud" in r.message.lower()
+            for r in caplog.records
+        )
+
+    def test_init_does_not_warn_for_ollama(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Default ollama provider should not emit the cloud warning."""
+        with caplog.at_level(logging.WARNING):
+            LLMClassifier(config=LLMConfig())
+        assert all(ANTHROPIC_CLOUD_WARNING not in r.message for r in caplog.records)
+
+    def test_available_true_when_anthropic_env_ready(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """available should be True when both env vars are present."""
+        _set_anthropic_env(monkeypatch)
+        classifier = LLMClassifier(config=LLMConfig(provider="anthropic"))
+        assert classifier.available is True
+
+    def test_available_false_when_api_key_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """available should be False when the API key is absent."""
+        monkeypatch.delenv(AnthropicProvider.API_KEY_ENV, raising=False)
+        monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "1")
+        classifier = LLMClassifier(config=LLMConfig(provider="anthropic"))
+        assert classifier.available is False
+
+    def test_available_false_when_consent_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """available should be False when consent is not granted."""
+        monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+        monkeypatch.delenv(AnthropicProvider.CONSENT_ENV, raising=False)
+        classifier = LLMClassifier(config=LLMConfig(provider="anthropic"))
+        assert classifier.available is False
+
+    def test_classify_dispatches_to_anthropic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """classify should route to the anthropic provider when selected."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            classifier = LLMClassifier(
+                config=LLMConfig(provider="anthropic"),
+            )
+            result = classifier.classify(_make_fragment(title="Test"))
+        assert result.frequency.primary == Frequency.F3
+        mock_client.messages.create.assert_called_once()
+
+    def test_classify_uses_same_prompt_for_both_providers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Anthropic path should send CLASSIFICATION_PROMPT-formatted text."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            classifier = LLMClassifier(
+                config=LLMConfig(provider="anthropic"),
+            )
+            classifier.classify(
+                _make_fragment(title="My Title"),
+                content="Body text",
+            )
+        kwargs = mock_client.messages.create.call_args.kwargs
+        prompt = kwargs["messages"][0]["content"]
+        assert "My Title" in prompt
+        assert "Body text" in prompt
+        assert "Frequency" in prompt
+
+    def test_classify_batch_dispatches_to_anthropic(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """classify_batch should call the anthropic SDK for each fragment."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+        with (
+            patch("anthropic.Anthropic", return_value=mock_client),
+            patch("creek.classify.llm.time.sleep"),
+        ):
+            classifier = LLMClassifier(
+                config=LLMConfig(provider="anthropic"),
+            )
+            frags = [_make_fragment(title=f"F{i}") for i in range(3)]
+            results = classifier.classify_batch(frags, progress=False)
+        assert len(results) == 3
+        assert mock_client.messages.create.call_count == 3
+        for res in results:
+            assert res.frequency.primary == Frequency.F3
+
+    def test_classify_retries_on_runtime_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """classify should retry when the provider raises RuntimeError."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = MagicMock()
+        good_block = MagicMock()
+        good_block.text = _VALID_YAML_RESPONSE
+        good_response = MagicMock()
+        good_response.content = [good_block]
+        import anthropic
+
+        mock_client.messages.create.side_effect = [
+            anthropic.APIError(
+                message="rate limited",
+                request=MagicMock(),
+                body=None,
+            ),
+            good_response,
+        ]
+        with (
+            patch("anthropic.Anthropic", return_value=mock_client),
+            patch("creek.classify.llm.time.sleep"),
+        ):
+            classifier = LLMClassifier(
+                config=LLMConfig(provider="anthropic"),
+            )
+            result = classifier.classify(_make_fragment())
+        assert result.frequency.primary == Frequency.F3
+        assert mock_client.messages.create.call_count == 2
+
+    def test_ollama_path_unchanged_by_anthropic_changes(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Default ollama provider continues to use _call_ollama."""
+        with patch.object(
+            LLMClassifier, "_call_ollama", return_value=_VALID_YAML_RESPONSE
+        ) as mock_call:
+            classifier = _make_classifier_available(
+                LLMClassifier(config=LLMConfig()),
+            )
+            classifier.classify(_make_fragment())
+        mock_call.assert_called_once()
 
 
 # ---- Integration test (requires running Ollama) ----
