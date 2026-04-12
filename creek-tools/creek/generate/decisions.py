@@ -1,23 +1,29 @@
-"""Decision detection — flag decision-relevant fragments.
+"""Decision detection and context gathering for Creek decisions.
 
 Detects decision-relevant content in Creek fragments using keyword matching
 and frequency/confidence pattern analysis, generates draft Decision notes
-in the vault, and manages decision phase transitions between Active and
-Archive folders.
+in the vault, manages decision phase transitions between Active and
+Archive folders, and gathers cross-vault context (related threads, past
+decisions, current wavelength, praxis, interventions) for active Decision
+notes while enforcing the anti-manipulation guardrails from Section 12.4
+of the Creek Ontology.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING
 
 import frontmatter
 
 from creek.models import (
+    Decision,
     DecisionCandidate,
     DecisionStatus,
     Frequency,
+    Phase,
     PraxisPotential,
     _generate_decision_id,
 )
@@ -335,3 +341,654 @@ class DecisionDetector:
                 if post.get("id") == decision_id:
                     return md_file
         return None
+
+
+# ---- Decision Context Gathering (Section 12.3 - 12.5) ----
+
+
+_FREQUENCY_COLOR: dict[str, str] = {
+    Frequency.F1: "beige",
+    Frequency.F2: "purple",
+    Frequency.F3: "red",
+    Frequency.F4: "blue",
+    Frequency.F5: "orange",
+    Frequency.F6: "green",
+    Frequency.F7: "yellow",
+    Frequency.F8: "teal",
+    Frequency.F9: "ultraviolet",
+    Frequency.F10: "clear_light",
+}
+"""Canonical mapping from APTITUDE frequency codes to ontology color names."""
+
+
+PRACTICE_MAP: dict[tuple[str, str], tuple[str, ...]] = {
+    ("beige", "rising"): ("Cold Shower",),
+    ("purple", "bottoming_out"): ("Listening to Music",),
+    ("red", "bottoming_out"): ("Pranayama (Lion's Breath)",),
+    ("blue", "rising"): ("Metta Meditation",),
+    ("orange", "rising"): ("Pranayama (Wim Hof)",),
+    ("green", "rising"): ("Yoga", "Creative Writing"),
+    ("yellow", "peaking"): ("Samatha Vipassana",),
+    ("teal", "peaking"): ("Magick",),
+    ("ultraviolet", "peaking"): ("Meditation Retreats",),
+    ("green", "diminishing"): ("Journaling",),
+    ("teal", "bottoming_out"): ("Baby Waterfall Conventions",),
+}
+"""Phase x Frequency intervention map (Ontology Section 12.5).
+
+Keys are ``(frequency_color, phase_value)`` pairs; values are tuples of
+practice names mapped by the Archetypal Wavelength framework as useful in
+that territory. Loaded at module import time; see
+:func:`DecisionContextGatherer.interventions_lookup`.
+"""
+
+
+_DIRECTIVE_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\byou should\b", re.IGNORECASE), "one option is to"),
+    (re.compile(r"\byou need to\b", re.IGNORECASE), "one possibility is to"),
+    (re.compile(r"\byou must\b", re.IGNORECASE), "one possibility is to"),
+    (re.compile(r"\bthe best option\b", re.IGNORECASE), "one option"),
+    (re.compile(r"\bthe right choice\b", re.IGNORECASE), "one possibility"),
+    (re.compile(r"\bit'?s clear that\b", re.IGNORECASE), "one reading is that"),
+    (re.compile(r"\bobviously\b", re.IGNORECASE), "from one perspective"),
+    (re.compile(r"\bact now\b", re.IGNORECASE), "act when it feels right"),
+    (
+        re.compile(r"\bbefore it'?s too late\b", re.IGNORECASE),
+        "when the moment feels right",
+    ),
+    (re.compile(r"\blast chance\b", re.IGNORECASE), "a moment that is present"),
+    (
+        re.compile(r"\bthis is permanent\b", re.IGNORECASE),
+        "some considerations include",
+    ),
+    (
+        re.compile(r"\bthis is irreversible\b", re.IGNORECASE),
+        "some considerations include",
+    ),
+)
+"""Directive/urgency/scarcity patterns replaced by descriptive language.
+
+Section 12.4 of the Ontology prohibits the decision layer from recommending
+options, weighting rationality over felt sense, or using urgency/scarcity
+framing. The patterns above are scrubbed by
+:meth:`DecisionContextGatherer.apply_guardrails`.
+"""
+
+
+_MIN_HISTORY_FOR_ADVISORY = 2
+"""Minimum past-decision count required to surface a wavelength advisory."""
+
+
+@dataclass
+class DecisionContext:
+    """Aggregated cross-vault context for a single Decision note.
+
+    Attributes:
+        decision_id: The ID of the decision this context is for.
+        decision_title: The title of the decision this context is for.
+        related_threads: IDs of threads semantically related to the decision.
+        related_decisions: IDs of past decisions with similar themes.
+        current_wavelength: Current wavelength phase of the human.
+        relevant_praxis: IDs of praxis notes applicable to this decision.
+        frequency_affinity: Frequency codes most active in this decision.
+        interventions: Suggested practices from the Phase x Frequency map.
+    """
+
+    decision_id: str
+    decision_title: str
+    related_threads: list[str] = field(default_factory=list)
+    related_decisions: list[str] = field(default_factory=list)
+    current_wavelength: str = ""
+    relevant_praxis: list[str] = field(default_factory=list)
+    frequency_affinity: list[str] = field(default_factory=list)
+    interventions: list[str] = field(default_factory=list)
+
+
+def _tokenize(text: str) -> set[str]:
+    """Tokenise text into a lowercase word set, dropping short stopwords.
+
+    Args:
+        text: Raw text to tokenise.
+
+    Returns:
+        Set of tokens with length >= 3, lowercased.
+    """
+    return {tok for tok in re.findall(r"[a-zA-Z]+", text.lower()) if len(tok) >= 3}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Compute Jaccard similarity between two sets.
+
+    Args:
+        a: First set.
+        b: Second set.
+
+    Returns:
+        Ratio of intersection size to union size, or ``0.0`` if both
+        sets are empty.
+    """
+    if not a and not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+def _load_post(path: Path) -> frontmatter.Post | None:
+    """Safely load a frontmatter post from disk.
+
+    Args:
+        path: The markdown file path.
+
+    Returns:
+        Loaded post, or ``None`` if the file cannot be parsed.
+    """
+    try:
+        return frontmatter.load(str(path))
+    except (OSError, ValueError):
+        return None
+
+
+def _listify(value: object) -> list[str]:
+    """Coerce a frontmatter value into a list of strings.
+
+    Args:
+        value: Raw value from a frontmatter field.
+
+    Returns:
+        A list of strings, empty if the input is falsy or unsupported.
+    """
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+class DecisionContextGatherer:
+    """Gather cross-vault context for Decision notes.
+
+    Walks the vault to find related threads, past decisions, relevant
+    praxis, and the current wavelength phase, then renders a Markdown
+    ``## Context`` section. All generated text is passed through
+    :meth:`apply_guardrails` to enforce the Section 12.4 anti-manipulation
+    rules (no recommendations, no urgency/scarcity framing, no prescriptive
+    language).
+
+    Attributes:
+        similarity_threshold: Minimum Jaccard similarity (0-1) for a
+            thread or decision to count as related.
+    """
+
+    def __init__(self, similarity_threshold: float = 0.1) -> None:
+        """Initialise the gatherer.
+
+        Args:
+            similarity_threshold: Minimum Jaccard similarity for
+                related-thread and related-decision matching.
+        """
+        self.similarity_threshold = similarity_threshold
+
+    # ---- Public API ----
+
+    def gather_context(
+        self,
+        decision: Decision,
+        vault_path: Path,
+    ) -> DecisionContext:
+        """Gather cross-vault context for a Decision.
+
+        Args:
+            decision: The Decision to gather context for.
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            A DecisionContext with related threads, decisions, praxis,
+            current wavelength, frequency affinity, and interventions.
+        """
+        tokens = _tokenize(decision.title)
+        freqs = [str(f) for f in decision.frequency_context]
+
+        related_threads = self._find_related_threads(vault_path, tokens, freqs)
+        related_decisions = self._find_related_decisions(
+            vault_path,
+            decision.id,
+            tokens,
+            freqs,
+        )
+        relevant_praxis = self._find_relevant_praxis(vault_path, freqs)
+        current_wavelength = self._current_wavelength(
+            vault_path,
+            fallback=decision.wavelength_phase_at_opening,
+        )
+        affinity = self._frequency_affinity(decision, relevant_praxis, vault_path)
+        interventions = self._gather_interventions(affinity, current_wavelength)
+
+        return DecisionContext(
+            decision_id=decision.id,
+            decision_title=decision.title,
+            related_threads=related_threads,
+            related_decisions=related_decisions,
+            current_wavelength=current_wavelength,
+            relevant_praxis=relevant_praxis,
+            frequency_affinity=affinity,
+            interventions=interventions,
+        )
+
+    def generate_context_section(self, context: DecisionContext) -> str:
+        """Render a Markdown ``## Context`` section for the decision.
+
+        The generated text is passed through :meth:`apply_guardrails`
+        before return to enforce the Section 12.4 anti-manipulation rules.
+
+        Args:
+            context: Context to render.
+
+        Returns:
+            A Markdown section body (no trailing newline).
+        """
+        lines: list[str] = ["## Context", ""]
+        lines.extend(self._render_threads(context.related_threads))
+        lines.extend(self._render_decisions(context.related_decisions))
+        lines.extend(self._render_praxis(context.relevant_praxis))
+        lines.extend(self._render_frequency_affinity(context.frequency_affinity))
+        lines.extend(
+            self._render_wavelength(
+                context.current_wavelength,
+                len(context.related_decisions),
+            ),
+        )
+        lines.extend(self._render_interventions(context.interventions))
+        return self.apply_guardrails("\n".join(lines).rstrip() + "\n")
+
+    def apply_guardrails(self, context_text: str) -> str:
+        """Scrub directive, urgency, and permanence framing from text.
+
+        Replaces patterns like "you should", "the best option", "act now",
+        and "this is permanent" with descriptive, option-surfacing language.
+
+        Args:
+            context_text: Input Markdown text.
+
+        Returns:
+            Text with directive language replaced by descriptive phrasing.
+        """
+        result = context_text
+        for pattern, replacement in _DIRECTIVE_REPLACEMENTS:
+            result = pattern.sub(replacement, result)
+        return result
+
+    def interventions_lookup(
+        self,
+        frequency: str,
+        phase: str,
+    ) -> list[str]:
+        """Look up practices mapped to a (frequency, phase) pair.
+
+        The frequency argument may be either a Frequency code (``"F6"``) or
+        a color name (``"green"``). Phase accepts any
+        :class:`~creek.models.Phase` value.
+
+        Args:
+            frequency: APTITUDE frequency code or color name.
+            phase: Archetypal wavelength phase.
+
+        Returns:
+            List of practice names from the Phase x Frequency map
+            (Section 12.5). Empty list if no practices are mapped.
+        """
+        color = _FREQUENCY_COLOR.get(frequency, frequency).lower()
+        phase_key = phase.lower()
+        return list(PRACTICE_MAP.get((color, phase_key), ()))
+
+    def append_context_section(
+        self,
+        decision_path: Path,
+        context_section: str,
+    ) -> Path:
+        """Append a generated context section to a Decision note.
+
+        If the note already contains a ``## Context`` section, the
+        existing section is replaced; otherwise the new section is
+        appended after the body.
+
+        Args:
+            decision_path: Path to the decision note.
+            context_section: The generated Markdown context section.
+
+        Returns:
+            The path that was updated.
+        """
+        post = frontmatter.load(str(decision_path))
+        body = post.content
+        existing = re.search(r"\n## Context\b.*", body, flags=re.DOTALL)
+        new_section = context_section.rstrip() + "\n"
+        if existing:
+            post.content = body[: existing.start()].rstrip() + "\n\n" + new_section
+        else:
+            post.content = body.rstrip() + "\n\n" + new_section
+        decision_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return decision_path
+
+    # ---- Related-thread / decision / praxis lookup ----
+
+    def _find_related_threads(
+        self,
+        vault_path: Path,
+        title_tokens: set[str],
+        freqs: list[str],
+    ) -> list[str]:
+        """Find IDs of threads related by token overlap or frequency."""
+        results: list[tuple[float, str]] = []
+        for md_file in self._iter_markdown(vault_path / "02-Threads"):
+            scored = self._score_thread(md_file, title_tokens, freqs)
+            if scored is not None:
+                results.append(scored)
+        return [tid for _, tid in sorted(results, key=lambda r: -r[0])]
+
+    def _score_thread(
+        self,
+        md_file: Path,
+        title_tokens: set[str],
+        freqs: list[str],
+    ) -> tuple[float, str] | None:
+        """Score a single thread file and return ``(score, id)`` if related."""
+        post = _load_post(md_file)
+        if post is None:
+            return None
+        thread_id = str(post.get("id") or "")
+        if not thread_id:
+            return None
+        thread_tokens = _tokenize(
+            str(post.get("title") or "") + " " + str(post.get("description") or ""),
+        )
+        score = _jaccard(title_tokens, thread_tokens)
+        thread_freqs = _listify(post.get("frequency_affinity"))
+        if any(f in thread_freqs for f in freqs):
+            score = max(score, self.similarity_threshold)
+        if score < self.similarity_threshold:
+            return None
+        return (score, thread_id)
+
+    def _find_related_decisions(
+        self,
+        vault_path: Path,
+        exclude_id: str,
+        title_tokens: set[str],
+        freqs: list[str],
+    ) -> list[str]:
+        """Find IDs of past decisions with similar themes or stakes."""
+        decisions_dir = vault_path / "08-Decisions"
+        results: list[tuple[float, str]] = []
+        for subfolder in ("Active", "Archive"):
+            for md_file in self._iter_markdown(decisions_dir / subfolder):
+                scored = self._score_decision(
+                    md_file,
+                    exclude_id,
+                    title_tokens,
+                    freqs,
+                )
+                if scored is not None:
+                    results.append(scored)
+        return [did for _, did in sorted(results, key=lambda r: -r[0])]
+
+    def _score_decision(
+        self,
+        md_file: Path,
+        exclude_id: str,
+        title_tokens: set[str],
+        freqs: list[str],
+    ) -> tuple[float, str] | None:
+        """Score a single decision file and return ``(score, id)`` if related."""
+        post = _load_post(md_file)
+        if post is None:
+            return None
+        did = str(post.get("id") or "")
+        if not did or did == exclude_id:
+            return None
+        their_tokens = _tokenize(str(post.get("title") or ""))
+        score = _jaccard(title_tokens, their_tokens)
+        their_freqs = _listify(post.get("frequency_context"))
+        if any(f in their_freqs for f in freqs):
+            score = max(score, self.similarity_threshold)
+        if score < self.similarity_threshold:
+            return None
+        return (score, did)
+
+    def _find_relevant_praxis(
+        self,
+        vault_path: Path,
+        freqs: list[str],
+    ) -> list[str]:
+        """Find IDs of praxis notes whose frequencies overlap the decision."""
+        praxis_dir = vault_path / "04-Praxis"
+        results: list[str] = []
+        for md_file in self._iter_markdown(praxis_dir):
+            post = _load_post(md_file)
+            if post is None:
+                continue
+            pid = str(post.get("id") or "")
+            if not pid:
+                continue
+            praxis_freqs = _listify(post.get("frequency"))
+            if not freqs or any(f in praxis_freqs for f in freqs):
+                results.append(pid)
+        return results
+
+    # ---- Wavelength + frequency affinity ----
+
+    def _current_wavelength(self, vault_path: Path, fallback: str) -> str:
+        """Determine current wavelength phase.
+
+        Reads the most recent WavelengthObservation note from
+        ``05-Wavelength/Observations/`` (by ``date`` field). Falls back
+        to the value carried on the decision if no observation is found.
+
+        Args:
+            vault_path: Vault root.
+            fallback: Phase string to use when no observation is available.
+
+        Returns:
+            A phase value (e.g. ``"rising"``), or the fallback.
+        """
+        obs_dir = vault_path / "05-Wavelength" / "Observations"
+        most_recent: tuple[str, str] | None = None
+        for md_file in self._iter_markdown(obs_dir):
+            post = _load_post(md_file)
+            if post is None:
+                continue
+            date_str = str(post.get("date") or "")
+            phase_val = str(post.get("phase") or "")
+            if not date_str or not phase_val:
+                continue
+            if most_recent is None or date_str > most_recent[0]:
+                most_recent = (date_str, phase_val)
+        return most_recent[1] if most_recent else fallback
+
+    def _frequency_affinity(
+        self,
+        decision: Decision,
+        relevant_praxis_ids: list[str],
+        vault_path: Path,
+    ) -> list[str]:
+        """Rank frequencies by prevalence across decision and praxis.
+
+        Args:
+            decision: The source decision.
+            relevant_praxis_ids: IDs of related praxis notes.
+            vault_path: Vault root (used to inspect praxis frequencies).
+
+        Returns:
+            Ordered list of frequency codes, most-active first.
+        """
+        counts: dict[str, int] = {}
+        for decision_freq in decision.frequency_context:
+            key = str(decision_freq)
+            counts[key] = counts.get(key, 0) + 2
+        for md_file in self._iter_markdown(vault_path / "04-Praxis"):
+            post = _load_post(md_file)
+            if post is None:
+                continue
+            if str(post.get("id") or "") not in relevant_praxis_ids:
+                continue
+            for praxis_freq in _listify(post.get("frequency")):
+                counts[praxis_freq] = counts.get(praxis_freq, 0) + 1
+        return [f for f, _ in sorted(counts.items(), key=lambda item: -item[1])]
+
+    def _gather_interventions(
+        self,
+        affinity: list[str],
+        phase: str,
+    ) -> list[str]:
+        """Collect unique interventions for the active frequencies+phase."""
+        if not phase:
+            return []
+        seen: list[str] = []
+        for freq in affinity:
+            for practice in self.interventions_lookup(freq, phase):
+                if practice not in seen:
+                    seen.append(practice)
+        return seen
+
+    # ---- Markdown rendering helpers ----
+
+    @staticmethod
+    def _render_threads(threads: list[str]) -> list[str]:
+        """Render the ``### Related Threads`` section."""
+        if not threads:
+            return ["### Related Threads", "", "_No related threads surfaced._", ""]
+        lines = ["### Related Threads", ""]
+        lines.extend(f"- [[{tid}]]" for tid in threads)
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _render_decisions(decisions: list[str]) -> list[str]:
+        """Render the ``### Related Past Decisions`` section."""
+        if not decisions:
+            return [
+                "### Related Past Decisions",
+                "",
+                "_No comparable past decisions surfaced._",
+                "",
+            ]
+        lines = ["### Related Past Decisions", ""]
+        lines.extend(f"- [[{did}]]" for did in decisions)
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _render_praxis(praxis: list[str]) -> list[str]:
+        """Render the ``### Relevant Praxis`` section."""
+        if not praxis:
+            return ["### Relevant Praxis", "", "_No praxis notes surfaced._", ""]
+        lines = ["### Relevant Praxis", ""]
+        lines.extend(f"- [[{pid}]]" for pid in praxis)
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _render_frequency_affinity(affinity: list[str]) -> list[str]:
+        """Render the ``### Frequency Affinity`` section."""
+        lines = ["### Frequency Affinity", ""]
+        if affinity:
+            lines.append(
+                "Most active frequencies in this decision: "
+                + ", ".join(affinity)
+                + ".",
+            )
+        else:
+            lines.append("_Frequency affinity is not yet established._")
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _render_wavelength(phase: str, past_decision_count: int) -> list[str]:
+        """Render the ``### Current Wavelength`` section and advisory."""
+        lines = ["### Current Wavelength", ""]
+        if not phase:
+            lines.append("_Current wavelength phase is unknown._")
+            lines.append("")
+            return lines
+        lines.append(f"You are currently in the **{phase}** phase.")
+        if past_decision_count >= _MIN_HISTORY_FOR_ADVISORY:
+            lines.append("")
+            lines.append(
+                f"Historically, decisions made during {phase} have had "
+                "a pattern worth noticing; review the related past "
+                "decisions above.",
+            )
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _render_interventions(interventions: list[str]) -> list[str]:
+        """Render the ``### Interventions Surfaced`` section."""
+        if not interventions:
+            return []
+        lines = ["### Interventions Surfaced", ""]
+        lines.append(
+            "Practices that have been mapped as useful in this territory:",
+        )
+        lines.append("")
+        lines.extend(f"- {practice}" for practice in interventions)
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _iter_markdown(directory: Path) -> list[Path]:
+        """List markdown files in a directory, safely handling absence."""
+        if not directory.exists():
+            return []
+        return sorted(directory.glob("*.md"))
+
+
+def _coerce_phase(raw: object) -> str:
+    """Coerce a raw phase value to a known Phase string or empty."""
+    value = str(raw or "")
+    valid = {p.value for p in Phase}
+    return value if value == "" or value in valid else ""
+
+
+def _coerce_opened(raw: object) -> date | None:
+    """Coerce a raw ``opened`` value to a date, or ``None`` if unparseable."""
+    if isinstance(raw, date):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def decision_from_note(note_path: Path) -> Decision:
+    """Load a Decision Pydantic model from a note file.
+
+    Args:
+        note_path: Path to a Decision markdown note.
+
+    Returns:
+        A :class:`~creek.models.Decision` built from the note's
+        frontmatter. Missing fields fall back to the model defaults.
+    """
+    post = frontmatter.load(str(note_path))
+    metadata = dict(post.metadata)
+    metadata["title"] = metadata.get("title") or note_path.stem
+    metadata["id"] = metadata.get("id") or _generate_decision_id()
+    valid_freqs = {freq.value for freq in Frequency}
+    metadata["frequency_context"] = [
+        f for f in _listify(metadata.get("frequency_context")) if f in valid_freqs
+    ]
+    metadata["wavelength_phase_at_opening"] = _coerce_phase(
+        metadata.get("wavelength_phase_at_opening"),
+    )
+    opened = _coerce_opened(metadata.get("opened"))
+    if opened is not None:
+        metadata["opened"] = opened
+    else:
+        metadata.pop("opened", None)
+    return Decision(**metadata)
