@@ -176,14 +176,17 @@ class WavelengthTracker:
             rolling_weeks: Weeks in the dosage rolling average. Defaults to 4.
                 Must be a positive integer.
             toxic_threshold: Ratio above which a frequency is "trending
-                toward overdose". Defaults to 0.6.
+                toward overdose". Defaults to 0.6. Must be in ``(0.0, 1.0]``;
+                values outside that range would either flag every frequency
+                vacuously or flag none at all.
             consecutive_weeks: Consecutive weeks above ``toxic_threshold``
                 required to flag a frequency. Defaults to 3. Must be a
                 positive integer.
 
         Raises:
             ValueError: If ``window_days``, ``rolling_weeks``, or
-                ``consecutive_weeks`` is less than 1.
+                ``consecutive_weeks`` is less than 1, or if
+                ``toxic_threshold`` is outside ``(0.0, 1.0]``.
         """
         if window_days < 1:
             msg = f"window_days must be >= 1, got {window_days}"
@@ -193,6 +196,9 @@ class WavelengthTracker:
             raise ValueError(msg)
         if consecutive_weeks < 1:
             msg = f"consecutive_weeks must be >= 1, got {consecutive_weeks}"
+            raise ValueError(msg)
+        if not 0.0 < toxic_threshold <= 1.0:
+            msg = f"toxic_threshold must be in (0.0, 1.0], got {toxic_threshold}"
             raise ValueError(msg)
         self.window_days = window_days
         self.rolling_weeks = rolling_weeks
@@ -351,7 +357,7 @@ class WavelengthTracker:
             if not freq or freq == Frequency.UNCLASSIFIED.value:
                 continue
             grouped[freq].append(fragment)
-        return grouped
+        return dict(grouped)
 
     @staticmethod
     def _weekly_toxic_ratios(
@@ -380,8 +386,7 @@ class WavelengthTracker:
         if not weekly:
             return []
         result: list[tuple[date, float]] = []
-        for idx in range(len(weekly)):
-            week = weekly[idx][0]
+        for idx, (week, _ratio) in enumerate(weekly):
             start = max(0, idx - self.rolling_weeks + 1)
             sample = [r for _, r in weekly[start : idx + 1]]
             result.append((week, sum(sample) / len(sample)))
@@ -422,10 +427,23 @@ class WavelengthTracker:
         The report file is named ``<report_date>-<period>.md``; if a file
         with that name already exists it is overwritten.
 
+        ``period`` controls the filename suffix, the ``period`` frontmatter
+        value, and the tag, but it does **not** change the analysis
+        granularity — both ``"weekly"`` and ``"monthly"`` runs aggregate
+        over :attr:`window_days`-sized windows. Callers who want coarser
+        monthly aggregation should construct the tracker with a larger
+        ``window_days`` (e.g. 28 or 30) when writing a monthly report.
+
+        Performance note: this method does
+        ``O(fragment_date_span / window_days)`` snapshot passes over the
+        fragment list. With ``window_days=1`` over a multi-year vault this
+        can produce thousands of snapshots; callers generating reports on
+        large corpora should prefer the default weekly windowing.
+
         Args:
             vault_path: Root of the Obsidian vault.
             period: Either ``"weekly"`` or ``"monthly"``. Controls the
-                report title and filename suffix.
+                report filename suffix and frontmatter.
             fragments: Fragments to aggregate. Empty lists still produce a
                 valid report.
             report_date: Date stamp used in the filename and ``generated_on``

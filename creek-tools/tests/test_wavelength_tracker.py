@@ -158,6 +158,26 @@ class TestTrackerInit:
         with pytest.raises(ValueError, match="consecutive_weeks"):
             WavelengthTracker(consecutive_weeks=0)
 
+    def test_rejects_toxic_threshold_above_one(self) -> None:
+        """A threshold above 1.0 can never be exceeded and would never flag."""
+        with pytest.raises(ValueError, match="toxic_threshold"):
+            WavelengthTracker(toxic_threshold=1.5)
+
+    def test_rejects_toxic_threshold_at_zero(self) -> None:
+        """A threshold of 0.0 flags every non-zero toxic ratio and is vacuous."""
+        with pytest.raises(ValueError, match="toxic_threshold"):
+            WavelengthTracker(toxic_threshold=0.0)
+
+    def test_rejects_negative_toxic_threshold(self) -> None:
+        """Negative thresholds are rejected."""
+        with pytest.raises(ValueError, match="toxic_threshold"):
+            WavelengthTracker(toxic_threshold=-0.1)
+
+    def test_accepts_toxic_threshold_of_one(self) -> None:
+        """The upper bound 1.0 is inclusive — flagging requires 100% toxic."""
+        trk = WavelengthTracker(toxic_threshold=1.0)
+        assert trk.toxic_threshold == pytest.approx(1.0)
+
 
 # ---- analyze_period ----
 
@@ -725,6 +745,38 @@ class TestTrackDosageTrends:
         trend = tracker.track_dosage_trends(fragments)
         assert trend.frequency_trends == {}
 
+    def test_ratio_exactly_at_threshold_does_not_flag(self) -> None:
+        """``_is_trending_toxic`` uses strict ``>``; exact threshold is safe."""
+        trk = WavelengthTracker(
+            toxic_threshold=0.6,
+            consecutive_weeks=2,
+            rolling_weeks=1,
+        )
+        fragments: list[Fragment] = []
+        # Two consecutive weeks where exactly 60% of fragments are toxic.
+        # Strict > 0.6 means the flag should NOT fire.
+        for week in range(2):
+            base_day = 1 + week * 7
+            for offset, dosage in enumerate(
+                [
+                    Dosage.TOXIC,
+                    Dosage.TOXIC,
+                    Dosage.TOXIC,
+                    Dosage.MEDICINE,
+                    Dosage.MEDICINE,
+                ],
+            ):
+                fragments.append(
+                    _make_fragment(
+                        frag_id=f"w{week}-{offset}",
+                        created=datetime(2025, 1, base_day, 10, offset, 0),
+                        frequency=Frequency.F1,
+                        dosage=dosage,
+                    ),
+                )
+        trend = trk.track_dosage_trends(fragments)
+        assert Frequency.F1.value not in trend.flagged_frequencies
+
     def test_rolling_window_larger_than_series(self) -> None:
         """Rolling average handles the case where the window exceeds data points."""
         trk = WavelengthTracker(rolling_weeks=10)
@@ -936,6 +988,31 @@ class TestGenerateReport:
         assert path.name == "2025-06-01-weekly.md"
         post = frontmatter.load(str(path))
         assert post["generated_on"] == "2025-06-01"
+
+    def test_report_overwrites_same_day_file(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        sample_fragments: list[Fragment],
+    ) -> None:
+        """Regenerating on the same date overwrites the prior file."""
+        stamp = date(2025, 6, 1)
+        first = tracker.generate_report(
+            vault_path,
+            "weekly",
+            sample_fragments,
+            report_date=stamp,
+        )
+        second = tracker.generate_report(
+            vault_path,
+            "weekly",
+            [],  # empty fragments -> different content
+            report_date=stamp,
+        )
+        assert first == second
+        # Second run's content differs from first because input changed.
+        content = second.read_text(encoding="utf-8")
+        assert "No fragments available for this period" in content
 
 
 # ---- PhaseTransition / DosageTrend dataclasses ----
