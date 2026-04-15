@@ -26,13 +26,27 @@ from creek.generate.synchronicity import (
     SynchronicityDetector,
 )
 from creek.generate.tags import TagGardenGenerator, TagScanResult
+from creek.generate.wavelength import (
+    DEFAULT_ROLLING_WEEKS,
+    DEFAULT_TOXIC_CONSECUTIVE_WEEKS,
+    DEFAULT_TOXIC_THRESHOLD,
+    DEFAULT_WINDOW_DAYS,
+    DosageTrend,
+    PhaseTransition,
+    WavelengthSnapshot,
+    WavelengthTracker,
+)
 
 __all__ = [
     "ABANDONMENT_KEYWORDS",
     "CONTRADICTION_KEYWORDS",
     "DECISION_KEYWORDS",
     "DEFAULT_MIN_TIME_GAP_DAYS",
+    "DEFAULT_ROLLING_WEEKS",
     "DEFAULT_SIMILARITY_THRESHOLD",
+    "DEFAULT_TOXIC_CONSECUTIVE_WEEKS",
+    "DEFAULT_TOXIC_THRESHOLD",
+    "DEFAULT_WINDOW_DAYS",
     "FREQUENCY_COLORS",
     "FREQUENCY_NAMES",
     "PRACTICE_MAP",
@@ -42,11 +56,15 @@ __all__ = [
     "DecisionContext",
     "DecisionContextGatherer",
     "DecisionDetector",
+    "DosageTrend",
     "IndexGenerator",
     "Paradox",
     "ParadoxDetector",
+    "PhaseTransition",
     "SynchronicityDetector",
     "TagGardenGenerator",
     "TagScanResult",
+    "WavelengthSnapshot",
+    "WavelengthTracker",
     "decision_from_note",
 ]
