@@ -172,12 +172,28 @@ class WavelengthTracker:
 
         Args:
             window_days: Length of the snapshot window. Defaults to 7.
+                Must be a positive integer.
             rolling_weeks: Weeks in the dosage rolling average. Defaults to 4.
+                Must be a positive integer.
             toxic_threshold: Ratio above which a frequency is "trending
                 toward overdose". Defaults to 0.6.
             consecutive_weeks: Consecutive weeks above ``toxic_threshold``
-                required to flag a frequency. Defaults to 3.
+                required to flag a frequency. Defaults to 3. Must be a
+                positive integer.
+
+        Raises:
+            ValueError: If ``window_days``, ``rolling_weeks``, or
+                ``consecutive_weeks`` is less than 1.
         """
+        if window_days < 1:
+            msg = f"window_days must be >= 1, got {window_days}"
+            raise ValueError(msg)
+        if rolling_weeks < 1:
+            msg = f"rolling_weeks must be >= 1, got {rolling_weeks}"
+            raise ValueError(msg)
+        if consecutive_weeks < 1:
+            msg = f"consecutive_weeks must be >= 1, got {consecutive_weeks}"
+            raise ValueError(msg)
         self.window_days = window_days
         self.rolling_weeks = rolling_weeks
         self.toxic_threshold = toxic_threshold
@@ -302,6 +318,11 @@ class WavelengthTracker:
         :attr:`toxic_threshold` for at least :attr:`consecutive_weeks`
         consecutive weeks.
 
+        Dosage buckets always use ISO calendar weeks (Monday boundaries),
+        independent of :attr:`window_days`. This is deliberate: the
+        ontology specifies weekly dosage accounting, and snapshot windows
+        are allowed to span multiple or fractional weeks.
+
         Args:
             fragments: Fragments to analyse.
 
@@ -358,11 +379,10 @@ class WavelengthTracker:
         """Apply a trailing *rolling_weeks* mean to *weekly* toxic ratios."""
         if not weekly:
             return []
-        window = max(1, self.rolling_weeks)
         result: list[tuple[date, float]] = []
         for idx in range(len(weekly)):
             week = weekly[idx][0]
-            start = max(0, idx - window + 1)
+            start = max(0, idx - self.rolling_weeks + 1)
             sample = [r for _, r in weekly[start : idx + 1]]
             result.append((week, sum(sample) / len(sample)))
         return result
@@ -386,20 +406,31 @@ class WavelengthTracker:
         vault_path: Path,
         period: str,
         fragments: list[Fragment],
+        *,
+        report_date: date | None = None,
     ) -> Path:
         """Write a descriptive wavelength report to ``05-Wavelength/Phase-Maps/``.
 
-        The report aggregates *fragments* into weekly snapshots, detects
-        transitions, tracks dosage trends, and renders the five required
-        sections: Current Phase, Phase History, Dosage Trends, Transition
-        Log, and Emotional Texture Cloud. Language is descriptive only.
+        The report aggregates *fragments* into window-sized snapshots (each
+        snapshot spans :attr:`window_days` days), detects transitions, tracks
+        dosage trends (bucketed by ISO calendar week; see
+        :meth:`track_dosage_trends`), and renders six sections: Current
+        Phase, Phase History, Dosage Trends, Transition Log, Emotional
+        Texture Cloud, and a Dataview query over all fragments. Language
+        is descriptive only.
+
+        The report file is named ``<report_date>-<period>.md``; if a file
+        with that name already exists it is overwritten.
 
         Args:
             vault_path: Root of the Obsidian vault.
             period: Either ``"weekly"`` or ``"monthly"``. Controls the
-                report title and filename prefix.
+                report title and filename suffix.
             fragments: Fragments to aggregate. Empty lists still produce a
                 valid report.
+            report_date: Date stamp used in the filename and ``generated_on``
+                frontmatter field. Defaults to :meth:`date.today`, so tests
+                can pin it for determinism.
 
         Returns:
             Path to the written markdown report.
@@ -414,31 +445,40 @@ class WavelengthTracker:
         target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        snapshots = self._weekly_snapshots(fragments)
+        snapshots = self._window_snapshots(fragments)
         transitions = self.detect_transitions(snapshots)
         trend = self.track_dosage_trends(fragments)
 
-        today = date.today()
+        stamp = report_date if report_date is not None else date.today()
         body = self._render_report_body(snapshots, transitions, trend)
         post = frontmatter.Post(
             content=body,
             type="wavelength-report",
             period=period,
-            generated_on=today.isoformat(),
+            generated_on=stamp.isoformat(),
             window_days=self.window_days,
             flagged_frequencies=list(trend.flagged_frequencies),
             tags=["wavelength", f"wavelength-{period}"],
         )
 
-        note_path = target_dir / f"{today.isoformat()}-{period}.md"
+        note_path = target_dir / f"{stamp.isoformat()}-{period}.md"
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
 
-    def _weekly_snapshots(
+    def _window_snapshots(
         self,
         fragments: list[Fragment],
     ) -> list[WavelengthSnapshot]:
-        """Build contiguous weekly snapshots spanning the fragment date range."""
+        """Build contiguous ``window_days``-sized snapshots spanning the range.
+
+        Windows are anchored to ISO week starts (Monday) for readability;
+        if ``window_days`` is not a multiple of 7 the final window may
+        extend past the last fragment, which is harmless because
+        :meth:`analyze_period` filters by date.
+
+        Dosage trends computed elsewhere always bucket by 7-day ISO weeks
+        regardless of ``window_days`` — see :meth:`track_dosage_trends`.
+        """
         if not fragments:
             return []
         first = min(f.created.date() for f in fragments)

@@ -133,6 +133,31 @@ class TestTrackerInit:
         assert trk.toxic_threshold == pytest.approx(0.75)
         assert trk.consecutive_weeks == 2
 
+    def test_rejects_zero_window_days(self) -> None:
+        """Zero-length windows would infinite-loop; the constructor rejects them."""
+        with pytest.raises(ValueError, match="window_days"):
+            WavelengthTracker(window_days=0)
+
+    def test_rejects_negative_window_days(self) -> None:
+        """Negative window_days is also rejected."""
+        with pytest.raises(ValueError, match="window_days"):
+            WavelengthTracker(window_days=-3)
+
+    def test_rejects_zero_rolling_weeks(self) -> None:
+        """Zero rolling weeks would produce an empty rolling average."""
+        with pytest.raises(ValueError, match="rolling_weeks"):
+            WavelengthTracker(rolling_weeks=0)
+
+    def test_rejects_negative_rolling_weeks(self) -> None:
+        """Negative rolling_weeks is rejected."""
+        with pytest.raises(ValueError, match="rolling_weeks"):
+            WavelengthTracker(rolling_weeks=-2)
+
+    def test_rejects_zero_consecutive_weeks(self) -> None:
+        """consecutive_weeks below 1 would flag every frequency vacuously."""
+        with pytest.raises(ValueError, match="consecutive_weeks"):
+            WavelengthTracker(consecutive_weeks=0)
+
 
 # ---- analyze_period ----
 
@@ -700,6 +725,29 @@ class TestTrackDosageTrends:
         trend = tracker.track_dosage_trends(fragments)
         assert trend.frequency_trends == {}
 
+    def test_rolling_window_larger_than_series(self) -> None:
+        """Rolling average handles the case where the window exceeds data points."""
+        trk = WavelengthTracker(rolling_weeks=10)
+        fragments = [
+            _make_fragment(
+                frag_id="a",
+                created=datetime(2025, 1, 6),
+                frequency=Frequency.F1,
+                dosage=Dosage.TOXIC,
+            ),
+            _make_fragment(
+                frag_id="b",
+                created=datetime(2025, 1, 13),
+                frequency=Frequency.F1,
+                dosage=Dosage.MEDICINE,
+            ),
+        ]
+        trend = trk.track_dosage_trends(fragments)
+        series = trend.frequency_trends[Frequency.F1.value]
+        # Week 1 (all toxic) -> 1.0. Week 2 average over both -> 0.5.
+        assert series[0][1] == pytest.approx(1.0)
+        assert series[1][1] == pytest.approx(0.5)
+
 
 # ---- generate_report ----
 
@@ -799,7 +847,7 @@ class TestGenerateReport:
         vault_path: Path,
         sample_fragments: list[Fragment],
     ) -> None:
-        """Report body has the five required sections."""
+        """Report body has all six rendered sections."""
         path = tracker.generate_report(vault_path, "weekly", sample_fragments)
         content = path.read_text(encoding="utf-8")
         assert "Current Phase" in content
@@ -807,6 +855,7 @@ class TestGenerateReport:
         assert "Dosage Trends" in content
         assert "Transition Log" in content
         assert "Emotional Texture Cloud" in content
+        assert "Fragments by Phase" in content
 
     def test_report_is_descriptive_not_prescriptive(
         self,
@@ -860,6 +909,33 @@ class TestGenerateReport:
         path = tracker.generate_report(vault_path, "weekly", fragments)
         content = path.read_text(encoding="utf-8")
         assert "F3" in content
+
+    def test_report_monthly_filename_suffix(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        sample_fragments: list[Fragment],
+    ) -> None:
+        """Monthly reports end with ``-monthly.md``."""
+        path = tracker.generate_report(vault_path, "monthly", sample_fragments)
+        assert path.name.endswith("-monthly.md")
+
+    def test_report_date_is_deterministic(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        sample_fragments: list[Fragment],
+    ) -> None:
+        """``report_date`` pins the filename and the ``generated_on`` field."""
+        path = tracker.generate_report(
+            vault_path,
+            "weekly",
+            sample_fragments,
+            report_date=date(2025, 6, 1),
+        )
+        assert path.name == "2025-06-01-weekly.md"
+        post = frontmatter.load(str(path))
+        assert post["generated_on"] == "2025-06-01"
 
 
 # ---- PhaseTransition / DosageTrend dataclasses ----
