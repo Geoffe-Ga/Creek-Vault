@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import itertools
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -42,7 +42,10 @@ def _load_sentence_transformer(
     """
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(model_name, cache_folder=cache_folder)
+    return cast(
+        "SentenceTransformerType",
+        SentenceTransformer(model_name, cache_folder=cache_folder),
+    )
 
 
 class EmbeddingLinker:
@@ -155,10 +158,9 @@ class EmbeddingLinker:
             path: Destination file path (typically ``*.npz``).
         """
         arrays = {k: np.array(v, dtype=np.float32) for k, v in embeddings.items()}
-        np.savez_compressed(
-            path,
-            **arrays,
-        )
+        # ``allow_pickle`` is passed explicitly so mypy can narrow the kwargs
+        # type for ``**arrays`` to ``ArrayLike`` instead of matching ``bool``.
+        np.savez_compressed(path, allow_pickle=True, **arrays)
         logger.info("Saved %d embedding(s) to %s", len(embeddings), path)
 
     def load_embeddings(self, path: Path) -> dict[str, list[float]]:
