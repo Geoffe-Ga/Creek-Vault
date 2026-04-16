@@ -8,7 +8,7 @@ wavelength report into the vault at ``05-Wavelength/Phase-Maps/``).
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -19,6 +19,8 @@ from creek.generate.wavelength import (
     DEFAULT_TOXIC_CONSECUTIVE_WEEKS,
     DEFAULT_TOXIC_THRESHOLD,
     DEFAULT_WINDOW_DAYS,
+    DOMAIN_MAPPINGS,
+    PHASE_DESCRIPTIONS,
     DosageTrend,
     PhaseTransition,
     WavelengthSnapshot,
@@ -1038,3 +1040,661 @@ class TestDataclasses:
         trend = DosageTrend()
         assert trend.frequency_trends == {}
         assert trend.flagged_frequencies == []
+
+
+# ---- Domain Mappings (ontology Section 7.1) ----
+
+
+class TestDomainMappings:
+    """Tests for the static DOMAIN_MAPPINGS lookup table."""
+
+    def test_all_six_phases_have_mappings(self) -> None:
+        """Every classified Archetypal Wavelength phase has a domain mapping."""
+        expected_phases = {
+            Phase.RISING.value,
+            Phase.PEAKING.value,
+            Phase.WITHDRAWAL.value,
+            Phase.DIMINISHING.value,
+            Phase.BOTTOMING_OUT.value,
+            Phase.RESTORATION.value,
+        }
+        assert expected_phases <= set(DOMAIN_MAPPINGS)
+
+    def test_mapping_has_required_domains(self) -> None:
+        """Each mapping covers the eight domains Issue #43 requires."""
+        required = {
+            "season",
+            "mood",
+            "spaciousness",
+            "relation_to_others",
+            "relation_to_self",
+            "buddhist_attachment",
+            "meditation",
+            "breath",
+        }
+        for phase, mapping in DOMAIN_MAPPINGS.items():
+            assert required <= set(mapping), (
+                f"phase {phase!r} missing domains: {required - set(mapping)}"
+            )
+
+    def test_rising_season_is_summer(self) -> None:
+        """Rising maps to Summer per ontology Section 7.1."""
+        assert DOMAIN_MAPPINGS[Phase.RISING.value]["season"] == "Summer"
+
+    def test_bottoming_out_season_is_winter_solstice(self) -> None:
+        """Bottoming Out maps to the Winter Solstice per ontology Section 7.1."""
+        assert DOMAIN_MAPPINGS[Phase.BOTTOMING_OUT.value]["season"] == "Winter Solstice"
+
+    def test_peaking_buddhist_attachment_is_attraction(self) -> None:
+        """Peaking's Buddhist attachment value is Attraction."""
+        assert (
+            DOMAIN_MAPPINGS[Phase.PEAKING.value]["buddhist_attachment"] == "Attraction"
+        )
+
+    def test_diminishing_buddhist_attachment_is_aversion(self) -> None:
+        """Diminishing's Buddhist attachment value is Aversion."""
+        assert (
+            DOMAIN_MAPPINGS[Phase.DIMINISHING.value]["buddhist_attachment"]
+            == "Aversion"
+        )
+
+    def test_restoration_mood_is_depression(self) -> None:
+        """Restoration in the bipolar-frame Mood column is Depression."""
+        assert DOMAIN_MAPPINGS[Phase.RESTORATION.value]["mood"] == "Depression"
+
+    def test_phase_descriptions_cover_all_six(self) -> None:
+        """Every classified phase has a one-line description."""
+        expected = {
+            Phase.RISING.value,
+            Phase.PEAKING.value,
+            Phase.WITHDRAWAL.value,
+            Phase.DIMINISHING.value,
+            Phase.BOTTOMING_OUT.value,
+            Phase.RESTORATION.value,
+        }
+        assert expected <= set(PHASE_DESCRIPTIONS)
+        for desc in PHASE_DESCRIPTIONS.values():
+            assert len(desc) > 0
+
+
+# ---- generate_weekly_report ----
+
+
+@pytest.fixture()
+def weekly_fragments() -> list[Fragment]:
+    """Fragments inside a single ISO week (2025-W02, Mon 2025-01-06)."""
+    return [
+        _make_fragment(
+            frag_id=f"w-{i}",
+            created=datetime(2025, 1, 6 + (i % 5), 12, 0, 0),
+            phase=Phase.RISING,
+            mode=Mode.INHABIT,
+            dosage=Dosage.MEDICINE,
+            frequency=Frequency.F2,
+            emotional_texture=["wonder", "wonder", "grief"][i % 3 : (i % 3) + 1],
+        )
+        for i in range(5)
+    ]
+
+
+class TestGenerateWeeklyReport:
+    """Tests for WavelengthTracker.generate_weekly_report."""
+
+    def test_filename_uses_iso_year_week_format(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Weekly reports are named ``YYYY-WNN-wavelength.md``."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        # 2025-01-08 is in ISO week 02.
+        assert path.name == "2025-W02-wavelength.md"
+
+    def test_filename_week_is_zero_padded(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Single-digit ISO weeks are zero-padded (e.g. W02, not W2)."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        assert "W02" in path.name
+
+    def test_report_under_phase_maps(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """The file lives under ``05-Wavelength/Phase-Maps/``."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        rel = path.relative_to(vault_path)
+        assert rel.parts[0] == "05-Wavelength"
+        assert rel.parts[1] == "Phase-Maps"
+
+    def test_frontmatter_fields(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Frontmatter carries type, period, week, year per Issue #43."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        post = frontmatter.load(str(path))
+        assert post["type"] == "wavelength_report"
+        assert post["period"] == "weekly"
+        assert post["week"] == 2
+        assert post["year"] == 2025
+
+    def test_body_contains_required_sections(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Body includes the seven sections mandated by Issue #43."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "Phase Summary" in content
+        assert "Domain Mappings" in content
+        assert "Mode Distribution" in content
+        assert "Dosage Balance" in content
+        assert "Emotional Texture Cloud" in content
+        assert "Notable Fragments" in content
+        assert "Transition Watch" in content
+
+    def test_phase_summary_uses_ontology_description(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Phase Summary renders the ontology description for the dominant phase."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        rising_description = PHASE_DESCRIPTIONS[Phase.RISING.value]
+        assert rising_description in content
+
+    def test_domain_mappings_rendered(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Domain Mappings section surfaces Season/Mood/Breath values."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "Summer" in content
+        assert "Mania" in content
+        assert "Inhale end" in content
+
+    def test_emotional_texture_cloud_format(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Texture tags render as ``tag(count)`` tokens per Issue #43."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        # wonder appears multiple times, grief at least once
+        assert "wonder(" in content
+        assert "grief(" in content
+
+    def test_mode_distribution_shows_active_modes(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Mode Distribution lists every mode that appeared this week."""
+        fragments = [
+            _make_fragment(
+                frag_id="a",
+                created=datetime(2025, 1, 6, 9, 0, 0),
+                phase=Phase.RISING,
+                mode=Mode.INHABIT,
+            ),
+            _make_fragment(
+                frag_id="b",
+                created=datetime(2025, 1, 7, 9, 0, 0),
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+        ]
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert Mode.INHABIT.value in content
+        assert Mode.EXPRESS.value in content
+
+    def test_dosage_balance_reports_medicine_and_toxic(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Dosage Balance renders both medicine and toxic percentages."""
+        fragments = [
+            _make_fragment(
+                frag_id="med-1",
+                created=datetime(2025, 1, 6, 9, 0, 0),
+                phase=Phase.RISING,
+                dosage=Dosage.MEDICINE,
+            ),
+            _make_fragment(
+                frag_id="tox-1",
+                created=datetime(2025, 1, 7, 9, 0, 0),
+                phase=Phase.RISING,
+                dosage=Dosage.TOXIC,
+            ),
+        ]
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "50%" in content  # 1 medicine of 2 classified = 50%
+        assert "Medicine" in content
+        assert "Toxic" in content
+
+    def test_notable_fragments_limited_to_five(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """At most 5 notable fragments are listed even when many classified."""
+        fragments = [
+            _make_fragment(
+                frag_id=f"frag-{i}",
+                title=f"notable {i}",
+                created=datetime(2025, 1, 6, 9, i, 0),
+                phase=Phase.RISING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+                frequency=Frequency.F2,
+                emotional_texture=["wonder"],
+            )
+            for i in range(10)
+        ]
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        notable_lines = [
+            line
+            for line in content.splitlines()
+            if line.startswith("- [[") and "notable" in line
+        ]
+        assert 0 < len(notable_lines) <= 5
+
+    def test_notable_fragments_link_back_by_id(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Notable fragments are rendered as wiki-links to their IDs."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "[[w-0" in content or "[[w-1" in content
+
+    def test_transition_watch_notes_next_possible_phase(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Transition Watch surfaces a recent shift when one exists."""
+        fragments: list[Fragment] = []
+        prior_week_start = datetime(2024, 12, 30, 9, 0, 0)
+        # Prior week: RISING
+        for day in range(3):
+            fragments.append(
+                _make_fragment(
+                    frag_id=f"r-{day}",
+                    created=prior_week_start + timedelta(days=day),
+                    phase=Phase.RISING,
+                    mode=Mode.INHABIT,
+                    dosage=Dosage.MEDICINE,
+                    frequency=Frequency.F2,
+                ),
+            )
+        # This week: PEAKING
+        for day in range(3):
+            fragments.append(
+                _make_fragment(
+                    frag_id=f"p-{day}",
+                    created=datetime(2025, 1, 6 + day, 9, 0, 0),
+                    phase=Phase.PEAKING,
+                    mode=Mode.EXPRESS,
+                    dosage=Dosage.MEDICINE,
+                    frequency=Frequency.F2,
+                ),
+            )
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "rising" in content.lower()
+        assert "peaking" in content.lower()
+
+    def test_dataview_section_present(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """A Dataview query scoped to this week's fragments is included."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "```dataview" in content
+
+    def test_descriptive_not_prescriptive(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        weekly_fragments: list[Fragment],
+    ) -> None:
+        """Body avoids prescriptive phrasing per the ontology."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=weekly_fragments,
+        )
+        content = path.read_text(encoding="utf-8").lower()
+        assert "you should" not in content
+        assert "you must" not in content
+        assert "you need to" not in content
+
+    def test_handles_week_at_year_boundary(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """ISO weeks spanning years use the ISO calendar year, not civil year."""
+        # Thursday 2026-01-01 is in ISO week 2026-W01.
+        fragments = [
+            _make_fragment(
+                frag_id="bound",
+                created=datetime(2026, 1, 1, 9, 0, 0),
+                phase=Phase.RESTORATION,
+            ),
+        ]
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2026, 1, 1),
+            fragments=fragments,
+        )
+        assert path.name == "2026-W01-wavelength.md"
+
+    def test_empty_fragments_still_generate_report(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Weekly report generation is robust to empty fragments."""
+        path = tracker.generate_weekly_report(
+            vault_path,
+            week_of=date(2025, 1, 8),
+            fragments=[],
+        )
+        assert path.exists()
+
+    def test_loads_fragments_from_vault_when_none_passed(
+        self,
+        tracker: WavelengthTracker,
+        tmp_path: Path,
+    ) -> None:
+        """When ``fragments`` is omitted, fragments are loaded from the vault."""
+        # Seed a vault with a fragment note.
+        frag_dir = tmp_path / "01-Fragments"
+        frag_dir.mkdir(parents=True, exist_ok=True)
+        fragment = _make_fragment(
+            frag_id="from-vault-1",
+            created=datetime(2025, 1, 7, 10, 0, 0),
+            phase=Phase.RISING,
+            mode=Mode.INHABIT,
+            dosage=Dosage.MEDICINE,
+            frequency=Frequency.F2,
+        )
+        post = frontmatter.Post(content="Body", **fragment.model_dump(mode="json"))
+        (frag_dir / f"{fragment.id}.md").write_text(
+            frontmatter.dumps(post),
+            encoding="utf-8",
+        )
+        path = tracker.generate_weekly_report(tmp_path, week_of=date(2025, 1, 8))
+        content = path.read_text(encoding="utf-8")
+        assert "from-vault-1" in content
+
+
+# ---- generate_monthly_report ----
+
+
+@pytest.fixture()
+def monthly_fragments() -> list[Fragment]:
+    """Fragments spanning four weeks of January 2025 with a phase progression."""
+    fragments: list[Fragment] = []
+    phase_schedule = [
+        (Phase.RISING, Mode.INHABIT),
+        (Phase.PEAKING, Mode.EXPRESS),
+        (Phase.WITHDRAWAL, Mode.COLLABORATE),
+        (Phase.DIMINISHING, Mode.INTEGRATE),
+    ]
+    for week_index, (phase, mode) in enumerate(phase_schedule):
+        for day in range(3):
+            fragments.append(
+                _make_fragment(
+                    frag_id=f"m-{week_index}-{day}",
+                    created=datetime(2025, 1, 6 + week_index * 7 + day, 9, 0, 0),
+                    phase=phase,
+                    mode=mode,
+                    dosage=Dosage.MEDICINE,
+                    frequency=Frequency.F2,
+                    emotional_texture=["wonder"],
+                ),
+            )
+    return fragments
+
+
+class TestGenerateMonthlyReport:
+    """Tests for WavelengthTracker.generate_monthly_report."""
+
+    def test_filename_uses_year_month_format(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        monthly_fragments: list[Fragment],
+    ) -> None:
+        """Monthly reports are named ``YYYY-MM-wavelength.md``."""
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 1, 1),
+            fragments=monthly_fragments,
+        )
+        assert path.name == "2025-01-wavelength.md"
+
+    def test_frontmatter_has_month_and_year(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        monthly_fragments: list[Fragment],
+    ) -> None:
+        """Monthly frontmatter carries month + year, period is 'monthly'."""
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 1, 1),
+            fragments=monthly_fragments,
+        )
+        post = frontmatter.load(str(path))
+        assert post["type"] == "wavelength_report"
+        assert post["period"] == "monthly"
+        assert post["month"] == 1
+        assert post["year"] == 2025
+
+    def test_includes_week_by_week_progression(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        monthly_fragments: list[Fragment],
+    ) -> None:
+        """Monthly report renders a text-based week-by-week progression chart."""
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 1, 1),
+            fragments=monthly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "Phase Progression" in content
+        assert "Week 1" in content
+        assert "Week 2" in content
+
+    def test_progression_chart_uses_block_marks(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        monthly_fragments: list[Fragment],
+    ) -> None:
+        """Progression chart uses ``#`` blocks to visualise intensity."""
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 1, 1),
+            fragments=monthly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "#" in content
+
+    def test_month_over_month_comparison_section(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        monthly_fragments: list[Fragment],
+    ) -> None:
+        """Monthly report surfaces a Month-over-Month comparison section."""
+        # Seed prior-month fragments so comparison is non-trivial.
+        previous_month = [
+            _make_fragment(
+                frag_id=f"prev-{i}",
+                created=datetime(2024, 12, 10 + i, 9, 0, 0),
+                phase=Phase.BOTTOMING_OUT,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+                frequency=Frequency.F1,
+            )
+            for i in range(3)
+        ]
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 1, 1),
+            fragments=[*monthly_fragments, *previous_month],
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "Month-over-Month" in content
+
+    def test_monthly_body_has_same_core_sections_as_weekly(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+        monthly_fragments: list[Fragment],
+    ) -> None:
+        """Monthly report retains the weekly report's core sections."""
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 1, 1),
+            fragments=monthly_fragments,
+        )
+        content = path.read_text(encoding="utf-8")
+        for section in (
+            "Phase Summary",
+            "Domain Mappings",
+            "Mode Distribution",
+            "Dosage Balance",
+            "Emotional Texture Cloud",
+            "Notable Fragments",
+            "Transition Watch",
+        ):
+            assert section in content
+
+    def test_empty_fragments_still_generate_report(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Monthly report generation is robust to empty fragments."""
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2025, 2, 1),
+            fragments=[],
+        )
+        assert path.exists()
+
+    def test_loads_fragments_from_vault_when_none_passed(
+        self,
+        tracker: WavelengthTracker,
+        tmp_path: Path,
+    ) -> None:
+        """When fragments omitted, monthly reports load them from the vault."""
+        frag_dir = tmp_path / "01-Fragments"
+        frag_dir.mkdir(parents=True, exist_ok=True)
+        fragment = _make_fragment(
+            frag_id="from-vault-monthly",
+            created=datetime(2025, 1, 15, 10, 0, 0),
+            phase=Phase.PEAKING,
+            mode=Mode.EXPRESS,
+            dosage=Dosage.MEDICINE,
+            frequency=Frequency.F2,
+        )
+        post = frontmatter.Post(content="Body", **fragment.model_dump(mode="json"))
+        (frag_dir / f"{fragment.id}.md").write_text(
+            frontmatter.dumps(post),
+            encoding="utf-8",
+        )
+        path = tracker.generate_monthly_report(tmp_path, month=date(2025, 1, 1))
+        content = path.read_text(encoding="utf-8")
+        assert "from-vault-monthly" in content

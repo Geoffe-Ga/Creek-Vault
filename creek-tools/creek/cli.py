@@ -192,6 +192,33 @@ def link(
     )
 
 
+def _run_wavelength_report(vault_path: Path, period: str | None) -> Path:
+    """Dispatch to the weekly/monthly wavelength report generator.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        period: ``"weekly"`` or ``"monthly"``. Any other value exits the CLI.
+
+    Returns:
+        Path to the generated markdown report.
+    """
+    from datetime import date as _date
+
+    from creek.generate.wavelength import WavelengthTracker
+
+    tracker = WavelengthTracker()
+    today = _date.today()
+    if period == "weekly":
+        return tracker.generate_weekly_report(vault_path, week_of=today)
+    if period == "monthly":
+        return tracker.generate_monthly_report(vault_path, month=today)
+    console.print(
+        "[bold red]--period must be 'weekly' or 'monthly' "
+        "for wavelength reports.[/bold red]",
+    )
+    raise typer.Exit(code=2)
+
+
 @app.command()
 def report(
     type: str | None = typer.Option(None, help="Report type"),
@@ -225,6 +252,11 @@ def report(
         )
         console.print(
             f"[bold green]Unnamed digest generated: {digest_path}[/bold green]",
+        )
+    elif type == "wavelength":
+        wavelength_path = _run_wavelength_report(vault_path, period)
+        console.print(
+            f"[bold green]Wavelength report generated: {wavelength_path}[/bold green]",
         )
     else:
         console.print(

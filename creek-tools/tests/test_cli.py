@@ -233,6 +233,74 @@ def test_report_command() -> None:
     assert result.exit_code == 0
 
 
+def test_report_wavelength_weekly(tmp_path: Path) -> None:
+    """``creek report --type wavelength --period weekly`` writes a weekly map."""
+    vault = tmp_path / "vault"
+    for folder in ("01-Fragments", "05-Wavelength", "05-Wavelength/Phase-Maps"):
+        (vault / folder).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "wavelength",
+            "--period",
+            "weekly",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written = list((vault / "05-Wavelength" / "Phase-Maps").glob("*-wavelength.md"))
+    assert written, f"no weekly report written under {vault}"
+    assert "wavelength" in result.output.lower()
+
+
+def test_report_wavelength_monthly(tmp_path: Path) -> None:
+    """``creek report --type wavelength --period monthly`` writes a monthly map."""
+    vault = tmp_path / "vault"
+    for folder in ("01-Fragments", "05-Wavelength", "05-Wavelength/Phase-Maps"):
+        (vault / folder).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "wavelength",
+            "--period",
+            "monthly",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written = list((vault / "05-Wavelength" / "Phase-Maps").glob("*-wavelength.md"))
+    assert written
+
+
+def test_report_wavelength_rejects_bad_period(tmp_path: Path) -> None:
+    """Invalid ``--period`` values for wavelength exit non-zero with a message."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "wavelength",
+            "--period",
+            "daily",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "weekly" in result.output.lower() or "monthly" in result.output.lower()
+
+
 def test_review_help() -> None:
     """Test that review --help shows subcommand help."""
     result = runner.invoke(app, ["review", "--help"])
