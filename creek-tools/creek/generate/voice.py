@@ -1,11 +1,17 @@
-"""Voice exemplar collection — gather high-confidence fragments by register.
+"""Voice exemplar collection and pattern extraction.
 
-Implements Section 11.1 of the Creek Ontology. The
-:class:`VoiceExemplarCollector` scans the vault for fragments whose
-``voice.confidence`` has crystallised (``settled`` or ``conviction``),
-groups them by ``voice.register``, ranks them by quality, and writes
-the top exemplars under ``07-Voice/Register-Samples/<register>/`` so a
-voice proxy can later train against curated samples.
+Implements Section 11.1 of the Creek Ontology.
+
+**Exemplar collection** — :class:`VoiceExemplarCollector` scans the vault
+for fragments whose ``voice.confidence`` has crystallised (``settled`` or
+``conviction``), groups them by ``voice.register``, ranks them by quality,
+and writes the top exemplars under ``07-Voice/Register-Samples/<register>/``
+so a voice proxy can later train against curated samples.
+
+**Pattern extraction** — :class:`VoicePatternExtractor` analyses exemplar
+body texts to extract sentence structure, paragraph structure, transition
+patterns, metaphor families, rhetorical moves, vocabulary fingerprint, and
+punctuation habits.
 
 The collector is deliberately conservative about privacy: ``intimate``
 tier fragments are excluded by default and only included when the caller
@@ -16,7 +22,10 @@ recording the breakdown of confidence levels.
 from __future__ import annotations
 
 import logging
+import math
+import re
 import shutil
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -439,9 +448,660 @@ class VoiceExemplarCollector:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Voice pattern extraction — data models & extractor
+# ---------------------------------------------------------------------------
+
+METAPHOR_DOMAINS: dict[str, tuple[str, ...]] = {
+    "water": (
+        "creek",
+        "flow",
+        "pool",
+        "eddy",
+        "current",
+        "stream",
+        "wave",
+        "tide",
+        "ripple",
+        "flood",
+        "drown",
+        "shore",
+    ),
+    "light": (
+        "illuminate",
+        "shadow",
+        "dark",
+        "bright",
+        "glow",
+        "shine",
+        "radiant",
+        "dim",
+        "light",
+        "luminous",
+    ),
+    "fire": (
+        "burn",
+        "flame",
+        "ignite",
+        "spark",
+        "blaze",
+        "smolder",
+        "kindle",
+        "ash",
+        "ember",
+    ),
+    "body": (
+        "heart",
+        "gut",
+        "bone",
+        "muscle",
+        "breath",
+        "blood",
+        "skin",
+        "nerve",
+        "spine",
+    ),
+}
+"""Keyword lists per metaphor domain used by :class:`VoicePatternExtractor`."""
+
+_TRANSITION_WORDS: tuple[str, ...] = (
+    "however",
+    "therefore",
+    "moreover",
+    "furthermore",
+    "nevertheless",
+    "consequently",
+    "meanwhile",
+    "similarly",
+    "additionally",
+    "alternatively",
+    "instead",
+    "otherwise",
+    "nonetheless",
+    "likewise",
+    "accordingly",
+    "hence",
+    "thus",
+    "besides",
+)
+
+_TRANSITION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (word, re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE))
+    for word in _TRANSITION_WORDS
+)
+"""Pre-compiled case-insensitive regexes for each transition word."""
+
+_SELF_DEPRECATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bi'?m\s+(?:probably|not\s+sure)", re.IGNORECASE),
+    re.compile(r"\bthis\s+is\s+probably\s+not", re.IGNORECASE),
+    re.compile(r"\bthis\s+might\s+be\s+silly", re.IGNORECASE),
+    re.compile(r"\bmaybe\s+i'?m\s+overthinking", re.IGNORECASE),
+)
+
+_PARADOX_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\band\s+yet\b", re.IGNORECASE),
+    re.compile(r"\bbut\s+also\b", re.IGNORECASE),
+    re.compile(r"\bat\s+the\s+same\s+time\b", re.IGNORECASE),
+    re.compile(r"\bparadox\b", re.IGNORECASE),
+)
+
+_CALLBACK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bas\s+i\s+mentioned", re.IGNORECASE),
+    re.compile(r"\bgoing\s+back\s+to\b", re.IGNORECASE),
+    re.compile(r"\breturning\s+to\b", re.IGNORECASE),
+    re.compile(r"\bas\s+we\s+discussed\b", re.IGNORECASE),
+    re.compile(r"\bearlier\s+i\s+said\b", re.IGNORECASE),
+    re.compile(r"\brecall\s+that\b", re.IGNORECASE),
+)
+
+_SENTENCE_SPLIT_RE: re.Pattern[str] = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z\"'\u201c])",
+)
+"""Split text into sentences on terminal punctuation followed by a capital.
+
+NOTE: Known limitation — abbreviations followed by a capitalised word
+(e.g. ``"Mr. Smith"``, ``"U.S. Senator"``) are split as if the period
+ended the sentence, slightly inflating ``total_sentences``. Acceptable
+for informal personal-journal prose; callers analysing formal or
+academic writing may want a dedicated tokenizer.
+"""
+
+_EM_DASH_RE: re.Pattern[str] = re.compile(r"\u2014|--")
+_ELLIPSIS_RE: re.Pattern[str] = re.compile(r"\.{3}|\u2026")
+_PARENTHETICAL_RE: re.Pattern[str] = re.compile(r"\([^)]+\)")
+_EXCLAMATION_RE: re.Pattern[str] = re.compile(r"!")
+
+_SHORT_SENTENCE_MAX: int = 9
+"""Sentences with at most this many words are classified as *short*."""
+
+_LONG_SENTENCE_MIN: int = 26
+"""Sentences with at least this many words are classified as *long*."""
+
+_FRAGMENT_MAX_WORDS: int = 3
+"""Sentences with at most this many words are counted as *fragments*."""
+
+_PER_THOUSAND: float = 1000.0
+"""Multiplier for per-1000-word frequency calculations."""
+
+_DEFAULT_TOP_DISTINCTIVE: int = 20
+"""Default number of distinctive words returned by vocabulary analysis."""
+
+_MIN_PHRASE_OCCURRENCES: int = 2
+"""Minimum occurrences for a bigram to count as a recurring phrase."""
+
+
+@dataclass(frozen=True)
+class SentenceMetrics:
+    """Sentence structure metrics extracted from voice exemplar texts.
+
+    Attributes:
+        average_length: Mean word count per sentence.
+        short_count: Sentences with at most 9 words.
+        medium_count: Sentences with 10-25 words.
+        long_count: Sentences with 26 or more words.
+        fragment_count: Very short sentences (≤3 words) used as
+            rhetorical fragments.
+        question_frequency: Fraction of sentences ending with ``?``.
+        total_sentences: Total number of sentences analysed.
+    """
+
+    average_length: float
+    short_count: int
+    medium_count: int
+    long_count: int
+    fragment_count: int
+    question_frequency: float
+    total_sentences: int
+
+
+@dataclass(frozen=True)
+class ParagraphMetrics:
+    """Paragraph structure metrics.
+
+    Attributes:
+        average_sentences_per_paragraph: Mean sentence count across
+            all paragraphs in the analysed texts.
+    """
+
+    average_sentences_per_paragraph: float
+
+
+@dataclass(frozen=True)
+class MetaphorFamily:
+    """A detected metaphor domain with matched keywords and examples.
+
+    Attributes:
+        domain: The metaphor domain name (e.g. ``"water"``).
+        matches: Keywords from the domain that were found in the text.
+        example_sentences: Representative sentences containing matches.
+    """
+
+    domain: str
+    matches: tuple[str, ...]
+    example_sentences: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RhetoricalMoves:
+    """Counts of detected rhetorical move patterns.
+
+    Attributes:
+        self_deprecation_count: Instances of self-deprecating hedges
+            before an insight.
+        paradox_count: Paradox or contradiction constructions.
+        callback_count: Explicit references back to earlier points.
+    """
+
+    self_deprecation_count: int
+    paradox_count: int
+    callback_count: int
+
+
+@dataclass(frozen=True)
+class Lexicon:
+    """Vocabulary fingerprint for a voice.
+
+    Attributes:
+        distinctive_words: High TF-IDF words relative to the corpus.
+        coined_terms: Words absent from the reference word set.
+        recurring_phrases: Bigrams appearing multiple times.
+    """
+
+    distinctive_words: tuple[str, ...]
+    coined_terms: tuple[str, ...]
+    recurring_phrases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PunctuationHabits:
+    """Punctuation usage frequencies (per 1 000 words).
+
+    Attributes:
+        em_dash_frequency: Em-dash (``—`` or ``--``) occurrences.
+        ellipsis_frequency: Ellipsis (``...`` or ``…``) occurrences.
+        parenthetical_frequency: Parenthetical aside occurrences.
+        exclamation_frequency: Exclamation mark occurrences.
+    """
+
+    em_dash_frequency: float
+    ellipsis_frequency: float
+    parenthetical_frequency: float
+    exclamation_frequency: float
+
+
+@dataclass(frozen=True)
+class VoicePatterns:
+    """All extracted voice patterns for a set of exemplar texts.
+
+    Attributes:
+        sentence_metrics: Sentence structure analysis.
+        paragraph_metrics: Paragraph structure analysis.
+        transitions: Detected transition words with counts, sorted by
+            descending frequency.
+        metaphor_families: Detected metaphor domains.
+        rhetorical_moves: Self-deprecation, paradox, and callback counts.
+        vocabulary: Vocabulary fingerprint (TF-IDF, coinages, phrases).
+        punctuation: Punctuation habit frequencies.
+    """
+
+    sentence_metrics: SentenceMetrics
+    paragraph_metrics: ParagraphMetrics
+    transitions: tuple[tuple[str, int], ...]
+    metaphor_families: tuple[MetaphorFamily, ...]
+    rhetorical_moves: RhetoricalMoves
+    vocabulary: Lexicon
+    punctuation: PunctuationHabits
+
+
+# ---- Sentence helpers ----
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split *text* into sentences using terminal-punctuation heuristics."""
+    stripped = text.strip()
+    if not stripped:
+        return []
+    parts = _SENTENCE_SPLIT_RE.split(stripped)
+    return [s.strip() for s in parts if s.strip()]
+
+
+def _count_words(text: str) -> int:
+    """Return the whitespace-delimited token count of *text*."""
+    return len(text.split())
+
+
+def _is_question(sentence: str) -> bool:
+    """Return whether *sentence* ends with a question mark."""
+    return sentence.rstrip().endswith("?")
+
+
+def _classify_length(word_count: int) -> str:
+    """Classify a sentence as ``'short'``, ``'medium'``, or ``'long'``."""
+    if word_count <= _SHORT_SENTENCE_MAX:
+        return "short"
+    if word_count >= _LONG_SENTENCE_MIN:
+        return "long"
+    return "medium"
+
+
+def _compute_sentence_metrics(all_sentences: list[str]) -> SentenceMetrics:
+    """Compute sentence-level metrics from a flat list of sentences."""
+    total = len(all_sentences)
+    if total == 0:
+        return SentenceMetrics(
+            average_length=0.0,
+            short_count=0,
+            medium_count=0,
+            long_count=0,
+            fragment_count=0,
+            question_frequency=0.0,
+            total_sentences=0,
+        )
+    lengths = [_count_words(s) for s in all_sentences]
+    avg = sum(lengths) / total
+    buckets = Counter(_classify_length(n) for n in lengths)
+    fragments = sum(1 for n in lengths if n <= _FRAGMENT_MAX_WORDS)
+    questions = sum(1 for s in all_sentences if _is_question(s))
+    return SentenceMetrics(
+        average_length=avg,
+        short_count=buckets.get("short", 0),
+        medium_count=buckets.get("medium", 0),
+        long_count=buckets.get("long", 0),
+        fragment_count=fragments,
+        question_frequency=questions / total,
+        total_sentences=total,
+    )
+
+
+# ---- Paragraph helpers ----
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    """Split *text* into paragraphs on double-newline boundaries."""
+    parts = re.split(r"\n\s*\n", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _compute_paragraph_metrics(texts: list[str]) -> ParagraphMetrics:
+    """Compute paragraph-level metrics across multiple texts."""
+    all_paragraphs: list[str] = []
+    for text in texts:
+        all_paragraphs.extend(_split_paragraphs(text))
+    if not all_paragraphs:
+        return ParagraphMetrics(average_sentences_per_paragraph=0.0)
+    counts = [len(_split_sentences(p)) for p in all_paragraphs]
+    avg = sum(counts) / len(counts)
+    return ParagraphMetrics(average_sentences_per_paragraph=avg)
+
+
+# ---- Transition helpers ----
+
+
+def _count_transitions(combined: str) -> tuple[tuple[str, int], ...]:
+    """Count transition word occurrences in *combined* text."""
+    found: list[tuple[str, int]] = []
+    for word, pattern in _TRANSITION_PATTERNS:
+        count = len(pattern.findall(combined))
+        if count > 0:
+            found.append((word, count))
+    return tuple(sorted(found, key=lambda t: (-t[1], t[0])))
+
+
+# ---- Rhetorical helpers ----
+
+
+def _count_pattern_matches(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+) -> int:
+    """Count total matches of *patterns* in *text*."""
+    return sum(len(p.findall(text)) for p in patterns)
+
+
+def _compute_rhetorical_moves(combined: str) -> RhetoricalMoves:
+    """Detect rhetorical move patterns in *combined* text."""
+    return RhetoricalMoves(
+        self_deprecation_count=_count_pattern_matches(
+            combined,
+            _SELF_DEPRECATION_PATTERNS,
+        ),
+        paradox_count=_count_pattern_matches(combined, _PARADOX_PATTERNS),
+        callback_count=_count_pattern_matches(combined, _CALLBACK_PATTERNS),
+    )
+
+
+# ---- Punctuation helpers ----
+
+
+def _frequency_per_thousand(count: int, total_words: int) -> float:
+    """Return *count* normalised to per-1000-word frequency."""
+    if total_words == 0:
+        return 0.0
+    return count / total_words * _PER_THOUSAND
+
+
+def _compute_punctuation(combined: str, total_words: int) -> PunctuationHabits:
+    """Quantify punctuation habits in *combined* text."""
+    return PunctuationHabits(
+        em_dash_frequency=_frequency_per_thousand(
+            len(_EM_DASH_RE.findall(combined)),
+            total_words,
+        ),
+        ellipsis_frequency=_frequency_per_thousand(
+            len(_ELLIPSIS_RE.findall(combined)),
+            total_words,
+        ),
+        parenthetical_frequency=_frequency_per_thousand(
+            len(_PARENTHETICAL_RE.findall(combined)),
+            total_words,
+        ),
+        exclamation_frequency=_frequency_per_thousand(
+            len(_EXCLAMATION_RE.findall(combined)),
+            total_words,
+        ),
+    )
+
+
+# ---- TF-IDF helpers ----
+
+
+def _tokenize_words(text: str) -> list[str]:
+    """Lowercase and extract alphabetic tokens from *text*."""
+    return [w.lower() for w in re.findall(r"[a-zA-Z]+", text)]
+
+
+def _compute_tfidf(documents: list[list[str]]) -> dict[str, float]:
+    """Compute TF-IDF scores across *documents* with smoothed IDF.
+
+    Each document is a list of lowercase tokens. Returns a mapping from
+    token to its aggregated TF-IDF score (summed across documents).
+
+    Uses the smoothed IDF formula ``log(1 + n_docs / (1 + doc_freq))`` so
+    that single-document corpora still produce non-zero, rank-preserving
+    scores. (The unsmoothed formula collapses to ``log(1) == 0`` when
+    ``n_docs == 1``.)
+
+    Args:
+        documents: Pre-tokenised document list.
+
+    Returns:
+        Token-to-score mapping, higher means more distinctive.
+    """
+    n_docs = len(documents)
+    if n_docs == 0:
+        return {}
+    doc_freq: Counter[str] = Counter()
+    for doc in documents:
+        doc_freq.update(set(doc))
+    scores: dict[str, float] = {}
+    for doc in documents:
+        tf_counts = Counter(doc)
+        doc_len = len(doc)
+        if doc_len == 0:
+            continue
+        for term, count in tf_counts.items():
+            tf = count / doc_len
+            idf = math.log(1 + n_docs / (1 + doc_freq[term]))
+            scores[term] = scores.get(term, 0.0) + tf * idf
+    return scores
+
+
+def _find_recurring_bigrams(
+    documents: list[list[str]],
+) -> tuple[str, ...]:
+    """Find bigrams appearing at least ``_MIN_PHRASE_OCCURRENCES`` times."""
+    bigram_counts: Counter[str] = Counter()
+    for doc in documents:
+        for i in range(len(doc) - 1):
+            bigram = f"{doc[i]} {doc[i + 1]}"
+            bigram_counts[bigram] += 1
+    return tuple(
+        bigram
+        for bigram, count in bigram_counts.most_common()
+        if count >= _MIN_PHRASE_OCCURRENCES
+    )
+
+
+# ---- VoicePatternExtractor ----
+
+
+class VoicePatternExtractor:
+    """Extract voice patterns from exemplar body texts.
+
+    Analyses sentence structure, paragraph structure, transition patterns,
+    metaphor families, rhetorical moves, vocabulary fingerprint, and
+    punctuation habits as specified in Section 11.1 of the Creek Ontology.
+
+    Attributes:
+        reference_words: Optional set of known English words. When
+            provided, words not in the set are flagged as coined terms.
+        top_n: Number of top distinctive words to include in the
+            vocabulary fingerprint.
+    """
+
+    def __init__(
+        self,
+        *,
+        reference_words: frozenset[str] | None = None,
+        top_n: int = _DEFAULT_TOP_DISTINCTIVE,
+    ) -> None:
+        """Initialise the pattern extractor.
+
+        Args:
+            reference_words: Optional set of known English words for
+                coined-term detection. When ``None``, coined terms
+                analysis returns an empty tuple.
+            top_n: Number of top TF-IDF words to return as distinctive.
+        """
+        self.reference_words = reference_words
+        self.top_n = top_n
+        # Pre-compute the lowercased reference set once; the English
+        # dictionary can contain hundreds of thousands of words and this
+        # avoids rebuilding it on every ``extract_vocabulary`` call.
+        self._lower_ref: frozenset[str] | None = (
+            frozenset(w.lower() for w in reference_words)
+            if reference_words is not None
+            else None
+        )
+
+    def extract_patterns(self, texts: list[str]) -> VoicePatterns:
+        """Extract all voice patterns from exemplar body texts.
+
+        Args:
+            texts: Body texts of voice exemplar fragments.
+
+        Returns:
+            A :class:`VoicePatterns` containing every extracted metric.
+        """
+        combined = "\n\n".join(texts)
+        all_sentences = self._gather_sentences(texts)
+        total_words = _count_words(combined)
+        return VoicePatterns(
+            sentence_metrics=_compute_sentence_metrics(all_sentences),
+            paragraph_metrics=_compute_paragraph_metrics(texts),
+            transitions=_count_transitions(combined),
+            metaphor_families=tuple(self.extract_metaphors(texts)),
+            rhetorical_moves=_compute_rhetorical_moves(combined),
+            vocabulary=self.extract_vocabulary(texts),
+            punctuation=_compute_punctuation(combined, total_words),
+        )
+
+    def extract_metaphors(self, texts: list[str]) -> list[MetaphorFamily]:
+        """Detect recurring metaphor families in *texts*.
+
+        Uses keyword lists from :data:`METAPHOR_DOMAINS` to identify
+        metaphor domains, then collects matching keywords and example
+        sentences for each detected domain.
+
+        Args:
+            texts: Body texts to scan for metaphor keywords.
+
+        Returns:
+            List of :class:`MetaphorFamily` for domains with at least
+            one keyword match. Empty list when no matches are found.
+        """
+        if not texts:
+            return []
+        all_sentences = self._gather_sentences(texts)
+        families: list[MetaphorFamily] = []
+        for domain, keywords in METAPHOR_DOMAINS.items():
+            result = self._scan_domain(domain, keywords, all_sentences)
+            if result is not None:
+                families.append(result)
+        return families
+
+    def extract_vocabulary(self, texts: list[str]) -> Lexicon:
+        """Generate a vocabulary fingerprint via TF-IDF analysis.
+
+        Args:
+            texts: Body texts to analyse.
+
+        Returns:
+            A :class:`Lexicon` with distinctive words, coined terms, and
+            recurring phrases.
+        """
+        if not texts:
+            return Lexicon(
+                distinctive_words=(),
+                coined_terms=(),
+                recurring_phrases=(),
+            )
+        documents = [_tokenize_words(t) for t in texts]
+        distinctive = self._top_distinctive(documents)
+        coined = self._detect_coined_terms(documents)
+        recurring = _find_recurring_bigrams(documents)
+        return Lexicon(
+            distinctive_words=distinctive,
+            coined_terms=coined,
+            recurring_phrases=recurring,
+        )
+
+    # ---- Private helpers ----
+
+    @staticmethod
+    def _gather_sentences(texts: list[str]) -> list[str]:
+        """Collect all sentences across multiple texts."""
+        sentences: list[str] = []
+        for text in texts:
+            sentences.extend(_split_sentences(text))
+        return sentences
+
+    @staticmethod
+    def _scan_domain(
+        domain: str,
+        keywords: tuple[str, ...],
+        sentences: list[str],
+    ) -> MetaphorFamily | None:
+        """Scan *sentences* for *keywords* and return a family if found."""
+        matched: set[str] = set()
+        examples: list[str] = []
+        for sentence in sentences:
+            lower = sentence.lower()
+            hits = [kw for kw in keywords if re.search(rf"\b{kw}\b", lower)]
+            if hits:
+                matched.update(hits)
+                examples.append(sentence)
+        if not matched:
+            return None
+        return MetaphorFamily(
+            domain=domain,
+            matches=tuple(sorted(matched)),
+            example_sentences=tuple(examples),
+        )
+
+    def _top_distinctive(
+        self,
+        documents: list[list[str]],
+    ) -> tuple[str, ...]:
+        """Return the top distinctive words by TF-IDF score."""
+        scores = _compute_tfidf(documents)
+        ranked = sorted(scores, key=lambda w: -scores[w])
+        return tuple(ranked[: self.top_n])
+
+    def _detect_coined_terms(
+        self,
+        documents: list[list[str]],
+    ) -> tuple[str, ...]:
+        """Find words absent from the reference word set."""
+        if self._lower_ref is None:
+            return ()
+        all_words = {w for doc in documents for w in doc}
+        coined = sorted(w for w in all_words if w not in self._lower_ref)
+        return tuple(coined)
+
+
 __all__ = [
     "DEFAULT_MAX_PER_REGISTER",
     "DEFAULT_MIN_PER_REGISTER",
+    "METAPHOR_DOMAINS",
     "VOICE_REGISTERS",
+    "Lexicon",
+    "MetaphorFamily",
+    "ParagraphMetrics",
+    "PunctuationHabits",
+    "RhetoricalMoves",
+    "SentenceMetrics",
     "VoiceExemplarCollector",
+    "VoicePatternExtractor",
+    "VoicePatterns",
 ]
