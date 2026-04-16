@@ -525,6 +525,12 @@ _TRANSITION_WORDS: tuple[str, ...] = (
     "besides",
 )
 
+_TRANSITION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (word, re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE))
+    for word in _TRANSITION_WORDS
+)
+"""Pre-compiled case-insensitive regexes for each transition word."""
+
 _SELF_DEPRECATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bi'?m\s+(?:probably|not\s+sure)", re.IGNORECASE),
     re.compile(r"\bthis\s+is\s+probably\s+not", re.IGNORECASE),
@@ -551,7 +557,14 @@ _CALLBACK_PATTERNS: tuple[re.Pattern[str], ...] = (
 _SENTENCE_SPLIT_RE: re.Pattern[str] = re.compile(
     r"(?<=[.!?])\s+(?=[A-Z\"'\u201c])",
 )
-"""Split text into sentences on terminal punctuation followed by a capital."""
+"""Split text into sentences on terminal punctuation followed by a capital.
+
+NOTE: Known limitation — abbreviations followed by a capitalised word
+(e.g. ``"Mr. Smith"``, ``"U.S. Senator"``) are split as if the period
+ended the sentence, slightly inflating ``total_sentences``. Acceptable
+for informal personal-journal prose; callers analysing formal or
+academic writing may want a dedicated tokenizer.
+"""
 
 _EM_DASH_RE: re.Pattern[str] = re.compile(r"\u2014|--")
 _ELLIPSIS_RE: re.Pattern[str] = re.compile(r"\.{3}|\u2026")
@@ -786,10 +799,9 @@ def _compute_paragraph_metrics(texts: list[str]) -> ParagraphMetrics:
 
 def _count_transitions(combined: str) -> tuple[tuple[str, int], ...]:
     """Count transition word occurrences in *combined* text."""
-    lower = combined.lower()
     found: list[tuple[str, int]] = []
-    for word in _TRANSITION_WORDS:
-        count = len(re.findall(rf"\b{re.escape(word)}\b", lower))
+    for word, pattern in _TRANSITION_PATTERNS:
+        count = len(pattern.findall(combined))
         if count > 0:
             found.append((word, count))
     return tuple(sorted(found, key=lambda t: (-t[1], t[0])))
@@ -859,10 +871,15 @@ def _tokenize_words(text: str) -> list[str]:
 
 
 def _compute_tfidf(documents: list[list[str]]) -> dict[str, float]:
-    """Compute TF-IDF scores across *documents*.
+    """Compute TF-IDF scores across *documents* with smoothed IDF.
 
     Each document is a list of lowercase tokens. Returns a mapping from
     token to its aggregated TF-IDF score (summed across documents).
+
+    Uses the smoothed IDF formula ``log(1 + n_docs / (1 + doc_freq))`` so
+    that single-document corpora still produce non-zero, rank-preserving
+    scores. (The unsmoothed formula collapses to ``log(1) == 0`` when
+    ``n_docs == 1``.)
 
     Args:
         documents: Pre-tokenised document list.
@@ -884,7 +901,7 @@ def _compute_tfidf(documents: list[list[str]]) -> dict[str, float]:
             continue
         for term, count in tf_counts.items():
             tf = count / doc_len
-            idf = math.log(n_docs / doc_freq[term])
+            idf = math.log(1 + n_docs / (1 + doc_freq[term]))
             scores[term] = scores.get(term, 0.0) + tf * idf
     return scores
 
@@ -938,6 +955,14 @@ class VoicePatternExtractor:
         """
         self.reference_words = reference_words
         self.top_n = top_n
+        # Pre-compute the lowercased reference set once; the English
+        # dictionary can contain hundreds of thousands of words and this
+        # avoids rebuilding it on every ``extract_vocabulary`` call.
+        self._lower_ref: frozenset[str] | None = (
+            frozenset(w.lower() for w in reference_words)
+            if reference_words is not None
+            else None
+        )
 
     def extract_patterns(self, texts: list[str]) -> VoicePatterns:
         """Extract all voice patterns from exemplar body texts.
@@ -1058,11 +1083,10 @@ class VoicePatternExtractor:
         documents: list[list[str]],
     ) -> tuple[str, ...]:
         """Find words absent from the reference word set."""
-        if self.reference_words is None:
+        if self._lower_ref is None:
             return ()
         all_words = {w for doc in documents for w in doc}
-        lower_ref = {w.lower() for w in self.reference_words}
-        coined = sorted(w for w in all_words if w not in lower_ref)
+        coined = sorted(w for w in all_words if w not in self._lower_ref)
         return tuple(coined)
 
 

@@ -413,6 +413,30 @@ class TestVocabulary:
         result = extractor.extract_vocabulary(texts)
         assert len(result.distinctive_words) > 0
 
+    def test_distinctive_words_single_document(
+        self,
+        extractor: VoicePatternExtractor,
+    ) -> None:
+        """Single-document corpus ranks distinctive words by frequency.
+
+        Without IDF smoothing, ``log(n_docs / doc_freq) == log(1/1) == 0``
+        for every term, so all TF-IDF scores collapse to zero and the
+        returned ordering reflects dict insertion order rather than
+        actual distinctiveness. This test exercises the smoothed branch.
+        """
+        # ``insight`` appears 3 times near the end; earlier words appear once.
+        result = extractor.extract_vocabulary(
+            [
+                "apple banana cherry date elderberry fig grape honeydew "
+                "iced jackfruit insight insight insight.",
+            ],
+        )
+        assert len(result.distinctive_words) > 0
+        # With smoothed IDF, ``insight`` (term frequency 3) ranks ahead of
+        # the single-occurrence tokens. Without smoothing it would not
+        # appear in the top three (it is 11th in insertion order).
+        assert "insight" in result.distinctive_words[:3]
+
     def test_recurring_phrases_detected(
         self,
         extractor: VoicePatternExtractor,
