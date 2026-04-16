@@ -226,6 +226,22 @@ def report(
         console.print(
             f"[bold green]Unnamed digest generated: {digest_path}[/bold green]",
         )
+    elif type == "voice":
+        from creek.generate.voice import VoiceProfileGenerator
+
+        profile_generator = VoiceProfileGenerator()
+        profile_paths = profile_generator.generate_all_profiles(vault_path)
+        if profile_paths:
+            names = ", ".join(path.stem for path in profile_paths)
+            console.print(
+                f"[bold green]Voice profiles generated ({len(profile_paths)}): "
+                f"{names}[/bold green]",
+            )
+        else:
+            console.print(
+                "[yellow]No voice profiles generated: "
+                "no qualifying exemplars found.[/yellow]",
+            )
     else:
         console.print(
             f"[bold green]Would report: type={type}, "

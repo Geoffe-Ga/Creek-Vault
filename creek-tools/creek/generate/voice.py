@@ -45,6 +45,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,33 @@ def _is_fully_classified(fragment: Fragment) -> bool:
 def _word_count(body: str) -> int:
     """Return the whitespace-delimited token count of *body*."""
     return len(body.split())
+
+
+def _eligible_register(
+    fragment: Fragment,
+    *,
+    allow_intimate: bool,
+) -> str | None:
+    """Return the fragment's register if it qualifies as an exemplar.
+
+    Args:
+        fragment: Candidate fragment.
+        allow_intimate: When ``False``, ``intimate`` privacy tier
+            fragments are rejected.
+
+    Returns:
+        The canonical register string when the fragment has qualifying
+        confidence, allowed privacy tier, and a canonical register;
+        otherwise ``None``.
+    """
+    if _confidence_value(fragment) not in _QUALIFYING_CONFIDENCE:
+        return None
+    if not allow_intimate and str(fragment.privacy_tier) == PrivacyTier.INTIMATE.value:
+        return None
+    register = _register_value(fragment)
+    if register not in VOICE_REGISTERS:
+        return None
+    return register
 
 
 def _load_fragment_with_body(
@@ -265,17 +293,7 @@ class VoiceExemplarCollector:
 
     def _eligible_register(self, fragment: Fragment) -> str | None:
         """Return the fragment's register if it qualifies, else ``None``."""
-        if _confidence_value(fragment) not in _QUALIFYING_CONFIDENCE:
-            return None
-        if (
-            not self.allow_intimate
-            and str(fragment.privacy_tier) == PrivacyTier.INTIMATE.value
-        ):
-            return None
-        register = _register_value(fragment)
-        if register not in VOICE_REGISTERS:
-            return None
-        return register
+        return _eligible_register(fragment, allow_intimate=self.allow_intimate)
 
     def _warn_below_minimum(self, buckets: dict[str, list[Fragment]]) -> None:
         """Emit a warning for registers with some but too few exemplars.
@@ -1090,11 +1108,505 @@ class VoicePatternExtractor:
         return tuple(coined)
 
 
+# ---------------------------------------------------------------------------
+# Voice register profile generation — Section 11.2
+# ---------------------------------------------------------------------------
+
+
+_PROFILE_SUBDIR: str = "07-Voice"
+"""Vault subdirectory where register profile notes are persisted."""
+
+_PROFILE_FILENAME_SUFFIX: str = "-profile.md"
+"""Filename suffix for register profile markdown files."""
+
+_DEFAULT_MAX_EXEMPLARS_PER_PROFILE: int = 10
+"""Default maximum number of exemplar passages included in a profile."""
+
+_DEFAULT_MIN_EXEMPLARS_PER_PROFILE: int = 5
+"""Registers below this threshold trigger a warning during profile generation."""
+
+_REGISTER_VOICE_DESCRIPTIONS: dict[str, str] = {
+    "confessional": (
+        "Write in a confessional register. Use first person. "
+        "Start from vulnerability and sensory detail, then arrive at insight. "
+        "Let paragraphs build from concrete experience to abstract reflection. "
+        "Favour em-dashes for asides."
+    ),
+    "analytical": (
+        "Write in an analytical register. Use precise, qualified claims "
+        "grounded in evidence. Move from observation to inference to "
+        "implication. Metaphors illustrate; they do not carry the argument."
+    ),
+    "playful": (
+        "Write in a playful register. Let wit carry the argument. "
+        "Puns, reversals, and small jokes are welcome. Irony underlines "
+        "sincerity rather than distancing from it."
+    ),
+    "prophetic": (
+        "Write in a prophetic register. Speak with declarative clarity. "
+        "Let each claim stand without apology. Cadence matters — "
+        "short lines have weight."
+    ),
+    "instructional": (
+        "Write in an instructional register. Lead the reader one step at a "
+        "time. Define every term on first use. Resolve each paragraph to "
+        "an actionable understanding."
+    ),
+    "raw": (
+        "Write in a raw register. Preserve the rough edges of the thought. "
+        "Let ideas arrive half-formed. Use fragments. Trust the reader to "
+        "fill the gaps."
+    ),
+    "conversational": (
+        "Write in a conversational register. Address the reader directly. "
+        "Use the second person when natural. Keep paragraphs short so the "
+        "exchange stays alive."
+    ),
+}
+"""Register-specific opening lines for the generated LLM voice prompts."""
+
+_REGISTER_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
+    "confessional": (
+        "Do not use corporate or management language.",
+        "Do not hedge with qualifiers like 'perhaps' or 'possibly'.",
+        "Do not structure thoughts as bullet points.",
+    ),
+    "analytical": (
+        "Do not assert emotion without evidence.",
+        "Do not adopt confessional first-person intimacy.",
+        "Do not issue prophetic pronouncements.",
+    ),
+    "playful": (
+        "Do not adopt formal academic solemnity.",
+        "Do not use jargon without winking at it.",
+        "Do not chain flat declarative sentences without variation.",
+    ),
+    "prophetic": (
+        "Do not hedge or qualify the vision.",
+        "Do not soften the claim with bureaucratic disclaimers.",
+        "Do not diminish the statement with self-deprecation.",
+    ),
+    "instructional": (
+        "Do not insert confessional asides that detour the reader.",
+        "Do not leave jargon undefined on first use.",
+        "Do not stop at metaphor without making the mechanism explicit.",
+    ),
+    "raw": (
+        "Do not polish the rough edges into smoothness.",
+        "Do not pre-empt the reader with explanatory framing.",
+        "Do not translate the moment into academic language.",
+    ),
+    "conversational": (
+        "Do not monologue without addressing the reader.",
+        "Do not use academic distance or formal register.",
+        "Do not bury the exchange under dense paragraphs.",
+    ),
+}
+"""Register-specific list of constraints the voice should never violate."""
+
+
+@dataclass(frozen=True)
+class Exemplar:
+    """A voice exemplar: a fragment's metadata paired with its body text.
+
+    :class:`VoiceProfileGenerator` consumes these to compose register
+    profiles. Bodies are kept separate from the :class:`Fragment` model
+    because Fragment only stores frontmatter; the body lives in the
+    markdown file alongside it.
+
+    Attributes:
+        fragment: The exemplar fragment's metadata.
+        body: The exemplar's prose body as stored on disk.
+    """
+
+    fragment: Fragment
+    body: str
+
+
+def _exemplar_score(exemplar: Exemplar) -> int:
+    """Return the ranking score for *exemplar*.
+
+    Mirrors :meth:`VoiceExemplarCollector._score` but reads word count
+    from the exemplar's body rather than a cached record: confidence
+    base (3 for conviction, 2 for settled), +1 bonus for a body in the
+    medium-length band [200, 800] words, and +1 bonus when every
+    classification axis is populated.
+    """
+    fragment = exemplar.fragment
+    score = _CONFIDENCE_SCORE.get(_confidence_value(fragment), 0)
+    word_count = _word_count(exemplar.body)
+    if _MEDIUM_LENGTH_MIN_WORDS <= word_count <= _MEDIUM_LENGTH_MAX_WORDS:
+        score += _LENGTH_BONUS
+    if _is_fully_classified(fragment):
+        score += _CLASSIFICATION_BONUS
+    return score
+
+
+@dataclass(frozen=True)
+class VoiceProfile:
+    """A per-register voice profile ready to be persisted as markdown.
+
+    Attributes:
+        register: The canonical voice register this profile describes.
+        exemplars: Tuple of 5-10 sample passages that exemplify the
+            register.
+        patterns: The :class:`VoicePatterns` extracted from the passages.
+        voice_prompt: A reusable LLM instruction block describing how to
+            write in this register.
+        anti_patterns: The register's "DO NOT" constraints.
+        generated_at: Timezone-aware timestamp of profile generation.
+    """
+
+    register: str
+    exemplars: tuple[str, ...]
+    patterns: VoicePatterns
+    voice_prompt: str
+    anti_patterns: tuple[str, ...]
+    generated_at: datetime
+
+    @property
+    def exemplar_count(self) -> int:
+        """Return the number of sample passages included in the profile."""
+        return len(self.exemplars)
+
+
+def _format_structural_patterns(patterns: VoicePatterns) -> list[str]:
+    """Render the structural pattern section as markdown bullet lines."""
+    sm = patterns.sentence_metrics
+    pm = patterns.paragraph_metrics
+    lines = [
+        f"- Average sentence length: {sm.average_length:.1f} words "
+        f"(short {sm.short_count} / medium {sm.medium_count} / "
+        f"long {sm.long_count}).",
+        f"- Sentence fragments used as rhetorical beats: {sm.fragment_count}.",
+        f"- Question frequency: {sm.question_frequency:.2f}.",
+        f"- Average sentences per paragraph: {pm.average_sentences_per_paragraph:.1f}.",
+    ]
+    if patterns.transitions:
+        top = ", ".join(word for word, _ in patterns.transitions[:5])
+        lines.append(f"- Preferred transitions: {top}.")
+    return lines
+
+
+def _format_metaphor_families(patterns: VoicePatterns) -> list[str]:
+    """Render the metaphor family section as markdown bullet lines."""
+    if not patterns.metaphor_families:
+        return ["- No recurring metaphor families detected."]
+    lines: list[str] = []
+    for family in patterns.metaphor_families:
+        matches = ", ".join(family.matches)
+        lines.append(f"- **{family.domain}**: {matches}.")
+    return lines
+
+
+def _format_rhetorical_moves(patterns: VoicePatterns) -> list[str]:
+    """Render the rhetorical moves section as markdown bullet lines."""
+    moves = patterns.rhetorical_moves
+    return [
+        f"- Self-deprecation before insight: {moves.self_deprecation_count}.",
+        f"- Paradox constructions: {moves.paradox_count}.",
+        f"- Callbacks to earlier points: {moves.callback_count}.",
+    ]
+
+
+def _build_voice_prompt(
+    register: str,
+    patterns: VoicePatterns,
+    anti_patterns: tuple[str, ...],
+) -> str:
+    """Construct the LLM-ready voice prompt for a register.
+
+    Args:
+        register: Canonical register name.
+        patterns: Extracted :class:`VoicePatterns` for this register.
+        anti_patterns: The register's DO NOT constraints.
+
+    Returns:
+        A multi-paragraph instruction block an LLM can follow to write
+        in this register.
+    """
+    lines: list[str] = [_REGISTER_VOICE_DESCRIPTIONS[register], ""]
+    if patterns.metaphor_families:
+        domains = ", ".join(f.domain for f in patterns.metaphor_families)
+        lines.append(f"Metaphors surface from: {domains}.")
+    moves = patterns.rhetorical_moves
+    if moves.paradox_count > 0:
+        lines.append("Use paradox constructions to hold tension without resolving it.")
+    if moves.callback_count > 0:
+        lines.append("Call back to earlier points to build narrative continuity.")
+    if moves.self_deprecation_count > 0:
+        lines.append(
+            "Allow brief self-deprecation before arriving at an insight.",
+        )
+    if patterns.vocabulary.recurring_phrases:
+        phrases = ", ".join(patterns.vocabulary.recurring_phrases[:3])
+        lines.append(f"Lean on recurring phrases such as: {phrases}.")
+    lines.extend(("", f"NEVER: {' '.join(anti_patterns)}"))
+    return "\n".join(lines)
+
+
+class VoiceProfileGenerator:
+    """Compose per-register voice profiles from exemplars and patterns.
+
+    The generator realises Section 11.2 of the Creek Ontology: for each
+    voice register, produce a profile note combining 5-10 exemplar
+    passages, the extracted :class:`VoicePatterns`, a reusable LLM voice
+    prompt, and register-specific anti-patterns.
+
+    Attributes:
+        max_exemplars: Upper bound on exemplars retained per profile.
+        min_exemplars: Threshold below which a warning is logged.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_exemplars: int = _DEFAULT_MAX_EXEMPLARS_PER_PROFILE,
+        min_exemplars: int = _DEFAULT_MIN_EXEMPLARS_PER_PROFILE,
+        collector: VoiceExemplarCollector | None = None,
+        extractor: VoicePatternExtractor | None = None,
+    ) -> None:
+        """Initialise the generator.
+
+        Args:
+            max_exemplars: Upper bound on exemplars per profile. Must be
+                at least 1.
+            min_exemplars: Lower bound below which a warning is logged.
+                Must be at least 1 and no greater than ``max_exemplars``.
+            collector: Optional :class:`VoiceExemplarCollector` used by
+                :meth:`generate_all_profiles`. Defaults to a collector
+                configured with the same exemplar bounds.
+            extractor: Optional :class:`VoicePatternExtractor` used by
+                :meth:`generate_all_profiles`. Defaults to a plain
+                extractor.
+
+        Raises:
+            ValueError: If either bound is less than 1, or if
+                ``min_exemplars`` exceeds ``max_exemplars``.
+        """
+        if max_exemplars < 1:
+            msg = f"max_exemplars must be >= 1, got {max_exemplars}"
+            raise ValueError(msg)
+        if min_exemplars < 1:
+            msg = f"min_exemplars must be >= 1, got {min_exemplars}"
+            raise ValueError(msg)
+        if min_exemplars > max_exemplars:
+            msg = f"min_exemplars ({min_exemplars}) > max_exemplars ({max_exemplars})"
+            raise ValueError(msg)
+        self.max_exemplars = max_exemplars
+        self.min_exemplars = min_exemplars
+        self._collector = collector or VoiceExemplarCollector(
+            max_per_register=max_exemplars,
+            min_per_register=min_exemplars,
+        )
+        self._extractor = extractor or VoicePatternExtractor()
+
+    def generate_profile(
+        self,
+        register: str,
+        exemplars: Sequence[Exemplar],
+        patterns: VoicePatterns,
+    ) -> VoiceProfile:
+        """Compose a :class:`VoiceProfile` from exemplars and patterns.
+
+        Passages are taken from the first :attr:`max_exemplars` entries
+        of *exemplars* so callers can pre-rank before invoking. The
+        generated voice prompt is register-specific and incorporates
+        detected metaphor families and rhetorical moves. Registers with
+        fewer than :attr:`min_exemplars` samples log a warning but still
+        produce a profile.
+
+        Args:
+            register: One of the seven canonical voice registers.
+            exemplars: Ordered sequence of exemplars; the top
+                :attr:`max_exemplars` are retained.
+            patterns: :class:`VoicePatterns` extracted from the
+                exemplars' bodies.
+
+        Returns:
+            A fully populated :class:`VoiceProfile`.
+
+        Raises:
+            ValueError: If *register* is not one of the seven canonical
+                voice registers, or if *exemplars* is empty.
+        """
+        if register not in VOICE_REGISTERS:
+            msg = f"Unknown voice register: {register!r}"
+            raise ValueError(msg)
+        if not exemplars:
+            msg = f"Cannot generate profile for {register!r}: exemplars is empty"
+            raise ValueError(msg)
+        selected = list(exemplars)[: self.max_exemplars]
+        if len(selected) < self.min_exemplars:
+            logger.warning(
+                "Voice register %r has only %d exemplar(s) for profile (minimum %d).",
+                register,
+                len(selected),
+                self.min_exemplars,
+            )
+        anti_patterns = _REGISTER_ANTI_PATTERNS[register]
+        voice_prompt = _build_voice_prompt(register, patterns, anti_patterns)
+        return VoiceProfile(
+            register=register,
+            exemplars=tuple(e.body for e in selected),
+            patterns=patterns,
+            voice_prompt=voice_prompt,
+            anti_patterns=anti_patterns,
+            generated_at=datetime.now(tz=UTC),
+        )
+
+    def write_profile(
+        self,
+        profile: VoiceProfile,
+        vault_path: Path,
+    ) -> Path:
+        """Persist *profile* to ``07-Voice/<register>-profile.md``.
+
+        The output follows the Section 11.2 template with the required
+        markdown headings and a YAML frontmatter block capturing the
+        profile metadata.
+
+        Args:
+            profile: The profile to write.
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            Absolute path of the written markdown file.
+
+        Raises:
+            ValueError: If ``profile.register`` is not one of the seven
+                canonical voice registers. :class:`VoiceProfile` is a
+                public dataclass, so this guard prevents path traversal
+                when a caller constructs a profile directly.
+        """
+        if profile.register not in VOICE_REGISTERS:
+            msg = f"Unknown voice register on profile: {profile.register!r}"
+            raise ValueError(msg)
+        profile_dir = vault_path / _PROFILE_SUBDIR
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        target = profile_dir / f"{profile.register}{_PROFILE_FILENAME_SUFFIX}"
+        body = self._render_profile_body(profile)
+        post = frontmatter.Post(
+            content=body,
+            type="voice_profile",
+            register=profile.register,
+            exemplar_count=profile.exemplar_count,
+            generated_date=profile.generated_at.isoformat(),
+            tags=["voice", "voice-profile", profile.register],
+        )
+        target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return target
+
+    def generate_all_profiles(self, vault_path: Path) -> list[Path]:
+        """Generate profile notes for every register with exemplars.
+
+        Scans ``01-Fragments/`` for qualifying exemplars, groups them by
+        register, extracts patterns from each register's bodies, and
+        writes a profile per non-empty register.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            List of paths written, one per register with exemplars.
+        """
+        grouped = self._collect_exemplars_with_bodies(vault_path)
+        written: list[Path] = []
+        for register in VOICE_REGISTERS:
+            register_exemplars = grouped.get(register, [])
+            if not register_exemplars:
+                continue
+            ranked = self._rank_exemplars(register_exemplars)
+            bodies = [e.body for e in ranked]
+            patterns = self._extractor.extract_patterns(bodies)
+            profile = self.generate_profile(register, ranked, patterns)
+            written.append(self.write_profile(profile, vault_path))
+        return written
+
+    # ---- Private helpers ----
+
+    def _collect_exemplars_with_bodies(
+        self,
+        vault_path: Path,
+    ) -> dict[str, list[Exemplar]]:
+        """Scan ``01-Fragments/`` for qualifying exemplars with body text."""
+        buckets: dict[str, list[Exemplar]] = {
+            register: [] for register in VOICE_REGISTERS
+        }
+        fragments_dir = vault_path / _FRAGMENTS_SUBDIR
+        if not fragments_dir.is_dir():
+            return buckets
+        for md_file in sorted(fragments_dir.rglob("*.md")):
+            loaded = _load_fragment_with_body(md_file)
+            if loaded is None:
+                continue
+            fragment, body = loaded
+            register = _eligible_register(
+                fragment,
+                allow_intimate=self._collector.allow_intimate,
+            )
+            if register is None:
+                continue
+            buckets[register].append(Exemplar(fragment=fragment, body=body))
+        return buckets
+
+    def _rank_exemplars(self, exemplars: list[Exemplar]) -> list[Exemplar]:
+        """Rank *exemplars* by the same quality heuristic as the collector.
+
+        Scoring mirrors :meth:`VoiceExemplarCollector.rank_exemplars` but
+        operates on :class:`Exemplar` values, avoiding coupling to the
+        collector's internal cache. Ties are broken by ascending
+        fragment id for deterministic ordering.
+
+        Returns:
+            Up to :attr:`max_exemplars` exemplars, sorted by descending
+            score.
+        """
+        scored = sorted(
+            exemplars,
+            key=lambda e: (-_exemplar_score(e), e.fragment.id),
+        )
+        return scored[: self.max_exemplars]
+
+    @staticmethod
+    def _render_profile_body(profile: VoiceProfile) -> str:
+        """Render the markdown body of a voice profile note."""
+        lines: list[str] = [
+            f"# Voice Proxy: {profile.register.title()}",
+            "",
+            "## Prompt for LLM",
+            "",
+            profile.voice_prompt,
+            "",
+            "### Structural Patterns",
+            "",
+            *_format_structural_patterns(profile.patterns),
+            "",
+            "### Metaphor Families",
+            "",
+            *_format_metaphor_families(profile.patterns),
+            "",
+            "### Rhetorical Moves",
+            "",
+            *_format_rhetorical_moves(profile.patterns),
+            "",
+            "### Sample Passages",
+            "",
+        ]
+        for index, passage in enumerate(profile.exemplars, start=1):
+            lines.extend((f"{index}. {passage}", ""))
+        lines.extend(("### Anti-Patterns (DO NOT)", ""))
+        lines.extend(f"- {pattern}" for pattern in profile.anti_patterns)
+        lines.append("")
+        return "\n".join(lines)
+
+
 __all__ = [
     "DEFAULT_MAX_PER_REGISTER",
     "DEFAULT_MIN_PER_REGISTER",
     "METAPHOR_DOMAINS",
     "VOICE_REGISTERS",
+    "Exemplar",
     "Lexicon",
     "MetaphorFamily",
     "ParagraphMetrics",
@@ -1104,4 +1616,6 @@ __all__ = [
     "VoiceExemplarCollector",
     "VoicePatternExtractor",
     "VoicePatterns",
+    "VoiceProfile",
+    "VoiceProfileGenerator",
 ]
