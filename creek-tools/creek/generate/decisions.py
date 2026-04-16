@@ -87,21 +87,22 @@ def _sanitize_title(title: str) -> str:
     return cleaned[:80]
 
 
-def _build_frequency_context(fragment: Fragment) -> list[str]:
+def _build_frequency_context(fragment: Fragment) -> list[Frequency]:
     """Extract all frequency values from a fragment.
 
     Args:
         fragment: The source fragment.
 
     Returns:
-        List of frequency code strings (e.g. ``["F1", "F5"]``).
+        List of ``Frequency`` enum values (e.g. ``[Frequency.F1, Frequency.F5]``),
+        excluding the ``UNCLASSIFIED`` primary.
     """
-    freqs: list[str] = []
-    primary = str(fragment.frequency.primary)
-    if primary != "unclassified":
+    freqs: list[Frequency] = []
+    primary = Frequency(fragment.frequency.primary)
+    if primary != Frequency.UNCLASSIFIED:
         freqs.append(primary)
     for sec in fragment.frequency.secondary:
-        freqs.append(str(sec))
+        freqs.append(Frequency(sec))
     return freqs
 
 
