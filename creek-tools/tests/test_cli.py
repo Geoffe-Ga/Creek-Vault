@@ -216,6 +216,64 @@ def test_report_unnamed_command(tmp_path: Path) -> None:
     assert (vault / "10-Liminal" / "Unnamed" / "Digests").is_dir()
 
 
+def test_report_voice_command(tmp_path: Path) -> None:
+    """Test that report --type voice generates register profiles."""
+    from datetime import UTC, datetime
+
+    import frontmatter
+
+    from creek.models import (
+        Confidence,
+        Fragment,
+        FragmentSource,
+        Frequency,
+        FrequencyClassification,
+        Mode,
+        Phase,
+        PrivacyTier,
+        SourcePlatform,
+        VoiceClassification,
+        VoiceRegister,
+        WavelengthClassification,
+    )
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments" / "Journal").mkdir(parents=True, exist_ok=True)
+    (vault / "07-Voice").mkdir(parents=True, exist_ok=True)
+
+    for i in range(5):
+        fragment = Fragment(
+            id=f"frag-{i}",
+            title=f"Fragment {i}",
+            source=FragmentSource(platform=SourcePlatform.JOURNAL),
+            created=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
+            ingested=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
+            frequency=FrequencyClassification(primary=Frequency.F5),
+            wavelength=WavelengthClassification(
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.CONFESSIONAL,
+                confidence=Confidence.CONVICTION,
+            ),
+            privacy_tier=PrivacyTier.PERSONAL,
+        )
+        body = "The creek of thought flows gently downstream. " * 20
+        data = fragment.model_dump(mode="json")
+        post = frontmatter.Post(content=body, **data)
+        target = vault / "01-Fragments" / "Journal" / f"{fragment.id}.md"
+        target.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "voice", "--vault", str(vault)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Voice profile" in result.output or "voice profile" in result.output
+    assert (vault / "07-Voice" / "confessional-profile.md").is_file()
+
+
 def test_report_command() -> None:
     """Test that report command runs with required args."""
     result = runner.invoke(
