@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 from pydantic import ValidationError
 
 from creek.models import (
@@ -139,7 +140,7 @@ def _load_fragment_with_body(
     """
     try:
         post = frontmatter.load(str(md_file))
-    except (OSError, ValueError):
+    except (OSError, ValueError, yaml.YAMLError):
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
     metadata = dict(post.metadata)
@@ -191,13 +192,20 @@ class VoiceExemplarCollector:
 
         Raises:
             ValueError: If ``max_per_register`` or ``min_per_register``
-                is less than 1.
+                is less than 1, or if ``min_per_register`` exceeds
+                ``max_per_register``.
         """
         if max_per_register < 1:
             msg = f"max_per_register must be >= 1, got {max_per_register}"
             raise ValueError(msg)
         if min_per_register < 1:
             msg = f"min_per_register must be >= 1, got {min_per_register}"
+            raise ValueError(msg)
+        if min_per_register > max_per_register:
+            msg = (
+                f"min_per_register ({min_per_register}) "
+                f"> max_per_register ({max_per_register})"
+            )
             raise ValueError(msg)
         self.max_per_register = max_per_register
         self.min_per_register = min_per_register
@@ -261,9 +269,13 @@ class VoiceExemplarCollector:
         return register
 
     def _warn_below_minimum(self, buckets: dict[str, list[Fragment]]) -> None:
-        """Emit a warning for any register short of :attr:`min_per_register`."""
+        """Emit a warning for registers with some but too few exemplars.
+
+        Registers with zero exemplars are silently skipped — a warning
+        is only useful when a register *has* data but not enough.
+        """
         for register, frags in buckets.items():
-            if len(frags) < self.min_per_register:
+            if 0 < len(frags) < self.min_per_register:
                 logger.warning(
                     "Voice register %r has only %d exemplars (minimum %d).",
                     register,
@@ -285,7 +297,7 @@ class VoiceExemplarCollector:
         - All classification axes populated (frequency, wavelength
           phase / mode, voice register, voice confidence): +1 point.
 
-        Ties are broken by descending ID for deterministic ordering.
+        Ties are broken by ascending ID for deterministic ordering.
 
         Args:
             fragments: Fragments to rank. May be empty.
@@ -327,6 +339,10 @@ class VoiceExemplarCollector:
         folder, copies (or rewrites) up to :attr:`max_per_register` of
         the top-ranked fragments, and writes a ``_Summary.md`` note
         recording statistics about the cohort.
+
+        Fragments in each register bucket are ranked internally via
+        :meth:`rank_exemplars` before being persisted — callers do not
+        need to pre-rank.
 
         Args:
             exemplars: Mapping of register → fragments, typically the

@@ -399,7 +399,7 @@ class TestRankExemplars:
             )
             _write_fragment(vault, frag, body_words=400)
             fragments.append(frag)
-        small = VoiceExemplarCollector(max_per_register=3)
+        small = VoiceExemplarCollector(max_per_register=3, min_per_register=1)
         small.collect_exemplars(vault)
         ranked = small.rank_exemplars(fragments)
         assert len(ranked) == 3
@@ -509,7 +509,7 @@ class TestSaveExemplars:
                 confidence=Confidence.SETTLED,
             )
             _write_fragment(vault, frag, body_words=400)
-        small = VoiceExemplarCollector(max_per_register=2)
+        small = VoiceExemplarCollector(max_per_register=2, min_per_register=1)
         exemplars = small.collect_exemplars(vault)
         small.save_exemplars(exemplars, vault)
         register_dir = vault / "07-Voice" / "Register-Samples" / "raw"
@@ -591,6 +591,11 @@ class TestInitValidation:
         """Passing a non-positive ``min_per_register`` raises ``ValueError``."""
         with pytest.raises(ValueError, match="min_per_register"):
             VoiceExemplarCollector(min_per_register=0)
+
+    def test_min_greater_than_max_raises(self) -> None:
+        """``min_per_register > max_per_register`` raises ``ValueError``."""
+        with pytest.raises(ValueError, match=r"min_per_register.*> max_per_register"):
+            VoiceExemplarCollector(min_per_register=20, max_per_register=5)
 
 
 # ---- Classification completeness branches ----
@@ -727,3 +732,119 @@ class TestSaveFallback:
         target = vault / "07-Voice" / "Register-Samples" / "analytical" / "frag-gone.md"
         assert target.exists()
         assert "analytical" in result
+
+    def test_fallback_serialisation_produces_valid_frontmatter(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """In-memory fallback must produce a parseable frontmatter document."""
+        frag = _build_fragment(
+            frag_id="frag-mem2",
+            title="In-memory fragment",
+            register=VoiceRegister.PLAYFUL,
+            confidence=Confidence.SETTLED,
+        )
+        collector.save_exemplars({"playful": [frag]}, vault)
+        target = vault / "07-Voice" / "Register-Samples" / "playful" / "frag-mem2.md"
+        post = frontmatter.load(str(target))
+        assert post["type"] == "fragment"
+        assert post["id"] == "frag-mem2"
+        assert post["title"] == "In-memory fragment"
+
+
+# ---- Tie-breaking ----
+
+
+class TestTieBreaking:
+    """Deterministic ordering when fragments have equal scores."""
+
+    def test_equal_score_ordered_by_ascending_id(
+        self,
+        vault: Path,
+    ) -> None:
+        """Fragments with identical scores are ordered by ascending ID."""
+        collector = VoiceExemplarCollector(max_per_register=10)
+        frag_z = _build_fragment(
+            frag_id="frag-zzz",
+            title="Z fragment",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.SETTLED,
+        )
+        frag_a = _build_fragment(
+            frag_id="frag-aaa",
+            title="A fragment",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.SETTLED,
+        )
+        _write_fragment(vault, frag_z, body_words=400)
+        _write_fragment(vault, frag_a, body_words=400)
+        collector.collect_exemplars(vault)
+        ranked = collector.rank_exemplars([frag_z, frag_a])
+        assert [f.id for f in ranked] == ["frag-aaa", "frag-zzz"]
+
+
+# ---- YAML error resilience ----
+
+
+class TestYamlErrorResilience:
+    """Malformed YAML must not abort the vault scan."""
+
+    def test_skips_broken_yaml_frontmatter(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """Files with syntactically invalid YAML are silently skipped."""
+        broken = vault / "01-Fragments" / "Journal" / "bad-yaml.md"
+        broken.write_text(
+            "---\nkey: [\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        good = _build_fragment(
+            frag_id="frag-yaml-ok",
+            title="Good YAML",
+            register=VoiceRegister.RAW,
+            confidence=Confidence.SETTLED,
+        )
+        _write_fragment(vault, good, body_words=400)
+        exemplars = collector.collect_exemplars(vault)
+        assert [f.id for f in exemplars["raw"]] == ["frag-yaml-ok"]
+
+
+# ---- Warning suppression for empty registers ----
+
+
+class TestWarningBehavior:
+    """Warning logic for registers below minimum threshold."""
+
+    def test_no_warnings_for_empty_registers(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Registers with zero exemplars must not emit warnings."""
+        with caplog.at_level(logging.WARNING, logger="creek.generate.voice"):
+            collector.collect_exemplars(vault)
+        assert caplog.records == []
+
+    def test_warns_when_register_has_some_but_below_minimum(
+        self,
+        vault: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Registers with 1..min-1 exemplars emit a warning."""
+        collector = VoiceExemplarCollector(min_per_register=3)
+        for idx in range(2):
+            frag = _build_fragment(
+                frag_id=f"frag-warn-{idx}",
+                title=f"Warn frag {idx}",
+                register=VoiceRegister.PLAYFUL,
+                confidence=Confidence.SETTLED,
+            )
+            _write_fragment(vault, frag, body_words=400)
+        with caplog.at_level(logging.WARNING, logger="creek.generate.voice"):
+            collector.collect_exemplars(vault)
+        playful_warnings = [r for r in caplog.records if "playful" in r.message]
+        assert len(playful_warnings) == 1
