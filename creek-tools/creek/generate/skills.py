@@ -820,73 +820,98 @@ class SkillTreeGenerator:
         self,
         vault_path: Path,
         output_dir: Path,
+        snapshot: VaultSnapshot | None = None,
     ) -> list[Path]:
-        """Generate one SKILL.md per APTITUDE frequency (F1-F10)."""
-        snapshot = _load_vault_snapshot(
-            vault_path,
-            allow_intimate=self.allow_intimate,
-        )
-        return self._generate_frequency_skills(snapshot, output_dir)
+        """Generate one SKILL.md per APTITUDE frequency (F1-F10).
+
+        Pass a pre-loaded *snapshot* to skip the vault scan when this method
+        is invoked alongside other per-category generators.
+        """
+        resolved = self._resolve_snapshot(vault_path, snapshot)
+        return self._generate_frequency_skills(resolved, output_dir)
 
     def generate_phase_skills(
         self,
         vault_path: Path,
         output_dir: Path,
+        snapshot: VaultSnapshot | None = None,
     ) -> list[Path]:
-        """Generate one SKILL.md per Archetypal Wavelength phase."""
-        snapshot = _load_vault_snapshot(
-            vault_path,
-            allow_intimate=self.allow_intimate,
-        )
-        return self._generate_phase_skills(snapshot, output_dir)
+        """Generate one SKILL.md per Archetypal Wavelength phase.
+
+        Pass a pre-loaded *snapshot* to skip the vault scan when this method
+        is invoked alongside other per-category generators.
+        """
+        resolved = self._resolve_snapshot(vault_path, snapshot)
+        return self._generate_phase_skills(resolved, output_dir)
 
     def generate_mode_skills(
         self,
         vault_path: Path,
         output_dir: Path,
+        snapshot: VaultSnapshot | None = None,
     ) -> list[Path]:
-        """Generate one SKILL.md per Mode/Orientation pair (nine total)."""
-        snapshot = _load_vault_snapshot(
-            vault_path,
-            allow_intimate=self.allow_intimate,
-        )
-        return self._generate_mode_skills(snapshot, output_dir)
+        """Generate one SKILL.md per Mode/Orientation pair (nine total).
+
+        Pass a pre-loaded *snapshot* to skip the vault scan when this method
+        is invoked alongside other per-category generators.
+        """
+        resolved = self._resolve_snapshot(vault_path, snapshot)
+        return self._generate_mode_skills(resolved, output_dir)
 
     def generate_register_skills(
         self,
         vault_path: Path,
         output_dir: Path,
+        snapshot: VaultSnapshot | None = None,
     ) -> list[Path]:
-        """Generate one SKILL.md per voice register (seven total)."""
-        snapshot = _load_vault_snapshot(
-            vault_path,
-            allow_intimate=self.allow_intimate,
-        )
-        return self._generate_register_skills(snapshot, output_dir)
+        """Generate one SKILL.md per voice register (seven total).
+
+        Pass a pre-loaded *snapshot* to skip the vault scan when this method
+        is invoked alongside other per-category generators.
+        """
+        resolved = self._resolve_snapshot(vault_path, snapshot)
+        return self._generate_register_skills(resolved, output_dir)
 
     def generate_thread_skills(
         self,
         vault_path: Path,
         output_dir: Path,
+        snapshot: VaultSnapshot | None = None,
     ) -> list[Path]:
-        """Generate one SKILL.md per qualifying thread."""
-        snapshot = _load_vault_snapshot(
-            vault_path,
-            allow_intimate=self.allow_intimate,
-        )
-        return self._generate_thread_skills(snapshot, output_dir)
+        """Generate one SKILL.md per qualifying thread.
+
+        Pass a pre-loaded *snapshot* to skip the vault scan when this method
+        is invoked alongside other per-category generators.
+        """
+        resolved = self._resolve_snapshot(vault_path, snapshot)
+        return self._generate_thread_skills(resolved, output_dir)
 
     def generate_eddy_skills(
         self,
         vault_path: Path,
         output_dir: Path,
+        snapshot: VaultSnapshot | None = None,
     ) -> list[Path]:
-        """Generate one SKILL.md per qualifying eddy."""
-        snapshot = _load_vault_snapshot(
+        """Generate one SKILL.md per qualifying eddy.
+
+        Pass a pre-loaded *snapshot* to skip the vault scan when this method
+        is invoked alongside other per-category generators.
+        """
+        resolved = self._resolve_snapshot(vault_path, snapshot)
+        return self._generate_eddy_skills(resolved, output_dir)
+
+    def _resolve_snapshot(
+        self,
+        vault_path: Path,
+        snapshot: VaultSnapshot | None,
+    ) -> VaultSnapshot:
+        """Return *snapshot* if provided, else scan *vault_path* once."""
+        if snapshot is not None:
+            return snapshot
+        return _load_vault_snapshot(
             vault_path,
             allow_intimate=self.allow_intimate,
         )
-        return self._generate_eddy_skills(snapshot, output_dir)
 
     def generate_meta_skills(self, output_dir: Path) -> list[Path]:
         """Generate the two meta skills (voice-core and activation guide).

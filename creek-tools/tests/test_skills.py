@@ -25,6 +25,7 @@ from creek.generate.skills import (
     REGISTER_KEYS,
     SkillExemplar,
     SkillTreeGenerator,
+    VaultSnapshot,
     _build_exemplar,
     _extract_passage,
     _load_fragment,
@@ -648,6 +649,144 @@ class TestGenerateAll:
         assert "threads" in categories
         assert "eddies" in categories
         assert len(paths) == 34 + 2
+
+
+# ---- Optional snapshot parameter ----
+
+
+class TestOptionalSnapshot:
+    """Public per-category methods accept a pre-loaded ``VaultSnapshot``."""
+
+    def test_frequency_skills_accepts_preloaded_snapshot(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Passing a snapshot should skip the vault scan and still render."""
+        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        paths = generator.generate_frequency_skills(
+            vault,
+            output_dir,
+            snapshot=snapshot,
+        )
+        assert len(paths) == 10
+
+    def test_phase_skills_accepts_preloaded_snapshot(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Phase skills accept a pre-loaded snapshot."""
+        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        paths = generator.generate_phase_skills(
+            vault,
+            output_dir,
+            snapshot=snapshot,
+        )
+        assert len(paths) == 6
+
+    def test_mode_skills_accepts_preloaded_snapshot(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Mode skills accept a pre-loaded snapshot."""
+        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        paths = generator.generate_mode_skills(
+            vault,
+            output_dir,
+            snapshot=snapshot,
+        )
+        assert len(paths) == 9
+
+    def test_register_skills_accepts_preloaded_snapshot(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Register skills accept a pre-loaded snapshot."""
+        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        paths = generator.generate_register_skills(
+            vault,
+            output_dir,
+            snapshot=snapshot,
+        )
+        assert len(paths) == 7
+
+    def test_thread_skills_accepts_preloaded_snapshot(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Thread skills accept a pre-loaded snapshot."""
+        _write_thread(
+            vault,
+            Thread(
+                id="thread-snap",
+                title="Snapshot Thread",
+                status=ThreadStatus.ACTIVE,
+                fragment_count=20,
+                description="Many fragments.",
+            ),
+        )
+        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        paths = generator.generate_thread_skills(
+            vault,
+            output_dir,
+            snapshot=snapshot,
+        )
+        assert len(paths) == 1
+
+    def test_eddy_skills_accepts_preloaded_snapshot(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Eddy skills accept a pre-loaded snapshot."""
+        _write_eddy(
+            vault,
+            Eddy(
+                id="eddy-snap",
+                title="Snapshot Eddy",
+                fragment_count=20,
+                threads=[],
+                description="Many fragments.",
+            ),
+        )
+        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        paths = generator.generate_eddy_skills(
+            vault,
+            output_dir,
+            snapshot=snapshot,
+        )
+        assert len(paths) == 1
+
+    def test_snapshot_skips_vault_scan(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """When snapshot is provided, ``vault_path`` is not re-read."""
+        empty_snapshot = VaultSnapshot(fragments=(), threads=(), eddies=())
+        fragment = _build_fragment(
+            frag_id="frag-should-be-ignored",
+            title="Should Not Appear",
+        )
+        _write_fragment(vault, fragment, _make_passage(3))
+        generator.generate_frequency_skills(
+            vault,
+            output_dir,
+            snapshot=empty_snapshot,
+        )
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "Should Not Appear" not in body
 
 
 # ---- Privacy enforcement ----
