@@ -587,7 +587,7 @@ def _extract_passage(body: str) -> str | None:
     word_count = 0
     for sentence in sentences:
         words = sentence.split()
-        if word_count + len(words) > _EXEMPLAR_WORDS_MAX and buf:
+        if word_count + len(words) > _EXEMPLAR_WORDS_MAX:
             break
         buf.append(sentence)
         word_count += len(words)
@@ -614,9 +614,19 @@ def _build_exemplar(
 
 
 def _slugify(text: str) -> str:
-    """Convert *text* to a filesystem-safe slug."""
+    """Convert *text* to a filesystem-safe slug.
+
+    Returns ``"untitled"`` when *text* has no alphanumeric content.
+    """
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug or "untitled"
+
+
+def _unique_slug(base: str, fallback_id: str, used: set[str]) -> str:
+    """Return *base* or, on collision, a disambiguated ``base-id`` slug."""
+    if base not in used:
+        return base
+    return f"{base}-{_slugify(fallback_id)}"
 
 
 def _mode_orientation_key(mode: str, orientation: str) -> str:
@@ -1061,9 +1071,11 @@ class SkillTreeGenerator:
             if thread.fragment_count > self.min_thread_fragments
         ]
         written: list[Path] = []
+        used_slugs: set[str] = set()
         for thread in qualifying:
             body = self._render_thread_body(thread)
-            slug = _slugify(thread.title)
+            slug = _unique_slug(_slugify(thread.title), thread.id, used_slugs)
+            used_slugs.add(slug)
             written.append(
                 _write_skill(
                     target_dir / f"{slug}{_SKILL_SUFFIX}",
@@ -1089,9 +1101,11 @@ class SkillTreeGenerator:
             if eddy.fragment_count > self.min_eddy_fragments
         ]
         written: list[Path] = []
+        used_slugs: set[str] = set()
         for eddy in qualifying:
             body = self._render_eddy_body(eddy)
-            slug = _slugify(eddy.title)
+            slug = _unique_slug(_slugify(eddy.title), eddy.id, used_slugs)
+            used_slugs.add(slug)
             written.append(
                 _write_skill(
                     target_dir / f"{slug}{_SKILL_SUFFIX}",

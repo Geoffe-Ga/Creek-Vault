@@ -514,6 +514,37 @@ class TestThreadSkills:
         paths = generator.generate_thread_skills(vault, output_dir)
         assert not paths
 
+    def test_thread_slug_collisions_preserve_both_files(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Two threads with titles that slugify identically keep distinct files."""
+        _write_thread(
+            vault,
+            Thread(
+                id="thread-aaa",
+                title="Foo Bar",
+                status=ThreadStatus.ACTIVE,
+                fragment_count=20,
+                description="First.",
+            ),
+        )
+        _write_thread(
+            vault,
+            Thread(
+                id="thread-bbb",
+                title="foo-bar",
+                status=ThreadStatus.ACTIVE,
+                fragment_count=20,
+                description="Second.",
+            ),
+        )
+        paths = generator.generate_thread_skills(vault, output_dir)
+        assert len(paths) == 2
+        assert len({p.name for p in paths}) == 2
+
 
 # ---- generate_eddy_skills ----
 
@@ -558,6 +589,37 @@ class TestEddySkills:
         _write_eddy(vault, eddy)
         paths = generator.generate_eddy_skills(vault, output_dir)
         assert not paths
+
+    def test_eddy_slug_collisions_preserve_both_files(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Two eddies with titles that slugify identically keep distinct files."""
+        _write_eddy(
+            vault,
+            Eddy(
+                id="eddy-aaa",
+                title="The Work",
+                fragment_count=25,
+                threads=[],
+                description="First.",
+            ),
+        )
+        _write_eddy(
+            vault,
+            Eddy(
+                id="eddy-bbb",
+                title="The Work!",
+                fragment_count=25,
+                threads=[],
+                description="Second.",
+            ),
+        )
+        paths = generator.generate_eddy_skills(vault, output_dir)
+        assert len(paths) == 2
+        assert len({p.name for p in paths}) == 2
 
 
 # ---- generate_meta_skills ----
@@ -1116,12 +1178,10 @@ class TestExtractPassageEdgeCases:
         passage = _extract_passage(body * 2)
         assert passage is not None
 
-    def test_long_first_sentence_still_produces_a_passage(self) -> None:
-        """A very long first sentence is accepted rather than dropped."""
+    def test_long_first_sentence_returns_none(self) -> None:
+        """A single sentence exceeding the max word budget is rejected."""
         huge = " ".join(["word"] * 300) + "."
-        passage = _extract_passage(huge)
-        assert passage is not None
-        assert passage.endswith(".")
+        assert _extract_passage(huge) is None
 
     def test_second_sentence_dropped_when_it_overflows_budget(self) -> None:
         """Once the first sentence is in, oversize follow-ups are cut."""
