@@ -12,12 +12,12 @@ import pytest
 
 from creek.generate.voice import (
     METAPHOR_DOMAINS,
-    Lexicon,
     MetaphorFamily,
     ParagraphMetrics,
     PunctuationHabits,
     RhetoricalMoves,
     SentenceMetrics,
+    VocabularyFingerprint,
     VoicePatternExtractor,
     VoicePatterns,
 )
@@ -112,7 +112,7 @@ class TestExtractPatterns:
         assert isinstance(result.transitions, tuple)
         assert isinstance(result.metaphor_families, tuple)
         assert isinstance(result.rhetorical_moves, RhetoricalMoves)
-        assert isinstance(result.vocabulary, Lexicon)
+        assert isinstance(result.vocabulary, VocabularyFingerprint)
         assert isinstance(result.punctuation, PunctuationHabits)
 
     def test_empty_input_returns_zeroed_patterns(
@@ -391,14 +391,14 @@ class TestRhetoricalMoves:
 class TestVocabulary:
     """TF-IDF distinctive words, coined terms, recurring phrases."""
 
-    def test_returns_lexicon_type(
+    def test_returns_vocabulary_fingerprint_type(
         self,
         extractor: VoicePatternExtractor,
     ) -> None:
-        """extract_vocabulary returns a Lexicon."""
+        """extract_vocabulary returns a VocabularyFingerprint."""
         texts = ["The creek flows gently downstream."]
         result = extractor.extract_vocabulary(texts)
-        assert isinstance(result, Lexicon)
+        assert isinstance(result, VocabularyFingerprint)
 
     def test_distinctive_words_found(
         self,
@@ -466,11 +466,11 @@ class TestVocabulary:
         result = extractor.extract_vocabulary(texts)
         assert result.coined_terms == ()
 
-    def test_empty_input_returns_empty_lexicon(
+    def test_empty_input_returns_empty_vocabulary_fingerprint(
         self,
         extractor: VoicePatternExtractor,
     ) -> None:
-        """Empty texts produce an empty Lexicon."""
+        """Empty texts produce an empty VocabularyFingerprint."""
         result = extractor.extract_vocabulary([])
         assert result.distinctive_words == ()
         assert result.coined_terms == ()
