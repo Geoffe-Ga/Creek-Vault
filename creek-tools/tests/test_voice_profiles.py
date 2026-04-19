@@ -17,12 +17,12 @@ import pytest
 from creek.generate.voice import (
     VOICE_REGISTERS,
     Exemplar,
-    Lexicon,
     MetaphorFamily,
     ParagraphMetrics,
     PunctuationHabits,
     RhetoricalMoves,
     SentenceMetrics,
+    VocabularyFingerprint,
     VoicePatterns,
     VoiceProfile,
     VoiceProfileGenerator,
@@ -105,7 +105,7 @@ def _flat_patterns() -> VoicePatterns:
             paradox_count=0,
             callback_count=0,
         ),
-        vocabulary=Lexicon(
+        vocabulary=VocabularyFingerprint(
             distinctive_words=(),
             coined_terms=(),
             recurring_phrases=(),
@@ -152,7 +152,7 @@ def _rich_patterns() -> VoicePatterns:
             paradox_count=2,
             callback_count=1,
         ),
-        vocabulary=Lexicon(
+        vocabulary=VocabularyFingerprint(
             distinctive_words=("creek", "eddy", "fragment"),
             coined_terms=("polygnosticism",),
             recurring_phrases=("creek of thought",),

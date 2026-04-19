@@ -676,7 +676,7 @@ class RhetoricalMoves:
 
 
 @dataclass(frozen=True)
-class Lexicon:
+class VocabularyFingerprint:
     """Vocabulary fingerprint for a voice.
 
     Attributes:
@@ -727,7 +727,7 @@ class VoicePatterns:
     transitions: tuple[tuple[str, int], ...]
     metaphor_families: tuple[MetaphorFamily, ...]
     rhetorical_moves: RhetoricalMoves
-    vocabulary: Lexicon
+    vocabulary: VocabularyFingerprint
     punctuation: PunctuationHabits
 
 
@@ -1028,18 +1028,18 @@ class VoicePatternExtractor:
                 families.append(result)
         return families
 
-    def extract_vocabulary(self, texts: list[str]) -> Lexicon:
+    def extract_vocabulary(self, texts: list[str]) -> VocabularyFingerprint:
         """Generate a vocabulary fingerprint via TF-IDF analysis.
 
         Args:
             texts: Body texts to analyse.
 
         Returns:
-            A :class:`Lexicon` with distinctive words, coined terms, and
-            recurring phrases.
+            A :class:`VocabularyFingerprint` with distinctive words,
+            coined terms, and recurring phrases.
         """
         if not texts:
-            return Lexicon(
+            return VocabularyFingerprint(
                 distinctive_words=(),
                 coined_terms=(),
                 recurring_phrases=(),
@@ -1048,7 +1048,7 @@ class VoicePatternExtractor:
         distinctive = self._top_distinctive(documents)
         coined = self._detect_coined_terms(documents)
         recurring = _find_recurring_bigrams(documents)
-        return Lexicon(
+        return VocabularyFingerprint(
             distinctive_words=distinctive,
             coined_terms=coined,
             recurring_phrases=recurring,
@@ -1607,12 +1607,12 @@ __all__ = [
     "METAPHOR_DOMAINS",
     "VOICE_REGISTERS",
     "Exemplar",
-    "Lexicon",
     "MetaphorFamily",
     "ParagraphMetrics",
     "PunctuationHabits",
     "RhetoricalMoves",
     "SentenceMetrics",
+    "VocabularyFingerprint",
     "VoiceExemplarCollector",
     "VoicePatternExtractor",
     "VoicePatterns",
