@@ -300,12 +300,48 @@ def skills(
 @app.command()
 def mine(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    strategy: str | None = typer.Option(None, help="Mining strategy"),
+    phase: str = typer.Option(
+        "unclassified",
+        help="Current Archetypal Wavelength phase (rising, peaking, ...).",
+    ),
+    limit: int = typer.Option(
+        10,
+        help="Maximum number of seeds to display (0 for all).",
+    ),
 ) -> None:
-    """Mine blog and essay ideas from vault."""
-    console.print(
-        f"[bold green]Would mine: vault={vault}, strategy={strategy}[/bold green]"
-    )
+    """Mine blog and essay ideas from the vault (Section 11.5).
+
+    Runs every strategy - liminal cross-eddy, thread terminus, resonance
+    chain, and wavelength-phase window - then prints a deduped,
+    score-ranked table of :class:`IdeaSeed` records.
+    """
+    from creek.generate.mining import IdeaMiner
+    from creek.models import Phase
+
+    vault_path = _resolve_vault(vault)
+    try:
+        current_phase = Phase(phase.lower())
+    except ValueError:
+        console.print(
+            f"[red]Unknown phase '{phase}'. "
+            "Use one of: rising, peaking, withdrawal, diminishing, "
+            "bottoming_out, restoration, unclassified.[/red]",
+        )
+        raise typer.Exit(code=2) from None
+
+    seeds = IdeaMiner().mine_all(vault_path, current_phase=current_phase)
+    if not seeds:
+        console.print("[yellow]No idea seeds surfaced.[/yellow]")
+        return
+
+    display = seeds if limit <= 0 else seeds[:limit]
+    table = Table(title=f"Idea seeds ({len(display)} of {len(seeds)})")
+    table.add_column("Strategy")
+    table.add_column("Title")
+    table.add_column("Score", justify="right")
+    for seed in display:
+        table.add_row(seed.strategy.value, seed.title, f"{seed.score:.2f}")
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
