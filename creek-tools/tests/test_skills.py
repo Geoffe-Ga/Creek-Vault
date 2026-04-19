@@ -33,6 +33,7 @@ from creek.generate.skills import (
     _load_vault_snapshot,
     _mode_orientation_key,
     _slugify,
+    _unique_slug,
 )
 from creek.models import (
     Confidence,
@@ -1063,6 +1064,28 @@ class TestUtilities:
             passage="passage",
         )
         assert isinstance(hash(exemplar), int)
+
+    def test_unique_slug_returns_base_when_no_collision(self) -> None:
+        """A fresh base slug is used unchanged."""
+        assert _unique_slug("foo", "bar", set()) == "foo"
+
+    def test_unique_slug_appends_fallback_on_base_collision(self) -> None:
+        """When the base collides, the fallback id is appended."""
+        used = {"foo"}
+        assert _unique_slug("foo", "thread-abc", used) == "foo-thread-abc"
+
+    def test_unique_slug_suffixes_counter_on_fallback_collision(self) -> None:
+        """When both base and fallback collide, a numeric suffix is added."""
+        used = {"foo", "foo-bar"}
+        result = _unique_slug("foo", "bar", used)
+        assert result not in used
+        assert result.startswith("foo-bar-")
+
+    def test_unique_slug_increments_counter_through_conflicts(self) -> None:
+        """The counter skips any already-used variant."""
+        used = {"foo", "foo-bar", "foo-bar-2"}
+        result = _unique_slug("foo", "bar", used)
+        assert result == "foo-bar-3"
 
 
 # ---- Classification filtering ----

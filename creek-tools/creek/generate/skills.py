@@ -575,9 +575,13 @@ def _extract_passage(body: str) -> str | None:
 
     The passage is the first contiguous run of sentences whose total
     word count falls between :data:`_EXEMPLAR_WORDS_MIN` and
-    :data:`_EXEMPLAR_WORDS_MAX`. Returns ``None`` when no such run
-    exists (e.g. body too short or composed entirely of very long
-    sentences).
+    :data:`_EXEMPLAR_WORDS_MAX`. Sentence boundaries are respected:
+    sentences are never split, so a passage that would exceed the max
+    by including the next sentence stops at the previous sentence
+    boundary. If even the first sentence alone exceeds the max, no
+    passage is produced (the function returns ``None``). Also returns
+    ``None`` when the body is empty or composed entirely of
+    over-length sentences.
     """
     text = body.strip()
     if not text:
@@ -623,10 +627,22 @@ def _slugify(text: str) -> str:
 
 
 def _unique_slug(base: str, fallback_id: str, used: set[str]) -> str:
-    """Return *base* or, on collision, a disambiguated ``base-id`` slug."""
+    """Return *base* or a disambiguated slug when it collides.
+
+    Tries *base* first, then ``{base}-{slugified-id}``, then appends a
+    monotonically-increasing counter until the candidate is absent from
+    *used*. Guarantees no silent overwrite even when ids themselves
+    slugify to the same string.
+    """
     if base not in used:
         return base
-    return f"{base}-{_slugify(fallback_id)}"
+    disambiguated = f"{base}-{_slugify(fallback_id)}"
+    if disambiguated not in used:
+        return disambiguated
+    counter = 2
+    while f"{disambiguated}-{counter}" in used:
+        counter += 1
+    return f"{disambiguated}-{counter}"
 
 
 def _mode_orientation_key(mode: str, orientation: str) -> str:
