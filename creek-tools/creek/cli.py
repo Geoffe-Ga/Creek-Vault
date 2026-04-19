@@ -274,10 +274,26 @@ def skills(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     output: Path | None = typer.Option(None, help="Output path"),
 ) -> None:
-    """Generate voice skill files."""
+    """Generate the Voice Skill Tree (Section 11.4).
+
+    Writes a tree of ``SKILL.md`` files under *output* (default
+    ``<vault>/creek-skills``) covering frequencies, phases, modes,
+    registers, threads, eddies, and two meta skills.
+    """
+    if not generate:
+        console.print(
+            "[yellow]Pass --generate to create the Voice Skill Tree.[/yellow]",
+        )
+        return
+
+    from creek.generate.skills import SkillTreeGenerator
+
+    vault_path = _resolve_vault(vault)
+    output_dir = output if output is not None else vault_path / "creek-skills"
+    written = SkillTreeGenerator().generate_all_skills(vault_path, output_dir)
     console.print(
-        f"[bold green]Would skills: generate={generate}, "
-        f"vault={vault}, output={output}[/bold green]"
+        f"[bold green]Voice Skill Tree generated ({len(written)} files) "
+        f"at {output_dir}[/bold green]",
     )
 
 

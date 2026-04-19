@@ -334,17 +334,20 @@ def test_skills_help() -> None:
     assert "skills" in result.output.lower()
 
 
-def test_skills_command() -> None:
+def test_skills_command(tmp_path: Path) -> None:
     """Test that skills command runs with required args."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    output = tmp_path / "out"
     result = runner.invoke(
         app,
         [
             "skills",
             "--generate",
             "--vault",
-            "/fake/vault",
+            str(vault),
             "--output",
-            "/fake/out",
+            str(output),
         ],
     )
     assert result.exit_code == 0
