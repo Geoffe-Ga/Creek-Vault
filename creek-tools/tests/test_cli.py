@@ -366,10 +366,19 @@ def test_mine_command() -> None:
     assert result.exit_code == 0
 
 
-def test_mine_with_strategy() -> None:
-    """Test that mine command runs with --strategy option."""
+def test_mine_with_phase() -> None:
+    """Test that mine command accepts a wavelength phase option."""
     result = runner.invoke(
         app,
-        ["mine", "--vault", "/fake/vault", "--strategy", "frequency"],
+        ["mine", "--vault", "/fake/vault", "--phase", "rising"],
     )
     assert result.exit_code == 0
+
+
+def test_mine_with_unknown_phase_errors() -> None:
+    """Test that an unknown phase exits with code 2."""
+    result = runner.invoke(
+        app,
+        ["mine", "--vault", "/fake/vault", "--phase", "nonsense"],
+    )
+    assert result.exit_code == 2
