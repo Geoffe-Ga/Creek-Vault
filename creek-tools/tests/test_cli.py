@@ -382,3 +382,28 @@ def test_mine_with_unknown_phase_errors() -> None:
         ["mine", "--vault", "/fake/vault", "--phase", "nonsense"],
     )
     assert result.exit_code == 2
+
+
+def test_draft_help() -> None:
+    """Test that draft --help shows subcommand help."""
+    result = runner.invoke(app, ["draft", "--help"])
+    assert result.exit_code == 0
+    assert "draft" in result.output.lower()
+
+
+def test_draft_command_no_seeds(tmp_path: Path) -> None:
+    """Test that draft on an empty vault reports no seeds and exits 0."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    assert result.exit_code == 0
+    assert "No idea seeds surfaced" in result.output
+
+
+def test_draft_unknown_phase_errors() -> None:
+    """Test that an unknown phase exits with code 2."""
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", "/fake/vault", "--phase", "nonsense"],
+    )
+    assert result.exit_code == 2
