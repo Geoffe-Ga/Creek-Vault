@@ -700,7 +700,7 @@ Given the following fragment, provide:
    - Medicine = right-sized, healthy expression
    - Toxic = overdosed, shadow expression
    - Ambiguous = could be read either way
-7. Wavelength Descriptor (the specific word from the Mode map that best fits, 
+7. Wavelength Descriptor (the specific word from the Mode map that best fits,
    e.g. "Introspectivity", "Anxiety", "Power-With", "Gnosis", etc.)
 8. Voice Register (confessional/analytical/playful/prophetic/instructional/raw/conversational)
 9. Confidence Level (musing/exploring/forming/settled/conviction)
@@ -709,9 +709,9 @@ Given the following fragment, provide:
 12. Suggested Thread names (existing or new)
 13. A 1-sentence summary suitable as a note title
 
-IMPORTANT: Do not force classifications. "Unclassified" is a valid and 
+IMPORTANT: Do not force classifications. "Unclassified" is a valid and
 respected answer. Liminal content that resists categorization is VALUABLE.
-Do not resolve paradoxes or contradictions — tag them with 
+Do not resolve paradoxes or contradictions — tag them with
 "paradox" in emotional_texture.
 When Medicine vs. Toxic is ambiguous, use "ambiguous" and note both readings.
 
@@ -921,7 +921,7 @@ ocr:
   enabled: true
   engine: pytesseract
   languages: ["eng"]
-  
+
 linking:
   temporal_window_hours: 168  # 1 week window for temporal proximity
   thread_min_fragments: 3     # minimum fragments to form a thread
@@ -947,7 +947,7 @@ google_drive:
   token_file: "token.json"              # OAuth token (gitignored)
   scopes: ["https://www.googleapis.com/auth/drive.readonly"]  # READ-ONLY, non-negotiable
   staging_dir: "google-drive-export/"   # download destination within source_drive
-  
+
 # Paths within source drive
 sources:
   claude: "chatbot-exports/claude/"
