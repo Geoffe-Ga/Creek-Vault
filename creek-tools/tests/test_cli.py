@@ -11,6 +11,8 @@ from creek.cli import app
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 runner = CliRunner()
 
 
@@ -391,13 +393,28 @@ def test_draft_help() -> None:
     assert "draft" in result.output.lower()
 
 
-def test_draft_command_no_seeds(tmp_path: Path) -> None:
+def test_draft_command_no_seeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test that draft on an empty vault reports no seeds and exits 0."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
     vault = tmp_path / "vault"
     vault.mkdir()
     result = runner.invoke(app, ["draft", "--vault", str(vault)])
     assert result.exit_code == 0
     assert "No idea seeds surfaced" in result.output
+
+
+def test_draft_command_errors_when_llm_unavailable(tmp_path: Path) -> None:
+    """Test that draft fails fast with exit 1 when the LLM is unavailable."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    assert result.exit_code == 1
+    assert "LLM provider unavailable" in result.output
 
 
 def test_draft_unknown_phase_errors() -> None:

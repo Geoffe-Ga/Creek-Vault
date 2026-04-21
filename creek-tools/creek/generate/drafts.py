@@ -259,6 +259,7 @@ class DraftGenerator:
         *,
         vault_path: Path,
         current_phase: Phase | None = None,
+        fragments: dict[str, tuple[Fragment, str]] | None = None,
     ) -> list[Path]:
         """Return the SKILL.md files to activate for *idea*.
 
@@ -272,6 +273,8 @@ class DraftGenerator:
             vault_path: Vault root used to look up source fragments for
                 dominant mode/register inference.
             current_phase: Optional current Archetypal Wavelength phase.
+            fragments: Optional pre-loaded ``{id: (Fragment, body)}`` map;
+                when provided the vault is not re-scanned.
 
         Returns:
             Ordered list of absolute paths to existing SKILL.md files.
@@ -281,9 +284,13 @@ class DraftGenerator:
         phase_path = self._phase_skill(current_phase)
         if phase_path is not None:
             paths.append(phase_path)
-        fragments = _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
+        loaded = (
+            fragments
+            if fragments is not None
+            else _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
+        )
         source_frags = [
-            fragments[fid][0] for fid in idea.source_fragments if fid in fragments
+            loaded[fid][0] for fid in idea.source_fragments if fid in loaded
         ]
         mode_path = self._mode_skill(source_frags)
         if mode_path is not None:
@@ -302,9 +309,7 @@ class DraftGenerator:
 
     def _phase_skill(self, current_phase: Phase | None) -> Path | None:
         """Return the phase SKILL.md for *current_phase*, if classified."""
-        if current_phase is None:
-            return None
-        if str(current_phase) == Phase.UNCLASSIFIED.value:
+        if current_phase is None or current_phase == Phase.UNCLASSIFIED:
             return None
         return self.skills_root / _PHASES_DIR / f"{current_phase.value}{_SKILL_SUFFIX}"
 
@@ -334,6 +339,7 @@ class DraftGenerator:
         idea: IdeaSeed,
         *,
         vault_path: Path,
+        fragments: dict[str, tuple[Fragment, str]] | None = None,
     ) -> str:
         """Collect fragment bodies and thread/eddy descriptions for *idea*.
 
@@ -347,13 +353,19 @@ class DraftGenerator:
         Args:
             idea: Idea seed whose IDs drive the lookup.
             vault_path: Vault root used to load fragments/threads/eddies.
+            fragments: Optional pre-loaded ``{id: (Fragment, body)}`` map;
+                when provided the vault is not re-scanned for fragments.
 
         Returns:
             A newline-joined markdown string.
         """
         sections: list[str] = []
-        fragments = _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
-        frag_block = _render_fragment_section(idea.source_fragments, fragments)
+        loaded = (
+            fragments
+            if fragments is not None
+            else _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
+        )
+        frag_block = _render_fragment_section(idea.source_fragments, loaded)
         if frag_block:
             sections.append(frag_block)
         threads = _load_threads_by_id(vault_path / _THREADS_SUBDIR)
@@ -377,8 +389,8 @@ class DraftGenerator:
         if self.voice_core:
             parts.append(f"## Voice core\n{self.voice_core.strip()}")
         if skill_stack:
-            skill_lines = "\n".join(f"- {p.name}" for p in skill_stack)
-            parts.append(f"## Activated skills\n{skill_lines}")
+            skill_sections = [_render_skill_section(path) for path in skill_stack]
+            parts.append("## Activated skills\n\n" + "\n\n".join(skill_sections))
         if source_material:
             parts.append(f"## Source material\n{source_material}")
         parts.append(
@@ -409,12 +421,18 @@ class DraftGenerator:
             A populated :class:`Draft` — the body comes from the LLM
             callable; everything else is provenance.
         """
+        fragments = _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
         skill_stack = self.select_skill_stack(
             idea,
             vault_path=vault_path,
             current_phase=current_phase,
+            fragments=fragments,
         )
-        source_material = self.gather_source_material(idea, vault_path=vault_path)
+        source_material = self.gather_source_material(
+            idea,
+            vault_path=vault_path,
+            fragments=fragments,
+        )
         prompt = self._compose_prompt(idea, skill_stack, source_material)
         body = self._llm(prompt).strip()
         if not body:
@@ -467,6 +485,27 @@ class DraftGenerator:
         )
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
+
+
+def _render_skill_section(path: Path) -> str:
+    """Return a ``### {skill name}`` block with the file contents inlined.
+
+    Args:
+        path: Absolute path to the SKILL.md file to read.
+
+    Returns:
+        A markdown block with the skill heading and the file body; if the
+        file cannot be read the block falls back to just the heading so
+        the prompt still records which skill was activated.
+    """
+    try:
+        body = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.warning("Could not read skill file %s; inlining name only.", path)
+        return f"### {path.name}"
+    if not body:
+        return f"### {path.name}"
+    return f"### {path.name}\n{body}"
 
 
 def _render_fragment_section(

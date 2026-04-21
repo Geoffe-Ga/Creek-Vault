@@ -358,6 +358,27 @@ def mine(
     console.print(table)
 
 
+def _read_voice_core(path: Path | None) -> str:
+    """Read a voice-core text file, exiting 2 on read errors.
+
+    Args:
+        path: Optional path to a voice-core text file.
+
+    Returns:
+        The file contents, or the empty string when *path* is ``None``.
+
+    Raises:
+        typer.Exit: With code 2 when the file cannot be read.
+    """
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]Could not read --voice-core {path}: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
 def _build_draft_llm() -> "DraftLLM":
     """Construct a :data:`DraftLLM` callable from the configured LLM provider.
 
@@ -419,6 +440,8 @@ def draft(
     vault_path = _resolve_vault(vault)
     skills_dir = skills_root if skills_root is not None else vault_path / "creek-skills"
     current_phase = _parse_phase(phase)
+    voice_text = _read_voice_core(voice_core)
+    llm = _build_draft_llm()
 
     seeds = IdeaMiner().mine_all(vault_path, current_phase=current_phase)
     if not seeds:
@@ -431,9 +454,8 @@ def draft(
         raise typer.Exit(code=2)
 
     idea = seeds[index]
-    voice_text = voice_core.read_text(encoding="utf-8") if voice_core else ""
     generator = DraftGenerator(
-        llm=_build_draft_llm(),
+        llm=llm,
         skills_root=skills_dir,
         voice_core=voice_text,
     )

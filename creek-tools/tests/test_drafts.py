@@ -162,7 +162,7 @@ def llm_echo() -> Callable[[str], str]:
 class TestDraft:
     """Invariants on the :class:`Draft` value object."""
 
-    def test_draft_is_frozen(self, llm_echo: Callable[[str], str]) -> None:
+    def test_draft_is_frozen(self) -> None:
         """Drafts are immutable value objects."""
         draft = Draft(
             title="x",
@@ -177,8 +177,6 @@ class TestDraft:
         )
         with pytest.raises(AttributeError):
             draft.title = "changed"  # type: ignore[misc]
-        # fixture ensures the LLM stub is injectable
-        assert callable(llm_echo)
 
     def test_draft_requires_title(self) -> None:
         """Empty titles are rejected."""
@@ -458,6 +456,35 @@ class TestGenerateDraft:
         seed = _build_seed()
         with pytest.raises(RuntimeError, match="empty draft body"):
             gen.generate_draft(seed, vault_path=vault)
+
+    def test_prompt_inlines_skill_file_contents(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The LLM prompt carries the SKILL.md body, not just the filename.
+
+        Regression test for the bug where only skill names reached the LLM —
+        the model cannot honour a skill it cannot read.
+        """
+        skill_body = "Frequency F1 guidance: stay close to sensory ground."
+        freq_path = skills_root / "frequencies" / "F1.SKILL.md"
+        freq_path.parent.mkdir(parents=True, exist_ok=True)
+        freq_path.write_text(skill_body, encoding="utf-8")
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "Draft body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        seed = _build_seed(frequency_affinity=(Frequency.F1,))
+        gen.generate_draft(seed, vault_path=vault)
+
+        assert "## Activated skills" in captured["prompt"]
+        assert "### F1.SKILL.md" in captured["prompt"]
+        assert skill_body in captured["prompt"]
 
 
 # ---- save_draft -------------------------------------------------------
