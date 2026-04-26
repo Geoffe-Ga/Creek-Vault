@@ -11,6 +11,8 @@ from creek.cli import app
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 runner = CliRunner()
 
 
@@ -380,5 +382,108 @@ def test_mine_with_unknown_phase_errors() -> None:
     result = runner.invoke(
         app,
         ["mine", "--vault", "/fake/vault", "--phase", "nonsense"],
+    )
+    assert result.exit_code == 2
+
+
+def test_draft_help() -> None:
+    """Test that draft --help shows subcommand help."""
+    result = runner.invoke(app, ["draft", "--help"])
+    assert result.exit_code == 0
+    assert "draft" in result.output.lower()
+
+
+def test_draft_command_no_seeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that draft on an empty vault reports no seeds and exits 0."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    assert result.exit_code == 0
+    assert "No idea seeds surfaced" in result.output
+
+
+def test_draft_command_happy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that draft mines an idea, generates a draft, and saves the file.
+
+    Stubs the LLM and the idea miner so the test exercises the full CLI
+    wiring path (mine → present → generate → save → exit 0) without
+    depending on the heuristic miner producing real seeds.
+    """
+    from creek import cli as cli_module
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+    from creek.models import Frequency
+
+    seed = IdeaSeed(
+        strategy=MiningStrategy.THREAD_TERMINUS,
+        title="Naming what orbits",
+        source_fragments=(),
+        threads=(),
+        eddies=(),
+        frequency_affinity=(Frequency.F1,),
+        brief_description="An essay waits here.",
+        score=0.8,
+    )
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda: lambda _p: "Generated draft body.",
+    )
+
+    def _stub_mine_all(
+        _self: object,
+        _vault: object,
+        *,
+        current_phase: object,
+    ) -> list[IdeaSeed]:
+        del current_phase
+        return [seed]
+
+    monkeypatch.setattr(
+        "creek.generate.mining.IdeaMiner.mine_all",
+        _stub_mine_all,
+    )
+
+    vault = tmp_path / "vault"
+    for sub in ("01-Fragments", "02-Threads", "03-Eddies", "07-Voice/Drafts"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "Naming what orbits" in result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    assert drafts[0].name.endswith("-naming-what-orbits.md")
+
+
+def test_draft_command_errors_when_llm_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that draft fails fast with exit 1 when the LLM is unavailable."""
+    from creek.classify.llm import LLMClassifier
+
+    monkeypatch.setattr(LLMClassifier, "available", property(lambda _self: False))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    assert result.exit_code == 1
+    assert "LLM provider unavailable" in result.output
+
+
+def test_draft_unknown_phase_errors() -> None:
+    """Test that an unknown phase exits with code 2."""
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", "/fake/vault", "--phase", "nonsense"],
     )
     assert result.exit_code == 2

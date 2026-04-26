@@ -11,6 +11,8 @@ from creek.config import load_config
 from creek.pipeline import Pipeline
 
 if TYPE_CHECKING:
+    from creek.generate.drafts import DraftLLM
+    from creek.models import Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 app = typer.Typer(name="creek", help="Creek knowledge organization pipeline")
@@ -297,6 +299,28 @@ def skills(
     )
 
 
+def _parse_phase(phase: str) -> "Phase":
+    """Parse a phase CLI argument, exiting with code 2 on unknown values.
+
+    Args:
+        phase: Raw phase string from the CLI.
+
+    Returns:
+        The parsed :class:`Phase` enum member.
+    """
+    from creek.models import Phase as _Phase
+
+    try:
+        return _Phase(phase.lower())
+    except ValueError:
+        console.print(
+            f"[red]Unknown phase '{phase}'. "
+            "Use one of: rising, peaking, withdrawal, diminishing, "
+            "bottoming_out, restoration, unclassified.[/red]",
+        )
+        raise typer.Exit(code=2) from None
+
+
 @app.command()
 def mine(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
@@ -316,19 +340,9 @@ def mine(
     score-ranked table of :class:`IdeaSeed` records.
     """
     from creek.generate.mining import IdeaMiner
-    from creek.models import Phase
 
     vault_path = _resolve_vault(vault)
-    try:
-        current_phase = Phase(phase.lower())
-    except ValueError:
-        console.print(
-            f"[red]Unknown phase '{phase}'. "
-            "Use one of: rising, peaking, withdrawal, diminishing, "
-            "bottoming_out, restoration, unclassified.[/red]",
-        )
-        raise typer.Exit(code=2) from None
-
+    current_phase = _parse_phase(phase)
     seeds = IdeaMiner().mine_all(vault_path, current_phase=current_phase)
     if not seeds:
         console.print("[yellow]No idea seeds surfaced.[/yellow]")
@@ -342,6 +356,118 @@ def mine(
     for seed in display:
         table.add_row(seed.strategy.value, seed.title, f"{seed.score:.2f}")
     console.print(table)
+
+
+def _read_voice_core(path: Path | None) -> str:
+    """Read a voice-core text file, exiting 2 on read errors.
+
+    Args:
+        path: Optional path to a voice-core text file.
+
+    Returns:
+        The file contents, or the empty string when *path* is ``None``.
+
+    Raises:
+        typer.Exit: With code 2 when the file cannot be read.
+    """
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]Could not read --voice-core {path}: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+def _build_draft_llm() -> "DraftLLM":
+    """Construct a :data:`DraftLLM` callable from the configured LLM provider.
+
+    Uses the Ollama/Anthropic adapter already wired up for classification.
+
+    Returns:
+        A callable ``(prompt) -> response`` ready to feed to
+        :class:`DraftGenerator`.
+
+    Raises:
+        typer.Exit: If the configured LLM provider is not reachable.
+    """
+    from creek.classify.llm import LLMClassifier
+
+    config = load_config()
+    classifier = LLMClassifier(config.llm)
+    if not classifier.available:
+        console.print(
+            "[red]LLM provider unavailable; cannot generate draft. "
+            "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
+        )
+        raise typer.Exit(code=1)
+    return classifier.invoke_prompt
+
+
+@app.command()
+def draft(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    skills_root: Path | None = typer.Option(
+        None,
+        "--skills-root",
+        help="Skill tree root (default <vault>/creek-skills).",
+    ),
+    phase: str = typer.Option(
+        "unclassified",
+        help="Current Archetypal Wavelength phase.",
+    ),
+    index: int = typer.Option(
+        0,
+        "--index",
+        help="Pick the Nth mined idea (0-based, score-ranked).",
+    ),
+    voice_core: Path | None = typer.Option(
+        None,
+        "--voice-core",
+        help="Path to a voice-core text file prepended to the prompt.",
+    ),
+) -> None:
+    """Draft an essay from a mined idea with the activated skill stack.
+
+    Mines ideas, presents the chosen idea as an invitation, assembles
+    the frequency/phase/mode/register skill stack, gathers source
+    material, asks the LLM to generate a draft, and saves it to
+    ``07-Voice/Drafts/`` with full provenance.
+    """
+    from creek.generate.drafts import DraftGenerator
+    from creek.generate.mining import IdeaMiner
+
+    vault_path = _resolve_vault(vault)
+    skills_dir = skills_root if skills_root is not None else vault_path / "creek-skills"
+    current_phase = _parse_phase(phase)
+    voice_text = _read_voice_core(voice_core)
+    llm = _build_draft_llm()
+
+    seeds = IdeaMiner().mine_all(vault_path, current_phase=current_phase)
+    if not seeds:
+        console.print("[yellow]No idea seeds surfaced; nothing to draft.[/yellow]")
+        return
+    if index < 0 or index >= len(seeds):
+        console.print(
+            f"[red]--index {index} is out of range (0..{len(seeds) - 1}).[/red]",
+        )
+        raise typer.Exit(code=2)
+
+    idea = seeds[index]
+    generator = DraftGenerator(
+        llm=llm,
+        skills_root=skills_dir,
+        voice_core=voice_text,
+    )
+
+    console.print(generator.present_idea(idea))
+    draft_obj = generator.generate_draft(
+        idea,
+        vault_path=vault_path,
+        current_phase=current_phase,
+    )
+    saved_path = generator.save_draft(draft_obj, vault_path)
+    console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
 
 
 # ---------------------------------------------------------------------------

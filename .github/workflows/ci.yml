@@ -99,8 +99,15 @@ jobs:
       - name: Run pip-audit dependency check
         run: |
           # PYSEC-2022-42969: ReDoS in py.path.svnwc (transitive dep of interrogate, not exploitable here)
-          pip-audit --format=json --output=reports/pip-audit-report.json --ignore-vuln PYSEC-2022-42969 || true
-          pip-audit --ignore-vuln PYSEC-2022-42969
+          # CVE-2026-3219: pip itself (no fix version published yet); pip is the installer,
+          # not a runtime dependency, and CI installs only from declared requirements
+          # files, so this is not exploitable in our context.
+          pip-audit --format=json --output=reports/pip-audit-report.json \
+            --ignore-vuln PYSEC-2022-42969 \
+            --ignore-vuln CVE-2026-3219 || true
+          pip-audit \
+            --ignore-vuln PYSEC-2022-42969 \
+            --ignore-vuln CVE-2026-3219
         continue-on-error: false
 
       - name: Run tests with coverage

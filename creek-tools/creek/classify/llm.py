@@ -472,6 +472,21 @@ class LLMClassifier:
             return self._get_anthropic_provider().call(prompt)
         return self._call_ollama(prompt)
 
+    def invoke_prompt(self, prompt: str) -> str:
+        """Public dispatch helper for callers outside classification.
+
+        Wraps :meth:`_invoke_llm` so consumers (e.g. the draft generator)
+        can route prompts through the configured provider without
+        depending on a private name.
+
+        Args:
+            prompt: The fully-formatted prompt.
+
+        Returns:
+            Raw response text from the provider.
+        """
+        return self._invoke_llm(prompt)
+
     def _build_prompt(
         self,
         fragment: Fragment,
