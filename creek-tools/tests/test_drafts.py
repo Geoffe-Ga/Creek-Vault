@@ -486,6 +486,33 @@ class TestGenerateDraft:
         assert "### F1.SKILL.md" in captured["prompt"]
         assert skill_body in captured["prompt"]
 
+    def test_unreadable_skill_falls_back_to_name_only(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """If a SKILL.md cannot be read, the prompt records the heading only.
+
+        A skill path that resolves to a directory triggers ``IsADirectoryError``
+        (an :class:`OSError`) inside :func:`_render_skill_section`; the
+        fallback should still record the activation in the prompt.
+        """
+        # Make F1.SKILL.md a directory rather than a file.
+        freq_path = skills_root / "frequencies" / "F1.SKILL.md"
+        freq_path.mkdir(parents=True, exist_ok=True)
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "Draft body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        seed = _build_seed(frequency_affinity=(Frequency.F1,))
+        gen.generate_draft(seed, vault_path=vault)
+
+        assert "### F1.SKILL.md" in captured["prompt"]
+
 
 # ---- save_draft -------------------------------------------------------
 
@@ -577,3 +604,37 @@ class TestSaveDraft:
         path = gen.save_draft(draft, vault)
         post = frontmatter.load(str(path))
         assert post.content.strip() == body.strip()
+
+    def test_same_day_same_title_does_not_overwrite(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Two drafts with the same date+slug write to distinct files."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+
+        def _mk(body: str) -> Draft:
+            return Draft(
+                title="Same title",
+                body=body,
+                idea_strategy=MiningStrategy.THREAD_TERMINUS.value,
+                source_fragments=(),
+                threads=(),
+                eddies=(),
+                skill_stack=(),
+                prompt="p",
+                generated_date=datetime(2026, 4, 20, tzinfo=UTC),
+            )
+
+        first = gen.save_draft(_mk("First."), vault)
+        second = gen.save_draft(_mk("Second."), vault)
+        third = gen.save_draft(_mk("Third."), vault)
+
+        assert first != second != third
+        assert first.name == "2026-04-20-same-title.md"
+        assert second.name == "2026-04-20-same-title-2.md"
+        assert third.name == "2026-04-20-same-title-3.md"
+        assert frontmatter.load(str(first)).content.strip() == "First."
+        assert frontmatter.load(str(second)).content.strip() == "Second."
+        assert frontmatter.load(str(third)).content.strip() == "Third."

@@ -408,8 +408,14 @@ def test_draft_command_no_seeds(
     assert "No idea seeds surfaced" in result.output
 
 
-def test_draft_command_errors_when_llm_unavailable(tmp_path: Path) -> None:
+def test_draft_command_errors_when_llm_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test that draft fails fast with exit 1 when the LLM is unavailable."""
+    from creek.classify.llm import LLMClassifier
+
+    monkeypatch.setattr(LLMClassifier, "available", property(lambda _self: False))
     vault = tmp_path / "vault"
     vault.mkdir()
     result = runner.invoke(app, ["draft", "--vault", str(vault)])

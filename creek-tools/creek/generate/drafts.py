@@ -190,7 +190,8 @@ def _dominant(values: list[str]) -> str | None:
 
 def _dominant_classified(values: Iterable[object]) -> str | None:
     """Return the dominant classified (non-unclassified) value as a string."""
-    filtered = [str(v) for v in values if str(v) and str(v) != "unclassified"]
+    stringified = [str(v) for v in values]
+    filtered = [s for s in stringified if s and s != "unclassified"]
     return _dominant(filtered)
 
 
@@ -202,6 +203,27 @@ def _slugify(text: str) -> str:
     if len(cleaned) > _SLUG_MAX_LENGTH:
         cleaned = cleaned[:_SLUG_MAX_LENGTH].rstrip("-")
     return cleaned
+
+
+def _next_available_draft_path(
+    drafts_dir: Path,
+    date_prefix: str,
+    slug: str,
+) -> Path:
+    """Return a non-colliding draft path under *drafts_dir*.
+
+    Same-day drafts of the same title are otherwise silently overwritten;
+    this helper appends ``-2``, ``-3``, … until an unused path is found.
+    """
+    base = drafts_dir / f"{date_prefix}-{slug}.md"
+    if not base.exists():
+        return base
+    counter = 2
+    while True:
+        candidate = drafts_dir / f"{date_prefix}-{slug}-{counter}.md"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 class DraftGenerator:
@@ -469,7 +491,7 @@ class DraftGenerator:
         drafts_dir.mkdir(parents=True, exist_ok=True)
         slug = _slugify(draft.title)
         date_prefix = draft.generated_date.strftime("%Y-%m-%d")
-        target = drafts_dir / f"{date_prefix}-{slug}.md"
+        target = _next_available_draft_path(drafts_dir, date_prefix, slug)
         post = frontmatter.Post(
             content=draft.body.strip() + "\n",
             type="draft",

@@ -401,7 +401,7 @@ def _build_draft_llm() -> "DraftLLM":
             "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
         )
         raise typer.Exit(code=1)
-    return classifier._invoke_llm
+    return classifier.invoke_prompt
 
 
 @app.command()
