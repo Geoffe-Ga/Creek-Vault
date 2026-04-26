@@ -55,10 +55,6 @@ _PUBLIC_PLATFORMS: frozenset[SourcePlatform] = frozenset(
     {SourcePlatform.ESSAY},
 )
 
-_CHATBOT_PLATFORMS: frozenset[SourcePlatform] = frozenset(
-    {SourcePlatform.CLAUDE, SourcePlatform.CHATGPT},
-)
-
 _PRIVATE_DISCORD_HINTS: frozenset[str] = frozenset({"dm", "private"})
 
 
@@ -100,8 +96,7 @@ class PrivacyClassifier:
         3. Confessional register with conviction → ``INTIMATE``.
         4. Essay source → :class:`PrivacyTier.PUBLIC`.
         5. Discord with a non-DM channel name → ``PUBLIC``.
-        6. Chatbot or unclassified-channel Discord → ``PERSONAL``.
-        7. Anything else → ``PERSONAL`` (safer default).
+        6. Anything else (chatbots, DMs, unmapped sources) → ``PERSONAL``.
 
         Args:
             fragment: The fragment to classify.
@@ -121,8 +116,8 @@ class PrivacyClassifier:
             return PrivacyTier.PUBLIC
         if platform == SourcePlatform.DISCORD:
             return self._classify_discord(fragment)
-        if platform in _CHATBOT_PLATFORMS:
-            return PrivacyTier.PERSONAL
+        # Chatbot conversations and every other unmapped source default
+        # to PERSONAL — leaking content is worse than over-restricting.
         return PrivacyTier.PERSONAL
 
     def enforce_tier(
