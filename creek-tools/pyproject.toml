@@ -131,6 +131,10 @@ module = ["markdownify", "pdfminer", "pdfminer.*", "docx", "docx.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["pytesseract", "PIL", "PIL.*", "pdf2image", "pdf2image.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 

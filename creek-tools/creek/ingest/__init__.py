@@ -17,6 +17,7 @@ Exports:
     DiscordIngestor: Concrete ingestor for Discord message exports.
     DocumentIngestor: Concrete ingestor for document files (DOCX, PDF, HTML, TXT).
     GenericIngestor: Fallback ingestor for unrecognized file formats.
+    ImageIngestor: Concrete ingestor for image files via OCR.
     MarkdownIngestor: Concrete ingestor for plain Markdown files.
 """
 
@@ -27,6 +28,7 @@ from creek.ingest.code import CodeIngestor
 from creek.ingest.discord import DiscordIngestor
 from creek.ingest.documents import DocumentIngestor
 from creek.ingest.generic import GenericIngestor
+from creek.ingest.images import ImageIngestor
 from creek.ingest.markdown import MarkdownIngestor
 
 # Registry mapping ingestor names to their concrete classes.
@@ -38,6 +40,7 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
     "discord": DiscordIngestor,
     "document": DocumentIngestor,
     "generic": GenericIngestor,
+    "image": ImageIngestor,
     "markdown": MarkdownIngestor,
 }
 
@@ -49,6 +52,7 @@ __all__ = [
     "DiscordIngestor",
     "DocumentIngestor",
     "GenericIngestor",
+    "ImageIngestor",
     "IngestResult",
     "Ingestor",
     "MarkdownIngestor",
