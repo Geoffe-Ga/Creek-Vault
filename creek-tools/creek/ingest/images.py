@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -158,7 +158,7 @@ class PytesseractOcrEngine:
         """
         try:
             import pytesseract
-            from PIL import Image, ImageEnhance
+            from PIL import Image
         except ImportError as exc:
             msg = (
                 "pytesseract and Pillow are required for OCR. "
@@ -168,19 +168,12 @@ class PytesseractOcrEngine:
             raise PytesseractUnavailableError(msg) from exc
 
         with Image.open(image_path) as raw:
-            image = ImageEnhance.Contrast(raw.convert("RGB")).enhance(2.0)
-            text = pytesseract.image_to_string(image, lang=self.language)
-            data = pytesseract.image_to_data(
-                image,
-                lang=self.language,
-                output_type=pytesseract.Output.DICT,
-            )
-        confidence = _average_confidence(data.get("conf", []))
-        image_type = detect_image_type(image_path)
+            image = self._preprocess(raw)
+            text, confidence = self._ocr_image(pytesseract, image)
         return OcrResult(
-            text=text.strip(),
+            text=text,
             confidence=confidence,
-            image_type=image_type,
+            image_type=detect_image_type(image_path),
         )
 
     def extract_pdf_pages(self, pdf_path: Path) -> list[OcrResult]:
@@ -210,22 +203,41 @@ class PytesseractOcrEngine:
         pages = convert_from_path(str(pdf_path))
         results: list[OcrResult] = []
         for index, page_image in enumerate(pages, start=1):
-            text = pytesseract.image_to_string(page_image, lang=self.language)
-            data = pytesseract.image_to_data(
-                page_image,
-                lang=self.language,
-                output_type=pytesseract.Output.DICT,
-            )
-            confidence = _average_confidence(data.get("conf", []))
+            preprocessed = self._preprocess(page_image)
+            text, confidence = self._ocr_image(pytesseract, preprocessed)
             results.append(
                 OcrResult(
-                    text=text.strip(),
+                    text=text,
                     confidence=confidence,
                     page=index,
                     image_type="scanned_pdf_page",
                 ),
             )
         return results
+
+    @staticmethod
+    def _preprocess(image: Any) -> Any:
+        """Boost contrast on *image* prior to OCR.
+
+        Centralised so :meth:`extract_text` and :meth:`extract_pdf_pages`
+        produce comparable OCR quality — previously the PDF path skipped
+        contrast enhancement which yielded systematically worse results
+        on faint scans.
+        """
+        from PIL import ImageEnhance
+
+        return ImageEnhance.Contrast(image.convert("RGB")).enhance(2.0)
+
+    def _ocr_image(self, pytesseract: Any, image: Any) -> tuple[str, float]:
+        """Run tesseract on a preprocessed image, returning ``(text, confidence)``."""
+        text = pytesseract.image_to_string(image, lang=self.language)
+        data = pytesseract.image_to_data(
+            image,
+            lang=self.language,
+            output_type=pytesseract.Output.DICT,
+        )
+        confidence = _average_confidence(data.get("conf", []))
+        return text.strip(), confidence
 
 
 def _average_confidence(conf_values: list[Any]) -> float:
@@ -356,6 +368,18 @@ class ImageIngestor(Ingestor):
         An image with no recoverable text yields an empty list rather
         than a fragment with an empty body — empty fragments would
         clutter the vault without carrying signal.
+
+        Raises:
+            PytesseractUnavailableError: When the default
+                :class:`PytesseractOcrEngine` is in use and
+                ``pytesseract`` / ``Pillow`` are not installed.
+                Custom :class:`OcrEngine` implementations may raise
+                their own errors. The base
+                :meth:`Ingestor.ingest` orchestrator catches
+                :class:`Exception` and records it on
+                :class:`IngestResult.errors`, so callers using the
+                full pipeline see a structured error rather than a
+                crash.
         """
         result = self.engine.extract_text(raw.path)
         if not result.text.strip():
@@ -376,10 +400,18 @@ class ImageIngestor(Ingestor):
         ]
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
-        """Embed the original image, then the OCR'd body."""
+        """Embed the original image, then the OCR'd body.
+
+        For multi-page scanned-PDF fragments produced by
+        :meth:`ingest_pdf`, the embed carries the Obsidian
+        ``#page=N`` anchor so each page renders independently.
+        Standalone-image fragments use the bare ``![[name]]`` embed.
+        """
         original = fragment.metadata.get("original_file", fragment.source_path)
         image_name = Path(original).name
-        return f"![[{image_name}]]\n\n{fragment.content.strip()}\n"
+        page = fragment.metadata.get("page", 0)
+        embed = f"![[{image_name}#page={page}]]" if page else f"![[{image_name}]]"
+        return f"{embed}\n\n{fragment.content.strip()}\n"
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Produce the YAML frontmatter for an OCR'd image fragment."""
@@ -441,8 +473,6 @@ class ImageIngestor(Ingestor):
 
 def _modified_time(path: Path) -> datetime:
     """Return the file's mtime as a timezone-aware UTC datetime."""
-    from datetime import UTC
-
     return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
 

@@ -340,6 +340,58 @@ class TestConvertToMarkdown:
         assert "shot.png" in markdown
         assert "OCR'd text body" in markdown
 
+    def test_pdf_page_fragment_renders_with_page_anchor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """PDF-page fragments render with Obsidian's ``#page=N`` anchor.
+
+        Without the anchor, every page from the same PDF would embed
+        the whole document, losing the per-page context that
+        :meth:`ImageIngestor.ingest_pdf` carefully preserved in
+        metadata.
+        """
+        from creek.ingest.base import ParsedFragment
+
+        fragment = ParsedFragment(
+            content="OCR'd page 3 body",
+            metadata={
+                "original_file": str(tmp_path / "scan.pdf"),
+                "ocr_confidence": 0.7,
+                "image_type": "scanned_pdf_page",
+                "page": 3,
+            },
+            source_path=str(tmp_path / "scan.pdf"),
+            timestamp=datetime(2026, 4, 27, tzinfo=UTC),
+        )
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        markdown = ingestor.convert_to_markdown(fragment)
+        assert markdown.startswith("![[scan.pdf#page=3]]")
+        assert "OCR'd page 3 body" in markdown
+
+    def test_image_fragment_without_page_omits_anchor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Standalone image fragments use the bare ``![[name]]`` embed."""
+        from creek.ingest.base import ParsedFragment
+
+        fragment = ParsedFragment(
+            content="hello",
+            metadata={
+                "original_file": str(tmp_path / "shot.png"),
+                "ocr_confidence": 0.9,
+                "image_type": "screenshot",
+                # ``page`` deliberately absent.
+            },
+            source_path=str(tmp_path / "shot.png"),
+            timestamp=datetime(2026, 4, 27, tzinfo=UTC),
+        )
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        markdown = ingestor.convert_to_markdown(fragment)
+        assert markdown.startswith("![[shot.png]]")
+        assert "#page=" not in markdown
+
 
 # ---- ImageIngestor.generate_frontmatter --------------------------------
 
