@@ -244,6 +244,33 @@ def report(
                 "[yellow]No voice profiles generated: "
                 "no qualifying exemplars found.[/yellow]",
             )
+    elif type == "wavelength":
+        from datetime import date as _date
+
+        from creek.generate.wavelength import WavelengthTracker
+
+        if period not in {"weekly", "monthly"}:
+            console.print(
+                "[red]--period must be 'weekly' or 'monthly' for "
+                "wavelength reports.[/red]",
+            )
+            raise typer.Exit(code=2)
+        wavelength_tracker = WavelengthTracker()
+        today = _date.today()
+        if period == "weekly":
+            wavelength_path = wavelength_tracker.generate_weekly_report(
+                vault_path,
+                week_of=today,
+            )
+        else:
+            wavelength_path = wavelength_tracker.generate_monthly_report(
+                vault_path,
+                month=today,
+            )
+        console.print(
+            f"[bold green]Wavelength {period} report generated: "
+            f"{wavelength_path}[/bold green]",
+        )
     else:
         console.print(
             f"[bold green]Would report: type={type}, "

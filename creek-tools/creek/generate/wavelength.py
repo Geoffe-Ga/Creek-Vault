@@ -20,13 +20,13 @@ from datetime import date, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
+from pydantic import ValidationError
 
-from creek.models import Dosage, Frequency, Mode, Phase
+from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    from creek.models import Fragment
 
 
 DEFAULT_WINDOW_DAYS: int = 7
@@ -43,6 +43,174 @@ DEFAULT_TOXIC_CONSECUTIVE_WEEKS: int = 3
 
 _VALID_PERIODS: frozenset[str] = frozenset({"weekly", "monthly"})
 """Accepted period strings for :meth:`WavelengthTracker.generate_report`."""
+
+
+_NOTABLE_FRAGMENT_LIMIT: int = 5
+"""Maximum number of Notable Fragments listed per report."""
+
+_MAX_BAR_WIDTH: int = 20
+"""Cap for ASCII bar widths in the week-by-week progression chart.
+
+Without a cap a busy month (50+ fragments in one week) renders an
+unreadable 50+-character bar. Twenty is enough to compare relative
+volumes while staying within terminal/Obsidian-pane widths.
+"""
+
+_CONFIDENCE_RANK: dict[str, int] = {
+    "conviction": 5,
+    "settled": 4,
+    "forming": 3,
+    "exploring": 2,
+    "musing": 1,
+}
+"""Ordinal rank of voice confidence levels for notable-fragment selection."""
+
+_PHASE_DESCRIPTIONS: dict[str, str] = {
+    Phase.RISING.value: (
+        "Energy building, ideas forming, momentum gathering. "
+        "Abundance begins to create indulgence."
+    ),
+    Phase.PEAKING.value: (
+        "Full expression, maximum creative or spiritual output. Abundance peaks."
+    ),
+    Phase.WITHDRAWAL.value: (
+        "First cracks appear, energy turns inward. Indulgence creates scarcity."
+    ),
+    Phase.DIMINISHING.value: (
+        "Active decline, contraction, things falling apart. "
+        "Scarcity begins to create resilience."
+    ),
+    Phase.BOTTOMING_OUT.value: (
+        "Lowest point, maximum contraction, dark-night material. Scarcity peaks."
+    ),
+    Phase.RESTORATION.value: (
+        "Return begins, new energy gathering, re-emergence. "
+        "Resilience creates abundance."
+    ),
+    Phase.UNCLASSIFIED.value: (
+        "No dominant phase signal in the period — the wavelength is quiet."
+    ),
+}
+"""One-line phase descriptions adapted from ontology §7.1."""
+
+PHASE_DOMAIN_MAPPINGS: dict[str, dict[str, str]] = {
+    Phase.RISING.value: {
+        "season": "Summer",
+        "mood": "Mania",
+        "spaciousness": "Expanded",
+        "relation_to_others": "Belonging",
+        "relation_to_self": "Esteem",
+        "buddhist_attachment": "Attraction",
+        "meditation": "Redirecting attention",
+        "breath": "Inhale end",
+    },
+    Phase.PEAKING.value: {
+        "season": "Summer Solstice",
+        "mood": "Mania",
+        "spaciousness": "Expanded",
+        "relation_to_others": "Belonging",
+        "relation_to_self": "Esteem",
+        "buddhist_attachment": "Attraction",
+        "meditation": "Absorption",
+        "breath": "Hold in",
+    },
+    Phase.WITHDRAWAL.value: {
+        "season": "Fall",
+        "mood": "Mania",
+        "spaciousness": "Expanded",
+        "relation_to_others": "Alienation",
+        "relation_to_self": "Doubt",
+        "buddhist_attachment": "Aversion",
+        "meditation": "Distraction",
+        "breath": "Exhale begin",
+    },
+    Phase.DIMINISHING.value: {
+        "season": "Winter",
+        "mood": "Depression",
+        "spaciousness": "Contracted",
+        "relation_to_others": "Alienation",
+        "relation_to_self": "Doubt",
+        "buddhist_attachment": "Aversion",
+        "meditation": "Forgetting",
+        "breath": "Exhale end",
+    },
+    Phase.BOTTOMING_OUT.value: {
+        "season": "Winter Solstice",
+        "mood": "Depression",
+        "spaciousness": "Contracted",
+        "relation_to_others": "Alienation",
+        "relation_to_self": "Doubt",
+        "buddhist_attachment": "Aversion",
+        "meditation": "Mind wandering",
+        "breath": "Hold out",
+    },
+    Phase.RESTORATION.value: {
+        "season": "Spring",
+        "mood": "Depression",
+        "spaciousness": "Contracted",
+        "relation_to_others": "Belonging",
+        "relation_to_self": "Esteem",
+        "buddhist_attachment": "Attraction",
+        "meditation": "Waking up",
+        "breath": "Inhale begin",
+    },
+}
+"""§7.1 cross-domain mapping per phase: Season, Mood, Spaciousness,
+Relation to Others / Self, Buddhist Attachment, Meditation, Breath.
+
+Used by :meth:`WavelengthTracker.generate_weekly_report` and
+:meth:`WavelengthTracker.generate_monthly_report` to render the
+``Domain Mappings`` block.
+
+The ``unclassified`` phase has no row by design: domain mappings are
+ontology assertions about a real phase, and rendering "Season:
+unclassified" would invent a mapping that does not exist. Renderers
+fall back to a placeholder when the dominant phase is unclassified.
+"""
+
+_DOMAIN_LABELS: list[tuple[str, str]] = [
+    ("season", "Season"),
+    ("mood", "Mood (bipolar frame)"),
+    ("spaciousness", "Spaciousness"),
+    ("relation_to_others", "Relation to Others"),
+    ("relation_to_self", "Relation to Self"),
+    ("buddhist_attachment", "Buddhist Attachment"),
+    ("meditation", "Meditation"),
+    ("breath", "Breath"),
+]
+
+
+def _safe_post(md_file: Path) -> frontmatter.Post | None:
+    """Return a parsed frontmatter post, or ``None`` on parse errors."""
+    try:
+        return frontmatter.load(str(md_file))
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+
+
+def _load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
+    """Load every classified fragment from ``01-Fragments/`` under *vault_path*.
+
+    Files that fail to parse or that lack the ``type: fragment`` marker
+    are silently skipped. Returns an empty list when the folder is
+    absent.
+    """
+    root = vault_path / "01-Fragments"
+    if not root.exists():
+        return []
+    fragments: list[Fragment] = []
+    for md_file in sorted(root.rglob("*.md")):
+        post = _safe_post(md_file)
+        if post is None:
+            continue
+        metadata = dict(post.metadata)
+        if metadata.get("type") != "fragment":
+            continue
+        try:
+            fragments.append(Fragment.model_validate(metadata))
+        except ValidationError:
+            continue
+    return fragments
 
 
 @dataclass
@@ -525,6 +693,185 @@ class WavelengthTracker:
         lines.extend(_render_dataview_section())
         return "\n".join(lines)
 
+    def generate_weekly_report(
+        self,
+        vault_path: Path,
+        week_of: date,
+        fragments: list[Fragment] | None = None,
+    ) -> Path:
+        """Write a §7.1-shaped weekly wavelength report to ``Phase-Maps/``.
+
+        The report covers the ISO week containing *week_of*. Sections:
+        Phase Summary, Domain Mappings, Mode Distribution, Dosage
+        Balance, Emotional Texture Cloud, Notable Fragments, Transition
+        Watch. Language is descriptive only — never prescriptive.
+
+        Args:
+            vault_path: Vault root.
+            week_of: Any date within the target ISO week.
+            fragments: Optional pre-loaded fragments. When ``None`` the
+                method scans ``vault_path/01-Fragments`` and loads all
+                classified fragments itself.
+
+        Returns:
+            Path to the written ``YYYY-WNN-wavelength.md`` file.
+        """
+        loaded = (
+            fragments
+            if fragments is not None
+            else _load_fragments_from_vault(vault_path)
+        )
+        start = _week_start(week_of)
+        end = start + timedelta(days=6)
+        in_window = [f for f in loaded if _fragment_in_window(f, start, end)]
+        snapshot = self.analyze_period(in_window, start, end)
+        transitions = self._weekly_transition_watch(loaded, start)
+        trend = self.track_dosage_trends(loaded)
+
+        iso_year, iso_week, _ = week_of.isocalendar()
+        body = _render_weekly_body(
+            snapshot,
+            in_window,
+            trend,
+            transitions,
+        )
+        post = frontmatter.Post(
+            content=body,
+            type="wavelength_report",
+            period="weekly",
+            week=iso_week,
+            year=iso_year,
+            generated_on=date.today().isoformat(),
+            tags=["wavelength", "wavelength-weekly"],
+        )
+        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        note_path = target_dir / f"{iso_year}-W{iso_week:02d}-wavelength.md"
+        note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return note_path
+
+    def generate_monthly_report(
+        self,
+        vault_path: Path,
+        month: date,
+        fragments: list[Fragment] | None = None,
+    ) -> Path:
+        """Write a §7.1-shaped monthly wavelength report to ``Phase-Maps/``.
+
+        The report aggregates the calendar month containing *month*.
+        Same sections as :meth:`generate_weekly_report` plus a
+        week-by-week ASCII progression chart and a month-over-month
+        comparison.
+
+        Args:
+            vault_path: Vault root.
+            month: Any date within the target month.
+            fragments: Optional pre-loaded fragments. When ``None`` the
+                method scans ``vault_path/01-Fragments``.
+
+        Returns:
+            Path to the written ``YYYY-MM-wavelength.md`` file.
+        """
+        loaded = (
+            fragments
+            if fragments is not None
+            else _load_fragments_from_vault(vault_path)
+        )
+        start, end = _month_bounds(month)
+        in_window = [f for f in loaded if _fragment_in_window(f, start, end)]
+        snapshot = self.analyze_period(in_window, start, end)
+        weekly_snapshots = self._weekly_snapshots(in_window, start, end)
+        prev_start, prev_end = _month_bounds(start - timedelta(days=1))
+        prev_window = [
+            f for f in loaded if _fragment_in_window(f, prev_start, prev_end)
+        ]
+        prev_snapshot = self.analyze_period(prev_window, prev_start, prev_end)
+        transitions = self.detect_transitions(weekly_snapshots)
+        trend = self.track_dosage_trends(loaded)
+
+        body = _render_monthly_body(
+            snapshot,
+            weekly_snapshots,
+            prev_snapshot,
+            in_window,
+            trend,
+            transitions,
+        )
+        post = frontmatter.Post(
+            content=body,
+            type="wavelength_report",
+            period="monthly",
+            month=month.month,
+            year=month.year,
+            generated_on=date.today().isoformat(),
+            tags=["wavelength", "wavelength-monthly"],
+        )
+        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        note_path = target_dir / f"{month.year}-{month.month:02d}-wavelength.md"
+        note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return note_path
+
+    def _weekly_snapshots(
+        self,
+        fragments: list[Fragment],
+        start: date,
+        end: date,
+    ) -> list[WavelengthSnapshot]:
+        """Return one snapshot per ISO week between *start* and *end*."""
+        snapshots: list[WavelengthSnapshot] = []
+        cursor = _week_start(start)
+        while cursor <= end:
+            window_end = min(cursor + timedelta(days=6), end)
+            window = [
+                f for f in fragments if _fragment_in_window(f, cursor, window_end)
+            ]
+            snapshots.append(self.analyze_period(window, cursor, window_end))
+            cursor = window_end + timedelta(days=1)
+        return snapshots
+
+    def _weekly_transition_watch(
+        self,
+        fragments: list[Fragment],
+        target_week_start: date,
+    ) -> list[PhaseTransition]:
+        """Return any transition between the previous and target ISO week.
+
+        Args:
+            fragments: The full vault fragment set, not just the target
+                week. Transition detection needs the prior week's
+                fragments to compare against, so callers must pass the
+                unfiltered list.
+            target_week_start: Monday of the target ISO week.
+        """
+        prev_start = target_week_start - timedelta(days=7)
+        prev_end = target_week_start - timedelta(days=1)
+        target_end = target_week_start + timedelta(days=6)
+        prev_window = [
+            f for f in fragments if _fragment_in_window(f, prev_start, prev_end)
+        ]
+        target_window = [
+            f
+            for f in fragments
+            if _fragment_in_window(f, target_week_start, target_end)
+        ]
+        snapshots = [
+            self.analyze_period(prev_window, prev_start, prev_end),
+            self.analyze_period(target_window, target_week_start, target_end),
+        ]
+        return self.detect_transitions(snapshots)
+
+
+def _month_bounds(day: date) -> tuple[date, date]:
+    """Return ``(first_of_month, last_of_month)`` for the month of *day*."""
+    start = day.replace(day=1)
+    if start.month == 12:
+        next_month = start.replace(year=start.year + 1, month=1)
+    else:
+        next_month = start.replace(month=start.month + 1)
+    end = next_month - timedelta(days=1)
+    return start, end
+
 
 # ---- Report rendering helpers ----
 
@@ -640,11 +987,246 @@ def _render_dataview_section() -> list[str]:
     ]
 
 
+# ---- Weekly and monthly section renderers ----
+
+
+def _render_phase_summary(snapshot: WavelengthSnapshot) -> list[str]:
+    """Render the ``Phase Summary`` section with the §7.1 description."""
+    description = _PHASE_DESCRIPTIONS.get(
+        snapshot.dominant_phase,
+        _PHASE_DESCRIPTIONS[Phase.UNCLASSIFIED.value],
+    )
+    return [
+        "## Phase Summary",
+        "",
+        f"- Dominant phase: **{snapshot.dominant_phase}**",
+        f"- Classification confidence: {snapshot.confidence:.2f}",
+        f"- Fragments observed: {snapshot.fragment_count}",
+        f"- {description}",
+        "",
+    ]
+
+
+def _render_domain_mappings(snapshot: WavelengthSnapshot) -> list[str]:
+    """Render the §7.1 cross-domain mappings for the dominant phase."""
+    lines = ["## Domain Mappings", ""]
+    mapping = PHASE_DOMAIN_MAPPINGS.get(snapshot.dominant_phase)
+    if mapping is None:
+        lines.append("_No mapping available — dominant phase is unclassified._")
+        lines.append("")
+        return lines
+    for key, label in _DOMAIN_LABELS:
+        lines.append(f"- **{label}**: {mapping[key]}")
+    lines.append("")
+    return lines
+
+
+def _render_mode_distribution(fragments: list[Fragment]) -> list[str]:
+    """Render the ``Mode Distribution`` section as a counted list."""
+    lines = ["## Mode Distribution", ""]
+    counts: Counter[str] = Counter(
+        str(f.wavelength.mode)
+        for f in fragments
+        if str(f.wavelength.mode) and str(f.wavelength.mode) != Mode.UNCLASSIFIED.value
+    )
+    if not counts:
+        lines.append("_No classified modes in this period._")
+        lines.append("")
+        return lines
+    for mode, count in counts.most_common():
+        lines.append(f"- `{mode}`: {count}")
+    lines.append("")
+    return lines
+
+
+def _render_dosage_balance(snapshot: WavelengthSnapshot) -> list[str]:
+    """Render the ``Dosage Balance`` section with medicine vs toxic shares."""
+    return [
+        "## Dosage Balance",
+        "",
+        f"- Medicine share: {snapshot.medicine_percent * 100:.1f}%",
+        f"- Toxic share: {snapshot.toxic_percent * 100:.1f}%",
+        "",
+    ]
+
+
+def _render_emotional_texture_cloud(
+    snapshots: list[WavelengthSnapshot],
+) -> list[str]:
+    """Render the ``Emotional Texture Cloud`` aggregated across snapshots."""
+    lines = ["## Emotional Texture Cloud", ""]
+    merged: Counter[str] = Counter()
+    for snap in snapshots:
+        for tag, count in snap.emotional_texture_cloud:
+            merged[tag] += count
+    if not merged:
+        lines.append("_No emotional texture tags recorded._")
+        lines.append("")
+        return lines
+    cloud = " ".join(f"{tag}({count})" for tag, count in merged.most_common())
+    lines.append(cloud)
+    lines.append("")
+    return lines
+
+
+def _render_notable_fragments(fragments: list[Fragment]) -> list[str]:
+    """Render up to ``_NOTABLE_FRAGMENT_LIMIT`` highest-confidence fragments."""
+    lines = ["## Notable Fragments", ""]
+    if not fragments:
+        lines.append("_No fragments observed in this period._")
+        lines.append("")
+        return lines
+    ranked = sorted(
+        fragments,
+        key=_notable_fragment_score,
+        reverse=True,
+    )
+    for fragment in ranked[:_NOTABLE_FRAGMENT_LIMIT]:
+        lines.append(
+            f"- [[{fragment.id}]] — *{fragment.title}* "
+            f"(phase: {fragment.wavelength.phase})",
+        )
+    lines.append("")
+    return lines
+
+
+def _notable_fragment_score(fragment: Fragment) -> tuple[int, str]:
+    """Score a fragment for notable-selection: confidence rank, then ID."""
+    confidence = fragment.voice.confidence
+    rank = _CONFIDENCE_RANK.get(str(confidence), 0) if confidence is not None else 0
+    return (rank, fragment.id)
+
+
+def _render_transition_watch(
+    snapshot: WavelengthSnapshot,
+    transitions: list[PhaseTransition],
+) -> list[str]:
+    """Render the ``Transition Watch`` section in descriptive language."""
+    lines = ["## Transition Watch", ""]
+    if transitions:
+        for trans in transitions:
+            lines.append(
+                f"- A shift from `{trans.from_phase}` to `{trans.to_phase}` "
+                f"appears between {trans.from_date.isoformat()} and "
+                f"{trans.to_date.isoformat()}.",
+            )
+    else:
+        lines.append(
+            f"- No phase transition appears in this period; the "
+            f"`{snapshot.dominant_phase}` reading is steady.",
+        )
+    lines.append("")
+    return lines
+
+
+def _render_week_by_week_chart(snapshots: list[WavelengthSnapshot]) -> list[str]:
+    """Render the ASCII week-by-week phase progression chart.
+
+    Bar width is capped at :data:`_MAX_BAR_WIDTH` characters so a busy
+    week does not blow out the chart. Zero-fragment weeks render
+    ``(empty)`` rather than a stray ``#`` so "no activity" is visually
+    distinct from "one fragment".
+    """
+    lines = ["## Week-by-Week Progression", ""]
+    if not snapshots:
+        lines.append("_No weekly snapshots in this month._")
+        lines.append("")
+        return lines
+    for index, snap in enumerate(snapshots, start=1):
+        if snap.fragment_count == 0:
+            bar = "(empty)"
+        else:
+            bar = "#" * min(snap.fragment_count, _MAX_BAR_WIDTH)
+        lines.append(
+            f"- Week {index:02d} ({snap.start_date.isoformat()}): "
+            f"{bar} {snap.dominant_phase} "
+            f"({snap.fragment_count} fragments)",
+        )
+    lines.append("")
+    return lines
+
+
+def _render_month_over_month(
+    current: WavelengthSnapshot,
+    previous: WavelengthSnapshot,
+) -> list[str]:
+    """Render the ``Month-over-Month`` comparison block."""
+    lines = ["## Month-over-Month", ""]
+    if previous.fragment_count == 0:
+        lines.append(
+            "_No prior month data to compare against._",
+        )
+        lines.append("")
+        return lines
+    delta = current.fragment_count - previous.fragment_count
+    direction = (
+        "more" if delta > 0 else ("fewer" if delta < 0 else "the same number of")
+    )
+    lines.append(
+        f"- Previous month dominant phase: `{previous.dominant_phase}` "
+        f"({previous.fragment_count} fragments)",
+    )
+    lines.append(
+        f"- This month dominant phase: `{current.dominant_phase}` "
+        f"({current.fragment_count} fragments)",
+    )
+    lines.append(
+        f"- Volume change: {direction} fragments ({delta:+d}).",
+    )
+    lines.append("")
+    return lines
+
+
+def _render_weekly_body(
+    snapshot: WavelengthSnapshot,
+    fragments: list[Fragment],
+    trend: DosageTrend,
+    transitions: list[PhaseTransition],
+) -> str:
+    """Compose the markdown body for a weekly report."""
+    lines: list[str] = []
+    lines.extend(_render_phase_summary(snapshot))
+    lines.extend(_render_domain_mappings(snapshot))
+    lines.extend(_render_mode_distribution(fragments))
+    lines.extend(_render_dosage_balance(snapshot))
+    lines.extend(_render_emotional_texture_cloud([snapshot]))
+    lines.extend(_render_notable_fragments(fragments))
+    lines.extend(_render_transition_watch(snapshot, transitions))
+    lines.extend(_render_dosage_trends(trend))
+    lines.extend(_render_dataview_section())
+    return "\n".join(lines)
+
+
+def _render_monthly_body(
+    snapshot: WavelengthSnapshot,
+    weekly_snapshots: list[WavelengthSnapshot],
+    previous_month: WavelengthSnapshot,
+    fragments: list[Fragment],
+    trend: DosageTrend,
+    transitions: list[PhaseTransition],
+) -> str:
+    """Compose the markdown body for a monthly report."""
+    lines: list[str] = []
+    lines.extend(_render_phase_summary(snapshot))
+    lines.extend(_render_domain_mappings(snapshot))
+    lines.extend(_render_mode_distribution(fragments))
+    lines.extend(_render_dosage_balance(snapshot))
+    lines.extend(_render_emotional_texture_cloud(weekly_snapshots))
+    lines.extend(_render_notable_fragments(fragments))
+    lines.extend(_render_transition_watch(snapshot, transitions))
+    lines.extend(_render_week_by_week_chart(weekly_snapshots))
+    lines.extend(_render_month_over_month(snapshot, previous_month))
+    lines.extend(_render_dosage_trends(trend))
+    lines.extend(_render_dataview_section())
+    return "\n".join(lines)
+
+
 __all__ = [
     "DEFAULT_ROLLING_WEEKS",
     "DEFAULT_TOXIC_CONSECUTIVE_WEEKS",
     "DEFAULT_TOXIC_THRESHOLD",
     "DEFAULT_WINDOW_DAYS",
+    "PHASE_DOMAIN_MAPPINGS",
     "DosageTrend",
     "PhaseTransition",
     "WavelengthSnapshot",

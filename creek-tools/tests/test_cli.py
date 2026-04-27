@@ -276,6 +276,67 @@ def test_report_voice_command(tmp_path: Path) -> None:
     assert (vault / "07-Voice" / "confessional-profile.md").is_file()
 
 
+def test_report_wavelength_weekly_command(tmp_path: Path) -> None:
+    """Test that report --type wavelength --period weekly produces a file."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "wavelength",
+            "--period",
+            "weekly",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Wavelength weekly report generated" in result.output
+    assert list((vault / "05-Wavelength" / "Phase-Maps").glob("*.md"))
+
+
+def test_report_wavelength_monthly_command(tmp_path: Path) -> None:
+    """Test that report --type wavelength --period monthly produces a file."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "wavelength",
+            "--period",
+            "monthly",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Wavelength monthly report generated" in result.output
+
+
+def test_report_wavelength_unknown_period_errors(tmp_path: Path) -> None:
+    """Test that wavelength report rejects an unknown period with exit 2."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "wavelength",
+            "--period",
+            "yearly",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "weekly" in result.output
+
+
 def test_report_command() -> None:
     """Test that report command runs with required args."""
     result = runner.invoke(
