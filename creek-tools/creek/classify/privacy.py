@@ -8,7 +8,11 @@ Section 13.2 of the Creek Ontology defines three privacy tiers:
   channels. Auto-process the bulk; flag genuinely sensitive content.
 * ``INTIMATE`` — journal entries, recovery-related text, and
   high-confidence confessional voice. Always reviewed by a human and
-  excluded from voice proxy generation.
+  excluded from voice proxy generation. Per the
+  :class:`~creek.models.PrivacyTier` docstring, ``INTIMATE`` is
+  reserved for self-authored content; AI-authored fragments
+  (``Authorship.AI`` etc.) are never silently elevated to ``INTIMATE``
+  by content signals.
 
 When in doubt the classifier returns :class:`PrivacyTier.PERSONAL`
 rather than :class:`PrivacyTier.PUBLIC` — leaking content the user
@@ -17,9 +21,11 @@ considered private is far worse than the inverse.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from creek.models import (
+    Authorship,
     Confidence,
     PrivacyTier,
     SourcePlatform,
@@ -37,10 +43,13 @@ RECOVERY_KEYWORDS: frozenset[str] = frozenset(
         "relapse",
         "sponsor",
         "dharma",
-        "meeting",
         "step work",
         "amends",
-        "inventory",
+        "aa meeting",
+        "na meeting",
+        "recovery meeting",
+        "moral inventory",
+        "step inventory",
     },
 )
 """Keywords that flag a fragment as recovery-related and therefore INTIMATE.
@@ -48,14 +57,24 @@ RECOVERY_KEYWORDS: frozenset[str] = frozenset(
 The list intentionally errs on the side of high-recall: false positives
 land in INTIMATE (extra review), false negatives risk publishing
 something the user considered private. See ontology §13.2.
+
+The bare words ``meeting`` and ``inventory`` are too common in
+non-recovery contexts (work meetings, stock inventories) to use
+unscoped, so this set scopes them via the canonical recovery phrases
+``aa meeting``, ``na meeting``, ``recovery meeting``,
+``moral inventory`` and ``step inventory``.
 """
 
 
-_PUBLIC_PLATFORMS: frozenset[SourcePlatform] = frozenset(
-    {SourcePlatform.ESSAY},
-)
+_PRIVATE_DISCORD_TOKENS: frozenset[str] = frozenset({"dm", "private"})
+"""Channel-name tokens that mark a Discord fragment as PERSONAL.
 
-_PRIVATE_DISCORD_HINTS: frozenset[str] = frozenset({"dm", "private"})
+Matched against tokens (split on common separators) rather than as
+substrings so that channels like ``#admin`` are not falsely flagged by
+the substring ``dm``.
+"""
+
+_CHANNEL_TOKEN_SPLIT: re.Pattern[str] = re.compile(r"[-_\s/]+")
 
 
 class PrivacyClassifier:
@@ -91,33 +110,42 @@ class PrivacyClassifier:
 
         Order of checks (first match wins):
 
-        1. Recovery keyword in title or body → :class:`PrivacyTier.INTIMATE`.
-        2. Journal source → :class:`PrivacyTier.INTIMATE`.
-        3. Confessional register with conviction → ``INTIMATE``.
+        1. Self-authored + recovery keyword in title or body → ``INTIMATE``.
+        2. Self-authored journal source → ``INTIMATE``.
+        3. Self-authored confessional register with conviction → ``INTIMATE``.
         4. Essay source → :class:`PrivacyTier.PUBLIC`.
         5. Discord with a non-DM channel name → ``PUBLIC``.
-        6. Anything else (chatbots, DMs, unmapped sources) → ``PERSONAL``.
+        6. Anything else (chatbots, DMs, unmapped sources, AI-authored
+           content with sensitive keywords) → ``PERSONAL``.
+
+        ``INTIMATE`` is gated on :class:`Authorship.SELF` per the
+        :class:`~creek.models.PrivacyTier` model docstring; AI- or
+        other-authored fragments cannot be elevated to ``INTIMATE`` via
+        content signals.
 
         Args:
             fragment: The fragment to classify.
             content: Optional body text scanned for recovery keywords.
+                Callers must pass the raw body explicitly — the
+                ``Fragment`` model does not carry the body text.
 
         Returns:
             The assigned :class:`PrivacyTier`.
         """
-        if self._has_recovery_content(fragment, content):
-            return PrivacyTier.INTIMATE
         platform = SourcePlatform(fragment.source.platform)
-        if platform == SourcePlatform.JOURNAL:
-            return PrivacyTier.INTIMATE
-        if self._is_high_confidence_confessional(fragment):
-            return PrivacyTier.INTIMATE
-        if platform in _PUBLIC_PLATFORMS:
+        if self._is_self_authored(fragment):
+            if self._has_recovery_content(fragment, content):
+                return PrivacyTier.INTIMATE
+            if platform == SourcePlatform.JOURNAL:
+                return PrivacyTier.INTIMATE
+            if self._is_high_confidence_confessional(fragment):
+                return PrivacyTier.INTIMATE
+        if platform == SourcePlatform.ESSAY:
             return PrivacyTier.PUBLIC
         if platform == SourcePlatform.DISCORD:
             return self._classify_discord(fragment)
-        # Chatbot conversations and every other unmapped source default
-        # to PERSONAL — leaking content is worse than over-restricting.
+        # Chatbots, DMs, unmapped sources, AI-authored sensitive content
+        # → PERSONAL. Leaking content is worse than over-restricting.
         return PrivacyTier.PERSONAL
 
     def enforce_tier(
@@ -127,24 +155,29 @@ class PrivacyClassifier:
     ) -> Fragment:
         """Apply *tier*-specific handling rules and return a new fragment.
 
-        * ``INTIMATE`` sets :attr:`Fragment.voice_proxy_eligible` to ``False``.
-          Combined with the review queue's INTIMATE check, this means
-          intimate fragments are both excluded from voice proxy
-          generation and surfaced for human review.
-        * ``PUBLIC`` and ``PERSONAL`` keep voice-proxy eligibility.
+        The resulting fragment carries:
+
+        * ``privacy_tier`` set to *tier*.
+        * ``voice_proxy_eligible`` set to ``False`` for ``INTIMATE`` and
+          ``True`` for ``PUBLIC`` and ``PERSONAL``. The reset on
+          downgrade matters: a fragment previously enforced as
+          ``INTIMATE`` and later re-classified to ``PERSONAL`` would
+          otherwise stay opted out of voice proxy generation.
 
         Args:
             fragment: The fragment to update. Not mutated.
             tier: The privacy tier to apply.
 
         Returns:
-            A new :class:`Fragment` with ``privacy_tier`` and (when
-            relevant) ``voice_proxy_eligible`` updated.
+            A new :class:`Fragment` with ``privacy_tier`` and
+            ``voice_proxy_eligible`` set to match *tier*.
         """
-        updates: dict[str, object] = {"privacy_tier": tier}
-        if tier == PrivacyTier.INTIMATE:
-            updates["voice_proxy_eligible"] = False
-        return fragment.model_copy(update=updates)
+        return fragment.model_copy(
+            update={
+                "privacy_tier": tier,
+                "voice_proxy_eligible": tier != PrivacyTier.INTIMATE,
+            },
+        )
 
     def classify_and_enforce(
         self,
@@ -156,7 +189,8 @@ class PrivacyClassifier:
         Args:
             fragment: The fragment to classify and update.
             content: Optional body text passed through to
-                :meth:`classify_tier`.
+                :meth:`classify_tier`. Callers must pass the raw body
+                explicitly to enable recovery-keyword detection.
 
         Returns:
             A new :class:`Fragment` with the assigned tier and any
@@ -164,6 +198,11 @@ class PrivacyClassifier:
         """
         tier = self.classify_tier(fragment, content=content)
         return self.enforce_tier(fragment, tier)
+
+    @staticmethod
+    def _is_self_authored(fragment: Fragment) -> bool:
+        """Return ``True`` when the fragment carries the user's own words."""
+        return Authorship(fragment.source.author) == Authorship.SELF
 
     def _has_recovery_content(self, fragment: Fragment, content: str) -> bool:
         """Return ``True`` if any recovery keyword appears in title or body."""
@@ -184,10 +223,18 @@ class PrivacyClassifier:
 
     @staticmethod
     def _classify_discord(fragment: Fragment) -> PrivacyTier:
-        """Map a Discord fragment to PUBLIC / PERSONAL by channel hint."""
-        channel = (fragment.source.channel or "").lower()
+        """Map a Discord fragment to PUBLIC / PERSONAL by channel hint.
+
+        The channel name is split into tokens on common separators
+        (``-``, ``_``, whitespace, ``/``) and each token is checked for
+        exact membership in :data:`_PRIVATE_DISCORD_TOKENS`. Token-level
+        matching prevents substrings like ``dm`` from triggering on
+        unrelated channel names like ``admin`` or ``stream``.
+        """
+        channel = (fragment.source.channel or "").strip().lower()
         if not channel:
             return PrivacyTier.PERSONAL
-        if any(hint in channel for hint in _PRIVATE_DISCORD_HINTS):
+        tokens = {token for token in _CHANNEL_TOKEN_SPLIT.split(channel) if token}
+        if tokens & _PRIVATE_DISCORD_TOKENS:
             return PrivacyTier.PERSONAL
         return PrivacyTier.PUBLIC
