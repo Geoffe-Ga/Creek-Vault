@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from creek.config import ClassificationConfig
-from creek.models import Confidence, Fragment, Frequency
+from creek.models import Confidence, Fragment, Frequency, PrivacyTier
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,7 @@ class ReviewQueueGenerator:
         - Its primary frequency is UNCLASSIFIED
         - Its source platform is in the human_review_sources list
         - Its voice confidence is None or in the low-confidence set
+        - Its privacy tier is INTIMATE (per ontology §13.2)
 
         Args:
             fragment: The fragment to evaluate.
@@ -58,6 +59,9 @@ class ReviewQueueGenerator:
         Returns:
             True if the fragment should be reviewed by a human.
         """
+        if fragment.privacy_tier == PrivacyTier.INTIMATE:
+            return True
+
         if fragment.frequency.primary == Frequency.UNCLASSIFIED:
             return True
 
