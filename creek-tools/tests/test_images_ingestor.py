@@ -1,4 +1,4 @@
-"""Tests for the Image/OCR ingestor (issue #54)."""
+"""Tests for the Image/OCR ingestor."""
 
 from __future__ import annotations
 
@@ -13,10 +13,8 @@ from creek.ingest.images import (
     OcrEngine,
     OcrResult,
     PytesseractOcrEngine,
+    PytesseractUnavailableError,
     detect_image_type,
-)
-from creek.ingest.images import (
-    PytesseractUnavailableError as PytesseractMissingError,
 )
 from creek.models import SourcePlatform
 
@@ -49,7 +47,6 @@ class StubOcrEngine:
         return OcrResult(
             text=f"OCR text from {image_path.name}",
             confidence=0.9,
-            image_type="image",
         )
 
     def extract_pdf_pages(self, pdf_path: Path) -> list[OcrResult]:
@@ -181,6 +178,34 @@ class TestDiscover:
         ingestor = ImageIngestor(engine=StubOcrEngine())
         raws = ingestor.discover(tmp_path)
         assert {raw.path.name for raw in raws} == {"shout.PNG", "shout.JPG"}
+
+    def test_discover_single_image_file_returns_one_raw(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Calling discover with a single image file returns one RawDocument."""
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        raws = ingestor.discover(image_path)
+        assert len(raws) == 1
+        assert raws[0].path == image_path
+
+    def test_discover_single_non_image_file_returns_empty(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A non-image file passed directly is rejected, not OCR'd.
+
+        Without the extension guard, a stray ``.txt`` or ``.py`` could
+        flow into the OCR engine and produce noise — the document
+        ingestor pipeline routes non-images through other handlers.
+        """
+        text_path = tmp_path / "notes.txt"
+        text_path.write_text("hello", encoding="utf-8")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        raws = ingestor.discover(text_path)
+        assert raws == []
 
 
 # ---- ImageIngestor.parse + ingest --------------------------------------
@@ -406,7 +431,7 @@ class TestPytesseractOcrEngine:
         image_path = tmp_path / "x.png"
         _write_image(image_path)
         engine = PytesseractOcrEngine()
-        with pytest.raises(PytesseractMissingError, match="pytesseract"):
+        with pytest.raises(PytesseractUnavailableError, match="pytesseract"):
             engine.extract_text(image_path)
 
     def test_extract_pdf_pages_raises_when_pdf2image_missing(
@@ -417,7 +442,7 @@ class TestPytesseractOcrEngine:
         pdf_path = tmp_path / "x.pdf"
         pdf_path.write_bytes(b"%PDF-1.4")
         engine = PytesseractOcrEngine()
-        with pytest.raises(PytesseractMissingError):
+        with pytest.raises(PytesseractUnavailableError):
             engine.extract_pdf_pages(pdf_path)
 
 

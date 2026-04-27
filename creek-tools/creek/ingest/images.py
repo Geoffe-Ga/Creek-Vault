@@ -69,13 +69,16 @@ class OcrResult:
         confidence: OCR confidence in ``[0.0, 1.0]``.
         page: 1-based page index (PDFs); ``0`` for standalone images.
         image_type: One of ``screenshot``, ``photo_of_text``, ``diagram``,
-            ``scanned_pdf_page``, ``image``, ``other``.
+            ``scanned_pdf_page``, or ``other``. Defaults to ``"other"``
+            so a callers that build an ``OcrResult`` without classifying
+            the image still produces a value :func:`detect_image_type`
+            could return.
     """
 
     text: str
     confidence: float
     page: int = 0
-    image_type: str = "image"
+    image_type: str = "other"
 
 
 @runtime_checkable
@@ -224,14 +227,18 @@ def _average_confidence(conf_values: list[Any]) -> float:
     Tesseract reports confidences in ``0-100`` (or ``-1`` for missing).
     Empty or all-negative input returns ``0.0``.
     """
-    numeric = [float(v) for v in conf_values if _is_positive_number(v)]
+    numeric = [float(v) for v in conf_values if _is_non_negative_number(v)]
     if not numeric:
         return 0.0
     return sum(numeric) / len(numeric) / 100.0
 
 
-def _is_positive_number(value: Any) -> bool:
-    """Return ``True`` when *value* parses to a non-negative float."""
+def _is_non_negative_number(value: Any) -> bool:
+    """Return ``True`` when *value* parses to a non-negative float.
+
+    Used to filter tesseract's ``-1`` sentinel for "missing confidence"
+    while preserving the legitimate ``0`` value for "low confidence".
+    """
     try:
         return float(value) >= 0
     except (TypeError, ValueError):
@@ -288,13 +295,19 @@ class ImageIngestor(Ingestor):
         """Recursively find every supported image under *source_path*.
 
         Args:
-            source_path: Directory (or single file) to scan.
+            source_path: Directory (or single file) to scan. When given
+                a single file, only image extensions in
+                :data:`IMAGE_EXTENSIONS` are accepted; anything else
+                returns an empty list (the document ingestor pipeline
+                routes non-images elsewhere).
 
         Returns:
             A list of :class:`RawDocument` per discovered image.
         """
         if source_path.is_file():
-            paths = [source_path]
+            paths = (
+                [source_path] if source_path.suffix.lower() in IMAGE_EXTENSIONS else []
+            )
         else:
             paths = [
                 p
@@ -383,7 +396,7 @@ class ImageIngestor(Ingestor):
                     metadata={
                         "original_file": str(pdf_path),
                         "ocr_confidence": result.confidence,
-                        "image_type": result.image_type or "scanned_pdf_page",
+                        "image_type": result.image_type,
                         "language": self.language,
                         "page": result.page,
                     },
