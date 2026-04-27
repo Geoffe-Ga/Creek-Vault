@@ -75,8 +75,12 @@ def tracker() -> WavelengthTracker:
 
 @pytest.fixture()
 def vault_path(tmp_path: Path) -> Path:
-    """Return a vault root with the expected Phase-Maps folder."""
-    (tmp_path / "05-Wavelength" / "Phase-Maps").mkdir(parents=True, exist_ok=True)
+    """Return an empty vault root.
+
+    Both report methods create ``05-Wavelength/Phase-Maps`` themselves
+    via ``mkdir(parents=True, exist_ok=True)``, so the fixture does not
+    pre-create it.
+    """
     return tmp_path
 
 
@@ -355,7 +359,8 @@ class TestGenerateWeeklyReport:
         """When fragments are not passed, they are loaded from the vault."""
         frags_dir = vault_path / "01-Fragments"
         frags_dir.mkdir(parents=True, exist_ok=True)
-        for fragment in _week_fragments():
+        seeded = _week_fragments()
+        for fragment in seeded:
             data = fragment.model_dump(mode="json")
             post = frontmatter.Post(content=fragment.title, **data)
             (frags_dir / f"{fragment.id}.md").write_text(
@@ -368,6 +373,10 @@ class TestGenerateWeeklyReport:
         )
         body = frontmatter.load(str(path)).content
         assert "frag-rising-2" in body
+        # All four seeded fragments survive the round-trip and reach the
+        # report, not just the highest-confidence one.
+        for fragment in seeded:
+            assert fragment.id in body, fragment.id
 
 
 # ---- generate_monthly_report --------------------------------------------
@@ -498,6 +507,85 @@ class TestGenerateMonthlyReport:
             fragments=[in_month, out_of_month],
         )
         body = frontmatter.load(str(path)).content
-        assert "in-month" in body or "rising" in body.lower()
-        # The out-of-month fragment should not be listed as notable.
+        assert "in-month" in body
+        # The out-of-month fragment should not appear in any section.
         assert "out-of-month" not in body
+
+    def test_rerunning_same_month_overwrites_existing_report(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Generating the same month twice replaces the file in place."""
+        first = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2026, 4, 1),
+            fragments=_week_fragments(),
+        )
+        first_body_len = first.read_text(encoding="utf-8")
+        # Second run with empty fragments should still land at the same path
+        # and replace, not append to, the original.
+        second = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2026, 4, 1),
+            fragments=[],
+        )
+        assert second == first
+        assert second.read_text(encoding="utf-8") != first_body_len
+        # Only one wavelength markdown file should exist for this month.
+        files = list((vault_path / "05-Wavelength" / "Phase-Maps").glob("*.md"))
+        assert len(files) == 1
+
+    def test_week_by_week_chart_caps_bar_width(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """A busy week renders a capped bar, not 50+ ``#`` characters."""
+        base = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)  # Monday of ISO week 15
+        many = [
+            _make_fragment(
+                frag_id=f"frag-{i}",
+                created=base,
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+                dosage=Dosage.MEDICINE,
+                frequency=Frequency.F3,
+            )
+            for i in range(50)
+        ]
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2026, 4, 1),
+            fragments=many,
+        )
+        body = frontmatter.load(str(path)).content
+        # 50 ``#`` characters in a row would be a regression.
+        assert "#" * 30 not in body
+
+    def test_week_by_week_chart_marks_zero_fragment_weeks(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """An ``(empty)`` marker distinguishes silent weeks from one-fragment weeks.
+
+        Without the marker a zero-fragment week and a one-fragment week
+        would both render with no leading bar (or a stray ``#``), which
+        is misleading.
+        """
+        # Single fragment in week 1 of April; weeks 2-5 stay silent.
+        single = _make_fragment(
+            frag_id="single",
+            created=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            phase=Phase.RISING,
+            mode=Mode.EXPRESS,
+            dosage=Dosage.MEDICINE,
+        )
+        path = tracker.generate_monthly_report(
+            vault_path,
+            month=date(2026, 4, 1),
+            fragments=[single],
+        )
+        body = frontmatter.load(str(path)).content
+        assert "(empty)" in body

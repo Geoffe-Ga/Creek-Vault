@@ -48,6 +48,14 @@ _VALID_PERIODS: frozenset[str] = frozenset({"weekly", "monthly"})
 _NOTABLE_FRAGMENT_LIMIT: int = 5
 """Maximum number of Notable Fragments listed per report."""
 
+_MAX_BAR_WIDTH: int = 20
+"""Cap for ASCII bar widths in the week-by-week progression chart.
+
+Without a cap a busy month (50+ fragments in one week) renders an
+unreadable 50+-character bar. Twenty is enough to compare relative
+volumes while staying within terminal/Obsidian-pane widths.
+"""
+
 _CONFIDENCE_RANK: dict[str, int] = {
     "conviction": 5,
     "settled": 4,
@@ -153,6 +161,11 @@ Relation to Others / Self, Buddhist Attachment, Meditation, Breath.
 Used by :meth:`WavelengthTracker.generate_weekly_report` and
 :meth:`WavelengthTracker.generate_monthly_report` to render the
 ``Domain Mappings`` block.
+
+The ``unclassified`` phase has no row by design: domain mappings are
+ontology assertions about a real phase, and rendering "Season:
+unclassified" would invent a mapping that does not exist. Renderers
+fall back to a placeholder when the dominant phase is unclassified.
 """
 
 _DOMAIN_LABELS: list[tuple[str, str]] = [
@@ -822,7 +835,15 @@ class WavelengthTracker:
         fragments: list[Fragment],
         target_week_start: date,
     ) -> list[PhaseTransition]:
-        """Return any transition between the previous and target ISO week."""
+        """Return any transition between the previous and target ISO week.
+
+        Args:
+            fragments: The full vault fragment set, not just the target
+                week. Transition detection needs the prior week's
+                fragments to compare against, so callers must pass the
+                unfiltered list.
+            target_week_start: Monday of the target ISO week.
+        """
         prev_start = target_week_start - timedelta(days=7)
         prev_end = target_week_start - timedelta(days=1)
         target_end = target_week_start + timedelta(days=6)
@@ -966,7 +987,7 @@ def _render_dataview_section() -> list[str]:
     ]
 
 
-# ---- Issue #43 weekly/monthly section renderers ----
+# ---- Weekly and monthly section renderers ----
 
 
 def _render_phase_summary(snapshot: WavelengthSnapshot) -> list[str]:
@@ -1023,8 +1044,8 @@ def _render_dosage_balance(snapshot: WavelengthSnapshot) -> list[str]:
     return [
         "## Dosage Balance",
         "",
-        f"- Medicine share: {snapshot.medicine_percent:.2f}",
-        f"- Toxic share: {snapshot.toxic_percent:.2f}",
+        f"- Medicine share: {snapshot.medicine_percent * 100:.1f}%",
+        f"- Toxic share: {snapshot.toxic_percent * 100:.1f}%",
         "",
     ]
 
@@ -1099,14 +1120,23 @@ def _render_transition_watch(
 
 
 def _render_week_by_week_chart(snapshots: list[WavelengthSnapshot]) -> list[str]:
-    """Render the ASCII week-by-week phase progression chart."""
+    """Render the ASCII week-by-week phase progression chart.
+
+    Bar width is capped at :data:`_MAX_BAR_WIDTH` characters so a busy
+    week does not blow out the chart. Zero-fragment weeks render
+    ``(empty)`` rather than a stray ``#`` so "no activity" is visually
+    distinct from "one fragment".
+    """
     lines = ["## Week-by-Week Progression", ""]
     if not snapshots:
         lines.append("_No weekly snapshots in this month._")
         lines.append("")
         return lines
     for index, snap in enumerate(snapshots, start=1):
-        bar = "#" * max(1, snap.fragment_count)
+        if snap.fragment_count == 0:
+            bar = "(empty)"
+        else:
+            bar = "#" * min(snap.fragment_count, _MAX_BAR_WIDTH)
         lines.append(
             f"- Week {index:02d} ({snap.start_date.isoformat()}): "
             f"{bar} {snap.dominant_phase} "
