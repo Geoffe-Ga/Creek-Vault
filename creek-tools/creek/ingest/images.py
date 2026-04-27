@@ -51,10 +51,17 @@ _DEFAULT_LANGUAGE: str = "eng"
 
 _IMAGE_TYPE_HINTS: dict[str, tuple[str, ...]] = {
     "screenshot": ("screenshot", "screen-shot", "screen_shot", "screencap"),
-    "photo_of_text": ("scan", "scanned", "handwritten", "notebook", "page"),
+    "photo_of_text": ("scan", "scanned", "handwritten", "notebook"),
     "diagram": ("diagram", "chart", "schematic", "flowchart", "wireframe"),
 }
-"""Filename token hints used by :func:`detect_image_type`."""
+"""Filename token hints used by :func:`detect_image_type`.
+
+The dict is iterated in insertion order and the **first matching
+category wins** (priority: screenshot > photo_of_text > diagram).
+The bare token ``page`` is intentionally absent because substrings
+like ``webpage`` would falsely classify "webpage screenshot" as
+``photo_of_text``; ``scanned-page-3.jpg`` still matches via ``scan``.
+"""
 
 
 # ---- Public dataclasses + protocol --------------------------------------
@@ -254,6 +261,11 @@ def detect_image_type(path: Path) -> str:
     Returns one of ``screenshot``, ``photo_of_text``, ``diagram``, or
     ``other``. The classification is intentionally cheap — real
     content-aware detection is out of scope for this ingestor.
+
+    Matching is **first-wins** on the insertion order of
+    :data:`_IMAGE_TYPE_HINTS`: a filename matching both ``screenshot``
+    and ``photo_of_text`` hints (e.g. ``screenshot-of-scanned-page.png``)
+    is classified as ``screenshot``.
     """
     name = path.stem.lower()
     for category, hints in _IMAGE_TYPE_HINTS.items():
@@ -285,8 +297,14 @@ class ImageIngestor(Ingestor):
         Args:
             engine: Optional OCR backend. Defaults to a fresh
                 :class:`PytesseractOcrEngine` when ``None``.
-            language: Forwarded to the default engine when *engine*
-                is ``None``. Ignored otherwise.
+            language: Tesseract language code. When *engine* is
+                ``None`` the value is forwarded to the default
+                :class:`PytesseractOcrEngine`. When a custom engine is
+                supplied the engine owns its own language settings;
+                this attribute is then used **only** to tag parsed
+                fragments via the ``language`` metadata key, so callers
+                can reconcile per-fragment language with the engine
+                that produced them.
         """
         self.engine = engine if engine is not None else PytesseractOcrEngine(language)
         self.language = language
@@ -303,6 +321,14 @@ class ImageIngestor(Ingestor):
 
         Returns:
             A list of :class:`RawDocument` per discovered image.
+
+        Note:
+            Image bytes are *not* loaded into the returned
+            :class:`RawDocument` because :meth:`parse` (and the OCR
+            engine it delegates to) reads from disk via the file path.
+            For an image-heavy vault, eagerly reading every image into
+            memory at discovery time would be wasteful and could cause
+            OOM on large TIFFs or scanned PDFs.
         """
         if source_path.is_file():
             paths = (
@@ -317,7 +343,7 @@ class ImageIngestor(Ingestor):
         return [
             RawDocument(
                 path=path,
-                content=path.read_bytes(),
+                content=b"",
                 metadata={"original_file": str(path)},
                 detected_encoding="binary",
             )
@@ -375,9 +401,15 @@ class ImageIngestor(Ingestor):
     def ingest_pdf(self, pdf_path: Path) -> list[ParsedFragment]:
         """Run OCR on every page of *pdf_path* and return per-page fragments.
 
-        Used by :class:`~creek.ingest.documents.DocumentIngestor` (or a
-        future pipeline orchestrator) when a PDF is detected as
-        scanned. Pages with no recoverable text are skipped.
+        This is a deliberately separate entry point — the standard
+        :meth:`Ingestor.ingest` pipeline only handles file extensions
+        in :data:`IMAGE_EXTENSIONS`. Scanned PDFs are routed here from
+        :class:`~creek.ingest.documents.DocumentIngestor` (or a
+        higher-level orchestrator) once it detects via
+        ``_detect_scanned_pdf`` that text extraction won't work. Until
+        that integration lands, callers can invoke this method directly
+        on a known-scanned PDF. Pages with no recoverable text are
+        skipped.
 
         Args:
             pdf_path: Path to the (scanned) PDF.

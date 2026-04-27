@@ -14,6 +14,8 @@ from creek.ingest.images import (
     OcrResult,
     PytesseractOcrEngine,
     PytesseractUnavailableError,
+    _average_confidence,
+    _is_non_negative_number,
     detect_image_type,
 )
 from creek.models import SourcePlatform
@@ -33,14 +35,17 @@ class StubOcrEngine:
         image_results: dict[str, OcrResult] | None = None,
         pdf_results: dict[str, list[OcrResult]] | None = None,
     ) -> None:
+        """Seed canned results keyed by file name."""
         self._image_results = image_results or {}
         self._pdf_results = pdf_results or {}
         self.calls: list[str] = []
 
     def is_available(self) -> bool:
+        """Stub engines are always available — no system deps."""
         return True
 
     def extract_text(self, image_path: Path) -> OcrResult:
+        """Return the canned image result, or a deterministic fallback."""
         self.calls.append(str(image_path))
         if image_path.name in self._image_results:
             return self._image_results[image_path.name]
@@ -50,6 +55,7 @@ class StubOcrEngine:
         )
 
     def extract_pdf_pages(self, pdf_path: Path) -> list[OcrResult]:
+        """Return the canned PDF page results, or a single-page fallback."""
         self.calls.append(str(pdf_path))
         if pdf_path.name in self._pdf_results:
             return self._pdf_results[pdf_path.name]
@@ -205,7 +211,7 @@ class TestDiscover:
         text_path.write_text("hello", encoding="utf-8")
         ingestor = ImageIngestor(engine=StubOcrEngine())
         raws = ingestor.discover(text_path)
-        assert raws == []
+        assert not raws
 
 
 # ---- ImageIngestor.parse + ingest --------------------------------------
@@ -267,6 +273,14 @@ class TestParseAndIngest:
         fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
         assert fragments[0].source_path == str(image_path)
 
+    def test_parse_propagates_language_to_metadata(self, tmp_path: Path) -> None:
+        """The ingestor's configured language reaches fragment metadata."""
+        image_path = tmp_path / "ocr.png"
+        _write_image(image_path)
+        ingestor = ImageIngestor(engine=StubOcrEngine(), language="eng+fra")
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        assert fragments[0].metadata["language"] == "eng+fra"
+
     def test_parse_skips_empty_ocr_text(self, tmp_path: Path) -> None:
         """An image with no recoverable text yields no fragment."""
         image_path = tmp_path / "blank.png"
@@ -278,7 +292,7 @@ class TestParseAndIngest:
         )
         ingestor = ImageIngestor(engine=engine)
         fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
-        assert fragments == []
+        assert not fragments
 
     def test_full_ingest_pipeline_succeeds(self, tmp_path: Path) -> None:
         """The full ingest() pipeline returns a populated IngestResult."""
@@ -414,20 +428,71 @@ class TestIngestPdf:
 # ---- PytesseractOcrEngine ---------------------------------------------
 
 
-class TestPytesseractOcrEngine:
-    """Default OCR backend respects the optional-dep contract."""
+def _make_import_blocker(blocked_modules: set[str]) -> object:
+    """Build an ``__import__`` replacement that raises for *blocked_modules*.
 
-    def test_is_available_returns_false_when_pytesseract_missing(self) -> None:
+    Used to make :class:`PytesseractOcrEngine` tests deterministic
+    regardless of whether ``pytesseract`` / ``Pillow`` / ``pdf2image``
+    are installed in the surrounding environment.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked_import(
+        name: str,
+        module_globals: dict[str, object] | None = None,
+        module_locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        """Raise ImportError for blocked modules; defer everything else."""
+        root = name.split(".", 1)[0]
+        if root in blocked_modules or name in blocked_modules:
+            msg = f"mocked-missing: {name}"
+            raise ImportError(msg)
+        return real_import(name, module_globals, module_locals, fromlist, level)
+
+    return _blocked_import
+
+
+class TestPytesseractOcrEngine:
+    """Default OCR backend respects the optional-dep contract.
+
+    These tests deterministically simulate the missing-dep state by
+    monkeypatching ``builtins.__import__`` so they pass regardless of
+    whether pytesseract / Pillow / pdf2image happen to be installed in
+    the surrounding environment.
+    """
+
+    def test_is_available_returns_false_when_pytesseract_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Without pytesseract, the engine reports unavailable."""
-        # pytesseract is not installed in the test environment.
+        import builtins
+
+        monkeypatch.setattr(
+            builtins,
+            "__import__",
+            _make_import_blocker({"pytesseract", "PIL"}),
+        )
         engine = PytesseractOcrEngine()
-        assert engine.is_available() is False
+        assert not engine.is_available()
 
     def test_extract_text_raises_when_pytesseract_missing(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Calling extract_text without pytesseract raises a clear error."""
+        import builtins
+
+        monkeypatch.setattr(
+            builtins,
+            "__import__",
+            _make_import_blocker({"pytesseract", "PIL"}),
+        )
         image_path = tmp_path / "x.png"
         _write_image(image_path)
         engine = PytesseractOcrEngine()
@@ -437,13 +502,97 @@ class TestPytesseractOcrEngine:
     def test_extract_pdf_pages_raises_when_pdf2image_missing(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Calling extract_pdf_pages without deps raises a clear error."""
+        import builtins
+
+        monkeypatch.setattr(
+            builtins,
+            "__import__",
+            _make_import_blocker({"pytesseract", "pdf2image"}),
+        )
         pdf_path = tmp_path / "x.pdf"
         pdf_path.write_bytes(b"%PDF-1.4")
         engine = PytesseractOcrEngine()
         with pytest.raises(PytesseractUnavailableError):
             engine.extract_pdf_pages(pdf_path)
+
+
+# ---- Helper function unit tests ---------------------------------------
+
+
+class TestAverageConfidence:
+    """`_average_confidence` normalises tesseract's per-word values to [0, 1]."""
+
+    def test_empty_input_is_zero(self) -> None:
+        """An empty list returns 0.0 — there is no signal to average."""
+        assert _average_confidence([]) == 0.0
+
+    def test_all_negative_sentinels_is_zero(self) -> None:
+        """Tesseract uses -1 for "missing"; an all-negative list filters down to 0.0."""
+        assert _average_confidence([-1, -1, -1]) == 0.0
+
+    def test_negative_sentinels_are_filtered_out(self) -> None:
+        """Mixed input ignores negatives and averages only the non-negative values."""
+        # 100 + 50 average to 75, normalised to 0.75.
+        result = _average_confidence([100, 50, -1])
+        assert result == pytest.approx(0.75)
+
+    def test_zero_confidence_is_kept(self) -> None:
+        """A legitimate 0% confidence is *not* the same as the -1 sentinel."""
+        result = _average_confidence([0, 100])
+        assert result == pytest.approx(0.5)
+
+    def test_string_inputs_are_coerced(self) -> None:
+        """Tesseract's JSON output sometimes hands back strings; coerce gracefully."""
+        result = _average_confidence(["80", "60", "40"])
+        assert result == pytest.approx(0.6)
+
+    def test_unparseable_inputs_are_skipped(self) -> None:
+        """Junk values (None, non-numeric strings) are dropped, not exploded."""
+        result = _average_confidence([None, "junk", 80, 40])
+        assert result == pytest.approx(0.6)
+
+
+class TestIsNonNegativeNumber:
+    """`_is_non_negative_number` filters tesseract's -1 sentinel."""
+
+    @pytest.mark.parametrize("value", [0, 0.0, 1, 100, "0", "75"])
+    def test_non_negative_values_are_accepted(self, value: object) -> None:
+        """Zero, positive ints/floats, and numeric strings are kept."""
+        assert _is_non_negative_number(value)
+
+    @pytest.mark.parametrize("value", [-1, -0.5, "-1", "-100"])
+    def test_negative_values_are_rejected(self, value: object) -> None:
+        """Negative numbers (incl. tesseract's -1 sentinel) are filtered."""
+        assert not _is_non_negative_number(value)
+
+    @pytest.mark.parametrize("value", [None, "junk", object()])
+    def test_unparseable_values_are_rejected(self, value: object) -> None:
+        """Non-numeric input returns False rather than raising."""
+        assert not _is_non_negative_number(value)
+
+
+# ---- detect_image_type priority ---------------------------------------
+
+
+class TestDetectImageTypePriority:
+    """`detect_image_type` resolves overlapping hints by first-wins order."""
+
+    def test_screenshot_outranks_photo_of_text(self) -> None:
+        """A name matching both 'screenshot' and 'scan' resolves to screenshot."""
+        from pathlib import Path
+
+        result = detect_image_type(Path("screenshot-of-scanned-page.png"))
+        assert result == "screenshot"
+
+    def test_webpage_does_not_match_photo_of_text(self) -> None:
+        """The bare 'page' token was removed; webpage thumbnails stay 'other'."""
+        from pathlib import Path
+
+        result = detect_image_type(Path("webpage-thumbnail.png"))
+        assert result == "other"
 
 
 if __name__ == "__main__":
