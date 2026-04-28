@@ -722,6 +722,67 @@ class TestPythonPptxBackend:
         with pytest.raises(PythonPptxUnavailableError, match="python-pptx"):
             backend.read_presentation(path)
 
+    def test_extract_title_returns_none_when_core_property_is_none(
+        self,
+    ) -> None:
+        """python-pptx sets core_properties.title to None — not the string."""
+
+        class _CoreProps:
+            title = None
+
+        class _Prs:
+            core_properties = _CoreProps()
+
+        assert PythonPptxBackend._extract_title(_Prs()) is None
+
+    def test_extract_title_strips_whitespace_and_treats_blank_as_none(
+        self,
+    ) -> None:
+        """A title made entirely of whitespace is treated as absent."""
+
+        class _CoreProps:
+            title = "   "
+
+        class _Prs:
+            core_properties = _CoreProps()
+
+        assert PythonPptxBackend._extract_title(_Prs()) is None
+
+    def test_extract_title_returns_real_title_unchanged(self) -> None:
+        """A populated title is returned verbatim (after .strip())."""
+
+        class _CoreProps:
+            title = "  My Talk  "
+
+        class _Prs:
+            core_properties = _CoreProps()
+
+        assert PythonPptxBackend._extract_title(_Prs()) == "My Talk"
+
+
+class TestPresentationParseHandlesMissingTitle:
+    """Untitled presentations must not surface the literal string ``None``."""
+
+    def test_untitled_pptx_falls_back_to_file_stem(self, tmp_path: Path) -> None:
+        """When ``data.title`` is ``None`` the fragment uses the file stem."""
+        path = tmp_path / "anonymous.pptx"
+        _write_pptx_placeholder(path)
+        backend = StubPresentationBackend(
+            presentations={
+                "anonymous.pptx": PresentationData(
+                    title=None,
+                    slides=(SlideData(index=1, title="Hi", body="There"),),
+                ),
+            },
+        )
+        ingestor = PresentationIngestor(backend=backend)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        assert fragments[0].metadata["title"] == "anonymous"
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        assert "# anonymous" in markdown
+        # The literal string "None" should never surface as the document title.
+        assert "# None" not in markdown
+
 
 # ---- Module re-exports -----------------------------------------------
 

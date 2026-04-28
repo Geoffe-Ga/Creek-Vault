@@ -242,6 +242,15 @@ def generate_fragment_id(source: str, timestamp: datetime, content: str) -> str:
     return f"frag-{digest}"
 
 
+def file_modified_time(path: Path) -> datetime:
+    """Return *path*'s modification time as a timezone-aware UTC datetime.
+
+    Centralised so file-based ingestors share a single conversion
+    rule and do not drift apart over time.
+    """
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+
+
 def create_provenance_entry(
     source_path: str,
     ingestor_name: str,

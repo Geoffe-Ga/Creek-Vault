@@ -25,11 +25,16 @@ from __future__ import annotations
 import csv
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from creek.ingest.base import Ingestor, ParsedFragment, RawDocument
+from creek.ingest.base import (
+    Ingestor,
+    ParsedFragment,
+    RawDocument,
+    file_modified_time,
+)
 from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
@@ -206,9 +211,11 @@ def _read_csv(path: Path) -> WorkbookData:
             continue
         rows = [tuple(row) for row in csv.reader(text.splitlines())]
         return WorkbookData(sheets=(_split_header(path.stem, rows),))
-    # Should be unreachable: cp1252 decodes any byte sequence.
+    # Unreachable: ``cp1252`` accepts any byte sequence so the loop
+    # always returns. We keep this guard so a future change to the
+    # fallback list cannot silently produce an undefined return.
     msg = f"Unable to decode CSV {path} with any known encoding."
-    raise UnicodeDecodeError("csv", raw, 0, 1, msg)  # pragma: no cover
+    raise AssertionError(msg)  # pragma: no cover
 
 
 def _split_header(
@@ -278,7 +285,7 @@ class SpreadsheetIngestor(Ingestor):
     def parse(self, raw: RawDocument) -> list[ParsedFragment]:
         """Read the workbook and emit one fragment per non-empty sheet."""
         workbook = self.backend.read_workbook(raw.path)
-        timestamp = _modified_time(raw.path)
+        timestamp = file_modified_time(raw.path)
         fragments: list[ParsedFragment] = []
         for sheet in workbook.sheets:
             if sheet.is_empty:
@@ -335,11 +342,6 @@ class SpreadsheetIngestor(Ingestor):
             "columns": fragment.metadata.get("columns", 0),
             "ingested": fragment.timestamp.isoformat(),
         }
-
-
-def _modified_time(path: Path) -> datetime:
-    """Return the file's mtime as a timezone-aware UTC datetime."""
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
 
 def _extract_headers_and_rows(

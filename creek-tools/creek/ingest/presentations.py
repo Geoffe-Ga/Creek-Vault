@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from creek.ingest.base import Ingestor, ParsedFragment, RawDocument
+from creek.ingest.base import (
+    Ingestor,
+    ParsedFragment,
+    RawDocument,
+    file_modified_time,
+)
 from creek.models import SourcePlatform
 
 if TYPE_CHECKING:
@@ -140,16 +144,29 @@ class PythonPptxBackend:
 
     @staticmethod
     def _extract_title(prs: Any) -> str | None:
-        """Return the presentation's core-properties title, if set."""
+        """Return the presentation's core-properties title, if set.
+
+        ``python-pptx`` exposes ``core_properties.title`` as either a
+        non-empty string, an empty string, or ``None``. We coerce all
+        absent-or-blank cases to ``None`` so callers can safely fall
+        back to the file stem with ``data.title or path.stem`` —
+        without the literal string ``"None"`` ever surfacing in
+        rendered markdown or YAML frontmatter.
+        """
         try:
-            return str(prs.core_properties.title) or None
+            title = prs.core_properties.title
         except (AttributeError, ValueError):
             return None
+        if title is None:
+            return None
+        stripped = str(title).strip()
+        return stripped or None
 
 
 def _slide_to_data(slide: Any, index: int) -> SlideData:
     """Convert a python-pptx slide object into a :class:`SlideData`."""
     title: str | None = None
+    title_shape = slide.shapes.title
     body_chunks: list[str] = []
     for shape in slide.shapes:
         if not getattr(shape, "has_text_frame", False):
@@ -157,7 +174,7 @@ def _slide_to_data(slide: Any, index: int) -> SlideData:
         text = shape.text_frame.text.strip()
         if not text:
             continue
-        if shape == slide.shapes.title and title is None:
+        if title_shape is not None and shape is title_shape and title is None:
             title = text
         else:
             body_chunks.append(text)
@@ -223,7 +240,7 @@ class PresentationIngestor(Ingestor):
                 raw.path,
             )
             return []
-        timestamp = _modified_time(raw.path)
+        timestamp = file_modified_time(raw.path)
         return [
             ParsedFragment(
                 content="",  # Markdown rendered in convert_to_markdown.
@@ -289,11 +306,6 @@ class PresentationIngestor(Ingestor):
             "slide_count": fragment.metadata.get("slide_count", 0),
             "ingested": fragment.timestamp.isoformat(),
         }
-
-
-def _modified_time(path: Path) -> datetime:
-    """Return the file's mtime as a timezone-aware UTC datetime."""
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
 
 __all__ = [
