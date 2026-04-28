@@ -36,7 +36,6 @@ Without these the module still imports cleanly and the
 
 from __future__ import annotations
 
-import ast
 import logging
 import os
 import stat
@@ -327,11 +326,27 @@ class GoogleApiDriveClient:
             else service.files().get_media(fileId=file_id)
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as handle:
-            downloader = MediaIoBaseDownload(handle, request, chunksize=1024 * 1024)
-            done = False
-            while not done:
-                _status, done = downloader.next_chunk()
+        # Write to a sibling temp file and atomically rename on success.
+        # If next_chunk() raises mid-stream, the destination is never
+        # touched — the local mtime stays correctly older than Drive's
+        # modified_time so the file is re-downloaded on the next run
+        # rather than silently treated as up-to-date.
+        tmp_path = destination.with_name(destination.name + ".download.tmp")
+        try:
+            with tmp_path.open("wb") as handle:
+                downloader = MediaIoBaseDownload(
+                    handle,
+                    request,
+                    chunksize=1024 * 1024,
+                )
+                done = False
+                while not done:
+                    _status, done = downloader.next_chunk()
+            os.replace(tmp_path, destination)
+        except BaseException:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
 
     def _get_service(self) -> Any:
         """Build (or return cached) Drive API service.
@@ -471,29 +486,6 @@ def _write_token_file(path: Path, contents: str) -> None:
         raise
 
 
-_FORBIDDEN_DRIVE_METHODS: frozenset[str] = frozenset(
-    {"update", "delete", "trash", "copy"},
-)
-
-
-def _audit_no_write_calls(source: str) -> None:
-    """Raise :class:`AssertionError` if *source* calls a forbidden Drive method.
-
-    AST-based: ignores method names that appear inside docstrings,
-    string literals, or comments. Only flags real call sites such as
-    ``service.files().delete(...)``. Used by the test suite to keep
-    the read-only contract enforced as the module evolves.
-    """
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_DRIVE_METHODS:
-            msg = f"Forbidden write call detected: {func.attr}() at line {node.lineno}"
-            raise AssertionError(msg)
-
-
 # ---- Routing helper ----------------------------------------------------
 
 
@@ -631,19 +623,30 @@ class GoogleDriveDownloader:
         raise KeyError(msg)
 
     def _write(self, drive_file: DriveFile, staging_dir: Path) -> Path:
-        """Stream *drive_file* to disk under *staging_dir* and return the path."""
+        """Stream *drive_file* to disk under *staging_dir* and return the path.
+
+        Writes are guarded so a failed ``download_to`` never leaves a
+        partial file at the final path — without this, a stale partial
+        whose mtime is now would shadow Drive's older ``modified_time``
+        and be treated as up-to-date forever after.
+        """
         target = self._target_path(drive_file, staging_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         if drive_file.is_google_native:
             export_mime, suffix = _NATIVE_EXPORT_TARGETS[drive_file.mime_type]
             target = target.with_name(target.stem + suffix)
+        else:
+            export_mime = None
+        try:
             self.client.download_to(
                 drive_file.id,
                 target,
                 export_mime=export_mime,
             )
-        else:
-            self.client.download_to(drive_file.id, target)
+        except BaseException:
+            if target.exists():
+                target.unlink()
+            raise
         timestamp = drive_file.modified_time.timestamp()
         os.utime(target, (timestamp, timestamp))
         return target

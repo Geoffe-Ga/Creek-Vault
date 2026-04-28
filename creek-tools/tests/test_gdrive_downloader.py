@@ -24,6 +24,32 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+_FORBIDDEN_DRIVE_METHODS: frozenset[str] = frozenset(
+    {"update", "delete", "trash", "copy", "create"},
+)
+
+
+def _audit_no_write_calls(source: str) -> None:
+    """Raise :class:`AssertionError` if *source* calls a forbidden Drive method.
+
+    AST-based: ignores method names that appear inside docstrings,
+    string literals, or comments. Only flags real call sites such as
+    ``service.files().delete(...)``. Lives in the test module rather
+    than in the production module so test infrastructure is not
+    shipped as production code.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_DRIVE_METHODS:
+            msg = f"Forbidden write call detected: {func.attr}() at line {node.lineno}"
+            raise AssertionError(msg)
+
+
 # ---- Stub client --------------------------------------------------------
 
 
@@ -146,6 +172,22 @@ class TestDriveClientProtocol:
         attrs = set(dir(DriveClient))
         for name in forbidden:
             assert name not in attrs, name
+
+    def test_ast_audit_flags_create_call(self) -> None:
+        """A `permissions().create(...)` call site is detected.
+
+        The Protocol covers ``create`` as forbidden (Drive
+        ``permissions().create()`` is the share-API write surface) so
+        the source-level AST audit should also flag it. This ensures
+        the two layers of read-only enforcement stay in sync.
+        """
+
+        sample = (
+            "def bad(service):\n"
+            "    return service.permissions().create(fileId='x').execute()\n"
+        )
+        with pytest.raises(AssertionError, match="create"):
+            _audit_no_write_calls(sample)
 
 
 # ---- GoogleApiDriveClient ---------------------------------------------
@@ -582,6 +624,54 @@ class TestDownloadAll:
         # The good file still landed.
         assert (tmp_path / "good.pdf").read_bytes() == b"good bytes"
 
+    def test_partial_failure_does_not_leave_stale_destination_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A failed download must not leave a half-written file at the target.
+
+        Otherwise the next run sees ``local.mtime > drive.modified_time``
+        (because the half-write happened *now*, after Drive's
+        modified_time) and skips the file forever. Regression for the
+        BLOCKING finding in PR #163's fourth review.
+        """
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+
+        old = _datetime(2024, 1, 1, tzinfo=_UTC)
+        bad_file = _file(fid="bad", name="bad.pdf", modified=old)
+
+        class _MidstreamFlakyClient(StubDriveClient):
+            def download_to(
+                self,
+                file_id: str,
+                destination: Path,
+                *,
+                export_mime: str | None = None,
+            ) -> None:
+                # Simulate writing some bytes then failing partway.
+                if file_id == "bad":
+                    destination.write_bytes(b"PARTIAL")
+                    msg = "stream interrupted"
+                    raise RuntimeError(msg)
+                super().download_to(
+                    file_id,
+                    destination,
+                    export_mime=export_mime,
+                )
+
+        client = _MidstreamFlakyClient(
+            files=[bad_file],
+            media={"bad": b"never-fully-written"},
+        )
+        downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
+        downloader.download_all(tmp_path)
+
+        # The destination file must not exist after a failed download —
+        # otherwise its mtime would shadow Drive's older modified_time
+        # and the file would be permanently skipped.
+        assert not (tmp_path / "bad.pdf").exists()
+
 
 # ---- Read-only audit ---------------------------------------------------
 
@@ -602,26 +692,6 @@ class TestReadOnlyContract:
         for call in client.calls:
             for method in forbidden:
                 assert method not in call.split(":", 1)[0], call
-
-    def test_module_source_passes_ast_audit(self) -> None:
-        """The module source has no real call sites for forbidden Drive methods.
-
-        Replaces the older grep-style audit with the AST-based
-        :func:`_audit_no_write_calls` helper, which only flags actual
-        call expressions and ignores method names that appear in
-        docstrings, comments, or string literals.
-        """
-        from creek.ingest import gdrive
-        from creek.ingest.gdrive import _audit_no_write_calls
-
-        source = (
-            __import__("pathlib")
-            .Path(gdrive.__file__)
-            .read_text(
-                encoding="utf-8",
-            )
-        )
-        _audit_no_write_calls(source)
 
 
 # ---- Module exports ----------------------------------------------------
@@ -938,14 +1008,12 @@ class TestAstReadOnlyAudit:
     def test_audit_passes_on_clean_module_source(self) -> None:
         """The current gdrive module passes the AST audit."""
         from creek.ingest import gdrive
-        from creek.ingest.gdrive import _audit_no_write_calls
 
         source = __import__("pathlib").Path(gdrive.__file__).read_text(encoding="utf-8")
         _audit_no_write_calls(source)
 
     def test_audit_ignores_method_name_in_docstring(self) -> None:
         """A docstring mentioning ``.delete(`` does not trip the audit."""
-        from creek.ingest.gdrive import _audit_no_write_calls
 
         sample = (
             "def foo():\n"
@@ -957,7 +1025,6 @@ class TestAstReadOnlyAudit:
 
     def test_audit_flags_real_write_call(self) -> None:
         """A genuine ``.delete(`` call site raises a clear AssertionError."""
-        from creek.ingest.gdrive import _audit_no_write_calls
 
         sample = (
             "def bad(service):\n"

@@ -313,11 +313,7 @@ def gdrive(
         staging if staging is not None else Path(config.google_drive.staging_dir)
     )
 
-    from creek.ingest.gdrive import (
-        GoogleApiDriveClient,
-        GoogleApiUnavailableError,
-        GoogleDriveDownloader,
-    )
+    from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
 
     client = GoogleApiDriveClient(config.google_drive)
     if not client.is_available():
@@ -331,15 +327,13 @@ def gdrive(
     downloader = GoogleDriveDownloader(client=client, config=config.google_drive)
     try:
         result = downloader.download_all(staging_dir)
-    except GoogleApiUnavailableError as exc:
-        console.print(f"[red]Google Drive download failed: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
     except Exception as exc:
-        # Drive surface includes HttpError (quota / rate limit / revoked
-        # token), network IOErrors, OAuth failures. We can't import
-        # googleapiclient.errors at module top-level since it's optional,
-        # so catch broadly here and present a clean message rather than
-        # a raw traceback.
+        # Drive surface includes GoogleApiUnavailableError (missing
+        # optional deps), HttpError (quota / rate limit / revoked
+        # token), network IOErrors, and OAuth failures. We can't
+        # import googleapiclient.errors at module top-level since
+        # it's optional, so catch broadly here and present a clean
+        # message rather than a raw traceback.
         console.print(f"[red]Google Drive download failed: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
