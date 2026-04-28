@@ -1,97 +1,80 @@
-# Creek Tools
+# Creek
 
-A Python CLI and data pipeline for organizing large volumes of semi-structured personal data — chat exports, documents, notes, messages — into an interlinked [Obsidian](https://obsidian.md/) knowledge base with semantic classification and NLP-driven discovery.
+A Python CLI and pipeline for organizing large volumes of semi-structured personal data — chat exports, documents, notes, screenshots, messages — into an interlinked [Obsidian](https://obsidian.md/) knowledge base with semantic classification and NLP-driven discovery.
 
-## What It Does
+## What it does
 
-Creek Tools ingests data from multiple sources, normalizes it, classifies it along configurable taxonomies, discovers semantic connections between documents, and outputs a richly interlinked Obsidian vault.
+The pipeline runs in five stages:
 
-**Pipeline stages:**
+1. **Redaction** — pattern-based scanning for secrets, API keys, and PII *before* anything else touches the data.
+2. **Ingestion** — source-specific parsers (Claude/ChatGPT exports, Discord, Google Drive, markdown, PDF, DOCX, XLSX/CSV, PPTX, code, images via OCR, generic text) normalize everything to UTF-8 markdown with structured YAML frontmatter.
+3. **Classification** — rule-based pre-classification plus opt-in LLM-assisted tagging across multiple dimensions (topic, voice register, frequency, archetypal phase, privacy tier, confidence).
+4. **Linking** — embedding-based semantic similarity, temporal proximity, and density-based eddy detection surface connections across sources.
+5. **Generation** — index notes, weekly/monthly wavelength reports, the Voice Skill Tree, blog-idea mining, and skill-stack-driven essay drafting.
 
-1. **Redaction** — Pattern-based scanning for secrets, API keys, and PII before any processing
-2. **Ingestion** — Source-specific parsers (chat exports, Discord, Google Drive, PDFs, images via OCR) normalize to UTF-8 markdown with structured YAML frontmatter
-3. **Classification** — Rule-based pre-classification + LLM-assisted tagging across multiple dimensions (topic, emotional tone, confidence level, voice register)
-4. **Linking** — Embedding-based semantic similarity, temporal proximity analysis, and cluster detection to surface connections across sources
-5. **Indexing** — Generated index notes, reports, and Dataview queries for vault navigation
+## Key capabilities
 
-**Key capabilities:**
+- **Twelve source platforms** wired into a single registry — Claude, ChatGPT, Discord, Google Drive, code, documents (DOCX/PDF), markdown, spreadsheets (XLSX/CSV), presentations (PPTX), images (OCR), generic text, plus a fallback `other`.
+- **Local-first by default.** Classification runs on Ollama; embeddings on `sentence-transformers`. The Anthropic API path is opt-in.
+- **Privacy-tiered.** `Open` / `Personal` / `Intimate` privacy tiers with consent gating and a full audit trail.
+- **Right-to-be-forgotten.** `creek purge` removes a fragment, source, date range, or the entire vault, scrubbing every reference along the way.
+- **Deterministic.** Fragment IDs are hashed from `(source, timestamp, content)` so re-processing is idempotent.
+- **Voice-aware generation.** The `creek skills` / `creek mine` / `creek draft` flow turns vault contents into a per-frequency Voice Skill Tree and uses it to draft new essays in your style.
 
-- Multi-source ingestion (Claude/ChatGPT exports, Discord, Google Drive, markdown, PDF, DOCX, XLSX, PPTX, images)
-- Local-first architecture — default LLM inference via Ollama, embeddings via sentence-transformers, no cloud calls required
-- Privacy-tiered processing with consent gating and full audit trail
-- Deterministic fragment IDs for idempotent re-processing
-- Configurable taxonomy system with support for multi-label classification
-
-## Architecture
+## Repository layout
 
 ```
-creek-tools/              # Monorepo root
-├── creek-tools/          # Python package & pipeline
-│   ├── creek/            # Source (flat layout)
-│   │   ├── ingest/       # Source-specific parsers
-│   │   ├── redact/       # Secret detection & redaction
-│   │   ├── classify/     # Rule-based + LLM classification
-│   │   ├── link/         # Embedding similarity & clustering
-│   │   ├── generate/     # Index, report, and voice generation
-│   │   ├── vault/        # Markdown + frontmatter writer
-│   │   └── cli.py        # Typer CLI entry point
-│   ├── tests/
-│   ├── scripts/          # Quality check scripts
-│   └── pyproject.toml
-├── scripts/Ontology/     # System specification & taxonomy definitions
-├── .github/workflows/    # CI/CD (GitHub Actions)
-└── CLAUDE.md             # AI-assisted development context
+Creek-Vault/                       # The Obsidian vault itself (this repo)
+├── 00-Creek-Meta/Ontology/        # Master ontology spec + APTITUDE / Wavelength docs
+├── 01-Fragments/                  # Atomic content units (one MD per chat / doc / sheet / slide deck)
+├── 02-Threads/                    # Narrative currents
+├── 03-Eddies/                     # Topic clusters
+├── 04-Praxis/                     # Actionable insights
+├── 05-Wavelength/                 # Phase reports
+├── 06-Frequencies/                # APTITUDE frequency notes
+├── 07-Voice/                      # Voice Skill Tree, drafts, register profiles
+├── 08-Decisions/                  # Decision context notes
+├── 09-Reference/                  # External reference material
+├── 10-Liminal/                    # In-between content awaiting classification
+├── creek-tools/                   # The Python CLI + pipeline (this is where the code lives)
+└── CLAUDE.md                      # Top-level repo guidance for Claude Code
 ```
 
-## Tech Stack
+The Obsidian vault and the `creek-tools` codebase share one git repository, so changes to the pipeline and to the vault content are versioned together.
+
+## Quickstart
+
+See [`creek-tools/README.md`](creek-tools/README.md) for install instructions, the full command reference, and configuration. The end-to-end task guides are under [`creek-tools/docs/`](creek-tools/docs/):
+
+| If you want to… | Read |
+|-----------------|------|
+| Run your first pipeline end to end | [`docs/getting-started.md`](creek-tools/docs/getting-started.md) |
+| Understand which ingestor fits which export | [`docs/ingestion.md`](creek-tools/docs/ingestion.md) |
+| Scan and apply redactions before you ingest | [`docs/redaction.md`](creek-tools/docs/redaction.md) |
+| Configure rule-based vs LLM classification | [`docs/classification.md`](creek-tools/docs/classification.md) |
+| Surface resonances, threads, and eddies | [`docs/linking.md`](creek-tools/docs/linking.md) |
+| Generate reports, mine ideas, draft essays | [`docs/generation.md`](creek-tools/docs/generation.md) |
+| Keep the vault tidy or exercise right-to-be-forgotten | [`docs/cleaning-and-purge.md`](creek-tools/docs/cleaning-and-purge.md) |
+| Edit `<vault>/00-Creek-Meta/config.yaml` confidently | [`docs/configuration.md`](creek-tools/docs/configuration.md) |
+
+## Tech stack
 
 | Layer | Tools |
-|---|---|
-| Language | Python 3.11+ |
+|-------|-------|
+| Language | Python 3.11+ (CI tests 3.11, 3.12, 3.13) |
 | CLI | Typer, Rich |
 | Data models | Pydantic v2 |
-| NLP / Embeddings | sentence-transformers (local), scikit-learn |
-| LLM classification | Ollama (local, default) or Anthropic API (opt-in) |
-| Document parsing | python-docx, python-pptx, openpyxl, pdfminer.six, pytesseract |
+| NLP / embeddings | `sentence-transformers` (local), scikit-learn |
+| LLM classification | Ollama (default, local) or Anthropic API (opt-in) |
+| Document parsing | `python-docx`, `python-pptx`, `openpyxl`, `pdfminer.six`, `pytesseract` |
 | Vault output | Markdown + YAML frontmatter (Obsidian-compatible) |
-| CI/CD | GitHub Actions — lint, type check, test, security scan, complexity analysis |
-| Quality | Ruff, Black, MyPy (strict), Bandit, pip-audit, Radon/Xenon, pytest (90%+ coverage) |
-
-## Development
-
-All commands run from `creek-tools/`:
-
-```bash
-cd creek-tools
-pip install -r requirements-dev.txt
-pre-commit install
-```
-
-```bash
-./scripts/check-all.sh      # Run all quality checks (do this before every commit)
-./scripts/test.sh            # Unit tests
-./scripts/test.sh --coverage # Tests with coverage report
-./scripts/lint.sh            # Ruff + MyPy
-./scripts/format.sh --fix    # Auto-format
-./scripts/security.sh        # Bandit + pip-audit
-```
-
-### Quality Standards
-
-- **Test coverage:** ≥90% (branch coverage)
-- **Type safety:** MyPy strict mode, all functions typed
-- **Complexity:** ≤10 cyclomatic complexity per function
-- **Security:** Zero Bandit/pip-audit findings
-- **Style:** Ruff + Black + isort, zero violations
-
-### Workflow
-
-TDD-first, 4-gate process: write tests → local checks green → CI green → code review LGTM. See [`creek-tools/CLAUDE.md`](creek-tools/CLAUDE.md) for detailed development guidelines.
+| CI / CD | GitHub Actions — lint, type check, test, security scan, complexity analysis, automated Claude review |
+| Quality | Ruff, MyPy (strict), Bandit, pip-audit, Radon/Xenon, pytest (≥90 % branch coverage) |
 
 ## Status
 
-Early development. Foundation tooling and quality infrastructure are in place. Pipeline modules are being built incrementally per the [implementation plan](scripts/Ontology/creek_ontology_agent_prompt.md#14-implementation-plan).
+Phase-3 of the implementation plan is complete: full ingestion across twelve source platforms, rule-based and LLM-assisted classification, embeddings + temporal + eddy linking, the Voice Skill Tree, idea mining, draft generation, weekly/monthly reports, redaction, and right-to-be-forgotten purges. Refactor follow-ups (typed parse intermediates, configurable header detection) are tracked in the issue backlog.
 
 ## License
 
-MIT
+MIT.
