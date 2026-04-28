@@ -177,6 +177,8 @@ class SourcePlatform(StrEnum):
     EMAIL = "email"
     DOCUMENT = "document"
     IMAGE_OCR = "image_ocr"
+    SPREADSHEET = "spreadsheet"
+    PRESENTATION = "presentation"
     OTHER = "other"
 
 
