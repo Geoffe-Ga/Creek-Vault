@@ -18,7 +18,7 @@ creek link --vault ~/Obsidian/Creek-Vault --method eddies
 
 ## Resonances (embeddings)
 
-`creek.link.embeddings.EmbeddingLinker` encodes each fragment's body with a sentence-transformer model and emits a resonance edge whenever the cosine similarity exceeds `LinkingConfig.embedding_threshold`. Resonance edges live in the fragment's frontmatter:
+`creek.link.embeddings.EmbeddingLinker` encodes each fragment's body with a sentence-transformer model and emits a resonance edge whenever the cosine similarity exceeds `EmbeddingsConfig.similarity_threshold`. Resonance edges live in the fragment's frontmatter:
 
 ```yaml
 links:
@@ -31,27 +31,24 @@ links:
 
 ### Tuning
 
-Defaults are tuned for the `all-MiniLM-L6-v2` model. If you switch models, recalibrate:
+Defaults are tuned for the `all-MiniLM-L6-v2` model. If you switch models, recalibrate via `embeddings.similarity_threshold`:
 
-| `embedding_threshold` | Effect                                                    |
-|-----------------------|-----------------------------------------------------------|
-| 0.85+                 | Tight — surfaces only near-paraphrases.                   |
-| 0.78 (default)        | Balanced — finds genuine semantic connections.            |
-| 0.70                  | Loose — pulls in distant relatives; expect noise.         |
-
-`LinkingConfig.max_neighbours_per_fragment` (default 25) caps fan-out so a viral fragment doesn't dominate the graph.
+| `similarity_threshold` | Effect                                                    |
+|------------------------|-----------------------------------------------------------|
+| 0.85+                  | Tight — surfaces only near-paraphrases.                   |
+| 0.75 (default)         | Balanced — finds genuine semantic connections.            |
+| 0.65                   | Loose — pulls in distant relatives; expect noise.         |
 
 ## Threads (temporal)
 
 A **thread** is a chain of fragments that span a topic across time. `creek.link.threads.ThreadDetector` slides a window over the timestamped fragments, joins them into a union-find structure when their topics overlap, and writes a thread note under `02-Threads/` for each connected component.
 
-Configuration:
+Configuration (from `LinkingConfig`):
 
 ```yaml
 linking:
-  thread_window_days: 14         # sliding window
-  thread_min_overlap: 0.55       # cosine over the title + tag bag
-  thread_min_size: 3             # minimum fragments per thread
+  temporal_window_hours: 168     # sliding window (default: 1 week)
+  thread_min_fragments: 3        # minimum fragments per thread
 ```
 
 Threads are **directional** (oldest → newest) and have a **terminus** — the most recent fragment. The `creek mine` strategy `thread-terminus` uses these as essay seeds (a thread that's gone quiet often means there's a synthesis waiting to be written).
@@ -60,12 +57,11 @@ Threads are **directional** (oldest → newest) and have a **terminus** — the 
 
 An **eddy** is a tight cluster in the resonance graph. `creek.link.eddies.EddyDetector` runs density-based clustering and writes one note per cluster under `03-Eddies/`. Where threads are *temporal*, eddies are *non-directional*: many fragments densely linked to each other, possibly years apart.
 
-Configuration:
+Configuration (from `LinkingConfig`):
 
 ```yaml
 linking:
-  eddy_min_density: 0.62
-  eddy_min_size: 4
+  eddy_min_fragments: 5          # minimum cluster size
 ```
 
 ## Synchronicities

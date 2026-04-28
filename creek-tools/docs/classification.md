@@ -11,7 +11,7 @@ Classification tags every fragment along five dimensions: **frequency** (the APT
 | `rules`  | Heuristic pattern matchers     | Default. Cheap, deterministic, runs offline. Captures roughly 70% of fragments confidently. |
 | `llm`    | Ollama (default) or Anthropic  | For the long tail of ambiguous fragments. Slower, requires either a local model or `ANTHROPIC_API_KEY`. |
 
-A common workflow: run `--method rules` over the whole vault first, then run `--method llm` only on fragments whose classification is `unclassified` or whose confidence is below `ClassificationConfig.review_threshold`.
+A common workflow: run `--method rules` over the whole vault first, then run `--method llm` only on fragments whose classification is `unclassified` or whose confidence is below `ClassificationConfig.confidence_threshold`.
 
 ```bash
 # Rules pass.
@@ -43,26 +43,26 @@ Privacy tiers are enforced by `creek.classify.privacy.PrivacyClassifier`. The de
 
 ## Configuration
 
-`ClassificationConfig` in `<vault>/00-Creek-Meta/config.yaml`:
+The relevant sections of `<vault>/00-Creek-Meta/creek_config.yaml` are `classification` (`ClassificationConfig`) and `llm` (`LLMConfig` — top-level, not nested):
 
 ```yaml
 classification:
-  method: rules               # default for `creek classify` and `creek process`
+  confidence_threshold: 0.7              # below this -> review queue
+  auto_classify_sources: [claude, chatgpt, discord]
+  human_review_sources: [journal]
+
+llm:
+  provider: ollama                       # or "anthropic"
+  model: mistral
   batch_size: 50
-  review_threshold: 0.6       # below this -> review queue
-  llm:
-    provider: ollama          # or "anthropic"
-    model: llama3.1
-    max_retries: 3
-  rules:
-    frequency_keyword_path: 06-Frequencies/_keyword_atlas.yaml
+  max_concurrent: 5
 ```
 
-The keyword atlas is a YAML file you maintain — it maps phrases / terms / metaphors to their primary frequency. The atlas ships with a starter, but tuning it to your vocabulary is one of the highest-leverage things you can do.
+The CLI selects rules vs LLM via `--method`. Rule-based classification reads frequency / phase keyword atlases bundled with the package; you can override or extend them at runtime by editing the relevant module data.
 
 ## The review queue
 
-Anything with `confidence < review_threshold` is added to the **review queue**:
+Anything with `confidence < classification.confidence_threshold` is added to the **review queue**:
 
 ```bash
 creek review --vault ~/Obsidian/Creek-Vault
@@ -78,14 +78,14 @@ Make sure `ollama` is running and the model is pulled:
 
 ```bash
 ollama serve &
-ollama pull llama3.1
+ollama pull mistral
 ```
 
-Configure the model name in `LLMConfig.model`. Latency on a CPU is ~2–4 s per fragment; expect a few hours for a vault of 10k fragments.
+Configure the model name in `LLMConfig.model` (default `mistral`). Latency on a CPU is ~2–4 s per fragment; expect a few hours for a vault of 10k fragments.
 
 ### Anthropic API (opt-in)
 
-Set `LLMConfig.provider: anthropic` and export `ANTHROPIC_API_KEY`. The provider uses `claude-haiku-4-5` by default for cost reasons; bump to `claude-sonnet-4-6` for higher accuracy.
+Set `LLMConfig.provider: anthropic` and export `ANTHROPIC_API_KEY`. Set `LLMConfig.model` to the canonical model ID — `claude-haiku-4-5-20251001` for cost-sensitive runs, `claude-sonnet-4-6` for higher accuracy.
 
 The Anthropic path is **not** the default — opt in deliberately. Cost on a 10k-fragment vault is roughly $1–3 with Haiku, $10–30 with Sonnet.
 

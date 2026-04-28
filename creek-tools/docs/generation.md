@@ -120,7 +120,7 @@ draft:
     - skills/meta/voice-core
   llm:
     provider: ollama
-    model: llama3.1
+    model: mistral
   generated_at: 2026-04-28T17:50:00Z
 ```
 

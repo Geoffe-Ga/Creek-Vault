@@ -31,18 +31,17 @@ Creek-Vault/
 └── 10-Liminal/                # Awaiting classification
 ```
 
-Open the repo in Obsidian and add a config file at `00-Creek-Meta/config.yaml`. A minimal starter:
+Open the repo in Obsidian and add a config file at `00-Creek-Meta/creek_config.yaml`. A minimal starter:
 
 ```yaml
 llm:
   provider: ollama
-  model: llama3.1
+  model: mistral
 embeddings:
   model: all-MiniLM-L6-v2
+  similarity_threshold: 0.78    # cosine cutoff for a resonance edge
 classification:
-  method: rules
-linking:
-  embedding_threshold: 0.78
+  confidence_threshold: 0.7
 ```
 
 The full schema with every field is documented in [configuration.md](configuration.md).
@@ -113,4 +112,4 @@ creek report --type wavelength --period weekly --vault ~/Obsidian/Creek-Vault
 | Tune classification | [classification.md](classification.md) |
 | Connect ideas across sources | [linking.md](linking.md) |
 | Generate the Voice Skill Tree, mine ideas, draft essays | [generation.md](generation.md) |
-| Edit `config.yaml` confidently | [configuration.md](configuration.md) |
+| Edit `creek_config.yaml` confidently | [configuration.md](configuration.md) |

@@ -55,7 +55,7 @@ See [`creek-tools/README.md`](creek-tools/README.md) for install instructions, t
 | Surface resonances, threads, and eddies | [`docs/linking.md`](creek-tools/docs/linking.md) |
 | Generate reports, mine ideas, draft essays | [`docs/generation.md`](creek-tools/docs/generation.md) |
 | Keep the vault tidy or exercise right-to-be-forgotten | [`docs/cleaning-and-purge.md`](creek-tools/docs/cleaning-and-purge.md) |
-| Edit `<vault>/00-Creek-Meta/config.yaml` confidently | [`docs/configuration.md`](creek-tools/docs/configuration.md) |
+| Edit `<vault>/00-Creek-Meta/creek_config.yaml` confidently | [`docs/configuration.md`](creek-tools/docs/configuration.md) |
 
 ## Tech stack
 

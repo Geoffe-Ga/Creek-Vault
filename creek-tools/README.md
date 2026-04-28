@@ -118,7 +118,7 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 
 ## Configuration
 
-`creek-tools` is configured via Pydantic models defined in [`creek/config.py`](creek/config.py). The active configuration lives in `<vault>/00-Creek-Meta/config.yaml` and can be edited by hand. Every section maps directly to a `BaseModel` you can find in `config.py`:
+`creek-tools` is configured via Pydantic models defined in [`creek/config.py`](creek/config.py). The active configuration lives in `<vault>/00-Creek-Meta/creek_config.yaml` and can be edited by hand. Every section maps directly to a `BaseModel` you can find in `config.py`:
 
 | Section | Class | What it controls |
 |---------|-------|------------------|

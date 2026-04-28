@@ -23,7 +23,7 @@ timezone: America/Los_Angeles
 ```yaml
 llm:
   provider: ollama
-  model: llama3.1
+  model: mistral
   ollama_url: http://localhost:11434
   batch_size: 50
   max_concurrent: 5
@@ -223,7 +223,7 @@ Every leaf field can be overridden by a `CREEK_…` env-var. Nested keys use dou
 
 ```bash
 export CREEK_LLM__PROVIDER=anthropic
-export CREEK_LLM__MODEL=claude-haiku-4-5
+export CREEK_LLM__MODEL=claude-haiku-4-5-20251001
 export CREEK_EMBEDDINGS__SIMILARITY_THRESHOLD=0.78
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
