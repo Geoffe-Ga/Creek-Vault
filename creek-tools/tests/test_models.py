@@ -239,7 +239,7 @@ class TestSourcePlatformEnum:
     """Tests for the SourcePlatform enum."""
 
     def test_all_platforms_exist(self) -> None:
-        """Verify all 10 source platform values exist."""
+        """Verify all 12 source platform values exist."""
         expected = [
             "claude",
             "chatgpt",
@@ -250,6 +250,8 @@ class TestSourcePlatformEnum:
             "email",
             "document",
             "image_ocr",
+            "spreadsheet",
+            "presentation",
             "other",
         ]
         actual = [s.value for s in SourcePlatform]

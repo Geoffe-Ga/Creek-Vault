@@ -135,6 +135,10 @@ module = ["pytesseract", "PIL", "PIL.*", "pdf2image", "pdf2image.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["openpyxl", "openpyxl.*", "pptx", "pptx.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = [
     "googleapiclient",
     "googleapiclient.*",
