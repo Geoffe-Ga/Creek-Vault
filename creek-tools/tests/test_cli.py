@@ -438,11 +438,11 @@ def test_gdrive_command_downloads_files_through_stub_client(
         "list_files",
         lambda _self: [drive_file],
     )
-    monkeypatch.setattr(
-        GoogleApiDriveClient,
-        "get_media",
-        lambda _self, _file_id: b"# Notes\n",
-    )
+
+    def _stream(_self: object, _file_id: str, destination: Path, **_: object) -> None:
+        destination.write_bytes(b"# Notes\n")
+
+    monkeypatch.setattr(GoogleApiDriveClient, "download_to", _stream)
 
     staging = tmp_path / "staging"
     result = runner.invoke(
@@ -483,11 +483,11 @@ def test_gdrive_command_reports_skipped_files_on_incremental_run(
         "list_files",
         lambda _self: [drive_file],
     )
-    monkeypatch.setattr(
-        GoogleApiDriveClient,
-        "get_media",
-        lambda _self, _file_id: b"# Notes\n",
-    )
+
+    def _stream(_self: object, _file_id: str, destination: Path, **_: object) -> None:
+        destination.write_bytes(b"# Notes\n")
+
+    monkeypatch.setattr(GoogleApiDriveClient, "download_to", _stream)
 
     staging = tmp_path / "staging"
     runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])

@@ -55,15 +55,25 @@ class StubDriveClient:
         self.calls.append("list_files")
         return list(self._files)
 
-    def get_media(self, file_id: str) -> bytes:
-        """Return raw media bytes for *file_id*."""
-        self.calls.append(f"get_media:{file_id}")
-        return self._media[file_id]
+    def download_to(
+        self,
+        file_id: str,
+        destination: Path,
+        *,
+        export_mime: str | None = None,
+    ) -> None:
+        """Write the canned bytes for *file_id* to *destination*.
 
-    def export_media(self, file_id: str, mime_type: str) -> bytes:
-        """Return exported media bytes for *file_id* + *mime_type*."""
-        self.calls.append(f"export_media:{file_id}:{mime_type}")
-        return self._exports[file_id, mime_type]
+        When *export_mime* is provided the (file_id, export_mime) entry
+        in ``_exports`` is used; otherwise the bytes from ``_media``.
+        """
+        if export_mime is not None:
+            self.calls.append(f"export_to:{file_id}:{export_mime}")
+            data = self._exports[file_id, export_mime]
+        else:
+            self.calls.append(f"download_to:{file_id}")
+            data = self._media[file_id]
+        destination.write_bytes(data)
 
 
 # ---- DriveFile ---------------------------------------------------------
@@ -202,11 +212,12 @@ class TestGoogleApiDriveClient:
         with pytest.raises(GoogleApiUnavailableError, match="google-api-python-client"):
             client.list_files()
 
-    def test_get_media_raises_without_deps(
+    def test_download_to_raises_without_deps(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        """get_media raises with actionable instructions when deps missing."""
+        """download_to raises with actionable instructions when deps missing."""
         import builtins
 
         monkeypatch.setattr(
@@ -218,13 +229,14 @@ class TestGoogleApiDriveClient:
         )
         client = GoogleApiDriveClient(GoogleDriveConfig())
         with pytest.raises(GoogleApiUnavailableError):
-            client.get_media("file-id")
+            client.download_to("file-id", tmp_path / "x.bin")
 
-    def test_export_media_raises_without_deps(
+    def test_download_to_export_raises_without_deps(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        """export_media raises with actionable instructions when deps missing."""
+        """download_to with an export_mime also raises when deps missing."""
         import builtins
 
         monkeypatch.setattr(
@@ -236,7 +248,11 @@ class TestGoogleApiDriveClient:
         )
         client = GoogleApiDriveClient(GoogleDriveConfig())
         with pytest.raises(GoogleApiUnavailableError):
-            client.export_media("file-id", "application/pdf")
+            client.download_to(
+                "file-id",
+                tmp_path / "x.docx",
+                export_mime="application/pdf",
+            )
 
 
 # ---- route_to_ingestor ------------------------------------------------
@@ -253,6 +269,7 @@ class TestRouteToIngestor:
             ("scan.pdf", "document"),
             ("page.html", "document"),
             ("readme.txt", "document"),
+            ("manual.rtf", "document"),
             ("budget.xlsx", "spreadsheet"),
             ("data.csv", "spreadsheet"),
             ("deck.pptx", "presentation"),
@@ -299,11 +316,11 @@ def _file(
 class TestDownloadFile:
     """`download_file` handles regular files and Google-native exports."""
 
-    def test_regular_file_is_downloaded_via_get_media(
+    def test_regular_file_is_streamed_to_disk(
         self,
         tmp_path: Path,
     ) -> None:
-        """A non-Google-native file calls ``get_media`` and writes bytes."""
+        """A non-Google-native file is streamed straight to disk via download_to."""
         client = StubDriveClient(
             files=[_file(fid="abc", name="Notes.pdf")],
             media={"abc": b"%PDF-1.4 raw bytes"},
@@ -312,10 +329,10 @@ class TestDownloadFile:
         path = downloader.download_file("abc", tmp_path)
         assert path == tmp_path / "Notes.pdf"
         assert path.read_bytes() == b"%PDF-1.4 raw bytes"
-        assert "get_media:abc" in client.calls
+        assert "download_to:abc" in client.calls
 
     def test_google_doc_is_exported_to_docx(self, tmp_path: Path) -> None:
-        """A Google Doc exports through ``export_media`` to .docx bytes."""
+        """A Google Doc exports through download_to with export_mime to .docx."""
         docx_mime = (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
@@ -327,10 +344,10 @@ class TestDownloadFile:
         path = downloader.download_file("g1", tmp_path)
         assert path.name == "Letter.docx"
         assert path.read_bytes().startswith(b"PK")
-        assert f"export_media:g1:{docx_mime}" in client.calls
+        assert f"export_to:g1:{docx_mime}" in client.calls
 
     def test_google_sheet_is_exported_to_xlsx(self, tmp_path: Path) -> None:
-        """A Google Sheet exports through ``export_media`` to .xlsx bytes."""
+        """A Google Sheet exports through download_to to .xlsx."""
         xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         client = StubDriveClient(
             files=[_file(fid="s1", name="Budget", mime=GOOGLE_SHEETS_MIME)],
@@ -341,7 +358,7 @@ class TestDownloadFile:
         assert path.name == "Budget.xlsx"
 
     def test_google_slides_is_exported_to_pptx(self, tmp_path: Path) -> None:
-        """Google Slides exports through ``export_media`` to .pptx bytes."""
+        """Google Slides exports through download_to to .pptx."""
         pptx_mime = (
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         )
@@ -409,10 +426,10 @@ class TestDownloadAll:
         )
         downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
         downloader.download_all(tmp_path)
-        # Reset call log; second pass should not call get_media again.
+        # Reset call log; second pass should not invoke download_to again.
         client.calls.clear()
         downloader.download_all(tmp_path)
-        assert all(not c.startswith("get_media") for c in client.calls)
+        assert all(not c.startswith("download_to") for c in client.calls)
 
     def test_redownloads_when_drive_file_is_newer(self, tmp_path: Path) -> None:
         """A bumped modified_time triggers re-download."""
@@ -429,7 +446,7 @@ class TestDownloadAll:
         client._media = {"a": b"v2"}
         client.calls.clear()
         downloader.download_all(tmp_path)
-        assert any(c.startswith("get_media") for c in client.calls)
+        assert any(c.startswith("download_to") for c in client.calls)
         assert (tmp_path / "a.pdf").read_bytes() == b"v2"
 
     def test_download_all_returns_separate_downloaded_and_skipped_lists(
@@ -448,11 +465,11 @@ class TestDownloadAll:
         downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
         first = downloader.download_all(tmp_path)
         assert len(first.downloaded) == 2
-        assert first.skipped == []
+        assert first.skipped == ()
 
         # Re-run: nothing changed, both files should be skipped.
         second = downloader.download_all(tmp_path)
-        assert second.downloaded == []
+        assert second.downloaded == ()
         assert {p.name for p in second.skipped} == {"a.pdf", "b.pdf"}
 
     def test_skipped_google_native_file_keeps_export_suffix(
@@ -483,7 +500,7 @@ class TestDownloadAll:
         downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
         downloader.download_all(tmp_path)  # first run downloads
         result = downloader.download_all(tmp_path)  # second run skips
-        assert result.downloaded == []
+        assert result.downloaded == ()
         assert len(result.skipped) == 1
         assert result.skipped[0].name == "Letter.docx"
         assert route_to_ingestor(result.skipped[0]) == "document"
@@ -501,6 +518,70 @@ class TestDownloadAll:
         result = downloader.download_all(tmp_path)
         assert {p.name for p in result.all_paths} == {"a.pdf"}
 
+    def test_download_result_lists_are_immutable(self, tmp_path: Path) -> None:
+        """`DownloadResult` exposes tuples so callers cannot mutate the record.
+
+        ``frozen=True`` only prevents field reassignment; mutable list
+        attributes would still allow ``result.downloaded.append(...)``.
+        Switching to tuples makes the value object truly immutable.
+        """
+        client = StubDriveClient(
+            files=[_file(fid="a", name="a.pdf")],
+            media={"a": b"x"},
+        )
+        downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
+        result = downloader.download_all(tmp_path)
+        assert isinstance(result.downloaded, tuple)
+        assert isinstance(result.skipped, tuple)
+        assert isinstance(result.errors, tuple)
+
+    def test_partial_failure_continues_and_records_per_file_errors(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A mid-loop client failure records the error and continues.
+
+        Without this, a 500-file sync that hits a transient quota error
+        at file 250 would abort and leave the staging directory in a
+        partial state with no programmatic record of how many files
+        succeeded.
+        """
+        good = _file(fid="ok", name="good.pdf")
+        bad = _file(fid="bad", name="bad.pdf")
+
+        class _FlakyClient(StubDriveClient):
+            def download_to(
+                self,
+                file_id: str,
+                destination: Path,
+                *,
+                export_mime: str | None = None,
+            ) -> None:
+                if file_id == "bad":
+                    msg = "simulated rate limit"
+                    raise RuntimeError(msg)
+                super().download_to(
+                    file_id,
+                    destination,
+                    export_mime=export_mime,
+                )
+
+        client = _FlakyClient(
+            files=[good, bad],
+            media={"ok": b"good bytes"},
+        )
+        downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
+        result = downloader.download_all(tmp_path)
+
+        assert len(result.downloaded) == 1
+        assert result.downloaded[0].name == "good.pdf"
+        assert len(result.errors) == 1
+        failed_file, exc = result.errors[0]
+        assert failed_file.id == "bad"
+        assert "rate limit" in str(exc)
+        # The good file still landed.
+        assert (tmp_path / "good.pdf").read_bytes() == b"good bytes"
+
 
 # ---- Read-only audit ---------------------------------------------------
 
@@ -509,7 +590,7 @@ class TestReadOnlyContract:
     """The downloader never invokes write APIs against Drive."""
 
     def test_downloader_does_not_call_write_methods(self, tmp_path: Path) -> None:
-        """A full download cycle records only list/get/export_media calls."""
+        """A full cycle records only list_files / download_to / export_to calls."""
         client = StubDriveClient(
             files=[_file(fid="a", name="a.pdf")],
             media={"a": b"x"},
@@ -741,6 +822,31 @@ class TestTokenFilePermissions:
         _write_token_file(token_path, '{"refresh_token": "second"}')
         assert token_path.read_text(encoding="utf-8") == '{"refresh_token": "second"}'
 
+    def test_overwrite_of_world_readable_file_lands_at_0o600(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Replacing a 0o644 token file leaves the new file at 0o600.
+
+        Closes the TOCTOU window where a previous run's wider-permission
+        token file could briefly contain the new refresh token before
+        the chmod tightened it. Atomic rename writes a fresh 0o600
+        sibling and atomically replaces the old file.
+        """
+        import stat
+
+        from creek.ingest.gdrive import _write_token_file
+
+        token_path = tmp_path / "token.json"
+        token_path.write_text("{}", encoding="utf-8")
+        token_path.chmod(0o644)
+        _write_token_file(token_path, '{"refresh_token": "new-secret"}')
+        mode = token_path.stat().st_mode & 0o777
+        assert mode == stat.S_IRUSR | stat.S_IWUSR  # 0o600
+        assert (
+            token_path.read_text(encoding="utf-8") == '{"refresh_token": "new-secret"}'
+        )
+
 
 # ---- Path traversal guard --------------------------------------------
 
@@ -803,8 +909,15 @@ class TestListFilesCache:
         list_calls = [c for c in client.calls if c == "list_files"]
         assert len(list_calls) == 1
 
-    def test_explicit_list_files_invalidates_cache(self, tmp_path: Path) -> None:
-        """A direct ``list_files()`` call refreshes the cache for callers."""
+    def test_explicit_list_files_always_fetches_from_client(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """`list_files()` is a live call — every invocation hits the client.
+
+        The internal cache is for the ``download_file`` fast-path only;
+        a direct ``list_files()`` from a caller refreshes it.
+        """
         client = StubDriveClient(
             files=[_file(fid="a", name="a.pdf")],
             media={"a": b"a"},

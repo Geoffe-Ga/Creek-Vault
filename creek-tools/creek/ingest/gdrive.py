@@ -10,9 +10,9 @@ methods so future refactors cannot sneak a write in by accident.
 
 Architecture:
 
-* :class:`DriveClient` — Protocol with ``list_files``, ``get_media``,
-  ``export_media``, and ``is_available``. Tests inject a deterministic
-  stub; production code uses :class:`GoogleApiDriveClient`.
+* :class:`DriveClient` — Protocol with ``list_files``, ``download_to``,
+  and ``is_available``. Tests inject a deterministic stub; production
+  code uses :class:`GoogleApiDriveClient`.
 * :class:`GoogleApiDriveClient` — concrete implementation that lazily
   imports ``googleapiclient`` and ``google_auth_oauthlib``. Raises
   :class:`GoogleApiUnavailableError` with actionable install
@@ -114,7 +114,7 @@ class DriveFile:
     """Lightweight metadata for a single Drive file.
 
     Attributes:
-        id: Drive file id (used for ``get_media`` / ``export_media``).
+        id: Drive file id (used for ``download_to``).
         name: File name as it appears in Drive.
         mime_type: Drive-reported mime type.
         modified_time: Drive-reported last-modified timestamp.
@@ -143,6 +143,10 @@ class DriveClient(Protocol):
     By construction the Protocol exposes no write surface — there is
     no ``update``, ``delete``, ``trash``, or ``copy`` method. Any
     implementation that adds one violates the read-only contract.
+
+    Downloads are streamed straight to disk via :meth:`download_to`
+    rather than collected to ``bytes``; callers do not need to hold
+    a full file in memory regardless of size.
     """
 
     def is_available(self) -> bool:
@@ -151,11 +155,19 @@ class DriveClient(Protocol):
     def list_files(self) -> list[DriveFile]:
         """Return every file visible to the configured credentials."""
 
-    def get_media(self, file_id: str) -> bytes:
-        """Download the raw bytes of a non-Google-native file."""
+    def download_to(
+        self,
+        file_id: str,
+        destination: Path,
+        *,
+        export_mime: str | None = None,
+    ) -> None:
+        """Stream *file_id* to *destination*.
 
-    def export_media(self, file_id: str, mime_type: str) -> bytes:
-        """Export a Google-native file to *mime_type* and return bytes."""
+        When *export_mime* is provided the file is treated as a
+        Google-native document and exported to that mime type;
+        otherwise the raw media is downloaded.
+        """
 
 
 class GoogleApiUnavailableError(RuntimeError):
@@ -166,20 +178,29 @@ class GoogleApiUnavailableError(RuntimeError):
 class DownloadResult:
     """Outcome of a :meth:`GoogleDriveDownloader.download_all` invocation.
 
+    Tuples (not lists) so the value object is fully immutable —
+    ``frozen=True`` would otherwise still allow callers to
+    ``result.downloaded.append(...)``.
+
     Attributes:
         downloaded: Paths of files that were freshly fetched (or
             re-fetched because Drive's modified_time was newer).
         skipped: Paths of files whose local mtime was at least as new
             as Drive — the incremental-sync skip set.
+        errors: ``(DriveFile, exception)`` pairs for any per-file
+            download that failed mid-loop. ``download_all`` records
+            each failure and continues so a transient quota/network
+            error mid-sync does not abandon the rest of the run.
     """
 
-    downloaded: list[Path]
-    skipped: list[Path]
+    downloaded: tuple[Path, ...]
+    skipped: tuple[Path, ...]
+    errors: tuple[tuple[DriveFile, Exception], ...] = ()
 
     @property
-    def all_paths(self) -> list[Path]:
+    def all_paths(self) -> tuple[Path, ...]:
         """Return the union of downloaded + skipped paths in listing order."""
-        return [*self.downloaded, *self.skipped]
+        return (*self.downloaded, *self.skipped)
 
 
 # ---- Default Drive client ----------------------------------------------
@@ -266,17 +287,51 @@ class GoogleApiDriveClient:
                 break
         return results
 
-    def get_media(self, file_id: str) -> bytes:
-        """Download raw media for a non-Google-native Drive file."""
-        service = self._get_service()
-        return bytes(service.files().get_media(fileId=file_id).execute())
+    def download_to(
+        self,
+        file_id: str,
+        destination: Path,
+        *,
+        export_mime: str | None = None,
+    ) -> None:
+        """Stream *file_id* to *destination* in chunks.
 
-    def export_media(self, file_id: str, mime_type: str) -> bytes:
-        """Export a Google-native file to *mime_type* and return bytes."""
+        Uses :class:`googleapiclient.http.MediaIoBaseDownload` so
+        large files (videos, multi-MB scans) are written in 1 MiB
+        chunks rather than collected into a single ``bytes`` object
+        in memory.
+
+        Args:
+            file_id: Drive file id.
+            destination: Local filesystem destination.
+            export_mime: Mime type to export to for Google-native
+                files. ``None`` issues a raw ``get_media`` request.
+
+        Raises:
+            GoogleApiUnavailableError: When the optional Google
+                libraries are not installed.
+        """
+        try:
+            from googleapiclient.http import MediaIoBaseDownload
+        except ImportError as exc:
+            msg = (
+                "google-api-python-client is required for Drive downloads. "
+                "Install it with `pip install google-api-python-client`."
+            )
+            raise GoogleApiUnavailableError(msg) from exc
+
         service = self._get_service()
-        return bytes(
-            service.files().export_media(fileId=file_id, mimeType=mime_type).execute(),
+        request = (
+            service.files().export_media(fileId=file_id, mimeType=export_mime)
+            if export_mime is not None
+            else service.files().get_media(fileId=file_id)
         )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            downloader = MediaIoBaseDownload(handle, request, chunksize=1024 * 1024)
+            done = False
+            while not done:
+                _status, done = downloader.next_chunk()
 
     def _get_service(self) -> Any:
         """Build (or return cached) Drive API service.
@@ -390,20 +445,30 @@ def _write_token_file(path: Path, contents: str) -> None:
     """Write *contents* to *path* with owner-only (``0o600``) permissions.
 
     The OAuth refresh token grants long-lived Drive access; a default
-    ``0o644`` umask would leave it group/world readable. Using
-    :func:`os.open` with mode ``0o600`` makes the file owner-only on
-    creation and atomically truncates an existing file.
+    ``0o644`` umask would leave it group/world readable. The function
+    writes a fresh ``0o600`` sibling temp file and then ``os.replace``
+    s it atomically over *path*. ``os.replace`` is the rename system
+    call on POSIX, so the new file's mode (``0o600``) replaces the old
+    file's mode in one step — closing the brief TOCTOU window that an
+    in-place truncate-then-chmod sequence would leave open.
     """
+    tmp_path = path.with_name(path.name + ".tmp")
+    # The mode argument to os.open applies only when O_CREAT actually
+    # creates the file; combined with the unique tmp_path that means
+    # the new file is owner-only from byte zero.
     fd = os.open(
-        path,
+        tmp_path,
         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
         stat.S_IRUSR | stat.S_IWUSR,
     )
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(contents)
-    # Re-chmod in case the file already existed (O_CREAT mode is
-    # ignored by os.open when the file is not newly created).
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 _FORBIDDEN_DRIVE_METHODS: frozenset[str] = frozenset(
@@ -511,10 +576,18 @@ class GoogleDriveDownloader:
 
         Files whose local mtime is at least as new as the Drive
         ``modified_time`` are skipped (incremental sync). Returns a
-        :class:`DownloadResult` with separate ``downloaded`` and
-        ``skipped`` lists; both lists carry the actual on-disk path
-        (including any Google-native export suffix such as ``.docx``)
-        so callers can route them through ``creek ingest`` reliably.
+        :class:`DownloadResult` with separate ``downloaded`` /
+        ``skipped`` / ``errors`` tuples; the path tuples carry the
+        actual on-disk path (including any Google-native export suffix
+        such as ``.docx``) so callers can route them through
+        ``creek ingest`` reliably.
+
+        Per-file errors are recorded into ``DownloadResult.errors``
+        and the loop continues, so a transient quota or network blip
+        on file N does not abandon the remaining files. The
+        path-traversal guard still raises eagerly because malicious
+        ``parent_path`` is a configuration bug, not a transient
+        condition.
 
         Raises:
             ValueError: When any file's ``parent_path`` would escape
@@ -525,14 +598,27 @@ class GoogleDriveDownloader:
         listing = self.list_files()
         downloaded: list[Path] = []
         skipped: list[Path] = []
+        errors: list[tuple[DriveFile, Exception]] = []
         for drive_file in listing:
             target = self._target_path(drive_file, staging_dir)
             if self._is_up_to_date(target, drive_file):
                 logger.info("Skipping unchanged Drive file: %s", drive_file.name)
                 skipped.append(self._native_target(target, drive_file))
                 continue
-            downloaded.append(self._write(drive_file, staging_dir))
-        return DownloadResult(downloaded=downloaded, skipped=skipped)
+            try:
+                downloaded.append(self._write(drive_file, staging_dir))
+            except Exception as exc:
+                logger.warning(
+                    "Drive download failed for %s: %s",
+                    drive_file.name,
+                    exc,
+                )
+                errors.append((drive_file, exc))
+        return DownloadResult(
+            downloaded=tuple(downloaded),
+            skipped=tuple(skipped),
+            errors=tuple(errors),
+        )
 
     def _resolve(self, file_id: str) -> DriveFile:
         """Return the :class:`DriveFile` for *file_id* from the cached listing."""
@@ -545,16 +631,19 @@ class GoogleDriveDownloader:
         raise KeyError(msg)
 
     def _write(self, drive_file: DriveFile, staging_dir: Path) -> Path:
-        """Fetch bytes for *drive_file* and persist them under *staging_dir*."""
+        """Stream *drive_file* to disk under *staging_dir* and return the path."""
         target = self._target_path(drive_file, staging_dir)
         target.parent.mkdir(parents=True, exist_ok=True)
         if drive_file.is_google_native:
             export_mime, suffix = _NATIVE_EXPORT_TARGETS[drive_file.mime_type]
-            data = self.client.export_media(drive_file.id, export_mime)
             target = target.with_name(target.stem + suffix)
+            self.client.download_to(
+                drive_file.id,
+                target,
+                export_mime=export_mime,
+            )
         else:
-            data = self.client.get_media(drive_file.id)
-        target.write_bytes(data)
+            self.client.download_to(drive_file.id, target)
         timestamp = drive_file.modified_time.timestamp()
         os.utime(target, (timestamp, timestamp))
         return target
