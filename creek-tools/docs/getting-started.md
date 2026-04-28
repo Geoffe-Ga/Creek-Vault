@@ -31,6 +31,8 @@ Creek-Vault/
 └── 10-Liminal/                # Awaiting classification
 ```
 
+**One vault setup tip:** since `Creek-Vault/` *is* the Obsidian vault and Obsidian recursively indexes every `.md` file, the project's own docs (`creek-tools/`, this guide, `CLAUDE.md`, etc.) will otherwise show up as orphan nodes in the graph view. Open Obsidian → Settings → Files & Links → **"Excluded files"** and add `creek-tools/`. (Equivalently, edit `<vault>/.obsidian/app.json` and add `"creek-tools/"` to `userIgnoreFilters`.)
+
 Open the repo in Obsidian and add a config file at `00-Creek-Meta/creek_config.yaml`. A minimal starter:
 
 ```yaml

@@ -126,12 +126,11 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
 | `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
-| `classification` | `ClassificationConfig` | Rules vs LLM, batch size, review thresholds. |
+| `classification` | `ClassificationConfig` | Auto-classify sources, confidence threshold, review-required sources. |
+| `context`        | `ContextConfig`        | How non-user content (others' messages, collaborative docs) is handled. |
 | `redaction`      | `RedactionConfig`      | Pattern enable list, exclusion globs, allow-list. |
-| `gdrive`         | `GoogleDriveConfig`    | OAuth token cache, root folder, mime allow-list. |
-| `cleaning`       | `CleaningConfig`       | Per-source filters (Discord, ChatGPT, Drive, Markdown). |
-| `validation`     | `ValidationConfig`     | Required frontmatter fields, encoding policy. |
-| `quality`        | `QualityConfig`        | Minimum content length, deduplication strategy. |
+| `google_drive`   | `GoogleDriveConfig`    | OAuth token cache, scopes, staging directory. |
+| `cleaning`       | `CleaningConfig`       | Per-source filters (Discord, ChatGPT, Drive, Markdown) plus `validation`, `quality`, `deduplication`, `hygiene` sub-sections. |
 
 See [`docs/configuration.md`](docs/configuration.md) for the full schema with examples.
 

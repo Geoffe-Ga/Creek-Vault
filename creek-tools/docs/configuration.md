@@ -31,13 +31,13 @@ llm:
 
 | Field            | Default   | Notes |
 |------------------|-----------|-------|
-| `provider`       | `ollama`  | `ollama`, `anthropic`, or `openai`. |
+| `provider`       | `ollama`  | `ollama` or `anthropic`. |
 | `model`          | `mistral` | Model id understood by the provider. |
 | `ollama_url`     | `http://localhost:11434` | Base URL when `provider: ollama`. |
 | `batch_size`     | `50`      | Items per batch call. |
 | `max_concurrent` | `5`       | Concurrent requests in flight. |
 
-When `provider: anthropic`, set `ANTHROPIC_API_KEY` in the environment. When `provider: openai`, set `OPENAI_API_KEY`. Local Ollama models require nothing in the environment beyond the server being running.
+When `provider: anthropic`, set `ANTHROPIC_API_KEY` in the environment. Local Ollama models require nothing in the environment beyond the server being running.
 
 ## `embeddings` — semantic similarity
 
