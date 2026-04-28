@@ -377,8 +377,8 @@ class TestDownloadAll:
             media={"a": b"a", "b": b"b"},
         )
         downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
-        paths = downloader.download_all(tmp_path)
-        assert {p.name for p in paths} == {"a.pdf", "b.docx"}
+        result = downloader.download_all(tmp_path)
+        assert {p.name for p in result.all_paths} == {"a.pdf", "b.docx"}
         assert (tmp_path / "a.pdf").read_bytes() == b"a"
 
     def test_preserves_folder_structure(self, tmp_path: Path) -> None:
@@ -390,8 +390,8 @@ class TestDownloadAll:
             media={"a": b"a"},
         )
         downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
-        paths = downloader.download_all(tmp_path)
-        assert paths[0] == tmp_path / "Docs" / "2026" / "a.pdf"
+        result = downloader.download_all(tmp_path)
+        assert result.downloaded[0] == tmp_path / "Docs" / "2026" / "a.pdf"
 
     def test_skips_unchanged_files_on_subsequent_runs(
         self,
@@ -431,6 +431,75 @@ class TestDownloadAll:
         downloader.download_all(tmp_path)
         assert any(c.startswith("get_media") for c in client.calls)
         assert (tmp_path / "a.pdf").read_bytes() == b"v2"
+
+    def test_download_all_returns_separate_downloaded_and_skipped_lists(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The return shape distinguishes freshly-downloaded vs skipped files."""
+        modified = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        client = StubDriveClient(
+            files=[
+                _file(fid="a", name="a.pdf", modified=modified),
+                _file(fid="b", name="b.pdf", modified=modified),
+            ],
+            media={"a": b"a", "b": b"b"},
+        )
+        downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
+        first = downloader.download_all(tmp_path)
+        assert len(first.downloaded) == 2
+        assert first.skipped == []
+
+        # Re-run: nothing changed, both files should be skipped.
+        second = downloader.download_all(tmp_path)
+        assert second.downloaded == []
+        assert {p.name for p in second.skipped} == {"a.pdf", "b.pdf"}
+
+    def test_skipped_google_native_file_keeps_export_suffix(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An up-to-date Google Doc still reports its on-disk ``.docx`` path.
+
+        Regression: previously the skip branch appended the un-suffixed
+        target (``Letter``), so a caller piping the result through
+        ``route_to_ingestor`` would mis-classify it.
+        """
+        docx_mime = (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        modified = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        client = StubDriveClient(
+            files=[
+                _file(
+                    fid="g1",
+                    name="Letter",
+                    mime=GOOGLE_DOCS_MIME,
+                    modified=modified,
+                ),
+            ],
+            exports={("g1", docx_mime): b"PK\x03\x04"},
+        )
+        downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
+        downloader.download_all(tmp_path)  # first run downloads
+        result = downloader.download_all(tmp_path)  # second run skips
+        assert result.downloaded == []
+        assert len(result.skipped) == 1
+        assert result.skipped[0].name == "Letter.docx"
+        assert route_to_ingestor(result.skipped[0]) == "document"
+
+    def test_download_all_returns_result_iterable_for_legacy_callers(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """`DownloadResult.all_paths` returns the union for callers that want it."""
+        client = StubDriveClient(
+            files=[_file(fid="a", name="a.pdf")],
+            media={"a": b"x"},
+        )
+        downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
+        result = downloader.download_all(tmp_path)
+        assert {p.name for p in result.all_paths} == {"a.pdf"}
 
 
 # ---- Read-only audit ---------------------------------------------------
@@ -706,8 +775,8 @@ class TestPathTraversalGuard:
             media={"a": b"x"},
         )
         downloader = GoogleDriveDownloader(client=client, config=GoogleDriveConfig())
-        paths = downloader.download_all(tmp_path)
-        assert paths[0] == tmp_path / "Docs" / "2026" / "a.pdf"
+        result = downloader.download_all(tmp_path)
+        assert result.downloaded[0] == tmp_path / "Docs" / "2026" / "a.pdf"
 
 
 # ---- list_files caching ----------------------------------------------

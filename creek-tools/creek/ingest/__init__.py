@@ -29,6 +29,7 @@ from creek.ingest.code import CodeIngestor
 from creek.ingest.discord import DiscordIngestor
 from creek.ingest.documents import DocumentIngestor
 from creek.ingest.gdrive import (
+    DownloadResult,
     DriveClient,
     DriveFile,
     GoogleApiUnavailableError,
@@ -59,6 +60,7 @@ __all__ = [
     "CodeIngestor",
     "DiscordIngestor",
     "DocumentIngestor",
+    "DownloadResult",
     "DriveClient",
     "DriveFile",
     "GenericIngestor",

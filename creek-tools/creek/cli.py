@@ -297,6 +297,10 @@ def gdrive(
     folder hierarchy preserved; subsequent runs are incremental
     (unchanged files are skipped). Pipe the staging directory through
     ``creek ingest`` to absorb the downloads into the vault.
+
+    First run opens a browser window for OAuth authorisation; the
+    refresh token is cached at ``GoogleDriveConfig.token_file`` (mode
+    ``0o600``) so subsequent runs are non-interactive.
     """
     if not download:
         console.print(
@@ -326,13 +330,23 @@ def gdrive(
 
     downloader = GoogleDriveDownloader(client=client, config=config.google_drive)
     try:
-        paths = downloader.download_all(staging_dir)
+        result = downloader.download_all(staging_dir)
     except GoogleApiUnavailableError as exc:
+        console.print(f"[red]Google Drive download failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        # Drive surface includes HttpError (quota / rate limit / revoked
+        # token), network IOErrors, OAuth failures. We can't import
+        # googleapiclient.errors at module top-level since it's optional,
+        # so catch broadly here and present a clean message rather than
+        # a raw traceback.
         console.print(f"[red]Google Drive download failed: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
     console.print(
-        f"[bold green]Downloaded {len(paths)} files to {staging_dir}[/bold green]",
+        f"[bold green]Downloaded {len(result.downloaded)} / "
+        f"Skipped {len(result.skipped)} (unchanged) files to "
+        f"{staging_dir}[/bold green]",
     )
 
 

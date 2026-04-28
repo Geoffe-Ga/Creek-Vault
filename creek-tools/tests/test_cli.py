@@ -450,8 +450,82 @@ def test_gdrive_command_downloads_files_through_stub_client(
         ["gdrive", "--download", "--staging", str(staging)],
     )
     assert result.exit_code == 0, result.output
-    assert "Downloaded 1 files" in result.output
+    assert "Downloaded 1" in result.output
+    assert "Skipped 0" in result.output
     assert (staging / "notes.md").read_bytes() == b"# Notes\n"
+
+
+def test_gdrive_command_reports_skipped_files_on_incremental_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second run on unchanged files reports them as skipped, not downloaded."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from creek.ingest.gdrive import DriveFile, GoogleApiDriveClient
+
+    drive_file = DriveFile(
+        id="x",
+        name="notes.md",
+        mime_type="text/markdown",
+        modified_time=_datetime(2026, 4, 1, tzinfo=_UTC),
+        size=10,
+        parent_path="",
+    )
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "is_available",
+        lambda _self: True,
+    )
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "list_files",
+        lambda _self: [drive_file],
+    )
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "get_media",
+        lambda _self, _file_id: b"# Notes\n",
+    )
+
+    staging = tmp_path / "staging"
+    runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+    second = runner.invoke(
+        app,
+        ["gdrive", "--download", "--staging", str(staging)],
+    )
+    assert second.exit_code == 0, second.output
+    assert "Downloaded 0" in second.output
+    assert "Skipped 1" in second.output
+
+
+def test_gdrive_command_reports_drive_api_errors_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive API HTTP errors surface as a clean message, not a traceback."""
+    from creek.ingest.gdrive import GoogleApiDriveClient
+
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "is_available",
+        lambda _self: True,
+    )
+
+    def _boom(_self: object) -> list[object]:
+        msg = "<HttpError 403: 'User Rate Limit Exceeded'>"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(GoogleApiDriveClient, "list_files", _boom)
+    staging = tmp_path / "staging"
+    result = runner.invoke(
+        app,
+        ["gdrive", "--download", "--staging", str(staging)],
+    )
+    assert result.exit_code == 1
+    assert "Google Drive download failed" in result.output
+    assert "Rate Limit" in result.output
 
 
 def test_skills_help() -> None:

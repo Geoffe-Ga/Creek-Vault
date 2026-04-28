@@ -162,6 +162,26 @@ class GoogleApiUnavailableError(RuntimeError):
     """Raised when a Drive call is made but the API client is not installed."""
 
 
+@dataclass(frozen=True)
+class DownloadResult:
+    """Outcome of a :meth:`GoogleDriveDownloader.download_all` invocation.
+
+    Attributes:
+        downloaded: Paths of files that were freshly fetched (or
+            re-fetched because Drive's modified_time was newer).
+        skipped: Paths of files whose local mtime was at least as new
+            as Drive — the incremental-sync skip set.
+    """
+
+    downloaded: list[Path]
+    skipped: list[Path]
+
+    @property
+    def all_paths(self) -> list[Path]:
+        """Return the union of downloaded + skipped paths in listing order."""
+        return [*self.downloaded, *self.skipped]
+
+
 # ---- Default Drive client ----------------------------------------------
 
 
@@ -486,13 +506,15 @@ class GoogleDriveDownloader:
         drive_file = self._resolve(file_id)
         return self._write(drive_file, staging_dir)
 
-    def download_all(self, staging_dir: Path) -> list[Path]:
+    def download_all(self, staging_dir: Path) -> DownloadResult:
         """Download every file in the listing to *staging_dir*.
 
         Files whose local mtime is at least as new as the Drive
-        ``modified_time`` are skipped (incremental sync). Returns the
-        list of *all* destination paths — both downloaded and skipped
-        — so callers can pipe them through the ingest registry.
+        ``modified_time`` are skipped (incremental sync). Returns a
+        :class:`DownloadResult` with separate ``downloaded`` and
+        ``skipped`` lists; both lists carry the actual on-disk path
+        (including any Google-native export suffix such as ``.docx``)
+        so callers can route them through ``creek ingest`` reliably.
 
         Raises:
             ValueError: When any file's ``parent_path`` would escape
@@ -501,15 +523,16 @@ class GoogleDriveDownloader:
         staging_dir.mkdir(parents=True, exist_ok=True)
         # Refresh cache so download_all always sees latest state.
         listing = self.list_files()
-        paths: list[Path] = []
+        downloaded: list[Path] = []
+        skipped: list[Path] = []
         for drive_file in listing:
             target = self._target_path(drive_file, staging_dir)
             if self._is_up_to_date(target, drive_file):
                 logger.info("Skipping unchanged Drive file: %s", drive_file.name)
-                paths.append(target)
+                skipped.append(self._native_target(target, drive_file))
                 continue
-            paths.append(self._write(drive_file, staging_dir))
-        return paths
+            downloaded.append(self._write(drive_file, staging_dir))
+        return DownloadResult(downloaded=downloaded, skipped=skipped)
 
     def _resolve(self, file_id: str) -> DriveFile:
         """Return the :class:`DriveFile` for *file_id* from the cached listing."""
@@ -595,6 +618,7 @@ __all__ = [
     "GOOGLE_DOCS_MIME",
     "GOOGLE_SHEETS_MIME",
     "GOOGLE_SLIDES_MIME",
+    "DownloadResult",
     "DriveClient",
     "DriveFile",
     "GoogleApiDriveClient",
