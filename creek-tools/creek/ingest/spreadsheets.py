@@ -179,11 +179,36 @@ def _cell_to_str(value: Any) -> str:
     return str(value)
 
 
+CSV_ENCODING_FALLBACKS: tuple[str, ...] = ("utf-8-sig", "cp1252")
+"""Encoding probe order for CSV reads.
+
+``utf-8-sig`` decodes plain UTF-8 *and* strips the UTF-8 BOM that
+Excel emits for "CSV UTF-8" exports. ``cp1252`` is the Windows
+default for legacy Excel "CSV (Comma delimited)" exports — a near
+superset of Latin-1 that decodes any byte sequence without raising,
+so it serves as a guaranteed-success fallback.
+"""
+
+
 def _read_csv(path: Path) -> WorkbookData:
-    """Read a CSV file as a single-sheet workbook."""
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        rows = [tuple(row) for row in csv.reader(handle)]
-    return WorkbookData(sheets=(_split_header(path.stem, rows),))
+    """Read a CSV file as a single-sheet workbook.
+
+    Tries each encoding in :data:`CSV_ENCODING_FALLBACKS` in order —
+    decoding with the first that succeeds. ``cp1252`` is positioned
+    last because it accepts arbitrary bytes and so always succeeds,
+    guaranteeing the read never raises ``UnicodeDecodeError``.
+    """
+    raw = path.read_bytes()
+    for encoding in CSV_ENCODING_FALLBACKS:
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        rows = [tuple(row) for row in csv.reader(text.splitlines())]
+        return WorkbookData(sheets=(_split_header(path.stem, rows),))
+    # Should be unreachable: cp1252 decodes any byte sequence.
+    msg = f"Unable to decode CSV {path} with any known encoding."
+    raise UnicodeDecodeError("csv", raw, 0, 1, msg)  # pragma: no cover
 
 
 def _split_header(
@@ -328,24 +353,54 @@ def _extract_headers_and_rows(
     return headers, rows
 
 
+def _escape_cell(value: object) -> str:
+    """Escape a cell value for safe inclusion in a GFM table.
+
+    GFM uses ``|`` as the column separator and a literal newline as
+    the row terminator, so cells carrying either character would
+    corrupt the table layout. We escape ``|`` to ``\\|`` (the GFM
+    canonical form) and replace any newline with ``<br>`` so the
+    cell renders on a single visual line.
+    """
+    return (
+        str(value)
+        .replace("|", r"\|")
+        .replace("\r\n", "<br>")
+        .replace("\n", "<br>")
+        .replace("\r", "<br>")
+    )
+
+
+def _render_row(cells: list[str] | tuple[str, ...]) -> str:
+    """Render one GFM table row from a sequence of pre-escaped cells."""
+    return "| " + " | ".join(cells) + " |"
+
+
 def _render_table(headers: list[str], rows: list[list[str]]) -> list[str]:
-    """Return markdown lines for a GFM table, summarising oversize sheets."""
+    """Return markdown lines for a GFM table, summarising oversize sheets.
+
+    Cells are escaped via :func:`_escape_cell` so values containing
+    ``|`` or newlines do not corrupt the table. Sheets larger than
+    :data:`SUMMARY_THRESHOLD` are emitted as a single table whose
+    body is the head + tail rows; the summary note appears *before*
+    the table so the reader sees the truncation context first.
+    """
+    safe_headers = [_escape_cell(header) for header in headers]
+    separator = _render_row(["---"] * len(safe_headers))
     lines: list[str] = []
-    lines.append("| " + " | ".join(headers) + " |")
-    lines.append("| " + " | ".join("---" for _ in headers) + " |")
     if len(rows) > SUMMARY_THRESHOLD:
-        lines.append(
-            f"_Showing first {SUMMARY_HEAD_ROWS} and last "
-            f"{SUMMARY_TAIL_ROWS} of {len(rows)} rows._",
+        lines.extend(
+            (
+                f"_Showing first {SUMMARY_HEAD_ROWS} and last "
+                f"{SUMMARY_TAIL_ROWS} of {len(rows)} rows._",
+                "",
+            ),
         )
-        lines.append("")
-        lines.append("| " + " | ".join(headers) + " |")
-        lines.append("| " + " | ".join("---" for _ in headers) + " |")
         displayed = rows[:SUMMARY_HEAD_ROWS] + rows[-SUMMARY_TAIL_ROWS:]
     else:
         displayed = rows
-    for row in displayed:
-        lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    lines.extend((_render_row(safe_headers), separator))
+    lines.extend(_render_row([_escape_cell(cell) for cell in row]) for row in displayed)
     return lines
 
 

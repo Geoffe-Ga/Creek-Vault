@@ -329,6 +329,75 @@ class TestSpreadsheetMarkdown:
         # Middle rows trimmed:
         assert "v75" not in markdown
 
+    def test_large_sheet_renders_single_header_after_summary(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Summary note precedes a single GFM table — no duplicate header."""
+        path = tmp_path / "huge.xlsx"
+        _write_xlsx_placeholder(path)
+        big_rows = tuple((str(i), f"v{i}") for i in range(150))
+        backend = StubSpreadsheetBackend(
+            workbooks={
+                "huge.xlsx": WorkbookData(
+                    sheets=(
+                        SheetData(
+                            name="Big",
+                            headers=("idx", "value"),
+                            rows=big_rows,
+                        ),
+                    ),
+                ),
+            },
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        header_line = "| idx | value |"
+        # The header row should appear exactly once.
+        assert markdown.count(header_line) == 1
+        # The separator row should appear exactly once too.
+        assert markdown.count("| --- | --- |") == 1
+        # The summary note should appear before the header in the document.
+        summary_idx = markdown.index("Showing first")
+        header_idx = markdown.index(header_line)
+        assert summary_idx < header_idx, (
+            "Summary note should precede the (single) header row."
+        )
+
+    def test_pipe_and_newline_in_cell_are_escaped(self, tmp_path: Path) -> None:
+        """Cells containing ``|`` or newlines do not corrupt GFM tables."""
+        path = tmp_path / "escapes.xlsx"
+        _write_xlsx_placeholder(path)
+        backend = StubSpreadsheetBackend(
+            workbooks={
+                "escapes.xlsx": WorkbookData(
+                    sheets=(
+                        SheetData(
+                            name="Sheet1",
+                            headers=("a|b", "c"),
+                            rows=(("x | y", "line1\nline2"),),
+                        ),
+                    ),
+                ),
+            },
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        # The literal cell text must be present in escaped form.
+        assert r"a\|b" in markdown
+        assert r"x \| y" in markdown
+        # Newlines inside a cell must not split the table row.
+        assert "line1<br>line2" in markdown
+        # Every non-empty markdown line that begins with `|` should have
+        # the same column count (3 pipes for 2 columns).
+        table_rows = [line for line in markdown.splitlines() if line.startswith("|")]
+        column_counts = {line.count("|") - line.count(r"\|") for line in table_rows}
+        assert column_counts == {3}, (
+            f"Mismatched pipe counts indicate broken escaping: {column_counts}"
+        )
+
 
 # ---- generate_frontmatter ---------------------------------------------
 
@@ -382,6 +451,32 @@ class TestCsvFiles:
         markdown = ingestor.convert_to_markdown(fragments[0])
         assert "| a | b |" in markdown
         assert "| 1 | 2 |" in markdown
+
+    def test_csv_with_utf8_bom_is_decoded(self, tmp_path: Path) -> None:
+        """CSV files saved with a UTF-8 BOM (common from Excel) decode cleanly."""
+        csv_path = tmp_path / "bom.csv"
+        # Real-world Excel "CSV UTF-8" exports prepend the BOM.
+        csv_path.write_bytes(
+            "﻿name,city\nAlice,Münster\nBob,São Paulo\n".encode(),
+        )
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        # Header row must not carry the BOM character.
+        assert "﻿" not in markdown
+        assert "| name | city |" in markdown
+        assert "Münster" in markdown
+        assert "São Paulo" in markdown
+
+    def test_csv_with_cp1252_falls_back(self, tmp_path: Path) -> None:
+        """CSV files saved as CP1252 (legacy Excel default) decode without crashing."""
+        csv_path = tmp_path / "legacy.csv"
+        csv_path.write_bytes("name,note\nAlice,café\n".encode("cp1252"))
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        assert "| name | note |" in markdown
+        assert "café" in markdown
 
 
 # ---- OpenpyxlBackend lazy-import ---------------------------------------
