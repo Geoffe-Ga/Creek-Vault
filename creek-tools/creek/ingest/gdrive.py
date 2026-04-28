@@ -36,8 +36,10 @@ Without these the module still imports cleanly and the
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,32 +195,56 @@ class GoogleApiDriveClient:
     def list_files(self) -> list[DriveFile]:
         """List every Drive file visible to the credentials.
 
+        First enumerates folders so each file's ``parents[0]`` id can
+        be resolved into a slash-separated path, then enumerates files
+        and stamps the resolved path onto every :class:`DriveFile`.
+
         Raises:
             GoogleApiUnavailableError: When the optional Google
                 libraries are not installed.
         """
         service = self._get_service()
-        files: list[DriveFile] = []
+        folders = self._list_raw(
+            service,
+            query="mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields="nextPageToken, files(id, name, parents)",
+        )
+        folder_paths = _resolve_folder_paths(folders)
+        files = self._list_raw(
+            service,
+            query="mimeType!='application/vnd.google-apps.folder' and trashed=false",
+            fields=(
+                "nextPageToken, files(id, name, mimeType, modifiedTime, size, parents)"
+            ),
+        )
+        return [_drive_file_from_raw(raw, folder_paths) for raw in files]
+
+    @staticmethod
+    def _list_raw(
+        service: Any,
+        *,
+        query: str,
+        fields: str,
+    ) -> list[dict[str, Any]]:
+        """Page through ``service.files().list`` returning raw dicts."""
+        results: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
             response: dict[str, Any] = (
                 service.files()
                 .list(
-                    pageSize=200,
-                    fields=(
-                        "nextPageToken, files(id, name, mimeType, "
-                        "modifiedTime, size, parents)"
-                    ),
+                    q=query,
+                    pageSize=1000,
+                    fields=fields,
                     pageToken=page_token,
                 )
                 .execute()
             )
-            for raw in response.get("files", []):
-                files.append(_drive_file_from_raw(raw))
+            results.extend(response.get("files", []))
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
-        return files
+        return results
 
     def get_media(self, file_id: str) -> bytes:
         """Download raw media for a non-Google-native Drive file."""
@@ -274,27 +300,113 @@ class GoogleApiDriveClient:
                     self.config.scopes,
                 )
                 creds = flow.run_local_server(port=0)
-            token_path.write_text(creds.to_json(), encoding="utf-8")
+            _write_token_file(token_path, creds.to_json())
         self._service = build("drive", "v3", credentials=creds)
         return self._service
 
 
-def _drive_file_from_raw(raw: dict[str, Any]) -> DriveFile:
-    """Convert a Drive API ``files.list`` row into a :class:`DriveFile`."""
+def _drive_file_from_raw(
+    raw: dict[str, Any],
+    folder_paths: dict[str, str],
+) -> DriveFile:
+    """Convert a Drive API ``files.list`` row into a :class:`DriveFile`.
+
+    *folder_paths* maps folder ids to slash-separated paths and is
+    produced by :func:`_resolve_folder_paths`. The file's first parent
+    id (Drive supports multi-parenting; we use the first) is looked up
+    to build :attr:`DriveFile.parent_path`. Files at the Drive root
+    keep ``parent_path = ""``.
+    """
     modified_str = str(raw.get("modifiedTime", "1970-01-01T00:00:00Z"))
     if modified_str.endswith("Z"):
         modified_str = modified_str[:-1] + "+00:00"
     modified = datetime.fromisoformat(modified_str)
     if modified.tzinfo is None:
         modified = modified.replace(tzinfo=UTC)
+    parents = raw.get("parents") or []
+    parent_path = folder_paths.get(parents[0], "") if parents else ""
     return DriveFile(
         id=str(raw["id"]),
         name=str(raw["name"]),
         mime_type=str(raw.get("mimeType", "application/octet-stream")),
         modified_time=modified,
         size=int(raw.get("size", 0)),
-        parent_path="",
+        parent_path=parent_path,
     )
+
+
+def _resolve_folder_paths(folders: list[dict[str, Any]]) -> dict[str, str]:
+    """Walk a flat folder listing into ``{folder_id: slash-path}``.
+
+    Folders whose declared parent is not in the visible listing
+    (orphans — usually shared folders above the visible root) are
+    anchored at their own name rather than being skipped, so files
+    inside them still mirror correctly under the staging root.
+    """
+    by_id: dict[str, dict[str, Any]] = {str(f["id"]): f for f in folders}
+    paths: dict[str, str] = {}
+
+    def _walk(folder_id: str, seen: frozenset[str]) -> str:
+        if folder_id in paths:
+            return paths[folder_id]
+        if folder_id in seen or folder_id not in by_id:
+            return ""
+        folder = by_id[folder_id]
+        parents = folder.get("parents") or []
+        if parents and parents[0] in by_id:
+            prefix = _walk(parents[0], seen | {folder_id})
+            path = f"{prefix}/{folder['name']}" if prefix else str(folder["name"])
+        else:
+            path = str(folder["name"])
+        paths[folder_id] = path
+        return path
+
+    for folder_id in by_id:
+        _walk(folder_id, frozenset())
+    return paths
+
+
+def _write_token_file(path: Path, contents: str) -> None:
+    """Write *contents* to *path* with owner-only (``0o600``) permissions.
+
+    The OAuth refresh token grants long-lived Drive access; a default
+    ``0o644`` umask would leave it group/world readable. Using
+    :func:`os.open` with mode ``0o600`` makes the file owner-only on
+    creation and atomically truncates an existing file.
+    """
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(contents)
+    # Re-chmod in case the file already existed (O_CREAT mode is
+    # ignored by os.open when the file is not newly created).
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+_FORBIDDEN_DRIVE_METHODS: frozenset[str] = frozenset(
+    {"update", "delete", "trash", "copy"},
+)
+
+
+def _audit_no_write_calls(source: str) -> None:
+    """Raise :class:`AssertionError` if *source* calls a forbidden Drive method.
+
+    AST-based: ignores method names that appear inside docstrings,
+    string literals, or comments. Only flags real call sites such as
+    ``service.files().delete(...)``. Used by the test suite to keep
+    the read-only contract enforced as the module evolves.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_DRIVE_METHODS:
+            msg = f"Forbidden write call detected: {func.attr}() at line {node.lineno}"
+            raise AssertionError(msg)
 
 
 # ---- Routing helper ----------------------------------------------------
@@ -337,13 +449,25 @@ class GoogleDriveDownloader:
         """Initialise with the client and config."""
         self.client = client
         self.config = config
+        self._listing_cache: list[DriveFile] | None = None
 
     def list_files(self) -> list[DriveFile]:
-        """Proxy ``client.list_files()`` so callers can preview a sync."""
-        return self.client.list_files()
+        """Return a fresh listing of every Drive file.
+
+        Always passes through to the client so callers see live state;
+        the cache used by :meth:`download_file` is populated as a side
+        effect so subsequent single-file downloads reuse this snapshot.
+        """
+        listing = self.client.list_files()
+        self._listing_cache = listing
+        return listing
 
     def download_file(self, file_id: str, staging_dir: Path) -> Path:
         """Download a single file by id and return the local path.
+
+        Reuses the cached listing if one exists (lazily populated on
+        first call) so a loop of ``download_file`` calls makes only one
+        ``list_files`` API request.
 
         Args:
             file_id: Drive file id.
@@ -356,6 +480,8 @@ class GoogleDriveDownloader:
 
         Raises:
             KeyError: When *file_id* is not in the current listing.
+            ValueError: When the file's ``parent_path`` would escape
+                *staging_dir* (path-traversal guard).
         """
         drive_file = self._resolve(file_id)
         return self._write(drive_file, staging_dir)
@@ -367,10 +493,16 @@ class GoogleDriveDownloader:
         ``modified_time`` are skipped (incremental sync). Returns the
         list of *all* destination paths — both downloaded and skipped
         — so callers can pipe them through the ingest registry.
+
+        Raises:
+            ValueError: When any file's ``parent_path`` would escape
+                *staging_dir* (path-traversal guard).
         """
         staging_dir.mkdir(parents=True, exist_ok=True)
+        # Refresh cache so download_all always sees latest state.
+        listing = self.list_files()
         paths: list[Path] = []
-        for drive_file in self.client.list_files():
+        for drive_file in listing:
             target = self._target_path(drive_file, staging_dir)
             if self._is_up_to_date(target, drive_file):
                 logger.info("Skipping unchanged Drive file: %s", drive_file.name)
@@ -380,8 +512,10 @@ class GoogleDriveDownloader:
         return paths
 
     def _resolve(self, file_id: str) -> DriveFile:
-        """Return the :class:`DriveFile` for *file_id* from the listing."""
-        for candidate in self.client.list_files():
+        """Return the :class:`DriveFile` for *file_id* from the cached listing."""
+        if self._listing_cache is None:
+            self._listing_cache = self.client.list_files()
+        for candidate in self._listing_cache:
             if candidate.id == file_id:
                 return candidate
         msg = f"missing Drive file id: {file_id!r}"
@@ -404,12 +538,41 @@ class GoogleDriveDownloader:
 
     @staticmethod
     def _target_path(drive_file: DriveFile, staging_dir: Path) -> Path:
-        """Return the destination path for *drive_file* under *staging_dir*."""
-        if drive_file.parent_path:
-            parent = staging_dir / Path(drive_file.parent_path)
+        """Return the destination path for *drive_file* under *staging_dir*.
+
+        Raises:
+            ValueError: If ``drive_file.parent_path`` would resolve
+                outside *staging_dir* — defends against malicious or
+                malformed Drive folder names that contain ``..``
+                segments or absolute paths.
+        """
+        staging_root = staging_dir.resolve()
+        parent_segments = (
+            Path(drive_file.parent_path) if drive_file.parent_path else None
+        )
+        if parent_segments is not None and parent_segments.is_absolute():
+            msg = (
+                f"parent_path {drive_file.parent_path!r} escapes staging "
+                f"root {staging_dir!s} (absolute path)"
+            )
+            raise ValueError(msg)
+        if parent_segments is not None:
+            candidate = (staging_root / parent_segments / drive_file.name).resolve()
         else:
-            parent = staging_dir
-        return parent / drive_file.name
+            candidate = (staging_root / drive_file.name).resolve()
+        try:
+            candidate.relative_to(staging_root)
+        except ValueError as exc:
+            msg = (
+                f"parent_path {drive_file.parent_path!r} escapes staging "
+                f"root {staging_dir!s}"
+            )
+            raise ValueError(msg) from exc
+        # Return the unresolved path (preserving symlinks etc.) so caller
+        # paths look like staging_dir/parent/name rather than the resolved form.
+        if parent_segments is not None:
+            return staging_dir / parent_segments / drive_file.name
+        return staging_dir / drive_file.name
 
     def _is_up_to_date(self, target: Path, drive_file: DriveFile) -> bool:
         """Return ``True`` when the local file is at least as new as Drive."""

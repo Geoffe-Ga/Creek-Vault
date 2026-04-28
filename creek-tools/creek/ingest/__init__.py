@@ -28,7 +28,13 @@ from creek.ingest.claude import ClaudeIngestor
 from creek.ingest.code import CodeIngestor
 from creek.ingest.discord import DiscordIngestor
 from creek.ingest.documents import DocumentIngestor
-from creek.ingest.gdrive import GoogleDriveDownloader
+from creek.ingest.gdrive import (
+    DriveClient,
+    DriveFile,
+    GoogleApiUnavailableError,
+    GoogleDriveDownloader,
+    route_to_ingestor,
+)
 from creek.ingest.generic import GenericIngestor
 from creek.ingest.images import ImageIngestor
 from creek.ingest.markdown import MarkdownIngestor
@@ -53,7 +59,10 @@ __all__ = [
     "CodeIngestor",
     "DiscordIngestor",
     "DocumentIngestor",
+    "DriveClient",
+    "DriveFile",
     "GenericIngestor",
+    "GoogleApiUnavailableError",
     "GoogleDriveDownloader",
     "ImageIngestor",
     "IngestResult",
@@ -61,4 +70,5 @@ __all__ = [
     "MarkdownIngestor",
     "ParsedFragment",
     "RawDocument",
+    "route_to_ingestor",
 ]
