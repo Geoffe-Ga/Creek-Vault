@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `creek-tools` is a monorepo containing tooling for the Creek knowledge organization system:
 
 - **`creek-tools/`** — Python subproject for the Creek processing pipeline. Has its own detailed `CLAUDE.md` with quality standards and workflow documentation. **Always read `creek-tools/CLAUDE.md` before working in that directory.**
-- **`scripts/Ontology/`** — Contains `creek_ontology_agent_prompt.md`, the master specification for the Creek Ontology: a personal knowledge organization system built around Obsidian, the APTITUDE frequency framework, and the Archetypal Wavelength mapping.
+- **`00-Creek-Meta/Ontology/`** — Contains `creek_ontology_agent_prompt.md`, the master specification for the Creek Ontology: a personal knowledge organization system built around Obsidian, the APTITUDE frequency framework, and the Archetypal Wavelength mapping.
 
 ## creek-tools Development
 
@@ -69,7 +69,7 @@ pytest tests/test_main.py::test_main_runs -v
 - CI: `/.github/workflows/ci.yml` (at repo root; jobs use `working-directory: creek-tools`)
 - Pre-commit: `creek-tools/.pre-commit-config.yaml` (install with `pre-commit install -c creek-tools/.pre-commit-config.yaml`)
 
-### The Creek Ontology (scripts/Ontology/)
+### The Creek Ontology (00-Creek-Meta/Ontology/)
 The ontology prompt defines a complete system for organizing personal data into an Obsidian vault using five ontological primitives: **Fragments** (atomic content units), **Resonances** (semantic connections), **Threads** (narrative currents), **Eddies** (topic clusters), and **Praxis** (actionable insights). Content is classified along the 10-frequency APTITUDE system and the 6-phase Archetypal Wavelength cycle. This prompt is reference material for building the creek-tools pipeline (ingestion, classification, linking, voice proxy generation).
 
 ## Workflow: Stay Green
