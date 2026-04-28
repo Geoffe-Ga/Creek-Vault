@@ -135,6 +135,17 @@ module = ["pytesseract", "PIL", "PIL.*", "pdf2image", "pdf2image.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = [
+    "googleapiclient",
+    "googleapiclient.*",
+    "google_auth_oauthlib",
+    "google_auth_oauthlib.*",
+    "google",
+    "google.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 
