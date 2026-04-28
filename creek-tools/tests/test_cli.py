@@ -381,13 +381,77 @@ def test_gdrive_help() -> None:
     assert "gdrive" in result.output.lower()
 
 
-def test_gdrive_command() -> None:
-    """Test that gdrive command runs with --download flag."""
+def test_gdrive_command_without_download_is_a_noop() -> None:
+    """Without --download the command exits 0 with a hint."""
+    result = runner.invoke(app, ["gdrive", "--staging", "/fake/staging"])
+    assert result.exit_code == 0
+    assert "Nothing to do" in result.output
+
+
+def test_gdrive_command_errors_when_api_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without google-api-python-client installed, --download exits 1."""
+    from creek.ingest.gdrive import GoogleApiDriveClient
+
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "is_available",
+        lambda _self: False,
+    )
+    staging = tmp_path / "staging"
     result = runner.invoke(
         app,
-        ["gdrive", "--download", "--staging", "/fake/staging"],
+        ["gdrive", "--download", "--staging", str(staging)],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 1
+    assert "Google API client unavailable" in result.output
+
+
+def test_gdrive_command_downloads_files_through_stub_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full download path runs end-to-end against an injected client."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from creek.ingest.gdrive import DriveFile, GoogleApiDriveClient
+
+    drive_file = DriveFile(
+        id="x",
+        name="notes.md",
+        mime_type="text/markdown",
+        modified_time=_datetime(2026, 4, 1, tzinfo=_UTC),
+        size=10,
+        parent_path="",
+    )
+
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "is_available",
+        lambda _self: True,
+    )
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "list_files",
+        lambda _self: [drive_file],
+    )
+    monkeypatch.setattr(
+        GoogleApiDriveClient,
+        "get_media",
+        lambda _self, _file_id: b"# Notes\n",
+    )
+
+    staging = tmp_path / "staging"
+    result = runner.invoke(
+        app,
+        ["gdrive", "--download", "--staging", str(staging)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Downloaded 1 files" in result.output
+    assert (staging / "notes.md").read_bytes() == b"# Notes\n"
 
 
 def test_skills_help() -> None:

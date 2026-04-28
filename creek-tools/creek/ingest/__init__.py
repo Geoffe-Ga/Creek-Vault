@@ -17,6 +17,7 @@ Exports:
     DiscordIngestor: Concrete ingestor for Discord message exports.
     DocumentIngestor: Concrete ingestor for document files (DOCX, PDF, HTML, TXT).
     GenericIngestor: Fallback ingestor for unrecognized file formats.
+    GoogleDriveDownloader: Read-only Google Drive download orchestrator.
     ImageIngestor: Concrete ingestor for image files via OCR.
     MarkdownIngestor: Concrete ingestor for plain Markdown files.
 """
@@ -27,6 +28,7 @@ from creek.ingest.claude import ClaudeIngestor
 from creek.ingest.code import CodeIngestor
 from creek.ingest.discord import DiscordIngestor
 from creek.ingest.documents import DocumentIngestor
+from creek.ingest.gdrive import GoogleDriveDownloader
 from creek.ingest.generic import GenericIngestor
 from creek.ingest.images import ImageIngestor
 from creek.ingest.markdown import MarkdownIngestor
@@ -52,6 +54,7 @@ __all__ = [
     "DiscordIngestor",
     "DocumentIngestor",
     "GenericIngestor",
+    "GoogleDriveDownloader",
     "ImageIngestor",
     "IngestResult",
     "Ingestor",

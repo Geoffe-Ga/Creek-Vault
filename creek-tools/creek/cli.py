@@ -291,9 +291,48 @@ def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
     staging: Path | None = typer.Option(None, help="Staging directory"),
 ) -> None:
-    """Download from Google Drive."""
+    """Download files from Google Drive into a local staging directory.
+
+    Read-only. Files are mirrored under *staging* with their Drive
+    folder hierarchy preserved; subsequent runs are incremental
+    (unchanged files are skipped). Pipe the staging directory through
+    ``creek ingest`` to absorb the downloads into the vault.
+    """
+    if not download:
+        console.print(
+            "[yellow]Nothing to do. Pass --download to fetch files.[/yellow]",
+        )
+        return
+
+    config = load_config()
+    staging_dir = (
+        staging if staging is not None else Path(config.google_drive.staging_dir)
+    )
+
+    from creek.ingest.gdrive import (
+        GoogleApiDriveClient,
+        GoogleApiUnavailableError,
+        GoogleDriveDownloader,
+    )
+
+    client = GoogleApiDriveClient(config.google_drive)
+    if not client.is_available():
+        console.print(
+            "[red]Google API client unavailable; cannot download from Drive. "
+            "Install with `pip install google-api-python-client "
+            "google-auth-oauthlib`.[/red]",
+        )
+        raise typer.Exit(code=1)
+
+    downloader = GoogleDriveDownloader(client=client, config=config.google_drive)
+    try:
+        paths = downloader.download_all(staging_dir)
+    except GoogleApiUnavailableError as exc:
+        console.print(f"[red]Google Drive download failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
     console.print(
-        f"[bold green]Would gdrive: download={download}, staging={staging}[/bold green]"
+        f"[bold green]Downloaded {len(paths)} files to {staging_dir}[/bold green]",
     )
 
 
