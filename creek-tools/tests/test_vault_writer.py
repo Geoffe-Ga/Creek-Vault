@@ -48,6 +48,11 @@ def vault_path(tmp_path: Path) -> Path:
         "01-Fragments/Writing",
         "01-Fragments/Journal",
         "01-Fragments/Technical",
+        "01-Fragments/Notes",
+        "01-Fragments/Documents",
+        "01-Fragments/Data",
+        "01-Fragments/Decks",
+        "01-Fragments/Images",
         "01-Fragments/Unsorted",
         "02-Threads/Active",
         "02-Threads/Dormant",
@@ -189,6 +194,37 @@ class TestWriteFragment:
         assert "title: Test Conversation Fragment" in content
         assert "type: fragment" in content
 
+    def test_write_fragment_persists_body(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """Provided body text is written below the frontmatter block."""
+        import frontmatter as fm_mod
+
+        body = "# A Note\n\nReal body content goes here.\n"
+        result = writer.write_fragment(sample_fragment, body=body)
+        post = fm_mod.load(str(result))
+        assert "Real body content goes here." in post.content
+        assert post["id"] == "frag-test0001"
+
+    def test_write_fragment_body_round_trips_through_pydantic(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """Frontmatter survives round-trip back into a Fragment model."""
+        import frontmatter as fm_mod
+
+        body = "Body that must survive serialisation."
+        result = writer.write_fragment(sample_fragment, body=body)
+        post = fm_mod.load(str(result))
+        round_tripped = Fragment.model_validate(dict(post.metadata))
+        assert round_tripped.id == sample_fragment.id
+        assert round_tripped.title == sample_fragment.title
+        assert body.strip() in post.content.strip()
+        assert round_tripped.type == "fragment"
+
     def test_write_fragment_chatgpt_goes_to_conversations(
         self,
         writer: VaultWriter,
@@ -267,31 +303,96 @@ class TestWriteFragment:
         result = writer.write_fragment(frag)
         assert "01-Fragments/Unsorted" in str(result)
 
-    def test_write_fragment_email_goes_to_unsorted(
+    def test_write_fragment_email_goes_to_messages(
         self,
         writer: VaultWriter,
     ) -> None:
-        """Email platform (not explicitly mapped) goes to Unsorted."""
+        """Email fragments share the Messages subfolder with chat platforms."""
         frag = Fragment(
             id="frag-email001",
             title="Email Fragment",
             source=FragmentSource(platform=SourcePlatform.EMAIL),
         )
         result = writer.write_fragment(frag)
-        assert "01-Fragments/Unsorted" in str(result)
+        assert "01-Fragments/Messages" in str(result)
 
-    def test_write_fragment_image_ocr_goes_to_unsorted(
+    def test_write_fragment_image_ocr_goes_to_images(
         self,
         writer: VaultWriter,
     ) -> None:
-        """Image OCR platform (not explicitly mapped) goes to Unsorted."""
+        """OCR'd image fragments land in the Images subfolder."""
         frag = Fragment(
             id="frag-ocr00001",
             title="OCR Fragment",
             source=FragmentSource(platform=SourcePlatform.IMAGE_OCR),
         )
         result = writer.write_fragment(frag)
-        assert "01-Fragments/Unsorted" in str(result)
+        assert "01-Fragments/Images" in str(result)
+
+    def test_write_fragment_document_goes_to_documents(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """Document fragments land in the Documents subfolder."""
+        frag = Fragment(
+            id="frag-doc00001",
+            title="Doc Fragment",
+            source=FragmentSource(platform=SourcePlatform.DOCUMENT),
+        )
+        result = writer.write_fragment(frag)
+        assert "01-Fragments/Documents" in str(result)
+
+    def test_write_fragment_spreadsheet_goes_to_data(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """Spreadsheet fragments land in the Data subfolder."""
+        frag = Fragment(
+            id="frag-xls00001",
+            title="Sheet Fragment",
+            source=FragmentSource(platform=SourcePlatform.SPREADSHEET),
+        )
+        result = writer.write_fragment(frag)
+        assert "01-Fragments/Data" in str(result)
+
+    def test_write_fragment_presentation_goes_to_decks(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """Presentation fragments land in the Decks subfolder."""
+        frag = Fragment(
+            id="frag-ppt00001",
+            title="Deck Fragment",
+            source=FragmentSource(platform=SourcePlatform.PRESENTATION),
+        )
+        result = writer.write_fragment(frag)
+        assert "01-Fragments/Decks" in str(result)
+
+    def test_write_fragment_markdown_goes_to_notes(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """Generic markdown fragments land in the Notes subfolder."""
+        frag = Fragment(
+            id="frag-md0000001",
+            title="Markdown Note",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        )
+        result = writer.write_fragment(frag)
+        assert "01-Fragments/Notes" in str(result)
+
+    def test_platform_subfolder_mapping_is_total(self) -> None:
+        """Every SourcePlatform must have an explicit subfolder mapping.
+
+        Guards against regressions where a new platform silently routes
+        to ``Unsorted/`` because a developer forgot to extend the map.
+        """
+        from creek.vault.writer import _PLATFORM_SUBFOLDER
+
+        unmapped = {p for p in SourcePlatform if p not in _PLATFORM_SUBFOLDER}
+        assert unmapped == set(), (
+            f"Missing _PLATFORM_SUBFOLDER entries for: {sorted(unmapped)}"
+        )
 
 
 # ---- write_thread ----
