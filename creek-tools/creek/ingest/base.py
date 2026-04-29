@@ -18,12 +18,14 @@ import abc
 import hashlib
 import logging
 from datetime import UTC, datetime
-from pathlib import Path  # noqa: TC003 — needed at runtime by Pydantic
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import chardet
 from pydantic import BaseModel, ConfigDict, Field
+
+from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,26 @@ class ProvenanceEntry(BaseModel):
 
     status: str
     """Status of the ingest operation (e.g., 'success', 'error', 'skipped')."""
+
+
+class IngestedFragment(BaseModel):
+    """A pipeline-ready fragment paired with its converted markdown body.
+
+    The four-stage ingestor protocol still produces ``ParsedFragment``
+    objects internally; this sibling model is the *clean* hand-off shape
+    consumed by the pipeline orchestrator and ``VaultWriter`` so the
+    body and the structured ``Fragment`` metadata travel together
+    instead of being smuggled through ``ParsedFragment.metadata``.
+
+    Attributes:
+        fragment: The validated ``Fragment`` carrying frontmatter
+            metadata, classifications, and a deterministic ID.
+        body: The converted Markdown body that will be written below
+            the YAML frontmatter in the vault file.
+    """
+
+    fragment: Fragment
+    body: str
 
 
 class IngestResult(BaseModel):
@@ -240,6 +262,49 @@ def generate_fragment_id(source: str, timestamp: datetime, content: str) -> str:
     hash_input = f"{source}:{timestamp.isoformat()}:{content}"
     digest = hashlib.sha256(hash_input.encode()).hexdigest()[:12]
     return f"frag-{digest}"
+
+
+def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
+    """Combine a ``ParsedFragment`` with its frontmatter into an ``IngestedFragment``.
+
+    The four-stage ``ingest()`` orchestrator stashes both the converted
+    Markdown body (``parsed.metadata["markdown"]``) and the generated
+    Creek frontmatter dict (``parsed.metadata["frontmatter"]``) on the
+    parsed fragment. This helper:
+
+    1. Pulls the frontmatter dict out and deep-merges in the deterministic
+       ``frag-<sha>`` ID so re-running the pipeline against the same
+       source remains idempotent.
+    2. Falls back to the source file stem for the title when an ingestor
+       didn't supply one (e.g. ``DiscordIngestor``'s frontmatter omits it).
+    3. Validates the dict into a ``Fragment`` and pairs it with the body.
+
+    Args:
+        parsed: A parsed fragment produced by an ingestor's four-stage
+            pipeline. Must have ``markdown`` and ``frontmatter`` keys
+            populated in ``metadata``.
+
+    Returns:
+        An :class:`IngestedFragment` with structured metadata and body.
+
+    Raises:
+        KeyError: If ``parsed.metadata`` is missing the ``frontmatter``
+            or ``markdown`` keys; this signals an ingestor contract
+            violation rather than a recoverable parse error.
+    """
+    frontmatter_dict: dict[str, Any] = dict(parsed.metadata["frontmatter"])
+    body: str = str(parsed.metadata["markdown"])
+
+    frontmatter_dict["id"] = generate_fragment_id(
+        parsed.source_path,
+        parsed.timestamp,
+        parsed.content,
+    )
+    frontmatter_dict.setdefault("type", "fragment")
+    frontmatter_dict.setdefault("title", Path(parsed.source_path).stem or "Untitled")
+
+    fragment = Fragment.model_validate(frontmatter_dict)
+    return IngestedFragment(fragment=fragment, body=body)
 
 
 def file_modified_time(path: Path) -> datetime:

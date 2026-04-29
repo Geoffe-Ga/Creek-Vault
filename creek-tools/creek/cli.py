@@ -49,6 +49,11 @@ def process(
     console.print(f"[bold]Classifications made:[/bold] {result.classifications_made}")
     console.print(f"[bold]Links found:[/bold] {result.links_found}")
     console.print(f"[bold]Indexes generated:[/bold] {result.indexes_generated}")
+    error_count = len(result.errors)
+    error_style = "red" if error_count else "dim"
+    console.print(f"[bold {error_style}]Errors:[/bold {error_style}] {error_count}")
+    for err in result.errors:
+        console.print(f"  [dim]{err}[/dim]")
 
 
 @app.command()

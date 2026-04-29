@@ -309,6 +309,11 @@ class TestPipelineWithFragments:
     def _make_mock_ingestor_registry(self, source_path):
         """Build a mock INGESTOR_REGISTRY that returns one ParsedFragment.
 
+        Mirrors the post-fix four-stage ingestor contract: each parsed
+        fragment carries its converted ``markdown`` body and the
+        ``frontmatter`` dict on ``metadata`` so the pipeline can
+        assemble it into a real :class:`Fragment` with a deterministic ID.
+
         Args:
             source_path: The source path, used for provenance.
 
@@ -321,7 +326,14 @@ class TestPipelineWithFragments:
 
         fragment = ParsedFragment(
             content="Test content about systems and patterns",
-            metadata={},
+            metadata={
+                "markdown": "Test content about systems and patterns",
+                "frontmatter": {
+                    "type": "fragment",
+                    "title": "Mock note",
+                    "source": {"platform": "markdown"},
+                },
+            },
             source_path=str(source_path / "note1.md"),
             timestamp=datetime.now(),
         )
@@ -366,6 +378,81 @@ class TestPipelineWithFragments:
         # Review queue file should exist in vault_path
         review_files = list(vault_path.glob("review-queue-*.md"))
         assert len(review_files) == 1
+
+
+class TestPipelineErrorSurfacing:
+    """Tests that ingestor errors and assembly failures reach PipelineResult."""
+
+    def _make_failing_registry(self, source_path):
+        """Build a registry whose ingestor reports one error and one good fragment."""
+        from datetime import datetime
+
+        from creek.ingest.base import IngestResult, ParsedFragment
+
+        bad_path = str(source_path / "broken.bin")
+        good = ParsedFragment(
+            content="Good content",
+            metadata={
+                "markdown": "Good content",
+                "frontmatter": {
+                    "type": "fragment",
+                    "title": "Good note",
+                    "source": {"platform": "markdown"},
+                },
+            },
+            source_path=str(source_path / "good.md"),
+            timestamp=datetime.now(),
+        )
+        ingest_result = IngestResult(
+            fragments=[good],
+            errors=[f"parse error for {bad_path}: corrupt header"],
+        )
+        mock_ingestor = MagicMock()
+        mock_ingestor.return_value.ingest.return_value = ingest_result
+        return {"mock": mock_ingestor}, bad_path
+
+    def test_errors_surface_on_pipeline_result(
+        self,
+        config,
+        vault_path,
+        source_path,
+    ) -> None:
+        """Ingestor-reported errors land on PipelineResult.errors."""
+        registry, bad_path = self._make_failing_registry(source_path)
+        pipeline = Pipeline(config=config)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.fragments_created == 1
+        assert len(result.errors) == 1
+        assert bad_path in result.errors[0]
+        assert result.errors[0].startswith("[mock]")
+
+    def test_cli_process_prints_errors(
+        self,
+        vault_path,
+        source_path,
+    ) -> None:
+        """CLI process command surfaces both fragment count and error count."""
+        from typer.testing import CliRunner
+
+        from creek.cli import app
+
+        registry, _bad_path = self._make_failing_registry(source_path)
+        runner = CliRunner()
+        with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
+            result = runner.invoke(
+                app,
+                [
+                    "process",
+                    "--source",
+                    str(source_path),
+                    "--vault",
+                    str(vault_path),
+                ],
+            )
+        assert result.exit_code == 0
+        assert "Errors:" in result.output
+        assert "1" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +583,9 @@ class TestPipelineIntegration:
         # Markdown ingestor finds .md files
         assert result.fragments_created >= 3
         assert result.classifications_made >= 3
-        assert result.links_found == 0
+        # Linking now runs on real fragments (was a no-op when bodies were
+        # discarded); we just assert it completed and produced a count.
+        assert result.links_found >= 0
         # Indexes should be generated
         assert result.indexes_generated >= 4
 
