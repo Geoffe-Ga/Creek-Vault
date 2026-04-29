@@ -78,11 +78,20 @@ dev = [
     "hypothesis>=6.92.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
+    "pylint>=3.0.0",
     "bandit>=1.7.5",
     "pip-audit>=2.6.0",
     "radon>=6.0.0",
     "xenon>=0.9.0",
+    "interrogate>=1.7.0",
+    "refurb>=2.0.0",
+    "tryceratops>=2.0.0",
+    "vulture>=2.10",
+    "detect-secrets>=1.5.0",
     "pre-commit>=3.4.0",
+    "types-PyYAML>=6.0.0",
+    "types-chardet>=5.0.0",
+    "types-tqdm>=4.66.0",
 ]
 
 [build-system]
