@@ -9,5 +9,5 @@
 # Adding a file to this list is a deliberate, time-bounded decision.
 # Each entry should reference an open issue tracking the work to bring
 # that file up to the strict threshold and remove it from this list.
-creek/ingest/presentations.py 67% baseline; raise to 80% per TEST-002 (track follow-up issue)
-creek/ingest/documents.py 77% baseline; raise to 80% per TEST-002 (track follow-up issue)
+creek/ingest/presentations.py 67% baseline; raise to 80% per plans/git-issues/TEST-002-coverage-aggregate-hides-low-modules.md
+creek/ingest/documents.py 77% baseline; raise to 80% per plans/git-issues/TEST-002-coverage-aggregate-hides-low-modules.md

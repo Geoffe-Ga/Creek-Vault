@@ -58,11 +58,41 @@ Specific commitments:
 | Docstring coverage         | ≥ 95%     | `interrogate --fail-under=95`                 |
 | Pylint score               | ≥ 9.0     | `pylint creek/ --fail-under=9.0`              |
 | MyPy                       | strict    | `mypy creek/` against `pyproject.toml`        |
-| Cyclomatic complexity      | ≤ 10      | `xenon --max-absolute B`                      |
+| Cyclomatic complexity      | ≤ 10 per fn / module-avg ≤ 10 | `xenon --max-absolute B --max-modules B --max-average B` |
 | pip-audit                  | 0 unhandled CVEs | `pip-audit` with documented `--ignore-vuln`  |
 
 Every file referenced in `CLAUDE.md` resolves to a real path. Every
 threshold mentioned in `CLAUDE.md` corresponds to a CI gate.
+
+### Notes on the chosen Xenon thresholds
+
+Xenon scores complexity on the radon scale: A=1–5, B=6–10, C=11–20,
+D=21–30, E=31–40, F≥41. The previously-inline (and unenforced) CI step
+used `--max-average A`; the project's local script always used
+`--max-average B`. `complexity.sh` is the source of truth and runs
+`--max-average B`, so CI now matches.
+
+`--max-absolute B` (no single function above C) directly enforces the
+≤10 per-function rule that `CLAUDE.md` advertises. `--max-average B`
+tolerates a module whose *average* function complexity sits in the 6–10
+band, which is more lenient than the old aspirational A but matches
+what the codebase actually achieves today (verified by running
+`xenon` against `creek/` at the time of writing). Tightening to
+`--max-average A` is a reasonable follow-up once the existing surface
+is refactored, but is out of scope for this ADR.
+
+### Notes on the per-file coverage gate
+
+`coverage-per-file.sh` reads `summary[file].summary.percent_covered`
+from `coverage.json`, which is the *line* coverage percentage. The
+aggregate gate (`pytest --cov-branch --cov-fail-under=90`) still
+enforces branch coverage at the project level. Using line coverage at
+the per-file level catches the most egregious "this module has no
+tests at all" cases without false-failing on files whose every line is
+exercised but whose branch state-space is large (ingestors with many
+content-type heuristics are the canonical example). A future iteration
+may switch to `percent_covered_branches`; the script supports it via a
+single field-name change.
 
 ## Consequences
 

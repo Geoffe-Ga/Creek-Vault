@@ -10,7 +10,6 @@ on:
 env:
   PYTHON_DEFAULT_VERSION: '3.12'
   COVERAGE_THRESHOLD: 90
-  BRANCH_COVERAGE_THRESHOLD: 85
   DOCSTRING_COVERAGE_THRESHOLD: 95
   PYLINT_FAIL_UNDER: '9.0'
   PER_FILE_COVERAGE_THRESHOLD: '80'
@@ -63,7 +62,9 @@ jobs:
           mkdir -p reports
 
       - name: Run Ruff linting
-        run: ruff check . --output-format=github
+        # --exit-non-zero-on-fix: if ruff finds an auto-fixable issue
+        # the developer didn't commit, fail rather than silently report.
+        run: ruff check . --output-format=github --exit-non-zero-on-fix
 
       - name: Run Ruff format check
         run: ruff format --check .

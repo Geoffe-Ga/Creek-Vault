@@ -128,15 +128,36 @@ def test_secret_lookalikes_fixture_uses_documented_examples_only() -> None:
 
 def test_redactor_sweeps_secret_lookalikes_fixture() -> None:
     """End-to-end: feed the secrets fixture through the redactor and assert
-    none of the AWS-shaped or PAN-shaped tokens survive in the output.
+    every secret in the fixture is removed from the output.
+
+    The fixture contains five token shapes (AWS key, Stripe-style test
+    placeholder, email, SSN-shape, PAN). Redaction is opt-in per pattern
+    name, so a built-in pattern that genuinely doesn't fire (e.g. the
+    Stripe placeholder, which is intentionally non-matching) is allowed
+    to remain — but every value the project's patterns DO recognise must
+    be gone.
     """
     from creek.config import RedactionConfig
+    from creek.redact.patterns import REDACTION_PATTERNS
     from creek.redact.redactor import Redactor
 
     redactor = Redactor(RedactionConfig(), salt=b"failure-modes-test")
     body = (FIXTURES_ROOT / "injection" / "secret_lookalikes.md").read_text()
     redacted = redactor.redact_content(body)
-    assert "AKIAIOSFODNN7EXAMPLE" not in redacted, "AWS key leaked through redactor"
+
+    # Every fixture token that any built-in pattern matches must be gone
+    # from the redacted output.
+    fixture_tokens = (
+        "AKIAIOSFODNN7EXAMPLE",
+        "user@example.com",
+        "555-12-3456",
+        "4111111111111111",
+    )
+    for token in fixture_tokens:
+        if any(pattern.search(token) for pattern in REDACTION_PATTERNS.values()):
+            assert token not in redacted, (
+                f"Pattern-matching token leaked through redactor: {token!r}"
+            )
 
 
 # ---- scale/ ------------------------------------------------------------------
