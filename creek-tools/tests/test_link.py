@@ -48,9 +48,13 @@ def _make_fragment(
     phase: Phase = Phase.UNCLASSIFIED,
     mode: Mode = Mode.UNCLASSIFIED,
     emotional_texture: list[str] | None = None,
+    fid: str | None = None,
 ) -> Fragment:
     """Create a Fragment for testing with configurable classification fields."""
+    from creek.models import synthetic_fragment_id
+
     return Fragment(
+        id=fid if fid is not None else synthetic_fragment_id(),
         title=title,
         source=FragmentSource(platform=platform),
         created=created or datetime.now(),
@@ -1855,6 +1859,7 @@ class TestLinkingPipeline:
             linking_config=LinkingConfig(),
         )
         fragment = Fragment(
+            id="frag-00000000000b",
             title="Test",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
             threads=["existing-thread"],
@@ -1883,6 +1888,7 @@ class TestLinkingPipeline:
             linking_config=LinkingConfig(),
         )
         fragment = Fragment(
+            id="frag-00000000000a",
             title="Test",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
             threads=["[[Existing]]"],

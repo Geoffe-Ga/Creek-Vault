@@ -182,6 +182,7 @@ class TestFilterFragmentsInWeek:
         """Fragments created exactly at ``week_start`` are included."""
         week_start = _week_start()
         frag = Fragment(
+            id="frag-000000000024",
             title="boundary-low",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
             created=datetime.combine(week_start, datetime.min.time(), tzinfo=UTC),
@@ -195,6 +196,7 @@ class TestFilterFragmentsInWeek:
         """Fragments created on ``week_start + 7`` are excluded."""
         week_start = _week_start()
         frag = Fragment(
+            id="frag-000000000023",
             title="boundary-high",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
             created=datetime.combine(
@@ -207,6 +209,7 @@ class TestFilterFragmentsInWeek:
         """Fragments from before the window are excluded."""
         week_start = _week_start()
         frag = Fragment(
+            id="frag-000000000022",
             title="old",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
             created=datetime.combine(
@@ -231,6 +234,7 @@ class TestDetectUnnamedClusters:
     ) -> None:
         """A single fragment cannot form a cluster."""
         frag = Fragment(
+            id="frag-000000000021",
             title="solo",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
@@ -240,10 +244,12 @@ class TestDetectUnnamedClusters:
         """Identical titles yield identical embeddings and form one cluster."""
         gen = UnnamedDigestGenerator(embedding_linker=linker, similarity_threshold=0.7)
         frag_a = Fragment(
+            id="frag-000000000020",
             title="recurring-dream",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
         frag_b = Fragment(
+            id="frag-00000000001f",
             title="recurring-dream",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
@@ -255,10 +261,12 @@ class TestDetectUnnamedClusters:
         """An impossibly high threshold collapses all clusters to singletons."""
         gen = UnnamedDigestGenerator(embedding_linker=linker, similarity_threshold=1.01)
         frag_a = Fragment(
+            id="frag-00000000001e",
             title="same-string",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
         frag_b = Fragment(
+            id="frag-00000000001d",
             title="same-string",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
@@ -276,14 +284,17 @@ class TestDetectUnnamedClusters:
         """
         gen = UnnamedDigestGenerator(embedding_linker=linker, similarity_threshold=0.99)
         frag_a = Fragment(
+            id="frag-00000000001c",
             title="alpha",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
         frag_b = Fragment(
+            id="frag-00000000001b",
             title="bravo",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )
         frag_c = Fragment(
+            id="frag-00000000001a",
             title="charlie",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
         )

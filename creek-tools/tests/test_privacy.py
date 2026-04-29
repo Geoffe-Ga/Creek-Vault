@@ -32,7 +32,10 @@ def _make_fragment(
     author: Authorship = Authorship.SELF,
 ) -> Fragment:
     """Build a deterministic Fragment for tests."""
+    from creek.models import synthetic_fragment_id
+
     return Fragment(
+        id=synthetic_fragment_id(),
         title=title,
         source=FragmentSource(platform=platform, channel=channel, author=author),
         created=datetime(2026, 4, 1, tzinfo=UTC),
@@ -377,6 +380,7 @@ class TestReviewQueueIntegration:
         """INTIMATE always needs human review even with full classification."""
         generator = ReviewQueueGenerator()
         frag = Fragment(
+            id="frag-000000000018",
             title="Personal note",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
             frequency=FrequencyClassification(primary=Frequency.F5),
@@ -389,6 +393,7 @@ class TestReviewQueueIntegration:
         """A fully-classified PUBLIC fragment is not flagged."""
         generator = ReviewQueueGenerator()
         frag = Fragment(
+            id="frag-000000000017",
             title="Published essay",
             source=FragmentSource(platform=SourcePlatform.ESSAY),
             frequency=FrequencyClassification(primary=Frequency.F3),

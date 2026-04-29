@@ -239,7 +239,7 @@ class TestSourcePlatformEnum:
     """Tests for the SourcePlatform enum."""
 
     def test_all_platforms_exist(self) -> None:
-        """Verify all 12 source platform values exist."""
+        """Verify the full set of source platform values, including markdown."""
         expected = [
             "claude",
             "chatgpt",
@@ -247,6 +247,7 @@ class TestSourcePlatformEnum:
             "journal",
             "essay",
             "code",
+            "markdown",
             "email",
             "document",
             "image_ocr",
@@ -382,13 +383,14 @@ class TestFragment:
     def test_minimal_creation(self) -> None:
         """Fragment with only title should use defaults for everything else."""
         frag = Fragment(
+            id="frag-000000000015",
             title="Test Fragment",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
         )
         assert frag.type == "fragment"
         assert frag.title == "Test Fragment"
         assert frag.id.startswith("frag-")
-        assert len(frag.id) == 13  # "frag-" + 8 hex chars
+        assert len(frag.id) == 17  # "frag-" + 12 hex chars
         assert frag.frequency.primary == "unclassified"
         assert frag.wavelength.phase == "unclassified"
         assert frag.voice.voice_register is None
@@ -402,6 +404,7 @@ class TestFragment:
         """Fragment with all fields specified should work."""
         now = datetime(2024, 1, 15, 10, 30, 0)
         frag = Fragment(
+            id="frag-000000000014",
             title="Deep Insight",
             source=FragmentSource(
                 platform=SourcePlatform.JOURNAL,
@@ -437,13 +440,17 @@ class TestFragment:
         assert frag.voice.voice_register == "analytical"
         assert frag.praxis_potential == "explicit"
 
-    def test_id_auto_generation(self) -> None:
-        """Each Fragment should get a unique auto-generated ID."""
+    def test_synthetic_id_is_unique(self) -> None:
+        """synthetic_fragment_id() returns distinct, frag-prefixed values."""
+        from creek.models import synthetic_fragment_id
+
         frag1 = Fragment(
+            id=synthetic_fragment_id(),
             title="A",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
         )
         frag2 = Fragment(
+            id=synthetic_fragment_id(),
             title="B",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
         )
@@ -454,6 +461,7 @@ class TestFragment:
     def test_model_dump_serializable(self) -> None:
         """Fragment model_dump should produce a JSON-serializable dict."""
         frag = Fragment(
+            id="frag-000000000011",
             title="Test",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
         )
@@ -468,6 +476,7 @@ class TestFragment:
     def test_round_trip(self) -> None:
         """Create a Fragment, dump it, and recreate from the dict."""
         original = Fragment(
+            id="frag-000000000010",
             title="Round Trip Test",
             source=FragmentSource(
                 platform=SourcePlatform.ESSAY,
@@ -738,15 +747,32 @@ class TestIdGeneration:
     """Tests for ID generation across all models."""
 
     def test_fragment_id_format(self) -> None:
-        """Fragment ID should match frag-XXXXXXXX format."""
+        """Fragment IDs (synthetic or deterministic) are 12-hex with frag- prefix."""
+        from creek.models import synthetic_fragment_id
+
         frag = Fragment(
+            id=synthetic_fragment_id(),
             title="Test",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
         )
         assert frag.id.startswith("frag-")
         hex_part = frag.id[5:]
-        assert len(hex_part) == 8
+        assert len(hex_part) == 12
         int(hex_part, 16)  # Should not raise — valid hex
+
+    def test_fragment_id_required(self) -> None:
+        """Fragment without an explicit id raises a validation error."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            Fragment.model_validate(
+                {
+                    "title": "Test",
+                    "source": FragmentSource(
+                        platform=SourcePlatform.CLAUDE,
+                    ).model_dump(),
+                },
+            )
 
     def test_thread_id_format(self) -> None:
         """Thread ID should match thread-XXXXXXXX format."""
@@ -803,6 +829,7 @@ class TestEnumSerialization:
     def test_fragment_enums_as_strings(self) -> None:
         """Fragment model_dump should serialize all enums as strings."""
         frag = Fragment(
+            id="frag-00000000000d",
             title="Test",
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
             frequency=FrequencyClassification(primary=Frequency.F1),

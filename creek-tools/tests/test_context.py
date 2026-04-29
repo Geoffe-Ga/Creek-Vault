@@ -41,7 +41,10 @@ def _make_fragment(
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED,
 ) -> Fragment:
     """Create a test fragment with the given authorship."""
+    from creek.models import synthetic_fragment_id
+
     return Fragment(
+        id=synthetic_fragment_id(),
         title=title,
         source=FragmentSource(
             platform=platform,
