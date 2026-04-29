@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/coverage.sh - Run tests with coverage report
-# Usage: ./scripts/coverage.sh [--html] [--xml] [--verbose] [--help]
+# Usage: ./scripts/coverage.sh [--html] [--xml] [--json] [--verbose] [--help]
 
 set -euo pipefail
 
@@ -9,6 +9,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 HTML_REPORT=false
 XML_REPORT=false
+JSON_REPORT=false
 VERBOSE=false
 
 # Parse command line arguments
@@ -20,6 +21,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --xml)
             XML_REPORT=true
+            shift
+            ;;
+        --json)
+            JSON_REPORT=true
             shift
             ;;
         --verbose)
@@ -35,6 +40,7 @@ Run tests with coverage report.
 OPTIONS:
     --html      Generate HTML coverage report
     --xml       Generate XML coverage report (for CI)
+    --json      Generate JSON coverage report (feeds per-file gate)
     --verbose   Show detailed output
     --help      Display this help message
 
@@ -47,6 +53,7 @@ EXAMPLES:
     $(basename "$0")          # Run coverage with terminal report
     $(basename "$0") --html   # Generate HTML report
     $(basename "$0") --xml    # Generate XML report for CI
+    $(basename "$0") --json   # Generate JSON report for the per-file gate
 EOF
             exit 0
             ;;
@@ -87,8 +94,19 @@ if $XML_REPORT; then
     echo "XML report will be generated as coverage.xml"
 fi
 
+# Add JSON report if requested (feeds the per-file gate)
+if $JSON_REPORT; then
+    mkdir -p reports
+    PYTEST_ARGS+=(--cov-report=json:reports/coverage.json)
+    echo "JSON report will be generated at reports/coverage.json"
+fi
+
+# Default to running unit tests only — keeps coverage runs aligned with
+# the rest of the local toolchain (CI-003).
+PYTEST_ARGS+=(-m "not integration and not e2e")
+
 # Run tests with coverage
-pytest "${PYTEST_ARGS[@]}" tests/ || {
+python -m pytest "${PYTEST_ARGS[@]}" tests/ || {
     echo "✗ Coverage below threshold" >&2
     exit 1
 }

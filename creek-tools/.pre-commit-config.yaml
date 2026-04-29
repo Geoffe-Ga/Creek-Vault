@@ -46,6 +46,10 @@ repos:
     - types-PyYAML
     - types-chardet
     - types-tqdm
+    - pytest>=7.4.0
+    - hypothesis>=6.92.0
+    - pydantic>=2.0.0
+    - python-frontmatter>=1.0.0
     args:
     - --strict
 - repo: https://github.com/PyCQA/bandit
@@ -116,6 +120,18 @@ repos:
     - --baseline
     - creek-tools/.secrets.baseline
     exclude: \.secrets\.baseline$
+# Local hook: pylint as a CI-aligned gate (CI-002 / CI-004). Runs only
+# on staged Python files so it stays fast; CI runs the full --fail-under
+# pass over creek/.
+- repo: local
+  hooks:
+  - id: pylint-fast
+    name: pylint (fast, staged files only)
+    entry: pylint
+    language: system
+    types: [python]
+    args: [--rcfile=creek-tools/pyproject.toml, --fail-under=9.0]
+    files: ^creek-tools/creek/
 ci:
   autofix_commit_msg: 'style: auto-fix by pre-commit hooks'
   autoupdate_commit_msg: 'chore: update pre-commit hooks'

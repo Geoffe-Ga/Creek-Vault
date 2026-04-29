@@ -72,7 +72,24 @@ echo "=== Dependency Vulnerability Check (pip-audit) ==="
 if $VERBOSE; then
     echo "Running pip-audit dependency checker..."
 fi
-pip-audit || { echo "✗ pip-audit found vulnerable dependencies" >&2; exit 1; }
+# Documented CVEs in build/install tooling. Each is excluded with a
+# justification, kept in sync with .github/workflows/ci.yml:
+#
+#   - PYSEC-2022-42969: ReDoS in py.path.svnwc; py is a transitive dev
+#     dep (pulled in by pytest plugins) and the affected code path is
+#     unused.
+#   - CVE-2025-8869, CVE-2026-1703, CVE-2026-3219: pip vulnerabilities.
+#     pip is the installer, not a runtime dependency. CI installs only
+#     from declared requirements files, so these are not exploitable.
+#   - CVE-2026-24049: wheel; wheel is build-tooling only and never
+#     reaches the production runtime.
+pip-audit \
+    --ignore-vuln PYSEC-2022-42969 \
+    --ignore-vuln CVE-2025-8869 \
+    --ignore-vuln CVE-2026-1703 \
+    --ignore-vuln CVE-2026-3219 \
+    --ignore-vuln CVE-2026-24049 \
+    || { echo "✗ pip-audit found vulnerable dependencies" >&2; exit 1; }
 
 if $FULL; then
     echo "=== Comprehensive Security Scan ==="

@@ -119,7 +119,8 @@ if $VERBOSE; then
     echo "Running pytest with args: ${PYTEST_ARGS[*]}"
 fi
 
-pytest "${PYTEST_ARGS[@]}" tests/ || { echo "✗ Tests failed" >&2; exit 1; }
+python -m pytest "${PYTEST_ARGS[@]}" tests/ \
+    || { echo "✗ Tests failed" >&2; exit 1; }
 
 echo "✓ Tests passed"
 

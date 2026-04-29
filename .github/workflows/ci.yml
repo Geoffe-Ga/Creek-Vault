@@ -12,6 +12,9 @@ env:
   COVERAGE_THRESHOLD: 90
   BRANCH_COVERAGE_THRESHOLD: 85
   DOCSTRING_COVERAGE_THRESHOLD: 95
+  PYLINT_FAIL_UNDER: '9.0'
+  PER_FILE_COVERAGE_THRESHOLD: '80'
+  PER_FILE_COVERAGE_WAIVER_FLOOR: '65'
 
 jobs:
   quality:
@@ -50,106 +53,91 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install pytest pytest-cov pytest-xdist pytest-timeout
-          pip install ruff pylint mypy
-          pip install bandit pip-audit
-          pip install interrogate
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          if [ -f setup.py ]; then pip install -e .; fi
-          if [ -f pyproject.toml ]; then pip install -e .; fi
+          # CI installs the [all] extras to keep coverage of optional code
+          # paths (DEP-001/DEP-002) and the [dev] toolchain.
+          pip install -e '.[all,dev]'
+          pip install -r requirements-dev.txt
 
       - name: Create necessary directories
         run: |
           mkdir -p reports
-          mkdir -p .coverage-reports
 
       - name: Run Ruff linting
-        run: |
-          ruff check . --output-format=github --exit-non-zero-on-fix
-        continue-on-error: false
+        run: ruff check . --output-format=github
 
       - name: Run Ruff format check
-        run: |
-          ruff format --check .
-        continue-on-error: false
+        run: ruff format --check .
 
-      - name: Run Pylint
+      - name: Run Pylint (CI-002)
         run: |
-          pylint **/*.py --output-format=colorized --fail-under=8.0 || true
-          pylint **/*.py --output-format=json > reports/pylint-report.json || true
-        continue-on-error: true
+          pylint creek/ --output-format=colorized \
+            --fail-under=${{ env.PYLINT_FAIL_UNDER }}
+          pylint creek/ --output-format=json \
+            > reports/pylint-report.json || true  # JSON snapshot only
 
-      - name: Run MyPy type checking
-        run: |
-          mypy . --ignore-missing-imports --no-strict-optional --show-error-codes --pretty || true
-        continue-on-error: true
+      - name: Run MyPy type checking (CI-001)
+        # Project-wide strict mode is configured in pyproject.toml; the
+        # script runs `mypy creek/` so local and CI agree.
+        run: ./scripts/typecheck.sh
 
       - name: Check docstring coverage
         run: |
-          interrogate -vv --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} .
-        continue-on-error: false
+          interrogate -vv \
+            --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} creek/
 
       - name: Run Bandit security scan
         run: |
-          bandit -r . -f json -o reports/bandit-report.json || true
-          bandit -r . -ll
-        continue-on-error: false
+          bandit -r creek/ -f json -o reports/bandit-report.json || true
+          bandit -r creek/ -ll
 
       - name: Run pip-audit dependency check
+        # Documented CVEs in build/install tooling. Each excluded with a
+        # justification, kept in sync with scripts/security.sh:
+        #   - PYSEC-2022-42969: ReDoS in py.path.svnwc; py is a transitive
+        #     dev dep (pulled in by pytest plugins); the affected code path
+        #     is unused.
+        #   - CVE-2025-8869, CVE-2026-1703, CVE-2026-3219: pip itself; pip
+        #     is the installer, not a runtime dependency, and CI installs
+        #     only from declared requirements files.
+        #   - CVE-2026-24049: wheel; wheel is build-tooling only and never
+        #     reaches the production runtime.
         run: |
-          # PYSEC-2022-42969: ReDoS in py.path.svnwc (transitive dep of interrogate, not exploitable here)
-          # CVE-2026-3219: pip itself (no fix version published yet); pip is the installer,
-          # not a runtime dependency, and CI installs only from declared requirements
-          # files, so this is not exploitable in our context.
           pip-audit --format=json --output=reports/pip-audit-report.json \
             --ignore-vuln PYSEC-2022-42969 \
-            --ignore-vuln CVE-2026-3219 || true
+            --ignore-vuln CVE-2025-8869 \
+            --ignore-vuln CVE-2026-1703 \
+            --ignore-vuln CVE-2026-3219 \
+            --ignore-vuln CVE-2026-24049
           pip-audit \
             --ignore-vuln PYSEC-2022-42969 \
-            --ignore-vuln CVE-2026-3219
-        continue-on-error: false
+            --ignore-vuln CVE-2025-8869 \
+            --ignore-vuln CVE-2026-1703 \
+            --ignore-vuln CVE-2026-3219 \
+            --ignore-vuln CVE-2026-24049
 
-      - name: Run tests with coverage
-        run: |
-          pytest \
-            --cov=. \
-            --cov-report=xml:reports/coverage.xml \
-            --cov-report=html:reports/htmlcov \
-            --cov-report=term-missing \
-            --cov-branch \
-            --cov-fail-under=${{ env.COVERAGE_THRESHOLD }} \
-            --junitxml=reports/junit.xml \
-            --maxfail=5 \
-            --tb=short \
-            -v
+      - name: Run tests with coverage (CI-003 — mirrors local default)
+        # ./scripts/test.sh excludes integration/e2e by default so local
+        # and CI run the same set of tests.
+        run: ./scripts/test.sh --unit --coverage
         env:
           COVERAGE_CORE: sysmon
 
-      - name: Verify coverage thresholds
+      - name: Verify aggregate coverage threshold
         run: |
           coverage report --fail-under=${{ env.COVERAGE_THRESHOLD }}
           coverage json -o reports/coverage.json
-          python -c "
-          import json
-          import sys
-          with open('reports/coverage.json') as f:
-              data = json.load(f)
-              total_coverage = data['totals']['percent_covered']
-              branch_coverage = data['totals'].get('percent_covered_branches', 0)
-              print(f'Total Coverage: {total_coverage:.2f}%')
-              print(f'Branch Coverage: {branch_coverage:.2f}%')
-              if total_coverage < ${{ env.COVERAGE_THRESHOLD }}:
-                  print(f'ERROR: Coverage {total_coverage:.2f}% is below threshold ${{ env.COVERAGE_THRESHOLD }}%')
-                  sys.exit(1)
-              if branch_coverage < ${{ env.BRANCH_COVERAGE_THRESHOLD }}:
-                  print(f'WARNING: Branch coverage {branch_coverage:.2f}% is below threshold ${{ env.BRANCH_COVERAGE_THRESHOLD }}%')
-          "
+
+      - name: Verify per-file coverage thresholds (TEST-002)
+        run: |
+          ./scripts/coverage-per-file.sh \
+            --threshold ${{ env.PER_FILE_COVERAGE_THRESHOLD }} \
+            --waiver-floor ${{ env.PER_FILE_COVERAGE_WAIVER_FLOOR }} \
+            --report reports/coverage.json
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
-          files: creek-tools/reports/coverage.xml
+          files: creek-tools/coverage.xml
           flags: python-${{ matrix.python-version }}
           name: python-${{ matrix.python-version }}
           fail_ci_if_error: false
@@ -169,9 +157,9 @@ jobs:
         with:
           name: coverage-reports-${{ matrix.python-version }}
           path: |
-            creek-tools/reports/coverage.xml
+            creek-tools/coverage.xml
             creek-tools/reports/coverage.json
-            creek-tools/reports/htmlcov
+            creek-tools/htmlcov
           retention-days: 30
 
       - name: Upload security reports
@@ -206,20 +194,20 @@ jobs:
           pip install radon xenon
           mkdir -p reports
 
-      - name: Calculate cyclomatic complexity
+      - name: Calculate cyclomatic complexity (informational)
         run: |
-          radon cc . -a -s -j > reports/complexity-cc.json || true
-          radon cc . -a -s
+          radon cc creek/ -a -s -j > reports/complexity-cc.json
+          radon cc creek/ -a -s
 
-      - name: Calculate maintainability index
+      - name: Calculate maintainability index (informational)
         run: |
-          radon mi . -s -j > reports/complexity-mi.json || true
-          radon mi . -s
+          radon mi creek/ -s -j > reports/complexity-mi.json
+          radon mi creek/ -s
 
-      - name: Check complexity thresholds
-        run: |
-          xenon --max-absolute B --max-modules B --max-average A . || true
-        continue-on-error: true
+      - name: Enforce complexity thresholds (CI-002)
+        # ./scripts/complexity.sh requires xenon, runs strict thresholds,
+        # and exits non-zero on any violation. No `|| true` escape hatch.
+        run: ./scripts/complexity.sh
 
       - name: Upload complexity reports
         uses: actions/upload-artifact@v7
@@ -251,12 +239,10 @@ jobs:
           pip install build twine
 
       - name: Build package
-        run: |
-          python -m build
+        run: python -m build
 
       - name: Check distribution
-        run: |
-          twine check dist/*
+        run: twine check dist/*
 
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v7
@@ -278,7 +264,14 @@ jobs:
             echo "Quality checks failed"
             exit 1
           fi
+          if [ "${{ needs.complexity-analysis.result }}" != "success" ]; then
+            echo "Complexity analysis failed"
+            exit 1
+          fi
+          if [ "${{ needs.build.result }}" != "success" ]; then
+            echo "Build failed"
+            exit 1
+          fi
 
       - name: Quality gate passed
-        run: |
-          echo "All quality gates passed successfully"
+        run: echo "All quality gates passed successfully"
