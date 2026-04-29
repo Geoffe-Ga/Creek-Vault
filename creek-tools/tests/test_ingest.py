@@ -780,7 +780,11 @@ class TestAssembleIngestedFragment:
     on ``ParsedFragment.metadata``.
     """
 
-    def _parsed(self, **metadata_overrides: object) -> ParsedFragment:
+    def _parsed(
+        self,
+        source_path: str = "fixtures/note.md",
+        **metadata_overrides: object,
+    ) -> ParsedFragment:
         """Build a ParsedFragment with a minimal frontmatter+markdown payload."""
         ts = datetime(2026, 1, 15, 12, 0, tzinfo=LA_TZ)
         metadata: dict[str, object] = {
@@ -795,7 +799,7 @@ class TestAssembleIngestedFragment:
         return ParsedFragment(
             content="# A note\n\nBody text.\n",
             metadata=metadata,
-            source_path="/tmp/note.md",
+            source_path=source_path,
             timestamp=ts,
         )
 
@@ -825,14 +829,15 @@ class TestAssembleIngestedFragment:
             frontmatter={"type": "fragment", "source": {"platform": "markdown"}},
         )
         ingested = assemble_ingested_fragment(parsed)
-        assert ingested.fragment.title == "note"  # /tmp/note.md → "note"
+        # fixtures/note.md → "note"
+        assert ingested.fragment.title == "note"
 
     def test_missing_frontmatter_raises_descriptive_keyerror(self) -> None:
         """Missing 'frontmatter' key surfaces as a descriptive KeyError."""
         parsed = ParsedFragment(
             content="x",
             metadata={"markdown": "x"},
-            source_path="/tmp/broken.md",
+            source_path="fixtures/broken.md",
             timestamp=datetime.now(tz=LA_TZ),
         )
         with pytest.raises(KeyError, match="frontmatter"):
@@ -843,7 +848,7 @@ class TestAssembleIngestedFragment:
         parsed = ParsedFragment(
             content="x",
             metadata={"frontmatter": {"type": "fragment"}},
-            source_path="/tmp/broken.md",
+            source_path="fixtures/broken.md",
             timestamp=datetime.now(tz=LA_TZ),
         )
         with pytest.raises(KeyError, match="markdown"):
@@ -854,7 +859,7 @@ class TestAssembleIngestedFragment:
         parsed = ParsedFragment(
             content="x",
             metadata={"markdown": "x"},
-            source_path="/tmp/specific-file.md",
+            source_path="fixtures/specific-file.md",
             timestamp=datetime.now(tz=LA_TZ),
         )
         with pytest.raises(KeyError, match="specific-file"):
