@@ -108,8 +108,9 @@ class Pipeline:
             1. Redaction scan on source files
             2. Ingestion (discover ingestors for source type)
             3. Classification (rule -> LLM -> review queue)
-            4. Linking (embeddings, temporal, threads, eddies)
-            5. Index generation
+            4. Vault write (persist classified fragments + bodies)
+            5. Linking (embeddings, temporal, threads, eddies)
+            6. Index generation
 
         Args:
             source_path: Directory containing source files to process.
@@ -145,15 +146,15 @@ class Pipeline:
         classified = self._run_classification(ingested, vault_path, result)
         result.classifications_made = len(classified)
 
-        # Stage 3.5: Persist classified fragments into the vault.
+        # Stage 4: Vault write -- persist classified fragments+bodies.
         self._write_to_vault(classified, vault_path, result)
 
-        # Stage 4: Linking
+        # Stage 5: Linking
         fragments_only = [item.fragment for item in classified]
         link_total = self._run_linking(fragments_only, vault_path, result)
         result.links_found = link_total
 
-        # Stage 5: Indexing
+        # Stage 6: Indexing
         index_count = self._run_indexing(vault_path, result)
         result.indexes_generated = index_count
 
@@ -331,7 +332,14 @@ class Pipeline:
         for item in classified:
             try:
                 writer.write_fragment(item.fragment, body=item.body)
-            except OSError as exc:
+            except (OSError, KeyError) as exc:
+                # OSError covers filesystem-level failures (permissions,
+                # disk full). KeyError covers a missing platform mapping —
+                # ``_PLATFORM_SUBFOLDER`` is enforced as total by a unit
+                # test, but if a future enum value slips through review
+                # the writer's bare ``dict[]`` access would otherwise
+                # crash the whole run. Record either as a per-fragment
+                # error and keep processing the rest.
                 result.errors.append(
                     f"[vault-writer] failed to write {item.fragment.id}: {exc}",
                 )

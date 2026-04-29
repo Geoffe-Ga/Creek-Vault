@@ -301,6 +301,17 @@ class VaultWriter:
         Inspects the ``type`` attribute of the model and calls the
         corresponding ``write_*`` method.
 
+        .. note::
+
+            For ``Fragment`` models this dispatch path produces a
+            **header-only** vault file because there is no body to
+            forward through the generic ``BaseModel`` signature. The
+            primary ingestion path bypasses ``write_any`` and calls
+            :meth:`write_fragment` directly with the converted Markdown
+            body. Reach for ``write_any`` only when you genuinely have
+            no body — e.g. compaction tooling that re-writes existing
+            metadata blobs.
+
         Args:
             model: A Pydantic model with a ``type`` field.
 

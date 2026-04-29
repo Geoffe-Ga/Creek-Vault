@@ -292,6 +292,16 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
             or ``markdown`` keys; this signals an ingestor contract
             violation rather than a recoverable parse error.
     """
+    for required_key in ("frontmatter", "markdown"):
+        if required_key not in parsed.metadata:
+            msg = (
+                f"Ingestor for {parsed.source_path!r} did not set "
+                f"'{required_key}' in ParsedFragment.metadata; "
+                "every Ingestor.ingest() must populate both 'markdown' "
+                "and 'frontmatter' before yielding a fragment."
+            )
+            raise KeyError(msg)
+
     frontmatter_dict: dict[str, Any] = dict(parsed.metadata["frontmatter"])
     body: str = str(parsed.metadata["markdown"])
 
