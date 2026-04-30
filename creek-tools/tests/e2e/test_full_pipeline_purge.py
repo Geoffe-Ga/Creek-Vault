@@ -25,10 +25,11 @@ pytestmark = [
     pytest.mark.xfail(
         reason=(
             "INC-005: purge_source does not yet write to "
-            "00-Creek-Meta/Audit. This xfail flips to XPASS once the "
-            "audit log is wired up."
+            "00-Creek-Meta/Audit. strict=True so when the audit log "
+            "is wired up the test XPASSES, fails CI, and forces "
+            "removal of this xfail marker."
         ),
-        strict=False,
+        strict=True,
     ),
 ]
 

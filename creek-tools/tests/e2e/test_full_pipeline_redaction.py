@@ -22,11 +22,12 @@ pytestmark = [
     pytest.mark.e2e,
     pytest.mark.xfail(
         reason=(
-            "BUG-004: pipeline scans for redactions but does not apply them. "
-            "This xfail flips to XPASS once the redactor is wired into the "
-            "ingestion path."
+            "BUG-004: pipeline scans for redactions but does not apply "
+            "them. strict=True so when the redactor is wired into the "
+            "ingestion path the test XPASSES, fails CI, and forces "
+            "removal of this xfail marker."
         ),
-        strict=False,
+        strict=True,
     ),
 ]
 

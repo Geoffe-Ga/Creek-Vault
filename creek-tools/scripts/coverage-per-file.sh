@@ -147,7 +147,11 @@ if orphan_waivers:
     ok = False
     print("Orphaned waivers (file not in coverage report):")
     for name in orphan_waivers:
-        print(f"  ORPHAN  {name}  — remove from coverage-waivers.txt")
+        print(
+            f"  ORPHAN  {name}  — file may have been renamed, deleted, "
+            f"or moved. Update its entry in scripts/coverage-waivers.txt "
+            f"or remove it."
+        )
 
 if not ok:
     sys.exit(1)

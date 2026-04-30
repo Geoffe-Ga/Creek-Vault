@@ -1,7 +1,13 @@
 # Per-file coverage waivers (TEST-002).
 #
-# Format: "<path> <reason>" — paths must match the keys in
-# reports/coverage.json (typically "creek/<module>.py"). The script
+# Format: "<path> <reason>". Paths must match the keys that pytest-cov
+# emits in reports/coverage.json — these are relative to the cwd where
+# pytest runs (creek-tools/), so the canonical form is
+# "creek/<module>.py" (NOT "creek-tools/creek/<module>.py"). The orphan-
+# waiver detector in coverage-per-file.sh fails the build if any entry
+# here doesn't appear in coverage.json, so a path-format drift surfaces
+# as a hard CI failure rather than silent skipping.
+#
 # scripts/coverage-per-file.sh applies a lower WAIVER_FLOOR (default
 # 65%) to files listed here while keeping the strict THRESHOLD (default
 # 80%) in force everywhere else.
