@@ -15,21 +15,30 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from creek.config import CreekConfig
-from creek.pipeline import Pipeline
+from creek.pipeline import Pipeline, PipelineResult
 
 pytestmark = pytest.mark.e2e
 
 
-def test_classify_review_round_trip(
+def test_classify_runs_twice_without_error(
     synthetic_vault: Path, synthetic_source: Path
 ) -> None:
-    """Two classification passes must not regress prior manual decisions.
+    """Two classification passes must not raise and must not duplicate fragments.
 
-    This is intentionally lightweight: it verifies that the classify
-    stage runs without error against a real source twice in a row,
-    leaving the vault's review queue file present after each pass.
-    Replacing the simple "queue exists" assertion with a true persisted-
-    decision check requires INC-002 (review command) to be implemented.
+    The original incarnation of this test asserted on
+    ``(synthetic_vault / "07-Review").exists()`` — but the
+    ``synthetic_vault`` fixture pre-creates that directory, so the
+    assertion was vacuous. The honest round-trip semantics require
+    INC-002 (review command) and INC-011 (classify --force flag) to
+    land. Until then this test guards two real properties:
+
+    1. Calling Pipeline.run() twice in a row never raises (smoke).
+    2. The second pass does not create duplicate fragments — i.e. the
+       ID-based dedup in VaultWriter still holds when classification
+       runs on already-classified content.
+
+    A persistence-of-manual-decisions assertion will replace #2 once
+    INC-002 ships.
     """
     (synthetic_source / "thought.md").write_text(
         "# A musing\n\nSomething I want to keep thinking about.\n",
@@ -39,13 +48,24 @@ def test_classify_review_round_trip(
     config = CreekConfig()
     pipeline = Pipeline(config=config)
 
-    pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
-    review_dir = synthetic_vault / "07-Review"
-    assert review_dir.exists(), (
-        "Review directory missing after first pipeline pass — INC-002 sentinel"
+    first = pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
+    assert isinstance(first, PipelineResult), (
+        f"Pipeline.run() returned {type(first).__name__}, expected PipelineResult"
+    )
+    fragment_files_after_first = sorted(
+        p.name for p in synthetic_vault.glob("01-Fragments/**/*.md")
     )
 
-    pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
-    assert review_dir.exists(), (
-        "Review directory disappeared on second pipeline pass — INC-011 sentinel"
+    second = pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
+    assert isinstance(second, PipelineResult)
+    fragment_files_after_second = sorted(
+        p.name for p in synthetic_vault.glob("01-Fragments/**/*.md")
+    )
+
+    # Real assertion: the second classification pass must not duplicate
+    # fragment files. The exact set should be identical between passes.
+    assert fragment_files_after_first == fragment_files_after_second, (
+        "Second classify pass changed the fragment set on disk — "
+        "INC-011 sentinel (re-classify should be idempotent without "
+        "the --force flag)."
     )

@@ -101,6 +101,24 @@ content-type heuristics are the canonical example). A future iteration
 may switch to `percent_covered_branches`; the script supports it via a
 single field-name change.
 
+### Notes on the branch coverage threshold
+
+Pre-Batch-F CI carried a separate `BRANCH_COVERAGE_THRESHOLD: 85` env
+var that an inline Python step compared against
+`percent_covered_branches`. The new flow drops the separate 85% floor
+because `pytest --cov-branch --cov-fail-under=90` already counts
+branches in the composite metric, and the composite at 90% is in
+practice stricter than line coverage at 90% with a separate branch
+floor at 85% (the composite must clear 90% with branches included, so
+a project trending toward many uncovered branches would push the
+composite below 90% before any branch-only gate would have fired).
+The trade-off: a hypothetical file that adds many uncovered branches
+while keeping the composite above 90% would be invisible. The per-
+file gate at 80% bounds the worst case at the file level. If
+follow-up data shows branch-only regressions slipping through, the
+right fix is `[tool.coverage.report] fail_under_branch = 85`, not a
+return to the inline Python check.
+
 ## Consequences
 
 **Positive**

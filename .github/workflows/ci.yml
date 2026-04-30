@@ -90,6 +90,10 @@ jobs:
             --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} creek/
 
       - name: Run Bandit security scan
+        # The first invocation only produces the JSON artifact and is
+        # intentionally non-gating (`|| true`). The SECOND invocation
+        # is the real gate: `bandit -r creek/ -ll` exits non-zero on
+        # any medium-or-above finding, with no escape hatch.
         run: |
           bandit -r creek/ -f json -o reports/bandit-report.json || true
           bandit -r creek/ -ll
