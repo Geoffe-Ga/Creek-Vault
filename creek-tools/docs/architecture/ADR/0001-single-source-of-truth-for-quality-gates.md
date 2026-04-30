@@ -101,6 +101,45 @@ content-type heuristics are the canonical example). A future iteration
 may switch to `percent_covered_branches`; the script supports it via a
 single field-name change.
 
+### Notes on `numpy` as a core runtime dependency
+
+Reviewer feedback on PR #170 has repeatedly suggested moving
+`numpy>=2.4.4` from `[project] dependencies` into the `[embeddings]`
+extra, on the principle that heavy ML dependencies should be opt-in
+the same way `markdownify` is for `[documents]`. The argument is
+correct in spirit — `numpy` is ~20 MB and only directly relevant to
+embedding-style functionality.
+
+The reason it stays in the core dependency list for Batch F:
+
+1. Five modules (`creek/clean/semantic_dedup.py`,
+   `creek/link/embeddings.py`, `creek/link/threads.py`,
+   `creek/link/eddies.py`, `creek/generate/unnamed.py`) all import
+   `numpy` at module load.
+2. `creek/link/__init__.py` re-exports the numpy-using submodules,
+   and `creek/pipeline.py` does
+   `from creek.link.linker import LinkingPipeline`. Therefore
+   `import creek.pipeline` triggers `numpy` transitively at import
+   time today.
+3. Moving `numpy` to `[embeddings]` without refactoring those five
+   modules would break `import creek.pipeline` for any user who
+   installed `creek-tools` without the `[embeddings]` extra — a
+   real usability regression for what is otherwise the core data
+   pipeline.
+4. The right architectural fix is to (a) wrap each numpy import in
+   a clear `try/except ImportError` block pointing at
+   `creek-tools[embeddings]`, and (b) lazy-import `LinkingPipeline`
+   inside `Pipeline.__init__` so the pipeline gracefully degrades
+   when the linking stage is unavailable. That refactor changes
+   `creek.link`'s public contract (linking becomes opt-in instead
+   of always available) and is therefore out of scope for Batch F
+   (CI / deps / tests). It belongs in a follow-up batch focused on
+   the linking architecture.
+
+For now `numpy` is documented here as a deliberate exception to the
+opt-in extras pattern, alongside the eager linking pipeline that
+relies on it.
+
 ### Notes on the branch coverage threshold
 
 Pre-Batch-F CI carried a separate `BRANCH_COVERAGE_THRESHOLD: 85` env

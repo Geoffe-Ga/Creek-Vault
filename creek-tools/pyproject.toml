@@ -55,18 +55,9 @@ gdrive = [
     "google-auth-oauthlib>=1.0",
 ]
 all = [
-    "anthropic>=0.40.0",
-    "sentence-transformers>=2.2.0",
-    "pytesseract>=0.3",
-    "pdf2image>=1.0",
-    "pillow>=10.0",
-    "python-docx>=1.0.0",
-    "pdfminer.six>=20260107",
-    "markdownify>=1.2.2",
-    "openpyxl>=3.1",
-    "python-pptx>=0.6",
-    "google-api-python-client>=2.0",
-    "google-auth-oauthlib>=1.0",
+    # Self-referential extras (pip >= 21.2). Adding a new sub-extra
+    # automatically flows into [all] without manual duplication.
+    "creek-tools[anthropic,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
 ]
 dev = [
     "pytest>=7.4.0",
