@@ -39,10 +39,17 @@ truth** for what "green" means. Three downstream consumers all invoke
 the same scripts:
 
 1. **Local development**: `./scripts/check-all.sh` exits 0 before any
-   commit.
+   commit. It runs the **gating** subset (lint, format, typecheck,
+   security, complexity, unit tests, coverage report, per-file
+   coverage gate). Extended-only checks (refurb, tryceratops, vulture,
+   detect-secrets baseline audit) live in
+   `./scripts/lint-extended.sh` and are run on demand or by
+   pre-commit; they will join `check-all.sh` once STYLE-001 clears
+   the existing whole-tree backlog.
 2. **Pre-commit hooks**: targeted hooks (ruff, mypy, refurb,
-   tryceratops, vulture, interrogate, detect-secrets) gate staged
-   files; the full battery still runs via `check-all.sh`.
+   tryceratops, vulture, interrogate, detect-secrets, pylint-fast)
+   gate staged files. These run only on changed files, so they catch
+   *new* violations cheaply without forcing the full backlog.
 3. **CI** (`.github/workflows/ci.yml`): every step calls a project
    script (`./scripts/typecheck.sh`, `./scripts/test.sh --unit
    --coverage`, `./scripts/coverage-per-file.sh`,

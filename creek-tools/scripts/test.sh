@@ -104,6 +104,10 @@ esac
 # Add coverage if requested
 if $COVERAGE; then
     echo "Coverage enabled"
+    # Always emit a junit.xml alongside coverage so CI's test-results
+    # artifact upload (.github/workflows/ci.yml) gets a real file
+    # instead of silently uploading nothing.
+    mkdir -p reports
     PYTEST_ARGS+=(
         --cov=creek
         --cov-branch
@@ -111,6 +115,7 @@ if $COVERAGE; then
         --cov-report=html
         --cov-report=xml
         --cov-fail-under=90
+        --junitxml=reports/junit.xml
     )
 fi
 

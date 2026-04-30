@@ -82,8 +82,10 @@ run_or_skip "vulture"     vulture       \
     vulture creek/ --min-confidence 80
 run_or_skip "interrogate" interrogate   \
     interrogate -vv --fail-under="$INTERROGATE_FAIL_UNDER" creek/
+# shellcheck takes a list of files directly; the shell expands the
+# glob before run_or_skip sees it.
 run_or_skip "shellcheck"  shellcheck    \
-    bash -c 'shellcheck scripts/*.sh'
+    shellcheck scripts/*.sh
 
 if command -v detect-secrets >/dev/null 2>&1 && [[ -f .secrets.baseline ]]; then
     if detect-secrets audit --report --fail-on-unaudited .secrets.baseline \

@@ -153,11 +153,23 @@ def test_redactor_sweeps_secret_lookalikes_fixture() -> None:
         "555-12-3456",
         "4111111111111111",
     )
+    checked = 0
     for token in fixture_tokens:
         if any(pattern.search(token) for pattern in REDACTION_PATTERNS.values()):
+            checked += 1
             assert token not in redacted, (
                 f"Pattern-matching token leaked through redactor: {token!r}"
             )
+
+    # Baseline guard: if every built-in pattern stops matching every
+    # fixture token (e.g. someone weakens the regexes), the per-token
+    # loop above silently passes by skipping every iteration. Require
+    # at least one match so a regression in pattern coverage surfaces
+    # here too.
+    assert checked >= 1, (
+        "No documented fixture token matched any built-in redaction "
+        "pattern — either patterns regressed or the fixture changed shape."
+    )
 
 
 # ---- scale/ ------------------------------------------------------------------

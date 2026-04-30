@@ -140,9 +140,10 @@ repos:
     additional_dependencies:
     - pylint>=3.0.0
     types: [python]
-    # pre-commit runs hooks with cwd=repo root, so this relative path
-    # resolves to <repo>/creek-tools/pyproject.toml.
-    args: [--rcfile=creek-tools/pyproject.toml, --fail-under=9.0]
+    # pyproject.toml has no [tool.pylint] section yet, so we don't pass
+    # --rcfile (pylint warned and fell back to defaults anyway). The
+    # CLI --fail-under is the actual enforcement contract.
+    args: [--fail-under=9.0]
     files: ^creek-tools/creek/
 ci:
   autofix_commit_msg: 'style: auto-fix by pre-commit hooks'
