@@ -19,11 +19,19 @@ _VAULT_DIRS = (
     "00-Creek-Meta/Indexes",
     "00-Creek-Meta/Audit",
     "00-Creek-Meta/Consent",
+    # 01-Fragments subfolders mirror creek/vault/writer.py's
+    # _PLATFORM_SUBFOLDER mapping. Keep this in sync when adding a new
+    # SourcePlatform value.
     "01-Fragments/Conversations",
     "01-Fragments/Messages",
     "01-Fragments/Writing",
     "01-Fragments/Journal",
     "01-Fragments/Technical",
+    "01-Fragments/Notes",
+    "01-Fragments/Documents",
+    "01-Fragments/Data",
+    "01-Fragments/Decks",
+    "01-Fragments/Images",
     "01-Fragments/Unsorted",
     "02-Threads/Active",
     "02-Threads/Dormant",

@@ -109,23 +109,36 @@ def fragments(draw: st.DrawFn) -> Fragment:
 def test_fragment_frontmatter_roundtrip(
     fragment: Fragment, tmp_path_factory: TempPathFactory
 ) -> None:
-    """``parse(write(fragment)) == fragment.model_dump()`` for every field."""
+    """Every field round-trips through frontmatter unchanged.
+
+    YAML loads scalars as native Python types (datetimes, ints, bools)
+    while ``model_dump(mode="json")`` produces JSON-friendly strings.
+    Comparison is done via re-validation through Fragment so the
+    contract is "the fragment we wrote equals the fragment we re-load,"
+    not "the literal YAML matches the JSON dump."
+    """
     vault = _make_vault(tmp_path_factory.mktemp("vault"))
     writer = VaultWriter(vault_path=vault)
     written_path = writer.write_fragment(fragment)
 
     post = frontmatter.load(str(written_path))
     parsed = post.metadata
-
     expected = fragment.model_dump(mode="json")
-    for key, value in expected.items():
+
+    # Every expected key must be present after the round-trip.
+    for key in expected:
         assert key in parsed, f"Missing key {key!r} in frontmatter"
-        # YAML may normalise scalar types (e.g. int-valued enums); compare
-        # via the JSON-mode dump on both sides.
-        if isinstance(value, (dict, list)):
-            assert parsed[key] == value, (
-                f"Round-trip mismatch on {key}: {parsed[key]!r} != {value!r}"
-            )
+
+    # Re-validate the loaded metadata back into a Fragment and compare
+    # field-by-field on the JSON-mode dump. This catches scalar
+    # round-trip bugs (None title, truncated id, dropped tags) that a
+    # dict/list-only assertion would miss.
+    reloaded = Fragment.model_validate(parsed)
+    actual = reloaded.model_dump(mode="json")
+    for key, value in expected.items():
+        assert actual[key] == value, (
+            f"Round-trip mismatch on {key!r}: {actual[key]!r} != {value!r}"
+        )
 
 
 @_PROFILE

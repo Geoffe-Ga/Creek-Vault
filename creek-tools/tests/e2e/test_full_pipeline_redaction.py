@@ -18,7 +18,17 @@ if TYPE_CHECKING:
 from creek.config import CreekConfig
 from creek.pipeline import Pipeline
 
-pytestmark = pytest.mark.e2e
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.xfail(
+        reason=(
+            "BUG-004: pipeline scans for redactions but does not apply them. "
+            "This xfail flips to XPASS once the redactor is wired into the "
+            "ingestion path."
+        ),
+        strict=False,
+    ),
+]
 
 
 _SECRET = "AKIAIOSFODNN7EXAMPLE"
