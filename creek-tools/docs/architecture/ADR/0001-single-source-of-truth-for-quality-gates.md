@@ -63,7 +63,7 @@ Specific commitments:
 | Aggregate branch coverage  | ≥ 90%     | `pytest --cov-fail-under=90` in `coverage.sh` |
 | Per-file coverage          | ≥ 80%     | `coverage-per-file.sh` (waiver list under 65% floor) |
 | Docstring coverage         | ≥ 95%     | `interrogate --fail-under=95`                 |
-| Pylint score               | ≥ 9.0     | `pylint creek/ --fail-under=9.0`              |
+| Pylint score               | ≥ 9.0     | `./scripts/pylint.sh` (`PYLINT_FAIL_UNDER` env override) |
 | MyPy                       | strict    | `mypy creek/` against `pyproject.toml`        |
 | Cyclomatic complexity      | ≤ 10 per fn / module-avg ≤ 10 | `xenon --max-absolute B --max-modules B --max-average B` |
 | pip-audit                  | 0 unhandled CVEs | `pip-audit` with documented `--ignore-vuln`  |

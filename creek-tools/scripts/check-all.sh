@@ -89,6 +89,7 @@ run_check() {
 run_check "Linting" "lint.sh" --check
 run_check "Formatting" "format.sh" --check
 run_check "Type checking" "typecheck.sh"
+run_check "Pylint" "pylint.sh"
 run_check "Security checks" "security.sh"
 run_check "Complexity analysis" "complexity.sh"
 run_check "Unit tests" "test.sh" --unit

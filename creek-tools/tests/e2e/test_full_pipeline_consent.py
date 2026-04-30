@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 from creek.config import CreekConfig
 from creek.consent import ConsentManager
-from creek.pipeline import Pipeline
+from creek.pipeline import Pipeline, PipelineResult
 
 pytestmark = pytest.mark.e2e
 
@@ -43,6 +43,13 @@ def test_pipeline_skips_ingestion_without_consent(
     pipeline = Pipeline(config=config, consent_manager=consent)
     result = pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
 
+    # Explicit type guard: if Pipeline.run()'s return shape changes,
+    # we want a clear AssertionError here rather than an opaque
+    # AttributeError on the next line. Also documents the contract
+    # this test depends on.
+    assert isinstance(result, PipelineResult), (
+        f"Pipeline.run() returned {type(result).__name__}, expected PipelineResult"
+    )
     assert result.fragments_created == 0, (
         "Pipeline ingested fragments without recorded consent (INC-010 sentinel)"
     )

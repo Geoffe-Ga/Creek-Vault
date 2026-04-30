@@ -71,11 +71,13 @@ jobs:
         run: ruff format --check .
 
       - name: Run Pylint (CI-002)
-        run: |
-          pylint creek/ --output-format=colorized \
-            --fail-under=${{ env.PYLINT_FAIL_UNDER }}
-          pylint creek/ --output-format=json \
-            > reports/pylint-report.json || true  # JSON snapshot only
+        # ./scripts/pylint.sh runs `python -m pylint creek/` with the
+        # configured --fail-under threshold and optionally writes a JSON
+        # snapshot. Same script the local check-all.sh runs, so a
+        # developer who passes locally cannot fail this gate (CI-004).
+        env:
+          PYLINT_FAIL_UNDER: ${{ env.PYLINT_FAIL_UNDER }}
+        run: ./scripts/pylint.sh --json reports/pylint-report.json
 
       - name: Run MyPy type checking (CI-001)
         # Project-wide strict mode is configured in pyproject.toml; the
