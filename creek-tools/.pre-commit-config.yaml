@@ -42,6 +42,12 @@ repos:
   rev: v1.8.0
   hooks:
   - id: mypy
+    # The packages listed here all ship py.typed (or are type stubs).
+    # mypy needs the actual package, not just stubs, to resolve types
+    # exported by pydantic v2's plugin, hypothesis's strategies, and
+    # pytest's fixture types in our test files. python-frontmatter is
+    # NOT in this list because pyproject.toml's mypy override already
+    # marks it ignore_missing_imports.
     additional_dependencies:
     - types-PyYAML
     - types-chardet
@@ -49,7 +55,6 @@ repos:
     - pytest>=7.4.0
     - hypothesis>=6.92.0
     - pydantic>=2.0.0
-    - python-frontmatter>=1.0.0
     args:
     - --strict
 - repo: https://github.com/PyCQA/bandit
@@ -128,8 +133,15 @@ repos:
   - id: pylint-fast
     name: pylint (fast, staged files only)
     entry: pylint
-    language: system
+    # language: python pulls pylint into pre-commit's isolated env so the
+    # hook works even when contributors haven't installed dev extras into
+    # their ambient PATH.
+    language: python
+    additional_dependencies:
+    - pylint>=3.0.0
     types: [python]
+    # pre-commit runs hooks with cwd=repo root, so this relative path
+    # resolves to <repo>/creek-tools/pyproject.toml.
     args: [--rcfile=creek-tools/pyproject.toml, --fail-under=9.0]
     files: ^creek-tools/creek/
 ci:

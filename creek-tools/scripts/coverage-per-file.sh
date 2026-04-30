@@ -43,7 +43,9 @@ while [[ $# -gt 0 ]]; do
             cat << EOF
 Usage: $(basename "$0") [--threshold N] [--waiver-floor N] [--report PATH]
 
-Fail if any source file's branch coverage is below the threshold.
+Fail if any source file's line coverage is below the threshold. (The
+aggregate gate enforces *branch* coverage at 90% — see ADR-0001 for
+the line-vs-branch rationale at the per-file level.)
 
 Files on the waiver allowlist (scripts/coverage-waivers.txt) are
 subject to the lower waiver-floor instead, but still fail if they
@@ -107,14 +109,25 @@ files = data.get("files", {})
 strict_failures: list[tuple[str, float]] = []
 waiver_failures: list[tuple[str, float, str]] = []
 
+# Detect orphaned waivers (entries that name a file no longer in the
+# coverage report — e.g. after a rename or deletion). An orphan is a
+# silent loophole: if the waivered file was renamed but kept its low
+# coverage, the new name would NOT be on the waiver list and would fail
+# the strict gate, which is correct behaviour. But if a file was
+# deleted, the waiver should be removed too.
+orphan_waivers = sorted(set(waivers) - set(files))
+
+# Count strictly: only files actually in the coverage report.
+files_in_report = set(files)
+applied_waivers = sorted(set(waivers) & files_in_report)
+
 for name, summary in files.items():
     pct = summary["summary"]["percent_covered"]
     if name in waivers:
         if pct < waiver_floor:
             waiver_failures.append((name, pct, waivers[name]))
-    else:
-        if pct < threshold:
-            strict_failures.append((name, pct))
+    elif pct < threshold:
+        strict_failures.append((name, pct))
 
 ok = True
 
@@ -130,13 +143,20 @@ if waiver_failures:
     for name, pct, reason in sorted(waiver_failures, key=lambda x: x[1]):
         print(f"  FAIL {pct:6.2f}% < {waiver_floor:.1f}%  {name}  ({reason})")
 
+if orphan_waivers:
+    ok = False
+    print("Orphaned waivers (file not in coverage report):")
+    for name in orphan_waivers:
+        print(f"  ORPHAN  {name}  — remove from coverage-waivers.txt")
+
 if not ok:
     sys.exit(1)
 
-waivered = len(waivers)
-strict = len(files) - waivered
+# Counts derive from set membership, not arithmetic on len(), so a
+# stale waiver entry can never produce a negative "strict" count.
+strict_count = len(files_in_report) - len(applied_waivers)
 print(
-    f"✓ {strict} files >= {threshold:.1f}%, "
-    f"{waivered} waivered files >= {waiver_floor:.1f}%"
+    f"✓ {strict_count} files >= {threshold:.1f}%, "
+    f"{len(applied_waivers)} waivered files >= {waiver_floor:.1f}%"
 )
 PYEOF

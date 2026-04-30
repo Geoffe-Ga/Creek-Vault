@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # scripts/lint-extended.sh - Extended static analysis (CI-004 / STYLE-001)
 #
-# Runs the static-analysis tools that pre-commit knows about but that
-# previously did not run in CI:
+# Status: OPTIONAL — not currently invoked from check-all.sh or CI.
+# Pre-commit already runs refurb/tryceratops/vulture/etc. on staged
+# files, and the existing whole-tree backlog (STYLE-001) prevents this
+# script from being a hard gate today. Once STYLE-001 closes, wire
+# this script into check-all.sh and the CI quality job.
+#
+# Until then, run it ad-hoc to triage the backlog:
+#
+#     ./scripts/lint-extended.sh
+#
+# Tools invoked (each optional at the binary level — skipped with a
+# warning if not installed — but ENFORCED if available; no `|| true`):
 #   - pylint (--fail-under per CI-002)
 #   - refurb (modernisation hints; STYLE-001)
 #   - tryceratops (exception-handling hygiene; STYLE-001)
@@ -10,10 +20,6 @@
 #   - interrogate (docstring coverage)
 #   - shellcheck (shell scripts)
 #   - detect-secrets (audit baseline)
-#
-# Each tool is OPTIONAL at the binary level (skipped with a warning if
-# not installed) but ENFORCED if available — there are no `|| true`
-# escape hatches.
 
 set -euo pipefail
 

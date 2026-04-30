@@ -73,16 +73,23 @@ if $VERBOSE; then
     echo "Running pip-audit dependency checker..."
 fi
 # Documented CVEs in build/install tooling. Each is excluded with a
-# justification, kept in sync with .github/workflows/ci.yml:
+# justification + advisory link, kept in sync with
+# .github/workflows/ci.yml. Audit this list at every release.
 #
 #   - PYSEC-2022-42969: ReDoS in py.path.svnwc; py is a transitive dev
 #     dep (pulled in by pytest plugins) and the affected code path is
-#     unused.
-#   - CVE-2025-8869, CVE-2026-1703, CVE-2026-3219: pip vulnerabilities.
-#     pip is the installer, not a runtime dependency. CI installs only
-#     from declared requirements files, so these are not exploitable.
-#   - CVE-2026-24049: wheel; wheel is build-tooling only and never
-#     reaches the production runtime.
+#     unused. https://github.com/advisories/GHSA-w596-4wvx-j9j6
+#   - CVE-2025-8869: pip — symlink TOCTOU during sdist install; the
+#     installer never runs against untrusted sdists in CI.
+#     https://nvd.nist.gov/vuln/detail/CVE-2025-8869
+#   - CVE-2026-1703: pip — index-URL parsing; CI installs from declared
+#     requirements only, so untrusted indexes are not in scope.
+#     https://nvd.nist.gov/vuln/detail/CVE-2026-1703
+#   - CVE-2026-3219: pip — no fix published yet; same scope as above.
+#     https://nvd.nist.gov/vuln/detail/CVE-2026-3219
+#   - CVE-2026-24049: wheel — RECORD parsing edge case; wheel is build-
+#     tooling only and never reaches the production runtime.
+#     https://nvd.nist.gov/vuln/detail/CVE-2026-24049
 pip-audit \
     --ignore-vuln PYSEC-2022-42969 \
     --ignore-vuln CVE-2025-8869 \
