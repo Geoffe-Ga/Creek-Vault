@@ -478,6 +478,7 @@ class TestDeduplicatorIntegration:
         content = "Today I reflected on the nature of creativity."
 
         fragment = Fragment(
+            id="frag-000000000007",
             title="Journal Entry",
             source=FragmentSource(
                 platform="journal",
@@ -515,6 +516,7 @@ class TestDeduplicatorIntegration:
         content_original = "The key insight is that patterns repeat."
 
         frag_discord = Fragment(
+            id="frag-000000000006",
             title="Discord message",
             source=FragmentSource(
                 platform="discord",
@@ -523,6 +525,7 @@ class TestDeduplicatorIntegration:
             created=ts,
         )
         frag_journal = Fragment(
+            id="frag-000000000005",
             title="Journal note",
             source=FragmentSource(
                 platform="journal",

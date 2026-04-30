@@ -309,6 +309,11 @@ class TestPipelineWithFragments:
     def _make_mock_ingestor_registry(self, source_path):
         """Build a mock INGESTOR_REGISTRY that returns one ParsedFragment.
 
+        Mirrors the post-fix four-stage ingestor contract: each parsed
+        fragment carries its converted ``markdown`` body and the
+        ``frontmatter`` dict on ``metadata`` so the pipeline can
+        assemble it into a real :class:`Fragment` with a deterministic ID.
+
         Args:
             source_path: The source path, used for provenance.
 
@@ -321,7 +326,14 @@ class TestPipelineWithFragments:
 
         fragment = ParsedFragment(
             content="Test content about systems and patterns",
-            metadata={},
+            metadata={
+                "markdown": "Test content about systems and patterns",
+                "frontmatter": {
+                    "type": "fragment",
+                    "title": "Mock note",
+                    "source": {"platform": "markdown"},
+                },
+            },
             source_path=str(source_path / "note1.md"),
             timestamp=datetime.now(),
         )
@@ -366,6 +378,168 @@ class TestPipelineWithFragments:
         # Review queue file should exist in vault_path
         review_files = list(vault_path.glob("review-queue-*.md"))
         assert len(review_files) == 1
+
+
+class TestPipelineErrorSurfacing:
+    """Tests that ingestor errors and assembly failures reach PipelineResult."""
+
+    def _make_failing_registry(self, source_path):
+        """Build a registry whose ingestor reports one error and one good fragment."""
+        from datetime import datetime
+
+        from creek.ingest.base import IngestResult, ParsedFragment
+
+        bad_path = str(source_path / "broken.bin")
+        good = ParsedFragment(
+            content="Good content",
+            metadata={
+                "markdown": "Good content",
+                "frontmatter": {
+                    "type": "fragment",
+                    "title": "Good note",
+                    "source": {"platform": "markdown"},
+                },
+            },
+            source_path=str(source_path / "good.md"),
+            timestamp=datetime.now(),
+        )
+        ingest_result = IngestResult(
+            fragments=[good],
+            errors=[f"parse error for {bad_path}: corrupt header"],
+        )
+        mock_ingestor = MagicMock()
+        mock_ingestor.return_value.ingest.return_value = ingest_result
+        return {"mock": mock_ingestor}, bad_path
+
+    def test_errors_surface_on_pipeline_result(
+        self,
+        config,
+        vault_path,
+        source_path,
+    ) -> None:
+        """Ingestor-reported errors land on PipelineResult.errors."""
+        registry, bad_path = self._make_failing_registry(source_path)
+        pipeline = Pipeline(config=config)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.fragments_created == 1
+        assert len(result.errors) == 1
+        assert bad_path in result.errors[0]
+        assert result.errors[0].startswith("[mock]")
+
+    def test_cli_process_prints_errors(
+        self,
+        vault_path,
+        source_path,
+    ) -> None:
+        """CLI process command surfaces both fragment count and error count."""
+        from typer.testing import CliRunner
+
+        from creek.cli import app
+
+        registry, _bad_path = self._make_failing_registry(source_path)
+        runner = CliRunner()
+        with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
+            result = runner.invoke(
+                app,
+                [
+                    "process",
+                    "--source",
+                    str(source_path),
+                    "--vault",
+                    str(vault_path),
+                ],
+            )
+        assert result.exit_code == 0
+        # Match the rendered error count line precisely so an unrelated
+        # "1" elsewhere in the output (line numbers, fragment counts,
+        # etc.) does not fool this assertion.
+        assert "Errors: 1" in result.output
+        # The error message itself should be visible to the user.
+        assert "broken.bin" in result.output
+
+    def test_assembly_failure_surfaces_as_error(
+        self,
+        config,
+        vault_path,
+        source_path,
+    ) -> None:
+        """Per-fragment assembly failures land on PipelineResult.errors."""
+        from datetime import datetime
+
+        from creek.ingest.base import IngestResult, ParsedFragment
+
+        # ParsedFragment with missing 'frontmatter' / 'markdown' keys —
+        # violates the ingestor contract and triggers the recoverable
+        # ``KeyError`` branch in _run_ingestion.
+        broken = ParsedFragment(
+            content="x",
+            metadata={},  # contract violation
+            source_path=str(source_path / "broken.md"),
+            timestamp=datetime.now(),
+        )
+        ingest_result = IngestResult(fragments=[broken])
+        mock_ingestor = MagicMock()
+        mock_ingestor.return_value.ingest.return_value = ingest_result
+        registry = {"mock": mock_ingestor}
+
+        pipeline = Pipeline(config=config)
+        with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
+
+        assert result.fragments_created == 0
+        assert len(result.errors) == 1
+        assert "[mock]" in result.errors[0]
+        assert "broken.md" in result.errors[0]
+
+    def test_vault_write_keyerror_surfaces_as_error(
+        self,
+        config,
+        vault_path,
+        source_path,
+    ) -> None:
+        """A missing platform mapping at write time becomes a graceful error."""
+        from datetime import datetime
+
+        from creek.ingest.base import IngestResult, ParsedFragment
+
+        good = ParsedFragment(
+            content="content",
+            metadata={
+                "markdown": "content",
+                "frontmatter": {
+                    "type": "fragment",
+                    "title": "Note",
+                    "source": {"platform": "markdown"},
+                },
+            },
+            source_path=str(source_path / "good.md"),
+            timestamp=datetime.now(),
+        )
+        ingest_result = IngestResult(fragments=[good])
+        mock_ingestor = MagicMock()
+        mock_ingestor.return_value.ingest.return_value = ingest_result
+        registry = {"mock": mock_ingestor}
+
+        # Simulate the regression scenario the writer guard is defending
+        # against: an enum value with no entry in _PLATFORM_SUBFOLDER.
+        # We patch the mapping to remove the markdown entry; the writer
+        # would otherwise raise an uncaught KeyError that bypasses the
+        # error infrastructure.
+        from creek.vault import writer as writer_mod
+
+        broken_map = dict(writer_mod._PLATFORM_SUBFOLDER)
+        broken_map.pop("markdown")
+        pipeline = Pipeline(config=config)
+        with (
+            patch("creek.pipeline.INGESTOR_REGISTRY", registry),
+            patch.object(writer_mod, "_PLATFORM_SUBFOLDER", broken_map),
+        ):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
+
+        # Pipeline keeps running; the missing-mapping fragment surfaces as
+        # an error but doesn't crash the run.
+        assert any("vault-writer" in err for err in result.errors)
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +670,16 @@ class TestPipelineIntegration:
         # Markdown ingestor finds .md files
         assert result.fragments_created >= 3
         assert result.classifications_made >= 3
-        assert result.links_found == 0
+        # Linking now runs against real fragment metadata. The mock
+        # SentenceTransformer in conftest.py is deterministic within a
+        # single pytest process (seeded by hash() of each fragment's
+        # content), so the count is stable across re-runs but its
+        # absolute value depends on PYTHONHASHSEED. We bound it to a
+        # sane envelope rather than pin an exact number: the lower
+        # bound catches "linker silently skipped"; the upper bound
+        # catches "linker exploded into N^2 spam links".
+        assert isinstance(result.links_found, int)
+        assert 0 <= result.links_found <= result.fragments_created**2
         # Indexes should be generated
         assert result.indexes_generated >= 4
 

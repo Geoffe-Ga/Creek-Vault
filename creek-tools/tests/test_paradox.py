@@ -52,7 +52,10 @@ def make_fragment(
     threads: list[str] | None = None,
 ) -> Fragment:
     """Build a synthetic Fragment with explicit classification axes."""
+    from creek.models import synthetic_fragment_id
+
     kwargs: dict[str, object] = {
+        "id": fid if fid is not None else synthetic_fragment_id(),
         "title": title,
         "source": FragmentSource(platform=SourcePlatform.JOURNAL),
         "frequency": FrequencyClassification(
@@ -63,8 +66,6 @@ def make_fragment(
         "voice": VoiceClassification(confidence=confidence),
         "threads": threads or [],
     }
-    if fid is not None:
-        kwargs["id"] = fid
     return Fragment(**kwargs)
 
 

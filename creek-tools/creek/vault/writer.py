@@ -39,14 +39,25 @@ if TYPE_CHECKING:
         Thread,
     )
 
-# Map source platform -> 01-Fragments subfolder
+# Map source platform -> 01-Fragments subfolder.
+# This mapping must remain *total* across SourcePlatform — every enum
+# value has an entry. The totality is enforced by a unit test in
+# tests/test_vault_writer.py so missing entries fail loudly rather than
+# silently routing fragments to ``Unsorted/``.
 _PLATFORM_SUBFOLDER: dict[str, str] = {
     SourcePlatform.CLAUDE: "Conversations",
     SourcePlatform.CHATGPT: "Conversations",
     SourcePlatform.DISCORD: "Messages",
+    SourcePlatform.EMAIL: "Messages",
     SourcePlatform.ESSAY: "Writing",
     SourcePlatform.JOURNAL: "Journal",
     SourcePlatform.CODE: "Technical",
+    SourcePlatform.MARKDOWN: "Notes",
+    SourcePlatform.DOCUMENT: "Documents",
+    SourcePlatform.SPREADSHEET: "Data",
+    SourcePlatform.PRESENTATION: "Decks",
+    SourcePlatform.IMAGE_OCR: "Images",
+    SourcePlatform.OTHER: "Unsorted",
 }
 
 # Map praxis type -> 04-Praxis subfolder
@@ -85,6 +96,46 @@ def _sanitize_title(title: str) -> str:
     cleaned = re.sub(r"[^\w\s-]", "", title)
     cleaned = cleaned.strip().replace(" ", "-")
     return cleaned[:_MAX_FILENAME_LENGTH]
+
+
+def _render_thread_body(thread: Thread) -> str:
+    """Render a one-paragraph summary body for a Thread."""
+    desc = thread.description.strip() or (
+        f"Thread `{thread.title}` carries {thread.fragment_count} fragments "
+        f"and is currently {thread.status}."
+    )
+    return f"{desc}\n"
+
+
+def _render_eddy_body(eddy: Eddy) -> str:
+    """Render a one-paragraph summary body for an Eddy."""
+    desc = eddy.description.strip() or (
+        f"Eddy `{eddy.title}` clusters {eddy.fragment_count} fragments "
+        f"across {len(eddy.threads)} thread(s)."
+    )
+    return f"{desc}\n"
+
+
+def _render_praxis_body(praxis: Praxis) -> str:
+    """Render a one-paragraph summary body for a Praxis."""
+    return (
+        f"Praxis `{praxis.title}` is a {praxis.praxis_type} "
+        f"({praxis.status}); review {praxis.review_interval}.\n"
+    )
+
+
+def _render_decision_body(decision: Decision) -> str:
+    """Render a one-paragraph summary body for a Decision."""
+    body_parts = [
+        f"Decision `{decision.title}` is currently {decision.status}.",
+    ]
+    if decision.options:
+        body_parts.append(
+            "Options under consideration: " + ", ".join(decision.options) + ".",
+        )
+    if decision.outcome:
+        body_parts.append(f"Outcome: {decision.outcome}.")
+    return " ".join(body_parts) + "\n"
 
 
 def _extract_date_str(model: BaseModel) -> str:
@@ -148,29 +199,36 @@ class VaultWriter:
 
         self.vault_path = vault_path
 
-    def write_fragment(self, fragment: Fragment) -> Path:
+    def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
         """Write a Fragment to the appropriate 01-Fragments/ subfolder.
 
-        Maps the fragment's source platform to a subfolder (e.g. claude
-        and chatgpt -> Conversations, discord -> Messages). Platforms
-        without an explicit mapping go to Unsorted.
+        Maps the fragment's source platform to a subfolder via the total
+        ``_PLATFORM_SUBFOLDER`` mapping. The ``body`` parameter holds the
+        converted markdown content, which is written below the YAML
+        frontmatter — without it the fragment file would contain only
+        metadata (the historical bug).
 
         Args:
             fragment: The Fragment model to write.
+            body: The markdown body to render below the frontmatter.
+                Empty strings are accepted (e.g. for placeholder writes
+                in tests) but should be considered a code smell in
+                production callers.
 
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
         platform = fragment.source.platform
-        subfolder = _PLATFORM_SUBFOLDER.get(str(platform), "Unsorted")
+        subfolder = _PLATFORM_SUBFOLDER[str(platform)]
         target_dir = self.vault_path / "01-Fragments" / subfolder
-        return self._write_model(fragment, target_dir)
+        return self._write_model(fragment, target_dir, body=body)
 
     def write_thread(self, thread: Thread) -> Path:
         """Write a Thread to 02-Threads/{status}/.
 
         The subfolder is determined by the thread's status field,
-        capitalised (e.g. Active, Dormant, Resolved).
+        capitalised (e.g. Active, Dormant, Resolved). A short summary
+        body is rendered automatically.
 
         Args:
             thread: The Thread model to write.
@@ -180,10 +238,13 @@ class VaultWriter:
         """
         status_folder = str(thread.status).capitalize()
         target_dir = self.vault_path / "02-Threads" / status_folder
-        return self._write_model(thread, target_dir)
+        return self._write_model(thread, target_dir, body=_render_thread_body(thread))
 
     def write_eddy(self, eddy: Eddy) -> Path:
         """Write an Eddy to 03-Eddies/.
+
+        A short summary body describing the eddy's fragment count and
+        bridged threads is rendered automatically.
 
         Args:
             eddy: The Eddy model to write.
@@ -192,13 +253,14 @@ class VaultWriter:
             Path to the written (or existing duplicate) markdown file.
         """
         target_dir = self.vault_path / "03-Eddies"
-        return self._write_model(eddy, target_dir)
+        return self._write_model(eddy, target_dir, body=_render_eddy_body(eddy))
 
     def write_praxis(self, praxis: Praxis) -> Path:
         """Write a Praxis to 04-Praxis/{type}/.
 
         Maps praxis_type to subfolder: habit/practice -> Daily,
         framework/commitment -> Seasonal, insight -> Situational.
+        A short summary body is rendered automatically.
 
         Args:
             praxis: The Praxis model to write.
@@ -208,13 +270,14 @@ class VaultWriter:
         """
         subfolder = _PRAXIS_SUBFOLDER.get(str(praxis.praxis_type), "Situational")
         target_dir = self.vault_path / "04-Praxis" / subfolder
-        return self._write_model(praxis, target_dir)
+        return self._write_model(praxis, target_dir, body=_render_praxis_body(praxis))
 
     def write_decision(self, decision: Decision) -> Path:
         """Write a Decision to 08-Decisions/{status}/.
 
         Active statuses (sensing, deliberating, committing) go to
         Active/. Completed statuses (enacted, reflecting) go to Archive/.
+        A short summary body is rendered automatically.
 
         Args:
             decision: The Decision model to write.
@@ -226,13 +289,28 @@ class VaultWriter:
             "Active" if str(decision.status) in _ACTIVE_DECISION_STATUSES else "Archive"
         )
         target_dir = self.vault_path / "08-Decisions" / subfolder
-        return self._write_model(decision, target_dir)
+        return self._write_model(
+            decision,
+            target_dir,
+            body=_render_decision_body(decision),
+        )
 
     def write_any(self, model: BaseModel) -> Path:
         """Dispatch to the appropriate write method based on the model's type field.
 
         Inspects the ``type`` attribute of the model and calls the
         corresponding ``write_*`` method.
+
+        .. note::
+
+            For ``Fragment`` models this dispatch path produces a
+            **header-only** vault file because there is no body to
+            forward through the generic ``BaseModel`` signature. The
+            primary ingestion path bypasses ``write_any`` and calls
+            :meth:`write_fragment` directly with the converted Markdown
+            body. Reach for ``write_any`` only when you genuinely have
+            no body — e.g. compaction tooling that re-writes existing
+            metadata blobs.
 
         Args:
             model: A Pydantic model with a ``type`` field.
@@ -257,15 +335,22 @@ class VaultWriter:
             raise ValueError(msg)
         return writer(model)
 
-    def _write_model(self, model: BaseModel, target_dir: Path) -> Path:
+    def _write_model(
+        self,
+        model: BaseModel,
+        target_dir: Path,
+        *,
+        body: str = "",
+    ) -> Path:
         """Serialise a model to markdown with YAML frontmatter and write to disk.
 
         Handles duplicate detection (by ID), filename generation,
-        frontmatter serialisation, and provenance logging.
+        frontmatter serialisation, body rendering, and provenance logging.
 
         Args:
             model: The Pydantic model to serialise.
             target_dir: The vault directory to write the file to.
+            body: Markdown body to render below the frontmatter block.
 
         Returns:
             Path to the written (or existing duplicate) file.
@@ -281,7 +366,7 @@ class VaultWriter:
         file_path = target_dir / filename
 
         data = model.model_dump(mode="json")
-        post = frontmatter.Post(content="", **data)
+        post = frontmatter.Post(content=body, **data)
         content = frontmatter.dumps(post)
         file_path.write_text(content, encoding="utf-8")
 

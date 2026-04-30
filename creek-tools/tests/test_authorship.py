@@ -513,6 +513,7 @@ class TestAuthorshipIntegration:
         from creek.models import Fragment, FragmentSource
 
         fragment = Fragment(
+            id="frag-000000000002",
             title="Claude conversation turn 1",
             source=FragmentSource(
                 platform="claude",
@@ -532,6 +533,7 @@ class TestAuthorshipIntegration:
         from creek.models import Fragment, FragmentSource
 
         fragment = Fragment(
+            id="frag-000000000001",
             title="Discord message group",
             source=FragmentSource(
                 platform="discord",

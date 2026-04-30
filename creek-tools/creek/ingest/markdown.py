@@ -129,6 +129,8 @@ def _infer_platform(document_type: str, file_path: Path) -> SourcePlatform:
     First checks the document type for a direct mapping. If the type
     is ``'notes'``, falls back to path-based heuristics (e.g., files
     in a ``daily/`` or ``journal/`` directory are classified as journal).
+    Generic markdown notes default to :attr:`SourcePlatform.MARKDOWN`
+    so the writer routes them to the dedicated ``Notes`` subfolder.
 
     Args:
         document_type: The detected document type (journal, essay, etc.).
@@ -166,7 +168,7 @@ def _infer_platform_from_path(file_path: Path) -> SourcePlatform:
     if any(p.search(path_str) for p in _ESSAY_PATH_PATTERNS):
         return SourcePlatform.ESSAY
 
-    return SourcePlatform.OTHER
+    return SourcePlatform.MARKDOWN
 
 
 def _merge_frontmatter(

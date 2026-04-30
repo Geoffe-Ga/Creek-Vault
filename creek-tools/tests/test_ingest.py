@@ -16,11 +16,13 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from creek.ingest.base import (
+    IngestedFragment,
     Ingestor,
     IngestResult,
     ParsedFragment,
     ProvenanceEntry,
     RawDocument,
+    assemble_ingested_fragment,
     create_provenance_entry,
     generate_fragment_id,
     normalize_encoding,
@@ -765,3 +767,100 @@ class TestIngestPackage:
         assert ParsedFragment is not None
         assert IngestResult is not None
         assert Ingestor is not None
+
+
+# ---- assemble_ingested_fragment Tests ----
+
+
+class TestAssembleIngestedFragment:
+    """Tests for the ``assemble_ingested_fragment`` helper.
+
+    Covers the happy path and the documented contract-violation paths
+    where an ingestor forgot to populate ``frontmatter`` or ``markdown``
+    on ``ParsedFragment.metadata``.
+    """
+
+    def _parsed(
+        self,
+        source_path: str = "fixtures/note.md",
+        **metadata_overrides: object,
+    ) -> ParsedFragment:
+        """Build a ParsedFragment with a minimal frontmatter+markdown payload."""
+        ts = datetime(2026, 1, 15, 12, 0, tzinfo=LA_TZ)
+        metadata: dict[str, object] = {
+            "markdown": "# A note\n\nBody text.\n",
+            "frontmatter": {
+                "type": "fragment",
+                "title": "A note",
+                "source": {"platform": "markdown"},
+            },
+        }
+        metadata.update(metadata_overrides)
+        return ParsedFragment(
+            content="# A note\n\nBody text.\n",
+            metadata=metadata,
+            source_path=source_path,
+            timestamp=ts,
+        )
+
+    def test_assembles_fragment_with_deterministic_id(self) -> None:
+        """Happy path: returns IngestedFragment with deterministic ``frag-<sha>``."""
+        ingested = assemble_ingested_fragment(self._parsed())
+        assert isinstance(ingested, IngestedFragment)
+        assert ingested.fragment.id.startswith("frag-")
+        # SHA-256[:12] — 12 hex chars after the prefix
+        assert len(ingested.fragment.id.removeprefix("frag-")) == 12
+        assert ingested.body == "# A note\n\nBody text.\n"
+
+    def test_id_matches_generate_fragment_id(self) -> None:
+        """The injected ID is exactly what generate_fragment_id produces."""
+        parsed = self._parsed()
+        expected = generate_fragment_id(
+            parsed.source_path,
+            parsed.timestamp,
+            parsed.content,
+        )
+        ingested = assemble_ingested_fragment(parsed)
+        assert ingested.fragment.id == expected
+
+    def test_falls_back_to_source_stem_for_title(self) -> None:
+        """When the ingestor's frontmatter omits title, use the file stem."""
+        parsed = self._parsed(
+            frontmatter={"type": "fragment", "source": {"platform": "markdown"}},
+        )
+        ingested = assemble_ingested_fragment(parsed)
+        # fixtures/note.md → "note"
+        assert ingested.fragment.title == "note"
+
+    def test_missing_frontmatter_raises_descriptive_keyerror(self) -> None:
+        """Missing 'frontmatter' key surfaces as a descriptive KeyError."""
+        parsed = ParsedFragment(
+            content="x",
+            metadata={"markdown": "x"},
+            source_path="fixtures/broken.md",
+            timestamp=datetime.now(tz=LA_TZ),
+        )
+        with pytest.raises(KeyError, match="frontmatter"):
+            assemble_ingested_fragment(parsed)
+
+    def test_missing_markdown_raises_descriptive_keyerror(self) -> None:
+        """Missing 'markdown' key surfaces as a descriptive KeyError."""
+        parsed = ParsedFragment(
+            content="x",
+            metadata={"frontmatter": {"type": "fragment"}},
+            source_path="fixtures/broken.md",
+            timestamp=datetime.now(tz=LA_TZ),
+        )
+        with pytest.raises(KeyError, match="markdown"):
+            assemble_ingested_fragment(parsed)
+
+    def test_keyerror_includes_source_path(self) -> None:
+        """The error message names the offending source path for traceability."""
+        parsed = ParsedFragment(
+            content="x",
+            metadata={"markdown": "x"},
+            source_path="fixtures/specific-file.md",
+            timestamp=datetime.now(tz=LA_TZ),
+        )
+        with pytest.raises(KeyError, match="specific-file"):
+            assemble_ingested_fragment(parsed)

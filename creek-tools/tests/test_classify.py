@@ -66,6 +66,7 @@ def _make_fragment(
         A Fragment instance with the given title and platform.
     """
     return Fragment(
+        id="frag-000000000003",
         title=title,
         source=FragmentSource(platform=platform),
     )
