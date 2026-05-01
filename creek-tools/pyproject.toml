@@ -83,6 +83,8 @@ dev = [
     "types-PyYAML>=6.0.0",
     "types-chardet>=5.0.0",
     "types-tqdm>=4.66.0",
+    "types-docutils>=0.20.0",
+    "lxml-stubs>=0.5.1",
 ]
 
 [build-system]

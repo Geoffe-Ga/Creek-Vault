@@ -1,15 +1,11 @@
 # Development dependencies (delegate to pyproject.toml extras).
 #
 # pyproject.toml [project.optional-dependencies] is the source of truth
-# for the dev toolchain. This file pulls in [dev] and [all] so a single
-# `pip install -r requirements-dev.txt` provisions a complete dev
-# environment with every optional code path available for testing.
+# for the dev toolchain — including type stubs. This file pulls in [dev]
+# and [all] so a single `pip install -r requirements-dev.txt` provisions
+# a complete dev environment with every optional code path available
+# for testing.
 -e .[all,dev]
-
-# Type stubs not yet modelled in pyproject.toml [dev] extras.
-# (types-PyYAML, types-chardet, types-tqdm are already in [dev].)
-types-docutils>=0.20.0
-lxml-stubs>=0.5.1
 
 # Pinned transitive bumps to address pip-audit findings (DEP-003).
 # These are dev/build-time tools whose vulnerable older versions can leak
