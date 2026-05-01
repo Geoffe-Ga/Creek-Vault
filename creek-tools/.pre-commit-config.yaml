@@ -133,12 +133,16 @@ repos:
   - id: pylint-fast
     name: pylint (fast, staged files only)
     entry: pylint
-    # language: python pulls pylint into pre-commit's isolated env so the
-    # hook works even when contributors haven't installed dev extras into
-    # their ambient PATH.
-    language: python
-    additional_dependencies:
-    - pylint>=3.0.0
+    # `language: system` runs pylint in the developer's already-activated
+    # venv (where `pip install -r requirements-dev.txt` has installed the
+    # project via `-e .[all,dev]`). Pre-commit's isolated `language: python`
+    # venv would not have `creek` itself or third-party runtime deps, so
+    # pylint would emit E0401 import-error for every `from creek...` and
+    # `import frontmatter|numpy|pydantic` line — driving the score below
+    # --fail-under and blocking every commit. Contributors are expected
+    # to provision the dev environment before installing pre-commit hooks
+    # (CLAUDE.md "Setup" documents this).
+    language: system
     types: [python]
     # pyproject.toml has no [tool.pylint] section yet, so we don't pass
     # --rcfile (pylint warned and fell back to defaults anyway). The

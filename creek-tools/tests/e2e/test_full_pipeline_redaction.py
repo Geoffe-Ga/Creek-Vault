@@ -32,7 +32,7 @@ pytestmark = [
 ]
 
 
-_SECRET = "AKIAIOSFODNN7EXAMPLE"
+_SECRET = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret  AWS test example
 """Documented AWS test access key — never a real credential."""
 
 

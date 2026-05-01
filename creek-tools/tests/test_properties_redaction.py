@@ -24,14 +24,17 @@ _PROFILE = settings(
 
 # Synthetic secrets are deliberately well-known examples so they appear
 # in no real configuration and can be safely committed to source control.
+# Each line carries `# pragma: allowlist secret` so detect-secrets does
+# not flag them — these are pattern-shape literals, not real credentials.
 _SECRET_SAMPLES = st.sampled_from(
     [
-        "AKIAIOSFODNN7EXAMPLE",  # AWS access key (RFC-style example)
-        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDexample==",
+        "AKIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret  AWS test example
+        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDexample==",  # pragma: allowlist secret
+        # pragma: allowlist secret  (private-key shape, not a real key)
         "-----BEGIN RSA PRIVATE KEY-----xxx-----END RSA PRIVATE KEY-----",
         "user@example.com",
         "555-12-3456",
-        "4111111111111111",  # PAN test number
+        "4111111111111111",  # pragma: allowlist secret  card test PAN
     ]
 )
 
