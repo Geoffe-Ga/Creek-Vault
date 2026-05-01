@@ -75,15 +75,10 @@ _TIMESTAMPS = st.datetimes(
     max_value=datetime(2100, 1, 1),
 )
 
-_PLATFORMS = st.sampled_from(
-    [
-        SourcePlatform.CLAUDE,
-        SourcePlatform.CHATGPT,
-        SourcePlatform.DISCORD,
-        SourcePlatform.JOURNAL,
-        SourcePlatform.ESSAY,
-    ]
-)
+# All SourcePlatform members — using list(SourcePlatform) means a new
+# platform added in models.py is automatically covered by these
+# property tests without a separate update here.
+_PLATFORMS = st.sampled_from(list(SourcePlatform))
 
 
 @st.composite

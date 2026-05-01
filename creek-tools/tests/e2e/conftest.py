@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
 
 _VAULT_DIRS = (
@@ -60,8 +59,13 @@ def synthetic_vault(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def synthetic_source(tmp_path: Path) -> Iterator[Path]:
-    """Empty source directory the test can populate before invoking the pipeline."""
+def synthetic_source(tmp_path: Path) -> Path:
+    """Empty source directory the test can populate before invoking the pipeline.
+
+    pytest's ``tmp_path`` owns cleanup, so this fixture has no teardown
+    code. The plain ``Path`` return type matches that — there is no
+    yield-then-cleanup pattern hiding behind an ``Iterator`` annotation.
+    """
     source = tmp_path / "source"
     source.mkdir()
-    yield source
+    return source

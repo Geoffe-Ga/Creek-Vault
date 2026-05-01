@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -139,8 +138,9 @@ def test_fragment_id_naive_timestamp_diverges_from_aware() -> None:
     """
     naive = datetime(2026, 4, 28, 12, 0)
     aware = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
-    if naive.isoformat() == aware.isoformat():
-        pytest.skip("Python's isoformat already collapses these")
+    # naive.isoformat() = "2026-04-28T12:00:00";
+    # aware.isoformat() = "2026-04-28T12:00:00+00:00".
+    # They differ by construction — no defensive skip needed.
     a = generate_fragment_id("s", naive, "c")
     b = generate_fragment_id("s", aware, "c")
     assert a != b

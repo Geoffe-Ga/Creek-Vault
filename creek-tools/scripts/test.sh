@@ -116,6 +116,11 @@ if $COVERAGE; then
         --cov-report=xml
         --cov-fail-under=90
         --junitxml=reports/junit.xml
+        # CI-bail: a widespread regression (e.g. import error) would
+        # otherwise burn through the full 2700+ test suite before
+        # surfacing. Bail at 10 to balance visibility (multiple
+        # failure sites) against wasted minutes on cascading errors.
+        --maxfail=10
     )
 fi
 
