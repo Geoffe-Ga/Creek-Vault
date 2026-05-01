@@ -30,29 +30,59 @@ def test_truncated_chatgpt_export_is_invalid_json() -> None:
         json.loads(raw)
 
 
-def test_empty_markdown_file_exists() -> None:
-    """The empty fixture is a real zero-byte file; the markdown filter
-    should classify it as ``skip``.
+def test_markdown_filter_skips_empty_fixture() -> None:
+    """Real production-code check: MarkdownFilter must reject the empty
+    fixture (``keep=False``) so an empty .md file does not produce a
+    fragment. Renamed from the original fixture-existence-only check.
     """
+    from creek.clean.filters import MarkdownFilter
+
     fixture = FIXTURES_ROOT / "corrupt" / "empty.md"
-    assert fixture.exists()
-    assert fixture.read_text() == ""
+    assert fixture.read_text() == "", (
+        "Sanity: the corrupt/empty.md fixture must remain truly empty."
+    )
+
+    result = MarkdownFilter().filter(content="")
+    assert result.keep is False, (
+        f"MarkdownFilter must skip empty content, got {result!r}"
+    )
+    assert result.reason, "MarkdownFilter should record a skip reason"
 
 
 def test_malformed_yaml_frontmatter_does_not_crash_python_frontmatter() -> None:
-    """``frontmatter.load`` should either return a Post (ignoring bad YAML) or
-    raise a YAML error — never a generic Exception or segfault.
+    """``frontmatter.load`` must either raise YAMLError or return a Post
+    whose ``.content`` preserves the markdown body.
+
+    The contract under test: the only acceptable outcomes for malformed
+    YAML are a structured ``yaml.YAMLError`` or a successful parse that
+    keeps the body intact. Any other exception (TypeError, generic
+    Exception, segfault) or a parse that silently drops the body is a
+    contract violation. The previous version only checked
+    ``isinstance(post.content, str)`` in the success path, which is
+    trivially True for any Post and let a body-dropping bug pass.
     """
     import frontmatter
     import yaml
 
     fixture = FIXTURES_ROOT / "corrupt" / "malformed_yaml.md"
+    body_marker = "Body with malformed frontmatter above"
     try:
         post = frontmatter.load(str(fixture))
     except yaml.YAMLError:
-        return  # expected — caller handles
-    # If it didn't raise, the body should still be accessible.
-    assert isinstance(post.content, str)
+        # Acceptable: parser surfaces a structured error.
+        return
+    except Exception as exc:
+        pytest.fail(
+            f"frontmatter.load raised an unexpected non-YAML error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    # Success path: the body MUST be intact. A Post with empty content
+    # would mean the parser silently swallowed the markdown body when
+    # the frontmatter failed to parse.
+    assert body_marker in post.content, (
+        f"frontmatter.load succeeded but body marker {body_marker!r} "
+        f"was missing from post.content (got {post.content!r:.80})"
+    )
 
 
 # ---- encoding/ ---------------------------------------------------------------
@@ -66,11 +96,26 @@ def test_malformed_yaml_frontmatter_does_not_crash_python_frontmatter() -> None:
         "shift_jis.csv",
     ],
 )
-def test_encoding_fixtures_are_present(fixture: str) -> None:
-    """Encoding fixtures must exist on disk for downstream encoding tests."""
+def test_normalize_encoding_decodes_each_codec_fixture(fixture: str) -> None:
+    """Real production-code check: ``creek.ingest.base.normalize_encoding``
+    must decode each non-UTF-8 fixture without raising and return a
+    non-empty string. Replaces the previous fixture-existence-only
+    assertion which never exercised Creek code.
+    """
+    from creek.ingest.base import normalize_encoding
+
     path = FIXTURES_ROOT / "encoding" / fixture
-    assert path.exists(), f"Missing encoding fixture: {fixture}"
-    assert path.stat().st_size > 0, f"Encoding fixture is empty: {fixture}"
+    raw = path.read_bytes()
+    assert raw, f"Sanity: encoding fixture {fixture} must be non-empty"
+
+    text, detected = normalize_encoding(raw)
+
+    assert isinstance(text, str) and text, (
+        f"normalize_encoding returned empty/non-string for {fixture}: got {text!r}"
+    )
+    assert isinstance(detected, str) and detected, (
+        f"normalize_encoding did not report a detected codec for {fixture}"
+    )
 
 
 def test_cp1252_fixture_is_not_valid_utf8() -> None:

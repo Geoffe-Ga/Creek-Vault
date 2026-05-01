@@ -56,7 +56,6 @@ def test_purge_round_trip_clears_fragments_and_writes_audit(
         from creek.purge.engine import PurgeEngine
     except ImportError:
         pytest.skip("creek.purge.engine not yet importable (INC-002)")
-        return
 
     engine = PurgeEngine(vault_path=synthetic_vault)
     # The pipeline ingestor stage tags fragments with platform "other"
