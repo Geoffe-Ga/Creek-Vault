@@ -36,7 +36,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
-import numpy as np
 from pydantic import ValidationError
 
 from creek.models import Fragment
@@ -268,6 +267,8 @@ class UnnamedDigestGenerator:
         ids = list(embeddings)
         if len(ids) < 2:
             return []
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         vectors = np.array([embeddings[fid] for fid in ids], dtype=np.float32)
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)

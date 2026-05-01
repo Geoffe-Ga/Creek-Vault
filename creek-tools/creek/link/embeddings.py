@@ -12,8 +12,6 @@ import itertools
 import logging
 from typing import TYPE_CHECKING, cast
 
-import numpy as np
-
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -92,6 +90,8 @@ class EmbeddingLinker:
         Returns:
             A list of floats representing the embedding vector.
         """
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         model = self.load_model()
         raw = model.encode(text)
         embedding = np.asarray(raw, dtype=np.float32)
@@ -132,6 +132,8 @@ class EmbeddingLinker:
             self.config.model,
         )
 
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         model = self.load_model()
         texts = [f.title for f in to_embed]
         show_progress = logger.isEnabledFor(logging.INFO)
@@ -157,6 +159,8 @@ class EmbeddingLinker:
             embeddings: Mapping of fragment IDs to embedding vectors.
             path: Destination file path (typically ``*.npz``).
         """
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         arrays = {k: np.array(v, dtype=np.float32) for k, v in embeddings.items()}
         # ``allow_pickle`` is passed explicitly so mypy can narrow the kwargs
         # type for ``**arrays`` to ``ArrayLike`` instead of matching ``bool``.
@@ -175,6 +179,8 @@ class EmbeddingLinker:
         Raises:
             FileNotFoundError: If *path* does not exist.
         """
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         if not path.exists():
             msg = f"Embeddings file not found: {path}"
             raise FileNotFoundError(msg)
@@ -209,6 +215,8 @@ class EmbeddingLinker:
             len(ids),
             self.config.similarity_threshold,
         )
+
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
 
         vectors = np.array([embeddings[id_] for id_ in ids], dtype=np.float32)
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)

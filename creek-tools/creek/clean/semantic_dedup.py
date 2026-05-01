@@ -23,10 +23,14 @@ dimensions will raise a ``ValueError`` with context about the offending
 fragment and expected size.
 """
 
-from typing import Literal
+from __future__ import annotations
 
-import numpy as np
+from typing import TYPE_CHECKING, Literal
+
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
@@ -43,6 +47,8 @@ def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
         Cosine similarity in the range [-1.0, 1.0], or 0.0 if either
         vector has zero magnitude.
     """
+    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
     norm_a = np.linalg.norm(vec_a)
     norm_b = np.linalg.norm(vec_b)
 
@@ -166,6 +172,8 @@ class SemanticDeduplicator:
             ValueError: If the embedding dimension does not match the
                 expected dimension.
         """
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         vec = np.asarray(embedding, dtype=np.float64)
         if self._dimension is None:
             self._dimension = len(embedding)
@@ -252,6 +260,8 @@ class SemanticDeduplicator:
                 resonances=resonances,
             )
 
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         # Convert to numpy and validate dimensions
         dim = len(embeddings[ids[0]])
         vecs: dict[str, np.ndarray] = {}
@@ -306,6 +316,8 @@ class SemanticDeduplicator:
             ValueError: If the embedding dimension does not match the
                 index dimension.
         """
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         duplicates: list[SemanticDuplicatePair] = []
         resonances: list[SemanticDuplicatePair] = []
 
