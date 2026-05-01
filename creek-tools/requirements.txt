@@ -1,16 +1,14 @@
-# Runtime dependencies
-typer>=0.9.0
-rich>=13.0.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-pyyaml>=6.0.3
-python-frontmatter>=1.1.0
-chardet>=7.4.3
-python-docx>=1.0.0
-pdfminer.six>=20260107
-markdownify>=1.2.2
-httpx>=0.27.0
-tqdm>=4.66.0
-sentence-transformers>=2.2.0
-numpy>=2.4.4
-anthropic>=0.40.0
+# Convenience wrapper for environments that prefer requirements.txt.
+#
+# The canonical source of truth is pyproject.toml. Prefer the editable
+# install with extras:
+#
+#     pip install -e .             # core only
+#     pip install -e .[all]        # all optional features
+#     pip install -e .[anthropic]  # specific feature
+#
+# Refer to README.md for the full extras matrix (anthropic, embeddings,
+# ocr, documents, spreadsheets, presentations, gdrive, all). Lower-bound
+# pins for individual packages live in pyproject.toml — the dependabot
+# bumps that previously lived here have been propagated there.
+-e .[all]

@@ -14,6 +14,10 @@ dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
     "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "pyyaml>=6.0.3",
+    "python-frontmatter>=1.1.0",
+    "chardet>=7.4.3",
     "httpx>=0.27.0",
     "tqdm>=4.66.0",
 ]
@@ -31,15 +35,58 @@ classifiers = [
 creek = "creek.cli:app"
 
 [project.optional-dependencies]
+anthropic = ["anthropic>=0.40.0"]
+embeddings = [
+    "sentence-transformers>=2.2.0",
+    "numpy>=2.4.4",
+]
+ocr = [
+    "pytesseract>=0.3",
+    "pdf2image>=1.0",
+    "pillow>=10.0",
+]
+documents = [
+    "python-docx>=1.0.0",
+    "pdfminer.six>=20260107",
+    "markdownify>=1.2.2",
+]
+spreadsheets = ["openpyxl>=3.1"]
+presentations = ["python-pptx>=0.6"]
+gdrive = [
+    "google-api-python-client>=2.0",
+    "google-auth-oauthlib>=1.0",
+]
+all = [
+    # Self-referential extras (pip >= 21.2). Adding a new sub-extra
+    # automatically flows into [all] without manual duplication.
+    "creek-tools[anthropic,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-xdist>=3.3.0",
+    "hypothesis>=6.92.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
+    "pylint>=3.0.0",
     "bandit>=1.7.5",
     "pip-audit>=2.6.0",
     "radon>=6.0.0",
+    "xenon>=0.9.0",
+    "interrogate>=1.7.0",
+    "refurb>=2.0.0",
+    "tryceratops>=2.0.0",
+    "vulture>=2.10",
+    "detect-secrets>=1.5.0",
     "pre-commit>=3.4.0",
+    "types-PyYAML>=6.0.0",
+    "types-chardet>=5.0.0",
+    "types-tqdm>=4.66.0",
+    "types-docutils>=0.20.0",
+    "lxml-stubs>=0.5.1",
 ]
 
 [build-system]

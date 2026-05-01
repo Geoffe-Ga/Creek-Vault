@@ -42,10 +42,19 @@ repos:
   rev: v1.8.0
   hooks:
   - id: mypy
+    # The packages listed here all ship py.typed (or are type stubs).
+    # mypy needs the actual package, not just stubs, to resolve types
+    # exported by pydantic v2's plugin, hypothesis's strategies, and
+    # pytest's fixture types in our test files. python-frontmatter is
+    # NOT in this list because pyproject.toml's mypy override already
+    # marks it ignore_missing_imports.
     additional_dependencies:
     - types-PyYAML
     - types-chardet
     - types-tqdm
+    - pytest>=7.4.0
+    - hypothesis>=6.92.0
+    - pydantic>=2.0.0
     args:
     - --strict
 - repo: https://github.com/PyCQA/bandit
@@ -116,6 +125,30 @@ repos:
     - --baseline
     - creek-tools/.secrets.baseline
     exclude: \.secrets\.baseline$
+# Local hook: pylint as a CI-aligned gate (CI-002 / CI-004). Runs only
+# on staged Python files so it stays fast; CI runs the full --fail-under
+# pass over creek/.
+- repo: local
+  hooks:
+  - id: pylint-fast
+    name: pylint (fast, staged files only)
+    entry: pylint
+    # `language: system` runs pylint in the developer's already-activated
+    # venv (where `pip install -r requirements-dev.txt` has installed the
+    # project via `-e .[all,dev]`). Pre-commit's isolated `language: python`
+    # venv would not have `creek` itself or third-party runtime deps, so
+    # pylint would emit E0401 import-error for every `from creek...` and
+    # `import frontmatter|numpy|pydantic` line — driving the score below
+    # --fail-under and blocking every commit. Contributors are expected
+    # to provision the dev environment before installing pre-commit hooks
+    # (CLAUDE.md "Setup" documents this).
+    language: system
+    types: [python]
+    # pyproject.toml has no [tool.pylint] section yet, so we don't pass
+    # --rcfile (pylint warned and fell back to defaults anyway). The
+    # CLI --fail-under is the actual enforcement contract.
+    args: [--fail-under=9.0]
+    files: ^creek-tools/creek/
 ci:
   autofix_commit_msg: 'style: auto-fix by pre-commit hooks'
   autoupdate_commit_msg: 'chore: update pre-commit hooks'

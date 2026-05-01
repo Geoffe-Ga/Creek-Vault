@@ -33,6 +33,10 @@ pre-commit install
 ./scripts/typecheck.sh          # MyPy strict type checking
 ./scripts/security.sh           # Bandit + pip-audit scans
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
+./scripts/coverage-per-file.sh  # Per-file coverage gate (TEST-002)
+./scripts/lint-extended.sh      # Optional: pylint, refurb, tryceratops, vulture, interrogate, shellcheck
+                                # (not in check-all.sh until STYLE-001 backlog clears; CI runs the
+                                # subset that matters for the gate)
 ./scripts/pr-status.sh list        # List recent CI workflow runs
 ./scripts/pr-status.sh view ID     # View workflow run results
 ./scripts/pr-status.sh watch ID    # Watch workflow run progress

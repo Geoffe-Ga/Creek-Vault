@@ -20,8 +20,6 @@ from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from creek.models import Frequency, Thread, ThreadStatus
 
 if TYPE_CHECKING:
@@ -275,6 +273,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
         Cosine similarity in ``[-1.0, 1.0]``; ``0.0`` if either vector
         has zero norm.
     """
+    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
     va = np.asarray(a, dtype=np.float32)
     vb = np.asarray(b, dtype=np.float32)
     na = float(np.linalg.norm(va))
