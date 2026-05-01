@@ -1,9 +1,27 @@
 """Failure-mode tests covering the fixtures under ``tests/fixtures/``.
 
-These tests exercise real on-disk inputs (corrupt, malformed, mixed
-encoding, injection-shaped, large) and assert the ingestion path
-handles them gracefully — no uncaught exceptions, no silent data loss,
-no leaked secrets.
+The module mixes two test categories — both intentional, named so a
+reader can tell them apart at a glance:
+
+1. ``test_*`` (no prefix) — production-path tests that exercise Creek
+   code (``MarkdownFilter``, ``normalize_encoding``, ``Redactor``)
+   against the fixtures and assert the ingestion path handles them
+   gracefully.
+
+2. ``test_fixture_*`` — fixture-sanity guards. These verify the
+   fixture files themselves stay in the shape downstream tests expect
+   (truly empty, truly non-UTF-8, truly contains the expected token,
+   etc.). They invoke stdlib / third-party libraries to characterise
+   the fixture, NOT Creek code. They exist so a fixture corrupted by
+   accident is caught immediately rather than producing confusing
+   downstream test failures.
+
+Real ingestor-level coverage for the fixture-sanity scenarios
+(corrupt JSON via ``ChatGPTIngestor``, malformed YAML through the
+markdown ingest path, prompt-injection rejection, scale fixture
+through Discord ingest) is tracked separately and will be added in
+the linking-architecture follow-up batch where the ingestor APIs
+are stabilising.
 """
 
 from __future__ import annotations
@@ -19,7 +37,7 @@ FIXTURES_ROOT = Path(__file__).parent / "fixtures"
 # ---- corrupt/ ----------------------------------------------------------------
 
 
-def test_truncated_chatgpt_export_is_invalid_json() -> None:
+def test_fixture_truncated_chatgpt_export_is_invalid_json() -> None:
     """The truncated export fixture is not valid JSON; ingestors must detect that.
 
     A real ingestor needs to surface a clear error rather than a
@@ -49,7 +67,7 @@ def test_markdown_filter_skips_empty_fixture() -> None:
     assert result.reason, "MarkdownFilter should record a skip reason"
 
 
-def test_malformed_yaml_frontmatter_does_not_crash_python_frontmatter() -> None:
+def test_fixture_malformed_yaml_frontmatter_does_not_crash_python_frontmatter() -> None:
     """``frontmatter.load`` must either raise YAMLError or return a Post
     whose ``.content`` preserves the markdown body.
 
@@ -118,7 +136,7 @@ def test_normalize_encoding_decodes_each_codec_fixture(fixture: str) -> None:
     )
 
 
-def test_cp1252_fixture_is_not_valid_utf8() -> None:
+def test_fixture_cp1252_is_not_valid_utf8() -> None:
     """The cp1252 fixture deliberately fails strict UTF-8 decoding so that
     encoding-detection paths get exercised (BUG-010 sentinel).
     """
@@ -127,7 +145,7 @@ def test_cp1252_fixture_is_not_valid_utf8() -> None:
         raw.decode("utf-8")
 
 
-def test_shift_jis_fixture_decodes_with_correct_codec() -> None:
+def test_fixture_shift_jis_decodes_with_correct_codec() -> None:
     """Sanity check: the shift_jis fixture is well-formed in its own codec."""
     raw = (FIXTURES_ROOT / "encoding" / "shift_jis.csv").read_bytes()
     decoded = raw.decode("shift_jis")
@@ -137,7 +155,7 @@ def test_shift_jis_fixture_decodes_with_correct_codec() -> None:
 # ---- injection/ --------------------------------------------------------------
 
 
-def test_injection_fixture_yaml_in_body_is_real_yaml_in_body() -> None:
+def test_fixture_injection_yaml_in_body_is_real_yaml_in_body() -> None:
     """The injection fixture has TWO ``---`` fences. ``frontmatter.load``
     must only consume the FIRST as frontmatter, leaving the second as body.
     Guards against a parser regression that might over-consume.
@@ -154,7 +172,7 @@ def test_injection_fixture_yaml_in_body_is_real_yaml_in_body() -> None:
     assert "override_classification" in post.content
 
 
-def test_secret_lookalikes_fixture_uses_documented_examples_only() -> None:
+def test_fixture_secret_lookalikes_uses_documented_examples_only() -> None:
     """Defence in depth: the lookalikes fixture must only contain well-known
     public test credentials. Any deviation suggests a real secret leaked
     into the test corpus.
@@ -220,7 +238,7 @@ def test_redactor_sweeps_secret_lookalikes_fixture() -> None:
 # ---- scale/ ------------------------------------------------------------------
 
 
-def test_scale_fixture_parses_and_has_expected_message_count() -> None:
+def test_fixture_scale_parses_and_has_expected_message_count() -> None:
     """The synthetic Discord export must remain a valid JSON shape that
     ingestors can iterate over.
     """
@@ -233,7 +251,7 @@ def test_scale_fixture_parses_and_has_expected_message_count() -> None:
 # ---- symlinks/ ---------------------------------------------------------------
 
 
-def test_symlinks_readme_documents_runtime_construction() -> None:
+def test_fixture_symlinks_readme_documents_runtime_construction() -> None:
     """Symlinks aren't portable in a repo; ensure the README explains the
     runtime-construction pattern so future tests follow it.
     """
