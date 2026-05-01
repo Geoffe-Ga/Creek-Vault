@@ -5,7 +5,8 @@ description: >-
   and documentation. Use when reviewing pull requests, evaluating code
   changes, or doing code review. Produces verdicts with specific references.
   Do NOT use for backlog grooming or issue triage (use backlog-grooming),
-  or reviewing your own changes before PR creation (use self-review).
+  reviewing your own changes before PR creation (use self-review), or
+  iterating on a review's feedback as the PR author (use address-feedback).
 metadata:
   author: Geoff
   version: 1.0.0
