@@ -1688,9 +1688,7 @@ class TestScannerLuhnPostValidation:
             "378282246310005",  # Luhn-valid Amex test (15 digits)
         ],
     )
-    def test_luhn_accepts_valid_card_numbers(
-        self, tmp_path: Path, number: str
-    ) -> None:
+    def test_luhn_accepts_valid_card_numbers(self, tmp_path: Path, number: str) -> None:
         """Scanner should keep credit_card matches that pass Luhn."""
         test_file = tmp_path / "cc.txt"
         test_file.write_text(f"card: {number}\n")
@@ -1719,9 +1717,7 @@ class TestScannerLuhnPostValidation:
 
         assert not any(m.match_type == "credit_card" for m in matches)
 
-    def test_luhn_filter_only_applies_to_credit_card(
-        self, tmp_path: Path
-    ) -> None:
+    def test_luhn_filter_only_applies_to_credit_card(self, tmp_path: Path) -> None:
         """Other patterns must not be filtered through the Luhn check."""
         test_file = tmp_path / "ssn.txt"
         # SSN that is not 16/15 digits — Luhn must not touch it.
@@ -1761,9 +1757,7 @@ class TestScannerLuhnPostValidation:
         for _ in range(1000):
             prefix = rng.choice(prefixes)
             remaining = 16 - len(prefix)
-            digits = prefix + "".join(
-                str(rng.randint(0, 9)) for _ in range(remaining)
-            )
+            digits = prefix + "".join(str(rng.randint(0, 9)) for _ in range(remaining))
             samples.append(digits)
 
         test_file = tmp_path / "noise.txt"
@@ -1948,9 +1942,7 @@ class TestNetworkIdentifierPatterns:
 class TestHighEntropyDetector:
     """Tests for the generic high-entropy secret detector."""
 
-    def test_high_entropy_long_random_string_matches(
-        self, tmp_path: Path
-    ) -> None:
+    def test_high_entropy_long_random_string_matches(self, tmp_path: Path) -> None:
         """A 32-char random hex string should be flagged."""
         # Hex random secret — high entropy, no obvious pattern.
         secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
@@ -1993,18 +1985,14 @@ class TestHighEntropyDetector:
         # A very strict threshold drops the match.
         strict = RedactionScanner(config=RedactionConfig(min_confidence=1.0))
         strict_matches = strict.scan_file(test_file)
-        assert not any(
-            m.match_type == "high_entropy_string" for m in strict_matches
-        )
+        assert not any(m.match_type == "high_entropy_string" for m in strict_matches)
 
         # A permissive threshold keeps it.
         permissive = RedactionScanner(
             config=RedactionConfig(min_confidence=0.0),
         )
         permissive_matches = permissive.scan_file(test_file)
-        assert any(
-            m.match_type == "high_entropy_string" for m in permissive_matches
-        )
+        assert any(m.match_type == "high_entropy_string" for m in permissive_matches)
 
     def test_high_entropy_respects_allowlist(self, tmp_path: Path) -> None:
         """A high-entropy string in the allowlist must not be flagged."""

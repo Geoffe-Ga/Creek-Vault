@@ -671,9 +671,7 @@ class TestOcrMinConfidence:
         with pytest.raises(ValidationError):
             OCRConfig(min_confidence=-0.1)
 
-    def test_low_confidence_marks_fragment_for_review(
-        self, tmp_path: Path
-    ) -> None:
+    def test_low_confidence_marks_fragment_for_review(self, tmp_path: Path) -> None:
         """OCR confidence below the threshold should set review=pending_review."""
         image_path = tmp_path / "blurry.png"
         _write_image(image_path)
@@ -694,9 +692,7 @@ class TestOcrMinConfidence:
         frontmatter = ingestor.generate_frontmatter(fragment)
         assert frontmatter.get("review") == "pending_review"
 
-    def test_high_confidence_does_not_mark_for_review(
-        self, tmp_path: Path
-    ) -> None:
+    def test_high_confidence_does_not_mark_for_review(self, tmp_path: Path) -> None:
         """Confidence above threshold leaves review unset."""
         image_path = tmp_path / "clear.png"
         _write_image(image_path)
@@ -715,9 +711,7 @@ class TestOcrMinConfidence:
         frontmatter = ingestor.generate_frontmatter(fragments[0])
         assert "review" not in frontmatter
 
-    def test_min_confidence_default_routes_borderline_ocr(
-        self, tmp_path: Path
-    ) -> None:
+    def test_min_confidence_default_routes_borderline_ocr(self, tmp_path: Path) -> None:
         """Default min_confidence (0.6) flags an OCR result reporting 0.4."""
         image_path = tmp_path / "borderline.png"
         _write_image(image_path)

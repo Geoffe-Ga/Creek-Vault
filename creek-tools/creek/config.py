@@ -239,10 +239,7 @@ class RedactionConfig(BaseModel):
             )
             raise ValueError(msg) from exc
         if "check" not in formatted:
-            msg = (
-                f"replacement_template {v!r} must include the '{{name}}' "
-                "placeholder."
-            )
+            msg = f"replacement_template {v!r} must include the '{{name}}' placeholder."
             raise ValueError(msg)
         return v
 
