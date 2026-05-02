@@ -178,7 +178,17 @@ def _load_or_compute_embeddings(
         merged = linker.generate_embeddings(fragments)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    linker.save_embeddings(merged, cache_path)
+    try:
+        linker.save_embeddings(merged, cache_path)
+    except OSError as exc:
+        # Disk full / permission denied / read-only volume. Linking
+        # itself succeeded — losing the cache only costs a recompute on
+        # the next run, so we degrade gracefully instead of crashing.
+        logger.warning(
+            "Failed to persist embeddings cache to %s: %s",
+            cache_path,
+            exc,
+        )
     return merged
 
 

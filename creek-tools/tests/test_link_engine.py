@@ -64,6 +64,36 @@ def test_run_link_embeddings_writes_cache(tmp_path: Path) -> None:
     assert cache_path.exists()
 
 
+def test_run_link_embeddings_save_oserror_does_not_crash(
+    tmp_path: Path,
+) -> None:
+    """An OSError while persisting the cache must not propagate."""
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-saveerr00000",
+        title="Save error",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.save_embeddings",
+        side_effect=OSError("disk full"),
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="embeddings",
+            rebuild=False,
+        )
+
+    # Linking still completes; the lost cache only costs a recompute
+    # on the next run.
+    assert summary.fragment_count == 1
+
+
 def test_run_link_temporal_returns_link_count(tmp_path: Path) -> None:
     """Temporal linker returns a numeric count for the CLI."""
     vault = tmp_path / "vault"

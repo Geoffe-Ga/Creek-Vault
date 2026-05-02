@@ -147,8 +147,6 @@ def test_run_classify_unreadable_file_records_error(tmp_path: Path) -> None:
     so that the file gets through validation and into the rewrite path,
     where the engine's ``except OSError`` branch records the failure.
     """
-    from unittest.mock import patch
-
     vault = tmp_path / "vault"
     fragment = Fragment(
         id="frag-iofail000000",
