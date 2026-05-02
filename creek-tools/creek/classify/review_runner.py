@@ -13,7 +13,7 @@ A subsequent ``creek classify`` pass preserves manual decisions unless
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
@@ -64,11 +64,16 @@ class ReviewSummary:
         accepted: Fragments accepted as-is and stamped manual.
         overridden: Fragments whose primary frequency was overridden.
         deferred: Fragments left unchanged for a later session.
+        errors: Human-readable error messages collected when persisting
+            an operator's decision failed (e.g. disk full, permission
+            denied). The classify engine uses the same shape on
+            ``ClassifySummary.errors`` for symmetry.
     """
 
     accepted: int = 0
     overridden: int = 0
     deferred: int = 0
+    errors: list[str] = field(default_factory=list)
 
 
 def format_review_summary(entry: ReviewEntry) -> str:
@@ -159,18 +164,50 @@ class ReviewQueueRunner:
                 self.console.print("[yellow]Exiting review.[/yellow]")
                 break
             if choice == "a":
-                _persist_manual(entry, entry.fragment)
-                summary.accepted += 1
+                if self._save(entry, entry.fragment, summary):
+                    summary.accepted += 1
             elif choice == "o":
                 new_fragment = _override_frequency(entry, self.console)
                 if new_fragment is None:
                     summary.deferred += 1
                     continue
-                _persist_manual(entry, new_fragment)
-                summary.overridden += 1
+                if self._save(entry, new_fragment, summary):
+                    summary.overridden += 1
             else:
                 summary.deferred += 1
         return summary
+
+    def _save(
+        self,
+        entry: ReviewEntry,
+        fragment: Fragment,
+        summary: ReviewSummary,
+    ) -> bool:
+        """Persist an operator's decision, capturing any I/O failure.
+
+        Without this guard a disk-full or permission-denied error mid
+        ``creek review`` session would propagate as a raw traceback;
+        we instead record the failure on ``summary.errors`` and
+        surface it through the console so the operator can fix the
+        underlying problem and resume.
+
+        Args:
+            entry: The queue entry being persisted.
+            fragment: The updated fragment metadata to write.
+            summary: Mutable summary to record any error onto.
+
+        Returns:
+            ``True`` when the write succeeded; ``False`` when an
+            ``OSError`` was caught.
+        """
+        try:
+            _persist_manual(entry, fragment)
+        except OSError as exc:
+            message = f"failed to persist {entry.path}: {exc}"
+            summary.errors.append(message)
+            self.console.print(f"[red]{message}[/red]")
+            return False
+        return True
 
 
 def _parse_frequency_input(value: str) -> Frequency | None:

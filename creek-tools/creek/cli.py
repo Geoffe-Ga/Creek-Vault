@@ -720,6 +720,10 @@ def review(
         f"[bold green]Review complete: {summary.accepted} accepted, "
         f"{summary.overridden} overridden, {summary.deferred} deferred.[/bold green]",
     )
+    if summary.errors:
+        console.print(f"[yellow]Errors: {len(summary.errors)}[/yellow]")
+        for err in summary.errors:
+            console.print(f"  [dim]{err}[/dim]")
 
 
 @app.command()

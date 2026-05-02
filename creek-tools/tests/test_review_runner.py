@@ -226,6 +226,41 @@ def test_run_interactive_override_accepts_uppercase_unclassified(
     assert reloaded["frequency"]["primary"] == "unclassified"
 
 
+def test_run_interactive_persist_oserror_records_error(tmp_path: Path) -> None:
+    """A disk error during ``_persist_manual`` is captured, not propagated.
+
+    Without this guard a disk-full or permission-denied write mid
+    review session would surface as a raw traceback at the CLI;
+    instead it must be recorded on ``ReviewSummary.errors`` so the
+    operator can fix the underlying problem and resume.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-saveerr00001",
+        title="Save error",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    runner = ReviewQueueRunner(vault_path=vault, console=Console())
+    pending = runner.list_pending()
+
+    with (
+        patch(
+            "creek.classify.review_runner._persist_manual",
+            side_effect=OSError("disk full"),
+        ),
+        patch("typer.prompt", return_value="a"),
+    ):
+        summary = runner.run_interactive(pending)
+
+    # The accept counter does NOT increment when persistence fails —
+    # only successful writes count toward ``accepted``.
+    assert summary.accepted == 0
+    assert len(summary.errors) == 1
+    assert "disk full" in summary.errors[0]
+
+
 def test_format_review_summary_contains_id(tmp_path: Path) -> None:
     """The single-line summary surfaces the fragment ID for the operator."""
     vault = tmp_path / "vault"
