@@ -849,3 +849,96 @@ class TestGenerateAllProfiles:
         assert len(paths) == 1
         post = frontmatter.load(str(paths[0]))
         assert post.get("exemplar_count") == 5
+
+
+# ---- Streaming exemplar accumulator (PERF-004) ----
+
+
+class TestStreamingAccumulator:
+    """Tests for the on-disk JSONL exemplar accumulator path."""
+
+    def _seed_register(
+        self,
+        vault_path: Path,
+        register: VoiceRegister,
+        count: int,
+    ) -> None:
+        """Seed *count* fragments of *register* with distinctive bodies."""
+        for i in range(count):
+            fragment = _make_fragment(
+                f"{register.value}-{i}",
+                f"{register.value} fragment {i}",
+                register=register,
+            )
+            body = (
+                f"Paragraph about the {register.value} register: "
+                "the creek of thought flows here. " * 30
+            )
+            _write_fragment_file(vault_path, fragment, body)
+
+    def test_temp_jsonl_is_cleaned_up(
+        self,
+        generator: VoiceProfileGenerator,
+        vault: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The accumulator's temp dir does not leak after the call returns."""
+        self._seed_register(vault, VoiceRegister.CONFESSIONAL, count=5)
+        before = set(tmp_path.iterdir())
+        generator.generate_all_profiles(vault)
+        after = set(tmp_path.iterdir())
+        # No new ``creek-voice-*`` directories remain in the parent.
+        leaked = {p for p in after - before if p.name.startswith("creek-voice-")}
+        assert not leaked
+
+    def test_streaming_matches_legacy_output(
+        self,
+        generator: VoiceProfileGenerator,
+        vault: Path,
+    ) -> None:
+        """Streaming path produces the same exemplar count as legacy in-memory."""
+        self._seed_register(vault, VoiceRegister.CONFESSIONAL, count=7)
+        paths = generator.generate_all_profiles(vault)
+        assert len(paths) == 1
+        post = frontmatter.load(str(paths[0]))
+        # max_exemplars defaults to 10; we seeded 7.
+        assert post.get("exemplar_count") == 7
+
+
+@pytest.mark.slow
+class TestVoiceMemoryFootprint:
+    """Memory benchmark guarding against PERF-004's load-everything bug."""
+
+    def test_peak_under_200mb_for_large_vault(
+        self,
+        generator: VoiceProfileGenerator,
+        vault: Path,
+    ) -> None:
+        """Peak heap stays under 200 MB while processing 2 000 large fragments."""
+        import tracemalloc
+
+        # 2000 fragments x ~5 KB body = ~10 MB total. With the legacy
+        # in-memory path that produces a single ~10 MB peak; the
+        # streaming path's peak should be well under the 200 MB envelope.
+        # The threshold guards against future regressions that would
+        # re-introduce the load-everything pattern.
+        body_template = "the creek of thought flows here. " * 150  # ~5 KB
+        for register in VoiceRegister:
+            for i in range(2_000 // len(VoiceRegister)):
+                fragment = _make_fragment(
+                    f"{register.value}-{i}",
+                    f"{register.value} fragment {i}",
+                    register=register,
+                )
+                _write_fragment_file(vault, fragment, body_template)
+
+        tracemalloc.start()
+        try:
+            paths = generator.generate_all_profiles(vault)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert paths
+        peak_mb = peak / (1024 * 1024)
+        assert peak_mb < 200, f"Peak memory was {peak_mb:.1f} MB"

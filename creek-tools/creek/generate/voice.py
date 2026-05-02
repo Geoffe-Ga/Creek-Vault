@@ -21,13 +21,17 @@ recording the breakdown of confidence levels.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
 import shutil
+import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -45,8 +49,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+    from collections.abc import Iterator, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +163,66 @@ def _eligible_register(
     if register not in VOICE_REGISTERS:
         return None
     return register
+
+
+class _JsonlWriter:
+    """Append-only JSONL writer used by the streaming exemplar accumulator.
+
+    Holds the file handle open for the duration of the walk so each
+    appended line costs an ``fwrite`` rather than an ``open + close``,
+    and flushes/closes the handle when the caller invokes
+    :meth:`close` (or the surrounding context manager exits).
+    """
+
+    def __init__(self, path: Path) -> None:
+        """Open *path* for append-binary writing."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Binary mode keeps newlines pristine across platforms; we do
+        # the encoding ourselves so a stray non-UTF8 char surfaces
+        # immediately rather than silently coercing.
+        self._fp = path.open("ab")
+
+    def append(self, payload: dict[str, object]) -> None:
+        """Serialise *payload* as a single JSON line and append it."""
+        line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        self._fp.write(line)
+
+    def close(self) -> None:
+        """Flush and close the underlying file handle."""
+        if not self._fp.closed:
+            self._fp.flush()
+            self._fp.close()
+
+
+def _iter_exemplars_from_jsonl(jsonl_path: Path) -> Iterator[Exemplar]:
+    """Yield :class:`Exemplar` objects from a streaming-accumulator JSONL file.
+
+    Lines that fail to parse are skipped with a debug log entry so a
+    partial flush under interrupt does not poison the rest of the
+    register's analysis.
+    """
+    with jsonl_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                logger.debug("Skipping malformed exemplar line in %s", jsonl_path)
+                continue
+            if not isinstance(payload, dict):
+                continue
+            fragment_data = payload.get("fragment")
+            body = payload.get("body")
+            if not isinstance(fragment_data, dict) or not isinstance(body, str):
+                continue
+            try:
+                fragment = Fragment.model_validate(fragment_data)
+            except ValidationError:
+                logger.debug("Skipping invalid fragment payload in %s", jsonl_path)
+                continue
+            yield Exemplar(fragment=fragment, body=body)
 
 
 def _load_fragment_with_body(
@@ -1500,9 +1563,12 @@ class VoiceProfileGenerator:
     def generate_all_profiles(self, vault_path: Path) -> list[Path]:
         """Generate profile notes for every register with exemplars.
 
-        Scans ``01-Fragments/`` for qualifying exemplars, groups them by
-        register, extracts patterns from each register's bodies, and
-        writes a profile per non-empty register.
+        Scans ``01-Fragments/`` lazily, routing each qualifying fragment
+        to a per-register JSONL accumulator on disk and dropping its
+        body before reading the next file. Memory therefore peaks at
+        the largest single register, not the whole vault — a 10 000-
+        fragment vault stays well under the 200 MB envelope mandated
+        by PERF-004.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
@@ -1510,32 +1576,72 @@ class VoiceProfileGenerator:
         Returns:
             List of paths written, one per register with exemplars.
         """
-        grouped = self._collect_exemplars_with_bodies(vault_path)
         written: list[Path] = []
-        for register in VOICE_REGISTERS:
-            register_exemplars = grouped.get(register, [])
-            if not register_exemplars:
-                continue
-            ranked = self._rank_exemplars(register_exemplars)
-            bodies = [e.body for e in ranked]
-            patterns = self._extractor.extract_patterns(bodies)
-            profile = self.generate_profile(register, ranked, patterns)
-            written.append(self.write_profile(profile, vault_path))
+        with self._streaming_accumulator(vault_path) as register_paths:
+            for register in VOICE_REGISTERS:
+                jsonl_path = register_paths.get(register)
+                if jsonl_path is None or not jsonl_path.exists():
+                    continue
+                register_exemplars = list(_iter_exemplars_from_jsonl(jsonl_path))
+                if not register_exemplars:
+                    continue
+                ranked = self._rank_exemplars(register_exemplars)
+                bodies = [e.body for e in ranked]
+                patterns = self._extractor.extract_patterns(bodies)
+                profile = self.generate_profile(register, ranked, patterns)
+                written.append(self.write_profile(profile, vault_path))
+                # Drop the per-register working set before moving on so
+                # the next register's load does not stack on top of it.
+                del register_exemplars, ranked, bodies, patterns, profile
         return written
 
     # ---- Private helpers ----
 
-    def _collect_exemplars_with_bodies(
+    @contextmanager
+    def _streaming_accumulator(
         self,
         vault_path: Path,
-    ) -> dict[str, list[Exemplar]]:
-        """Scan ``01-Fragments/`` for qualifying exemplars with body text."""
-        buckets: dict[str, list[Exemplar]] = {
-            register: [] for register in VOICE_REGISTERS
-        }
-        fragments_dir = vault_path / _FRAGMENTS_SUBDIR
-        if not fragments_dir.is_dir():
-            return buckets
+    ) -> Iterator[dict[str, Path]]:
+        """Stream qualifying fragments into per-register JSONL files.
+
+        Yields a mapping of ``register -> jsonl_path`` for use within
+        :meth:`generate_all_profiles`. The temp directory is deleted on
+        context-manager exit so partial runs leave no debris.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Yields:
+            Mapping of canonical register name to the absolute path of
+            its JSONL accumulator file. Registers with no qualifying
+            fragments are absent from the mapping.
+        """
+        with tempfile.TemporaryDirectory(prefix="creek-voice-") as tmp:
+            tmp_path = Path(tmp)
+            register_paths: dict[str, Path] = {}
+            register_handles: dict[str, _JsonlWriter] = {}
+            try:
+                fragments_dir = vault_path / _FRAGMENTS_SUBDIR
+                if fragments_dir.is_dir():
+                    self._stream_into(
+                        fragments_dir,
+                        tmp_path,
+                        register_paths,
+                        register_handles,
+                    )
+            finally:
+                for handle in register_handles.values():
+                    handle.close()
+            yield register_paths
+
+    def _stream_into(
+        self,
+        fragments_dir: Path,
+        tmp_path: Path,
+        register_paths: dict[str, Path],
+        register_handles: dict[str, _JsonlWriter],
+    ) -> None:
+        """Walk *fragments_dir* and append eligible exemplars to JSONL files."""
         for md_file in sorted(fragments_dir.rglob("*.md")):
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
@@ -1547,8 +1653,21 @@ class VoiceProfileGenerator:
             )
             if register is None:
                 continue
-            buckets[register].append(Exemplar(fragment=fragment, body=body))
-        return buckets
+            handle = register_handles.get(register)
+            if handle is None:
+                jsonl_path = tmp_path / f"{register}.jsonl"
+                handle = _JsonlWriter(jsonl_path)
+                register_handles[register] = handle
+                register_paths[register] = jsonl_path
+            handle.append(
+                {
+                    "fragment": fragment.model_dump(mode="json"),
+                    "body": body,
+                }
+            )
+            # Drop the local body reference before the next iteration
+            # so the per-iteration peak is bounded by a single fragment.
+            del body, fragment, loaded
 
     def _rank_exemplars(self, exemplars: list[Exemplar]) -> list[Exemplar]:
         """Rank *exemplars* by the same quality heuristic as the collector.
