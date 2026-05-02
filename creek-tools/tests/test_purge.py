@@ -724,6 +724,7 @@ def test_cli_purge_vault_rejects_bad_confirm(tmp_path: Path) -> None:
             str(vault),
             "--confirm-text",
             "maybe",
+            "--force-non-interactive",
         ],
     )
 
@@ -732,7 +733,7 @@ def test_cli_purge_vault_rejects_bad_confirm(tmp_path: Path) -> None:
 
 
 def test_cli_purge_vault_accepts_exact_confirm(tmp_path: Path) -> None:
-    """Correct confirmation text purges the vault."""
+    """Correct confirmation text purges the vault (with explicit non-tty opt-in)."""
     vault = _make_vault(tmp_path)
     frag = _write_fragment(vault, "frag-A", "Alpha")
 
@@ -745,6 +746,7 @@ def test_cli_purge_vault_accepts_exact_confirm(tmp_path: Path) -> None:
             str(vault),
             "--confirm-text",
             VAULT_PURGE_CONFIRMATION,
+            "--force-non-interactive",
         ],
     )
 
@@ -765,6 +767,123 @@ def test_cli_purge_vault_dry_run(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "DRY-RUN" in result.output
     assert frag.exists()
+
+
+# ---------------------------------------------------------------------------
+# OPS-002: non-interactive purge refusal
+# ---------------------------------------------------------------------------
+
+
+def test_cli_purge_vault_refuses_non_tty_without_force(tmp_path: Path) -> None:
+    """Piped stdin is rejected unless --force-non-interactive is set."""
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+
+    result = runner.invoke(
+        app,
+        [
+            "purge",
+            "vault",
+            "--vault",
+            str(vault),
+            "--confirm-text",
+            VAULT_PURGE_CONFIRMATION,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "non-interactive" in result.output.lower()
+    assert frag.exists()
+
+
+def test_cli_purge_vault_refuses_when_only_yes_piped(tmp_path: Path) -> None:
+    """Even with piped 'y' confirmation, non-tty must abort without the flag."""
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+
+    result = runner.invoke(
+        app,
+        ["purge", "vault", "--vault", str(vault)],
+        input="y\n",
+    )
+
+    assert result.exit_code != 0
+    assert "non-interactive" in result.output.lower()
+    assert frag.exists()
+
+
+def test_cli_purge_vault_force_non_interactive_logs_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`--force-non-interactive` succeeds but emits a WARNING audit entry."""
+    import logging
+
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+
+    with caplog.at_level(logging.WARNING, logger="creek.cli"):
+        result = runner.invoke(
+            app,
+            [
+                "purge",
+                "vault",
+                "--vault",
+                str(vault),
+                "--confirm-text",
+                VAULT_PURGE_CONFIRMATION,
+                "--force-non-interactive",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert not frag.exists()
+    assert any(
+        "non-interactive" in record.message.lower()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )
+
+
+def test_cli_purge_vault_interactive_wrong_path_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interactive run that types the wrong vault path aborts."""
+    monkeypatch.setattr("creek.cli._stdin_is_interactive", lambda: True)
+
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+
+    result = runner.invoke(
+        app,
+        ["purge", "vault", "--vault", str(vault)],
+        input="not-the-right-path\n",
+    )
+
+    assert result.exit_code != 0
+    assert frag.exists()
+
+
+def test_cli_purge_vault_interactive_correct_path_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Typing the absolute vault path interactively confirms the purge."""
+    monkeypatch.setattr("creek.cli._stdin_is_interactive", lambda: True)
+
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+    abs_vault = str(vault.resolve())
+
+    result = runner.invoke(
+        app,
+        ["purge", "vault", "--vault", str(vault)],
+        input=f"{abs_vault}\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not frag.exists()
 
 
 # ---------------------------------------------------------------------------

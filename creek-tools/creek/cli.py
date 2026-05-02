@@ -1,5 +1,7 @@
 """Creek CLI -- command-line interface for the Creek knowledge organization pipeline."""
 
+import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -9,6 +11,20 @@ from rich.table import Table
 
 from creek.config import load_config
 from creek.pipeline import Pipeline
+
+logger = logging.getLogger(__name__)
+
+
+def _stdin_is_interactive() -> bool:
+    """Return ``True`` when the process stdin is attached to a real TTY.
+
+    Wrapping ``sys.stdin.isatty`` makes the OPS-002 non-interactive
+    refusal trivially testable: tests can monkeypatch this single
+    helper instead of fighting Typer's :class:`CliRunner`, which
+    always provides a non-tty StringIO regardless of the host.
+    """
+    return sys.stdin.isatty()
+
 
 if TYPE_CHECKING:
     from creek.generate.drafts import DraftLLM
@@ -934,28 +950,110 @@ def purge_vault(
         "",
         help=(
             "Must equal 'I understand this is irreversible' "
-            "to bypass interactive prompt."
+            "to bypass interactive prompt (requires --force-non-interactive)."
+        ),
+    ),
+    force_non_interactive: bool = typer.Option(
+        False,
+        "--force-non-interactive",
+        help=(
+            "Allow vault purge without a TTY. Logs a WARNING. "
+            "Required when stdin is piped or redirected."
         ),
     ),
 ) -> None:
-    """Destroy every fragment, thread, and eddy (nuclear option)."""
+    """Destroy every fragment, thread, and eddy (nuclear option).
+
+    OPS-002 hardening: outside of ``--dry-run``, the command refuses to
+    proceed unless either (a) stdin is a real TTY and the operator types
+    the absolute vault path, or (b) the operator explicitly opts in with
+    ``--force-non-interactive`` and supplies ``--confirm-text``. The
+    second path emits a ``WARNING`` log entry so an audit trail records
+    the bypass.
+    """
     from creek.purge.engine import VAULT_PURGE_CONFIRMATION
 
     engine = _build_engine(vault, dry_run=dry_run)
-    phrase = confirm_text
-    if not dry_run and phrase != VAULT_PURGE_CONFIRMATION:
+
+    if dry_run:
+        try:
+            result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+        except ValueError as exc:
+            console.print(f"[red]Aborted: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        _render_purge_result(result)
+        return
+
+    interactive = _stdin_is_interactive()
+    if not interactive and not force_non_interactive:
         console.print(
-            "[bold red]This will destroy the entire vault contents.[/bold red]",
+            "[red]Refusing to purge vault from a non-interactive session. "
+            "Pass --force-non-interactive (with caution) to override.[/red]",
         )
-        phrase = typer.prompt(
-            f"Type exactly {VAULT_PURGE_CONFIRMATION!r} to continue",
-            default="",
-            show_default=False,
+        raise typer.Exit(code=1)
+    if not interactive and force_non_interactive:
+        logger.warning(
+            "creek purge vault running non-interactively at %s "
+            "via --force-non-interactive",
+            engine.vault_path,
         )
+
+    phrase = _resolve_purge_phrase(
+        engine_vault_path=engine.vault_path,
+        confirm_text=confirm_text,
+        interactive=interactive,
+    )
+    if phrase is None:
+        console.print("[red]Aborted: vault path did not match.[/red]")
+        raise typer.Exit(code=1)
+
     try:
-        supplied = VAULT_PURGE_CONFIRMATION if dry_run else phrase
-        result = engine.purge_vault(supplied)
+        result = engine.purge_vault(phrase)
     except ValueError as exc:
         console.print(f"[red]Aborted: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     _render_purge_result(result)
+
+
+def _resolve_purge_phrase(
+    *,
+    engine_vault_path: Path,
+    confirm_text: str,
+    interactive: bool,
+) -> str | None:
+    """Return the engine-level confirmation phrase, or ``None`` to abort.
+
+    Three legal paths: (1) operator pre-supplied ``confirm_text`` for
+    non-interactive use, (2) interactive session in which the operator
+    types the absolute vault path, (3) abort.
+
+    Args:
+        engine_vault_path: Vault path the engine will operate on (used
+            as the prompt's expected literal).
+        confirm_text: ``--confirm-text`` value, possibly empty.
+        interactive: Whether stdin is a TTY.
+
+    Returns:
+        The phrase to pass to ``PurgeEngine.purge_vault`` when accepted,
+        or ``None`` when the interactive prompt was answered incorrectly.
+    """
+    from creek.purge.engine import VAULT_PURGE_CONFIRMATION
+
+    if confirm_text:
+        return confirm_text
+
+    if not interactive:
+        return None
+
+    expected = str(engine_vault_path.resolve())
+    console.print(
+        "[bold red]This will destroy the entire vault contents.[/bold red]",
+    )
+    typed = typer.prompt(
+        f"Type the absolute vault path {expected!r} to continue",
+        default="",
+        show_default=False,
+    )
+    if typed.strip() != expected:
+        return None
+    return VAULT_PURGE_CONFIRMATION

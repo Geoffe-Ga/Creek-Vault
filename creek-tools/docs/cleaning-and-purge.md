@@ -110,10 +110,24 @@ creek purge daterange --start 2025-01-01 --end 2025-01-31 --vault ~/Obsidian/Cre
 
 ### `creek purge vault`
 
-Nuclear option: destroys every fragment, thread, eddy, and resonance. Leaves the directory structure and `00-Creek-Meta/` intact. This is **never** undoable; it requires `--yes` *and* an interactive prompt.
+Nuclear option: destroys every fragment, thread, eddy, and resonance. Leaves the directory structure and `00-Creek-Meta/` intact. This is **never** undoable.
+
+Outside of `--dry-run`, the command refuses to proceed unless one of these is true:
+
+- **Interactive run.** stdin is attached to a real TTY and the operator types the **absolute path** of the vault when prompted (not the literal string `"yes"`). Typing the wrong path aborts.
+- **Explicit non-interactive opt-in.** The command was invoked with `--force-non-interactive` *and* a valid `--confirm-text "I understand this is irreversible"`. This path emits a `WARNING` log entry so the audit trail records the bypass.
+
+A piped or redirected stdin without `--force-non-interactive` exits non-zero with a clear message — closing the OPS-002 gap where a misbehaving cron job could satisfy the prompt programmatically.
 
 ```bash
-creek purge vault --vault ~/Obsidian/Creek-Vault --yes
+# Interactive (recommended): prompts for the absolute vault path.
+creek purge vault --vault ~/Obsidian/Creek-Vault
+
+# Explicit non-interactive opt-in (CI / scripted teardown):
+creek purge vault \
+    --vault ~/Obsidian/Creek-Vault \
+    --confirm-text "I understand this is irreversible" \
+    --force-non-interactive
 ```
 
 ---
