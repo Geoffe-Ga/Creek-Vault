@@ -16,13 +16,18 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path  # noqa: TC003 — runtime use in dataclass field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 import frontmatter
 import typer
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.constants import (
+    CLASSIFICATION_METHOD_KEY,
+    CLASSIFIED_AT_KEY,
+    MANUAL_METHOD,
+)
 from creek.classify.review import ReviewQueueGenerator
 from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency, FrequencyClassification
@@ -31,9 +36,6 @@ if TYPE_CHECKING:
     from rich.console import Console
 
 logger = logging.getLogger(__name__)
-
-_CLASSIFICATION_METHOD_KEY: Final[str] = "classification_method"
-_CLASSIFIED_AT_KEY: Final[str] = "classified_at"
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,7 @@ class ReviewQueueRunner:
             entry = _read_entry(md_file)
             if entry is None:
                 continue
-            if entry.raw_metadata.get(_CLASSIFICATION_METHOD_KEY) == "manual":
+            if entry.raw_metadata.get(CLASSIFICATION_METHOD_KEY) == MANUAL_METHOD:
                 continue
             if not self._generator.needs_review(entry.fragment):
                 continue
@@ -214,8 +216,8 @@ def _persist_manual(entry: ReviewEntry, fragment: Fragment) -> None:
     """
     metadata = dict(entry.raw_metadata)
     metadata.update(fragment.model_dump(mode="json"))
-    metadata[_CLASSIFICATION_METHOD_KEY] = "manual"
-    metadata[_CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
+    metadata[CLASSIFICATION_METHOD_KEY] = MANUAL_METHOD
+    metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
 
     post = frontmatter.Post(content=entry.body, **metadata)
     entry.path.write_text(frontmatter.dumps(post), encoding="utf-8")

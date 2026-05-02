@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,7 +17,6 @@ from creek.consent import ConsentManager
 from creek.pipeline import Pipeline, RedactionRequiredError
 
 if TYPE_CHECKING:
-    from creek.config import CreekConfig
     from creek.generate.drafts import DraftLLM
     from creek.ingest.base import Ingestor
     from creek.models import Phase
@@ -44,15 +45,37 @@ def _consent_log_dir(vault_path: Path) -> Path:
     return vault_path / "00-Creek-Meta" / "Processing-Log"
 
 
-def _operator_identity() -> str:
-    """Return a best-effort identity string for the current operator.
+_OPERATOR_IDENTITY_MAX_LEN = 64
+"""Cap on the operator identity recorded in the consent log.
 
-    Falls back to ``"cli"`` when the environment provides nothing.
+Adversaries with control of ``USER``/``USERNAME`` (e.g. a misconfigured
+CI runner) could otherwise inject arbitrary text into the audit
+record. Truncating to a reasonable length and filtering to a safe
+character set bounds the blast radius without preventing legitimate
+unicode usernames.
+"""
+
+_OPERATOR_IDENTITY_ALLOWED_CHARS = re.compile(r"[^\w.@+\- ]")
+"""Characters stripped from the raw env-var value before logging."""
+
+
+def _operator_identity() -> str:
+    """Return a best-effort, sanitised identity string for the operator.
+
+    Reads ``USER`` then ``USERNAME`` from the environment, strips
+    control characters and metacharacters that have no place in an
+    audit log entry, truncates to
+    :data:`_OPERATOR_IDENTITY_MAX_LEN` characters, and falls back to
+    ``"cli"`` when the result is empty.
 
     Returns:
         Identity string suitable for stamping on a consent record.
     """
-    return os.environ.get("USER") or os.environ.get("USERNAME") or "cli"
+    raw = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    cleaned = _OPERATOR_IDENTITY_ALLOWED_CHARS.sub("", raw).strip()
+    if not cleaned:
+        return "cli"
+    return cleaned[:_OPERATOR_IDENTITY_MAX_LEN]
 
 
 def _format_summary(file_count: int, size_bytes: int) -> str:
@@ -71,7 +94,6 @@ def _format_summary(file_count: int, size_bytes: int) -> str:
 
 def _gate_consent(
     *,
-    config: CreekConfig,
     source_path: Path,
     vault_path: Path,
     source_type: str,
@@ -86,8 +108,6 @@ def _gate_consent(
     operator marker so it can be audited later.
 
     Args:
-        config: Loaded Creek config (currently unused, reserved for
-            future per-source consent policy hooks).
         source_path: Source directory the operator wants to ingest.
         vault_path: Vault path used to locate the consent log.
         source_type: Source identifier for the consent record (e.g.
@@ -167,8 +187,6 @@ def _is_interactive() -> bool:
     Returns:
         ``True`` when stdin is a terminal.
     """
-    import sys
-
     try:
         return bool(sys.stdin.isatty())
     except (AttributeError, ValueError):
@@ -285,7 +303,6 @@ def process(
     )
 
     consent_manager = _gate_consent(
-        config=config,
         source_path=source_path,
         vault_path=vault_path,
         source_type="pipeline",
@@ -345,7 +362,6 @@ def ingest(
         raise typer.Exit(code=2)
 
     _gate_consent(
-        config=config,
         source_path=input,
         vault_path=vault_path,
         source_type=type,
@@ -480,7 +496,6 @@ _LINK_METHODS = ("embeddings", "temporal", "eddies")
 def classify(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     method: str = typer.Option("rules", help="Classification method (rules|llm)"),
-    batch_size: int = typer.Option(50, help="Batch size for LLM classification"),
     force: bool = typer.Option(
         False,
         "--force",
@@ -495,6 +510,9 @@ def classify(
     ``classification.confidence_threshold``. Fragments with
     ``classification.method: manual`` are preserved unless ``--force``
     is supplied.
+
+    LLM concurrency is governed by ``llm.max_concurrent`` in the
+    config, not a CLI flag.
     """
     if method not in _CLASSIFY_METHODS:
         console.print(
@@ -512,7 +530,6 @@ def classify(
         vault_path=vault_path,
         config=config,
         method=method,
-        batch_size=batch_size,
         force=force,
     )
     console.print(

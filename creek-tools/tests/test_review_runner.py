@@ -21,40 +21,10 @@ from creek.models import (
     SourcePlatform,
     VoiceClassification,
 )
+from tests.helpers import write_fragment_file as _write_fragment
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-
-def _write_fragment(
-    *,
-    vault: Path,
-    fragment: Fragment,
-    body: str,
-    method: str | None = None,
-) -> Path:
-    """Persist *fragment* in the vault for review.
-
-    Args:
-        vault: Vault root.
-        fragment: Fragment metadata to persist.
-        body: Markdown body to retain on disk.
-        method: Optional ``classification_method`` to stamp.
-
-    Returns:
-        Path to the written fragment.
-    """
-    fragments_dir = vault / "01-Fragments" / "Notes"
-    fragments_dir.mkdir(parents=True, exist_ok=True)
-    metadata = fragment.model_dump(mode="json")
-    if method is not None:
-        metadata["classification_method"] = method
-    path = fragments_dir / f"{fragment.id}.md"
-    path.write_text(
-        frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
-        encoding="utf-8",
-    )
-    return path
 
 
 def test_list_pending_returns_only_review_candidates(tmp_path: Path) -> None:

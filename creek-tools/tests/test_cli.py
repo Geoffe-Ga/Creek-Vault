@@ -619,6 +619,41 @@ def test_review_list_only(tmp_path: Path) -> None:
     assert "Need a human eye" in result.output
 
 
+def test_operator_identity_strips_metacharacters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adversarial USER/USERNAME values are stripped before logging."""
+    from creek.cli import _operator_identity
+
+    monkeypatch.setenv("USER", "alice;rm -rf /\nboom")
+    assert _operator_identity() == "alicerm -rf boom"
+
+
+def test_operator_identity_truncates_long_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pathological-length env values are truncated to the configured cap."""
+    from creek.cli import _OPERATOR_IDENTITY_MAX_LEN, _operator_identity
+
+    monkeypatch.setenv("USER", "a" * 200)
+    result = _operator_identity()
+    assert len(result) == _OPERATOR_IDENTITY_MAX_LEN
+
+
+def test_operator_identity_falls_back_to_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty (or all-stripped) identity falls back to ``"cli"``."""
+    from creek.cli import _operator_identity
+
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERNAME", raising=False)
+    assert _operator_identity() == "cli"
+
+    monkeypatch.setenv("USER", ";;;\n\n")
+    assert _operator_identity() == "cli"
+
+
 def test_process_aborts_when_consent_declined(tmp_path: Path) -> None:
     """Declining the consent prompt aborts the pipeline non-zero."""
     src = tmp_path / "src"

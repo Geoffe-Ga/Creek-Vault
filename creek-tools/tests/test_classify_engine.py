@@ -16,44 +16,10 @@ import frontmatter
 from creek.classify.classify_engine import run_classify
 from creek.config import CreekConfig
 from creek.models import Fragment, FragmentSource, SourcePlatform
+from tests.helpers import write_fragment_file as _write_fragment
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-
-def _write_fragment(
-    *,
-    vault: Path,
-    fragment: Fragment,
-    body: str,
-    method: str | None = None,
-    extras: dict[str, object] | None = None,
-) -> Path:
-    """Persist a fragment file under ``<vault>/01-Fragments/Notes``.
-
-    Args:
-        vault: Vault root.
-        fragment: Fragment metadata to persist.
-        body: Markdown body for the file.
-        method: Optional ``classification_method`` to stamp.
-        extras: Extra frontmatter keys to merge in.
-
-    Returns:
-        Path to the freshly-written file.
-    """
-    fragments_dir = vault / "01-Fragments" / "Notes"
-    fragments_dir.mkdir(parents=True, exist_ok=True)
-    metadata = fragment.model_dump(mode="json")
-    if method is not None:
-        metadata["classification_method"] = method
-    if extras:
-        metadata.update(extras)
-    path = fragments_dir / f"{fragment.id}.md"
-    path.write_text(
-        frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
-        encoding="utf-8",
-    )
-    return path
 
 
 def test_run_classify_returns_zeroes_when_no_fragments_dir(tmp_path: Path) -> None:
@@ -62,7 +28,6 @@ def test_run_classify_returns_zeroes_when_no_fragments_dir(tmp_path: Path) -> No
         vault_path=tmp_path / "vault",
         config=CreekConfig(),
         method="rules",
-        batch_size=10,
         force=False,
     )
     assert summary.total == 0
@@ -87,7 +52,6 @@ def test_run_classify_rules_updates_fragments(tmp_path: Path) -> None:
         vault_path=vault,
         config=CreekConfig(),
         method="rules",
-        batch_size=10,
         force=False,
     )
 
@@ -116,7 +80,6 @@ def test_run_classify_preserves_manual_without_force(tmp_path: Path) -> None:
         vault_path=vault,
         config=CreekConfig(),
         method="rules",
-        batch_size=10,
         force=False,
     )
 
@@ -145,7 +108,6 @@ def test_run_classify_force_overwrites_manual(tmp_path: Path) -> None:
         vault_path=vault,
         config=CreekConfig(),
         method="rules",
-        batch_size=10,
         force=True,
     )
 
@@ -154,8 +116,13 @@ def test_run_classify_force_overwrites_manual(tmp_path: Path) -> None:
     assert reloaded["classification_method"] == "rules"
 
 
-def test_run_classify_unreadable_file_records_error(tmp_path: Path) -> None:
-    """Bad fragment files surface as errors, not crashes."""
+def test_run_classify_skips_non_fragment_files(tmp_path: Path) -> None:
+    """Files that parse as YAML but aren't fragments are silently skipped.
+
+    The classify engine treats a missing/wrong ``type`` field as "not a
+    Creek fragment, leave it alone" — these are not errors, they're
+    arbitrary markdown that happens to share the directory.
+    """
     vault = tmp_path / "vault"
     fragments_dir = vault / "01-Fragments" / "Notes"
     fragments_dir.mkdir(parents=True)
@@ -166,13 +133,49 @@ def test_run_classify_unreadable_file_records_error(tmp_path: Path) -> None:
         vault_path=vault,
         config=CreekConfig(),
         method="rules",
-        batch_size=10,
         force=False,
     )
     assert summary.total == 1
-    # The file is "valid YAML" but missing type=fragment, so it's silently
-    # skipped (fragment readers swallow non-fragment docs by design).
     assert summary.classified == 0
+    assert summary.errors == []
+
+
+def test_run_classify_unreadable_file_records_error(tmp_path: Path) -> None:
+    """Files that fail to load surface on ``summary.errors``.
+
+    Simulates an OSError at write time by patching ``_write_fragment``
+    so that the file gets through validation and into the rewrite path,
+    where the engine's ``except OSError`` branch records the failure.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-iofail000000",
+        title="Power dominance bold rage warrior conquest",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="Power dominance control conquest force aggression bold rage warrior",
+    )
+
+    with patch(
+        "creek.classify.classify_engine._write_fragment",
+        side_effect=OSError("disk full"),
+    ):
+        summary = run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="rules",
+            force=False,
+        )
+
+    assert summary.total == 1
+    assert summary.classified == 0
+    assert len(summary.errors) == 1
+    assert "disk full" in summary.errors[0]
 
 
 def test_run_classify_llm_skips_high_confidence(tmp_path: Path) -> None:
@@ -197,7 +200,6 @@ def test_run_classify_llm_skips_high_confidence(tmp_path: Path) -> None:
             vault_path=vault,
             config=config,
             method="llm",
-            batch_size=10,
             force=False,
         )
 
@@ -229,7 +231,6 @@ def test_run_classify_llm_invoked_for_low_confidence(tmp_path: Path) -> None:
             vault_path=vault,
             config=config,
             method="llm",
-            batch_size=10,
             force=False,
         )
 

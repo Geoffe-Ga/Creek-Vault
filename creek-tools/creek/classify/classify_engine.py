@@ -13,12 +13,17 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path  # noqa: TC003 — runtime use in dataclass field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.constants import (
+    CLASSIFICATION_METHOD_KEY,
+    CLASSIFIED_AT_KEY,
+    MANUAL_METHOD,
+)
 from creek.classify.llm import LLMClassifier
 from creek.classify.rules import RuleClassifier
 from creek.ingest.base import LA_TZ
@@ -28,14 +33,6 @@ if TYPE_CHECKING:
     from creek.config import CreekConfig
 
 logger = logging.getLogger(__name__)
-
-_CLASSIFICATION_METHOD_KEY: Final[str] = "classification_method"
-"""Frontmatter key carrying ``rules | llm | manual``."""
-
-_CLASSIFIED_AT_KEY: Final[str] = "classified_at"
-"""Frontmatter key carrying the ISO-8601 classification timestamp."""
-
-_MANUAL_METHOD: Final[str] = "manual"
 
 
 @dataclass(frozen=True)
@@ -66,7 +63,6 @@ def run_classify(
     vault_path: Path,
     config: CreekConfig,
     method: str,
-    batch_size: int,
     force: bool,
 ) -> ClassifySummary:
     """Classify every fragment in *vault_path* using the chosen method.
@@ -75,9 +71,6 @@ def run_classify(
         vault_path: Vault root.
         config: Loaded Creek configuration.
         method: ``"rules"`` or ``"llm"``.
-        batch_size: Reserved; the current LLM classifier processes
-            fragments individually because the per-vault scan is
-            already streaming.
         force: When ``True``, overwrite ``classification_method:
             manual`` decisions.
 
@@ -99,13 +92,19 @@ def run_classify(
 
     for md_file in sorted(fragments_root.rglob("*.md")):
         total += 1
-        record = _read_fragment(md_file)
+        try:
+            record = _read_fragment(md_file)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            errors.append(f"unreadable fragment {md_file}: {exc}")
+            continue
         if record is None:
-            errors.append(f"unreadable fragment: {md_file}")
+            # File parsed cleanly but is not a Creek fragment (no
+            # ``type: fragment`` field, or schema mismatch). Silently
+            # skip — markdown notes coexist with fragments in the vault.
             continue
         fragment, body, raw = record
 
-        if not force and raw.get(_CLASSIFICATION_METHOD_KEY) == _MANUAL_METHOD:
+        if not force and raw.get(CLASSIFICATION_METHOD_KEY) == MANUAL_METHOD:
             preserved += 1
             continue
 
@@ -190,14 +189,18 @@ def _read_fragment(md_file: Path) -> tuple[Fragment, str, dict[str, object]] | N
         md_file: Markdown file to load.
 
     Returns:
-        ``(fragment, body, raw_metadata)`` or ``None`` when the file is
-        not a valid fragment record.
+        ``(fragment, body, raw_metadata)`` for valid fragments, or
+        ``None`` when the file is well-formed YAML but is **not** a
+        Creek fragment (no ``type: fragment`` key, or a schema
+        mismatch). Real I/O failures are propagated to the caller so
+        they can be recorded on :attr:`ClassifySummary.errors`.
+
+    Raises:
+        OSError: When the file cannot be opened.
+        ValueError: When the YAML cannot be parsed.
+        yaml.YAMLError: When the YAML parser rejects the document.
     """
-    try:
-        post = frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
-        logger.debug("Skipping unreadable markdown file: %s", md_file)
-        return None
+    post = frontmatter.load(str(md_file))
     metadata = dict(post.metadata)
     if metadata.get("type") != "fragment":
         return None
@@ -233,8 +236,8 @@ def _write_fragment(
     """
     new_metadata = dict(raw)
     new_metadata.update(fragment.model_dump(mode="json"))
-    new_metadata[_CLASSIFICATION_METHOD_KEY] = method
-    new_metadata[_CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
+    new_metadata[CLASSIFICATION_METHOD_KEY] = method
+    new_metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
 
     post = frontmatter.Post(content=body, **new_metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
