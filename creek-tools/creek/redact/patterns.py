@@ -256,6 +256,19 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
             "ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) per project."
         ),
     ),
+    "high_entropy_string": PatternInfo(
+        pattern=re.compile(r"[A-Za-z0-9+/=_\-]{20,}"),
+        description=(
+            "Generic high-entropy substrings (≥20 base64url-ish chars) "
+            "above the configured RedactionConfig.min_confidence threshold."
+        ),
+        severity="medium",
+        false_positive_notes=(
+            "Long random-looking identifiers, hashes, and content-addressed "
+            "filenames will match. Tune via RedactionConfig.min_confidence "
+            "or add specific substrings to false_positive_allowlist."
+        ),
+    ),
     "ipv6": PatternInfo(
         pattern=re.compile(
             r"(?<![:\w.])(?:"
@@ -282,7 +295,17 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
     ),
 }
 
+_DETECTOR_ONLY_PATTERNS: frozenset[str] = frozenset({"high_entropy_string"})
+"""Pattern names whose matching is implemented by a non-regex detector.
+
+These entries live in :data:`PATTERN_METADATA` (so reports can look up
+severity and descriptions) but are excluded from
+:data:`REDACTION_PATTERNS` so the standard regex scan does not double-fire.
+"""
+
 REDACTION_PATTERNS: dict[str, re.Pattern[str]] = {
-    name: info.pattern for name, info in PATTERN_METADATA.items()
+    name: info.pattern
+    for name, info in PATTERN_METADATA.items()
+    if name not in _DETECTOR_ONLY_PATTERNS
 }
 """Flat mapping of pattern name to compiled regex, for backward compatibility."""

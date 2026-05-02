@@ -189,6 +189,15 @@ class RedactionConfig(BaseModel):
     )
     """Directory name patterns to exclude from recursive scanning."""
 
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Confidence threshold for the generic high-entropy secret detector.
+
+    Higher values demand more entropy before flagging a substring; ``0.0``
+    catches everything that looks base64-ish, ``1.0`` requires near-random
+    output. The default ``0.6`` corresponds to roughly 4.2 bits/char which
+    suppresses most natural-language false positives.
+    """
+
 
 _READONLY_SCOPES: set[str] = {
     "https://www.googleapis.com/auth/drive.readonly",
