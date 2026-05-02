@@ -1733,6 +1733,21 @@ class TestScannerLuhnPostValidation:
         ssn_matches = [m for m in matches if m.match_type == "ssn"]
         assert len(ssn_matches) == 1
 
+    def test_luhn_keeps_other_pattern_with_credit_card_lookalike(
+        self, tmp_path: Path
+    ) -> None:
+        """A bearer token containing CC-like digits should still match bearer."""
+        test_file = tmp_path / "bearer.txt"
+        test_file.write_text(
+            "Authorization: Bearer 4111111111111112-extra-token-payload-AAAA\n"
+        )
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        # The bearer pattern should still flag it.
+        assert any(m.match_type == "bearer_token" for m in matches)
+
     def test_luhn_low_false_positive_rate_on_random_digits(
         self, tmp_path: Path
     ) -> None:
@@ -1764,3 +1779,291 @@ class TestScannerLuhnPostValidation:
         assert len(cc_matches) < 150, (
             f"Luhn filter not effective: {len(cc_matches)} of 1000 matched"
         )
+
+
+# ---------------------------------------------------------------------------
+# Modern API token + network identifier patterns (SEC-002, INC-014)
+# ---------------------------------------------------------------------------
+
+
+class TestModernApiTokenPatterns:
+    """Tests for new API-token patterns added in batch D."""
+
+    # -- discord_bot_token --
+
+    def test_discord_bot_token_matches(self) -> None:
+        """discord_bot_token should match the documented Discord token shape."""
+        pattern = REDACTION_PATTERNS["discord_bot_token"]
+        # Synthetic token: prefix + 23 chars + . + 6 chars + . + 27 chars
+        token = "MTE" + "a" * 23 + ".AAAAAA." + "x" * 27
+        assert pattern.search(token)
+
+    def test_discord_bot_token_modern_prefix(self) -> None:
+        """discord_bot_token should match longer modern prefixes."""
+        pattern = REDACTION_PATTERNS["discord_bot_token"]
+        # Newer Discord tokens are longer; allow up to ~38 chars in tail.
+        token = "Nzk" + "B" * 27 + ".AAAAAA." + "y" * 38
+        assert pattern.search(token)
+
+    def test_discord_bot_token_no_false_positive(self) -> None:
+        """discord_bot_token should not match arbitrary dotted strings."""
+        pattern = REDACTION_PATTERNS["discord_bot_token"]
+        assert not pattern.search("hello.world.foo")
+        assert not pattern.search("MTE.short.abc")
+
+    # -- github_pat (fine-grained PAT) --
+
+    def test_github_pat_matches(self) -> None:
+        """github_pat should match GitHub fine-grained PAT format."""
+        pattern = REDACTION_PATTERNS["github_pat"]
+        # Documented format: github_pat_<11 chars>_<59 chars>; total ~82 chars.
+        token = "github_pat_" + "A" * 11 + "_" + "B" * 59
+        assert pattern.search(token)
+
+    def test_github_pat_no_false_positive(self) -> None:
+        """github_pat should not match short or non-PAT strings."""
+        pattern = REDACTION_PATTERNS["github_pat"]
+        assert not pattern.search("github_pat_short")
+        assert not pattern.search("ghp_classic_token")
+
+    def test_github_pat_distinct_from_classic(self) -> None:
+        """Existing github_token (classic) must still match `gh[pousr]_...`."""
+        classic = REDACTION_PATTERNS["github_token"]
+        assert classic.search("ghp_" + "A" * 36)
+
+    # -- stripe_key --
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "sk_live_" + "A" * 24,
+            "sk_test_" + "A" * 24,
+            "pk_live_" + "A" * 24,
+            "pk_test_" + "A" * 24,
+            "rk_live_" + "A" * 24,
+            "rk_test_" + "A" * 24,
+        ],
+    )
+    def test_stripe_key_matches(self, key: str) -> None:
+        """stripe_key should match Stripe live/test secret/publishable keys."""
+        pattern = REDACTION_PATTERNS["stripe_key"]
+        assert pattern.search(key)
+
+    def test_stripe_key_no_false_positive(self) -> None:
+        """stripe_key should not match unrelated strings."""
+        pattern = REDACTION_PATTERNS["stripe_key"]
+        assert not pattern.search("sk_dev_short")
+        assert not pattern.search("just text without key")
+
+    # -- anthropic_key --
+
+    def test_anthropic_key_matches(self) -> None:
+        """anthropic_key should explicitly match sk-ant- prefixed keys."""
+        pattern = REDACTION_PATTERNS["anthropic_key"]
+        # 'sk-ant-' followed by 95+ chars in real life; minimum 20 in test.
+        assert pattern.search("sk-ant-api03-" + "A" * 80)
+
+    def test_anthropic_key_no_false_positive(self) -> None:
+        """anthropic_key should not match unrelated sk- strings."""
+        pattern = REDACTION_PATTERNS["anthropic_key"]
+        assert not pattern.search("sk-ant-")
+        assert not pattern.search("sk-other-not-anthropic")
+
+    # -- openai_project_key --
+
+    def test_openai_project_key_matches(self) -> None:
+        """openai_project_key should match sk-proj- prefix."""
+        pattern = REDACTION_PATTERNS["openai_project_key"]
+        assert pattern.search("sk-proj-" + "A" * 30)
+
+    def test_openai_project_key_no_false_positive(self) -> None:
+        """openai_project_key should not match short or unrelated strings."""
+        pattern = REDACTION_PATTERNS["openai_project_key"]
+        assert not pattern.search("sk-proj-")
+        assert not pattern.search("sk-other")
+
+
+class TestNetworkIdentifierPatterns:
+    """Tests for IPv4 / IPv6 patterns (INC-014)."""
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "10.20.30.40",
+            "192.168.1.1",
+            "8.8.8.8",
+            "255.255.255.255",
+            "0.0.0.0",
+        ],
+    )
+    def test_ipv4_matches_valid(self, ip: str) -> None:
+        """ipv4 pattern should match well-formed IPv4 addresses."""
+        pattern = REDACTION_PATTERNS["ipv4"]
+        assert pattern.search(f"Server: {ip}")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "256.0.0.1",  # octet > 255
+            "1.2.3",  # too few octets
+            "1.2.3.4.5",  # too many octets
+            "999.999.999.999",  # all out of range
+        ],
+    )
+    def test_ipv4_rejects_invalid(self, value: str) -> None:
+        """ipv4 pattern should reject malformed addresses."""
+        pattern = REDACTION_PATTERNS["ipv4"]
+        # Some invalid values may match a substring of digits — assert that
+        # the *full* malformed value does not appear as a single match.
+        for m in pattern.finditer(value):
+            assert m.group() != value
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "2001:0db8:85a3:0000:0000:8a2e:0370:7334",  # full
+            "2001:db8::8a2e:370:7334",  # shortened
+            "::1",  # loopback
+            "fe80::1",  # link-local short
+            "::ffff:192.168.1.1",  # IPv4-mapped
+        ],
+    )
+    def test_ipv6_matches(self, ip: str) -> None:
+        """ipv6 pattern should match common IPv6 address forms."""
+        pattern = REDACTION_PATTERNS["ipv6"]
+        assert pattern.search(ip), f"Failed to match {ip}"
+
+    def test_ipv6_rejects_plain_text(self) -> None:
+        """ipv6 pattern should not match arbitrary colon-separated text."""
+        pattern = REDACTION_PATTERNS["ipv6"]
+        assert not pattern.search("http://example.com")
+        assert not pattern.search("hello:world:foo")
+
+
+# ---------------------------------------------------------------------------
+# High-entropy generic-secret detector (SEC-002, RedactionConfig.min_confidence)
+# ---------------------------------------------------------------------------
+
+
+class TestHighEntropyDetector:
+    """Tests for the generic high-entropy secret detector."""
+
+    def test_high_entropy_long_random_string_matches(
+        self, tmp_path: Path
+    ) -> None:
+        """A 32-char random hex string should be flagged."""
+        # Hex random secret — high entropy, no obvious pattern.
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        test_file = tmp_path / "data.txt"
+        test_file.write_text(f"token = {secret}\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        assert any(m.match_type == "high_entropy_string" for m in matches)
+
+    def test_low_entropy_string_not_matched(self, tmp_path: Path) -> None:
+        """A long but low-entropy run (e.g. all 'a') should not be flagged."""
+        test_file = tmp_path / "data.txt"
+        test_file.write_text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        assert not any(m.match_type == "high_entropy_string" for m in matches)
+
+    def test_short_strings_not_matched(self, tmp_path: Path) -> None:
+        """Strings shorter than 20 chars must not trigger entropy detection."""
+        test_file = tmp_path / "data.txt"
+        # Below the 20-char minimum substring length.
+        test_file.write_text("abc12345xyz9\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        assert not any(m.match_type == "high_entropy_string" for m in matches)
+
+    def test_min_confidence_gates_detection(self, tmp_path: Path) -> None:
+        """Raising min_confidence should suppress low-entropy candidates."""
+        # A run that is borderline-entropy.
+        borderline = "abcdefgh12345678ijkl"
+        test_file = tmp_path / "data.txt"
+        test_file.write_text(borderline + "\n")
+
+        # A very strict threshold drops the match.
+        strict = RedactionScanner(config=RedactionConfig(min_confidence=1.0))
+        strict_matches = strict.scan_file(test_file)
+        assert not any(
+            m.match_type == "high_entropy_string" for m in strict_matches
+        )
+
+        # A permissive threshold keeps it.
+        permissive = RedactionScanner(
+            config=RedactionConfig(min_confidence=0.0),
+        )
+        permissive_matches = permissive.scan_file(test_file)
+        assert any(
+            m.match_type == "high_entropy_string" for m in permissive_matches
+        )
+
+    def test_high_entropy_respects_allowlist(self, tmp_path: Path) -> None:
+        """A high-entropy string in the allowlist must not be flagged."""
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        test_file = tmp_path / "data.txt"
+        test_file.write_text(secret + "\n")
+
+        config = RedactionConfig(false_positive_allowlist=[secret])
+        scanner = RedactionScanner(config=config)
+        matches = scanner.scan_file(test_file)
+
+        assert not any(m.match_type == "high_entropy_string" for m in matches)
+
+
+# ---------------------------------------------------------------------------
+# replacement_template config field (INC-009)
+# ---------------------------------------------------------------------------
+
+
+class TestReplacementTemplate:
+    """Tests for RedactionConfig.replacement_template (INC-009)."""
+
+    def test_default_template_matches_documentation(self) -> None:
+        """The default template must produce the documented marker."""
+        from creek.config import RedactionConfig as CfgCls
+
+        cfg = CfgCls()
+        assert cfg.replacement_template == "[REDACTED:{name}]"
+
+    def test_custom_template_used_in_redactor(self) -> None:
+        """Custom replacement_template should drive the redactor output."""
+        from creek.config import RedactionConfig as CfgCls
+
+        cfg = CfgCls(replacement_template="<<{name}>>")
+        scanner = RedactionScanner(config=cfg)
+        redactor = Redactor(config=cfg, salt=scanner.salt)
+
+        out = redactor.redact_content(
+            "key = AKIAIOSFODNN7EXAMPLE",
+            pattern_types=["api_key"],
+        )
+
+        assert "<<api_key>>" in out
+        assert "REDACTED" not in out
+
+    def test_invalid_template_missing_placeholder_rejected(self) -> None:
+        """A template without {name} must be rejected at config load."""
+        from pydantic import ValidationError
+
+        from creek.config import RedactionConfig as CfgCls
+
+        with pytest.raises(ValidationError):
+            CfgCls(replacement_template="no placeholder here")
+
+    def test_template_with_non_name_placeholder_rejected(self) -> None:
+        """A template with an unknown placeholder must be rejected."""
+        from pydantic import ValidationError
+
+        from creek.config import RedactionConfig as CfgCls
+
+        with pytest.raises(ValidationError):
+            CfgCls(replacement_template="{type}")
