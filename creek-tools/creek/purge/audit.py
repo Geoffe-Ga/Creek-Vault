@@ -1,12 +1,16 @@
 """Audit log for purge operations.
 
-Records every purge operation — including dry runs — to a JSON log at
-``00-Creek-Meta/Processing-Log/purge-log.json``. Each entry captures the
-timestamp, operation, target, affected count, operator, and dry-run flag.
+Records every purge operation — including dry runs — to a tamper-
+evident JSONL log at ``<vault>/00-Creek-Meta/audit/purge.jsonl``. Each
+entry captures the timestamp, operation, criteria dict, affected
+fragment IDs, deletion counts, references scrubbed, embeddings removed,
+operator, and dry-run flag.
 
-The log is a JSON array; new entries are appended. If the file does not
-exist it is created. Malformed existing logs are rebuilt from scratch
-rather than losing new entries.
+Backward compatibility: an existing legacy
+``<vault>/00-Creek-Meta/Processing-Log/purge-log.json`` file is migrated
+into the new JSONL log on first read or write, then removed. The
+migration writes one entry per legacy record plus a final
+``purge.audit.migration`` marker, so the chain captures the move.
 """
 
 from __future__ import annotations
@@ -14,16 +18,22 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from creek.audit import AuditLog
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_OPERATOR = "human via CLI"
+
+LEGACY_PURGE_LOG_RELPATH = Path("00-Creek-Meta/Processing-Log/purge-log.json")
+"""Pre-Batch-C purge log location used for one-time migration."""
+
+PURGE_AUDIT_RELPATH = Path("00-Creek-Meta/audit/purge.jsonl")
+"""Canonical Batch-C purge audit log location."""
 
 
 class PurgeAuditEntry(BaseModel):
@@ -33,28 +43,69 @@ class PurgeAuditEntry(BaseModel):
         timestamp: UTC ISO-format datetime of the purge.
         operation: Operation name (``fragment``, ``source``,
             ``classifications``, ``daterange``, ``vault``).
-        target: The purge target (fragment ID, source type, etc.).
-        count: Number of affected files or fragments.
-        operator: Who performed the purge (default ``"human via CLI"``).
+        criteria: Structured input that drove the purge (e.g. fragment
+            ID, source platform, date range).
+        affected_fragments: Fragment IDs touched by the operation.
+        fragments_deleted: Number of fragment files removed from disk.
+        references_scrubbed: Number of wiki-link references removed.
+        embeddings_removed: Number of fragments whose embeddings should
+            be considered invalidated by the purge.
+        operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
+        target: Legacy field preserved for backward compatibility on
+            read; populated only when reading pre-Batch-C entries.
+        count: Legacy fragment count preserved for backward compatibility
+            on read.
     """
 
     timestamp: str = Field(
         default_factory=lambda: datetime.now(tz=UTC).isoformat(),
     )
     operation: str
-    target: str
-    count: int
+    criteria: dict[str, Any] = Field(default_factory=dict)
+    affected_fragments: list[str] = Field(default_factory=list)
+    fragments_deleted: int = 0
+    references_scrubbed: int = 0
+    embeddings_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
+    target: str | None = None
+    count: int | None = None
+
+
+def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a pre-Batch-C entry shape into the current schema.
+
+    Pre-Batch-C entries carried ``target`` (str) and ``count`` (int).
+    The new schema uses ``criteria`` (dict) and ``fragments_deleted``.
+    Both old fields are preserved on the resulting entry so a downstream
+    consumer that still expects them does not break.
+    """
+    if "criteria" in raw and "affected_fragments" in raw:
+        return raw
+    upgraded = dict(raw)
+    target = raw.get("target")
+    if target is not None and "criteria" not in raw:
+        upgraded["criteria"] = {"target": target}
+    if "count" in raw and "fragments_deleted" not in raw:
+        upgraded["fragments_deleted"] = int(raw.get("count", 0) or 0)
+    upgraded.setdefault("affected_fragments", [])
+    upgraded.setdefault("references_scrubbed", 0)
+    upgraded.setdefault("embeddings_removed", 0)
+    return upgraded
+
 
 class PurgeAuditLog:
-    """Append-only JSON audit log for purge operations.
+    """Tamper-evident JSONL audit log for purge operations.
+
+    The log lives at :data:`PURGE_AUDIT_RELPATH` under the vault root
+    and is backed by :class:`creek.audit.AuditLog`, so every append
+    extends a sha256 hash chain that :meth:`creek.audit.AuditLog.verify`
+    can validate.
 
     Args:
-        vault_path: Root of the Obsidian vault. The log file lives at
-            ``{vault_path}/00-Creek-Meta/Processing-Log/purge-log.json``.
+        vault_path: Root of the Obsidian vault.
     """
 
     def __init__(self, vault_path: Path) -> None:
@@ -64,58 +115,96 @@ class PurgeAuditLog:
             vault_path: Root of the Obsidian vault.
         """
         self.vault_path = vault_path
-        self.log_path = (
-            vault_path / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
-        )
+        self.log_path = vault_path / PURGE_AUDIT_RELPATH
+        self._legacy_path = vault_path / LEGACY_PURGE_LOG_RELPATH
+        self._audit = AuditLog(self.log_path)
 
     def append(self, entry: PurgeAuditEntry) -> None:
         """Append a new entry to the audit log.
 
-        Creates the log directory and file if missing. If the existing
-        log is malformed, it is replaced with a fresh log containing
-        only the new entry.
-
         Args:
             entry: The audit entry to append.
         """
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        entries = self._read_entries()
-        entries.append(entry.model_dump(mode="json"))
-        self.log_path.write_text(
-            json.dumps(entries, indent=2),
-            encoding="utf-8",
-        )
+        self._migrate_legacy_if_needed()
+        payload = entry.model_dump(mode="json", exclude_none=True)
+        self._audit.append(payload)
 
     def read(self) -> list[PurgeAuditEntry]:
         """Read all entries from the audit log.
 
         Returns:
-            List of parsed :class:`PurgeAuditEntry` objects. Empty list
-            if the log does not exist or is malformed.
+            List of parsed :class:`PurgeAuditEntry` objects in append
+            order.
         """
-        entries = self._read_entries()
-        return [PurgeAuditEntry.model_validate(e) for e in entries]
+        self._migrate_legacy_if_needed()
+        entries: list[PurgeAuditEntry] = []
+        for raw in self._audit.read():
+            entry_data = {k: v for k, v in raw.items() if k != "prev_hash"}
+            upgraded = _coerce_legacy_entry(entry_data)
+            entries.append(PurgeAuditEntry.model_validate(upgraded))
+        return entries
 
-    def _read_entries(self) -> list[dict[str, object]]:
-        """Read raw entry dicts from the log file.
+    def verify(self) -> None:
+        """Verify the audit log's hash chain.
 
-        Returns:
-            List of raw entry dicts. Empty list if the log is missing
-            or unreadable.
+        Raises:
+            creek.audit.AuditChainBroken: If the chain is broken.
         """
-        if not self.log_path.exists():
+        self._audit.verify()
+
+    def _migrate_legacy_if_needed(self) -> None:
+        """One-shot migration of the pre-Batch-C JSON-array log.
+
+        If the legacy file exists and the new JSONL log is empty, every
+        legacy entry is replayed into the new chain in order, a
+        ``purge.audit.migration`` marker is appended, and the legacy file
+        is unlinked. Subsequent calls become a cheap path-existence
+        check thanks to the unlink.
+        """
+        if not self._legacy_path.exists():
+            return
+        if self.log_path.exists() and self.log_path.stat().st_size > 0:
+            return
+        legacy_entries = self._load_legacy_entries()
+        if legacy_entries is None:
+            return
+        for entry in legacy_entries:
+            self._audit.append(_coerce_legacy_entry(entry))
+        self._audit.append(self._migration_marker(len(legacy_entries)))
+        self._legacy_path.unlink(missing_ok=True)
+
+    def _load_legacy_entries(self) -> list[dict[str, Any]] | None:
+        """Return parsed legacy entries, or ``None`` when unreadable."""
+        try:
+            raw = self._legacy_path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Could not read legacy purge log %s", self._legacy_path)
+            return None
+        if not raw.strip():
             return []
         try:
-            raw = self.log_path.read_text(encoding="utf-8")
-            if not raw.strip():
-                return []
             data = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             logger.warning(
-                "Purge log at %s is unreadable — starting fresh.",
-                self.log_path,
+                "Legacy purge log %s is not valid JSON; skipping migration",
+                self._legacy_path,
             )
             return []
         if not isinstance(data, list):
             return []
         return [item for item in data if isinstance(item, dict)]
+
+    def _migration_marker(self, migrated_count: int) -> dict[str, Any]:
+        """Build the ``purge.audit.migration`` chain marker payload."""
+        return {
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "operation": "purge.audit.migration",
+            "criteria": {"legacy_path": str(self._legacy_path)},
+            "affected_fragments": [],
+            "fragments_deleted": 0,
+            "references_scrubbed": 0,
+            "embeddings_removed": 0,
+            "operator": "system",
+            "dry_run": False,
+            "migrated_entries": migrated_count,
+        }

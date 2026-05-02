@@ -276,8 +276,10 @@ def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
     assert len(entries) == 1
     entry = entries[0]
     assert entry.operation == "fragment"
-    assert entry.target == "frag-A"
-    assert entry.count == 1
+    assert entry.criteria == {"fragment_id": "frag-A"}
+    assert entry.affected_fragments == ["frag-A"]
+    assert entry.fragments_deleted == 1
+    assert entry.embeddings_removed == 1
     assert entry.operator == "human via CLI"
     assert entry.dry_run is False
 
@@ -492,44 +494,55 @@ def test_audit_log_appends_entries(tmp_path: Path) -> None:
     log = PurgeAuditLog(vault)
 
     log.append(
-        PurgeAuditEntry(operation="fragment", target="frag-A", count=1),
+        PurgeAuditEntry(
+            operation="fragment",
+            criteria={"fragment_id": "frag-A"},
+            affected_fragments=["frag-A"],
+            fragments_deleted=1,
+        ),
     )
     log.append(
-        PurgeAuditEntry(operation="source", target="claude", count=3),
+        PurgeAuditEntry(
+            operation="source",
+            criteria={"source_type": "claude"},
+            fragments_deleted=3,
+        ),
     )
 
     entries = log.read()
     assert len(entries) == 2
-    assert entries[0].target == "frag-A"
-    assert entries[1].target == "claude"
+    assert entries[0].criteria["fragment_id"] == "frag-A"
+    assert entries[1].criteria["source_type"] == "claude"
 
 
 def test_audit_log_path_location(tmp_path: Path) -> None:
-    """Audit log lives at 00-Creek-Meta/Processing-Log/purge-log.json."""
+    """Audit log lives at 00-Creek-Meta/audit/purge.jsonl."""
     vault = _make_vault(tmp_path)
     log = PurgeAuditLog(vault)
-    log.append(PurgeAuditEntry(operation="vault", target="x", count=0))
+    log.append(PurgeAuditEntry(operation="vault"))
 
-    expected = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    expected = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
     assert expected.exists()
-    data = json.loads(expected.read_text(encoding="utf-8"))
-    assert isinstance(data, list)
-    assert data[0]["operation"] == "vault"
+    lines = expected.read_text(encoding="utf-8").splitlines()
+    payload = json.loads(lines[0])
+    assert payload["operation"] == "vault"
+    assert payload["prev_hash"] == "0" * 64
 
 
-def test_audit_log_recovers_from_corruption(tmp_path: Path) -> None:
-    """Malformed log is rebuilt when appending a new entry."""
+def test_audit_log_chain_detects_tampering(tmp_path: Path) -> None:
+    """Removing the first entry breaks the chain on verify()."""
+    from creek.audit import AuditChainBroken
+
     vault = _make_vault(tmp_path)
     log = PurgeAuditLog(vault)
-    log.log_path.parent.mkdir(parents=True, exist_ok=True)
-    log.log_path.write_text("{not valid json", encoding="utf-8")
+    log.append(PurgeAuditEntry(operation="fragment", criteria={"id": "A"}))
+    log.append(PurgeAuditEntry(operation="fragment", criteria={"id": "B"}))
 
-    log.append(
-        PurgeAuditEntry(operation="fragment", target="frag-A", count=1),
-    )
+    lines = log.log_path.read_text(encoding="utf-8").splitlines()
+    log.log_path.write_text(lines[1] + "\n", encoding="utf-8")
 
-    entries = log.read()
-    assert len(entries) == 1
+    with pytest.raises(AuditChainBroken):
+        log.verify()
 
 
 def test_audit_log_read_missing_returns_empty(tmp_path: Path) -> None:
@@ -537,6 +550,65 @@ def test_audit_log_read_missing_returns_empty(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     log = PurgeAuditLog(vault)
     assert log.read() == []
+
+
+def test_audit_log_migrates_legacy_purge_log(tmp_path: Path) -> None:
+    """Pre-Batch-C purge-log.json is migrated to the new JSONL log."""
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-X",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+
+    assert not legacy_path.exists()
+    assert log.log_path.exists()
+    assert any(
+        (e.operation == "fragment" and "frag-X" in (e.target or ""))
+        or e.criteria.get("target") == "frag-X"
+        for e in entries
+    )
+    assert any(e.operation == "purge.audit.migration" for e in entries)
+
+
+def test_audit_log_concurrent_appends_lose_nothing(tmp_path: Path) -> None:
+    """Threaded appends produce N entries with no losses."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    vault = _make_vault(tmp_path)
+
+    def append_n(worker: int) -> None:
+        log = PurgeAuditLog(vault)
+        for j in range(20):
+            log.append(
+                PurgeAuditEntry(
+                    operation="fragment",
+                    criteria={"worker": worker, "j": j},
+                ),
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(append_n, range(4)))
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+    assert len(entries) == 80
+    log.verify()
 
 
 # ---------------------------------------------------------------------------
@@ -885,11 +957,14 @@ def test_audit_log_empty_file_is_treated_as_empty(tmp_path: Path) -> None:
     assert log.read() == []
 
 
-def test_audit_log_non_list_json_is_discarded(tmp_path: Path) -> None:
-    """A top-level non-list JSON value is discarded on read."""
+def test_audit_log_legacy_corrupt_json_is_skipped(tmp_path: Path) -> None:
+    """A malformed legacy log is left alone but does not crash readers."""
     vault = _make_vault(tmp_path)
-    log = PurgeAuditLog(vault)
-    log.log_path.parent.mkdir(parents=True, exist_ok=True)
-    log.log_path.write_text('{"not": "a list"}', encoding="utf-8")
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text("{not json", encoding="utf-8")
 
-    assert log.read() == []
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+
+    assert any(e.operation == "purge.audit.migration" for e in entries)

@@ -36,6 +36,10 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    filter_fragments_by_tier,
+)
 from creek.models import (
     Eddy,
     Fragment,
@@ -227,8 +231,18 @@ def _validate_fragment(post: frontmatter.Post, path: Path) -> Fragment | None:
         return None
 
 
-def _load_fragments(root: Path) -> list[tuple[Fragment, str]]:
-    """Load every fragment under *root* as ``(fragment, body)`` tuples."""
+def _load_fragments(
+    root: Path,
+    *,
+    privacy_override: PrivacyTierOverride | None = None,
+) -> list[tuple[Fragment, str]]:
+    """Load every fragment under *root* as ``(fragment, body)`` tuples.
+
+    ``privacy_override`` is forwarded to
+    :func:`~creek.classify.privacy_filter.filter_fragments_by_tier`; the
+    default policy excludes intimate fragments and replaces personal
+    bodies with title-only summaries.
+    """
     if not root.exists():
         return []
     collected: list[tuple[Fragment, str]] = []
@@ -239,26 +253,45 @@ def _load_fragments(root: Path) -> list[tuple[Fragment, str]]:
         fragment = _validate_fragment(post, md_file)
         if fragment is not None:
             collected.append((fragment, post.content))
-    return collected
+    return list(filter_fragments_by_tier(collected, override=privacy_override))
 
 
-def _load_liminal_fragments(liminal_root: Path) -> list[tuple[Fragment, str, str]]:
+def _liminal_kind(md_file: Path, liminal_root: Path) -> str | None:
+    """Return the immediate subfolder name (``Unnamed`` etc.), or ``None``.
+
+    Returns ``None`` to signal "skip this file" — used for the
+    ``synchronicities`` subfolder, whose records are reflection notes
+    rather than fragments.
+    """
+    try:
+        relative = md_file.relative_to(liminal_root)
+    except ValueError:  # pragma: no cover - defensive
+        return None
+    kind = relative.parts[0] if relative.parts else ""
+    if kind.lower() == "synchronicities":
+        return None
+    return kind
+
+
+def _load_liminal_fragments(
+    liminal_root: Path,
+    *,
+    privacy_override: PrivacyTierOverride | None = None,
+) -> list[tuple[Fragment, str, str]]:
     """Return ``(fragment, body, kind)`` tuples for liminal fragments.
 
     *kind* is the immediate subfolder name under ``10-Liminal`` — typically
     ``"Unnamed"`` or ``"Compost"``. The Synchronicities subfolder is
     excluded because its records are reflection notes, not fragments.
+
+    ``privacy_override`` is forwarded to the shared tier filter.
     """
     if not liminal_root.exists():
         return []
     collected: list[tuple[Fragment, str, str]] = []
     for md_file in sorted(liminal_root.rglob("*.md")):
-        try:
-            relative = md_file.relative_to(liminal_root)
-        except ValueError:  # pragma: no cover - defensive
-            continue
-        kind = relative.parts[0] if relative.parts else ""
-        if kind.lower() == "synchronicities":
+        kind = _liminal_kind(md_file, liminal_root)
+        if kind is None:
             continue
         post = _safe_post(md_file)
         if post is None:
@@ -266,7 +299,10 @@ def _load_liminal_fragments(liminal_root: Path) -> list[tuple[Fragment, str, str
         fragment = _validate_fragment(post, md_file)
         if fragment is not None:
             collected.append((fragment, post.content, kind))
-    return collected
+    kind_by_id: dict[str, str] = {f.id: kind for f, _body, kind in collected}
+    pairs = [(f, body) for f, body, _kind in collected]
+    filtered = list(filter_fragments_by_tier(pairs, override=privacy_override))
+    return [(f, body, kind_by_id[f.id]) for f, body in filtered]
 
 
 _ModelT = TypeVar("_ModelT", Thread, Eddy)
@@ -333,10 +369,25 @@ def _load_synchronicities(root: Path) -> list[tuple[str, str, float]]:
     return pairs
 
 
-def _load_mining_snapshot(vault_path: Path) -> MiningSnapshot:
-    """Scan *vault_path* for every record the miner needs."""
-    fragments = _load_fragments(vault_path / _FRAGMENTS_SUBDIR)
-    liminal = _load_liminal_fragments(vault_path / _LIMINAL_SUBDIR)
+def _load_mining_snapshot(
+    vault_path: Path,
+    *,
+    privacy_override: PrivacyTierOverride | None = None,
+) -> MiningSnapshot:
+    """Scan *vault_path* for every record the miner needs.
+
+    The privacy override flows through to fragment loaders so callers
+    cannot accidentally bypass tier filtering by reading the snapshot
+    directly.
+    """
+    fragments = _load_fragments(
+        vault_path / _FRAGMENTS_SUBDIR,
+        privacy_override=privacy_override,
+    )
+    liminal = _load_liminal_fragments(
+        vault_path / _LIMINAL_SUBDIR,
+        privacy_override=privacy_override,
+    )
     threads = _load_typed(
         vault_path / _THREADS_SUBDIR,
         type_tag="thread",
@@ -373,6 +424,7 @@ class IdeaMiner:
         min_chain_length: int = DEFAULT_MIN_CHAIN_LENGTH,
         similarity_liminal: float = DEFAULT_SIMILARITY_LIMINAL,
         similarity_resonance: float = DEFAULT_SIMILARITY_RESONANCE,
+        privacy_override: PrivacyTierOverride | None = None,
     ) -> None:
         """Initialise with optional threshold and similarity overrides.
 
@@ -387,12 +439,16 @@ class IdeaMiner:
                 to anchor to an eddy.
             similarity_resonance: Minimum similarity for a resonance-chain
                 edge.
+            privacy_override: Optional ``--include-tier`` value. The
+                default policy excludes intimate fragments and replaces
+                personal bodies with title-only summaries.
         """
         self._similarity_fn: SimilarityFn = similarity_fn or _jaccard_similarity
         self.min_thread_fragments = min_thread_fragments
         self.min_chain_length = min_chain_length
         self.similarity_liminal = similarity_liminal
         self.similarity_resonance = similarity_resonance
+        self.privacy_override = privacy_override
 
     def _resolve_snapshot(
         self,
@@ -402,7 +458,10 @@ class IdeaMiner:
         """Return *snapshot* if provided, otherwise load from *vault_path*."""
         if snapshot is not None:
             return snapshot
-        return _load_mining_snapshot(vault_path)
+        return _load_mining_snapshot(
+            vault_path,
+            privacy_override=self.privacy_override,
+        )
 
     # ---- Strategy: Thread terminus ----
 

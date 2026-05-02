@@ -32,6 +32,10 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    filter_fragments_by_tier,
+)
 from creek.models import (
     Eddy,
     Fragment,
@@ -113,11 +117,21 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
         return None
 
 
-def _load_fragments_by_id(root: Path) -> dict[str, tuple[Fragment, str]]:
-    """Return ``{fragment.id: (fragment, body)}`` for every fragment under *root*."""
+def _load_fragments_by_id(
+    root: Path,
+    *,
+    privacy_override: PrivacyTierOverride | None = None,
+) -> dict[str, tuple[Fragment, str]]:
+    """Return ``{fragment.id: (fragment, body)}`` for every fragment under *root*.
+
+    The privacy override is forwarded to
+    :func:`~creek.classify.privacy_filter.filter_fragments_by_tier` so
+    intimate content never leaks into the draft prompt under default
+    policy and personal bodies are replaced by title-only summaries.
+    """
     if not root.exists():
         return {}
-    collected: dict[str, tuple[Fragment, str]] = {}
+    pairs: list[tuple[Fragment, str]] = []
     for md_file in sorted(root.rglob("*.md")):
         post = _safe_post(md_file)
         if post is None:
@@ -130,8 +144,9 @@ def _load_fragments_by_id(root: Path) -> dict[str, tuple[Fragment, str]]:
         except ValidationError:
             logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
             continue
-        collected[fragment.id] = (fragment, post.content)
-    return collected
+        pairs.append((fragment, post.content))
+    filtered = filter_fragments_by_tier(pairs, override=privacy_override)
+    return {f.id: (f, body) for f, body in filtered}
 
 
 def _load_threads_by_id(root: Path) -> dict[str, Thread]:
@@ -240,6 +255,7 @@ class DraftGenerator:
         llm: DraftLLM,
         skills_root: Path,
         voice_core: str = "",
+        privacy_override: PrivacyTierOverride | None = None,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -250,10 +266,14 @@ class DraftGenerator:
             voice_core: Optional voice-core description the prompt will
                 open with (e.g. a paragraph describing the human's
                 baseline voice).
+            privacy_override: Optional ``--include-tier`` value applied
+                when scanning vault fragments for skill inference and
+                source material gathering.
         """
         self._llm = llm
         self.skills_root = skills_root
         self.voice_core = voice_core
+        self.privacy_override = privacy_override
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -309,7 +329,10 @@ class DraftGenerator:
         loaded = (
             fragments
             if fragments is not None
-            else _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
+            else _load_fragments_by_id(
+                vault_path / _FRAGMENTS_SUBDIR,
+                privacy_override=self.privacy_override,
+            )
         )
         source_frags = [
             loaded[fid][0] for fid in idea.source_fragments if fid in loaded
@@ -385,7 +408,10 @@ class DraftGenerator:
         loaded = (
             fragments
             if fragments is not None
-            else _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
+            else _load_fragments_by_id(
+                vault_path / _FRAGMENTS_SUBDIR,
+                privacy_override=self.privacy_override,
+            )
         )
         frag_block = _render_fragment_section(idea.source_fragments, loaded)
         if frag_block:
@@ -443,7 +469,10 @@ class DraftGenerator:
             A populated :class:`Draft` — the body comes from the LLM
             callable; everything else is provenance.
         """
-        fragments = _load_fragments_by_id(vault_path / _FRAGMENTS_SUBDIR)
+        fragments = _load_fragments_by_id(
+            vault_path / _FRAGMENTS_SUBDIR,
+            privacy_override=self.privacy_override,
+        )
         skill_stack = self.select_skill_stack(
             idea,
             vault_path=vault_path,

@@ -1,0 +1,166 @@
+"""Tests for the tamper-evident JSONL audit log primitive.
+
+The :class:`creek.audit.AuditLog` is the integrity backbone for every
+compliance log in the project (purge, redaction, privacy overrides). The
+tests in this module exercise three guarantees:
+
+* Append is atomic across threads and processes (no losses, no
+  half-written lines).
+* The hash chain detects any post-hoc tampering with a clear exception.
+* The schema is JSONL — the file remains byte-iterable even mid-run, so
+  ``O_APPEND`` writes never trigger a read-modify-write cycle.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
+
+import pytest
+
+from creek.audit import AuditChainBroken, AuditLog
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def test_append_round_trips_payload(tmp_path: Path) -> None:
+    """A single append is observable via read()."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"operation": "x", "i": 1})
+
+    entries = list(log.read())
+    assert len(entries) == 1
+    assert entries[0]["operation"] == "x"
+    assert entries[0]["i"] == 1
+
+
+def test_append_writes_jsonl_one_entry_per_line(tmp_path: Path) -> None:
+    """Each appended payload becomes one newline-terminated JSON object."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+    log.append({"op": "second"})
+
+    raw = log.path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["op"] == "first"
+    assert json.loads(lines[1])["op"] == "second"
+
+
+def test_genesis_prev_hash_is_zero(tmp_path: Path) -> None:
+    """The first entry has a genesis (all-zero) prev_hash."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+
+    entry = next(iter(log.read()))
+    assert entry["prev_hash"] == "0" * 64
+
+
+def test_subsequent_prev_hash_matches_previous_line(tmp_path: Path) -> None:
+    """The prev_hash of entry N equals sha256 of entry N-1's bytes."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+    log.append({"op": "second"})
+
+    raw = log.path.read_text(encoding="utf-8").splitlines()
+    expected = hashlib.sha256(raw[0].encode("utf-8")).hexdigest()
+    second_entry = json.loads(raw[1])
+    assert second_entry["prev_hash"] == expected
+
+
+def test_verify_passes_for_untampered_log(tmp_path: Path) -> None:
+    """verify() returns silently when every prev_hash is intact."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    for i in range(5):
+        log.append({"op": "x", "i": i})
+
+    log.verify()
+
+
+def test_verify_rejects_removed_first_entry(tmp_path: Path) -> None:
+    """Removing the first line breaks the chain and verify() raises."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+    log.append({"op": "second"})
+
+    lines = log.path.read_text(encoding="utf-8").splitlines()
+    log.path.write_text(lines[1] + "\n", encoding="utf-8")
+
+    with pytest.raises(AuditChainBroken):
+        log.verify()
+
+
+def test_verify_rejects_modified_payload(tmp_path: Path) -> None:
+    """Mutating a stored field breaks the chain at the next entry."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first", "value": 1})
+    log.append({"op": "second"})
+
+    lines = log.path.read_text(encoding="utf-8").splitlines()
+    tampered_first = lines[0].replace('"value": 1', '"value": 999')
+    log.path.write_text(tampered_first + "\n" + lines[1] + "\n", encoding="utf-8")
+
+    with pytest.raises(AuditChainBroken):
+        log.verify()
+
+
+def test_verify_handles_empty_log(tmp_path: Path) -> None:
+    """An empty log is trivially valid."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.verify()
+
+
+def test_verify_handles_missing_log(tmp_path: Path) -> None:
+    """A missing log is trivially valid (no entries to verify)."""
+    log = AuditLog(tmp_path / "missing.jsonl")
+    log.verify()
+
+
+def test_read_missing_returns_empty(tmp_path: Path) -> None:
+    """read() on a missing log yields no entries."""
+    log = AuditLog(tmp_path / "missing.jsonl")
+    assert list(log.read()) == []
+
+
+def test_concurrent_appends_lose_nothing(tmp_path: Path) -> None:
+    """Eight threads each appending 100 entries lose no entries."""
+    path = tmp_path / "audit.jsonl"
+
+    def append_n(worker: int) -> None:
+        log = AuditLog(path)
+        for j in range(100):
+            log.append({"op": "x", "worker": worker, "j": j})
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(append_n, range(8)))
+
+    log = AuditLog(path)
+    assert sum(1 for _ in log.read()) == 800
+    log.verify()
+
+
+def test_corrupt_line_raises_on_read(tmp_path: Path) -> None:
+    """A malformed JSON line raises AuditChainBroken from verify()."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+    log.path.write_text("not json\n", encoding="utf-8")
+
+    with pytest.raises(AuditChainBroken):
+        log.verify()
+
+
+def test_payload_with_prev_hash_is_rejected(tmp_path: Path) -> None:
+    """Caller-supplied prev_hash is forbidden — the log owns the chain."""
+    log = AuditLog(tmp_path / "audit.jsonl")
+    with pytest.raises(ValueError, match="prev_hash"):
+        log.append({"op": "x", "prev_hash": "deadbeef"})
+
+
+def test_creates_parent_directory(tmp_path: Path) -> None:
+    """Append creates the parent directory tree if missing."""
+    log = AuditLog(tmp_path / "deep" / "nested" / "audit.jsonl")
+    log.append({"op": "first"})
+    assert log.path.exists()

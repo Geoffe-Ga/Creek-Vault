@@ -62,6 +62,9 @@ class PurgeResult(BaseModel):
     Attributes:
         operation: Name of the operation (``fragment``, ``source``, ...).
         target: The purge target (fragment id, source type, date range, ...).
+        criteria: Structured representation of *target* used for the
+            audit log (e.g. ``{"fragment_id": "frag-abc"}``).
+        affected_fragment_ids: IDs of fragments touched by the operation.
         dry_run: Whether deletions were only previewed.
         deleted_files: Paths of files deleted (or that would be deleted).
         fragments_affected: Number of fragments directly affected.
@@ -73,6 +76,8 @@ class PurgeResult(BaseModel):
 
     operation: str
     target: str
+    criteria: dict[str, object] = Field(default_factory=dict)
+    affected_fragment_ids: list[str] = Field(default_factory=list)
     dry_run: bool = False
     deleted_files: list[str] = Field(default_factory=list)
     fragments_affected: int = 0
@@ -126,6 +131,7 @@ class PurgeEngine:
         result = PurgeResult(
             operation="fragment",
             target=fragment_id,
+            criteria={"fragment_id": fragment_id},
             dry_run=self.dry_run,
         )
         frag_file, post = self._find_fragment_by_id(fragment_id)
@@ -138,6 +144,7 @@ class PurgeEngine:
         eddy_ids = [str(e) for e in post.get("eddies", []) or []]
 
         result.deleted_files.append(str(frag_file))
+        result.affected_fragment_ids.append(fragment_id)
         result.fragments_affected = 1
         result.wikilinks_removed = self._scrub_wikilinks(title, exclude=frag_file)
         result.threads_updated = self._decrement_counts(
@@ -170,6 +177,7 @@ class PurgeEngine:
         result = PurgeResult(
             operation="source",
             target=source_type,
+            criteria={"source_type": source_type},
             dry_run=self.dry_run,
         )
         matches = self._fragments_from_source(source_type)
@@ -204,6 +212,7 @@ class PurgeEngine:
         result = PurgeResult(
             operation="classifications",
             target="all",
+            criteria={"scope": "all"},
             dry_run=self.dry_run,
         )
         for frag_file in self._list_fragment_files():
@@ -212,6 +221,9 @@ class PurgeEngine:
                 continue
             if self._reset_classifications(post):
                 result.classifications_reset += 1
+                frag_id = post.get("id")
+                if isinstance(frag_id, str):
+                    result.affected_fragment_ids.append(frag_id)
                 if not self.dry_run:
                     frag_file.write_text(
                         frontmatter.dumps(post),
@@ -248,6 +260,7 @@ class PurgeEngine:
         result = PurgeResult(
             operation="daterange",
             target=target,
+            criteria={"start": start.isoformat(), "end": end.isoformat()},
             dry_run=self.dry_run,
         )
         for frag_file in self._list_fragment_files():
@@ -290,6 +303,7 @@ class PurgeEngine:
         result = PurgeResult(
             operation="vault",
             target="entire vault",
+            criteria={"scope": "entire vault"},
             dry_run=self.dry_run,
         )
         for folder in _VAULT_CONTENT_FOLDERS:
@@ -321,6 +335,9 @@ class PurgeEngine:
         eddy_ids = [str(e) for e in post.get("eddies", []) or []]
 
         result.deleted_files.append(str(frag_file))
+        frag_id = post.get("id")
+        if isinstance(frag_id, str):
+            result.affected_fragment_ids.append(frag_id)
         result.fragments_affected += 1
         result.wikilinks_removed += self._scrub_wikilinks(
             title,
@@ -526,13 +543,25 @@ class PurgeEngine:
     def _write_audit(self, result: PurgeResult) -> None:
         """Append a :class:`PurgeAuditEntry` for a completed purge.
 
+        ``fragments_deleted`` counts only operations that remove files
+        from disk; ``classifications`` resets metadata in place and
+        therefore reports zero deletions. ``embeddings_removed`` mirrors
+        ``fragments_deleted`` because every deleted fragment's cached
+        embedding is invalidated at the next ``creek link`` run; the
+        engine does not maintain the embedding cache directly.
+
         Args:
             result: The result whose metadata should be logged.
         """
+        deletes_files = result.operation != "classifications"
+        fragments_deleted = result.fragments_affected if deletes_files else 0
         entry = PurgeAuditEntry(
             operation=result.operation,
-            target=result.target,
-            count=result.fragments_affected,
+            criteria=dict(result.criteria),
+            affected_fragments=list(result.affected_fragment_ids),
+            fragments_deleted=fragments_deleted,
+            references_scrubbed=result.wikilinks_removed,
+            embeddings_removed=fragments_deleted,
             dry_run=result.dry_run,
         )
         self.audit_log.append(entry)

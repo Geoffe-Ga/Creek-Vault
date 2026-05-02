@@ -23,6 +23,7 @@ from rich.table import Table
 from rich.text import Text
 
 from creek.config import load_config
+from creek.redact.audit import RedactionAuditEntry, RedactionAuditLog
 from creek.redact.patterns import PATTERN_METADATA
 from creek.redact.redactor import Redactor
 from creek.redact.scanner import RedactionScanner, ScanSummary
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from rich.console import Console
 
     from creek.config import CreekConfig
+    from creek.redact.scanner import RedactionMatch
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +353,53 @@ def _atomic_write(file_path: Path, content: str) -> None:
         raise
 
 
+def _matches_by_file(
+    summary: ScanSummary,
+) -> dict[Path, list[RedactionMatch]]:
+    """Group *summary*'s matches into ``{file_path: [matches]}``."""
+    grouped: dict[Path, list[RedactionMatch]] = {}
+    for match in summary.matches:
+        grouped.setdefault(match.file_path, []).append(match)
+    return grouped
+
+
+def _audit_entry_for_file(
+    file_path: Path,
+    file_matches: list[RedactionMatch],
+    *,
+    dry_run: bool,
+) -> RedactionAuditEntry:
+    """Build a :class:`RedactionAuditEntry` for one touched file."""
+    counts: dict[str, int] = {}
+    for match in file_matches:
+        counts[match.match_type] = counts.get(match.match_type, 0) + 1
+    return RedactionAuditEntry(
+        source_path=str(file_path),
+        pattern_names=sorted(counts.keys()),
+        match_counts=counts,
+        dry_run=dry_run,
+    )
+
+
+def _write_redaction_audit(
+    summary: ScanSummary,
+    files: list[Path],
+    *,
+    vault_path: Path,
+    dry_run: bool,
+) -> None:
+    """Append one audit entry per touched file under *vault_path*."""
+    audit_log = RedactionAuditLog(vault_path)
+    grouped = _matches_by_file(summary)
+    for file_path in files:
+        file_matches = grouped.get(file_path, [])
+        if not file_matches:
+            continue
+        audit_log.append(
+            _audit_entry_for_file(file_path, file_matches, dry_run=dry_run),
+        )
+
+
 def _apply_redactions(
     redactor: Redactor,
     files: list[Path],
@@ -421,8 +470,14 @@ def run_apply(
     verbose: bool,
     assume_yes: bool,
     console: Console,
+    vault: Path | None = None,
 ) -> None:
     """Scan *source*, obtain consent, and redact files in place.
+
+    Both dry-run and apply runs append per-file entries to
+    ``<vault>/00-Creek-Meta/audit/redact.jsonl`` so the audit trail
+    captures every preview operators reviewed in addition to the
+    committed rewrites.
 
     Args:
         source: File or directory to scan and redact.
@@ -430,9 +485,12 @@ def run_apply(
         verbose: When ``True``, render the per-match table.
         assume_yes: Skip the interactive confirmation prompt.
         console: Rich console sink.
+        vault: Vault root for the audit log. Defaults to
+            ``load_config().vault_path``.
     """
     _require_existing(console, source, "Source path")
     config = load_config()
+    vault_path = vault if vault is not None else config.vault_path
     scanner, summary = _scan_source(source, config)
     render_summary(summary, console)
     if verbose:
@@ -442,16 +500,29 @@ def run_apply(
         console.print("[green]No findings — nothing to redact.[/green]")
         return
 
+    files = _files_from_summary(summary)
+
     if dry_run:
+        _write_redaction_audit(
+            summary,
+            files,
+            vault_path=vault_path,
+            dry_run=True,
+        )
         console.print("[yellow]Dry run: no files modified.[/yellow]")
         return
 
-    files = _files_from_summary(summary)
     if not _confirm_apply(files, assume_yes=assume_yes, console=console):
         return
 
     redactor = Redactor(config=config.redaction, salt=scanner.salt)
     _apply_redactions(redactor, files, console)
+    _write_redaction_audit(
+        summary,
+        files,
+        vault_path=vault_path,
+        dry_run=False,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -833,6 +833,20 @@ class TestFilenameUniqueness:
 class TestProvenanceLogging:
     """Tests for provenance log file creation and appending."""
 
+    @staticmethod
+    def _provenance_path(vault_path: Path) -> Path:
+        """Return the canonical JSONL provenance log path."""
+        return vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+
+    @staticmethod
+    def _read_entries(log_path: Path) -> list[dict[str, Any]]:
+        """Parse a JSONL provenance log into a list of dict entries."""
+        entries: list[dict[str, Any]] = []
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            if line:
+                entries.append(json.loads(line))
+        return entries
+
     def test_provenance_log_created(
         self,
         writer: VaultWriter,
@@ -841,8 +855,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Writing a fragment creates/updates the provenance log."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        assert log_path.exists()
+        assert self._provenance_path(vault_path).exists()
 
     def test_provenance_log_contains_entry(
         self,
@@ -852,10 +865,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log contains an entry for the written fragment."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 1
         assert entries[0]["id"] == "frag-test0001"
         assert entries[0]["type"] == "fragment"
@@ -870,10 +880,7 @@ class TestProvenanceLogging:
         """Multiple writes append to the provenance log."""
         writer.write_fragment(sample_fragment)
         writer.write_thread(sample_thread)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 2
         ids = {e["id"] for e in entries}
         assert "frag-test0001" in ids
@@ -887,10 +894,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log entry includes the written file path."""
         result = writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert entries[0]["path"] == str(result)
 
     def test_provenance_log_has_timestamp(
@@ -901,10 +905,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log entry includes a timestamp."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert "written_at" in entries[0]
 
     def test_duplicate_not_logged_again(
@@ -916,8 +917,5 @@ class TestProvenanceLogging:
         """Writing a duplicate does not add a second provenance entry."""
         writer.write_fragment(sample_fragment)
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 1

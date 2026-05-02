@@ -12,13 +12,13 @@ Obsidian-compatible markdown files with YAML frontmatter. It handles:
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.audit import AuditLog
 from creek.models import (
     DecisionStatus,
     PraxisType,
@@ -431,32 +431,26 @@ class VaultWriter:
     ) -> None:
         """Append a provenance entry to the processing log.
 
-        The log is a JSON array stored at
-        ``00-Creek-Meta/Processing-Log/provenance.json``.
+        The log is a JSONL stream (one entry per line, hash-chained for
+        free via :class:`creek.audit.AuditLog`) stored at
+        ``00-Creek-Meta/Processing-Log/provenance.jsonl``. Switching from
+        the previous JSON-array shape eliminates the read-modify-write
+        cycle that made appends ``O(n)`` in log size and dropped
+        concurrent writes (see PERF-002 / BUG-006).
 
         Args:
             model_id: The ID of the written model.
             model_type: The type string of the written model.
             file_path: The path where the model was written.
         """
-        log_dir = self.vault_path / "00-Creek-Meta" / "Processing-Log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "provenance.json"
-
-        entries: list[dict[str, str]] = []
-        if log_path.exists():
-            raw = log_path.read_text(encoding="utf-8")
-            if raw.strip():
-                entries = json.loads(raw)
-
-        entry: dict[str, str] = {
-            "id": model_id,
-            "type": model_type,
-            "path": str(file_path),
-            "written_at": datetime.now().isoformat(),
-        }
-        entries.append(entry)
-        log_path.write_text(
-            json.dumps(entries, indent=2),
-            encoding="utf-8",
+        log_path = (
+            self.vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        )
+        AuditLog(log_path).append(
+            {
+                "id": model_id,
+                "type": model_type,
+                "path": str(file_path),
+                "written_at": datetime.now().isoformat(),
+            },
         )
