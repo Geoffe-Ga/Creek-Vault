@@ -198,6 +198,45 @@ class RedactionConfig(BaseModel):
     suppresses most natural-language false positives.
     """
 
+    replacement_template: str = "[REDACTED:{name}]"
+    """Format string used by :class:`creek.redact.redactor.Redactor`.
+
+    Must contain the ``{name}`` placeholder so the matched pattern's name
+    is interpolated into the marker. Other format placeholders are
+    rejected at validation time to surface typos early.
+    """
+
+    @field_validator("replacement_template")
+    @classmethod
+    def validate_replacement_template(cls, v: str) -> str:
+        """Validate that the template contains exactly the ``{name}`` placeholder.
+
+        Args:
+            v: Template string to validate.
+
+        Returns:
+            The validated template string.
+
+        Raises:
+            ValueError: If the template lacks ``{name}`` or contains any
+                placeholder other than ``{name}``.
+        """
+        try:
+            formatted = v.format(name="check")
+        except (KeyError, IndexError, ValueError) as exc:
+            msg = (
+                f"replacement_template {v!r} has invalid placeholders; "
+                "only '{name}' is supported."
+            )
+            raise ValueError(msg) from exc
+        if "check" not in formatted:
+            msg = (
+                f"replacement_template {v!r} must include the '{{name}}' "
+                "placeholder."
+            )
+            raise ValueError(msg)
+        return v
+
 
 _READONLY_SCOPES: set[str] = {
     "https://www.googleapis.com/auth/drive.readonly",

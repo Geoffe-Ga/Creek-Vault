@@ -92,7 +92,7 @@ class Redactor:
             patterns_to_use = self._patterns
 
         for name, pattern in patterns_to_use.items():
-            marker = f"[REDACTED:{name}]"
+            marker = self.config.replacement_template.format(name=name)
             content = self._replace_pattern(content, pattern, marker, name)
 
         return content
