@@ -64,6 +64,15 @@ class OCRConfig(BaseModel):
     languages: list[str] = Field(default_factory=lambda: ["eng"])
     """Tesseract language codes for OCR."""
 
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Minimum OCR confidence below which a fragment lands in the review queue.
+
+    Image and scanned-PDF ingestors compare the per-page confidence
+    reported by the engine to this threshold; a fragment whose OCR
+    score falls below it is tagged ``review: pending_review`` in
+    frontmatter so a human can verify the recovered text.
+    """
+
 
 class LinkingConfig(BaseModel):
     """Linking pipeline configuration."""
