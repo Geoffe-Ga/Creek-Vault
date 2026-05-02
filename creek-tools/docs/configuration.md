@@ -160,6 +160,37 @@ google_drive:
 | `scopes`           | `[drive.readonly]`                 | OAuth scopes; **read-only by default and recommended**. |
 | `staging_dir`      | `google-drive-export/`             | Where mirrored files land. |
 
+### Security considerations
+
+The `token_file` stores a long-lived OAuth **refresh token** in
+plaintext. It is written at mode `0o600`, which keeps other Unix users
+out, but anything running as the same user — malware, an Obsidian
+plugin, an unencrypted backup, or a clipboard manager that snapshots
+the file — can lift the token. The token grants `drive.readonly`
+access until you revoke it.
+
+Recommended hygiene:
+
+- **Encrypt the disk.** Enable FileVault (macOS) or LUKS (Linux) so an
+  offline attacker cannot read the token from a stolen device. This is
+  the single most important mitigation; the rest of this section
+  assumes the disk is already encrypted at rest.
+- **Treat `token.json` as a secret.** Add it to `.gitignore` and to
+  any backup-tool exclusion list.
+- **Rotate or revoke after exposure.** If the file is ever copied off
+  the host (shared screenshot, accidental commit, third-party sync),
+  run `creek gdrive --revoke` to invalidate it both locally and at
+  Google. The command best-effort posts to
+  <https://oauth2.googleapis.com/revoke>, then overwrites the local
+  file with zeros and unlinks it. You can also revoke manually from
+  <https://myaccount.google.com/permissions>.
+- **Re-authorise sparingly.** Each `--download` run reuses the cached
+  token; you only need to re-authorise after a `--revoke` or after the
+  token expires.
+
+For the broader picture of what is and isn't protected, see
+[`security/threat-model.md`](security/threat-model.md).
+
 ## `cleaning` — per-source filters
 
 ```yaml

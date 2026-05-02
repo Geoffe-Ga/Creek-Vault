@@ -286,25 +286,70 @@ def review(
     console.print(f"[bold green]Would review: vault={vault}[/bold green]")
 
 
+def _gdrive_revoke() -> None:
+    """Run the SEC-008 OAuth token revocation flow and report the outcome.
+
+    Loads the configured token-file path, delegates to
+    :func:`creek.ingest.gdrive.revoke_token`, then prints a clear
+    summary so the operator can see whether a follow-up step (visiting
+    Google's revocation page manually) is required.
+    """
+    from creek.ingest.gdrive import revoke_token
+
+    config = load_config()
+    result = revoke_token(config.google_drive)
+    token_path = config.google_drive.token_file
+    if not result.token_file_existed:
+        console.print(
+            f"[yellow]No cached token at {token_path}; nothing to revoke.[/yellow]",
+        )
+        return
+    console.print(f"[green]Token file removed: {token_path}[/green]")
+    if result.remote_revoked:
+        console.print("[green]Remote token revoked at Google.[/green]")
+    else:
+        message = result.error or "remote endpoint returned a non-success status"
+        console.print(
+            f"[yellow]Local token erased, but remote revocation did not "
+            f"confirm: {message}. Visit "
+            f"https://myaccount.google.com/permissions to revoke "
+            f"manually if needed.[/yellow]",
+        )
+
+
 @app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
+    revoke: bool = typer.Option(
+        False,
+        "--revoke",
+        help="Revoke the cached OAuth token and delete the local token file",
+    ),
     staging: Path | None = typer.Option(None, help="Staging directory"),
 ) -> None:
-    """Download files from Google Drive into a local staging directory.
+    """Download files from Google Drive or revoke the cached OAuth token.
 
-    Read-only. Files are mirrored under *staging* with their Drive
-    folder hierarchy preserved; subsequent runs are incremental
-    (unchanged files are skipped). Pipe the staging directory through
-    ``creek ingest`` to absorb the downloads into the vault.
+    ``--download`` mirrors files into a local staging directory
+    (read-only; subsequent runs are incremental). ``--revoke`` runs the
+    SEC-008 hygiene path: it best-effort calls Google's revocation
+    endpoint, then erases the local token file with a zero-byte pass
+    before unlinking. The two flags are mutually exclusive.
 
-    First run opens a browser window for OAuth authorisation; the
-    refresh token is cached at ``GoogleDriveConfig.token_file`` (mode
-    ``0o600``) so subsequent runs are non-interactive.
+    First ``--download`` run opens a browser for OAuth authorisation;
+    the refresh token is cached at ``GoogleDriveConfig.token_file``
+    (mode ``0o600``) so subsequent runs are non-interactive.
     """
+    if download and revoke:
+        console.print(
+            "[red]Specify exactly one of --download or --revoke.[/red]",
+        )
+        raise typer.Exit(code=2)
+    if revoke:
+        _gdrive_revoke()
+        return
     if not download:
         console.print(
-            "[yellow]Nothing to do. Pass --download to fetch files.[/yellow]",
+            "[yellow]Nothing to do. Pass --download or --revoke.[/yellow]",
         )
         return
 

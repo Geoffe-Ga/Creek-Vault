@@ -86,6 +86,7 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 | `creek purge classifications` | Reset every fragment's classification fields to `unclassified`. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek purge daterange` | Delete fragments created within a date range. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek purge vault`     | Nuclear option: destroy every fragment, thread, and eddy. Asks for explicit confirmation. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
+| `creek gdrive --revoke` | Revoke the cached Google Drive OAuth token (best-effort remote revoke + secure local erase). | [configuration](docs/configuration.md#google_drive) |
 
 ### Analysis
 
