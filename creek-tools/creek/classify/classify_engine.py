@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path  # noqa: TC003 — runtime use in dataclass field
+from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -176,7 +176,7 @@ def _classify_one(
         if confidence >= confidence_threshold:
             return rule_result, True
 
-    if llm is None:  # pragma: no cover — guarded by ``method == "llm"``
+    if llm is None:  # pragma: no cover  # no issue: defensive guard, unreachable
         msg = "LLM classifier required when method='llm'"
         raise RuntimeError(msg)
     return llm.classify(rule_result, content=body), False

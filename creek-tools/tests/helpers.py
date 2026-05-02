@@ -10,7 +10,7 @@ suites.
 
 from __future__ import annotations
 
-from pathlib import Path  # noqa: TC003 — runtime use in type hints
+from pathlib import Path  # noqa: TC003  # no issue: runtime helper signature
 from typing import TYPE_CHECKING
 
 import frontmatter
