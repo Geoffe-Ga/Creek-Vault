@@ -116,6 +116,37 @@ def test_run_classify_force_overwrites_manual(tmp_path: Path) -> None:
     assert reloaded["classification_method"] == "rules"
 
 
+def test_classify_summary_errors_is_an_immutable_tuple(tmp_path: Path) -> None:
+    """``ClassifySummary`` is genuinely immutable, not just frozen.
+
+    A ``frozen=True`` dataclass with a ``list`` field would let
+    callers mutate the list in place — defeating the purpose of the
+    annotation. Pin the contract: ``summary.errors`` is a tuple, and
+    appending to it raises.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-immutable001",
+        title="Immutable",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert isinstance(summary.errors, tuple)
+    import pytest as _pytest
+
+    with _pytest.raises(AttributeError):
+        # Tuples have no ``append``; the call is the regression pin.
+        summary.errors.append("oops")  # type: ignore[attr-defined]
+
+
 def test_run_classify_skips_non_fragment_files(tmp_path: Path) -> None:
     """Files that parse as YAML but aren't fragments are silently skipped.
 
@@ -139,7 +170,7 @@ def test_run_classify_skips_non_fragment_files(tmp_path: Path) -> None:
     )
     assert summary.total == 0
     assert summary.classified == 0
-    assert summary.errors == []
+    assert summary.errors == ()
 
 
 def test_run_classify_unreadable_file_records_error(tmp_path: Path) -> None:

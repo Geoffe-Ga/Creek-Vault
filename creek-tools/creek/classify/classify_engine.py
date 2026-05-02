@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 class ClassifySummary:
     """Counts produced by a single ``creek classify`` run.
 
+    The dataclass is genuinely immutable: ``errors`` is a tuple, not a
+    list, so ``frozen=True`` actually prevents mutation. Callers that
+    want to mutate the per-run state should work with the private
+    :class:`_RunCounts` accumulator instead.
+
     Attributes:
         total: Number of Creek fragments visited (non-fragment markdown
             files in ``01-Fragments`` are silently skipped and not
@@ -62,7 +67,7 @@ class ClassifySummary:
     classified: int
     preserved_manual: int
     skipped_high_confidence: int
-    errors: list[str]
+    errors: tuple[str, ...]
 
 
 @dataclass
@@ -101,7 +106,7 @@ def run_classify(
     """
     fragments_root = vault_path / "01-Fragments"
     if not fragments_root.exists():
-        return ClassifySummary(0, 0, 0, 0, [])
+        return ClassifySummary(0, 0, 0, 0, ())
 
     rules = RuleClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
@@ -123,7 +128,10 @@ def run_classify(
         classified=counts.classified,
         preserved_manual=counts.preserved,
         skipped_high_confidence=counts.skipped,
-        errors=counts.errors,
+        # Snapshot-by-tuple so the frozen dataclass is genuinely
+        # immutable: the caller can't accidentally append to the
+        # underlying list and reach into completed-run state.
+        errors=tuple(counts.errors),
     )
 
 
