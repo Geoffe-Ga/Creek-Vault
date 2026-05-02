@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 import frontmatter
 import typer
 import yaml
-from pydantic import ValidationError
 
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
@@ -31,6 +30,7 @@ from creek.classify.constants import (
 from creek.classify.review import ReviewQueueGenerator
 from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency, FrequencyClassification
+from creek.vault.reader import try_load_fragment
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -283,6 +283,13 @@ def _persist_manual(entry: ReviewEntry, fragment: Fragment) -> None:
 def _read_entry(md_file: Path) -> ReviewEntry | None:
     """Load *md_file* into a :class:`ReviewEntry`, returning ``None`` on error.
 
+    Delegates the validation chain to
+    :func:`creek.vault.reader.try_load_fragment` so the engine,
+    review runner, and link engine share one definition of "is this
+    a Creek fragment?" — a future schema change to :class:`Fragment`
+    or rename of the ``type`` sentinel only needs to update the
+    shared helper.
+
     Args:
         md_file: Path to a fragment file.
 
@@ -290,21 +297,16 @@ def _read_entry(md_file: Path) -> ReviewEntry | None:
         Parsed entry or ``None`` if the file is not a fragment.
     """
     try:
-        post = frontmatter.load(str(md_file))
+        record = try_load_fragment(md_file)
     except (OSError, ValueError, yaml.YAMLError):
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
-    metadata = dict(post.metadata)
-    if metadata.get("type") != "fragment":
+    if record is None:
         return None
-    try:
-        fragment = Fragment.model_validate(metadata)
-    except ValidationError:
-        logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
-        return None
+    fragment, body, metadata = record
     return ReviewEntry(
         path=md_file,
         fragment=fragment,
-        body=str(post.content),
+        body=body,
         raw_metadata=metadata,
     )

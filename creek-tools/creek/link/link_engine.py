@@ -14,17 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING, Final
 
-import frontmatter
-import yaml
-from pydantic import ValidationError
-
 from creek.link.eddies import EddyDetector
 from creek.link.embeddings import EmbeddingLinker
 from creek.link.temporal import TemporalLinker
-from creek.models import Fragment
+from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
     from creek.config import CreekConfig
+    from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
 
@@ -200,8 +197,12 @@ def _load_or_compute_embeddings(
 def _load_fragments(vault_path: Path) -> list[Fragment]:
     """Load every fragment file under ``<vault>/01-Fragments/``.
 
-    Files that fail to parse are logged and skipped; they should never
-    block a linking pass.
+    Delegates the per-file validation chain to
+    :func:`creek.vault.reader.iter_vault_fragments` so the link
+    engine, classify engine, and review runner share one definition
+    of "is this a Creek fragment?" Linking doesn't surface I/O
+    failures to the operator (yet) — they're skipped at DEBUG
+    level inside the helper, the same way they were before.
 
     Args:
         vault_path: Vault root.
@@ -209,23 +210,5 @@ def _load_fragments(vault_path: Path) -> list[Fragment]:
     Returns:
         Sorted list of :class:`Fragment` instances.
     """
-    fragments_root = vault_path / "01-Fragments"
-    if not fragments_root.exists():
-        return []
-
-    out: list[Fragment] = []
-    for md_file in sorted(fragments_root.rglob("*.md")):
-        try:
-            post = frontmatter.load(str(md_file))
-        except (OSError, ValueError, yaml.YAMLError):
-            logger.debug("Skipping unreadable markdown file: %s", md_file)
-            continue
-        metadata = dict(post.metadata)
-        if metadata.get("type") != "fragment":
-            continue
-        try:
-            out.append(Fragment.model_validate(metadata))
-        except ValidationError:
-            logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
-            continue
-    return out
+    records = iter_vault_fragments(vault_path / "01-Fragments")
+    return [fragment for _path, fragment, _body, _raw in records]

@@ -696,6 +696,73 @@ def test_process_records_consent_with_yes_flag(tmp_path: Path) -> None:
     assert any(r["source_path"] == str(src) for r in records)
 
 
+def test_process_skips_prompt_when_consent_already_recorded(tmp_path: Path) -> None:
+    """Second invocation against a consented source needs no ``--yes``.
+
+    The core INC-010 invariant: once consent is on file, subsequent
+    runs against that source path proceed silently. A re-prompt would
+    be friction; a silent abort would be worse.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("Body\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    # First run records consent via ``--yes``.
+    first = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+    assert first.exit_code == 0, first.output
+
+    # Second run, no ``--yes`` — must succeed because consent is cached.
+    second = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault)],
+    )
+    assert second.exit_code == 0, second.output
+    # And it must not have re-prompted (no "First time processing").
+    assert "First time processing" not in second.output
+
+
+def test_process_consent_is_per_source(tmp_path: Path) -> None:
+    """A different source path still triggers the gate.
+
+    Consent is recorded per (source_type, source_path) tuple. Granting
+    consent for ``/srcA`` must not waive the gate for ``/srcB`` —
+    otherwise an operator's first-source approval would silently
+    extend to every future source they ingest.
+    """
+    src_a = tmp_path / "src_a"
+    src_a.mkdir()
+    (src_a / "a.md").write_text("A\n")
+
+    src_b = tmp_path / "src_b"
+    src_b.mkdir()
+    (src_b / "b.md").write_text("B\n")
+
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    # Consent for src_a only.
+    granted = runner.invoke(
+        app,
+        ["process", "--source", str(src_a), "--vault", str(vault), "--yes"],
+    )
+    assert granted.exit_code == 0, granted.output
+
+    # src_b without ``--yes`` and no recorded consent → exit 1.
+    blocked = runner.invoke(
+        app,
+        ["process", "--source", str(src_b), "--vault", str(vault)],
+    )
+    assert blocked.exit_code == 1
+    assert "consent" in blocked.output.lower() or "Non-interactive" in blocked.output
+
+
 def test_process_aborts_on_unresolved_redactions(tmp_path: Path) -> None:
     """``creek process`` exits 1 with a remediation hint when secrets exist."""
     src = tmp_path / "src"

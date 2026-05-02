@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 import yaml
-from pydantic import ValidationError
 
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
@@ -29,6 +28,7 @@ from creek.classify.llm import LLMClassifier
 from creek.classify.rules import RuleClassifier
 from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency
+from creek.vault.reader import try_load_fragment
 
 if TYPE_CHECKING:
     from creek.config import CreekConfig
@@ -239,7 +239,15 @@ def _classify_one(
 
 
 def _read_fragment(md_file: Path) -> tuple[Fragment, str, dict[str, object]] | None:
-    """Load a fragment file's metadata, body, and raw frontmatter dict.
+    """Thin alias for :func:`creek.vault.reader.try_load_fragment`.
+
+    Kept as a private name so existing patches in
+    ``tests/test_classify_engine.py`` continue to target the engine
+    module rather than the shared reader. The semantics are
+    identical: ``None`` means "not a Creek fragment, silently skip",
+    while real I/O failures propagate so the engine's outer
+    ``except`` block can record them on
+    :attr:`ClassifySummary.errors`.
 
     Args:
         md_file: Markdown file to load.
@@ -247,25 +255,14 @@ def _read_fragment(md_file: Path) -> tuple[Fragment, str, dict[str, object]] | N
     Returns:
         ``(fragment, body, raw_metadata)`` for valid fragments, or
         ``None`` when the file is well-formed YAML but is **not** a
-        Creek fragment (no ``type: fragment`` key, or a schema
-        mismatch). Real I/O failures are propagated to the caller so
-        they can be recorded on :attr:`ClassifySummary.errors`.
+        Creek fragment.
 
     Raises:
         OSError: When the file cannot be opened.
         ValueError: When the YAML cannot be parsed.
         yaml.YAMLError: When the YAML parser rejects the document.
     """
-    post = frontmatter.load(str(md_file))
-    metadata = dict(post.metadata)
-    if metadata.get("type") != "fragment":
-        return None
-    try:
-        fragment = Fragment.model_validate(metadata)
-    except ValidationError:
-        logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
-        return None
-    return fragment, str(post.content), metadata
+    return try_load_fragment(md_file)
 
 
 def _write_fragment(
