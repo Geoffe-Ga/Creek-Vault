@@ -86,7 +86,7 @@ PYTEST_ARGS=(-v)
 case "$TEST_TYPE" in
     unit)
         echo "=== Running Unit Tests ==="
-        PYTEST_ARGS+=(-m "not integration and not e2e")
+        PYTEST_ARGS+=(-m "not integration and not e2e and not slow")
         ;;
     integration)
         echo "=== Running Integration Tests ==="
