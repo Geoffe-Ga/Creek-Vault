@@ -174,6 +174,7 @@ class SourcePlatform(StrEnum):
     JOURNAL = "journal"
     ESSAY = "essay"
     CODE = "code"
+    MARKDOWN = "markdown"
     EMAIL = "email"
     DOCUMENT = "document"
     IMAGE_OCR = "image_ocr"
@@ -212,9 +213,22 @@ class PrivacyTier(StrEnum):
 # ---- ID Generation Helpers ----
 
 
-def _generate_frag_id() -> str:
-    """Generate a unique fragment ID with prefix 'frag-'."""
-    return f"frag-{uuid.uuid4().hex[:8]}"
+def synthetic_fragment_id() -> str:
+    """Generate a synthetic (random) fragment ID with prefix 'frag-'.
+
+    Reserved for fragments without a deterministic ``(source, timestamp,
+    content)`` triple — for example, synthesised praxis-derived fragments
+    or test fixtures. Production ingestors must use the deterministic
+    :func:`creek.ingest.base.generate_fragment_id` instead so re-running
+    the pipeline against the same source is idempotent.
+
+    The width matches ``generate_fragment_id`` (12 hex chars) so the two
+    namespaces are visually indistinguishable downstream.
+
+    Returns:
+        A random ID string in the format ``frag-XXXXXXXXXXXX``.
+    """
+    return f"frag-{uuid.uuid4().hex[:12]}"
 
 
 def _generate_thread_id() -> str:
@@ -313,7 +327,7 @@ class Fragment(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
     type: str = "fragment"
-    id: str = Field(default_factory=_generate_frag_id)
+    id: str
     title: str
     source: FragmentSource
     created: datetime = Field(default_factory=datetime.now)

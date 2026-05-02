@@ -28,8 +28,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import markdownify
-
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -68,7 +66,19 @@ def _parse_html_to_markdown(html: str) -> str:
 
     Returns:
         A markdown-formatted string.
+
+    Raises:
+        ImportError: If ``markdownify`` is not installed. Install with
+            ``pip install creek-tools[documents]``.
     """
+    try:
+        import markdownify
+    except ImportError as exc:
+        msg = (
+            "markdownify is required for HTML ingestion. "
+            "Install with: pip install creek-tools[documents]"
+        )
+        raise ImportError(msg) from exc
     result: str = markdownify.markdownify(html, heading_style="ATX")
     return result
 

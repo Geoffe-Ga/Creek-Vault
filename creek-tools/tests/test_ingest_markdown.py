@@ -387,10 +387,10 @@ class TestPlatformInference:
             SourcePlatform.CODE
         )
 
-    def test_infers_other_platform_for_notes(self) -> None:
-        """Should infer OTHER platform for notes-type documents."""
+    def test_infers_markdown_platform_for_notes(self) -> None:
+        """Should infer MARKDOWN platform for unclassified note-type documents."""
         assert _infer_platform("notes", Path("/notes/misc.md")) == (
-            SourcePlatform.OTHER
+            SourcePlatform.MARKDOWN
         )
 
     def test_infers_journal_from_path(self) -> None:

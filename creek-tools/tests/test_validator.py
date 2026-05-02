@@ -27,7 +27,10 @@ from creek.models import Fragment, FragmentSource, SourcePlatform
 
 def _make_fragment(**overrides: object) -> Fragment:
     """Build a valid Fragment with sensible defaults, applying overrides."""
+    from creek.models import synthetic_fragment_id
+
     defaults: dict[str, object] = {
+        "id": synthetic_fragment_id(),
         "title": ("A sufficiently long content body for validation testing purposes"),
         "source": FragmentSource(
             platform=SourcePlatform.CLAUDE,

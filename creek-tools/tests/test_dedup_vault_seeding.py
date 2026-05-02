@@ -439,6 +439,7 @@ class TestVaultSeedingIntegration:
         content = "The key insight is that patterns repeat."
 
         fragment = Fragment(
+            id="frag-000000000008",
             title="Insight note",
             source=FragmentSource(
                 platform="journal",

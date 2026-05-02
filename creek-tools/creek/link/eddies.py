@@ -35,8 +35,6 @@ import re
 from collections import Counter
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from creek.models import Eddy
 
 if TYPE_CHECKING:
@@ -228,6 +226,8 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         Cosine similarity in ``[-1.0, 1.0]``; ``0.0`` if either vector
         has zero norm.
     """
+    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
     va = np.asarray(a, dtype=np.float32)
     vb = np.asarray(b, dtype=np.float32)
     na = float(np.linalg.norm(va))

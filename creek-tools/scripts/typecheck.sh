@@ -54,7 +54,11 @@ fi
 echo "=== Type Checking (MyPy) ==="
 
 if command -v mypy &> /dev/null; then
-    mypy creek/ || {
+    # Use python -m mypy so the same interpreter that has the project
+    # dependencies installed runs the type checker. This avoids
+    # "Cannot find implementation" noise when mypy is installed via
+    # pipx/uv into a different site-packages.
+    python -m mypy creek/ || {
         echo "✗ Type checking failed" >&2
         exit 1
     }

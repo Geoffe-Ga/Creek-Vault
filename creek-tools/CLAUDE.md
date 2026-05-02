@@ -283,30 +283,22 @@ Before creating/updating a PR:
 
 ```
 creek-tools/
-├── .github/
-│   ├── workflows/
-│   │   ├── ci.yml                    # Continuous Integration (lives at repo root /.github/)
-│   │   └── code-review.yml          # AI code review (lives at repo root /.github/)
-│   └── CODEOWNERS
 ├── docs/
-│   ├── skills/                       # Development skills & guidelines
-│   │   ├── architectural-decisions.md
-│   │   ├── comprehensive-pr-review.md
-│   │   ├── concurrency.md
-│   │   ├── documentation.md
-│   │   ├── error-handling.md
-│   │   ├── security.md
-│   │   ├── stay-green.md
-│   │   ├── testing.md
-│   │   └── vibe.md
-│   └── architecture/                 # Architecture documentation
+│   └── architecture/
 │       └── ADR/                      # Architecture Decision Records
 ├── scripts/
-│   ├── check-all.sh                  # Run all quality checks
-│   ├── test.sh                       # Run test suite
-│   ├── lint.sh                       # Run linters and type checkers
-│   ├── format.sh                     # Format code
-│   └── security.sh                   # Security scanning
+│   ├── check-all.sh                  # Run every quality gate (single source of truth)
+│   ├── test.sh                       # Run test suite (--unit / --integration / --e2e / --all)
+│   ├── lint.sh                       # Ruff lint
+│   ├── lint-extended.sh              # pylint, refurb, tryceratops, vulture, interrogate
+│   ├── format.sh                     # Ruff format
+│   ├── typecheck.sh                  # MyPy strict (CI-001)
+│   ├── security.sh                   # Bandit + pip-audit (with documented ignores; DEP-003)
+│   ├── complexity.sh                 # Radon + Xenon (CI-002)
+│   ├── coverage.sh                   # pytest --cov-fail-under (90% aggregate)
+│   ├── coverage-per-file.sh          # Per-file gate (80% strict, 65% waiver floor; TEST-002)
+│   ├── coverage-waivers.txt          # Documented waivers for the per-file gate
+│   └── pr-status.sh                  # CI/PR status helpers
 ├── creek/                            # Main package
 │   ├── __init__.py
 │   └── ...                           # Package modules
@@ -326,7 +318,10 @@ creek-tools/
 
 ### 5.3 Key Architectural Decisions
 
-All significant architectural decisions are documented in Architecture Decision Records (ADRs) located in `docs/architecture/ADR/`. See [docs/skills/architectural-decisions.md](docs/skills/architectural-decisions.md) for guidelines on creating ADRs.
+Significant architectural decisions live in
+[`docs/architecture/ADR/`](docs/architecture/ADR/) as numbered Markdown
+files. Skill guidance for *how* to write a decision record lives at
+the repository-level `.claude/skills/architectural-decisions/SKILL.md`.
 
 ---
 
@@ -337,27 +332,40 @@ All significant architectural decisions are documented in Architecture Decision 
 All code must meet these standards before merging to main:
 
 #### Test Coverage
-- **Code Coverage**: 90% minimum (branch coverage)
-- **Docstring Coverage**: 95% minimum (interrogate)
-- **Test Types**: Unit, Integration, and E2E coverage required
+- **Aggregate**: ≥90% branch coverage (enforced by
+  `pytest --cov-fail-under=90` in `coverage.sh` and CI).
+- **Per-file**: ≥80% strict, ≥65% for files listed in
+  `scripts/coverage-waivers.txt` (enforced by
+  `coverage-per-file.sh`; see TEST-002).
+- **Docstring**: ≥95% (`interrogate --fail-under=95`, in
+  `lint-extended.sh` and the `interrogate` pre-commit hook).
+- **Test markers**: `unit` (default), `integration`, `e2e`. Local
+  `./scripts/test.sh` and CI both default to `not integration and
+  not e2e` (CI-003).
 
 #### Type Checking
-- **MyPy**: Strict mode, no `# type: ignore` without justification
-- **Type Hints**: All function parameters and return types required
-- **Generic Types**: Use for collections (List, Dict, etc.)
+- **MyPy**: Strict mode (configured in `pyproject.toml`; enforced by
+  `./scripts/typecheck.sh` locally and CI; CI-001).
+- **Type Hints**: All function parameters and return types required.
 
 #### Code Complexity
-- **Cyclomatic Complexity**: Max 10 per function
-- **Maintainability Index**: Minimum 20 (radon)
-- **Max Arguments**: 5 per function
-- **Max Branches**: 12 per function
-- **Max Lines per Function**: 50 lines
+- **Cyclomatic Complexity**: Max 10 per function (Xenon
+  `--max-absolute B`, enforced by `./scripts/complexity.sh`; CI-002).
+- **Maintainability Index**: reported by Radon (informational).
+- The previously-claimed Max Arguments/Branches/Lines thresholds are
+  not currently enforced; aspirational targets only.
 
 #### Linting and Formatting
-- **Ruff**: ALL rules enabled, formatting + import sorting (no exceptions unless documented)
-- **Pylint**: Score of 9.0+ required
-- **Bandit**: Security scanning with zero exceptions
-- **pip-audit**: Dependency vulnerability checking
+- **Ruff**: lint + format, configured in `pyproject.toml` (no `|| true`).
+- **Pylint**: ≥9.0 (`pylint creek/ --fail-under=9.0`, in CI and
+  `lint-extended.sh`; CI-002).
+- **Bandit**: zero medium-or-above findings (`bandit -r creek/ -ll`).
+- **pip-audit**: zero vulnerabilities except documented unfixable
+  CVEs in `scripts/security.sh` and `.github/workflows/ci.yml`
+  (DEP-003).
+- **Refurb / Tryceratops / Vulture**: pre-commit-only today; tracked
+  under STYLE-001 to be added to `lint-extended.sh` once the existing
+  violation backlog is cleared.
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs

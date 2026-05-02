@@ -10,8 +10,10 @@ on:
 env:
   PYTHON_DEFAULT_VERSION: '3.12'
   COVERAGE_THRESHOLD: 90
-  BRANCH_COVERAGE_THRESHOLD: 85
   DOCSTRING_COVERAGE_THRESHOLD: 95
+  PYLINT_FAIL_UNDER: '9.0'
+  PER_FILE_COVERAGE_THRESHOLD: '80'
+  PER_FILE_COVERAGE_WAIVER_FLOOR: '65'
 
 jobs:
   quality:
@@ -27,17 +29,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache pip dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/pip
@@ -50,113 +52,115 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install pytest pytest-cov pytest-xdist pytest-timeout
-          pip install ruff pylint mypy
-          pip install bandit pip-audit
-          pip install interrogate
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          if [ -f setup.py ]; then pip install -e .; fi
-          if [ -f pyproject.toml ]; then pip install -e .; fi
+          # requirements-dev.txt declares "-e .[all,dev]" plus pinned
+          # transitive bumps for fixable CVEs (DEP-003), so this single
+          # install gives CI the [all] runtime extras plus the dev
+          # toolchain in one resolver pass.
+          pip install -r requirements-dev.txt
 
       - name: Create necessary directories
         run: |
           mkdir -p reports
-          mkdir -p .coverage-reports
 
       - name: Run Ruff linting
-        run: |
-          ruff check . --output-format=github --exit-non-zero-on-fix
-        continue-on-error: false
+        # --exit-non-zero-on-fix: if ruff finds an auto-fixable issue
+        # the developer didn't commit, fail rather than silently report.
+        run: ruff check . --output-format=github --exit-non-zero-on-fix
 
       - name: Run Ruff format check
-        run: |
-          ruff format --check .
-        continue-on-error: false
+        run: ruff format --check .
 
-      - name: Run Pylint
-        run: |
-          pylint **/*.py --output-format=colorized --fail-under=8.0 || true
-          pylint **/*.py --output-format=json > reports/pylint-report.json || true
-        continue-on-error: true
+      - name: Run Pylint (CI-002)
+        # ./scripts/pylint.sh runs `python -m pylint creek/` with the
+        # configured --fail-under threshold and optionally writes a JSON
+        # snapshot. Same script the local check-all.sh runs, so a
+        # developer who passes locally cannot fail this gate (CI-004).
+        env:
+          PYLINT_FAIL_UNDER: ${{ env.PYLINT_FAIL_UNDER }}
+        run: ./scripts/pylint.sh --json reports/pylint-report.json
 
-      - name: Run MyPy type checking
-        run: |
-          mypy . --ignore-missing-imports --no-strict-optional --show-error-codes --pretty || true
-        continue-on-error: true
+      - name: Run MyPy type checking (CI-001)
+        # Project-wide strict mode is configured in pyproject.toml; the
+        # script runs `mypy creek/` so local and CI agree.
+        run: ./scripts/typecheck.sh
 
       - name: Check docstring coverage
         run: |
-          interrogate -vv --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} .
-        continue-on-error: false
+          interrogate -vv \
+            --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} creek/
 
       - name: Run Bandit security scan
+        # The first invocation only produces the JSON artifact and is
+        # intentionally non-gating (`|| true`). The SECOND invocation
+        # is the real gate: `bandit -r creek/ -ll` exits non-zero on
+        # any medium-or-above finding, with no escape hatch.
         run: |
-          bandit -r . -f json -o reports/bandit-report.json || true
-          bandit -r . -ll
-        continue-on-error: false
+          bandit -r creek/ -f json -o reports/bandit-report.json || true
+          bandit -r creek/ -ll
 
       - name: Run pip-audit dependency check
+        # Documented CVEs in build/install tooling. Each excluded with a
+        # justification + advisory link, kept in sync with
+        # scripts/security.sh. Audit this list at every release.
+        #   - PYSEC-2022-42969: ReDoS in py.path.svnwc; py is a transitive
+        #     dev dep (pulled in by pytest plugins); the affected code path
+        #     is unused.
+        #     https://github.com/advisories/GHSA-w596-4wvx-j9j6
+        #   - CVE-2025-8869: pip — symlink TOCTOU during sdist install; the
+        #     installer never runs against untrusted sdists in CI.
+        #     https://nvd.nist.gov/vuln/detail/CVE-2025-8869
+        #   - CVE-2026-1703: pip — index-URL parsing; CI installs from
+        #     declared requirements only, so untrusted indexes are not in
+        #     scope.
+        #     https://nvd.nist.gov/vuln/detail/CVE-2026-1703
+        #   - CVE-2026-3219: pip — no fix published yet; same scope as
+        #     above.
+        #     https://nvd.nist.gov/vuln/detail/CVE-2026-3219
+        #   - CVE-2026-24049: wheel — RECORD parsing edge case; wheel is
+        #     build-tooling only and never reaches the production runtime.
+        #     https://nvd.nist.gov/vuln/detail/CVE-2026-24049
+        # A single `pip-audit --format=json --output=…` call writes the
+        # JSON artifact AND gates on findings (pip-audit exits non-zero
+        # if any non-ignored vulnerability is reported, regardless of the
+        # output flag). No `|| true`, no second invocation needed.
         run: |
-          # PYSEC-2022-42969: ReDoS in py.path.svnwc (transitive dep of interrogate, not exploitable here)
-          # CVE-2026-3219: pip itself (no fix version published yet); pip is the installer,
-          # not a runtime dependency, and CI installs only from declared requirements
-          # files, so this is not exploitable in our context.
           pip-audit --format=json --output=reports/pip-audit-report.json \
             --ignore-vuln PYSEC-2022-42969 \
-            --ignore-vuln CVE-2026-3219 || true
-          pip-audit \
-            --ignore-vuln PYSEC-2022-42969 \
-            --ignore-vuln CVE-2026-3219
-        continue-on-error: false
+            --ignore-vuln CVE-2025-8869 \
+            --ignore-vuln CVE-2026-1703 \
+            --ignore-vuln CVE-2026-3219 \
+            --ignore-vuln CVE-2026-24049
 
-      - name: Run tests with coverage
-        run: |
-          pytest \
-            --cov=. \
-            --cov-report=xml:reports/coverage.xml \
-            --cov-report=html:reports/htmlcov \
-            --cov-report=term-missing \
-            --cov-branch \
-            --cov-fail-under=${{ env.COVERAGE_THRESHOLD }} \
-            --junitxml=reports/junit.xml \
-            --maxfail=5 \
-            --tb=short \
-            -v
+      - name: Run tests with coverage (CI-003 — mirrors local default)
+        # ./scripts/test.sh excludes integration/e2e by default so local
+        # and CI run the same set of tests.
+        run: ./scripts/test.sh --unit --coverage
         env:
           COVERAGE_CORE: sysmon
 
-      - name: Verify coverage thresholds
+      - name: Verify aggregate coverage threshold
         run: |
           coverage report --fail-under=${{ env.COVERAGE_THRESHOLD }}
           coverage json -o reports/coverage.json
-          python -c "
-          import json
-          import sys
-          with open('reports/coverage.json') as f:
-              data = json.load(f)
-              total_coverage = data['totals']['percent_covered']
-              branch_coverage = data['totals'].get('percent_covered_branches', 0)
-              print(f'Total Coverage: {total_coverage:.2f}%')
-              print(f'Branch Coverage: {branch_coverage:.2f}%')
-              if total_coverage < ${{ env.COVERAGE_THRESHOLD }}:
-                  print(f'ERROR: Coverage {total_coverage:.2f}% is below threshold ${{ env.COVERAGE_THRESHOLD }}%')
-                  sys.exit(1)
-              if branch_coverage < ${{ env.BRANCH_COVERAGE_THRESHOLD }}:
-                  print(f'WARNING: Branch coverage {branch_coverage:.2f}% is below threshold ${{ env.BRANCH_COVERAGE_THRESHOLD }}%')
-          "
+
+      - name: Verify per-file coverage thresholds (TEST-002)
+        run: |
+          ./scripts/coverage-per-file.sh \
+            --threshold ${{ env.PER_FILE_COVERAGE_THRESHOLD }} \
+            --waiver-floor ${{ env.PER_FILE_COVERAGE_WAIVER_FLOOR }} \
+            --report reports/coverage.json
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
-          files: creek-tools/reports/coverage.xml
+          files: creek-tools/coverage.xml
           flags: python-${{ matrix.python-version }}
           name: python-${{ matrix.python-version }}
           fail_ci_if_error: false
         continue-on-error: true
 
       - name: Upload test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: test-results-${{ matrix.python-version }}
@@ -164,18 +168,18 @@ jobs:
           retention-days: 30
 
       - name: Upload coverage reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-reports-${{ matrix.python-version }}
           path: |
-            creek-tools/reports/coverage.xml
+            creek-tools/coverage.xml
             creek-tools/reports/coverage.json
-            creek-tools/reports/htmlcov
+            creek-tools/htmlcov
           retention-days: 30
 
       - name: Upload security reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: security-reports-${{ matrix.python-version }}
@@ -194,10 +198,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
@@ -206,23 +210,23 @@ jobs:
           pip install radon xenon
           mkdir -p reports
 
-      - name: Calculate cyclomatic complexity
+      - name: Calculate cyclomatic complexity (informational)
         run: |
-          radon cc . -a -s -j > reports/complexity-cc.json || true
-          radon cc . -a -s
+          radon cc creek/ -a -s -j > reports/complexity-cc.json
+          radon cc creek/ -a -s
 
-      - name: Calculate maintainability index
+      - name: Calculate maintainability index (informational)
         run: |
-          radon mi . -s -j > reports/complexity-mi.json || true
-          radon mi . -s
+          radon mi creek/ -s -j > reports/complexity-mi.json
+          radon mi creek/ -s
 
-      - name: Check complexity thresholds
-        run: |
-          xenon --max-absolute B --max-modules B --max-average A . || true
-        continue-on-error: true
+      - name: Enforce complexity thresholds (CI-002)
+        # ./scripts/complexity.sh requires xenon, runs strict thresholds,
+        # and exits non-zero on any violation. No `|| true` escape hatch.
+        run: ./scripts/complexity.sh
 
       - name: Upload complexity reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: complexity-reports
           path: creek-tools/reports/complexity-*.json
@@ -238,10 +242,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
@@ -251,15 +255,13 @@ jobs:
           pip install build twine
 
       - name: Build package
-        run: |
-          python -m build
+        run: python -m build
 
       - name: Check distribution
-        run: |
-          twine check dist/*
+        run: twine check dist/*
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: distribution
           path: creek-tools/dist/
@@ -278,7 +280,14 @@ jobs:
             echo "Quality checks failed"
             exit 1
           fi
+          if [ "${{ needs.complexity-analysis.result }}" != "success" ]; then
+            echo "Complexity analysis failed"
+            exit 1
+          fi
+          if [ "${{ needs.build.result }}" != "success" ]; then
+            echo "Build failed"
+            exit 1
+          fi
 
       - name: Quality gate passed
-        run: |
-          echo "All quality gates passed successfully"
+        run: echo "All quality gates passed successfully"

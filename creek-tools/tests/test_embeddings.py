@@ -27,7 +27,10 @@ _DIMS = 384  # all-MiniLM-L6-v2 output dimensions
 
 def _make_fragment(title: str = "Test Fragment") -> Fragment:
     """Create a minimal Fragment for testing."""
+    from creek.models import synthetic_fragment_id
+
     return Fragment(
+        id=synthetic_fragment_id(),
         title=title,
         source=FragmentSource(platform=SourcePlatform.CLAUDE),
     )

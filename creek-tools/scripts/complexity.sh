@@ -72,16 +72,19 @@ else
 fi
 
 # Check complexity with Xenon
-if command -v xenon &> /dev/null; then
-    if $VERBOSE; then
-        echo "Running Xenon complexity check..."
-    fi
-    xenon --max-absolute B --max-modules B --max-average B creek/ || { echo "✗ Complexity exceeds thresholds" >&2; exit 1; }
-else
-    if $VERBOSE; then
-        echo "Note: xenon not installed for strict complexity checks"
-    fi
+if ! command -v xenon &> /dev/null; then
+    echo "✗ xenon is required for the complexity gate but is not installed." >&2
+    echo "  Install with: pip install xenon" >&2
+    exit 1
 fi
+
+if $VERBOSE; then
+    echo "Running Xenon complexity check..."
+fi
+xenon --max-absolute B --max-modules B --max-average B creek/ || {
+    echo "✗ Complexity exceeds thresholds" >&2
+    exit 1
+}
 
 echo "✓ Complexity analysis completed"
 exit 0

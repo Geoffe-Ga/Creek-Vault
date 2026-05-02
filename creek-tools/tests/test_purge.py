@@ -850,7 +850,7 @@ def test_cli_purge_vault_interactive_wrong_path_aborts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An interactive run that types the wrong vault path aborts."""
-    monkeypatch.setattr("creek.cli._stdin_is_interactive", lambda: True)
+    monkeypatch.setattr("creek.cli._is_interactive", lambda: True)
 
     vault = _make_vault(tmp_path)
     frag = _write_fragment(vault, "frag-A", "Alpha")
@@ -870,7 +870,7 @@ def test_cli_purge_vault_interactive_correct_path_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Typing the absolute vault path interactively confirms the purge."""
-    monkeypatch.setattr("creek.cli._stdin_is_interactive", lambda: True)
+    monkeypatch.setattr("creek.cli._is_interactive", lambda: True)
 
     vault = _make_vault(tmp_path)
     frag = _write_fragment(vault, "frag-A", "Alpha")

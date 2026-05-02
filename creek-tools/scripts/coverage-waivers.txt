@@ -1,0 +1,19 @@
+# Per-file coverage waivers (TEST-002).
+#
+# Format: "<path> <reason>". Paths must match the keys that pytest-cov
+# emits in reports/coverage.json — these are relative to the cwd where
+# pytest runs (creek-tools/), so the canonical form is
+# "creek/<module>.py" (NOT "creek-tools/creek/<module>.py"). The orphan-
+# waiver detector in coverage-per-file.sh fails the build if any entry
+# here doesn't appear in coverage.json, so a path-format drift surfaces
+# as a hard CI failure rather than silent skipping.
+#
+# scripts/coverage-per-file.sh applies a lower WAIVER_FLOOR (default
+# 65%) to files listed here while keeping the strict THRESHOLD (default
+# 80%) in force everywhere else.
+#
+# Adding a file to this list is a deliberate, time-bounded decision.
+# Each entry should reference an open issue tracking the work to bring
+# that file up to the strict threshold and remove it from this list.
+creek/ingest/presentations.py 67% baseline; raise to 80% per plans/git-issues/TEST-002-coverage-aggregate-hides-low-modules.md
+creek/ingest/documents.py 77% baseline; raise to 80% per plans/git-issues/TEST-002-coverage-aggregate-hides-low-modules.md

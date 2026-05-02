@@ -1,6 +1,10 @@
 """Creek CLI -- command-line interface for the Creek knowledge organization pipeline."""
 
+from __future__ import annotations
+
 import logging
+import os
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10,24 +14,15 @@ from rich.console import Console
 from rich.table import Table
 
 from creek.config import load_config
-from creek.pipeline import Pipeline
+from creek.consent import ConsentManager
+from creek.pipeline import Pipeline, RedactionRequiredError
 
 logger = logging.getLogger(__name__)
 
 
-def _stdin_is_interactive() -> bool:
-    """Return ``True`` when the process stdin is attached to a real TTY.
-
-    Wrapping ``sys.stdin.isatty`` makes the OPS-002 non-interactive
-    refusal trivially testable: tests can monkeypatch this single
-    helper instead of fighting Typer's :class:`CliRunner`, which
-    always provides a non-tty StringIO regardless of the host.
-    """
-    return sys.stdin.isatty()
-
-
 if TYPE_CHECKING:
     from creek.generate.drafts import DraftLLM
+    from creek.ingest.base import Ingestor
     from creek.models import Phase
     from creek.purge import PurgeEngine, PurgeResult
 
@@ -42,12 +37,266 @@ app.add_typer(purge_app, name="purge")
 console = Console()
 
 
+def _consent_log_dir(vault_path: Path) -> Path:
+    """Resolve the canonical consent log directory beneath a vault.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        Path to ``<vault>/00-Creek-Meta/Processing-Log``.
+    """
+    return vault_path / "00-Creek-Meta" / "Processing-Log"
+
+
+_OPERATOR_IDENTITY_MAX_LEN = 64
+"""Cap on the operator identity recorded in the consent log.
+
+Adversaries with control of ``USER``/``USERNAME`` (e.g. a misconfigured
+CI runner) could otherwise inject arbitrary text into the audit
+record. Truncating to a reasonable length and filtering to a safe
+character set bounds the blast radius without preventing legitimate
+unicode usernames.
+"""
+
+_OPERATOR_IDENTITY_ALLOWED_CHARS = re.compile(r"[^\w.@+\- ]")
+"""Characters stripped from the raw env-var value before logging."""
+
+
+def _operator_identity() -> str:
+    """Return a best-effort, sanitised identity string for the operator.
+
+    Reads ``USER`` then ``USERNAME`` from the environment, strips
+    control characters and metacharacters that have no place in an
+    audit log entry, truncates to
+    :data:`_OPERATOR_IDENTITY_MAX_LEN` characters, and falls back to
+    ``"cli"`` when the result is empty.
+
+    Returns:
+        Identity string suitable for stamping on a consent record.
+    """
+    raw = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    cleaned = _OPERATOR_IDENTITY_ALLOWED_CHARS.sub("", raw).strip()
+    if not cleaned:
+        return "cli"
+    return cleaned[:_OPERATOR_IDENTITY_MAX_LEN]
+
+
+def _format_summary(file_count: int, size_bytes: int) -> str:
+    """Render a human-readable size summary for the consent prompt.
+
+    Args:
+        file_count: Number of files in the source.
+        size_bytes: Aggregate size of those files in bytes.
+
+    Returns:
+        A short ``"<N> files, <X> MB"`` style description.
+    """
+    mb = size_bytes / (1024 * 1024)
+    return f"{file_count} file(s), {mb:.1f} MB"
+
+
+def _gate_consent(
+    *,
+    source_path: Path,
+    vault_path: Path,
+    source_type: str,
+    assume_yes: bool,
+) -> ConsentManager:
+    """Prompt for, or auto-grant, consent for processing *source_path*.
+
+    Returns a :class:`ConsentManager` that the pipeline can consult.
+    First-time sources display a short summary and require explicit
+    confirmation. Non-interactive callers must pass ``--yes``; the
+    bypass is recorded as a consent grant with an ``assume_yes``
+    operator marker so it can be audited later.
+
+    Args:
+        source_path: Source directory the operator wants to ingest.
+        vault_path: Vault path used to locate the consent log.
+        source_type: Source identifier for the consent record (e.g.
+            ``"pipeline"``, ``"markdown"``).
+        assume_yes: When ``True``, skip the interactive prompt.
+
+    Returns:
+        A :class:`ConsentManager` rooted at the vault's processing log.
+
+    Raises:
+        typer.Exit: With code ``1`` when the operator declines, or
+            when consent has not been recorded and the caller is
+            non-interactive without ``--yes``.
+    """
+    log_dir = _consent_log_dir(vault_path)
+    manager = ConsentManager(log_dir=log_dir)
+
+    if manager.check_consent(source_type, str(source_path)):
+        return manager
+
+    if not source_path.exists():
+        console.print(f"[red]Source path not found: {source_path}[/red]")
+        raise typer.Exit(code=2)
+
+    summary = manager.get_source_summary(source_path, exclusions=[])
+    console.print(f"[bold]First time processing {source_path}.[/bold]")
+    console.print(
+        f"Found: {_format_summary(summary.file_count, summary.total_size_bytes)}."
+    )
+    if summary.sample_filenames:
+        sample = ", ".join(summary.sample_filenames[:5])
+        console.print(f"Sample: {sample}")
+
+    if assume_yes:
+        manager.record_consent(
+            source_type=source_type,
+            source_path=str(source_path),
+            file_count=summary.file_count,
+            exclusions=[],
+            operator=f"{_operator_identity()} (assume_yes)",
+        )
+        console.print(
+            "[yellow]Consent auto-granted via --yes; recorded in consent log.[/yellow]",
+        )
+        return manager
+
+    if not _is_interactive():
+        console.print(
+            "[red]Non-interactive shell and consent not on file. "
+            "Re-run with --yes or run interactively to record consent.[/red]",
+        )
+        raise typer.Exit(code=1)
+
+    if not typer.confirm("Proceed?", default=False):
+        console.print("[yellow]Consent declined; aborting.[/yellow]")
+        raise typer.Exit(code=1)
+
+    manager.record_consent(
+        source_type=source_type,
+        source_path=str(source_path),
+        file_count=summary.file_count,
+        exclusions=[],
+        operator=_operator_identity(),
+    )
+    console.print("[green]Consent recorded.[/green]")
+    return manager
+
+
+def _is_interactive() -> bool:
+    """Return ``True`` when stdin appears to be attached to a TTY.
+
+    The CliRunner used in tests reports stdin as a non-TTY; tests
+    therefore use ``--yes`` or ``input=`` to drive prompts. Returning
+    ``False`` here prevents ``typer.confirm`` from looping forever in
+    pipeline-driven invocations.
+
+    Returns:
+        ``True`` when stdin is a terminal.
+    """
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _resolve_ingestor(type_name: str) -> type[Ingestor]:
+    """Look up an ingestor class by registry key, exiting on miss.
+
+    Args:
+        type_name: Registry key (e.g. ``"markdown"``, ``"claude"``).
+
+    Returns:
+        The matching :class:`~creek.ingest.base.Ingestor` subclass.
+
+    Raises:
+        typer.Exit: With code ``2`` when *type_name* is unknown.
+    """
+    from creek.ingest import INGESTOR_REGISTRY
+
+    cls = INGESTOR_REGISTRY.get(type_name)
+    if cls is None:
+        known = ", ".join(sorted(INGESTOR_REGISTRY.keys()))
+        console.print(
+            f"[red]Unknown ingestor type {type_name!r}. Known types: {known}[/red]",
+        )
+        raise typer.Exit(code=2)
+    return cls
+
+
+def _run_ingest(
+    *,
+    ingestor_cls: type[Ingestor],
+    source_type: str,
+    input_path: Path,
+    vault_path: Path,
+) -> tuple[int, list[str]]:
+    """Run a single ingestor and persist its output to the vault.
+
+    Args:
+        ingestor_cls: Concrete :class:`Ingestor` subclass to run.
+        source_type: Registry key, used to prefix error messages.
+        input_path: Source directory or file to ingest.
+        vault_path: Vault root for :class:`VaultWriter`.
+
+    Returns:
+        Tuple of ``(written_count, errors)`` where ``errors`` is a list
+        of human-readable strings prefixed with ``[<source_type>]``.
+
+    Raises:
+        typer.Exit: With code ``1`` when the vault cannot be opened.
+    """
+    from creek.ingest.base import assemble_ingested_fragment
+    from creek.vault.writer import VaultWriter
+
+    try:
+        writer = VaultWriter(vault_path=vault_path)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Vault unavailable: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    ingestor = ingestor_cls()
+    ingest_result = ingestor.ingest(input_path)
+
+    errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
+    written = 0
+    for parsed in ingest_result.fragments:
+        try:
+            assembled = assemble_ingested_fragment(parsed)
+        except (KeyError, ValueError) as exc:
+            errors.append(
+                f"[{source_type}] failed to assemble fragment from "
+                f"{parsed.source_path}: {exc}",
+            )
+            continue
+        try:
+            writer.write_fragment(assembled.fragment, body=assembled.body)
+        except (OSError, KeyError) as exc:
+            errors.append(
+                f"[{source_type}] failed to write {assembled.fragment.id}: {exc}",
+            )
+            continue
+        written += 1
+
+    return written, errors
+
+
 @app.command()
 def process(
     source: Path | None = typer.Option(None, help="Source directory to process"),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the consent prompt for first-time sources (logged).",
+    ),
 ) -> None:
-    """Full pipeline: ingest, redact, classify, link, index."""
+    """Run the full pipeline: redact, ingest, classify, link, index.
+
+    Aborts with a remediation hint if the redaction scanner finds
+    unresolved sensitive matches; run ``creek redact --apply`` first to
+    clear them. Per-source consent is enforced — first-time sources
+    prompt for confirmation before ingestion. Use ``--yes`` to skip the
+    prompt in non-interactive contexts (the bypass is logged).
+    """
     config = load_config()
     source_path = source or config.source_drive
     vault_path = vault or config.vault_path
@@ -57,27 +306,84 @@ def process(
         f"source={source_path}, vault={vault_path}[/bold green]"
     )
 
-    pipeline = Pipeline(config=config)
-    result = pipeline.run(source_path=source_path, vault_path=vault_path)
+    consent_manager = _gate_consent(
+        source_path=source_path,
+        vault_path=vault_path,
+        source_type="pipeline",
+        assume_yes=yes,
+    )
+
+    pipeline = Pipeline(config=config, consent_manager=consent_manager)
+    try:
+        result = pipeline.run(source_path=source_path, vault_path=vault_path)
+    except RedactionRequiredError as exc:
+        console.print(f"[red]Redaction gate: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")
     console.print(f"[bold]Fragments created:[/bold] {result.fragments_created}")
     console.print(f"[bold]Classifications made:[/bold] {result.classifications_made}")
     console.print(f"[bold]Links found:[/bold] {result.links_found}")
     console.print(f"[bold]Indexes generated:[/bold] {result.indexes_generated}")
+    error_count = len(result.errors)
+    error_style = "red" if error_count else "dim"
+    console.print(f"[bold {error_style}]Errors:[/bold {error_style}] {error_count}")
+    for err in result.errors:
+        console.print(f"  [dim]{err}[/dim]")
 
 
 @app.command()
 def ingest(
-    type: str | None = typer.Option(None, help="Source type to ingest"),
-    input: Path | None = typer.Option(None, help="Input path"),
-    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    type: str | None = typer.Option(None, "--type", help="Source type to ingest"),
+    input: Path | None = typer.Option(None, "--input", help="Input path"),
+    vault: Path | None = typer.Option(None, "--vault", help="Obsidian vault path"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the consent prompt for first-time sources (logged).",
+    ),
 ) -> None:
-    """Ingest a specific source type."""
-    console.print(
-        f"[bold green]Would ingest: "
-        f"type={type}, input={input}, vault={vault}[/bold green]"
+    """Ingest a specific source type into the vault.
+
+    Resolves ``--type`` against
+    :data:`creek.ingest.INGESTOR_REGISTRY`, runs the matching ingestor
+    against ``--input``, and writes each produced fragment via
+    :class:`~creek.vault.writer.VaultWriter`. Re-running against the same
+    input is idempotent: deterministic fragment IDs ensure existing
+    files are recognised and skipped.
+    """
+    if type is None or input is None:
+        console.print("[red]--type and --input are required.[/red]")
+        raise typer.Exit(code=2)
+
+    config = load_config()
+    vault_path = vault or config.vault_path
+    ingestor_cls = _resolve_ingestor(type)
+
+    if not input.exists():
+        console.print(f"[red]Input path not found: {input}[/red]")
+        raise typer.Exit(code=2)
+
+    _gate_consent(
+        source_path=input,
+        vault_path=vault_path,
+        source_type=type,
+        assume_yes=yes,
     )
+
+    written, errors = _run_ingest(
+        ingestor_cls=ingestor_cls,
+        source_type=type,
+        input_path=input,
+        vault_path=vault_path,
+    )
+
+    console.print(f"[bold green]Ingested {written} fragment(s).[/bold green]")
+    if errors:
+        console.print(f"[yellow]Errors: {len(errors)}[/yellow]")
+        for err in errors:
+            console.print(f"  [dim]{err}[/dim]")
 
 
 def _dispatch_redact(
@@ -186,27 +492,105 @@ def redact(
     )
 
 
+_CLASSIFY_METHODS = ("rules", "llm")
+_LINK_METHODS = ("embeddings", "temporal", "eddies")
+
+
 @app.command()
 def classify(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    method: str = typer.Option("rules", help="Classification method"),
-    batch_size: int = typer.Option(50, help="Batch size for classification"),
+    method: str = typer.Option("rules", help="Classification method (rules|llm)"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite fragments classified as method: manual.",
+    ),
 ) -> None:
-    """Run classification on vault fragments."""
-    console.print(
-        f"[bold green]Would classify: vault={vault}, "
-        f"method={method}, batch_size={batch_size}[/bold green]"
+    """Run classification on existing vault fragments.
+
+    ``--method rules`` runs the keyword-based classifier locally.
+    ``--method llm`` calls the configured LLM provider for any
+    fragment the rules left unclassified or below
+    ``classification.confidence_threshold``. Fragments with
+    ``classification.method: manual`` are preserved unless ``--force``
+    is supplied.
+
+    LLM concurrency is governed by ``llm.max_concurrent`` in the
+    config, not a CLI flag.
+    """
+    if method not in _CLASSIFY_METHODS:
+        console.print(
+            f"[red]Unknown method {method!r}. "
+            f"Supported: {', '.join(_CLASSIFY_METHODS)}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+    config = load_config()
+    vault_path = _resolve_vault(vault)
+
+    from creek.classify.classify_engine import run_classify
+
+    summary = run_classify(
+        vault_path=vault_path,
+        config=config,
+        method=method,
+        force=force,
     )
+    console.print(
+        f"[bold green]Classified {summary.classified} of "
+        f"{summary.total} fragment(s) "
+        f"({summary.preserved_manual} manual preserved, "
+        f"{summary.skipped_high_confidence} skipped).[/bold green]",
+    )
+    if summary.errors:
+        console.print(f"[yellow]Errors: {len(summary.errors)}[/yellow]")
+        for err in summary.errors:
+            console.print(f"  [dim]{err}[/dim]")
 
 
 @app.command()
 def link(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    method: str = typer.Option("embeddings", help="Linking method"),
+    method: str = typer.Option(
+        "embeddings",
+        help="Linking method (embeddings|temporal|eddies)",
+    ),
+    rebuild: bool = typer.Option(
+        False,
+        "--rebuild",
+        help="Invalidate the embeddings cache and recompute from scratch.",
+    ),
 ) -> None:
-    """Run linking pass to connect fragments."""
+    """Run a single linker stage against the vault.
+
+    Loads every fragment from ``<vault>/01-Fragments/``, runs the chosen
+    linker, and writes the resulting links back to fragment frontmatter
+    (and any thread/eddy notes). ``--rebuild`` invalidates the cached
+    embeddings file before running ``--method embeddings`` so the
+    similarity matrix is recomputed from scratch.
+    """
+    if method not in _LINK_METHODS:
+        console.print(
+            f"[red]Unknown method {method!r}. "
+            f"Supported: {', '.join(_LINK_METHODS)}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+    config = load_config()
+    vault_path = _resolve_vault(vault)
+
+    from creek.link.link_engine import run_link
+
+    summary = run_link(
+        vault_path=vault_path,
+        config=config,
+        method=method,
+        rebuild=rebuild,
+    )
     console.print(
-        f"[bold green]Would link: vault={vault}, method={method}[/bold green]"
+        f"[bold green]{method.capitalize()} linker: "
+        f"{summary.fragment_count} fragment(s), "
+        f"{summary.link_count} link(s).[/bold green]",
     )
 
 
@@ -297,9 +681,53 @@ def report(
 @app.command()
 def review(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    list_only: bool = typer.Option(
+        False,
+        "--list",
+        help="Print pending review queue items and exit (non-interactive).",
+    ),
 ) -> None:
-    """Interactive review queue for fragments."""
-    console.print(f"[bold green]Would review: vault={vault}[/bold green]")
+    """Walk the review queue and persist accept/override/defer decisions.
+
+    Prints each fragment that needs review, then prompts for one of:
+
+    * ``a`` — accept the current classification (writes
+      ``classification.method: manual``).
+    * ``o`` — override; the operator types a new primary frequency.
+    * ``d`` — defer (skip without changes).
+    * ``q`` — quit.
+
+    Pass ``--list`` to dump the queue without prompting; useful in CI
+    or when scripting around the queue.
+    """
+    vault_path = _resolve_vault(vault)
+
+    from creek.classify.review_runner import (
+        ReviewQueueRunner,
+        format_review_summary,
+    )
+
+    runner = ReviewQueueRunner(vault_path=vault_path, console=console)
+    pending = runner.list_pending()
+
+    if not pending:
+        console.print("[green]Review queue is empty.[/green]")
+        return
+
+    if list_only:
+        for entry in pending:
+            console.print(format_review_summary(entry))
+        return
+
+    summary = runner.run_interactive(pending)
+    console.print(
+        f"[bold green]Review complete: {summary.accepted} accepted, "
+        f"{summary.overridden} overridden, {summary.deferred} deferred.[/bold green]",
+    )
+    if summary.errors:
+        console.print(f"[yellow]Errors: {len(summary.errors)}[/yellow]")
+        for err in summary.errors:
+            console.print(f"  [dim]{err}[/dim]")
 
 
 def _gdrive_revoke() -> None:
@@ -434,7 +862,7 @@ def skills(
     )
 
 
-def _parse_phase(phase: str) -> "Phase":
+def _parse_phase(phase: str) -> Phase:
     """Parse a phase CLI argument, exiting with code 2 on unknown values.
 
     Args:
@@ -514,7 +942,7 @@ def _read_voice_core(path: Path | None) -> str:
         raise typer.Exit(code=2) from exc
 
 
-def _build_draft_llm() -> "DraftLLM":
+def _build_draft_llm() -> DraftLLM:
     """Construct a :data:`DraftLLM` callable from the configured LLM provider.
 
     Uses the Ollama/Anthropic adapter already wired up for classification.
@@ -772,7 +1200,7 @@ def clean_report(
 # ---------------------------------------------------------------------------
 
 
-def _render_purge_result(result: "PurgeResult") -> None:
+def _render_purge_result(result: PurgeResult) -> None:
     """Render a purge result as a rich table.
 
     Args:
@@ -817,7 +1245,7 @@ def _build_engine(
     vault: Path | None,
     *,
     dry_run: bool,
-) -> "PurgeEngine":
+) -> PurgeEngine:
     """Construct a :class:`PurgeEngine` rooted at the resolved vault.
 
     Args:
@@ -984,7 +1412,7 @@ def purge_vault(
         _render_purge_result(result)
         return
 
-    interactive = _stdin_is_interactive()
+    interactive = _is_interactive()
     if not interactive and not force_non_interactive:
         console.print(
             "[red]Refusing to purge vault from a non-interactive session. "

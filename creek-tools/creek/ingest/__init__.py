@@ -22,7 +22,14 @@ Exports:
     MarkdownIngestor: Concrete ingestor for plain Markdown files.
 """
 
-from creek.ingest.base import Ingestor, IngestResult, ParsedFragment, RawDocument
+from creek.ingest.base import (
+    IngestedFragment,
+    Ingestor,
+    IngestResult,
+    ParsedFragment,
+    RawDocument,
+    assemble_ingested_fragment,
+)
 from creek.ingest.chatgpt import ChatGPTIngestor
 from creek.ingest.claude import ClaudeIngestor
 from creek.ingest.code import CodeIngestor
@@ -72,11 +79,13 @@ __all__ = [
     "GoogleDriveDownloader",
     "ImageIngestor",
     "IngestResult",
+    "IngestedFragment",
     "Ingestor",
     "MarkdownIngestor",
     "ParsedFragment",
     "PresentationIngestor",
     "RawDocument",
     "SpreadsheetIngestor",
+    "assemble_ingested_fragment",
     "route_to_ingestor",
 ]
