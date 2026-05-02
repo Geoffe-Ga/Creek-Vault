@@ -250,12 +250,48 @@ class TestPipelineStages:
             pipeline.run(source_path=source_path, vault_path=vault_path)
             mock_scan.assert_called_once_with(source_path)
 
-    def test_redaction_logs_when_matches_found(self, vault_path, tmp_path):
-        """Test that redaction scan logs findings when PII is detected."""
+    def test_redaction_dry_run_continues_when_matches_found(
+        self,
+        vault_path,
+        tmp_path,
+    ):
+        """Dry-run scan logs findings but lets the pipeline continue."""
+        config = CreekConfig()
+        config.redaction.dry_run = True
+        src = tmp_path / "pii_source"
+        src.mkdir()
+        (src / "contact.md").write_text("Email me at user@example.com")
+
+        pipeline = Pipeline(config=config)
+        result = pipeline.run(source_path=src, vault_path=vault_path)
+        assert result.files_scanned == 1
+
+    def test_redaction_fails_loud_when_matches_found(
+        self,
+        vault_path,
+        tmp_path,
+    ):
+        """When matches exist and dry_run is false, the pipeline aborts."""
+        from creek.pipeline import RedactionRequiredError
+
         config = CreekConfig()
         src = tmp_path / "pii_source"
         src.mkdir()
         (src / "contact.md").write_text("Email me at user@example.com")
+
+        pipeline = Pipeline(config=config)
+        with pytest.raises(RedactionRequiredError) as excinfo:
+            pipeline.run(source_path=src, vault_path=vault_path)
+
+        assert excinfo.value.match_count >= 1
+        assert "creek redact --apply" in str(excinfo.value)
+
+    def test_redaction_clean_source_continues(self, vault_path, tmp_path):
+        """A source with no matches should run end-to-end."""
+        config = CreekConfig()
+        src = tmp_path / "clean_source"
+        src.mkdir()
+        (src / "ok.md").write_text("Just notes — no secrets here.")
 
         pipeline = Pipeline(config=config)
         result = pipeline.run(source_path=src, vault_path=vault_path)
@@ -448,6 +484,7 @@ class TestPipelineErrorSurfacing:
                     str(source_path),
                     "--vault",
                     str(vault_path),
+                    "--yes",
                 ],
             )
         assert result.exit_code == 0
@@ -610,6 +647,7 @@ class TestCLIProcess:
                 str(source_path),
                 "--vault",
                 str(vault_path),
+                "--yes",
             ],
         )
         assert result.exit_code == 0
@@ -630,6 +668,7 @@ class TestCLIProcess:
                 str(source_path),
                 "--vault",
                 str(vault_path),
+                "--yes",
             ],
         )
         assert result.exit_code == 0
@@ -858,3 +897,128 @@ class TestPipelineConsent:
         cm = ConsentManager(log_dir=log_dir)
         pipeline = Pipeline(config=config, consent_manager=cm)
         assert pipeline.consent_manager is cm
+
+
+# ---------------------------------------------------------------------------
+# BUG-003: classification gating on confidence threshold
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineClassificationGating:
+    """Tests that LLM classification only runs when rules are uncertain."""
+
+    def _make_ingested(
+        self,
+        platform: str = "markdown",
+        title: str = "Mock note",
+    ):
+        """Return a single ``IngestedFragment`` with the given source platform."""
+        from creek.ingest.base import IngestedFragment
+        from creek.models import Fragment, FragmentSource, SourcePlatform
+
+        fragment = Fragment(
+            id="frag-test12345678",
+            title=title,
+            source=FragmentSource(platform=SourcePlatform(platform)),
+        )
+        return IngestedFragment(fragment=fragment, body="body text")
+
+    def test_high_confidence_skips_llm(self, config, vault_path):
+        """If rules give high confidence, LLM is not invoked."""
+        pipeline = Pipeline(config=config)
+        item = self._make_ingested()
+
+        with (
+            patch.object(
+                pipeline.rule_classifier,
+                "classify",
+                side_effect=lambda f, content="": f.model_copy(
+                    update={
+                        "frequency": f.frequency.model_copy(
+                            update={"primary": "F5"},
+                        ),
+                    },
+                ),
+            ),
+            patch.object(
+                pipeline.rule_classifier,
+                "confidence_score",
+                return_value=0.95,
+            ),
+            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+        ):
+            pipeline._run_classification([item], vault_path, PipelineResult())
+
+        mock_llm.assert_not_called()
+
+    def test_low_confidence_invokes_llm(self, config, vault_path):
+        """If rules give low confidence, LLM is invoked."""
+        pipeline = Pipeline(config=config)
+        item = self._make_ingested()
+
+        with (
+            patch.object(
+                pipeline.rule_classifier,
+                "classify",
+                side_effect=lambda f, content="": f.model_copy(
+                    update={
+                        "frequency": f.frequency.model_copy(
+                            update={"primary": "F5"},
+                        ),
+                    },
+                ),
+            ),
+            patch.object(
+                pipeline.rule_classifier,
+                "confidence_score",
+                return_value=0.1,
+            ),
+            patch.object(
+                pipeline.llm_classifier,
+                "classify",
+                side_effect=lambda f, content="": f,
+            ) as mock_llm,
+        ):
+            pipeline._run_classification([item], vault_path, PipelineResult())
+
+        mock_llm.assert_called_once()
+
+    def test_unclassified_invokes_llm(self, config, vault_path):
+        """If rules leave fragment unclassified, LLM is invoked."""
+        pipeline = Pipeline(config=config)
+        item = self._make_ingested()
+
+        with (
+            patch.object(
+                pipeline.rule_classifier,
+                "classify",
+                side_effect=lambda f, content="": f,
+            ),
+            patch.object(
+                pipeline.llm_classifier,
+                "classify",
+                side_effect=lambda f, content="": f,
+            ) as mock_llm,
+        ):
+            pipeline._run_classification([item], vault_path, PipelineResult())
+
+        mock_llm.assert_called_once()
+
+    def test_human_review_source_skips_llm(self, vault_path):
+        """Sources in human_review_sources never reach the LLM."""
+        config = CreekConfig()
+        config.classification.human_review_sources = ["journal"]
+        pipeline = Pipeline(config=config)
+        item = self._make_ingested(platform="journal")
+
+        with (
+            patch.object(
+                pipeline.rule_classifier,
+                "classify",
+                side_effect=lambda f, content="": f,
+            ),
+            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+        ):
+            pipeline._run_classification([item], vault_path, PipelineResult())
+
+        mock_llm.assert_not_called()

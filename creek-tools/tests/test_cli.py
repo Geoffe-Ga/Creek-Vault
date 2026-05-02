@@ -45,9 +45,9 @@ def test_process_command(tmp_path: Path) -> None:
 
     result = runner.invoke(
         app,
-        ["process", "--source", str(source), "--vault", str(vault)],
+        ["process", "--source", str(source), "--vault", str(vault), "--yes"],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
 
 
 def test_ingest_help() -> None:
@@ -57,8 +57,51 @@ def test_ingest_help() -> None:
     assert "ingest" in result.output.lower()
 
 
-def test_ingest_command() -> None:
-    """Test that ingest command runs with required args."""
+def test_ingest_command_requires_input(tmp_path: Path) -> None:
+    """The ingest command refuses to run when --input is missing."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(
+        app,
+        ["ingest", "--type", "markdown", "--vault", str(vault)],
+    )
+    assert result.exit_code == 2
+
+
+def test_ingest_command_rejects_unknown_type(tmp_path: Path) -> None:
+    """An unknown --type exits 2 with a hint listing known types."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+    src = tmp_path / "in"
+    src.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "nope",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "Unknown ingestor type" in result.output
+
+
+def test_ingest_command_writes_fragments(tmp_path: Path) -> None:
+    """The ingest command resolves the registry and writes fragments."""
+    vault = tmp_path / "vault"
+    for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
+        (vault / d).mkdir(parents=True)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# Hello\n\nFirst note about systems.\n")
+
     result = runner.invoke(
         app,
         [
@@ -66,12 +109,56 @@ def test_ingest_command() -> None:
             "--type",
             "markdown",
             "--input",
-            "/fake/in",
+            str(src),
             "--vault",
-            "/fake/vault",
+            str(vault),
+            "--yes",
         ],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
+    written = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(written) >= 1
+
+
+def test_ingest_command_idempotent(tmp_path: Path) -> None:
+    """Running ingest twice against the same source writes no new files."""
+    vault = tmp_path / "vault"
+    for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
+        (vault / d).mkdir(parents=True)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# Hello\n\nIdempotent run.\n")
+
+    runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+    first = sorted((vault / "01-Fragments").rglob("*.md"))
+    runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+    second = sorted((vault / "01-Fragments").rglob("*.md"))
+    assert [p.name for p in first] == [p.name for p in second]
 
 
 def test_redact_help() -> None:
@@ -139,27 +226,133 @@ def test_classify_help() -> None:
     assert "classify" in result.output.lower()
 
 
-def test_classify_command() -> None:
-    """Test that classify command runs with required args."""
-    result = runner.invoke(app, ["classify", "--vault", "/fake/vault"])
+def test_classify_command_runs_against_empty_vault(tmp_path: Path) -> None:
+    """``creek classify`` exits 0 against a vault with no fragments."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(app, ["classify", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+
+
+def test_classify_rejects_unknown_method(tmp_path: Path) -> None:
+    """An unknown ``--method`` exits with code 2."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(
+        app,
+        ["classify", "--vault", str(vault), "--method", "magic"],
+    )
+    assert result.exit_code == 2
+    assert "Unknown method" in result.output
+
+
+def test_classify_rules_writes_method_to_frontmatter(tmp_path: Path) -> None:
+    """``creek classify --method rules`` stamps the method on each fragment."""
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    vault = tmp_path / "vault"
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+
+    fragment = Fragment(
+        id="frag-test12345678",
+        title="Power and dominance",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    body = (
+        "Power dominance control conquest force aggression bold fearless "
+        "warrior rage impulsive rebellion."
+    )
+    file = fragments_dir / "fragment.md"
+    file.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(content=body, **fragment.model_dump(mode="json")),
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["classify", "--vault", str(vault), "--method", "rules"],
+    )
+    assert result.exit_code == 0, result.output
+    reloaded = frontmatter.load(str(file))
+    assert reloaded["classification_method"] == "rules"
+    assert "classified_at" in reloaded.metadata
+
+
+def test_classify_preserves_manual_without_force(tmp_path: Path) -> None:
+    """A ``manual`` decision is not overwritten when ``--force`` is absent."""
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    vault = tmp_path / "vault"
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+
+    fragment = Fragment(
+        id="frag-manual000000",
+        title="Hand-tagged note",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    metadata = fragment.model_dump(mode="json")
+    metadata["classification_method"] = "manual"
+    metadata["classified_at"] = "2026-01-01T00:00:00-08:00"
+    file = fragments_dir / "manual.md"
+    file.write_text(
+        frontmatter.dumps(frontmatter.Post(content="body", **metadata)),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["classify", "--vault", str(vault), "--method", "rules"],
+    )
     assert result.exit_code == 0
+    reloaded = frontmatter.load(str(file))
+    assert reloaded["classification_method"] == "manual"
 
 
-def test_classify_with_options() -> None:
-    """Test that classify command runs with all options."""
+def test_classify_force_overrides_manual(tmp_path: Path) -> None:
+    """``--force`` overwrites ``classification_method: manual`` decisions."""
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    vault = tmp_path / "vault"
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+
+    fragment = Fragment(
+        id="frag-manual000001",
+        title="Tag it again",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    metadata = fragment.model_dump(mode="json")
+    metadata["classification_method"] = "manual"
+    file = fragments_dir / "manual.md"
+    file.write_text(
+        frontmatter.dumps(frontmatter.Post(content="body", **metadata)),
+        encoding="utf-8",
+    )
+
     result = runner.invoke(
         app,
         [
             "classify",
             "--vault",
-            "/fake/vault",
+            str(vault),
             "--method",
-            "llm",
-            "--batch-size",
-            "25",
+            "rules",
+            "--force",
         ],
     )
     assert result.exit_code == 0
+    reloaded = frontmatter.load(str(file))
+    assert reloaded["classification_method"] == "rules"
 
 
 def test_link_help() -> None:
@@ -169,19 +362,48 @@ def test_link_help() -> None:
     assert "link" in result.output.lower()
 
 
-def test_link_command() -> None:
-    """Test that link command runs with required args."""
-    result = runner.invoke(app, ["link", "--vault", "/fake/vault"])
-    assert result.exit_code == 0
+def test_link_command_runs_against_empty_vault(tmp_path: Path) -> None:
+    """``creek link`` exits 0 against a vault with no fragments."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(app, ["link", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
 
 
-def test_link_with_method() -> None:
-    """Test that link command runs with --method option."""
+def test_link_rejects_unknown_method(tmp_path: Path) -> None:
+    """An unknown ``--method`` exits with code 2."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
     result = runner.invoke(
         app,
-        ["link", "--vault", "/fake/vault", "--method", "graph"],
+        ["link", "--vault", str(vault), "--method", "graph"],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 2
+    assert "Unknown method" in result.output
+
+
+def test_link_rebuild_clears_embeddings_cache(tmp_path: Path) -> None:
+    """``--rebuild`` deletes the cached embeddings archive before linking."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    cache_dir = vault / "00-Creek-Meta"
+    cache_dir.mkdir(parents=True)
+    cache_path = cache_dir / "embeddings.npz"
+    cache_path.write_bytes(b"stale-cache")
+
+    result = runner.invoke(
+        app,
+        [
+            "link",
+            "--vault",
+            str(vault),
+            "--method",
+            "embeddings",
+            "--rebuild",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not cache_path.exists()
 
 
 def test_report_help() -> None:
@@ -361,10 +583,237 @@ def test_review_help() -> None:
     assert "review" in result.output.lower()
 
 
-def test_review_command() -> None:
-    """Test that review command runs with required args."""
-    result = runner.invoke(app, ["review", "--vault", "/fake/vault"])
-    assert result.exit_code == 0
+def test_review_empty_queue(tmp_path: Path) -> None:
+    """Empty queue: ``creek review`` exits 0 with a friendly message."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(app, ["review", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "Review queue is empty" in result.output
+
+
+def test_review_list_only(tmp_path: Path) -> None:
+    """``creek review --list`` prints pending entries without prompting."""
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    vault = tmp_path / "vault"
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+    fragment = Fragment(
+        id="frag-pending00000",
+        title="Need a human eye",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    file = fragments_dir / "pending.md"
+    file.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(content="body", **fragment.model_dump(mode="json")),
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["review", "--vault", str(vault), "--list"])
+    assert result.exit_code == 0, result.output
+    assert "Need a human eye" in result.output
+
+
+def test_operator_identity_strips_metacharacters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adversarial USER/USERNAME values are stripped before logging."""
+    from creek.cli import _operator_identity
+
+    monkeypatch.setenv("USER", "alice;rm -rf /\nboom")
+    assert _operator_identity() == "alicerm -rf boom"
+
+
+def test_operator_identity_truncates_long_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pathological-length env values are truncated to the configured cap."""
+    from creek.cli import _OPERATOR_IDENTITY_MAX_LEN, _operator_identity
+
+    monkeypatch.setenv("USER", "a" * 200)
+    result = _operator_identity()
+    assert len(result) == _OPERATOR_IDENTITY_MAX_LEN
+
+
+def test_operator_identity_falls_back_to_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty (or all-stripped) identity falls back to ``"cli"``."""
+    from creek.cli import _operator_identity
+
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERNAME", raising=False)
+    assert _operator_identity() == "cli"
+
+    monkeypatch.setenv("USER", ";;;\n\n")
+    assert _operator_identity() == "cli"
+
+
+def test_process_aborts_when_consent_declined(tmp_path: Path) -> None:
+    """Declining the consent prompt aborts the pipeline non-zero."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("Just a note.\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault)],
+    )
+    # Non-interactive shell with no consent on file: exit 1.
+    assert result.exit_code == 1
+    assert "consent" in result.output.lower() or "Non-interactive" in result.output
+
+
+def test_process_records_consent_with_yes_flag(tmp_path: Path) -> None:
+    """``--yes`` records consent so a second run no longer prompts."""
+    import json
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("Body\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+    assert result.exit_code == 0, result.output
+
+    log_file = vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json"
+    assert log_file.exists()
+    data = json.loads(log_file.read_text(encoding="utf-8"))
+    records = data["records"]
+    assert any(r["source_path"] == str(src) for r in records)
+
+
+def test_process_skips_prompt_when_consent_already_recorded(tmp_path: Path) -> None:
+    """Second invocation against a consented source needs no ``--yes``.
+
+    The core INC-010 invariant: once consent is on file, subsequent
+    runs against that source path proceed silently. A re-prompt would
+    be friction; a silent abort would be worse.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("Body\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    # First run records consent via ``--yes``.
+    first = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+    assert first.exit_code == 0, first.output
+
+    # Second run, no ``--yes`` — must succeed because consent is cached.
+    second = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault)],
+    )
+    assert second.exit_code == 0, second.output
+    # And it must not have re-prompted (no "First time processing").
+    assert "First time processing" not in second.output
+
+
+def test_process_consent_is_per_source(tmp_path: Path) -> None:
+    """A different source path still triggers the gate.
+
+    Consent is recorded per (source_type, source_path) tuple. Granting
+    consent for ``/srcA`` must not waive the gate for ``/srcB`` —
+    otherwise an operator's first-source approval would silently
+    extend to every future source they ingest.
+    """
+    src_a = tmp_path / "src_a"
+    src_a.mkdir()
+    (src_a / "a.md").write_text("A\n")
+
+    src_b = tmp_path / "src_b"
+    src_b.mkdir()
+    (src_b / "b.md").write_text("B\n")
+
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    # Consent for src_a only.
+    granted = runner.invoke(
+        app,
+        ["process", "--source", str(src_a), "--vault", str(vault), "--yes"],
+    )
+    assert granted.exit_code == 0, granted.output
+
+    # src_b without ``--yes`` and no recorded consent → exit 1.
+    blocked = runner.invoke(
+        app,
+        ["process", "--source", str(src_b), "--vault", str(vault)],
+    )
+    assert blocked.exit_code == 1
+    assert "consent" in blocked.output.lower() or "Non-interactive" in blocked.output
+
+
+def test_process_aborts_on_unresolved_redactions(tmp_path: Path) -> None:
+    """``creek process`` exits 1 with a remediation hint when secrets exist."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "leaky.md").write_text("Email me at user@example.com\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+    assert result.exit_code == 1
+    # rich's console may soft-wrap the remediation hint, so match the parts
+    # individually rather than the literal full command.
+    output = result.output.lower()
+    assert "redact" in output
+    assert "apply" in output
+
+
+def test_review_accept_writes_manual(tmp_path: Path) -> None:
+    """Accepting an entry stamps ``classification_method: manual``."""
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    vault = tmp_path / "vault"
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+    fragment = Fragment(
+        id="frag-accept000000",
+        title="Accept me",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    file = fragments_dir / "accept.md"
+    file.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(content="body", **fragment.model_dump(mode="json")),
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["review", "--vault", str(vault)],
+        input="a\n",
+    )
+    assert result.exit_code == 0, result.output
+    reloaded = frontmatter.load(str(file))
+    assert reloaded["classification_method"] == "manual"
 
 
 def test_purge_help() -> None:
