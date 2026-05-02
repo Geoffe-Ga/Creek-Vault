@@ -6,14 +6,21 @@ Obsidian-compatible markdown files with YAML frontmatter. It handles:
 
 - Mapping each primitive to the correct vault subfolder
 - Sanitising titles into safe filenames
-- Detecting duplicates (by ID) and skipping re-writes
-- Appending provenance entries to the processing log
+- Detecting duplicates (by ID) via a per-directory ``.id-index.json``
+  index — O(1) per write rather than rescanning the directory each time
+- Atomic file creation via ``O_CREAT | O_EXCL`` with counter-suffix
+  retry, so concurrent writers cannot clobber each other's files
+- Appending provenance entries to the processing log under a process
+  lock so concurrent writers do not lose entries
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import threading
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -78,6 +85,21 @@ _ACTIVE_DECISION_STATUSES: set[str] = {
     DecisionStatus.DELIBERATING,
     DecisionStatus.COMMITTING,
 }
+
+INDEX_FILENAME = ".id-index.jsonl"
+"""Per-directory append-only index file mapping ``id`` -> filename.
+
+JSONL format (one JSON object per line, ``{"id": ..., "filename": ...}``)
+keeps each write O(1) — appends never touch existing entries — so a
+directory of 10 000 fragments does not produce O(N²) total work.
+"""
+
+PROVENANCE_FILENAME = "provenance.jsonl"
+"""Append-only provenance log filename under ``00-Creek-Meta/Processing-Log/``.
+
+JSONL format keeps each write O(1) and avoids the read-modify-write
+race that would otherwise lose entries under ``ThreadPoolExecutor``.
+"""
 
 
 def _sanitize_title(title: str) -> str:
@@ -160,6 +182,19 @@ def _extract_date_str(model: BaseModel) -> str:
     return date.today().isoformat()
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically write *content* to *path* via tempfile + ``os.replace``."""
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fp:
+            fp.write(content)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+
+
 class VaultWriter:
     """Write Creek ontological primitives to an Obsidian vault.
 
@@ -168,6 +203,13 @@ class VaultWriter:
     Duplicate detection is based on the model's ``id`` field: if a file
     containing that ID already exists in the target directory, the write
     is skipped and the existing path is returned.
+
+    Per-directory ``.id-index.json`` files persist the ``id -> filename``
+    mapping so duplicate detection is O(1) per write rather than scanning
+    every markdown file in the directory. File creation uses
+    ``O_CREAT | O_EXCL`` so two concurrent threads picking the same
+    filename always retry with a counter suffix instead of clobbering
+    each other.
 
     Args:
         vault_path: Path to the root of the Obsidian vault.
@@ -198,6 +240,14 @@ class VaultWriter:
                 raise FileNotFoundError(msg)
 
         self.vault_path = vault_path
+        # Per-directory in-memory caches of the ``id -> filename`` index.
+        # Loaded lazily on first access; persisted to disk on every
+        # write so a second process picks up entries written by the first.
+        self._dir_indexes: dict[Path, dict[str, str]] = {}
+        # Single process-level lock guards both the in-memory index
+        # cache and the provenance log read-modify-write. Cross-process
+        # safety is out of scope here (see BUG-006: optional fcntl).
+        self._lock = threading.Lock()
 
     def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
         """Write a Fragment to the appropriate 01-Fragments/ subfolder.
@@ -344,8 +394,10 @@ class VaultWriter:
     ) -> Path:
         """Serialise a model to markdown with YAML frontmatter and write to disk.
 
-        Handles duplicate detection (by ID), filename generation,
-        frontmatter serialisation, body rendering, and provenance logging.
+        Uses the per-directory ID index for O(1) duplicate detection,
+        creates the file atomically via ``O_CREAT | O_EXCL`` to prevent
+        concurrent writers from clobbering each other, and updates the
+        index transactionally before logging provenance.
 
         Args:
             model: The Pydantic model to serialise.
@@ -356,28 +408,75 @@ class VaultWriter:
             Path to the written (or existing duplicate) file.
         """
         model_id: str = getattr(model, "id", "")
-        existing = self._find_existing(model_id, target_dir)
-        if existing is not None:
-            return existing
 
-        target_dir.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            existing = self._find_existing_locked(model_id, target_dir)
+            if existing is not None:
+                return existing
 
-        filename = self._generate_filename(model, target_dir)
-        file_path = target_dir / filename
+            target_dir.mkdir(parents=True, exist_ok=True)
+            base_name = self._compute_base_name(model)
 
-        data = model.model_dump(mode="json")
-        post = frontmatter.Post(content=body, **data)
-        content = frontmatter.dumps(post)
-        file_path.write_text(content, encoding="utf-8")
+            data = model.model_dump(mode="json")
+            post = frontmatter.Post(content=body, **data)
+            content = frontmatter.dumps(post)
 
-        self._log_provenance(model_id, str(getattr(model, "type", "")), file_path)
+            file_path = self._atomic_create(target_dir, base_name, content)
+
+            # Update the in-memory + on-disk index transactionally with
+            # the file write so a follow-up call (or a fresh process)
+            # finds the entry without a directory rescan.
+            index = self._dir_indexes[target_dir]
+            index[model_id] = file_path.name
+            self._append_index_entry(target_dir, model_id, file_path.name)
+
+            self._log_provenance_locked(
+                model_id,
+                str(getattr(model, "type", "")),
+                file_path,
+            )
         return file_path
 
-    def _find_existing(self, model_id: str, target_dir: Path) -> Path | None:
-        """Search for an existing file with the given model ID in target_dir.
+    def _find_existing_locked(
+        self,
+        model_id: str,
+        target_dir: Path,
+    ) -> Path | None:
+        """Return the path of an existing file for *model_id*, or ``None``.
 
-        Reads the frontmatter of each ``.md`` file in the directory and
-        checks if its ``id`` field matches.
+        Caller must hold ``self._lock``. Loads (and caches) the
+        per-directory index on first access; rebuilds it from a
+        directory scan if the index file is missing or corrupt so
+        existing vaults remain compatible.
+
+        Args:
+            model_id: The ID to search for.
+            target_dir: The directory to search in.
+
+        Returns:
+            The path to the existing file, or ``None`` if not indexed
+            or the indexed path no longer exists on disk.
+        """
+        index = self._load_index_locked(target_dir)
+        filename = index.get(model_id)
+        if filename is None:
+            return None
+        candidate = target_dir / filename
+        if candidate.exists():
+            return candidate
+        # Stale entry — drop it from the in-memory cache so the next
+        # write reuses the slot. The on-disk JSONL still contains the
+        # stale line, but it is harmless: the next write appends a new
+        # mapping that overrides it on rebuild, and a future compaction
+        # pass (out of scope for this fix) can reclaim the space.
+        del index[model_id]
+        return None
+
+    def _find_existing(self, model_id: str, target_dir: Path) -> Path | None:
+        """Return the path of an existing file for *model_id*, or ``None``.
+
+        Public-style helper retained for backwards compatibility. Acquires
+        ``self._lock`` for safety and delegates to the locked variant.
 
         Args:
             model_id: The ID to search for.
@@ -386,20 +485,161 @@ class VaultWriter:
         Returns:
             The path to the existing file, or ``None`` if not found.
         """
-        if not target_dir.exists():
-            return None
+        with self._lock:
+            return self._find_existing_locked(model_id, target_dir)
+
+    def _load_index_locked(self, target_dir: Path) -> dict[str, str]:
+        """Return the cached per-directory index, loading it if needed.
+
+        On first access for *target_dir* the index is reconstructed from
+        the JSONL file (later entries overwrite earlier ones, so the
+        last successful write wins). If the JSONL file is missing the
+        index is rebuilt by scanning the directory's ``.md`` files and
+        the result is persisted so subsequent processes skip the scan.
+        """
+        cached = self._dir_indexes.get(target_dir)
+        if cached is not None:
+            return cached
+        index_path = target_dir / INDEX_FILENAME
+        if index_path.exists():
+            index = self._load_index_file(index_path)
+        elif target_dir.is_dir():
+            index = self._rebuild_index(target_dir)
+            self._persist_full_index(target_dir, index)
+        else:
+            index = {}
+        self._dir_indexes[target_dir] = index
+        return index
+
+    @staticmethod
+    def _load_index_file(index_path: Path) -> dict[str, str]:
+        """Parse a JSONL index file into ``{id: filename}``.
+
+        Malformed lines are skipped so a partial write under crash
+        cannot poison the rest of the index. Later entries overwrite
+        earlier ones — appending an entry for an existing id therefore
+        rewrites the mapping in-place.
+        """
+        index: dict[str, str] = {}
+        try:
+            raw = index_path.read_text(encoding="utf-8")
+        except OSError:
+            return index
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            mid = entry.get("id")
+            filename = entry.get("filename")
+            if isinstance(mid, str) and isinstance(filename, str):
+                index[mid] = filename
+        return index
+
+    @staticmethod
+    def _rebuild_index(target_dir: Path) -> dict[str, str]:
+        """Scan *target_dir* for ``.md`` files and rebuild the ID index."""
+        index: dict[str, str] = {}
+        if not target_dir.is_dir():
+            return index
         for md_file in target_dir.glob("*.md"):
-            post = frontmatter.load(str(md_file))
-            if post.get("id") == model_id:
-                return md_file
-        return None
+            try:
+                post = frontmatter.load(str(md_file))
+            except (OSError, ValueError):
+                continue
+            mid = post.get("id")
+            if isinstance(mid, str):
+                index[mid] = md_file.name
+        return index
+
+    @staticmethod
+    def _persist_full_index(target_dir: Path, index: dict[str, str]) -> None:
+        """Atomically write a fresh JSONL index file from *index*.
+
+        Used only on first-time index construction (scanning a vault
+        that predates the index file). Steady-state updates use
+        :meth:`_append_index_entry`, which is O(1) per write.
+        """
+        target_dir.mkdir(parents=True, exist_ok=True)
+        lines = "".join(
+            json.dumps({"id": mid, "filename": filename}, sort_keys=True) + "\n"
+            for mid, filename in sorted(index.items())
+        )
+        _atomic_write_text(target_dir / INDEX_FILENAME, lines)
+
+    @staticmethod
+    def _append_index_entry(target_dir: Path, model_id: str, filename: str) -> None:
+        """Append a single ``{id, filename}`` JSON line to the index.
+
+        Uses ``O_APPEND`` so concurrent appenders cannot interleave
+        partial writes (POSIX guarantees atomicity for line-sized writes
+        under append mode).
+        """
+        target_dir.mkdir(parents=True, exist_ok=True)
+        index_path = target_dir / INDEX_FILENAME
+        encoded = (
+            json.dumps({"id": model_id, "filename": filename}, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(str(index_path), flags, 0o644)
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _compute_base_name(model: BaseModel) -> str:
+        """Return the ``{date}-{title}`` filename stem for *model*."""
+        date_str = _extract_date_str(model)
+        title = getattr(model, "title", "")
+        sanitized = _sanitize_title(title)
+        return f"{date_str}-{sanitized}" if sanitized else date_str
+
+    @staticmethod
+    def _atomic_create(target_dir: Path, base_name: str, content: str) -> Path:
+        """Create ``target_dir/{base_name}.md`` atomically; retry with a counter.
+
+        Uses ``O_CREAT | O_EXCL`` so two concurrent callers picking the
+        same filename will not clobber each other — the second call
+        increments a counter suffix and retries.
+
+        Args:
+            target_dir: Directory the file will live in.
+            base_name: Filename stem (without ``.md``).
+            content: Full file contents to write.
+
+        Returns:
+            The path of the created file.
+        """
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        encoded = content.encode("utf-8")
+        counter = 0
+        while True:
+            suffix = "" if counter == 0 else f"-{counter}"
+            candidate = target_dir / f"{base_name}{suffix}.md"
+            try:
+                fd = os.open(str(candidate), flags, 0o644)
+            except FileExistsError:
+                counter += 1
+                continue
+            try:
+                os.write(fd, encoded)
+            finally:
+                os.close(fd)
+            return candidate
 
     def _generate_filename(self, model: BaseModel, target_dir: Path) -> str:
-        """Generate a unique filename for the model.
+        """Return a unique filename for *model* under *target_dir*.
 
-        Format: ``{date}-{sanitised_title}.md``. If a file with the
-        same name already exists (title collision with different ID),
-        a numeric suffix is appended.
+        Retained as part of the public API surface for tools that
+        introspect the writer; the production path uses
+        :meth:`_atomic_create` directly to avoid the TOCTOU window
+        between filename selection and file creation.
 
         Args:
             model: The model to generate a filename for.
@@ -408,31 +648,27 @@ class VaultWriter:
         Returns:
             A unique filename string ending in ``.md``.
         """
-        date_str = _extract_date_str(model)
-        title = getattr(model, "title", "")
-        sanitized = _sanitize_title(title)
-
-        base_name = f"{date_str}-{sanitized}" if sanitized else date_str
-
+        base_name = self._compute_base_name(model)
         filename = f"{base_name}.md"
         if not (target_dir / filename).exists():
             return filename
-
         counter = 1
         while (target_dir / f"{base_name}-{counter}.md").exists():
             counter += 1
         return f"{base_name}-{counter}.md"
 
-    def _log_provenance(
+    def _log_provenance_locked(
         self,
         model_id: str,
         model_type: str,
         file_path: Path,
     ) -> None:
-        """Append a provenance entry to the processing log.
+        """Append a provenance entry to the JSONL processing log.
 
-        The log is a JSON array stored at
-        ``00-Creek-Meta/Processing-Log/provenance.json``.
+        Caller must hold ``self._lock``. The log lives at
+        ``00-Creek-Meta/Processing-Log/provenance.jsonl`` with one JSON
+        object per line — appended via ``O_APPEND`` so concurrent
+        writers cannot lose entries in a read-modify-write race.
 
         Args:
             model_id: The ID of the written model.
@@ -441,13 +677,7 @@ class VaultWriter:
         """
         log_dir = self.vault_path / "00-Creek-Meta" / "Processing-Log"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "provenance.json"
-
-        entries: list[dict[str, str]] = []
-        if log_path.exists():
-            raw = log_path.read_text(encoding="utf-8")
-            if raw.strip():
-                entries = json.loads(raw)
+        log_path = log_dir / PROVENANCE_FILENAME
 
         entry: dict[str, str] = {
             "id": model_id,
@@ -455,8 +685,20 @@ class VaultWriter:
             "path": str(file_path),
             "written_at": datetime.now().isoformat(),
         }
-        entries.append(entry)
-        log_path.write_text(
-            json.dumps(entries, indent=2),
-            encoding="utf-8",
-        )
+        encoded = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(str(log_path), flags, 0o644)
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+
+    def _log_provenance(
+        self,
+        model_id: str,
+        model_type: str,
+        file_path: Path,
+    ) -> None:
+        """Backwards-compatible shim for callers that bypass ``_write_model``."""
+        with self._lock:
+            self._log_provenance_locked(model_id, model_type, file_path)

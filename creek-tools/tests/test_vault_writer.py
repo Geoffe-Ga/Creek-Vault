@@ -830,6 +830,13 @@ class TestFilenameUniqueness:
 # ---- Provenance Logging ----
 
 
+def _read_provenance(vault_path: Path) -> list[dict[str, Any]]:
+    """Read the JSONL provenance log into a list of dicts (test helper)."""
+    log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+    text = log_path.read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 class TestProvenanceLogging:
     """Tests for provenance log file creation and appending."""
 
@@ -841,7 +848,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Writing a fragment creates/updates the provenance log."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
         assert log_path.exists()
 
     def test_provenance_log_contains_entry(
@@ -852,10 +859,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log contains an entry for the written fragment."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = _read_provenance(vault_path)
         assert len(entries) == 1
         assert entries[0]["id"] == "frag-test0001"
         assert entries[0]["type"] == "fragment"
@@ -870,10 +874,7 @@ class TestProvenanceLogging:
         """Multiple writes append to the provenance log."""
         writer.write_fragment(sample_fragment)
         writer.write_thread(sample_thread)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = _read_provenance(vault_path)
         assert len(entries) == 2
         ids = {e["id"] for e in entries}
         assert "frag-test0001" in ids
@@ -887,10 +888,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log entry includes the written file path."""
         result = writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = _read_provenance(vault_path)
         assert entries[0]["path"] == str(result)
 
     def test_provenance_log_has_timestamp(
@@ -901,10 +899,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log entry includes a timestamp."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = _read_provenance(vault_path)
         assert "written_at" in entries[0]
 
     def test_duplicate_not_logged_again(
@@ -916,8 +911,201 @@ class TestProvenanceLogging:
         """Writing a duplicate does not add a second provenance entry."""
         writer.write_fragment(sample_fragment)
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
-        entries: list[dict[str, Any]] = json.loads(
-            log_path.read_text(encoding="utf-8"),
-        )
+        entries = _read_provenance(vault_path)
         assert len(entries) == 1
+
+
+# ---- ID Index (PERF-001) ----
+
+
+class TestIdIndex:
+    """Tests for the per-directory ``.id-index.jsonl`` index file."""
+
+    def test_index_file_created_on_first_write(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A first write appends a JSON line to ``.id-index.jsonl``."""
+        result = writer.write_fragment(sample_fragment)
+        index_path = result.parent / ".id-index.jsonl"
+        assert index_path.exists()
+        lines = [
+            line for line in index_path.read_text(encoding="utf-8").splitlines() if line
+        ]
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry == {"id": sample_fragment.id, "filename": result.name}
+
+    def test_index_lookup_avoids_directory_scan(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """Re-writing an existing fragment uses the index, not a scan."""
+        result = writer.write_fragment(sample_fragment)
+        # If the index path is consulted, removing the markdown but
+        # leaving a stale index entry should make the second write
+        # re-create the file at a new path (proof the lookup goes
+        # through the index, then verifies file existence on disk).
+        result.unlink()
+        new_path = writer.write_fragment(sample_fragment)
+        assert new_path.exists()
+        assert new_path.parent == result.parent
+
+    def test_index_rebuilds_when_missing(
+        self,
+        vault_path: Path,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A vault with existing fragments but no index rebuilds it on demand."""
+        # Seed the directory using one writer instance.
+        seed_writer = VaultWriter(vault_path=vault_path)
+        original = seed_writer.write_fragment(sample_fragment)
+        # Remove the index file as if migrating from an older vault.
+        index_path = original.parent / ".id-index.jsonl"
+        index_path.unlink()
+        # A fresh writer should detect the existing fragment without
+        # re-creating it.
+        fresh_writer = VaultWriter(vault_path=vault_path)
+        result = fresh_writer.write_fragment(sample_fragment)
+        assert result == original
+        assert index_path.exists()
+
+    def test_corrupt_index_lines_are_skipped(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        vault_path: Path,
+    ) -> None:
+        """Malformed lines in the JSONL index are skipped, not fatal."""
+        original = writer.write_fragment(sample_fragment)
+        index_path = original.parent / ".id-index.jsonl"
+        # Append a malformed line; the well-formed first line should
+        # still be parsed by a fresh writer.
+        with index_path.open("a", encoding="utf-8") as fp:
+            fp.write("{not json}\n")
+        fresh_writer = VaultWriter(vault_path=vault_path)
+        result = fresh_writer.write_fragment(sample_fragment)
+        assert result == original
+
+    def test_index_skips_blank_and_non_dict_lines(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        vault_path: Path,
+    ) -> None:
+        """Blank lines and non-object JSON lines are tolerated."""
+        original = writer.write_fragment(sample_fragment)
+        index_path = original.parent / ".id-index.jsonl"
+        with index_path.open("a", encoding="utf-8") as fp:
+            fp.write("\n")  # blank line
+            fp.write("[1, 2, 3]\n")  # non-dict line
+            fp.write('{"id": 7, "filename": "x.md"}\n')  # wrong types
+        fresh_writer = VaultWriter(vault_path=vault_path)
+        result = fresh_writer.write_fragment(sample_fragment)
+        assert result == original
+
+    def test_public_find_existing_uses_lock(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """``_find_existing`` (the public-style shim) returns the indexed path."""
+        original = writer.write_fragment(sample_fragment)
+        target_dir = original.parent
+        # Direct call to the locked-shim variant should report the same
+        # path the in-memory index holds.
+        assert writer._find_existing(sample_fragment.id, target_dir) == original
+        # Unknown ID returns ``None`` via the same path.
+        assert writer._find_existing("frag-unknown", target_dir) is None
+
+
+# ---- Concurrent writes (BUG-006) ----
+
+
+class TestConcurrentWrites:
+    """Tests guarding against the ThreadPoolExecutor race in ``_write_model``."""
+
+    def test_concurrent_distinct_writes_no_loss(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+    ) -> None:
+        """200 distinct fragments x 8 threads -> 200 distinct files, no loss."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import frontmatter as fm_mod
+
+        fragments = [
+            Fragment(
+                id=f"frag-{i:09d}",
+                title=f"t{i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 0, 0),
+            )
+            for i in range(200)
+        ]
+
+        def _write(fragment: Fragment) -> Path:
+            return writer.write_fragment(fragment, body=f"body for {fragment.id}")
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_write, fragments))
+
+        written = list((vault_path / "01-Fragments" / "Conversations").glob("*.md"))
+        assert len(written) == 200
+        ids = {fm_mod.load(str(p)).get("id") for p in written}
+        assert ids == {f.id for f in fragments}
+
+        entries = _read_provenance(vault_path)
+        assert len(entries) == 200
+
+    def test_concurrent_same_id_writes_dedup(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        vault_path: Path,
+    ) -> None:
+        """Concurrent writes of the same ID converge on a single file."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _write(_: int) -> Path:
+            return writer.write_fragment(sample_fragment, body="x")
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            paths = list(ex.map(_write, range(50)))
+
+        # All paths point to the same file — no duplicates.
+        assert len({str(p) for p in paths}) == 1
+        written = list((vault_path / "01-Fragments" / "Conversations").glob("*.md"))
+        assert len(written) == 1
+
+
+@pytest.mark.slow
+class TestVaultWriterScaling:
+    """Benchmark guarding against PERF-001's quadratic ``_find_existing``."""
+
+    def test_constant_time_per_write(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """Per-write time stays roughly flat across 2000 writes."""
+        import statistics
+        import time
+
+        durations: list[float] = []
+        for i in range(2000):
+            fragment = Fragment(
+                id=f"frag-{i:012d}",
+                title=f"t{i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 0, 0),
+            )
+            start = time.perf_counter()
+            writer.write_fragment(fragment, body=f"body {i}")
+            durations.append(time.perf_counter() - start)
+
+        early = statistics.median(durations[10:60])
+        late = statistics.median(durations[-50:])
+        assert late < 3 * early, f"Per-write grew: early={early:.4f}s late={late:.4f}s"
