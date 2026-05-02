@@ -11,6 +11,7 @@ command registration and keeps :mod:`creek.cli` focused on routing.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from collections import Counter
@@ -26,6 +27,8 @@ from creek.config import load_config
 from creek.redact.patterns import PATTERN_METADATA
 from creek.redact.redactor import Redactor
 from creek.redact.scanner import RedactionScanner, ScanSummary
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -215,6 +218,58 @@ def _error_exit(console: Console, message: str, *, code: int = 2) -> NoReturn:
     """
     console.print(f"[red]{message}[/red]")
     raise typer.Exit(code=code)
+
+
+def _assert_no_escaping_symlinks(
+    root: Path,
+    *,
+    console: Console,
+    label: str,
+) -> None:
+    """Refuse to operate on a tree containing symlinks that escape *root*.
+
+    Walks *root* without following directory symlinks (``followlinks=False``)
+    and, for every symlink encountered, verifies that the resolved target
+    is a descendant of the resolved root. Any symlink whose target lies
+    outside the tree triggers ``typer.Exit`` with a clear, actionable
+    error message — preventing the SEC-003 path-traversal scenario where
+    a symlink under the source tree could cause redaction to overwrite
+    arbitrary on-disk files.
+
+    Symlinks whose resolved target stays inside *root* are permitted so
+    that legitimate intra-tree aliases (e.g. ``alias.md`` → ``real.md``)
+    continue to work.
+
+    Args:
+        root: The user-supplied source or vault root.
+        console: Rich console sink for the error banner.
+        label: Human-readable label for the root in error messages
+            (e.g. ``"source"`` or ``"vault"``).
+
+    Raises:
+        typer.Exit: When any descendant symlink resolves outside *root*.
+    """
+    resolved_root = root.resolve(strict=False)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for entry in dirnames + filenames:
+            candidate = Path(dirpath) / entry
+            if not candidate.is_symlink():
+                continue
+            try:
+                resolved = candidate.resolve(strict=False)
+                resolved.relative_to(resolved_root)
+            except (OSError, ValueError):
+                logger.error(
+                    "Refusing to follow symlink that escapes the %s root: %s",
+                    label,
+                    candidate,
+                )
+                _error_exit(
+                    console,
+                    f"Refusing to follow symlink that escapes the {label} "
+                    f"root: {candidate}",
+                    code=1,
+                )
 
 
 def _require_existing(console: Console, path: Path, label: str) -> None:
@@ -432,6 +487,8 @@ def run_apply(
         console: Rich console sink.
     """
     _require_existing(console, source, "Source path")
+    if source.is_dir():
+        _assert_no_escaping_symlinks(source, console=console, label="source")
     config = load_config()
     scanner, summary = _scan_source(source, config)
     render_summary(summary, console)
@@ -473,6 +530,8 @@ def run_review(
         console: Rich console sink.
     """
     _require_existing(console, vault, "Vault path")
+    if vault.is_dir():
+        _assert_no_escaping_symlinks(vault, console=console, label="vault")
     config = load_config()
     scanner, summary = _scan_source(vault, config)
     render_summary(summary, console)

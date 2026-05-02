@@ -70,7 +70,10 @@ For every queued match:
 
 1. Replaces the match with `[REDACTED:<pattern_name>]` (configurable via `RedactionConfig.replacement_template`).
 2. Marks the queue entry as `applied: true` and stamps the timestamp.
-3. Refuses to write through symlinks (path-traversal guard).
+3. Refuses to write through symlinks (path-traversal guard): before any
+   file is read or rewritten the source tree is walked and the run is
+   aborted if any descendant symlink resolves outside the source root.
+   The same guard is applied to `creek redact --review`.
 
 `--dry-run` walks the queue without modifying any source file — useful for sanity-checking a big batch before committing.
 

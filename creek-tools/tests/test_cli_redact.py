@@ -386,3 +386,113 @@ def test_redact_review_missing_vault(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "not found" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# SEC-003: symlink refusal
+# ---------------------------------------------------------------------------
+
+
+def test_redact_apply_refuses_symlink_escaping_source(tmp_path: Path) -> None:
+    """A symlink whose target lies outside the source root aborts --apply.
+
+    Demonstrates the SEC-003 path-traversal guard: even if the symlink
+    points at a victim file containing nothing sensitive, ``creek redact
+    --apply`` must refuse to follow it. The victim file's contents are
+    asserted untouched after the run.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "leak.env").write_text(
+        "API_KEY=sk-abcdefghijklmnopqrstuvwx\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "outside.md"
+    target.write_text("preserve-me", encoding="utf-8")
+    queue_dir = source / ".creek-redactions"
+    queue_dir.mkdir()
+    (queue_dir / "queue.json").symlink_to(target)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(source), "--yes"],
+    )
+
+    assert result.exit_code != 0
+    assert "symlink" in result.output.lower()
+    # The would-be victim file is untouched.
+    assert target.read_text(encoding="utf-8") == "preserve-me"
+
+
+def test_redact_apply_refuses_deeply_nested_symlink(tmp_path: Path) -> None:
+    """A symlink nested several directories deep still triggers refusal."""
+    source = tmp_path / "src"
+    nested = source / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    (source / "leak.env").write_text(
+        "API_KEY=sk-abcdefghijklmnopqrstuvwx\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "outside.txt"
+    target.write_text("untouched", encoding="utf-8")
+    (nested / "linked.md").symlink_to(target)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(source), "--yes"],
+    )
+
+    assert result.exit_code != 0
+    assert "symlink" in result.output.lower()
+    assert target.read_text(encoding="utf-8") == "untouched"
+
+
+def test_redact_apply_allows_internal_symlink(tmp_path: Path) -> None:
+    """A symlink whose resolved target stays under the source proceeds."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "real.md").write_text(
+        "Contact: alice@example.com\nSSN: 123-45-6789\n",
+        encoding="utf-8",
+    )
+    # Internal symlink: resolves to a file inside the same source root.
+    (source / "alias.md").symlink_to(source / "real.md")
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(source), "--yes"],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_redact_apply_no_symlinks_proceeds(tmp_path: Path) -> None:
+    """A symlink-free source tree is unaffected by the new guard."""
+    source = _write_sensitive_source(tmp_path)
+    leak = _leak_path(source)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(source), "--yes"],
+    )
+
+    assert result.exit_code == 0
+    assert "hunter2" not in leak.read_text(encoding="utf-8")
+
+
+def test_redact_review_refuses_symlink_escaping_vault(tmp_path: Path) -> None:
+    """--review also refuses symlinks that point outside the vault root."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "good.md").write_text("Contact: alice@example.com\n", encoding="utf-8")
+    target = tmp_path / "secrets.md"
+    target.write_text("API_KEY=sk-abcdefghijklmnopqrstuvwx\n", encoding="utf-8")
+    (vault / "linked.md").symlink_to(target)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--review", "--vault", str(vault)],
+    )
+
+    assert result.exit_code != 0
+    assert "symlink" in result.output.lower()
