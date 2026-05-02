@@ -2,6 +2,8 @@
 
 `creek redact` is the **first** thing you run on any new export. It scans for secrets, API keys, and PII before they enter your vault — and once they've entered, it can scrub them out.
 
+> Redaction is one defensive layer; it does not encrypt the vault and it cannot detect every secret format. Read the [threat model](security/threat-model.md) for the full picture of what Creek does and does not protect against.
+
 ## The three modes
 
 `creek redact` is dispatched by exactly one of `--scan`, `--apply`, or `--review`. Mixing them is an error.

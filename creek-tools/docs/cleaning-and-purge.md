@@ -7,6 +7,8 @@ Two adjacent command groups handle vault hygiene:
 
 `clean` finds problems and reports them. `purge` deletes things. They're separate tools because mistaking one for the other would be expensive.
 
+> Purge does best-effort deletion. It is **not** anti-forensic — modern SSDs and copy-on-write filesystems retain old block contents even after a successful unlink. See the [threat model](security/threat-model.md) for the full set of guarantees Creek does and doesn't make.
+
 ---
 
 ## Cleaning

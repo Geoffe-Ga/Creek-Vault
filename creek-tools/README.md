@@ -117,6 +117,24 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 
 ---
 
+## Security
+
+Creek is **local-first** but **not encrypted at rest**. Vault content,
+the embedding cache, and the Google Drive OAuth token are plaintext
+on disk; the only filesystem-level defence is the `0o600` mode on the
+OAuth token. If you're trusting Creek with intimate journal content,
+read the threat model below before doing anything else.
+
+- **[`docs/security/threat-model.md`](docs/security/threat-model.md)** — what
+  Creek protects against, what it doesn't, and the explicit non-goals.
+- **Audit log** — `<vault>/00-Creek-Meta/audit/` records every purge
+  and redaction-apply (treat as a journal, not a tamper-evident log
+  yet — see SEC-005).
+- **Hygiene tldr:** enable disk encryption (FileVault / LUKS), keep
+  the vault out of cloud-sync directories, run
+  `creek gdrive --revoke` after any token exposure, and prefer
+  `creek redact --scan` before importing any third-party content.
+
 ## Configuration
 
 `creek-tools` is configured via Pydantic models defined in [`creek/config.py`](creek/config.py). The active configuration lives in `<vault>/00-Creek-Meta/creek_config.yaml` and can be edited by hand. Every section maps directly to a `BaseModel` you can find in `config.py`:

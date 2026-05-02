@@ -2,6 +2,8 @@
 
 Classification tags every fragment along five dimensions: **frequency** (the APTITUDE 10-frequency system), **archetypal phase** (Origins, Rising, Peaking, Cresting, Receding, Composting), **mode**, **register**, and **privacy tier**. The classifier writes its decisions into the fragment's frontmatter; downstream stages (linking, generation) consume those tags.
 
+> Routing fragments through the Anthropic provider sends content to a third party. The privacy-tier system gates this — `intimate` fragments stay local — but the broader trade-offs and the hardening done against prompt-injection (SEC-004) are documented in the [threat model](security/threat-model.md).
+
 ## Two methods
 
 `creek classify --method <method>` accepts:
