@@ -21,6 +21,7 @@ import pytest
 from pydantic import ValidationError
 
 from creek.clean.semantic_dedup import (
+    DeduplicationConfig,
     SemanticDeduplicator,
     SemanticDuplicatePair,
     SemanticDuplicateResult,
@@ -651,3 +652,128 @@ class TestBatchAndIncrementalIntegration:
         result = dedup.check_fragment("frag-new", [1.0, 0.0, 0.0])
         assert len(result.duplicates) == 1
         assert result.duplicates[0].fragment_id_b == "frag-a"
+
+
+# ---------------------------------------------------------------------------
+# Vectorised path (PERF-003)
+# ---------------------------------------------------------------------------
+
+
+class TestVectorisedFindDuplicates:
+    """Tests guarding the vectorised matmul path against the legacy loop."""
+
+    def test_matches_pairwise_loop(self) -> None:
+        """Matmul path produces the same pairs as pairwise cosine similarity."""
+        rng = np.random.default_rng(42)
+        embeddings: dict[str, list[float]] = {
+            f"frag-{i:03d}": rng.standard_normal(64).astype(np.float32).tolist()
+            for i in range(40)
+        }
+        dedup = SemanticDeduplicator(
+            duplicate_threshold=0.85,
+            resonance_threshold=0.5,
+        )
+        result = dedup.find_duplicates(embeddings)
+
+        # Reference: brute-force cosine over the same data.
+        ids = sorted(embeddings.keys())
+        expected_pairs: set[tuple[str, str, str]] = set()
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                vec_i = _to_np(embeddings[ids[i]])
+                vec_j = _to_np(embeddings[ids[j]])
+                sim = _cosine_similarity(vec_i, vec_j)
+                if sim >= 0.85:
+                    expected_pairs.add((ids[i], ids[j], "duplicate"))
+                elif sim >= 0.5:
+                    expected_pairs.add((ids[i], ids[j], "resonance"))
+
+        actual_pairs: set[tuple[str, str, str]] = set()
+        for pair in result.duplicates:
+            actual_pairs.add(
+                (pair.fragment_id_a, pair.fragment_id_b, pair.classification),
+            )
+        for pair in result.resonances:
+            actual_pairs.add(
+                (pair.fragment_id_a, pair.fragment_id_b, pair.classification),
+            )
+        assert actual_pairs == expected_pairs
+
+    def test_zero_vector_yields_zero_similarity(self) -> None:
+        """A zero embedding does not produce ``NaN`` or false matches."""
+        dedup = SemanticDeduplicator()
+        embeddings = {
+            "frag-zero": [0.0, 0.0, 0.0],
+            "frag-other": [1.0, 0.0, 0.0],
+        }
+        result = dedup.find_duplicates(embeddings)
+        assert not result.duplicates
+        assert not result.resonances
+
+
+class TestDeduplicationConfig:
+    """Tests for the optional FAISS feature flag and config plumbing."""
+
+    def test_use_faiss_falls_back_when_not_installed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``use_faiss=True`` does not crash if the package is missing."""
+        # Force ``import faiss`` to fail so we exercise the fallback path
+        # regardless of whether FAISS happens to be installed in CI.
+        import builtins
+
+        original_import = builtins.__import__
+
+        def fake_import(name: str, *args: object, **kwargs: object) -> object:
+            if name == "faiss":
+                msg = "faiss not available in test"
+                raise ImportError(msg)
+            return original_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        config = DeduplicationConfig(
+            duplicate_threshold=0.95,
+            resonance_threshold=0.75,
+            use_faiss=True,
+        )
+        dedup = SemanticDeduplicator(config=config)
+        embeddings = {
+            "frag-a": [1.0, 0.0, 0.0],
+            "frag-b": [1.0, 0.0, 0.0],
+        }
+        result = dedup.find_duplicates(embeddings)
+        assert len(result.duplicates) == 1
+
+    def test_config_thresholds_take_precedence(self) -> None:
+        """Config-supplied thresholds override the keyword defaults."""
+        config = DeduplicationConfig(
+            duplicate_threshold=0.5,
+            resonance_threshold=0.1,
+        )
+        dedup = SemanticDeduplicator(config=config)
+        assert dedup.duplicate_threshold == pytest.approx(0.5)
+        assert dedup.resonance_threshold == pytest.approx(0.1)
+
+
+@pytest.mark.slow
+class TestSemanticDedupScaling:
+    """Benchmark guarding against PERF-003's quadratic loop."""
+
+    def test_dedup_completes_under_30s_for_10k(self) -> None:
+        """10k float32 embeddings finish in under 30 seconds."""
+        import time
+
+        rng = np.random.default_rng(0)
+        embeddings: dict[str, list[float]] = {
+            f"frag-{i:06d}": rng.standard_normal(128).astype(np.float32).tolist()
+            for i in range(10_000)
+        }
+        dedup = SemanticDeduplicator(
+            duplicate_threshold=0.95,
+            resonance_threshold=0.85,
+        )
+        start = time.perf_counter()
+        dedup.find_duplicates(embeddings)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 30.0, f"dedup took {elapsed:.2f}s for 10k embeddings"
