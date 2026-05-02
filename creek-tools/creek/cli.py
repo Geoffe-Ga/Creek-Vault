@@ -538,6 +538,10 @@ def classify(
         f"({summary.preserved_manual} manual preserved, "
         f"{summary.skipped_high_confidence} skipped).[/bold green]",
     )
+    if summary.errors:
+        console.print(f"[yellow]Errors: {len(summary.errors)}[/yellow]")
+        for err in summary.errors:
+            console.print(f"  [dim]{err}[/dim]")
 
 
 @app.command()

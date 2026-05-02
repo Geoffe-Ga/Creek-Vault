@@ -180,6 +180,52 @@ def test_run_interactive_override_with_unknown_frequency_defers(
     assert reloaded.get("classification_method") != "manual"
 
 
+def test_parse_frequency_input_accepts_case_variants() -> None:
+    """``_parse_frequency_input`` is case-insensitive across the enum."""
+    from creek.classify.review_runner import _parse_frequency_input
+
+    assert _parse_frequency_input("F1") == Frequency.F1
+    assert _parse_frequency_input("f1") == Frequency.F1
+    assert _parse_frequency_input("  F10  ") == Frequency.F10
+    assert _parse_frequency_input("unclassified") == Frequency.UNCLASSIFIED
+    assert _parse_frequency_input("UNCLASSIFIED") == Frequency.UNCLASSIFIED
+    assert _parse_frequency_input("Unclassified") == Frequency.UNCLASSIFIED
+
+
+def test_parse_frequency_input_rejects_unknown() -> None:
+    """Unknown values return ``None`` rather than raising."""
+    from creek.classify.review_runner import _parse_frequency_input
+
+    assert _parse_frequency_input("magenta") is None
+    assert _parse_frequency_input("F11") is None
+    assert _parse_frequency_input("") is None
+
+
+def test_run_interactive_override_accepts_uppercase_unclassified(
+    tmp_path: Path,
+) -> None:
+    """Operators typing ``UNCLASSIFIED`` should not silently get deferred."""
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-uncl00000001",
+        title="Uppercase unclassified",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        frequency=FrequencyClassification(primary=Frequency.F5),
+    )
+    file = _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    runner = ReviewQueueRunner(vault_path=vault, console=Console())
+    pending = runner.list_pending()
+
+    with patch("typer.prompt", side_effect=["o", "UNCLASSIFIED"]):
+        summary = runner.run_interactive(pending)
+
+    assert summary.overridden == 1
+    reloaded = frontmatter.load(str(file))
+    assert reloaded["classification_method"] == "manual"
+    assert reloaded["frequency"]["primary"] == "unclassified"
+
+
 def test_format_review_summary_contains_id(tmp_path: Path) -> None:
     """The single-line summary surfaces the fragment ID for the operator."""
     vault = tmp_path / "vault"

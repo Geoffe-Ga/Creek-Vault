@@ -43,6 +43,32 @@ def test_run_link_rebuild_clears_cache(tmp_path: Path) -> None:
     assert not cache_path.exists()
 
 
+def test_run_link_rebuild_is_noop_for_temporal(tmp_path: Path) -> None:
+    """``--rebuild`` must not delete the cache when method != embeddings.
+
+    ``--rebuild`` is documented as "invalidate the embeddings cache".
+    Running it under ``--method temporal`` previously also blew away
+    the cache as a side effect; that's the regression being pinned
+    here.
+    """
+    vault = tmp_path / "vault"
+    cache_dir = vault / "00-Creek-Meta"
+    cache_dir.mkdir(parents=True)
+    cache_path = cache_dir / "embeddings.npz"
+    sentinel = b"keep-me"
+    cache_path.write_bytes(sentinel)
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="temporal",
+        rebuild=True,
+    )
+    assert cache_path.exists()
+    assert cache_path.read_bytes() == sentinel
+
+
 def test_run_link_embeddings_writes_cache(tmp_path: Path) -> None:
     """Embeddings are persisted to the on-disk cache after a run."""
     vault = tmp_path / "vault"

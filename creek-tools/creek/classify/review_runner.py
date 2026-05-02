@@ -173,6 +173,27 @@ class ReviewQueueRunner:
         return summary
 
 
+def _parse_frequency_input(value: str) -> Frequency | None:
+    """Parse operator-typed frequency input case-insensitively.
+
+    Accepts ``F1``..``F10`` (any casing) plus ``unclassified`` (any
+    casing). Returns ``None`` for anything else so the caller can
+    print a helpful error and defer the entry instead of silently
+    falling through.
+
+    Args:
+        value: Raw response from the prompt.
+
+    Returns:
+        The matching :class:`Frequency` enum, or ``None`` on no match.
+    """
+    cleaned = value.strip().lower()
+    for member in Frequency:
+        if cleaned == member.value.lower():
+            return member
+    return None
+
+
 def _override_frequency(
     entry: ReviewEntry,
     console: Console,
@@ -191,9 +212,8 @@ def _override_frequency(
         "New primary frequency (F1..F10 / unclassified)",
         default=str(entry.fragment.frequency.primary),
     ).strip()
-    try:
-        primary = Frequency(response.upper() if response.startswith("f") else response)
-    except ValueError:
+    primary = _parse_frequency_input(response)
+    if primary is None:
         console.print(f"[red]Unknown frequency {response!r}; skipping.[/red]")
         return None
 

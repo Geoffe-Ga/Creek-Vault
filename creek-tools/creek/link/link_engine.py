@@ -71,7 +71,12 @@ def run_link(
         A :class:`LinkSummary` capturing per-method counts.
     """
     cache_path = vault_path / _EMBEDDINGS_CACHE_DIR / _EMBEDDINGS_CACHE_NAME
-    if rebuild and cache_path.exists():
+    # ``--rebuild`` is documented as "invalidate the embeddings cache",
+    # so only act on it for the embeddings linker. Temporal and eddy
+    # methods don't own the cache and shouldn't side-effect it — eddy
+    # *consumes* the cache, so blowing it away under that method would
+    # silently force a recompute the operator didn't ask for.
+    if rebuild and method == "embeddings" and cache_path.exists():
         cache_path.unlink()
         logger.info("Removed cached embeddings archive at %s", cache_path)
 
