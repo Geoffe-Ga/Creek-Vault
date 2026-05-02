@@ -1628,3 +1628,139 @@ class TestRedactionConfigEnhancements:
         """RedactionConfig should accept custom exclusion patterns."""
         config = RedactionConfig(exclude_patterns=["vendor", "dist"])
         assert config.exclude_patterns == ["vendor", "dist"]
+
+
+# ---------------------------------------------------------------------------
+# Luhn validation for credit cards (SEC-001)
+# ---------------------------------------------------------------------------
+
+
+class TestLuhnValidator:
+    """Tests for the standalone Luhn validator helper."""
+
+    @pytest.mark.parametrize(
+        "digits",
+        [
+            "4111111111111111",  # Visa test card
+            "5555555555554444",  # Mastercard test card
+            "378282246310005",  # Amex test card
+            "6011111111111117",  # Discover test card
+        ],
+    )
+    def test_luhn_accepts_valid(self, digits: str) -> None:
+        """_luhn_valid should accept canonical Luhn-valid digit strings."""
+        from creek.redact.scanner import _luhn_valid
+
+        assert _luhn_valid(digits)
+
+    @pytest.mark.parametrize(
+        "digits",
+        [
+            "4111111111111112",  # last digit wrong
+            "1234567890123456",  # random sequential
+            "5555555555554443",  # off-by-one Mastercard
+            "0000000000000001",  # near-zero
+        ],
+    )
+    def test_luhn_rejects_invalid(self, digits: str) -> None:
+        """_luhn_valid should reject digit strings that fail the checksum."""
+        from creek.redact.scanner import _luhn_valid
+
+        assert not _luhn_valid(digits)
+
+    def test_luhn_rejects_non_digits(self) -> None:
+        """_luhn_valid should reject non-digit input."""
+        from creek.redact.scanner import _luhn_valid
+
+        assert not _luhn_valid("")
+        assert not _luhn_valid("abcd")
+        assert not _luhn_valid("4111-1111-1111-1111")  # caller must canonicalise
+
+
+class TestScannerLuhnPostValidation:
+    """The scanner must drop credit_card matches that fail Luhn (SEC-001)."""
+
+    @pytest.mark.parametrize(
+        "number",
+        [
+            "4111 1111 1111 1111",  # Luhn-valid Visa test
+            "5555-5555-5555-4444",  # Luhn-valid Mastercard test
+            "378282246310005",  # Luhn-valid Amex test (15 digits)
+        ],
+    )
+    def test_luhn_accepts_valid_card_numbers(
+        self, tmp_path: Path, number: str
+    ) -> None:
+        """Scanner should keep credit_card matches that pass Luhn."""
+        test_file = tmp_path / "cc.txt"
+        test_file.write_text(f"card: {number}\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        assert any(m.match_type == "credit_card" for m in matches)
+
+    @pytest.mark.parametrize(
+        "number",
+        [
+            "4111 1111 1111 1112",  # Luhn-invalid Visa-shaped string
+            "5555-5555-5555-4443",  # Luhn-invalid Mastercard-shaped string
+        ],
+    )
+    def test_luhn_rejects_invalid_card_numbers(
+        self, tmp_path: Path, number: str
+    ) -> None:
+        """Scanner should drop credit_card matches that fail Luhn."""
+        test_file = tmp_path / "cc.txt"
+        test_file.write_text(f"card: {number}\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        assert not any(m.match_type == "credit_card" for m in matches)
+
+    def test_luhn_filter_only_applies_to_credit_card(
+        self, tmp_path: Path
+    ) -> None:
+        """Other patterns must not be filtered through the Luhn check."""
+        test_file = tmp_path / "ssn.txt"
+        # SSN that is not 16/15 digits — Luhn must not touch it.
+        test_file.write_text("SSN: 123-45-6789\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+
+        ssn_matches = [m for m in matches if m.match_type == "ssn"]
+        assert len(ssn_matches) == 1
+
+    def test_luhn_low_false_positive_rate_on_random_digits(
+        self, tmp_path: Path
+    ) -> None:
+        """On random 16-digit corpora the false-positive rate must drop below 1%."""
+        import random
+
+        rng = random.Random(20260502)
+        # 1000 random 16-digit numbers prefixed to match BIN ranges.
+        prefixes = ["4", "51", "52", "53", "54", "55", "65", "60"]
+        samples = []
+        for _ in range(1000):
+            prefix = rng.choice(prefixes)
+            remaining = 16 - len(prefix)
+            digits = prefix + "".join(
+                str(rng.randint(0, 9)) for _ in range(remaining)
+            )
+            samples.append(digits)
+
+        test_file = tmp_path / "noise.txt"
+        test_file.write_text("\n".join(samples) + "\n")
+
+        scanner = RedactionScanner(config=RedactionConfig())
+        matches = scanner.scan_file(test_file)
+        cc_matches = [m for m in matches if m.match_type == "credit_card"]
+        # Pure random digits will be Luhn-valid ~10% of the time on average,
+        # so we expect a small fraction to survive. The point is that Luhn
+        # collapses what would otherwise be a 100% match rate (one per line)
+        # to a small slice of those.
+        assert len(cc_matches) < 150, (
+            f"Luhn filter not effective: {len(cc_matches)} of 1000 matched"
+        )

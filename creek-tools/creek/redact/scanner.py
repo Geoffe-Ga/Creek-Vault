@@ -199,6 +199,11 @@ class RedactionScanner:
         Reads the file line-by-line and returns a :class:`RedactionMatch`
         for every pattern hit that is not on the false-positive allowlist.
 
+        Pattern-specific post-validators are applied after a regex hit:
+        the ``credit_card`` pattern is filtered through the Luhn checksum
+        so that 16-digit identifiers that happen to match a BIN range
+        are not reported as cards.
+
         Args:
             file_path: Path to the file to scan.
 
@@ -220,6 +225,8 @@ class RedactionScanner:
                 for m in pattern.finditer(line):
                     matched_text = m.group()
                     if self._is_allowlisted(matched_text):
+                        continue
+                    if not _post_validate(name, matched_text):
                         continue
                     matches.append(
                         RedactionMatch(
@@ -561,6 +568,57 @@ class RedactionScanner:
                 lines.append("")
 
         return "\n".join(lines)
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Return ``True`` when *digits* satisfies the Luhn checksum.
+
+    Caller is responsible for stripping non-digit separators (spaces,
+    dashes) before invoking — this helper rejects any input containing
+    non-digit characters so a typo in the caller is surfaced as a
+    rejection rather than a silent miscount.
+
+    Args:
+        digits: A non-empty string of decimal digits.
+
+    Returns:
+        ``True`` if the digit sequence is Luhn-valid; ``False`` for
+        empty input, non-digit input, or a failing checksum.
+    """
+    if not digits or not digits.isdigit():
+        return False
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        digit = ord(char) - ord("0")
+        if index % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+_DIGIT_STRIP = re.compile(r"\D")
+
+
+def _post_validate(pattern_name: str, matched_text: str) -> bool:
+    """Run pattern-specific post-validation on a regex hit.
+
+    Returns ``True`` when the match should be kept and ``False`` when
+    it should be dropped. Patterns without a registered validator are
+    always kept.
+
+    Args:
+        pattern_name: The pattern key that produced the match.
+        matched_text: The substring that the regex captured.
+
+    Returns:
+        Whether the match passes the pattern's post-validation.
+    """
+    if pattern_name == "credit_card":
+        digits = _DIGIT_STRIP.sub("", matched_text)
+        return _luhn_valid(digits)
+    return True
 
 
 def _get_severity(match_type: str) -> str:

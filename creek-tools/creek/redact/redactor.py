@@ -15,7 +15,7 @@ from typing import Any
 
 from creek.config import RedactionConfig
 from creek.redact.patterns import REDACTION_PATTERNS
-from creek.redact.scanner import RedactionMatch
+from creek.redact.scanner import RedactionMatch, _post_validate
 
 
 class Redactor:
@@ -93,7 +93,7 @@ class Redactor:
 
         for name, pattern in patterns_to_use.items():
             marker = f"[REDACTED:{name}]"
-            content = self._replace_pattern(content, pattern, marker)
+            content = self._replace_pattern(content, pattern, marker, name)
 
         return content
 
@@ -102,22 +102,27 @@ class Redactor:
         content: str,
         pattern: re.Pattern[str],
         marker: str,
+        pattern_name: str,
     ) -> str:
         """Replace all occurrences of *pattern* in *content* with *marker*.
 
-        Skips allowlisted matches so they remain in the output.
+        Skips allowlisted matches and matches that fail the
+        pattern-specific post-validator (e.g. Luhn for ``credit_card``)
+        so they remain in the output.
 
         Args:
             content: Source text.
             pattern: Compiled regex to search for.
             marker: Replacement string (e.g. ``[REDACTED:ssn]``).
+            pattern_name: The pattern key, used to dispatch
+                post-validators that filter false positives.
 
         Returns:
             Content with non-allowlisted matches replaced.
         """
 
         def _replacer(m: re.Match[str]) -> str:
-            """Return the marker unless the match is allowlisted.
+            """Return the marker unless the match is allowlisted or invalid.
 
             Args:
                 m: Regex match object.
@@ -126,6 +131,8 @@ class Redactor:
                 The marker string or the original match text.
             """
             if self._is_allowlisted(m.group()):
+                return m.group()
+            if not _post_validate(pattern_name, m.group()):
                 return m.group()
             return marker
 
