@@ -10,7 +10,7 @@ and ``classified_at`` timestamp on each fragment so that subsequent
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
@@ -23,6 +23,7 @@ from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
     CLASSIFIED_AT_KEY,
     MANUAL_METHOD,
+    RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.rules import RuleClassifier
@@ -40,14 +41,20 @@ class ClassifySummary:
     """Counts produced by a single ``creek classify`` run.
 
     Attributes:
-        total: Total fragment files visited.
-        classified: Fragments whose frontmatter was updated.
+        total: Number of Creek fragments visited (non-fragment markdown
+            files in ``01-Fragments`` are silently skipped and not
+            counted here).
+        classified: Fragments whose frontmatter was updated. A
+            ``--method llm`` run that short-circuits to the rule
+            result still counts as classified — the work is real and
+            the file is rewritten.
         preserved_manual: Fragments left unchanged because the operator
             previously stamped them ``method: manual`` and ``--force``
             was not passed.
-        skipped_high_confidence: Fragments the LLM was not asked about
-            because the rules classifier already produced a confident
-            answer.
+        skipped_high_confidence: Subset of ``classified`` for which
+            the LLM was not invoked because the rule classifier
+            produced a high-confidence answer. The fragment is still
+            stamped ``classification_method: rules`` on disk.
         errors: Human-readable error messages (one per failure).
     """
 
@@ -56,6 +63,21 @@ class ClassifySummary:
     preserved_manual: int
     skipped_high_confidence: int
     errors: list[str]
+
+
+@dataclass
+class _RunCounts:
+    """Mutable counters threaded through the per-file dispatch.
+
+    Pulled out of :func:`run_classify` so the loop body can update
+    counts without inflating that function's cyclomatic complexity.
+    """
+
+    total: int = 0
+    classified: int = 0
+    preserved: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
 
 
 def run_classify(
@@ -83,63 +105,97 @@ def run_classify(
 
     rules = RuleClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
-
-    total = 0
-    classified = 0
-    preserved = 0
-    skipped = 0
-    errors: list[str] = []
+    counts = _RunCounts()
 
     for md_file in sorted(fragments_root.rglob("*.md")):
-        total += 1
-        try:
-            record = _read_fragment(md_file)
-        except (OSError, ValueError, yaml.YAMLError) as exc:
-            errors.append(f"unreadable fragment {md_file}: {exc}")
-            continue
-        if record is None:
-            # File parsed cleanly but is not a Creek fragment (no
-            # ``type: fragment`` field, or schema mismatch). Silently
-            # skip — markdown notes coexist with fragments in the vault.
-            continue
-        fragment, body, raw = record
-
-        if not force and raw.get(CLASSIFICATION_METHOD_KEY) == MANUAL_METHOD:
-            preserved += 1
-            continue
-
-        new_fragment, was_skipped = _classify_one(
-            fragment=fragment,
-            body=body,
+        _process_file(
+            md_file=md_file,
             method=method,
+            force=force,
             rules=rules,
             llm=llm,
             confidence_threshold=config.classification.confidence_threshold,
+            counts=counts,
         )
-        if was_skipped:
-            skipped += 1
-            continue
-
-        try:
-            _write_fragment(
-                md_file=md_file,
-                fragment=new_fragment,
-                body=body,
-                method=method,
-                raw=raw,
-            )
-        except OSError as exc:
-            errors.append(f"failed to update {md_file}: {exc}")
-            continue
-        classified += 1
 
     return ClassifySummary(
-        total=total,
-        classified=classified,
-        preserved_manual=preserved,
-        skipped_high_confidence=skipped,
-        errors=errors,
+        total=counts.total,
+        classified=counts.classified,
+        preserved_manual=counts.preserved,
+        skipped_high_confidence=counts.skipped,
+        errors=counts.errors,
     )
+
+
+def _process_file(
+    *,
+    md_file: Path,
+    method: str,
+    force: bool,
+    rules: RuleClassifier,
+    llm: LLMClassifier | None,
+    confidence_threshold: float,
+    counts: _RunCounts,
+) -> None:
+    """Classify a single fragment file and update ``counts`` in place.
+
+    Args:
+        md_file: The file to consider.
+        method: ``"rules"`` or ``"llm"``.
+        force: Whether to overwrite manual classifications.
+        rules: Shared :class:`RuleClassifier` instance.
+        llm: Shared :class:`LLMClassifier` (when ``method == "llm"``).
+        confidence_threshold: Threshold below which the LLM is invoked.
+        counts: Mutable per-run counters; mutated in place.
+    """
+    try:
+        record = _read_fragment(md_file)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        counts.errors.append(f"unreadable fragment {md_file}: {exc}")
+        return
+    if record is None:
+        # File parsed cleanly but is not a Creek fragment (no
+        # ``type: fragment`` field, or schema mismatch). Silently skip —
+        # markdown notes coexist with fragments in the vault, and it
+        # would be misleading to count them in ``total``.
+        return
+    # Only count files we actually identify as Creek fragments.
+    counts.total += 1
+    fragment, body, raw = record
+
+    if not force and raw.get(CLASSIFICATION_METHOD_KEY) == MANUAL_METHOD:
+        counts.preserved += 1
+        return
+
+    new_fragment, was_skipped = _classify_one(
+        fragment=fragment,
+        body=body,
+        method=method,
+        rules=rules,
+        llm=llm,
+        confidence_threshold=confidence_threshold,
+    )
+    # When ``--method llm`` short-circuits because the rule classifier
+    # already produced a confident answer, the provenance stamp must
+    # reflect what actually classified the fragment ("rules"), not
+    # the user's CLI choice ("llm"). Either way the fragment IS
+    # persisted — we never skip the write, only the LLM call.
+    write_method = RULES_METHOD if was_skipped else method
+
+    try:
+        _write_fragment(
+            md_file=md_file,
+            fragment=new_fragment,
+            body=body,
+            method=write_method,
+            raw=raw,
+        )
+    except OSError as exc:
+        counts.errors.append(f"failed to update {md_file}: {exc}")
+        return
+    counts.classified += 1
+    if was_skipped:
+        counts.skipped += 1
 
 
 def _classify_one(

@@ -121,7 +121,9 @@ def test_run_classify_skips_non_fragment_files(tmp_path: Path) -> None:
 
     The classify engine treats a missing/wrong ``type`` field as "not a
     Creek fragment, leave it alone" — these are not errors, they're
-    arbitrary markdown that happens to share the directory.
+    arbitrary markdown that happens to share the directory. Such
+    files must not appear in ``summary.total`` either, otherwise the
+    "Classified N of M" CLI message becomes misleading.
     """
     vault = tmp_path / "vault"
     fragments_dir = vault / "01-Fragments" / "Notes"
@@ -135,7 +137,7 @@ def test_run_classify_skips_non_fragment_files(tmp_path: Path) -> None:
         method="rules",
         force=False,
     )
-    assert summary.total == 1
+    assert summary.total == 0
     assert summary.classified == 0
     assert summary.errors == []
 
@@ -177,14 +179,23 @@ def test_run_classify_unreadable_file_records_error(tmp_path: Path) -> None:
 
 
 def test_run_classify_llm_skips_high_confidence(tmp_path: Path) -> None:
-    """When rules give a confident answer, the LLM is not invoked."""
+    """High-confidence rule result is persisted with method='rules'.
+
+    When ``--method llm`` and the rule classifier produces a
+    confident answer, the LLM is short-circuited but the rule's
+    classification IS written back to disk — otherwise the operator's
+    work would be silently discarded and the fragment would re-enter
+    the review queue on every run.
+    """
+    import frontmatter
+
     vault = tmp_path / "vault"
     fragment = Fragment(
         id="frag-skip00000000",
         title="Confident already",
         source=FragmentSource(platform=SourcePlatform.MARKDOWN),
     )
-    _write_fragment(
+    file = _write_fragment(
         vault=vault,
         fragment=fragment,
         body="Power dominance control conquest force aggression bold rage warrior",
@@ -203,6 +214,49 @@ def test_run_classify_llm_skips_high_confidence(tmp_path: Path) -> None:
 
     mock_llm.assert_not_called()
     assert summary.skipped_high_confidence >= 1
+    assert summary.classified == summary.skipped_high_confidence
+
+    # The rule-classified fragment must be persisted with the truthful
+    # provenance stamp, not the user's CLI choice.
+    reloaded = frontmatter.load(str(file))
+    assert reloaded["classification_method"] == "rules"
+    assert "classified_at" in reloaded.metadata
+
+
+def test_run_classify_total_only_counts_creek_fragments(tmp_path: Path) -> None:
+    """``total`` excludes arbitrary markdown notes that share the directory.
+
+    A vault with 2 Creek fragments and 3 unrelated Obsidian notes
+    must report ``total == 2`` — not 5. Counting non-fragments would
+    surface as a misleading "Classified 2 of 5" CLI message.
+    """
+    vault = tmp_path / "vault"
+    for i in range(2):
+        _write_fragment(
+            vault=vault,
+            fragment=Fragment(
+                id=f"frag-realfrag00{i:03d}",
+                title=f"Real fragment {i}",
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            ),
+            body="Power dominance bold rage warrior conquest",
+        )
+
+    notes_dir = vault / "01-Fragments" / "Notes"
+    for i in range(3):
+        note = notes_dir / f"unrelated-{i}.md"
+        # Plain Obsidian note — no ``type: fragment`` frontmatter.
+        note.write_text(f"# Unrelated {i}\n\nJust a note.\n", encoding="utf-8")
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert summary.total == 2
+    assert summary.classified == 2
 
 
 def test_run_classify_llm_invoked_for_low_confidence(tmp_path: Path) -> None:
