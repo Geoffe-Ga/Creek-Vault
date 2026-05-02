@@ -87,3 +87,28 @@ Redaction sanitises *content*; it doesn't delete the fragment. If you need a fra
 - **Always** scan before `creek ingest` on any new export.
 - **Re-scan** the vault after every classification pass, especially if you've turned on the LLM path — it can occasionally surface PII the rules missed.
 - **Audit** the report monthly. The audit log under `<vault>/00-Creek-Meta/audit/` records every apply.
+
+## How `creek process` interacts with redaction
+
+`creek process` is **fail-loud**: when the redaction scan finds any unresolved
+matches it raises `RedactionRequiredError` and exits non-zero before
+ingestion. The CLI prints an exact remediation hint:
+
+```
+Redaction gate: Redaction scan found 17 unresolved match(es) in /tmp/exports.
+Run `creek redact --apply --source /tmp/exports` (or set redaction.dry_run:
+true to skip this gate) before re-running `creek process`.
+```
+
+Two ways to override the gate:
+
+1. **Recommended.** Run `creek redact --apply --source <path>` so the
+   replacements happen with operator review, then re-run
+   `creek process`.
+2. Set `redaction.dry_run: true` in your `creek_config.yaml`. The
+   pipeline still scans and logs the matches, but does not abort. This
+   is the right setting only when the source is known to be safe — e.g.
+   regenerating a vault from already-cleaned exports.
+
+This trades a small ergonomic cost (an extra command) for the guarantee
+that `creek process` cannot silently leak secrets into the vault.

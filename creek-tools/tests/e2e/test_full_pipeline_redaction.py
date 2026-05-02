@@ -2,8 +2,9 @@
 
 Drops a source file containing a deliberately well-known test secret,
 runs the full pipeline, and asserts the secret does not appear in any
-file written under the vault. Catches the BUG-004 regression where the
-pipeline scans for redactions but never applies them.
+file written under the vault. Pinned to the fail-loud behaviour
+documented in ``docs/redaction.md``: the pipeline must refuse to ingest
+when unresolved redaction matches exist.
 """
 
 from __future__ import annotations
@@ -16,20 +17,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from creek.config import CreekConfig
-from creek.pipeline import Pipeline
+from creek.pipeline import Pipeline, RedactionRequiredError
 
-pytestmark = [
-    pytest.mark.e2e,
-    pytest.mark.xfail(
-        reason=(
-            "BUG-004: pipeline scans for redactions but does not apply "
-            "them. strict=True so when the redactor is wired into the "
-            "ingestion path the test XPASSES, fails CI, and forces "
-            "removal of this xfail marker."
-        ),
-        strict=True,
-    ),
-]
+pytestmark = [pytest.mark.e2e]
 
 
 _SECRET = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret  AWS test example
@@ -39,12 +29,11 @@ _SECRET = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret  AWS test example
 def test_pipeline_does_not_leak_secret_into_vault(
     synthetic_vault: Path, synthetic_source: Path
 ) -> None:
-    """A well-known fake AWS key must not survive to any vault file.
+    """A well-known fake AWS key must never reach any vault file.
 
-    Reads every file in the resulting vault and asserts the secret token
-    is absent. This is a hard "no leaks" invariant: even if redaction
-    only rewrites *some* files, none of them should contain the literal
-    AKIA* token.
+    With the fail-loud redaction gate, the pipeline aborts before
+    ingestion when it sees the secret. Either way the invariant holds:
+    no file under the vault contains the literal AKIA* token.
     """
     note = synthetic_source / "leaky.md"
     note.write_text(
@@ -54,7 +43,8 @@ def test_pipeline_does_not_leak_secret_into_vault(
 
     config = CreekConfig()
     pipeline = Pipeline(config=config)
-    pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
+    with pytest.raises(RedactionRequiredError):
+        pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
 
     for path in synthetic_vault.rglob("*"):
         if not path.is_file():

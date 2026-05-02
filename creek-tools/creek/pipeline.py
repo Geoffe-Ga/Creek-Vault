@@ -6,6 +6,13 @@ source directory, producing a :class:`PipelineResult` with aggregate counts.
 
 Processing is gated on user consent via :class:`~creek.consent.ConsentManager`:
 if consent has not been recorded for a source, the pipeline skips ingestion.
+
+The redaction stage is **fail-loud**: when ``redaction.enabled`` is true and
+the scanner finds unresolved sensitive content, the pipeline raises
+:class:`RedactionRequiredError` and refuses to ingest. The user must run
+``creek redact --apply`` first. This trades a small ergonomic cost for the
+guarantee that ``creek process`` can never silently leak secrets into the
+vault.
 """
 
 import logging
@@ -22,11 +29,41 @@ from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.base import IngestedFragment, assemble_ingested_fragment
 from creek.link.linker import LinkingPipeline
-from creek.models import Fragment
+from creek.models import Fragment, Frequency
 from creek.redact.scanner import RedactionScanner
 from creek.vault.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
+
+
+class RedactionRequiredError(RuntimeError):
+    """Raised when ``creek process`` finds unresolved redaction matches.
+
+    The pipeline refuses to ingest until the user runs
+    ``creek redact --apply --source <path>`` (or accepts the matches by
+    setting ``redaction.dry_run: true``). Carrying the match count lets
+    the CLI render an exact remediation message.
+
+    Attributes:
+        match_count: Number of unresolved redaction matches found.
+        source_path: The source directory that was scanned.
+    """
+
+    def __init__(self, match_count: int, source_path: Path) -> None:
+        """Build a fail-loud redaction error with a remediation hint.
+
+        Args:
+            match_count: Number of unresolved sensitive matches.
+            source_path: Source directory the scanner walked.
+        """
+        self.match_count = match_count
+        self.source_path = source_path
+        super().__init__(
+            f"Redaction scan found {match_count} unresolved match(es) in "
+            f"{source_path}. Run `creek redact --apply --source "
+            f"{source_path}` (or set redaction.dry_run: true to skip "
+            "this gate) before re-running `creek process`."
+        )
 
 
 class PipelineResult(BaseModel):
@@ -181,7 +218,15 @@ class Pipeline:
         )
 
     def _run_redaction(self, source_path: Path, result: PipelineResult) -> int:
-        """Scan source files for sensitive data.
+        """Scan source files for sensitive data and abort if any are found.
+
+        When ``redaction.enabled`` is true and the scanner reports any
+        unresolved matches, this method raises
+        :class:`RedactionRequiredError` rather than ingest sensitive
+        content into the vault. Set ``redaction.dry_run: true`` to keep
+        the scan informational (matches are logged but the pipeline
+        proceeds); the documented remediation is to run
+        ``creek redact --apply`` first.
 
         Args:
             source_path: Directory to scan.
@@ -189,6 +234,10 @@ class Pipeline:
 
         Returns:
             Number of files scanned.
+
+        Raises:
+            RedactionRequiredError: When matches are found and
+                ``redaction.dry_run`` is false.
         """
         if not source_path.exists():
             logger.warning("Source path does not exist: %s", source_path)
@@ -197,15 +246,28 @@ class Pipeline:
         files = list(source_path.rglob("*"))
         file_count = sum(1 for f in files if f.is_file())
 
-        if self.config.redaction.enabled:
-            matches = self.scanner.scan_directory(source_path)
-            if matches:
-                logger.info(
-                    "Redaction scan found %d potential PII match(es)",
-                    len(matches),
-                )
+        if not self.config.redaction.enabled:
+            return file_count
 
-        return file_count
+        matches = self.scanner.scan_directory(source_path)
+        if not matches:
+            return file_count
+
+        if self.config.redaction.dry_run:
+            logger.warning(
+                "Redaction scan found %d potential PII match(es) "
+                "(dry_run=true; pipeline will continue without applying)",
+                len(matches),
+            )
+            return file_count
+
+        logger.error(
+            "Redaction scan found %d unresolved match(es) in %s; "
+            "refusing to ingest until they are applied.",
+            len(matches),
+            source_path,
+        )
+        raise RedactionRequiredError(len(matches), source_path)
 
     def _run_ingestion(
         self, source_path: Path, result: PipelineResult
@@ -268,7 +330,14 @@ class Pipeline:
         vault_path: Path,
         result: PipelineResult,
     ) -> list[IngestedFragment]:
-        """Classify fragments through rules, LLM, and review queue.
+        """Classify fragments through rules, optional LLM, and review queue.
+
+        Runs the rule-based classifier first, then escalates to the LLM
+        only for fragments that the rules left below
+        ``ClassificationConfig.confidence_threshold`` or with an
+        unclassified primary frequency. Fragments whose source platform
+        is in ``human_review_sources`` are never sent to the LLM — they
+        always go to the review queue for a human decision.
 
         Classification operates on the inner :class:`Fragment`; the body
         is preserved unchanged on the returned :class:`IngestedFragment`.
@@ -287,8 +356,9 @@ class Pipeline:
 
         classified: list[IngestedFragment] = []
         for item in ingested:
-            frag = self.rule_classifier.classify(item.fragment)
-            frag = self.llm_classifier.classify(frag)
+            frag = self.rule_classifier.classify(item.fragment, content=item.body)
+            if self._needs_llm(frag, item.body):
+                frag = self.llm_classifier.classify(frag, content=item.body)
             classified.append(IngestedFragment(fragment=frag, body=item.body))
 
         self.review_generator.generate_queue(
@@ -296,6 +366,44 @@ class Pipeline:
             vault_path,
         )
         return classified
+
+    def _needs_llm(self, fragment: Fragment, content: str) -> bool:
+        """Return ``True`` when the rule classifier left this fragment uncertain.
+
+        A fragment is sent to the LLM when:
+
+        * its source platform is not in
+          :attr:`ClassificationConfig.human_review_sources` (those go
+          straight to the review queue without LLM assistance), and
+        * the rule classifier left its primary frequency unclassified
+          *or* its rule-derived confidence sits below
+          :attr:`ClassificationConfig.confidence_threshold`.
+
+        Fragments whose source platform is in ``auto_classify_sources``
+        and whose rules already produced a confident answer are skipped,
+        which is the cost-saving fast path for cleanly-classified bulk
+        imports.
+
+        Args:
+            fragment: Fragment after the rule-classifier pass.
+            content: Markdown body the rule classifier scored.
+
+        Returns:
+            ``True`` if :class:`LLMClassifier` should be invoked.
+        """
+        classification = self.config.classification
+
+        if fragment.source.platform in classification.human_review_sources:
+            return False
+
+        if fragment.frequency.primary == Frequency.UNCLASSIFIED:
+            return True
+
+        confidence = self.rule_classifier.confidence_score(
+            fragment,
+            content=content,
+        )
+        return confidence < classification.confidence_threshold
 
     def _write_to_vault(
         self,
