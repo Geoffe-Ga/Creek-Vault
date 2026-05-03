@@ -480,6 +480,39 @@ def test_redact_apply_no_symlinks_proceeds(tmp_path: Path) -> None:
     assert "hunter2" not in leak.read_text(encoding="utf-8")
 
 
+def test_redact_apply_handles_circular_symlink(tmp_path: Path) -> None:
+    """A loop (`a → b → a`) inside the source must not crash the guard.
+
+    ``os.walk(followlinks=False)`` will not descend into the loop, but
+    ``Path.resolve(strict=False)`` on a circular symlink could return
+    an unexpected target. The guard must terminate cleanly: either by
+    refusing (resolved target escapes) or by allowing (resolved target
+    stays under root). Either is acceptable; an uncaught exception is
+    not.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "leak.env").write_text(
+        "API_KEY=sk-abcdefghijklmnopqrstuvwx\n",
+        encoding="utf-8",
+    )
+    a = source / "a.md"
+    b = source / "b.md"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(source), "--yes"],
+    )
+
+    # Exit code may be 0 (loop allowed if it resolves under root) or
+    # non-zero (loop rejected). The guarantee is that we don't crash.
+    assert result.exit_code in (0, 1)
+    if result.exit_code != 0:
+        assert "symlink" in result.output.lower()
+
+
 def test_redact_review_refuses_symlink_escaping_vault(tmp_path: Path) -> None:
     """--review also refuses symlinks that point outside the vault root."""
     vault = tmp_path / "vault"

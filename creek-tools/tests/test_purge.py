@@ -711,7 +711,14 @@ def test_cli_purge_daterange_applies(tmp_path: Path) -> None:
 
 
 def test_cli_purge_vault_rejects_bad_confirm(tmp_path: Path) -> None:
-    """Wrong confirmation text aborts with non-zero exit code."""
+    """Wrong confirmation text aborts at the CLI boundary, not in the engine.
+
+    Reviewer flagged that letting :class:`PurgeEngine` raise
+    ``ValueError`` for a bad ``--confirm-text`` puts the validation
+    deep inside the engine. The CLI should detect the mismatch up
+    front and surface a clear, user-facing message that names the
+    flag involved.
+    """
     vault = _make_vault(tmp_path)
     frag = _write_fragment(vault, "frag-A", "Alpha")
 
@@ -730,6 +737,7 @@ def test_cli_purge_vault_rejects_bad_confirm(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert frag.exists()
+    assert "--confirm-text" in result.output
 
 
 def test_cli_purge_vault_accepts_exact_confirm(tmp_path: Path) -> None:

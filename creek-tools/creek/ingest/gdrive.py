@@ -492,10 +492,14 @@ def _write_token_file(path: Path, contents: str) -> None:
 # ---- OAuth token revocation (SEC-008) ---------------------------------
 
 
-REVOKE_URL: str = "https://oauth2.googleapis.com/revoke"
+_REVOKE_URL: str = "https://oauth2.googleapis.com/revoke"
 """Google OAuth2 token revocation endpoint.
 
 Reference: https://developers.google.com/identity/protocols/oauth2/web-server#tokenrevoke.
+
+Private — Google has rotated this URL before, so callers shouldn't
+take a hard dependency on it. Tests that need the constant import it
+under its private name explicitly.
 """
 
 
@@ -555,7 +559,7 @@ def _read_refresh_token(path: Path) -> str | None:
     return candidate
 
 
-def _secure_erase(path: Path) -> None:
+def _secure_erase(path: Path) -> bool:
     """Best-effort overwrite of *path* with zero bytes before unlinking.
 
     Modern SSDs and copy-on-write filesystems (APFS, btrfs, ZFS) cannot
@@ -566,8 +570,17 @@ def _secure_erase(path: Path) -> None:
     overwrite fails we still drop the directory entry rather than
     leaving the token in place.
 
+    The return value lets callers tell the operator whether the file
+    is actually gone — a previous version assumed it was, producing a
+    false assurance whenever the unlink raised on read-only or
+    permission-denied paths.
+
     Args:
         path: Token file to erase. Must exist when called.
+
+    Returns:
+        ``True`` when the directory entry was successfully removed,
+        ``False`` when the unlink raised ``OSError``.
     """
     try:
         size = path.stat().st_size
@@ -589,6 +602,8 @@ def _secure_erase(path: Path) -> None:
         path.unlink()
     except OSError as exc:
         logger.warning("Could not unlink %s: %s", path, exc)
+        return False
+    return True
 
 
 def revoke_token(config: GoogleDriveConfig) -> RevokeResult:
@@ -613,15 +628,14 @@ def revoke_token(config: GoogleDriveConfig) -> RevokeResult:
     token_path = Path(config.token_file)
     existed = token_path.exists()
     refresh_token = _read_refresh_token(token_path) if existed else None
-    if existed:
-        _secure_erase(token_path)
+    removed = _secure_erase(token_path) if existed else False
 
     remote_revoked = False
     error: str | None = None
     if refresh_token:
         try:
             response = httpx.post(
-                REVOKE_URL,
+                _REVOKE_URL,
                 data={"token": refresh_token},
                 timeout=_REVOKE_TIMEOUT,
             )
@@ -636,7 +650,7 @@ def revoke_token(config: GoogleDriveConfig) -> RevokeResult:
 
     return RevokeResult(
         token_file_existed=existed,
-        token_file_removed=existed,
+        token_file_removed=removed,
         remote_revoked=remote_revoked,
         error=error,
     )

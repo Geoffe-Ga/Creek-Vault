@@ -1,13 +1,15 @@
 # Creek Threat Model
 
 **Version:** 1.0
-**Last reviewed:** 2026-04-28
 
 This document is the canonical statement of what Creek defends against
 and what it does not. It is intentionally short. It assumes you have
 already read the [README](../../README.md) and the
 [cleaning-and-purge](../cleaning-and-purge.md) and
 [redaction](../redaction.md) docs.
+
+The "current as of" date is whatever git-blame says about this
+file's last touch — manual `Last reviewed` annotations rot.
 
 If you read "local-first by default" in the README and inferred
 "private," read this file before trusting Creek with intimate journal
@@ -131,10 +133,15 @@ Creek **does not** aim to provide:
 
 ## Cross-references
 
-- [SEC-002: Redaction pattern coverage gaps](../../../plans/git-issues/SEC-002-redaction-pattern-coverage-gaps.md)
-- [SEC-003: Symlink refusal in redaction](../../../plans/git-issues/SEC-003-redactor-symlink-claim-not-enforced.md)
-- [SEC-004: Prompt injection hardening](../../../plans/git-issues/SEC-004-prompt-injection-llm-classifier.md)
-- [SEC-005: Audit log tamper-evidence](../../../plans/git-issues/SEC-005-audit-log-not-tamper-evident.md)
-- [SEC-006: Privacy-tier enforcement in mine/draft](../../../plans/git-issues/SEC-006-mine-and-draft-do-not-filter-intimate.md)
-- [SEC-008: OAuth token hygiene](../../../plans/git-issues/SEC-008-oauth-token-plaintext-at-rest.md)
-- [OPS-002: Non-interactive purge refusal](../../../plans/git-issues/OPS-002-purge-vault-prompt-bypassable-via-stdin.md)
+Issue files live at the repository root under `plans/git-issues/`:
+
+- **SEC-002** — Redaction pattern coverage gaps
+- **SEC-003** — Symlink refusal in redaction (resolved)
+- **SEC-004** — Prompt injection hardening (resolved)
+- **SEC-005** — Audit log tamper-evidence
+- **SEC-006** — Privacy-tier enforcement in mine/draft
+- **SEC-008** — OAuth token hygiene (resolved)
+- **OPS-002** — Non-interactive purge refusal (resolved)
+
+Each is filed under its short ID; search the issue tracker or the
+in-repo `plans/git-issues/` directory for the full text.

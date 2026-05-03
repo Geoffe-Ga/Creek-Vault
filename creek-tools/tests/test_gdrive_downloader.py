@@ -1071,7 +1071,10 @@ class TestRevokeToken:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The cached refresh token is POSTed to Google's revocation URL."""
-        from creek.ingest.gdrive import REVOKE_URL, revoke_token
+        # Importing the URL constant under its private name documents
+        # that this is a deliberate test-only coupling — production
+        # callers must not depend on the value Google uses here.
+        from creek.ingest.gdrive import _REVOKE_URL, revoke_token
 
         token = tmp_path / "token.json"
         token.write_text('{"refresh_token": "rt-secret"}', encoding="utf-8")
@@ -1091,7 +1094,7 @@ class TestRevokeToken:
 
         revoke_token(config)
 
-        assert captured == [(REVOKE_URL, {"token": "rt-secret"})]
+        assert captured == [(_REVOKE_URL, {"token": "rt-secret"})]
 
     def test_continues_local_delete_when_remote_endpoint_fails(
         self,
@@ -1153,6 +1156,43 @@ class TestRevokeToken:
         on_disk = token.read_bytes()
         assert "rt-very-secret" not in on_disk.decode("utf-8", errors="replace")
         assert on_disk == b"\x00" * len(original)
+
+    def test_token_file_removed_reflects_unlink_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When unlink fails, ``token_file_removed`` must be ``False``.
+
+        Reviewer flagged that the previous implementation set
+        ``token_file_removed=existed`` *before* attempting the unlink,
+        producing a false assurance to the operator if the unlink
+        silently failed (read-only mount, transient OSError). The
+        result must accurately mirror the on-disk outcome.
+        """
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        token.write_text('{"refresh_token": "rt-abc"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        monkeypatch.setattr(
+            "creek.ingest.gdrive.httpx.post",
+            lambda *_a, **_kw: _StubResponse(200),
+        )
+
+        def _boom_unlink(_self: Path, **_kw: object) -> None:
+            msg = "simulated read-only filesystem"
+            raise OSError(msg)
+
+        monkeypatch.setattr("creek.ingest.gdrive.Path.unlink", _boom_unlink)
+
+        result = revoke_token(config)
+
+        assert result.token_file_existed is True
+        assert result.token_file_removed is False
+        # The file is still on disk because unlink raised.
+        assert token.exists()
 
 
 # ---- AST-based read-only audit ---------------------------------------

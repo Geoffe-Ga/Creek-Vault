@@ -11,6 +11,7 @@ command registration and keeps :mod:`creek.cli` focused on routing.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import tempfile
@@ -240,6 +241,14 @@ def _assert_no_escaping_symlinks(
     that legitimate intra-tree aliases (e.g. ``alias.md`` → ``real.md``)
     continue to work.
 
+    ``strict=False`` on ``Path.resolve`` is deliberate: a dangling
+    symlink (pointing at a path that doesn't yet exist) still resolves
+    to a candidate location that we can compare against *root*. The
+    only resolve error we expect to see in practice is
+    ``RuntimeError`` from a circular symlink, which we treat as
+    "escaping" — the caller can't safely operate on the tree either
+    way.
+
     Args:
         root: The user-supplied source or vault root.
         console: Rich console sink for the error banner.
@@ -247,18 +256,19 @@ def _assert_no_escaping_symlinks(
             (e.g. ``"source"`` or ``"vault"``).
 
     Raises:
-        typer.Exit: When any descendant symlink resolves outside *root*.
+        typer.Exit: When any descendant symlink resolves outside
+            *root* or forms a loop.
     """
     resolved_root = root.resolve(strict=False)
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        for entry in dirnames + filenames:
+        for entry in itertools.chain(dirnames, filenames):
             candidate = Path(dirpath) / entry
             if not candidate.is_symlink():
                 continue
             try:
                 resolved = candidate.resolve(strict=False)
                 resolved.relative_to(resolved_root)
-            except (OSError, ValueError):
+            except (OSError, RuntimeError, ValueError):
                 logger.error(
                     "Refusing to follow symlink that escapes the %s root: %s",
                     label,

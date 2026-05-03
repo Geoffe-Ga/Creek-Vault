@@ -748,14 +748,21 @@ def _gdrive_revoke() -> None:
             f"[yellow]No cached token at {token_path}; nothing to revoke.[/yellow]",
         )
         return
-    console.print(f"[green]Token file removed: {token_path}[/green]")
+    if result.token_file_removed:
+        console.print(f"[green]Token file removed: {token_path}[/green]")
+    else:
+        console.print(
+            f"[red]Could not remove token file at {token_path}; "
+            "check filesystem permissions.[/red]",
+        )
     if result.remote_revoked:
         console.print("[green]Remote token revoked at Google.[/green]")
     else:
-        message = result.error or "remote endpoint returned a non-success status"
+        # `revoke_token` always populates `result.error` when
+        # `remote_revoked` is False, so no `or`-fallback is needed.
         console.print(
             f"[yellow]Local token erased, but remote revocation did not "
-            f"confirm: {message}. Visit "
+            f"confirm: {result.error}. Visit "
             f"https://myaccount.google.com/permissions to revoke "
             f"manually if needed.[/yellow]",
         )
@@ -1451,9 +1458,15 @@ def _resolve_purge_phrase(
 ) -> str | None:
     """Return the engine-level confirmation phrase, or ``None`` to abort.
 
-    Three legal paths: (1) operator pre-supplied ``confirm_text`` for
-    non-interactive use, (2) interactive session in which the operator
-    types the absolute vault path, (3) abort.
+    Three legal paths: (1) operator pre-supplied a *valid*
+    ``confirm_text`` for non-interactive use, (2) interactive session
+    in which the operator types the absolute vault path, (3) abort.
+
+    Validation happens here at the CLI boundary so an invalid
+    ``--confirm-text`` produces a message naming the flag, rather
+    than letting :class:`PurgeEngine` raise a generic ``ValueError``
+    (which is correct behaviour but reads as an internal error to
+    operators).
 
     Args:
         engine_vault_path: Vault path the engine will operate on (used
@@ -1463,12 +1476,19 @@ def _resolve_purge_phrase(
 
     Returns:
         The phrase to pass to ``PurgeEngine.purge_vault`` when accepted,
-        or ``None`` when the interactive prompt was answered incorrectly.
+        or ``None`` when the supplied phrase is wrong or the
+        interactive prompt was answered incorrectly.
     """
     from creek.purge.engine import VAULT_PURGE_CONFIRMATION
 
     if confirm_text:
-        return confirm_text
+        if confirm_text != VAULT_PURGE_CONFIRMATION:
+            console.print(
+                "[red]--confirm-text did not match the required phrase "
+                f"{VAULT_PURGE_CONFIRMATION!r}.[/red]",
+            )
+            return None
+        return VAULT_PURGE_CONFIRMATION
 
     if not interactive:
         return None

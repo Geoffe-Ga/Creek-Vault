@@ -132,6 +132,32 @@ creek purge vault \
     --force-non-interactive
 ```
 
+#### Migration note (OPS-002)
+
+Earlier versions accepted any of the following as valid confirmation:
+
+```bash
+# Old (≤ Batch G-1): both forms worked.
+echo "I understand this is irreversible" | creek purge vault --vault ... --yes
+creek purge vault --vault ... --confirm-text "I understand this is irreversible"
+```
+
+Both now fail closed:
+
+- **Piping the phrase** is rejected because stdin is no longer a TTY. Wrap the call with `--force-non-interactive` and pass `--confirm-text` explicitly.
+- **The interactive prompt** no longer accepts the literal phrase; it asks for the absolute vault path. Operator runbooks that scripted the old phrase need updating to type the path instead.
+
+If your CI or teardown scripts depended on the old behaviour, the equivalent is:
+
+```bash
+creek purge vault \
+    --vault "$VAULT" \
+    --confirm-text "I understand this is irreversible" \
+    --force-non-interactive
+```
+
+The `WARNING` log entry written when `--force-non-interactive` is used will surface in `<vault>/00-Creek-Meta/audit/` going forward, giving you a record of every bypass.
+
 ---
 
 ## Audit trail
