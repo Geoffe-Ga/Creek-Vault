@@ -6,7 +6,7 @@ Obsidian-compatible markdown files with YAML frontmatter. It handles:
 
 - Mapping each primitive to the correct vault subfolder
 - Sanitising titles into safe filenames
-- Detecting duplicates (by ID) via a per-directory ``.id-index.json``
+- Detecting duplicates (by ID) via a per-directory ``.id-index.jsonl``
   index — O(1) per write rather than rescanning the directory each time
 - Atomic file creation via ``O_CREAT | O_EXCL`` with counter-suffix
   retry, so concurrent writers cannot clobber each other's files
@@ -250,7 +250,7 @@ class VaultWriter:
     containing that ID already exists in the target directory, the write
     is skipped and the existing path is returned.
 
-    Per-directory ``.id-index.json`` files persist the ``id -> filename``
+    Per-directory ``.id-index.jsonl`` files persist the ``id -> filename``
     mapping so duplicate detection is O(1) per write rather than scanning
     every markdown file in the directory. File creation uses
     ``O_CREAT | O_EXCL`` so two concurrent threads picking the same
@@ -460,6 +460,14 @@ class VaultWriter:
         """
         model_id: str = getattr(model, "id", "")
 
+        # The lock is intentionally held across the whole write —
+        # duplicate check, file creation, index append, and provenance
+        # append all run serially within a single process. Narrowing
+        # the critical section would re-introduce the TOCTOU between
+        # ``_find_existing_locked`` and ``_atomic_create`` that BUG-006
+        # was filed to close. The throughput trade-off is documented
+        # in the PR description; revisit only with a benchmark-driven
+        # follow-up issue.
         with self._lock:
             existing = self._find_existing_locked(model_id, target_dir)
             if existing is not None:
@@ -476,8 +484,13 @@ class VaultWriter:
 
             # Update the in-memory + on-disk index transactionally with
             # the file write so a follow-up call (or a fresh process)
-            # finds the entry without a directory rescan.
-            index = self._dir_indexes[target_dir]
+            # finds the entry without a directory rescan. Re-using
+            # ``_load_index_locked`` rather than indexing
+            # ``self._dir_indexes`` directly keeps the cache-population
+            # contract local — the dup-check above happened to load
+            # it, but a future refactor that skips the dup-check
+            # branch would otherwise hit a ``KeyError`` here.
+            index = self._load_index_locked(target_dir)
             index[model_id] = file_path.name
             self._append_index_entry(target_dir, model_id, file_path.name)
 
