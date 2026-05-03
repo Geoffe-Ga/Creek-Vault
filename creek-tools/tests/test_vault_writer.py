@@ -997,6 +997,52 @@ class TestProvenanceLegacyMigration:
         assert len(entries) == 1
         assert entries[0]["id"] == sample_fragment.id
 
+    def test_migration_drops_oversized_entry_without_blocking_writes(
+        self,
+        vault_path: Path,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A single oversized legacy entry must not permanently block upgrades.
+
+        The PIPE_BUF cap rejects oversized entries via ``ValueError``.
+        Without per-entry tolerance the migration would re-enter on
+        every write — leaving the vault stuck and surfacing only as a
+        confusing "exceeds PIPE_BUF" error from the unrelated user
+        write that triggered the migration.
+        """
+        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        oversized_entry = {
+            "id": "x" * 5000,  # forces encoded size > _PIPE_BUF_BYTES
+            "type": "fragment",
+            "path": "/old.md",
+            "written_at": "2025-01-01T00:00:00",
+        }
+        well_formed_entry = {
+            "id": "frag-legacy0001",
+            "type": "fragment",
+            "path": "/ok.md",
+            "written_at": "2025-01-02T00:00:00",
+        }
+        legacy_path = log_dir / "provenance.json"
+        legacy_path.write_text(
+            json.dumps([oversized_entry, well_formed_entry]),
+            encoding="utf-8",
+        )
+
+        # First write must succeed — the oversized entry is dropped
+        # (with the legacy file removed) rather than failing the whole
+        # write.
+        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
+
+        entries = _read_provenance(vault_path)
+        ids = [e["id"] for e in entries]
+        assert "frag-legacy0001" in ids  # well-formed legacy entry survived
+        assert sample_fragment.id in ids  # the user write itself landed
+        # The legacy file is removed even though one entry was dropped,
+        # so the second write does not re-enter the migration loop.
+        assert not legacy_path.exists()
+
 
 # ---- ID Index (PERF-001) ----
 

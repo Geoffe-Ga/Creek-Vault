@@ -114,18 +114,25 @@ LEGACY_PROVENANCE_FILENAME = "provenance.json"
 """Pre-Batch-E provenance filename. Migrated on first write to JSONL."""
 
 _PIPE_BUF_BYTES = 4096
-"""Linux ``PIPE_BUF`` — the upper bound for guaranteed atomic ``O_APPEND``.
+"""Conservative upper bound on a single ``O_APPEND`` ``write(2)``.
 
-POSIX guarantees that a single ``write(2)`` of at most ``PIPE_BUF``
-bytes to a file opened with ``O_APPEND`` is atomic with respect to
-other appenders (i.e. the write lands as one contiguous chunk and
-cannot interleave with another writer). Larger writes can split.
-On Linux this is 4 096; on some BSDs it can be as low as 512. A
-JSON line of ``{id, type, path, written_at}`` is well under this
-in practice, but an unusually long fragment ID or path would push
-past it. The producers in this module assert their encoded line
-size against ``_PIPE_BUF_BYTES`` so a regression surfaces loudly
-rather than silently corrupting the log.
+POSIX's ``PIPE_BUF`` atomicity guarantee technically applies only to
+pipes and FIFOs. For **regular files** on Linux local filesystems
+(ext4, xfs, btrfs, …), the kernel's VFS write lock causes a single
+``write(2)`` to land as one contiguous chunk regardless of size — but
+that is a Linux implementation detail, not a portable POSIX contract.
+Network filesystems (NFS) and non-Linux platforms may split larger
+writes between concurrent appenders.
+
+This module bounds its append-mode writers at ``PIPE_BUF`` (4 096
+bytes on Linux; 512 bytes on some BSDs) so the same code is safe
+across the platforms this project supports without relying on the
+Linux-specific VFS behaviour. A JSON line of
+``{id, type, path, written_at}`` is well under that limit in
+practice, but an unusually long fragment ID or path would push past
+it; the producers in this module assert their encoded line size
+against ``_PIPE_BUF_BYTES`` so a regression surfaces loudly rather
+than silently risking interleaved writes.
 """
 
 
@@ -287,6 +294,11 @@ class VaultWriter:
         # cache and the provenance log read-modify-write. Cross-process
         # safety is out of scope here (see BUG-006: optional fcntl).
         self._lock = threading.Lock()
+        # Legacy ``provenance.json`` migration runs at most once per
+        # writer instance. The flag short-circuits the per-write
+        # ``legacy_path.exists()`` stat after the first migration,
+        # whether it succeeded, found nothing, or failed gracefully.
+        self._legacy_provenance_migrated = False
 
     def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
         """Write a Fragment to the appropriate 01-Fragments/ subfolder.
@@ -514,8 +526,10 @@ class VaultWriter:
     def _find_existing(self, model_id: str, target_dir: Path) -> Path | None:
         """Return the path of an existing file for *model_id*, or ``None``.
 
-        Public-style helper retained for backwards compatibility. Acquires
-        ``self._lock`` for safety and delegates to the locked variant.
+        Retained for tests and tooling that introspect the writer
+        without going through ``_write_model``. Acquires ``self._lock``
+        and delegates to the locked variant so the caller does not have
+        to know about the lock invariant.
 
         Args:
             model_id: The ID to search for.
@@ -695,10 +709,10 @@ class VaultWriter:
     def _generate_filename(self, model: BaseModel, target_dir: Path) -> str:
         """Return a unique filename for *model* under *target_dir*.
 
-        Retained as part of the public API surface for tools that
-        introspect the writer; the production path uses
-        :meth:`_atomic_create` directly to avoid the TOCTOU window
-        between filename selection and file creation.
+        Retained for tests and tooling that introspect the writer; the
+        production path uses :meth:`_atomic_create` directly to avoid
+        the TOCTOU window between filename selection and file creation.
+        New callers should prefer :meth:`_atomic_create`.
 
         Args:
             model: The model to generate a filename for.
@@ -786,31 +800,62 @@ class VaultWriter:
 
         Caller must hold ``self._lock``. Entries from a pre-Batch-E
         JSON array are appended one-per-line into the new file and the
-        legacy file is unlinked so repeated invocations do not double-
-        import. Malformed legacy files are silently dropped — the
-        caller's fresh write still succeeds.
+        legacy file is **always** unlinked when this method returns —
+        even if some individual entries cannot be migrated (malformed,
+        oversized for ``PIPE_BUF``, etc.). Without that guarantee a
+        single bad entry would leave ``provenance.json`` in place and
+        the migration would re-fire on every subsequent write,
+        permanently blocking vault upgrades for unlucky vaults.
+
+        After the first successful (or first attempted) migration, the
+        ``_legacy_provenance_migrated`` flag short-circuits the stat on
+        every subsequent call so the steady-state per-write cost is one
+        boolean check rather than a filesystem hit.
         """
+        if self._legacy_provenance_migrated:
+            return
         legacy_path = log_dir / LEGACY_PROVENANCE_FILENAME
         if not legacy_path.exists():
+            self._legacy_provenance_migrated = True
             return
+        try:
+            self._migrate_legacy_provenance_body(legacy_path, log_path)
+        finally:
+            with contextlib.suppress(OSError):
+                legacy_path.unlink()
+            self._legacy_provenance_migrated = True
+
+    def _migrate_legacy_provenance_body(
+        self,
+        legacy_path: Path,
+        log_path: Path,
+    ) -> None:
+        """Read and append entries from *legacy_path*; tolerate per-entry failures.
+
+        Extracted so :meth:`_migrate_legacy_provenance_locked` can wrap
+        the whole body in a ``try/finally`` that always removes the
+        legacy file regardless of which entry tripped a recoverable
+        failure (oversized line, malformed shape, partial content).
+        """
         try:
             raw = legacy_path.read_text(encoding="utf-8")
             parsed = json.loads(raw) if raw.strip() else []
         except (OSError, json.JSONDecodeError):
-            with contextlib.suppress(OSError):
-                legacy_path.unlink()
             return
         if not isinstance(parsed, list):
-            with contextlib.suppress(OSError):
-                legacy_path.unlink()
             return
         for raw_entry in parsed:
             if not isinstance(raw_entry, dict):
                 continue
             entry = {str(k): str(v) for k, v in raw_entry.items() if isinstance(k, str)}
-            self._append_provenance_entry(log_path, entry)
-        with contextlib.suppress(OSError):
-            legacy_path.unlink()
+            try:
+                self._append_provenance_entry(log_path, entry)
+            except ValueError:
+                # Oversized legacy entry (rare: a path/id past PIPE_BUF).
+                # Drop it rather than aborting the migration — the
+                # alternative is to re-enter on every future write and
+                # block the vault forever.
+                continue
 
     def _log_provenance(
         self,
