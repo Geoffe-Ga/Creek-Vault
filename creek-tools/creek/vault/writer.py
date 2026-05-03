@@ -84,15 +84,30 @@ _ACTIVE_DECISION_STATUSES: set[str] = {
 logger = logging.getLogger(__name__)
 
 
-def _read_legacy_provenance_entries(legacy_path: Path) -> list[dict[str, object]]:
-    """Return parsed legacy provenance entries, or empty on any failure."""
+def _read_legacy_provenance_entries(
+    legacy_path: Path,
+) -> tuple[list[dict[str, object]], str]:
+    """Return (entries, status) for the legacy provenance log.
+
+    ``status`` is one of:
+
+    * ``"ok"`` — file parsed cleanly (entries may still be empty if the
+      file held an empty array).
+    * ``"read_failed"`` — :class:`OSError` while reading the file.
+    * ``"parse_failed"`` — file existed but did not parse as JSON or
+      did not contain a list.
+
+    The status is stamped on the migration marker so an operator
+    inspecting the audit log can distinguish a clean migration of an
+    empty legacy file from a transient I/O error that lost data.
+    """
     try:
         raw = legacy_path.read_text(encoding="utf-8")
     except OSError:
         logger.warning("Could not read legacy provenance log %s", legacy_path)
-        return []
+        return [], "read_failed"
     if not raw.strip():
-        return []
+        return [], "ok"
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -100,15 +115,16 @@ def _read_legacy_provenance_entries(legacy_path: Path) -> list[dict[str, object]
             "Legacy provenance log %s is not valid JSON; skipping migration",
             legacy_path,
         )
-        return []
+        return [], "parse_failed"
     if not isinstance(data, list):
-        return []
-    return [item for item in data if isinstance(item, dict)]
+        return [], "parse_failed"
+    return [item for item in data if isinstance(item, dict)], "ok"
 
 
 def _provenance_migration_marker(
     legacy_path: Path,
     migrated_count: int,
+    status: str,
 ) -> dict[str, object]:
     """Build the migration marker entry recorded in the new chain."""
     return {
@@ -117,6 +133,7 @@ def _provenance_migration_marker(
         "path": str(legacy_path),
         "written_at": datetime.now().isoformat(),
         "migrated_entries": migrated_count,
+        "migration_status": status,
     }
 
 
@@ -134,15 +151,23 @@ def _migrate_legacy_provenance(
     file. If the new log is already populated we leave the legacy
     file alone so a partially-migrated state can be resolved by
     inspection.
+
+    Defensively strips any caller-supplied ``prev_hash`` field from
+    legacy entries before append — :meth:`AuditLog.append` rejects
+    payloads that try to forge the chain key, and we want migration
+    of older logs to be tolerant rather than blow up at startup.
     """
     if not legacy_path.exists():
         return
     if new_log.path.exists() and new_log.path.stat().st_size > 0:
         return
-    legacy_entries = _read_legacy_provenance_entries(legacy_path)
+    legacy_entries, status = _read_legacy_provenance_entries(legacy_path)
     for entry in legacy_entries:
-        new_log.append(entry)
-    new_log.append(_provenance_migration_marker(legacy_path, len(legacy_entries)))
+        sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
+        new_log.append(sanitised)
+    new_log.append(
+        _provenance_migration_marker(legacy_path, len(legacy_entries), status),
+    )
     legacy_path.unlink(missing_ok=True)
 
 

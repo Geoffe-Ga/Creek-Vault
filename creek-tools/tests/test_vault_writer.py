@@ -966,8 +966,71 @@ class TestProvenanceLogging:
         ids = [e.get("id") for e in entries]
         assert "frag-old-001" in ids
         assert "frag-old-002" in ids
-        assert any(e.get("type") == "provenance.migration" for e in entries)
+        marker = next(e for e in entries if e.get("type") == "provenance.migration")
+        assert marker["migrated_entries"] == 2
+        assert marker["migration_status"] == "ok"
         AuditLog(new_path).verify()
+
+    def test_legacy_provenance_migration_marks_corrupt_input(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Malformed legacy JSON is recorded as ``parse_failed``.
+
+        Distinguishes a clean migration of an empty legacy file from a
+        transient parse failure that lost data — the operator can audit
+        which case occurred.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text("{not valid json", encoding="utf-8")
+
+        VaultWriter(vault_path=vault_path)
+
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        entries = self._read_entries(new_path)
+        marker = next(e for e in entries if e.get("type") == "provenance.migration")
+        assert marker["migration_status"] == "parse_failed"
+        assert marker["migrated_entries"] == 0
+
+    def test_legacy_provenance_migration_strips_prev_hash(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Legacy entries carrying ``prev_hash`` are sanitised before append.
+
+        :meth:`AuditLog.append` rejects payloads that try to forge the
+        chain key. Migration must be tolerant of older logs that may
+        have stamped ``prev_hash`` themselves rather than blow up at
+        startup.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "frag-with-prev",
+                        "type": "fragment",
+                        "prev_hash": "deadbeef" * 8,
+                    },
+                ],
+            ),
+            encoding="utf-8",
+        )
+
+        VaultWriter(vault_path=vault_path)
+
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        entries = self._read_entries(new_path)
+        migrated = next(e for e in entries if e.get("id") == "frag-with-prev")
+        # The line's prev_hash field is the chain hash, not the legacy
+        # value. Genesis hash of an empty chain is 64 zeros.
+        assert migrated["prev_hash"] == "0" * 64
 
     def test_legacy_provenance_migration_skipped_when_jsonl_already_populated(
         self,
