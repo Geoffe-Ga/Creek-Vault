@@ -1112,6 +1112,42 @@ class TestProvenanceLogging:
         ids_after = [e.get("id") for e in self._read_entries(new_path)]
         assert ids_after == ["frag-empty-pre", "_migration_"]
 
+    def test_legacy_provenance_orphaned_file_logs_warning(
+        self,
+        vault_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Half-migrated state (both files present, JSONL non-empty) is logged.
+
+        Regression for PR #193 review (comment 4367360694 HIGH): the
+        size guard would silently skip migration when both the legacy
+        and the new log carried content, leaving an operator unaware
+        that the legacy file was orphaned. The warning makes the
+        inconsistency visible the first time it is encountered.
+        """
+        from creek.audit import AuditLog
+
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps([{"id": "orphan-frag", "type": "fragment"}]),
+            encoding="utf-8",
+        )
+        AuditLog(new_path).append({"id": "already-here", "type": "fragment"})
+
+        with caplog.at_level("WARNING", logger="creek.vault.writer"):
+            VaultWriter(vault_path=vault_path)
+
+        assert legacy_path.exists()
+        assert any(
+            "skipping migration" in record.message
+            and "provenance.json" in record.message
+            for record in caplog.records
+        )
+
     def test_provenance_chain_intact_after_many_writes(
         self,
         writer: VaultWriter,

@@ -41,7 +41,7 @@ import json
 import logging
 import os
 import threading
-from collections import defaultdict
+import weakref
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -62,8 +62,43 @@ GENESIS_PREV_HASH = "0" * 64
 """Genesis hash for the first entry in a fresh chain."""
 
 _PREV_HASH_FIELD = "prev_hash"
-_THREAD_LOCKS: dict[Path, threading.Lock] = defaultdict(threading.Lock)
-_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+class _LockHolder:
+    """Weakref-able container for a per-path :class:`threading.Lock`.
+
+    ``threading.Lock`` is a C-level object without a ``__weakref__``
+    slot, so it cannot be the value of a :class:`weakref.WeakValueDictionary`
+    directly. Wrapping it in a tiny Python object gives us the slot and
+    keeps the lock alive for as long as any :class:`AuditLog` instance
+    references the holder.
+    """
+
+    __slots__ = ("__weakref__", "lock")
+
+    def __init__(self) -> None:
+        """Initialise the holder with a fresh :class:`threading.Lock`."""
+        self.lock = threading.Lock()
+
+
+_THREAD_LOCK_HOLDERS: weakref.WeakValueDictionary[Path, _LockHolder] = (
+    weakref.WeakValueDictionary()
+)
+"""Per-resolved-path lock holders.
+
+A :class:`weakref.WeakValueDictionary` so holders (and the locks they
+own) can be reclaimed once no live :class:`AuditLog` references the
+holder for a given path. Long-running daemons writing to many distinct
+log paths therefore do not accumulate dead lock entries; the test
+suite, where each ``tmp_path`` is unique, also stays bounded across
+runs.
+
+Each :class:`AuditLog` keeps a strong reference to its holder via
+``AuditLog._lock_holder`` so the dict entry is pinned for the
+instance's lifetime even when no append is currently in flight.
+"""
+
+_THREAD_LOCK_HOLDERS_GUARD = threading.Lock()
 
 
 class AuditChainBrokenError(Exception):
@@ -75,19 +110,28 @@ class AuditChainBrokenError(Exception):
 AuditChainBroken = AuditChainBrokenError
 
 
-def _thread_lock_for(path: Path) -> threading.Lock:
-    """Return the per-path lock used to serialise threaded appends.
+def _thread_lock_holder_for(path: Path) -> _LockHolder:
+    """Return the per-path lock holder used to serialise threaded appends.
 
     The key is ``path.resolve()`` so that two :class:`AuditLog`
     instances constructed with different representations of the same
     file (``"audit.jsonl"`` vs ``"./audit.jsonl"`` vs an absolute path)
-    share the same lock. Without resolution the raw ``Path`` objects
-    compare unequal and would each get their own lock, silently
+    share the same holder. Without resolution the raw ``Path`` objects
+    compare unequal and would each get their own holder, silently
     breaking cross-thread serialisation.
+
+    Returning the holder (rather than the bare lock) lets the caller
+    pin the entry in the :class:`weakref.WeakValueDictionary` for as
+    long as it needs the lock — the dict's value would otherwise be
+    eligible for GC the instant this function returns.
     """
     resolved = path.resolve(strict=False)
-    with _THREAD_LOCKS_GUARD:
-        return _THREAD_LOCKS[resolved]
+    with _THREAD_LOCK_HOLDERS_GUARD:
+        holder = _THREAD_LOCK_HOLDERS.get(resolved)
+        if holder is None:
+            holder = _LockHolder()
+            _THREAD_LOCK_HOLDERS[resolved] = holder
+        return holder
 
 
 def _hash_line(line: str) -> str:
@@ -135,6 +179,14 @@ class AuditLog:
         self.path = path
         self._cached_last_hash: str | None = None
         self._cached_size: int | None = None
+        # Pin the per-path lock holder for the lifetime of this
+        # AuditLog. Holding a strong reference keeps the
+        # WeakValueDictionary entry alive so concurrent AuditLogs on
+        # the same path share the same lock. When the last AuditLog
+        # for a path is GC'd the holder (and lock) become eligible for
+        # collection — long-running daemons writing to many distinct
+        # paths therefore do not leak locks.
+        self._lock_holder = _thread_lock_holder_for(path)
 
     def append(self, payload: dict[str, Any]) -> None:
         """Append *payload* as a JSON line, stamping in the chain hash.
@@ -155,7 +207,7 @@ class AuditLog:
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with (
-            _thread_lock_for(self.path),
+            self._lock_holder.lock,
             self.path.open("a", encoding="utf-8") as fh,
         ):
             if _HAS_FCNTL:

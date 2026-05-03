@@ -1195,6 +1195,115 @@ def test_audit_log_migration_with_empty_preexisting_log_does_not_double(
     ]
 
 
+def test_audit_log_migration_oserror_preserves_legacy_and_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-migration OSError keeps the legacy file and logs the failure.
+
+    Regression for PR #193 review (comment 4367360694 HIGH): without
+    the explicit try/except, a failed ``AuditLog.append`` (disk full,
+    permission flip) would leave the new JSONL with partial content
+    while silently losing the rest of the legacy entries — and the
+    next instance's size guard would treat the partial state as a
+    clean prior migration. The new code re-raises so the caller sees
+    the failure, leaves the legacy file intact, and emits an
+    EXCEPTION-level log entry the operator can act on.
+    """
+    from creek.audit.log import AuditLog
+
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-doomed",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    real_append = AuditLog.append
+
+    def failing_append(self: AuditLog, payload: dict[str, object]) -> None:
+        if payload.get("operation") == "fragment":
+            raise OSError("simulated disk full")
+        real_append(self, payload)
+
+    monkeypatch.setattr(AuditLog, "append", failing_append)
+
+    with caplog.at_level("ERROR", logger="creek.purge.audit"), pytest.raises(OSError):
+        PurgeAuditLog(vault).read()
+
+    # Legacy file preserved so no entries are lost.
+    assert legacy_path.exists()
+    # Operator has a high-signal log line to act on.
+    assert any(
+        "failed mid-write" in record.message and "purge-log.json" in record.message
+        for record in caplog.records
+    )
+
+
+def test_audit_log_orphaned_legacy_file_logs_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Half-migrated state (both files present, JSONL non-empty) is logged.
+
+    Regression for PR #193 review (comment 4367360694 HIGH): the size
+    guard would silently skip migration when both the legacy and new
+    log carried content, leaving an operator unaware that the legacy
+    file was orphaned. The warning makes the inconsistency visible
+    the first time it is encountered.
+    """
+    from creek.audit import AuditLog
+
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    new_path = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-orphan",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+    AuditLog(new_path).append(
+        {
+            "timestamp": "2025-02-01T00:00:00+00:00",
+            "operation": "fragment",
+            "criteria": {"fragment_id": "frag-already"},
+        },
+    )
+
+    with caplog.at_level("WARNING", logger="creek.purge.audit"):
+        PurgeAuditLog(vault).read()
+
+    assert legacy_path.exists()
+    assert any(
+        "skipping migration" in record.message and "purge-log.json" in record.message
+        for record in caplog.records
+    )
+
+
 def test_write_audit_known_operations_use_explicit_allowlist(tmp_path: Path) -> None:
     """Each known operation routes through the explicit allowlist.
 

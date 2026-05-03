@@ -210,13 +210,14 @@ def test_thread_lock_keyed_on_resolved_path(tmp_path: Path) -> None:
     serialisation. We assert that the resolved-path keying makes the
     instances share a lock.
     """
-    from creek.audit.log import _thread_lock_for
+    from creek.audit.log import _thread_lock_holder_for
 
     same_file = tmp_path / "audit.jsonl"
     relative_form = (tmp_path / "." / "audit.jsonl").resolve()
-    lock_a = _thread_lock_for(same_file)
-    lock_b = _thread_lock_for(relative_form)
-    assert lock_a is lock_b
+    holder_a = _thread_lock_holder_for(same_file)
+    holder_b = _thread_lock_holder_for(relative_form)
+    assert holder_a is holder_b
+    assert holder_a.lock is holder_b.lock
 
 
 def test_append_calls_fsync_for_durability(
@@ -270,3 +271,48 @@ def test_cache_invalidated_when_foreign_writer_resizes_file(
     AuditLog(path).verify()
     entries = [e["op"] for e in AuditLog(path).read()]
     assert entries == ["a1", "b1", "a2"]
+
+
+def test_thread_lock_holder_collected_when_no_audit_log_references_it(
+    tmp_path: Path,
+) -> None:
+    """The per-path lock holder is GC-eligible once no AuditLog pins it.
+
+    Regression for PR #193 review (comment 4367360694 HIGH): the prior
+    ``defaultdict[Path, Lock]`` accumulated one lock per distinct path
+    forever, leaking memory in long-running daemons (and in test
+    suites where every ``tmp_path`` is unique). Switching to a
+    ``WeakValueDictionary`` keyed on a holder lets dead entries fall
+    out as soon as the last :class:`AuditLog` for that path is
+    collected.
+
+    We assert the holder is *strongly* referenced while an AuditLog
+    exists (so concurrent AuditLogs on the same path share the lock)
+    and *weakly* referenced afterwards (so the entry is reclaimable).
+    """
+    import gc
+    import weakref
+
+    from creek.audit.log import _THREAD_LOCK_HOLDERS
+
+    path = tmp_path / "gc-audit.jsonl"
+    log = AuditLog(path)
+    log.append({"op": "x"})
+
+    resolved = path.resolve(strict=False)
+    holder = _THREAD_LOCK_HOLDERS.get(resolved)
+    assert holder is not None
+    holder_ref = weakref.ref(holder)
+
+    # While the AuditLog is alive the holder must stay reachable.
+    del holder
+    gc.collect()
+    assert holder_ref() is not None
+    assert _THREAD_LOCK_HOLDERS.get(resolved) is not None
+
+    # Drop the AuditLog (the only strong reference) and the holder
+    # becomes eligible for collection.
+    del log
+    gc.collect()
+    assert holder_ref() is None
+    assert _THREAD_LOCK_HOLDERS.get(resolved) is None

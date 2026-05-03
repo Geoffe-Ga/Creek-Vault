@@ -176,21 +176,52 @@ class PurgeAuditLog:
             self._migration_settled = True
             return
         if self.log_path.exists() and self.log_path.stat().st_size > 0:
+            # JSONL already populated AND legacy still on disk: a
+            # previous attempt wrote some entries then crashed before
+            # unlinking, or an operator restored the legacy file. The
+            # state is half-migrated; silently doing nothing would let
+            # the inconsistency drift indefinitely, so surface it
+            # explicitly the first time we see it.
+            logger.warning(
+                "Purge audit migration: %s exists and %s also exists with "
+                "content; skipping migration. Inspect both files and remove "
+                "%s by hand once you have confirmed every legacy entry is in "
+                "the new log.",
+                self._legacy_path,
+                self.log_path,
+                self._legacy_path,
+            )
             self._migration_settled = True
             return
         legacy_entries = self._load_legacy_entries()
         if legacy_entries is None:
             self._migration_settled = True
             return
-        for entry in legacy_entries:
-            # Strip prev_hash defensively: AuditLog.append rejects
-            # payloads carrying the reserved chain key, and a legacy
-            # log written by an earlier audit substrate (or hand-edited
-            # by an operator) could include one. Without this guard the
-            # whole migration aborts with ValueError.
-            sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
-            self._audit.append(_coerce_legacy_entry(sanitised))
-        self._audit.append(self._migration_marker(len(legacy_entries)))
+        try:
+            for entry in legacy_entries:
+                # Strip prev_hash defensively: AuditLog.append rejects
+                # payloads carrying the reserved chain key, and a legacy
+                # log written by an earlier audit substrate (or hand-edited
+                # by an operator) could include one. Without this guard the
+                # whole migration aborts with ValueError.
+                sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
+                self._audit.append(_coerce_legacy_entry(sanitised))
+            self._audit.append(self._migration_marker(len(legacy_entries)))
+        except OSError:
+            # Mid-migration failure (disk full, permission flip). The
+            # new log now has partial content so the size guard above
+            # will short-circuit subsequent attempts; the legacy file
+            # is left in place deliberately so no entries are lost.
+            # Warn loudly so the operator can reconcile before the
+            # next run silently treats the partial state as "already
+            # migrated".
+            logger.exception(
+                "Purge audit migration of %s into %s failed mid-write; legacy "
+                "file left intact for manual reconciliation.",
+                self._legacy_path,
+                self.log_path,
+            )
+            raise
         self._legacy_path.unlink(missing_ok=True)
         self._migration_settled = True
 

@@ -224,14 +224,43 @@ def _migrate_legacy_provenance(
     if not legacy_path.exists():
         return
     if new_log.path.exists() and new_log.path.stat().st_size > 0:
+        # JSONL already populated AND legacy still on disk: a previous
+        # attempt wrote some entries then crashed before unlinking, or
+        # an operator copied the legacy file back in. Either way the
+        # state is half-migrated and silently doing nothing would let
+        # the inconsistency drift indefinitely. Surface it explicitly
+        # so an operator inspecting logs notices.
+        logger.warning(
+            "Provenance migration: %s exists and %s also exists with content; "
+            "skipping migration. Inspect both files and remove %s by hand once "
+            "you have confirmed every legacy entry is in the new log.",
+            legacy_path,
+            new_log.path,
+            legacy_path,
+        )
         return
     legacy_entries, status = _read_legacy_provenance_entries(legacy_path)
-    for entry in legacy_entries:
-        sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
-        new_log.append(sanitised)
-    new_log.append(
-        _provenance_migration_marker(legacy_path, len(legacy_entries), status),
-    )
+    try:
+        for entry in legacy_entries:
+            sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
+            new_log.append(sanitised)
+        new_log.append(
+            _provenance_migration_marker(legacy_path, len(legacy_entries), status),
+        )
+    except OSError:
+        # Mid-migration failure (disk full, permission flip). The new
+        # log now has partial content so the size guard above will
+        # short-circuit subsequent attempts; the legacy file is left
+        # in place deliberately so no entries are lost. Warn loudly so
+        # the operator can resolve it before the next run silently
+        # treats the partial state as "already migrated".
+        logger.exception(
+            "Provenance migration of %s into %s failed mid-write; legacy file "
+            "left intact for manual reconciliation.",
+            legacy_path,
+            new_log.path,
+        )
+        raise
     legacy_path.unlink(missing_ok=True)
 
 
