@@ -63,13 +63,15 @@ ocr:
   enabled: true
   engine: pytesseract
   languages: [eng]
+  min_confidence: 0.6
 ```
 
-| Field       | Default        | Notes |
-|-------------|----------------|-------|
-| `enabled`   | `true`         | If `false`, `creek ingest --type images` will skip OCR. |
-| `engine`    | `pytesseract`  | Engine name. (Custom engines are injected at the API level — see `creek.ingest.images.OcrEngine`.) |
-| `languages` | `[eng]`        | Tesseract language codes. |
+| Field            | Default        | Notes |
+|------------------|----------------|-------|
+| `enabled`        | `true`         | If `false`, `creek ingest --type images` will skip OCR. |
+| `engine`         | `pytesseract`  | Engine name. (Custom engines are injected at the API level — see `creek.ingest.images.OcrEngine`.) |
+| `languages`      | `[eng]`        | Tesseract language codes. |
+| `min_confidence` | `0.6`          | Per-page OCR confidence below which the resulting fragment is tagged `review: pending_review` in frontmatter and surfaced by `creek redact --review`. Range `[0.0, 1.0]`. |
 
 ## `linking` — resonance / thread / eddy thresholds
 
@@ -131,16 +133,20 @@ redaction:
   exclude_patterns:
     - .git/
     - node_modules/
+  min_confidence: 0.6
+  replacement_template: "[REDACTED:{name}]"
 ```
 
-| Field                       | Default | Notes |
-|-----------------------------|---------|-------|
-| `enabled`                   | `true`  | Master switch. |
-| `dry_run`                   | `false` | When `true`, `--apply` plans but doesn't write. |
-| `custom_patterns`           | `{}`    | Extra regex name → pattern map merged with built-ins. |
-| `false_positive_allowlist`  | `[]`    | Substrings that, when present in the surrounding context, suppress a match. |
-| `supported_extensions`      | (text)  | File extensions the scanner walks. |
-| `exclude_patterns`          | (vcs)   | Path globs to skip. |
+| Field                       | Default                | Notes |
+|-----------------------------|------------------------|-------|
+| `enabled`                   | `true`                 | Master switch. |
+| `dry_run`                   | `false`                | When `true`, `--apply` plans but doesn't write. |
+| `custom_patterns`           | `{}`                   | Extra regex name → pattern map merged with built-ins. |
+| `false_positive_allowlist`  | `[]`                   | Substrings that, when present in the surrounding context, suppress a match. |
+| `supported_extensions`      | (text)                 | File extensions the scanner walks. |
+| `exclude_patterns`          | (vcs)                  | Path globs to skip. |
+| `min_confidence`            | `0.6`                  | Threshold for the generic high-entropy detector; range `[0.0, 1.0]`. Higher demands more entropy before flagging. |
+| `replacement_template`      | `"[REDACTED:{name}]"`  | Marker template for `--apply`. Must contain the `{name}` placeholder; other placeholders are rejected at config-load time. |
 
 ## `google_drive`
 

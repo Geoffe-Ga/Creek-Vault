@@ -185,9 +185,127 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
         severity="high",
         false_positive_notes="Long base64-encoded strings with dots.",
     ),
+    "discord_bot_token": PatternInfo(
+        pattern=re.compile(
+            r"(?<![A-Za-z0-9_-])[MN][A-Za-z0-9_-]{23,38}"
+            r"\.[A-Za-z0-9_-]{6,7}"
+            r"\.[A-Za-z0-9_-]{27,40}(?![A-Za-z0-9_-])",
+        ),
+        description="Discord bot tokens (three dot-separated base64url segments).",
+        severity="critical",
+        false_positive_notes=(
+            "Other dotted base64url-ish triplets; the JWT pattern overlaps "
+            "but uses an `eyJ` prefix instead of `M`/`N`."
+        ),
+    ),
+    "github_pat": PatternInfo(
+        pattern=re.compile(
+            r"\bgithub_pat_[A-Za-z0-9_]{59,}\b",
+        ),
+        description="GitHub fine-grained personal access tokens (github_pat_...).",
+        severity="critical",
+        false_positive_notes=(
+            "Documentation strings literally writing `github_pat_...` — use "
+            "`false_positive_allowlist` to suppress those."
+        ),
+    ),
+    "stripe_key": PatternInfo(
+        pattern=re.compile(
+            r"\b[srpk]k_(?:live|test)_[A-Za-z0-9]{24,}\b",
+        ),
+        description="Stripe API keys (sk_live/sk_test/pk_live/pk_test/rk_*).",
+        severity="critical",
+        false_positive_notes=(
+            "The api_key pattern overlaps for the `sk_test_` prefix; both "
+            "would fire, which is acceptable since the action is the same."
+        ),
+    ),
+    "anthropic_key": PatternInfo(
+        pattern=re.compile(
+            r"\bsk-ant-[A-Za-z0-9_-]{20,}\b",
+        ),
+        description="Anthropic API keys (explicit sk-ant- prefix).",
+        severity="critical",
+        false_positive_notes=(
+            "Already covered by the generic api_key pattern but the explicit "
+            "entry surfaces clearer telemetry in the report."
+        ),
+    ),
+    "openai_project_key": PatternInfo(
+        pattern=re.compile(
+            r"\bsk-proj-[A-Za-z0-9_-]{20,}\b",
+        ),
+        description="OpenAI project-scoped API keys (sk-proj- prefix).",
+        severity="critical",
+        false_positive_notes=(
+            "Like anthropic_key, partially overlaps with the generic api_key "
+            "pattern; the explicit entry distinguishes provider in reports."
+        ),
+    ),
+    "ipv4": PatternInfo(
+        pattern=re.compile(
+            r"(?<![\w.])"
+            r"(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)"
+            r"(?:\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}"
+            r"(?![\w.])",
+        ),
+        description="IPv4 addresses with octet-range validation (0-255).",
+        severity="medium",
+        false_positive_notes=(
+            "Version numbers like `1.2.3.4` will match; allowlist private "
+            "ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) per project."
+        ),
+    ),
+    "high_entropy_string": PatternInfo(
+        pattern=re.compile(r"[A-Za-z0-9+/=_\-]{20,}"),
+        description=(
+            "Generic high-entropy substrings (≥20 base64url-ish chars) "
+            "above the configured RedactionConfig.min_confidence threshold."
+        ),
+        severity="medium",
+        false_positive_notes=(
+            "Long random-looking identifiers, hashes, and content-addressed "
+            "filenames will match. Tune via RedactionConfig.min_confidence "
+            "or add specific substrings to false_positive_allowlist."
+        ),
+    ),
+    "ipv6": PatternInfo(
+        pattern=re.compile(
+            r"(?<![:\w.])(?:"
+            r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+            r"|(?:[0-9A-Fa-f]{1,4}:){1,7}:"
+            r"|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}"
+            r"|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}"
+            r"|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}"
+            r"|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}"
+            r"|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}"
+            r"|[0-9A-Fa-f]{1,4}:(?::[0-9A-Fa-f]{1,4}){1,6}"
+            r"|::(?:[0-9A-Fa-f]{1,4}:){0,5}[0-9A-Fa-f]{1,4}"
+            r"|::(?:[fF]{4}(?::0{1,4})?:)?"
+            r"(?:(?:25[0-5]|(?:2[0-4]|1?\d)?\d)\.){3}"
+            r"(?:25[0-5]|(?:2[0-4]|1?\d)?\d)"
+            r")(?![:\w.])",
+        ),
+        description="IPv6 addresses (full, shortened, and IPv4-mapped forms).",
+        severity="medium",
+        false_positive_notes=(
+            "Loopback (`::1`) and link-local (`fe80::`) addresses match by "
+            "design; allowlist them when scanning code or documentation."
+        ),
+    ),
 }
 
+_DETECTOR_ONLY_PATTERNS: frozenset[str] = frozenset({"high_entropy_string"})
+"""Pattern names whose matching is implemented by a non-regex detector.
+
+These entries live in :data:`PATTERN_METADATA` (so reports can look up
+severity and descriptions) but are excluded from
+:data:`REDACTION_PATTERNS` so the standard regex scan does not double-fire.
+"""
+
 REDACTION_PATTERNS: dict[str, re.Pattern[str]] = {
-    name: info.pattern for name, info in PATTERN_METADATA.items()
+    name: info.pattern
+    for name, info in PATTERN_METADATA.items()
+    if name not in _DETECTOR_ONLY_PATTERNS
 }
 """Flat mapping of pattern name to compiled regex, for backward compatibility."""

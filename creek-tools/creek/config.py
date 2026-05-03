@@ -64,6 +64,15 @@ class OCRConfig(BaseModel):
     languages: list[str] = Field(default_factory=lambda: ["eng"])
     """Tesseract language codes for OCR."""
 
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Minimum OCR confidence below which a fragment lands in the review queue.
+
+    Image and scanned-PDF ingestors compare the per-page confidence
+    reported by the engine to this threshold; a fragment whose OCR
+    score falls below it is tagged ``review: pending_review`` in
+    frontmatter so a human can verify the recovered text.
+    """
+
 
 class LinkingConfig(BaseModel):
     """Linking pipeline configuration."""
@@ -188,6 +197,43 @@ class RedactionConfig(BaseModel):
         default_factory=lambda: [".git", "node_modules"],
     )
     """Directory name patterns to exclude from recursive scanning."""
+
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Confidence threshold for the generic high-entropy secret detector.
+
+    Higher values demand more entropy before flagging a substring; ``0.0``
+    catches everything that looks base64-ish, ``1.0`` requires near-random
+    output. The default ``0.6`` corresponds to roughly 4.2 bits/char which
+    suppresses most natural-language false positives.
+    """
+
+    replacement_template: str = "[REDACTED:{name}]"
+    """Format string used by :class:`creek.redact.redactor.Redactor`.
+
+    Must contain the ``{name}`` placeholder so the matched pattern's name
+    is interpolated into the marker. Other format placeholders are
+    rejected at validation time to surface typos early.
+    """
+
+    @field_validator("replacement_template")
+    @classmethod
+    def validate_replacement_template(cls, v: str) -> str:
+        """Reject templates lacking ``{name}`` or carrying other placeholders."""
+        # Format with a sentinel; if substitution didn't change the string,
+        # `{name}` was absent. KeyError/IndexError/ValueError surface unknown
+        # placeholders like `{type}` or malformed format specs.
+        try:
+            formatted = v.format(name="\x00creek_name_sentinel\x00")
+        except (KeyError, IndexError, ValueError) as exc:
+            msg = (
+                f"replacement_template {v!r} has invalid placeholders; "
+                "only '{name}' is supported."
+            )
+            raise ValueError(msg) from exc
+        if formatted == v:
+            msg = f"replacement_template {v!r} must include the '{{name}}' placeholder."
+            raise ValueError(msg)
+        return v
 
 
 _READONLY_SCOPES: set[str] = {

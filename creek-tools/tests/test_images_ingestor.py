@@ -647,5 +647,88 @@ class TestDetectImageTypePriority:
         assert result == "other"
 
 
+# ---- OCRConfig.min_confidence + low-confidence routing (INC-016) -------
+
+
+class TestOcrMinConfidence:
+    """OCRConfig.min_confidence + ImageIngestor routing for low-confidence OCR."""
+
+    def test_ocr_config_has_default_min_confidence(self) -> None:
+        """OCRConfig must expose a default min_confidence in [0, 1]."""
+        from creek.config import OCRConfig
+
+        cfg = OCRConfig()
+        assert 0.0 <= cfg.min_confidence <= 1.0
+
+    def test_ocr_config_min_confidence_rejects_out_of_range(self) -> None:
+        """min_confidence outside [0, 1] is rejected at validation."""
+        from pydantic import ValidationError
+
+        from creek.config import OCRConfig
+
+        with pytest.raises(ValidationError):
+            OCRConfig(min_confidence=1.5)
+        with pytest.raises(ValidationError):
+            OCRConfig(min_confidence=-0.1)
+
+    def test_low_confidence_marks_fragment_for_review(self, tmp_path: Path) -> None:
+        """OCR confidence below the threshold should set review=pending_review."""
+        image_path = tmp_path / "blurry.png"
+        _write_image(image_path)
+        engine = StubOcrEngine(
+            image_results={
+                "blurry.png": OcrResult(
+                    text="Indistinct text",
+                    confidence=0.3,
+                    image_type="photo_of_text",
+                ),
+            },
+        )
+        ingestor = ImageIngestor(engine=engine, min_confidence=0.6)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+
+        assert len(fragments) == 1
+        fragment = fragments[0]
+        frontmatter = ingestor.generate_frontmatter(fragment)
+        assert frontmatter.get("review") == "pending_review"
+
+    def test_high_confidence_does_not_mark_for_review(self, tmp_path: Path) -> None:
+        """Confidence above threshold leaves review unset."""
+        image_path = tmp_path / "clear.png"
+        _write_image(image_path)
+        engine = StubOcrEngine(
+            image_results={
+                "clear.png": OcrResult(
+                    text="Crystal clear text",
+                    confidence=0.95,
+                    image_type="screenshot",
+                ),
+            },
+        )
+        ingestor = ImageIngestor(engine=engine, min_confidence=0.6)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+
+        frontmatter = ingestor.generate_frontmatter(fragments[0])
+        assert "review" not in frontmatter
+
+    def test_min_confidence_default_routes_borderline_ocr(self, tmp_path: Path) -> None:
+        """Default min_confidence (0.6) flags an OCR result reporting 0.4."""
+        image_path = tmp_path / "borderline.png"
+        _write_image(image_path)
+        engine = StubOcrEngine(
+            image_results={
+                "borderline.png": OcrResult(
+                    text="Soft focus",
+                    confidence=0.4,
+                ),
+            },
+        )
+        ingestor = ImageIngestor(engine=engine)  # use default
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+
+        frontmatter = ingestor.generate_frontmatter(fragments[0])
+        assert frontmatter.get("review") == "pending_review"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

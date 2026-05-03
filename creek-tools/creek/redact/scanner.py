@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path  # noqa: TC003 — Pydantic needs Path at runtime
 
@@ -34,6 +35,31 @@ from tqdm import tqdm
 
 from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
 from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
+
+HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
+"""Pattern key used by the generic high-entropy detector."""
+
+# Source of truth for the candidate regex lives on the PatternInfo entry
+# so reports and the detector cannot drift apart silently.
+HIGH_ENTROPY_CANDIDATE = PATTERN_METADATA[HIGH_ENTROPY_PATTERN_NAME].pattern
+"""Substring shape for the generic-secret detector (≥20 base64url chars)."""
+
+_ENTROPY_FLOOR_BITS = 2.5
+"""Lower bound (bits/char) for the entropy threshold at min_confidence=0.0.
+
+Below this, even runs of ``aaaa…`` would slip through, so we do not
+allow callers to relax the floor further.
+"""
+
+_ENTROPY_CEILING_BITS = 4.5
+"""Upper bound (bits/char) for the entropy threshold at min_confidence=1.0.
+
+Pure base64 random data tops out near 6 bits/char in theory, but
+realistic short secret strings cluster between 3.5 and 4.5; setting
+the ceiling at 4.5 keeps even hex-encoded 32-char secrets (which have
+≈4 bits/char) catchable at the default ``0.6`` confidence.
+"""
+
 
 # Magic bytes for common binary file formats.
 _BINARY_SIGNATURES: list[bytes] = [
@@ -199,6 +225,11 @@ class RedactionScanner:
         Reads the file line-by-line and returns a :class:`RedactionMatch`
         for every pattern hit that is not on the false-positive allowlist.
 
+        Pattern-specific post-validators are applied after a regex hit:
+        the ``credit_card`` pattern is filtered through the Luhn checksum
+        so that 16-digit identifiers that happen to match a BIN range
+        are not reported as cards.
+
         Args:
             file_path: Path to the file to scan.
 
@@ -221,6 +252,8 @@ class RedactionScanner:
                     matched_text = m.group()
                     if self._is_allowlisted(matched_text):
                         continue
+                    if not post_validate(name, matched_text):
+                        continue
                     matches.append(
                         RedactionMatch(
                             file_path=file_path,
@@ -229,8 +262,49 @@ class RedactionScanner:
                             salted_hash=self._hash_match(matched_text),
                         )
                     )
+            matches.extend(self._scan_high_entropy(file_path, line_num, line))
 
         return matches
+
+    def _scan_high_entropy(
+        self,
+        file_path: Path,
+        line_num: int,
+        line: str,
+    ) -> list[RedactionMatch]:
+        """Flag base64url-ish substrings whose Shannon entropy clears the bar.
+
+        The threshold is derived from :pyattr:`RedactionConfig.min_confidence`
+        so users can tune false-positive sensitivity without editing code:
+        ``0.0`` flags any ≥20-char base64url-ish run, ``1.0`` requires the
+        substring to be effectively random.
+
+        Args:
+            file_path: Path to the file being scanned (passed through to
+                the resulting :class:`RedactionMatch`).
+            line_num: 1-based line number for the match.
+            line: The single line to scan.
+
+        Returns:
+            One :class:`RedactionMatch` per high-entropy substring found.
+        """
+        threshold = entropy_threshold(self.config.min_confidence)
+        results: list[RedactionMatch] = []
+        for candidate in HIGH_ENTROPY_CANDIDATE.finditer(line):
+            text = candidate.group()
+            if self._is_allowlisted(text):
+                continue
+            if shannon_entropy(text) < threshold:
+                continue
+            results.append(
+                RedactionMatch(
+                    file_path=file_path,
+                    line_number=line_num,
+                    match_type=HIGH_ENTROPY_PATTERN_NAME,
+                    salted_hash=self._hash_match(text),
+                )
+            )
+        return results
 
     def scan_directory(
         self,
@@ -561,6 +635,93 @@ class RedactionScanner:
                 lines.append("")
 
         return "\n".join(lines)
+
+
+def shannon_entropy(text: str) -> float:
+    """Return the Shannon entropy (bits/char) of *text*.
+
+    Args:
+        text: The string to measure.
+
+    Returns:
+        Entropy in bits per character; ``0.0`` for the empty string.
+    """
+    if not text:
+        return 0.0
+    counts = Counter(text)
+    length = len(text)
+    return -sum(
+        (count / length) * math.log2(count / length) for count in counts.values()
+    )
+
+
+def entropy_threshold(min_confidence: float) -> float:
+    """Map a ``min_confidence`` in ``[0, 1]`` to a bits/char entropy threshold.
+
+    The threshold rises linearly between :data:`_ENTROPY_FLOOR_BITS` and
+    :data:`_ENTROPY_CEILING_BITS` so callers can express sensitivity as a
+    confidence rather than a bit count.
+
+    Args:
+        min_confidence: Confidence in ``[0, 1]``; higher = stricter.
+
+    Returns:
+        Entropy threshold in bits/char.
+    """
+    span = _ENTROPY_CEILING_BITS - _ENTROPY_FLOOR_BITS
+    return _ENTROPY_FLOOR_BITS + min_confidence * span
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Return ``True`` when *digits* satisfies the Luhn checksum.
+
+    Caller is responsible for stripping non-digit separators (spaces,
+    dashes) before invoking — this helper rejects any input containing
+    non-digit characters so a typo in the caller is surfaced as a
+    rejection rather than a silent miscount.
+
+    Args:
+        digits: A non-empty string of decimal digits.
+
+    Returns:
+        ``True`` if the digit sequence is Luhn-valid; ``False`` for
+        empty input, non-digit input, or a failing checksum.
+    """
+    if not digits or not digits.isdigit():
+        return False
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        digit = ord(char) - ord("0")
+        if index % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+_DIGIT_STRIP = re.compile(r"\D")
+
+
+def post_validate(pattern_name: str, matched_text: str) -> bool:
+    """Run pattern-specific post-validation on a regex hit.
+
+    Public dispatch shared by :class:`RedactionScanner` and
+    :class:`creek.redact.redactor.Redactor`. Returns ``True`` when the
+    match should be kept and ``False`` when it should be dropped;
+    patterns without a registered validator are always kept.
+
+    Args:
+        pattern_name: The pattern key that produced the match.
+        matched_text: The substring that the regex captured.
+
+    Returns:
+        Whether the match passes the pattern's post-validation.
+    """
+    if pattern_name == "credit_card":
+        digits = _DIGIT_STRIP.sub("", matched_text)
+        return _luhn_valid(digits)
+    return True
 
 
 def _get_severity(match_type: str) -> str:

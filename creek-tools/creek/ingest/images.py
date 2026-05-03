@@ -49,6 +49,22 @@ _DEFAULT_LANGUAGE: str = "eng"
 """Default tesseract language code; override per-engine for multi-lang OCR."""
 
 
+_DEFAULT_MIN_CONFIDENCE: float = 0.6
+"""Default OCR confidence threshold for review-queue routing.
+
+Mirrors :pyattr:`creek.config.OCRConfig.min_confidence` so the ingestor
+can be constructed standalone (e.g. in tests) without requiring callers
+to materialise an :class:`OCRConfig`.
+"""
+
+
+_REVIEW_FRONTMATTER_KEY: str = "review"
+"""Frontmatter key used to flag fragments awaiting human review."""
+
+_REVIEW_PENDING_VALUE: str = "pending_review"
+"""Value written to :data:`_REVIEW_FRONTMATTER_KEY` when OCR is uncertain."""
+
+
 _IMAGE_TYPE_HINTS: dict[str, tuple[str, ...]] = {
     "screenshot": ("screenshot", "screen-shot", "screen_shot", "screencap"),
     "photo_of_text": ("scan", "scanned", "handwritten", "notebook"),
@@ -303,6 +319,7 @@ class ImageIngestor(Ingestor):
         self,
         engine: OcrEngine | None = None,
         language: str = _DEFAULT_LANGUAGE,
+        min_confidence: float = _DEFAULT_MIN_CONFIDENCE,
     ) -> None:
         """Initialise the ingestor.
 
@@ -317,9 +334,13 @@ class ImageIngestor(Ingestor):
                 fragments via the ``language`` metadata key, so callers
                 can reconcile per-fragment language with the engine
                 that produced them.
+            min_confidence: OCR-confidence threshold below which a
+                produced fragment is tagged for the review queue. Mirrors
+                :pyattr:`creek.config.OCRConfig.min_confidence`.
         """
         self.engine = engine if engine is not None else PytesseractOcrEngine(language)
         self.language = language
+        self.min_confidence = min_confidence
 
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Recursively find every supported image under *source_path*.
@@ -385,19 +406,39 @@ class ImageIngestor(Ingestor):
         if not result.text.strip():
             logger.info("OCR produced no text for %s; skipping fragment.", raw.path)
             return []
+        metadata: dict[str, Any] = {
+            "original_file": str(raw.path),
+            "ocr_confidence": result.confidence,
+            "image_type": result.image_type,
+            "language": self.language,
+        }
+        self._tag_low_confidence(metadata, result.confidence)
         return [
             ParsedFragment(
                 content=result.text.strip(),
-                metadata={
-                    "original_file": str(raw.path),
-                    "ocr_confidence": result.confidence,
-                    "image_type": result.image_type,
-                    "language": self.language,
-                },
+                metadata=metadata,
                 source_path=str(raw.path),
                 timestamp=_modified_time(raw.path),
             ),
         ]
+
+    def _tag_low_confidence(
+        self,
+        metadata: dict[str, Any],
+        confidence: float,
+    ) -> None:
+        """Mark *metadata* for review when *confidence* is below the threshold.
+
+        Mutates the supplied metadata dict in place — adding the review
+        marker only when needed keeps the high-confidence path unchanged
+        and avoids polluting frontmatter with an irrelevant field.
+
+        Args:
+            metadata: Fragment metadata dict to mutate.
+            confidence: The OCR confidence in ``[0.0, 1.0]``.
+        """
+        if confidence < self.min_confidence:
+            metadata[_REVIEW_FRONTMATTER_KEY] = _REVIEW_PENDING_VALUE
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Embed the original image, then the OCR'd body.
@@ -415,7 +456,7 @@ class ImageIngestor(Ingestor):
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Produce the YAML frontmatter for an OCR'd image fragment."""
-        return {
+        frontmatter: dict[str, Any] = {
             "type": "fragment",
             "source": {
                 "platform": SourcePlatform.IMAGE_OCR.value,
@@ -429,6 +470,10 @@ class ImageIngestor(Ingestor):
             "language": fragment.metadata.get("language", self.language),
             "ingested": fragment.timestamp.isoformat(),
         }
+        review_marker = fragment.metadata.get(_REVIEW_FRONTMATTER_KEY)
+        if review_marker:
+            frontmatter[_REVIEW_FRONTMATTER_KEY] = review_marker
+        return frontmatter
 
     def ingest_pdf(self, pdf_path: Path) -> list[ParsedFragment]:
         """Run OCR on every page of *pdf_path* and return per-page fragments.
@@ -454,16 +499,18 @@ class ImageIngestor(Ingestor):
         for result in results:
             if not result.text.strip():
                 continue
+            metadata: dict[str, Any] = {
+                "original_file": str(pdf_path),
+                "ocr_confidence": result.confidence,
+                "image_type": result.image_type,
+                "language": self.language,
+                "page": result.page,
+            }
+            self._tag_low_confidence(metadata, result.confidence)
             fragments.append(
                 ParsedFragment(
                     content=result.text.strip(),
-                    metadata={
-                        "original_file": str(pdf_path),
-                        "ocr_confidence": result.confidence,
-                        "image_type": result.image_type,
-                        "language": self.language,
-                        "page": result.page,
-                    },
+                    metadata=metadata,
                     source_path=str(pdf_path),
                     timestamp=_modified_time(pdf_path),
                 ),
