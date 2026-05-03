@@ -218,27 +218,19 @@ class RedactionConfig(BaseModel):
     @field_validator("replacement_template")
     @classmethod
     def validate_replacement_template(cls, v: str) -> str:
-        """Validate that the template contains exactly the ``{name}`` placeholder.
-
-        Args:
-            v: Template string to validate.
-
-        Returns:
-            The validated template string.
-
-        Raises:
-            ValueError: If the template lacks ``{name}`` or contains any
-                placeholder other than ``{name}``.
-        """
+        """Reject templates lacking ``{name}`` or carrying other placeholders."""
+        # Format with a sentinel; if substitution didn't change the string,
+        # `{name}` was absent. KeyError/IndexError/ValueError surface unknown
+        # placeholders like `{type}` or malformed format specs.
         try:
-            formatted = v.format(name="check")
+            formatted = v.format(name="\x00creek_name_sentinel\x00")
         except (KeyError, IndexError, ValueError) as exc:
             msg = (
                 f"replacement_template {v!r} has invalid placeholders; "
                 "only '{name}' is supported."
             )
             raise ValueError(msg) from exc
-        if "check" not in formatted:
+        if formatted == v:
             msg = f"replacement_template {v!r} must include the '{{name}}' placeholder."
             raise ValueError(msg)
         return v

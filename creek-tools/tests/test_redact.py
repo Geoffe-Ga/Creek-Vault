@@ -2055,3 +2055,134 @@ class TestReplacementTemplate:
 
         with pytest.raises(ValidationError):
             CfgCls(replacement_template="{type}")
+
+    def test_template_literal_check_without_placeholder_rejected(self) -> None:
+        """A template containing the literal string ``check`` but no placeholder.
+
+        Regression for a sentinel-based validator that accepted any template
+        containing the substring used to verify substitution.
+        """
+        from pydantic import ValidationError
+
+        from creek.config import RedactionConfig as CfgCls
+
+        with pytest.raises(ValidationError):
+            CfgCls(replacement_template="[REDACTED:check]")
+
+
+# ---------------------------------------------------------------------------
+# Public post_validate dispatch (review feedback)
+# ---------------------------------------------------------------------------
+
+
+class TestPostValidateDispatch:
+    """The post-validation dispatch is part of the public scanner API."""
+
+    def test_post_validate_is_public(self) -> None:
+        """``post_validate`` must be importable as a public symbol."""
+        from creek.redact.scanner import post_validate
+
+        assert callable(post_validate)
+
+    def test_post_validate_unknown_pattern_returns_true(self) -> None:
+        """Patterns without a registered validator are kept by default."""
+        from creek.redact.scanner import post_validate
+
+        assert post_validate("ssn", "123-45-6789") is True
+        assert post_validate("email", "x@y.com") is True
+
+    def test_post_validate_credit_card_filters(self) -> None:
+        """``credit_card`` is filtered through Luhn."""
+        from creek.redact.scanner import post_validate
+
+        assert post_validate("credit_card", "4111-1111-1111-1111") is True
+        assert post_validate("credit_card", "4111-1111-1111-1112") is False
+
+
+# ---------------------------------------------------------------------------
+# Redactor must replace high-entropy strings (review feedback)
+# ---------------------------------------------------------------------------
+
+
+class TestRedactorHighEntropy:
+    """`Redactor.redact_content` must apply the high-entropy detector too."""
+
+    def test_redactor_replaces_high_entropy_secret(self) -> None:
+        """A high-entropy hex secret must be replaced by the redactor."""
+        from creek.config import RedactionConfig as CfgCls
+
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        cfg = CfgCls()
+        scanner = RedactionScanner(config=cfg)
+        redactor = Redactor(config=cfg, salt=scanner.salt)
+
+        # Bare line — avoids env_secret picking up `token = …` first.
+        out = redactor.redact_content(secret)
+
+        assert secret not in out
+        assert "[REDACTED:high_entropy_string]" in out
+
+    def test_redactor_high_entropy_respects_allowlist(self) -> None:
+        """An allowlisted high-entropy substring must not be replaced."""
+        from creek.config import RedactionConfig as CfgCls
+
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        cfg = CfgCls(false_positive_allowlist=[secret])
+        scanner = RedactionScanner(config=cfg)
+        redactor = Redactor(config=cfg, salt=scanner.salt)
+
+        out = redactor.redact_content(secret)
+
+        assert secret in out
+        assert "REDACTED" not in out
+
+    def test_redactor_high_entropy_respects_min_confidence(self) -> None:
+        """A low-entropy string must survive even at min_confidence=0."""
+        from creek.config import RedactionConfig as CfgCls
+
+        # Predictable, repeating content.
+        low_entropy = "ababababababababababab"
+        cfg = CfgCls(min_confidence=1.0)
+        scanner = RedactionScanner(config=cfg)
+        redactor = Redactor(config=cfg, salt=scanner.salt)
+
+        out = redactor.redact_content(low_entropy)
+
+        assert low_entropy in out
+
+
+# ---------------------------------------------------------------------------
+# Discord bot token regex must accept hyphen-suffixed tokens (review feedback)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordBotTokenBoundaries:
+    """Discord token boundary must not break on trailing ``-`` characters."""
+
+    def test_discord_bot_token_trailing_hyphen(self) -> None:
+        """A token ending in ``-`` must still match (boundary char-class fix)."""
+        pattern = REDACTION_PATTERNS["discord_bot_token"]
+        token = "MTE" + "a" * 23 + ".AAAAAA." + "x" * 26 + "-"
+        assert pattern.search(token)
+
+    def test_discord_bot_token_internal_hyphens(self) -> None:
+        """Hyphens inside the segments are still allowed."""
+        pattern = REDACTION_PATTERNS["discord_bot_token"]
+        token = "MTE" + "a-b-c-" * 4 + "abc.AAAAAA." + "x-y-" * 7 + "abcd"
+        assert pattern.search(token)
+
+
+# ---------------------------------------------------------------------------
+# high_entropy_string regex single source of truth (review feedback)
+# ---------------------------------------------------------------------------
+
+
+class TestHighEntropyRegexSourceOfTruth:
+    """Detector and metadata must share one regex object."""
+
+    def test_detector_uses_pattern_metadata_regex(self) -> None:
+        """The scanner's entropy candidate regex is the metadata pattern."""
+        from creek.redact.patterns import PATTERN_METADATA
+        from creek.redact.scanner import HIGH_ENTROPY_CANDIDATE
+
+        assert HIGH_ENTROPY_CANDIDATE is PATTERN_METADATA["high_entropy_string"].pattern

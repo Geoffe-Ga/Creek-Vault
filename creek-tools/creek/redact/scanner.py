@@ -36,12 +36,13 @@ from tqdm import tqdm
 from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
 from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
 
-# High-entropy detection candidates: runs of base64url-/hex-ish chars.
-_HIGH_ENTROPY_CANDIDATE = re.compile(r"[A-Za-z0-9+/=_\-]{20,}")
-"""Substring shape for the generic-secret detector (≥20 base64url chars)."""
-
-_HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
+HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
 """Pattern key used by the generic high-entropy detector."""
+
+# Source of truth for the candidate regex lives on the PatternInfo entry
+# so reports and the detector cannot drift apart silently.
+HIGH_ENTROPY_CANDIDATE = PATTERN_METADATA[HIGH_ENTROPY_PATTERN_NAME].pattern
+"""Substring shape for the generic-secret detector (≥20 base64url chars)."""
 
 _ENTROPY_FLOOR_BITS = 2.5
 """Lower bound (bits/char) for the entropy threshold at min_confidence=0.0.
@@ -251,7 +252,7 @@ class RedactionScanner:
                     matched_text = m.group()
                     if self._is_allowlisted(matched_text):
                         continue
-                    if not _post_validate(name, matched_text):
+                    if not post_validate(name, matched_text):
                         continue
                     matches.append(
                         RedactionMatch(
@@ -287,19 +288,19 @@ class RedactionScanner:
         Returns:
             One :class:`RedactionMatch` per high-entropy substring found.
         """
-        threshold = _entropy_threshold(self.config.min_confidence)
+        threshold = entropy_threshold(self.config.min_confidence)
         results: list[RedactionMatch] = []
-        for candidate in _HIGH_ENTROPY_CANDIDATE.finditer(line):
+        for candidate in HIGH_ENTROPY_CANDIDATE.finditer(line):
             text = candidate.group()
             if self._is_allowlisted(text):
                 continue
-            if _shannon_entropy(text) < threshold:
+            if shannon_entropy(text) < threshold:
                 continue
             results.append(
                 RedactionMatch(
                     file_path=file_path,
                     line_number=line_num,
-                    match_type=_HIGH_ENTROPY_PATTERN_NAME,
+                    match_type=HIGH_ENTROPY_PATTERN_NAME,
                     salted_hash=self._hash_match(text),
                 )
             )
@@ -636,7 +637,7 @@ class RedactionScanner:
         return "\n".join(lines)
 
 
-def _shannon_entropy(text: str) -> float:
+def shannon_entropy(text: str) -> float:
     """Return the Shannon entropy (bits/char) of *text*.
 
     Args:
@@ -654,7 +655,7 @@ def _shannon_entropy(text: str) -> float:
     )
 
 
-def _entropy_threshold(min_confidence: float) -> float:
+def entropy_threshold(min_confidence: float) -> float:
     """Map a ``min_confidence`` in ``[0, 1]`` to a bits/char entropy threshold.
 
     The threshold rises linearly between :data:`_ENTROPY_FLOOR_BITS` and
@@ -702,12 +703,13 @@ def _luhn_valid(digits: str) -> bool:
 _DIGIT_STRIP = re.compile(r"\D")
 
 
-def _post_validate(pattern_name: str, matched_text: str) -> bool:
+def post_validate(pattern_name: str, matched_text: str) -> bool:
     """Run pattern-specific post-validation on a regex hit.
 
-    Returns ``True`` when the match should be kept and ``False`` when
-    it should be dropped. Patterns without a registered validator are
-    always kept.
+    Public dispatch shared by :class:`RedactionScanner` and
+    :class:`creek.redact.redactor.Redactor`. Returns ``True`` when the
+    match should be kept and ``False`` when it should be dropped;
+    patterns without a registered validator are always kept.
 
     Args:
         pattern_name: The pattern key that produced the match.

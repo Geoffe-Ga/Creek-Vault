@@ -15,7 +15,14 @@ from typing import Any
 
 from creek.config import RedactionConfig
 from creek.redact.patterns import REDACTION_PATTERNS
-from creek.redact.scanner import RedactionMatch, _post_validate
+from creek.redact.scanner import (
+    HIGH_ENTROPY_CANDIDATE,
+    HIGH_ENTROPY_PATTERN_NAME,
+    RedactionMatch,
+    entropy_threshold,
+    post_validate,
+    shannon_entropy,
+)
 
 
 class Redactor:
@@ -95,7 +102,49 @@ class Redactor:
             marker = self.config.replacement_template.format(name=name)
             content = self._replace_pattern(content, pattern, marker, name)
 
+        if self._should_apply_high_entropy(pattern_types):
+            content = self._replace_high_entropy(content)
+
         return content
+
+    def _should_apply_high_entropy(
+        self,
+        pattern_types: list[str] | None,
+    ) -> bool:
+        """Decide whether the entropy detector should run for this call.
+
+        Args:
+            pattern_types: Caller-supplied filter; ``None`` means *all*.
+
+        Returns:
+            ``True`` when the high-entropy detector is in scope.
+        """
+        if pattern_types is None:
+            return True
+        return HIGH_ENTROPY_PATTERN_NAME in pattern_types
+
+    def _replace_high_entropy(self, content: str) -> str:
+        """Replace high-entropy substrings with the configured marker.
+
+        Mirrors :meth:`creek.redact.scanner.RedactionScanner._scan_high_entropy`
+        so a `--scan` finding cannot survive a `--apply` step. The shared
+        ``HIGH_ENTROPY_CANDIDATE`` regex and ``shannon_entropy`` helper
+        keep both paths in lockstep.
+        """
+        marker = self.config.replacement_template.format(
+            name=HIGH_ENTROPY_PATTERN_NAME,
+        )
+        threshold = entropy_threshold(self.config.min_confidence)
+
+        def _replacer(m: re.Match[str]) -> str:
+            text = m.group()
+            if self._is_allowlisted(text):
+                return text
+            if shannon_entropy(text) < threshold:
+                return text
+            return marker
+
+        return HIGH_ENTROPY_CANDIDATE.sub(_replacer, content)
 
     def _replace_pattern(
         self,
@@ -132,7 +181,7 @@ class Redactor:
             """
             if self._is_allowlisted(m.group()):
                 return m.group()
-            if not _post_validate(pattern_name, m.group()):
+            if not post_validate(pattern_name, m.group()):
                 return m.group()
             return marker
 

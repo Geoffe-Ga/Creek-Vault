@@ -187,9 +187,9 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
     ),
     "discord_bot_token": PatternInfo(
         pattern=re.compile(
-            r"\b[MN][A-Za-z0-9_-]{23,38}"
+            r"(?<![A-Za-z0-9_-])[MN][A-Za-z0-9_-]{23,38}"
             r"\.[A-Za-z0-9_-]{6,7}"
-            r"\.[A-Za-z0-9_-]{27,40}\b",
+            r"\.[A-Za-z0-9_-]{27,40}(?![A-Za-z0-9_-])",
         ),
         description="Discord bot tokens (three dot-separated base64url segments).",
         severity="critical",
