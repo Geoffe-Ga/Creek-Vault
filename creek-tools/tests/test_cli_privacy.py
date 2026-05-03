@@ -7,6 +7,7 @@ whenever the operator elevates inclusion above the default tier.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,18 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 runner = CliRunner()
+
+# Click 8 + Rich emit ANSI styling around dashes when stdout is detected
+# as a terminal (CI runners differ from local CliRunner here), which
+# breaks naive substring searches like ``"--include-tier" in output``
+# because the dashes are split across reset codes. Strip ANSI before
+# asserting on help text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+
+def _plain(text: str) -> str:
+    """Return *text* with ANSI escape sequences stripped."""
+    return _ANSI_RE.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -146,25 +159,25 @@ def test_mine_help_mentions_include_tier() -> None:
     """``creek mine --help`` advertises the new flag."""
     result = runner.invoke(app, ["mine", "--help"])
     assert result.exit_code == 0
-    assert "--include-tier" in result.output
+    assert "--include-tier" in _plain(result.output)
 
 
 def test_draft_help_mentions_include_tier() -> None:
     """``creek draft --help`` advertises the new flag."""
     result = runner.invoke(app, ["draft", "--help"])
     assert result.exit_code == 0
-    assert "--include-tier" in result.output
+    assert "--include-tier" in _plain(result.output)
 
 
 def test_report_help_mentions_include_tier() -> None:
     """``creek report --help`` advertises the new flag."""
     result = runner.invoke(app, ["report", "--help"])
     assert result.exit_code == 0
-    assert "--include-tier" in result.output
+    assert "--include-tier" in _plain(result.output)
 
 
 def test_skills_help_mentions_include_tier() -> None:
     """``creek skills --help`` advertises the new flag."""
     result = runner.invoke(app, ["skills", "--help"])
     assert result.exit_code == 0
-    assert "--include-tier" in result.output
+    assert "--include-tier" in _plain(result.output)
