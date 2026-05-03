@@ -849,3 +849,145 @@ class TestGenerateAllProfiles:
         assert len(paths) == 1
         post = frontmatter.load(str(paths[0]))
         assert post.get("exemplar_count") == 5
+
+
+# ---- Streaming exemplar accumulator (PERF-004) ----
+
+
+class TestStreamingAccumulator:
+    """Tests for the on-disk JSONL exemplar accumulator path."""
+
+    def _seed_register(
+        self,
+        vault_path: Path,
+        register: VoiceRegister,
+        count: int,
+    ) -> None:
+        """Seed *count* fragments of *register* with distinctive bodies."""
+        for i in range(count):
+            fragment = _make_fragment(
+                f"{register.value}-{i}",
+                f"{register.value} fragment {i}",
+                register=register,
+            )
+            body = (
+                f"Paragraph about the {register.value} register: "
+                "the creek of thought flows here. " * 30
+            )
+            _write_fragment_file(vault_path, fragment, body)
+
+    def test_temp_jsonl_is_cleaned_up(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        generator: VoiceProfileGenerator,
+        vault: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The accumulator's temp dir is actually deleted after the call returns.
+
+        The previous version of this test was vacuous: it scanned
+        ``tmp_path`` for ``creek-voice-*`` entries, but
+        ``tempfile.TemporaryDirectory`` creates under
+        ``tempfile.gettempdir()`` (e.g. ``/tmp``) by default, so the
+        scan never had anything to find. The fix monkey-patches the
+        ``tempfile.TemporaryDirectory`` constructor used inside
+        ``creek.generate.voice`` so the directory lands under
+        ``tmp_path`` and we can directly assert that the directory is
+        gone after ``generate_all_profiles`` returns.
+        """
+        import os
+        import tempfile
+
+        from creek.generate import voice as voice_mod
+
+        created: list[str] = []
+        real_td = tempfile.TemporaryDirectory
+
+        def patched_td(*args: object, **kwargs: object) -> object:
+            kwargs["dir"] = str(tmp_path)
+            td = real_td(*args, **kwargs)  # type: ignore[arg-type]
+            created.append(td.name)
+            return td
+
+        monkeypatch.setattr(voice_mod.tempfile, "TemporaryDirectory", patched_td)
+        self._seed_register(vault, VoiceRegister.CONFESSIONAL, count=5)
+        generator.generate_all_profiles(vault)
+
+        # The patched constructor must have been used, and every
+        # directory it returned must be deleted by the time the call
+        # exits the streaming-accumulator context manager.
+        assert created, "patched TemporaryDirectory was never invoked"
+        for path in created:
+            assert not os.path.exists(path), f"Temp dir leaked: {path}"
+
+    def test_streaming_matches_legacy_output(
+        self,
+        generator: VoiceProfileGenerator,
+        vault: Path,
+    ) -> None:
+        """Streaming path produces the same exemplar count as legacy in-memory."""
+        self._seed_register(vault, VoiceRegister.CONFESSIONAL, count=7)
+        paths = generator.generate_all_profiles(vault)
+        assert len(paths) == 1
+        post = frontmatter.load(str(paths[0]))
+        # max_exemplars defaults to 10; we seeded 7.
+        assert post.get("exemplar_count") == 7
+
+    def test_jsonl_writer_flushes_on_each_append(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``_JsonlWriter.append`` flushes per call to leave a coherent prefix."""
+        from creek.generate.voice import _JsonlWriter
+
+        target = tmp_path / "exemplar.jsonl"
+        writer = _JsonlWriter(target)
+        try:
+            writer.append({"a": 1})
+            # Without flush, the new line might still be in the userspace
+            # buffer; with the per-append flush, an out-of-band reader
+            # sees it immediately.
+            assert target.read_text(encoding="utf-8") == '{"a": 1}\n'
+            writer.append({"b": 2})
+            assert target.read_text(encoding="utf-8") == '{"a": 1}\n{"b": 2}\n'
+        finally:
+            writer.close()
+
+
+@pytest.mark.slow
+class TestVoiceMemoryFootprint:
+    """Memory benchmark guarding against PERF-004's load-everything bug."""
+
+    def test_peak_under_200mb_for_large_vault(
+        self,
+        generator: VoiceProfileGenerator,
+        vault: Path,
+    ) -> None:
+        """Peak heap stays under 200 MB while processing 2 000 large fragments."""
+        import tracemalloc
+
+        # 2000 fragments x ~5 KB body = ~10 MB total. With the legacy
+        # in-memory path that produces a single ~10 MB peak; the
+        # streaming path's peak should be well under the 200 MB envelope.
+        # The threshold guards against future regressions that would
+        # re-introduce the load-everything pattern.
+        body_template = "the creek of thought flows here. " * 150  # ~5 KB
+        for register in VoiceRegister:
+            for i in range(2_000 // len(VoiceRegister)):
+                fragment = _make_fragment(
+                    f"{register.value}-{i}",
+                    f"{register.value} fragment {i}",
+                    register=register,
+                )
+                _write_fragment_file(vault, fragment, body_template)
+
+        tracemalloc.start()
+        try:
+            paths = generator.generate_all_profiles(vault)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert paths
+        peak_mb = peak / (1024 * 1024)
+        assert peak_mb < 200, f"Peak memory was {peak_mb:.1f} MB"

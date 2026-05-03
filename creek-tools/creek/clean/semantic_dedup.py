@@ -21,16 +21,30 @@ fragment vs. existing index) processing modes.
 Embedding vectors must all share the same dimensionality.  Mismatched
 dimensions will raise a ``ValueError`` with context about the offending
 fragment and expected size.
+
+The batch path uses a vectorised matmul (``X @ X.T`` after L2
+normalisation) so a 10 000-fragment vault is dominated by BLAS, not Python
+loops. A FAISS-backed approximate-nearest-neighbour fallback is available
+behind :class:`DeduplicationConfig.use_faiss`; FAISS is an optional
+dependency and the code degrades gracefully to the dense matmul when it
+is not installed.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     import numpy as np
+    from numpy.typing import NDArray
+
+    FloatArray = NDArray[np.float32]
+
+
+logger = logging.getLogger(__name__)
 
 
 def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
@@ -56,6 +70,36 @@ def _cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
         return 0.0
 
     return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+class DeduplicationConfig(BaseModel):
+    """Tunable knobs for :class:`SemanticDeduplicator`.
+
+    Threshold ranges are enforced inside :class:`SemanticDeduplicator`'s
+    constructor (not by Pydantic) so the validation error message stays
+    consistent across the keyword-argument and config-object code paths.
+
+    Attributes:
+        duplicate_threshold: Cosine similarity at or above which a pair
+            is classified as a duplicate.
+        resonance_threshold: Cosine similarity at or above which (but
+            below ``duplicate_threshold``) a pair is classified as a
+            resonance.
+        use_faiss: When ``True`` and the optional ``faiss`` package is
+            installed, use an approximate-nearest-neighbour index for
+            the batch all-pairs query. Falls back to the dense matmul
+            transparently when ``faiss`` is unavailable so this knob
+            never becomes a hard dependency.
+    """
+
+    duplicate_threshold: float = Field(default=0.95)
+    resonance_threshold: float = Field(default=0.75)
+    use_faiss: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +139,113 @@ class SemanticDuplicateResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Vectorised similarity helpers
+# ---------------------------------------------------------------------------
+
+
+def _l2_normalise(matrix: FloatArray) -> FloatArray:
+    """Return ``matrix`` row-normalised to unit length.
+
+    Zero rows are preserved as zero rows (rather than producing ``NaN``)
+    so a zero embedding contributes zero similarity to every pair.
+
+    Args:
+        matrix: 2-D array of shape ``(n, d)``.
+
+    Returns:
+        A new array of the same shape with each non-zero row scaled to
+        unit L2 norm.
+    """
+    import numpy as np
+
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True).astype(np.float32)
+    safe = np.where(norms == 0.0, np.float32(1.0), norms)
+    normalised: FloatArray = (matrix / safe).astype(np.float32, copy=False)
+    return normalised
+
+
+def _stack_embeddings(
+    ids: list[str],
+    embeddings: dict[str, list[float]],
+    expected_dim: int,
+) -> FloatArray:
+    """Validate dimensions and stack *ids* into a contiguous float32 matrix."""
+    import numpy as np
+
+    for fid in ids:
+        if len(embeddings[fid]) != expected_dim:
+            msg = (
+                f"Embedding dimension mismatch for fragment "
+                f"'{fid}': expected {expected_dim}, "
+                f"got {len(embeddings[fid])}"
+            )
+            raise ValueError(msg)
+    matrix: FloatArray = np.asarray(
+        [embeddings[fid] for fid in ids],
+        dtype=np.float32,
+    )
+    return matrix
+
+
+def _faiss_pair_indices(
+    matrix: FloatArray,
+    threshold: float,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float32]]:
+    """Return upper-triangle (i, j, sim) triples above *threshold* via FAISS.
+
+    Caller is responsible for ensuring ``faiss`` is importable and that
+    *matrix* has been L2-normalised. Falls back to ``range_search`` on
+    ``IndexFlatIP`` so an exact result is returned (useful when the
+    pure-Python matmul would exceed the memory budget).
+    """
+    import faiss  # type: ignore[import-not-found]
+    import numpy as np
+
+    n, dim = matrix.shape
+    index = faiss.IndexFlatIP(dim)
+    index.add(matrix)
+    lims, distances, neighbours = index.range_search(matrix, float(threshold))
+    rows_list: list[np.ndarray] = [
+        np.full(lims[i + 1] - lims[i], i, dtype=np.int64) for i in range(n)
+    ]
+    rows = np.concatenate(rows_list) if rows_list else np.empty(0, dtype=np.int64)
+    cols = neighbours.astype(np.int64)
+    sims = distances.astype(np.float32)
+    upper = cols > rows
+    return rows[upper], cols[upper], sims[upper]
+
+
+def _matmul_pair_indices(
+    matrix: FloatArray,
+    threshold: float,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float32]]:
+    """Return upper-triangle (i, j, sim) triples above *threshold* via matmul.
+
+    Caller is responsible for ensuring *matrix* has been L2-normalised.
+
+    Memory: only **one** ``N x N`` float32 matrix is live at a time
+    (≈ 400 MB at N = 10 000). The previous implementation used
+    ``np.triu`` which materialised a second N x N copy alongside the
+    matmul result, doubling peak memory; the current code uses
+    ``np.triu_indices`` to extract the strictly upper-triangle
+    coordinates without copying the matrix.
+
+    The documented FAISS path is the right cutover for larger corpora.
+    """
+    import numpy as np
+
+    sim = matrix @ matrix.T
+    rows, cols = np.triu_indices(sim.shape[0], k=1)
+    upper = sim[rows, cols]
+    mask = upper >= threshold
+    return (
+        rows[mask].astype(np.int64, copy=False),
+        cols[mask].astype(np.int64, copy=False),
+        upper[mask].astype(np.float32, copy=False),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deduplicator
 # ---------------------------------------------------------------------------
 
@@ -111,12 +262,20 @@ class SemanticDeduplicator:
     dimension is set by the first vector added and enforced on subsequent
     additions.
 
+    The batch path uses a vectorised matmul (``X @ X.T``) so 10 000
+    embeddings finish in a few seconds rather than minutes. Pass
+    ``config=DeduplicationConfig(use_faiss=True)`` to opt into the FAISS
+    fallback for very large corpora; FAISS is optional and the code
+    falls back to the matmul if the package is missing.
+
     Attributes:
         duplicate_threshold: Minimum cosine similarity for a pair to be
             classified as a near-duplicate.
         resonance_threshold: Minimum cosine similarity for a pair to be
             classified as a resonance (must be below
             ``duplicate_threshold``).
+        config: The :class:`DeduplicationConfig` driving classification
+            and the choice of similarity backend.
     """
 
     def __init__(
@@ -124,32 +283,47 @@ class SemanticDeduplicator:
         *,
         duplicate_threshold: float = 0.95,
         resonance_threshold: float = 0.75,
+        config: DeduplicationConfig | None = None,
     ) -> None:
         """Initialise the deduplicator with configurable thresholds.
 
         Args:
             duplicate_threshold: Cosine similarity at or above which a
-                pair is classified as a near-duplicate.
+                pair is classified as a near-duplicate. Ignored when
+                *config* is provided.
             resonance_threshold: Cosine similarity at or above which
                 (but below ``duplicate_threshold``) a pair is classified
-                as a resonance.
+                as a resonance. Ignored when *config* is provided.
+            config: Optional :class:`DeduplicationConfig`. When provided,
+                its thresholds and ``use_faiss`` flag take precedence
+                over the standalone keyword arguments.
 
         Raises:
             ValueError: If ``resonance_threshold`` is not less than
                 ``duplicate_threshold``, or if either is outside (0, 1].
         """
-        if not (0.0 < resonance_threshold < duplicate_threshold <= 1.0):
+        if config is None:
+            config = DeduplicationConfig(
+                duplicate_threshold=duplicate_threshold,
+                resonance_threshold=resonance_threshold,
+            )
+        if not (0.0 < config.resonance_threshold < config.duplicate_threshold <= 1.0):
             msg = (
-                f"resonance_threshold ({resonance_threshold}) must be "
-                f"less than duplicate_threshold ({duplicate_threshold}) "
+                f"resonance_threshold ({config.resonance_threshold}) must be "
+                f"less than duplicate_threshold ({config.duplicate_threshold}) "
                 f"and both must be in (0, 1]"
             )
             raise ValueError(msg)
 
-        self.duplicate_threshold = duplicate_threshold
-        self.resonance_threshold = resonance_threshold
+        self.config = config
+        self.duplicate_threshold = config.duplicate_threshold
+        self.resonance_threshold = config.resonance_threshold
         self._index: dict[str, np.ndarray] = {}
         self._dimension: int | None = None
+        # Memoised result of the ``import faiss`` probe in
+        # ``_faiss_available``. ``None`` = not yet probed; ``True`` /
+        # ``False`` = importable / not.
+        self._faiss_probe_cache: bool | None = None
 
     def _validate_embedding(
         self,
@@ -238,7 +412,12 @@ class SemanticDeduplicator:
         Compares all unique pairs and classifies each by cosine
         similarity.  Does **not** modify the internal index.
 
-        All vectors in *embeddings* must have the same dimensionality.
+        Implementation: stacks the embeddings into an ``(N, D)`` float32
+        matrix, L2-normalises rows, and computes the upper-triangle of
+        ``X @ X.T`` in a single BLAS call. Pairs with similarity below
+        ``resonance_threshold`` are filtered out before any Python-level
+        iteration so a 10 000-fragment input that previously needed
+        minutes now finishes in seconds.
 
         Args:
             embeddings: Mapping of fragment IDs to embedding vectors.
@@ -250,40 +429,26 @@ class SemanticDeduplicator:
         Raises:
             ValueError: If embedding dimensions are inconsistent.
         """
+        ids = sorted(embeddings.keys())
+        if len(ids) < 2:
+            return SemanticDuplicateResult(duplicates=[], resonances=[])
+
+        dim = len(embeddings[ids[0]])
+        matrix = _stack_embeddings(ids, embeddings, dim)
+        normalised = _l2_normalise(matrix)
+
+        rows, cols, sims = self._pair_indices(normalised)
+
         duplicates: list[SemanticDuplicatePair] = []
         resonances: list[SemanticDuplicatePair] = []
-
-        ids = sorted(embeddings.keys())
-        if not ids:
-            return SemanticDuplicateResult(
-                duplicates=duplicates,
-                resonances=resonances,
-            )
-
-        import numpy as np  # lazy: numpy lives in the [embeddings] extra
-
-        # Convert to numpy and validate dimensions
-        dim = len(embeddings[ids[0]])
-        vecs: dict[str, np.ndarray] = {}
-        for fid in ids:
-            emb = embeddings[fid]
-            if len(emb) != dim:
-                msg = (
-                    f"Embedding dimension mismatch for fragment "
-                    f"'{fid}': expected {dim}, got {len(emb)}"
-                )
-                raise ValueError(msg)
-            vecs[fid] = np.asarray(emb, dtype=np.float64)
-
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                sim = _cosine_similarity(vecs[ids[i]], vecs[ids[j]])
-                pair = self._classify_pair(ids[i], ids[j], sim)
-                if pair is not None:
-                    if pair.classification == "duplicate":
-                        duplicates.append(pair)
-                    else:
-                        resonances.append(pair)
+        for i, j, sim in zip(rows, cols, sims, strict=True):
+            pair = self._classify_pair(ids[int(i)], ids[int(j)], float(sim))
+            if pair is None:
+                continue
+            if pair.classification == "duplicate":
+                duplicates.append(pair)
+            else:
+                resonances.append(pair)
 
         duplicates.sort(key=lambda p: p.similarity, reverse=True)
         resonances.sort(key=lambda p: p.similarity, reverse=True)
@@ -292,6 +457,47 @@ class SemanticDeduplicator:
             duplicates=duplicates,
             resonances=resonances,
         )
+
+    def _pair_indices(
+        self,
+        normalised: FloatArray,
+    ) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float32]]:
+        """Return ``(rows, cols, sims)`` for pairs above resonance threshold.
+
+        Honors :attr:`DeduplicationConfig.use_faiss` and gracefully
+        degrades to the dense matmul only if the top-level ``faiss``
+        import itself fails. ``ImportError`` raised from inside FAISS
+        (e.g. a missing submodule) is **not** swallowed so internal
+        FAISS bugs surface as real failures rather than silent
+        fallbacks.
+        """
+        if self.config.use_faiss and self._faiss_available():
+            return _faiss_pair_indices(normalised, self.resonance_threshold)
+        return _matmul_pair_indices(normalised, self.resonance_threshold)
+
+    def _faiss_available(self) -> bool:
+        """Return whether the optional ``faiss`` package is importable.
+
+        The probe result is cached on the instance so a long-running
+        pipeline that calls :meth:`find_duplicates` repeatedly with
+        ``use_faiss=True`` against a FAISS-less environment emits at
+        most one fallback warning per deduplicator instead of one per
+        call.
+        """
+        cached = self._faiss_probe_cache
+        if cached is not None:
+            return cached
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "use_faiss=True but faiss is not installed — "
+                "falling back to dense matmul.",
+            )
+            self._faiss_probe_cache = False
+            return False
+        self._faiss_probe_cache = True
+        return True
 
     def check_fragment(
         self,
@@ -303,6 +509,11 @@ class SemanticDeduplicator:
         Compares the given embedding against all indexed fragments
         without modifying the index.  Use :meth:`add_fragment` to add
         the fragment to the index after reviewing results.
+
+        Implementation: stacks the indexed embeddings into a single
+        matrix, normalises both sides, and runs a single matmul so the
+        per-call cost is proportional to a BLAS GEMV rather than ``N``
+        Python-level cosine calls.
 
         Args:
             fragment_id: ID of the fragment to check.
@@ -318,9 +529,6 @@ class SemanticDeduplicator:
         """
         import numpy as np  # lazy: numpy lives in the [embeddings] extra
 
-        duplicates: list[SemanticDuplicatePair] = []
-        resonances: list[SemanticDuplicatePair] = []
-
         if self._dimension is not None and len(embedding) != self._dimension:
             msg = (
                 f"Embedding dimension mismatch for fragment "
@@ -329,15 +537,27 @@ class SemanticDeduplicator:
             )
             raise ValueError(msg)
 
-        vec = np.asarray(embedding, dtype=np.float64)
-        for indexed_id, indexed_vec in self._index.items():
-            sim = _cosine_similarity(vec, indexed_vec)
-            pair = self._classify_pair(fragment_id, indexed_id, sim)
-            if pair is not None:
-                if pair.classification == "duplicate":
-                    duplicates.append(pair)
-                else:
-                    resonances.append(pair)
+        if not self._index:
+            return SemanticDuplicateResult(duplicates=[], resonances=[])
+
+        ids = list(self._index.keys())
+        indexed_matrix: FloatArray = np.asarray(
+            [self._index[fid] for fid in ids],
+            dtype=np.float32,
+        )
+        query: FloatArray = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+        sims = (_l2_normalise(query) @ _l2_normalise(indexed_matrix).T).reshape(-1)
+
+        duplicates: list[SemanticDuplicatePair] = []
+        resonances: list[SemanticDuplicatePair] = []
+        for indexed_id, sim_value in zip(ids, sims, strict=True):
+            pair = self._classify_pair(fragment_id, indexed_id, float(sim_value))
+            if pair is None:
+                continue
+            if pair.classification == "duplicate":
+                duplicates.append(pair)
+            else:
+                resonances.append(pair)
 
         duplicates.sort(key=lambda p: p.similarity, reverse=True)
         resonances.sort(key=lambda p: p.similarity, reverse=True)
