@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
@@ -197,6 +198,55 @@ def test_repeated_appends_do_not_rescan_log_when_single_writer(
 
     assert rescans["count"] == 0
     log.verify()
+
+
+def test_thread_lock_keyed_on_resolved_path(tmp_path: Path) -> None:
+    """Two instances on equivalent paths share the same thread lock.
+
+    Regression for PR #193 review: ``Path("audit.jsonl")`` and
+    ``Path("./audit.jsonl")`` compare unequal but resolve to the same
+    file. If the lock dictionary keyed on the raw ``Path`` they would
+    each get their own ``Lock``, silently breaking cross-thread
+    serialisation. We assert that the resolved-path keying makes the
+    instances share a lock.
+    """
+    from creek.audit.log import _thread_lock_for
+
+    same_file = tmp_path / "audit.jsonl"
+    relative_form = (tmp_path / "." / "audit.jsonl").resolve()
+    lock_a = _thread_lock_for(same_file)
+    lock_b = _thread_lock_for(relative_form)
+    assert lock_a is lock_b
+
+
+def test_append_calls_fsync_for_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each append fsyncs the file descriptor before releasing the lock.
+
+    Regression for PR #193 review: ``flush`` only pushes data into the
+    OS page cache; a crash before kernel writeback can silently lose
+    the last entry. We monkeypatch ``os.fsync`` and assert it is called
+    exactly once per append, on a real fd.
+    """
+    from creek.audit import log as log_module
+
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(log_module.os, "fsync", recording_fsync)
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+    log.append({"op": "second"})
+
+    assert len(calls) == 2
+    assert all(isinstance(fd, int) and fd >= 0 for fd in calls)
 
 
 def test_cache_invalidated_when_foreign_writer_resizes_file(

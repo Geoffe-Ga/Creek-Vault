@@ -13,11 +13,19 @@ Concurrency:
   freshly opened file descriptor for every append, so callers do not
   share state between processes.
 * Cross-thread safety is provided by a module-level ``threading.Lock``
-  keyed on the resolved log path, so multiple :class:`AuditLog`
-  instances that point at the same file still serialise correctly.
+  keyed on the **resolved** log path, so ``Path("audit.jsonl")`` and
+  ``Path("./audit.jsonl")`` correctly share a lock even though the raw
+  ``Path`` objects compare unequal.
 * On platforms without ``fcntl`` (notably Windows) only the in-process
   lock applies; cross-process concurrency falls back to "best effort"
   and callers must not run multiple processes against the same log.
+
+Durability: every successful ``append`` calls ``os.fsync`` on the file
+descriptor before releasing the flock, so a crash (power loss, OOM
+kill) immediately after ``append`` returns does not silently lose the
+last entry. For a tamper-evidence log a silent loss-without-detection
+is the worst failure mode; ``fsync`` makes the durability boundary
+explicit.
 
 The threat model is "careless or hostile editor", not "well-funded
 adversary"; the chain is integrity, not authentication. An attacker who
@@ -31,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -67,9 +76,18 @@ AuditChainBroken = AuditChainBrokenError
 
 
 def _thread_lock_for(path: Path) -> threading.Lock:
-    """Return the per-path lock used to serialise threaded appends."""
+    """Return the per-path lock used to serialise threaded appends.
+
+    The key is ``path.resolve()`` so that two :class:`AuditLog`
+    instances constructed with different representations of the same
+    file (``"audit.jsonl"`` vs ``"./audit.jsonl"`` vs an absolute path)
+    share the same lock. Without resolution the raw ``Path`` objects
+    compare unequal and would each get their own lock, silently
+    breaking cross-thread serialisation.
+    """
+    resolved = path.resolve(strict=False)
     with _THREAD_LOCKS_GUARD:
-        return _THREAD_LOCKS[path]
+        return _THREAD_LOCKS[resolved]
 
 
 def _hash_line(line: str) -> str:
@@ -148,6 +166,13 @@ class AuditLog:
                 line = json.dumps(chained, sort_keys=True)
                 fh.write(line + "\n")
                 fh.flush()
+                # fsync inside the flock window: the lock guarantees no
+                # other writer races us, and fsync guarantees the bytes
+                # are durable before we release the lock or return to
+                # the caller. Without fsync, a crash between flush and
+                # the OS's lazy writeback would silently drop the entry
+                # — the worst failure mode for a tamper-evidence log.
+                os.fsync(fh.fileno())
                 self._cached_last_hash = _hash_line(line)
                 self._cached_size = self.path.stat().st_size
             finally:
