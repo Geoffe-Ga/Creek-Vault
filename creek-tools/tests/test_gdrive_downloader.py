@@ -1194,6 +1194,45 @@ class TestRevokeToken:
         # The file is still on disk because unlink raised.
         assert token.exists()
 
+    def test_unparseable_token_file_populates_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A token file with no refresh token sets a meaningful ``error``.
+
+        Reviewer caught a user-facing bug: when ``_read_refresh_token``
+        returns ``None`` (file exists but is empty / has no
+        ``refresh_token`` field), ``revoke_token`` skipped the remote
+        call and returned ``error=None``. The CLI then printed
+        ``confirm: None`` to the operator. The result must instead
+        surface a human-readable explanation.
+        """
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        # Valid JSON, but no `refresh_token` or `token` field.
+        token.write_text('{"client_id": "abc"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        called = {"n": 0}
+
+        def _post(*_a: object, **_kw: object) -> _StubResponse:
+            called["n"] += 1
+            return _StubResponse(200)
+
+        monkeypatch.setattr("creek.ingest.gdrive.httpx.post", _post)
+
+        result = revoke_token(config)
+
+        assert result.token_file_existed is True
+        assert result.token_file_removed is True
+        assert result.remote_revoked is False
+        # No remote call was made because there was no token to revoke.
+        assert called["n"] == 0
+        assert result.error is not None
+        assert "refresh token" in result.error.lower()
+
 
 # ---- AST-based read-only audit ---------------------------------------
 

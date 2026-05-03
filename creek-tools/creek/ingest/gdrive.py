@@ -643,10 +643,16 @@ def revoke_token(config: GoogleDriveConfig) -> RevokeResult:
             error = f"remote revocation failed: {type(exc).__name__}"
             logger.warning("%s", error)
         else:
-            remote_revoked = bool(getattr(response, "is_success", False))
+            remote_revoked = response.is_success
             if not remote_revoked:
                 error = f"revocation endpoint returned HTTP {response.status_code}"
                 logger.warning("%s", error)
+    elif existed:
+        # File was on disk but unparseable / lacked a refresh token.
+        # Without an `error` here the CLI would surface a confusing
+        # ``confirm: None`` message to the operator.
+        error = "no refresh token found in token file; remote revocation skipped"
+        logger.warning("%s", error)
 
     return RevokeResult(
         token_file_existed=existed,

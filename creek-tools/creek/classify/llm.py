@@ -111,7 +111,12 @@ _DOSAGE_AMBIGUOUS_MARKERS: frozenset[str] = frozenset(
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     {"frequency", "wavelength", "voice"},
 )
-"""Top-level keys recognised in a documented LLM classification response."""
+"""Top-level keys recognised in a documented LLM classification response.
+
+Mirrors the three sections in :data:`CLASSIFICATION_PROMPT`. Update
+both when adding a new classification dimension — ``validate_response``
+will otherwise reject the LLM's output as unexpected.
+"""
 
 
 _MAX_PROMPT_CONTENT_CHARS: int = 8192

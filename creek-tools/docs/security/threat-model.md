@@ -73,7 +73,15 @@ from most to least likely:
 - **Prompt-injection hardening.** Fragment title and body are
   sanitised before being templated into the LLM classifier prompt;
   responses are strictly validated to reject multi-document YAML and
-  undocumented top-level keys (SEC-004).
+  undocumented top-level keys (SEC-004). The substring sanitiser
+  ``[FENCE]`` / ``[CMT-OPEN]`` / ``[CMT-CLOSE]`` defends only against
+  the literal sequences ``---`` / ``<!--`` / ``-->``; an attacker who
+  controls fragment content and knows these replacements could craft
+  Unicode look-alikes (e.g. fullwidth hyphens, mathematical minus
+  signs) that the substring pass would miss. This is acceptable
+  because the assumed adversary is "third-party content / careless
+  operator," not "sophisticated prompt-injection specialist." The
+  strict YAML response validator is the second line of defence.
 - **Audit log integrity.** Every purge and redaction-apply writes a
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity
   story (hash chaining, tamper-evidence) is the subject of SEC-005;
