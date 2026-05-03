@@ -663,7 +663,16 @@ class TestVectorisedFindDuplicates:
     """Tests guarding the vectorised matmul path against the legacy loop."""
 
     def test_matches_pairwise_loop(self) -> None:
-        """Matmul path produces the same pairs as pairwise cosine similarity."""
+        """Matmul path produces the same pairs as pairwise cosine similarity.
+
+        The reference loop runs in float32 — same dtype as the matmul
+        path's :func:`_stack_embeddings` — so a pair's similarity is
+        compared against the threshold with bit-identical arithmetic
+        on both sides. (A float64 reference would disagree with the
+        float32 matmul on pairs sitting within ~1e-7 of either
+        threshold, producing a non-deterministic, seed-sensitive
+        failure.)
+        """
         rng = np.random.default_rng(42)
         embeddings: dict[str, list[float]] = {
             f"frag-{i:03d}": rng.standard_normal(64).astype(np.float32).tolist()
@@ -675,13 +684,14 @@ class TestVectorisedFindDuplicates:
         )
         result = dedup.find_duplicates(embeddings)
 
-        # Reference: brute-force cosine over the same data.
+        # Reference: brute-force cosine over the same data, in float32
+        # to match the matmul path's precision.
         ids = sorted(embeddings.keys())
         expected_pairs: set[tuple[str, str, str]] = set()
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
-                vec_i = _to_np(embeddings[ids[i]])
-                vec_j = _to_np(embeddings[ids[j]])
+                vec_i = np.asarray(embeddings[ids[i]], dtype=np.float32)
+                vec_j = np.asarray(embeddings[ids[j]], dtype=np.float32)
                 sim = _cosine_similarity(vec_i, vec_j)
                 if sim >= 0.85:
                     expected_pairs.add((ids[i], ids[j], "duplicate"))
@@ -754,6 +764,41 @@ class TestDeduplicationConfig:
         dedup = SemanticDeduplicator(config=config)
         assert dedup.duplicate_threshold == pytest.approx(0.5)
         assert dedup.resonance_threshold == pytest.approx(0.1)
+
+    def test_faiss_probe_cached_across_calls(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Repeated ``find_duplicates`` calls log the fallback warning at most once."""
+        import builtins
+        import logging
+
+        original_import = builtins.__import__
+
+        def fake_import(name: str, *args: object, **kwargs: object) -> object:
+            if name == "faiss":
+                msg = "faiss not available in test"
+                raise ImportError(msg)
+            return original_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        config = DeduplicationConfig(
+            duplicate_threshold=0.95,
+            resonance_threshold=0.75,
+            use_faiss=True,
+        )
+        dedup = SemanticDeduplicator(config=config)
+        embeddings = {"frag-a": [1.0, 0.0], "frag-b": [1.0, 0.0]}
+        with caplog.at_level(logging.WARNING, logger="creek.clean.semantic_dedup"):
+            for _ in range(5):
+                dedup.find_duplicates(embeddings)
+        fallback_warnings = [
+            rec
+            for rec in caplog.records
+            if "falling back to dense matmul" in rec.message
+        ]
+        assert len(fallback_warnings) == 1
 
 
 @pytest.mark.slow

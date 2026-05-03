@@ -878,18 +878,47 @@ class TestStreamingAccumulator:
 
     def test_temp_jsonl_is_cleaned_up(
         self,
+        monkeypatch: pytest.MonkeyPatch,
         generator: VoiceProfileGenerator,
         vault: Path,
         tmp_path: Path,
     ) -> None:
-        """The accumulator's temp dir does not leak after the call returns."""
+        """The accumulator's temp dir is actually deleted after the call returns.
+
+        The previous version of this test was vacuous: it scanned
+        ``tmp_path`` for ``creek-voice-*`` entries, but
+        ``tempfile.TemporaryDirectory`` creates under
+        ``tempfile.gettempdir()`` (e.g. ``/tmp``) by default, so the
+        scan never had anything to find. The fix monkey-patches the
+        ``tempfile.TemporaryDirectory`` constructor used inside
+        ``creek.generate.voice`` so the directory lands under
+        ``tmp_path`` and we can directly assert that the directory is
+        gone after ``generate_all_profiles`` returns.
+        """
+        import os
+        import tempfile
+
+        from creek.generate import voice as voice_mod
+
+        created: list[str] = []
+        real_td = tempfile.TemporaryDirectory
+
+        def patched_td(*args: object, **kwargs: object) -> object:
+            kwargs["dir"] = str(tmp_path)
+            td = real_td(*args, **kwargs)  # type: ignore[arg-type]
+            created.append(td.name)
+            return td
+
+        monkeypatch.setattr(voice_mod.tempfile, "TemporaryDirectory", patched_td)
         self._seed_register(vault, VoiceRegister.CONFESSIONAL, count=5)
-        before = set(tmp_path.iterdir())
         generator.generate_all_profiles(vault)
-        after = set(tmp_path.iterdir())
-        # No new ``creek-voice-*`` directories remain in the parent.
-        leaked = {p for p in after - before if p.name.startswith("creek-voice-")}
-        assert not leaked
+
+        # The patched constructor must have been used, and every
+        # directory it returned must be deleted by the time the call
+        # exits the streaming-accumulator context manager.
+        assert created, "patched TemporaryDirectory was never invoked"
+        for path in created:
+            assert not os.path.exists(path), f"Temp dir leaked: {path}"
 
     def test_streaming_matches_legacy_output(
         self,

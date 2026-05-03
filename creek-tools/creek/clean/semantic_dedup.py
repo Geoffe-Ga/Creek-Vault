@@ -222,20 +222,27 @@ def _matmul_pair_indices(
     """Return upper-triangle (i, j, sim) triples above *threshold* via matmul.
 
     Caller is responsible for ensuring *matrix* has been L2-normalised.
-    Memory peaks at ``N²`` float32 entries (≈ 400 MB at N = 10 000) —
-    acceptable up to that scale and the documented FAISS path takes
-    over for larger corpora.
+
+    Memory: only **one** ``N x N`` float32 matrix is live at a time
+    (≈ 400 MB at N = 10 000). The previous implementation used
+    ``np.triu`` which materialised a second N x N copy alongside the
+    matmul result, doubling peak memory; the current code uses
+    ``np.triu_indices`` to extract the strictly upper-triangle
+    coordinates without copying the matrix.
+
+    The documented FAISS path is the right cutover for larger corpora.
     """
     import numpy as np
 
-    # ``triu(k=1)`` already zeroes the diagonal and lower triangle, and
-    # configured thresholds are always > 0 (enforced in
-    # ``SemanticDeduplicator.__init__``), so the zeroed entries cannot
-    # masquerade as real matches.
-    sim_upper = np.triu(matrix @ matrix.T, k=1)
-    rows, cols = np.where(sim_upper >= threshold)
-    sims = sim_upper[rows, cols].astype(np.float32, copy=False)
-    return rows.astype(np.int64), cols.astype(np.int64), sims
+    sim = matrix @ matrix.T
+    rows, cols = np.triu_indices(sim.shape[0], k=1)
+    upper = sim[rows, cols]
+    mask = upper >= threshold
+    return (
+        rows[mask].astype(np.int64, copy=False),
+        cols[mask].astype(np.int64, copy=False),
+        upper[mask].astype(np.float32, copy=False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +320,10 @@ class SemanticDeduplicator:
         self.resonance_threshold = config.resonance_threshold
         self._index: dict[str, np.ndarray] = {}
         self._dimension: int | None = None
+        # Memoised result of the ``import faiss`` probe in
+        # ``_faiss_available``. ``None`` = not yet probed; ``True`` /
+        # ``False`` = importable / not.
+        self._faiss_probe_cache: bool | None = None
 
     def _validate_embedding(
         self,
@@ -464,9 +475,18 @@ class SemanticDeduplicator:
             return _faiss_pair_indices(normalised, self.resonance_threshold)
         return _matmul_pair_indices(normalised, self.resonance_threshold)
 
-    @staticmethod
-    def _faiss_available() -> bool:
-        """Return whether the optional ``faiss`` package is importable."""
+    def _faiss_available(self) -> bool:
+        """Return whether the optional ``faiss`` package is importable.
+
+        The probe result is cached on the instance so a long-running
+        pipeline that calls :meth:`find_duplicates` repeatedly with
+        ``use_faiss=True`` against a FAISS-less environment emits at
+        most one fallback warning per deduplicator instead of one per
+        call.
+        """
+        cached = self._faiss_probe_cache
+        if cached is not None:
+            return cached
         try:
             import faiss  # noqa: F401
         except ImportError:
@@ -474,7 +494,9 @@ class SemanticDeduplicator:
                 "use_faiss=True but faiss is not installed — "
                 "falling back to dense matmul.",
             )
+            self._faiss_probe_cache = False
             return False
+        self._faiss_probe_cache = True
         return True
 
     def check_fragment(
