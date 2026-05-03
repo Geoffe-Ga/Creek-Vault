@@ -12,6 +12,8 @@ Obsidian-compatible markdown files with YAML frontmatter. It handles:
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from datetime import date, datetime
 from typing import TYPE_CHECKING
@@ -78,6 +80,70 @@ _ACTIVE_DECISION_STATUSES: set[str] = {
     DecisionStatus.DELIBERATING,
     DecisionStatus.COMMITTING,
 }
+
+logger = logging.getLogger(__name__)
+
+
+def _read_legacy_provenance_entries(legacy_path: Path) -> list[dict[str, object]]:
+    """Return parsed legacy provenance entries, or empty on any failure."""
+    try:
+        raw = legacy_path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("Could not read legacy provenance log %s", legacy_path)
+        return []
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "Legacy provenance log %s is not valid JSON; skipping migration",
+            legacy_path,
+        )
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _provenance_migration_marker(
+    legacy_path: Path,
+    migrated_count: int,
+) -> dict[str, object]:
+    """Build the migration marker entry recorded in the new chain."""
+    return {
+        "id": "_migration_",
+        "type": "provenance.migration",
+        "path": str(legacy_path),
+        "written_at": datetime.now().isoformat(),
+        "migrated_entries": migrated_count,
+    }
+
+
+def _migrate_legacy_provenance(
+    legacy_path: Path,
+    new_log: AuditLog,
+) -> None:
+    """One-shot migration of pre-Batch-C ``provenance.json`` array.
+
+    Older vaults shipped a JSON-array log at ``provenance.json``;
+    Batch C switched to JSONL via :class:`AuditLog` so the log is
+    chained, append-only, and crash-safe. We replay every legacy
+    entry into the new chain in original order, append a marker
+    line so the migration is auditable, and unlink the legacy
+    file. If the new log is already populated we leave the legacy
+    file alone so a partially-migrated state can be resolved by
+    inspection.
+    """
+    if not legacy_path.exists():
+        return
+    if new_log.path.exists() and new_log.path.stat().st_size > 0:
+        return
+    legacy_entries = _read_legacy_provenance_entries(legacy_path)
+    for entry in legacy_entries:
+        new_log.append(entry)
+    new_log.append(_provenance_migration_marker(legacy_path, len(legacy_entries)))
+    legacy_path.unlink(missing_ok=True)
 
 
 def _sanitize_title(title: str) -> str:
@@ -203,8 +269,11 @@ class VaultWriter:
         # vault-writer ingest loop. A fresh AuditLog per call would
         # collapse the cache and re-introduce the O(N²) read flagged
         # on PR #193 (BLOCKING review item, comment 4365147477).
-        self._provenance_log = AuditLog(
-            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl",
+        processing_log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        self._provenance_log = AuditLog(processing_log_dir / "provenance.jsonl")
+        _migrate_legacy_provenance(
+            processing_log_dir / "provenance.json",
+            self._provenance_log,
         )
 
     def write_fragment(self, fragment: Fragment, body: str = "") -> Path:

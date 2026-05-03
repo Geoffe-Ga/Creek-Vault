@@ -920,6 +920,82 @@ class TestProvenanceLogging:
         entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 1
 
+    def test_legacy_provenance_json_migrated_on_first_writer(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Pre-Batch-C provenance.json is replayed into provenance.jsonl.
+
+        Regression for PR #193 review (comment 4365568699 BLOCKING #2):
+        operators upgrading from a vault that already has the legacy
+        JSON-array log must not lose those entries when the new
+        :class:`creek.audit.AuditLog`-backed JSONL log is constructed.
+        """
+        from creek.audit import AuditLog
+
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "frag-old-001",
+                        "type": "fragment",
+                        "path": "/tmp/old-frag.md",
+                        "written_at": "2025-12-31T23:59:59",
+                    },
+                    {
+                        "id": "frag-old-002",
+                        "type": "fragment",
+                        "path": "/tmp/old-frag-2.md",
+                        "written_at": "2026-01-01T00:00:00",
+                    },
+                ],
+            ),
+            encoding="utf-8",
+        )
+
+        VaultWriter(vault_path=vault_path)
+
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        assert new_path.exists()
+        assert not legacy_path.exists()
+        entries = self._read_entries(new_path)
+        ids = [e.get("id") for e in entries]
+        assert "frag-old-001" in ids
+        assert "frag-old-002" in ids
+        assert any(e.get("type") == "provenance.migration" for e in entries)
+        AuditLog(new_path).verify()
+
+    def test_legacy_provenance_migration_skipped_when_jsonl_already_populated(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """If the JSONL log already has entries, the legacy JSON is left alone.
+
+        Prevents a half-migrated state from being silently re-migrated;
+        the operator must resolve the inconsistency by inspection.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(json.dumps([{"id": "old", "type": "fragment"}]))
+        # Pre-populate the new log via a fresh AuditLog to simulate a
+        # prior partial migration.
+        from creek.audit import AuditLog
+
+        AuditLog(new_path).append({"id": "already-here", "type": "fragment"})
+
+        VaultWriter(vault_path=vault_path)
+
+        assert legacy_path.exists()  # Untouched.
+        ids = [e.get("id") for e in self._read_entries(new_path)]
+        assert ids == ["already-here"]
+
     def test_provenance_chain_intact_after_many_writes(
         self,
         writer: VaultWriter,
