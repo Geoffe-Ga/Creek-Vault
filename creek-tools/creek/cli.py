@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
@@ -15,6 +16,9 @@ from rich.table import Table
 from creek.config import load_config
 from creek.consent import ConsentManager
 from creek.pipeline import Pipeline, RedactionRequiredError
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from creek.generate.drafts import DraftLLM
@@ -726,25 +730,77 @@ def review(
             console.print(f"  [dim]{err}[/dim]")
 
 
+def _gdrive_revoke() -> None:
+    """Run the SEC-008 OAuth token revocation flow and report the outcome.
+
+    Loads the configured token-file path, delegates to
+    :func:`creek.ingest.gdrive.revoke_token`, then prints a clear
+    summary so the operator can see whether a follow-up step (visiting
+    Google's revocation page manually) is required.
+    """
+    from creek.ingest.gdrive import revoke_token
+
+    config = load_config()
+    result = revoke_token(config.google_drive)
+    token_path = config.google_drive.token_file
+    if not result.token_file_existed:
+        console.print(
+            f"[yellow]No cached token at {token_path}; nothing to revoke.[/yellow]",
+        )
+        return
+    if result.token_file_removed:
+        console.print(f"[green]Token file removed: {token_path}[/green]")
+    else:
+        console.print(
+            f"[red]Could not remove token file at {token_path}; "
+            "check filesystem permissions.[/red]",
+        )
+    if result.remote_revoked:
+        console.print("[green]Remote token revoked at Google.[/green]")
+    else:
+        # `revoke_token` always populates `result.error` when
+        # `remote_revoked` is False, so no `or`-fallback is needed.
+        console.print(
+            f"[yellow]Local token erased, but remote revocation did not "
+            f"confirm: {result.error}. Visit "
+            f"https://myaccount.google.com/permissions to revoke "
+            f"manually if needed.[/yellow]",
+        )
+
+
 @app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
+    revoke: bool = typer.Option(
+        False,
+        "--revoke",
+        help="Revoke the cached OAuth token and delete the local token file",
+    ),
     staging: Path | None = typer.Option(None, help="Staging directory"),
 ) -> None:
-    """Download files from Google Drive into a local staging directory.
+    """Download files from Google Drive or revoke the cached OAuth token.
 
-    Read-only. Files are mirrored under *staging* with their Drive
-    folder hierarchy preserved; subsequent runs are incremental
-    (unchanged files are skipped). Pipe the staging directory through
-    ``creek ingest`` to absorb the downloads into the vault.
+    ``--download`` mirrors files into a local staging directory
+    (read-only; subsequent runs are incremental). ``--revoke`` runs the
+    SEC-008 hygiene path: it best-effort calls Google's revocation
+    endpoint, then erases the local token file with a zero-byte pass
+    before unlinking. The two flags are mutually exclusive.
 
-    First run opens a browser window for OAuth authorisation; the
-    refresh token is cached at ``GoogleDriveConfig.token_file`` (mode
-    ``0o600``) so subsequent runs are non-interactive.
+    First ``--download`` run opens a browser for OAuth authorisation;
+    the refresh token is cached at ``GoogleDriveConfig.token_file``
+    (mode ``0o600``) so subsequent runs are non-interactive.
     """
+    if download and revoke:
+        console.print(
+            "[red]Specify exactly one of --download or --revoke.[/red]",
+        )
+        raise typer.Exit(code=2)
+    if revoke:
+        _gdrive_revoke()
+        return
     if not download:
         console.print(
-            "[yellow]Nothing to do. Pass --download to fetch files.[/yellow]",
+            "[yellow]Nothing to do. Pass --download or --revoke.[/yellow]",
         )
         return
 
@@ -1329,28 +1385,123 @@ def purge_vault(
         "",
         help=(
             "Must equal 'I understand this is irreversible' "
-            "to bypass interactive prompt."
+            "to bypass interactive prompt (requires --force-non-interactive)."
+        ),
+    ),
+    force_non_interactive: bool = typer.Option(
+        False,
+        "--force-non-interactive",
+        help=(
+            "Allow vault purge without a TTY. Logs a WARNING. "
+            "Required when stdin is piped or redirected."
         ),
     ),
 ) -> None:
-    """Destroy every fragment, thread, and eddy (nuclear option)."""
+    """Destroy every fragment, thread, and eddy (nuclear option).
+
+    OPS-002 hardening: outside of ``--dry-run``, the command refuses to
+    proceed unless either (a) stdin is a real TTY and the operator types
+    the absolute vault path, or (b) the operator explicitly opts in with
+    ``--force-non-interactive`` and supplies ``--confirm-text``. The
+    second path emits a ``WARNING`` log entry so an audit trail records
+    the bypass.
+    """
     from creek.purge.engine import VAULT_PURGE_CONFIRMATION
 
     engine = _build_engine(vault, dry_run=dry_run)
-    phrase = confirm_text
-    if not dry_run and phrase != VAULT_PURGE_CONFIRMATION:
+
+    if dry_run:
+        try:
+            result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+        except ValueError as exc:
+            console.print(f"[red]Aborted: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        _render_purge_result(result)
+        return
+
+    interactive = _is_interactive()
+    if not interactive and not force_non_interactive:
         console.print(
-            "[bold red]This will destroy the entire vault contents.[/bold red]",
+            "[red]Refusing to purge vault from a non-interactive session. "
+            "Pass --force-non-interactive (with caution) to override.[/red]",
         )
-        phrase = typer.prompt(
-            f"Type exactly {VAULT_PURGE_CONFIRMATION!r} to continue",
-            default="",
-            show_default=False,
+        raise typer.Exit(code=1)
+    if not interactive and force_non_interactive:
+        logger.warning(
+            "creek purge vault running non-interactively at %s "
+            "via --force-non-interactive",
+            engine.vault_path,
         )
+
+    phrase = _resolve_purge_phrase(
+        engine_vault_path=engine.vault_path,
+        confirm_text=confirm_text,
+        interactive=interactive,
+    )
+    if phrase is None:
+        console.print("[red]Aborted: vault path did not match.[/red]")
+        raise typer.Exit(code=1)
+
     try:
-        supplied = VAULT_PURGE_CONFIRMATION if dry_run else phrase
-        result = engine.purge_vault(supplied)
+        result = engine.purge_vault(phrase)
     except ValueError as exc:
         console.print(f"[red]Aborted: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     _render_purge_result(result)
+
+
+def _resolve_purge_phrase(
+    *,
+    engine_vault_path: Path,
+    confirm_text: str,
+    interactive: bool,
+) -> str | None:
+    """Return the engine-level confirmation phrase, or ``None`` to abort.
+
+    Three legal paths: (1) operator pre-supplied a *valid*
+    ``confirm_text`` for non-interactive use, (2) interactive session
+    in which the operator types the absolute vault path, (3) abort.
+
+    Validation happens here at the CLI boundary so an invalid
+    ``--confirm-text`` produces a message naming the flag, rather
+    than letting :class:`PurgeEngine` raise a generic ``ValueError``
+    (which is correct behaviour but reads as an internal error to
+    operators).
+
+    Args:
+        engine_vault_path: Vault path the engine will operate on (used
+            as the prompt's expected literal).
+        confirm_text: ``--confirm-text`` value, possibly empty.
+        interactive: Whether stdin is a TTY.
+
+    Returns:
+        The phrase to pass to ``PurgeEngine.purge_vault`` when accepted,
+        or ``None`` when the supplied phrase is wrong or the
+        interactive prompt was answered incorrectly.
+    """
+    from creek.purge.engine import VAULT_PURGE_CONFIRMATION
+
+    if confirm_text:
+        if confirm_text != VAULT_PURGE_CONFIRMATION:
+            console.print(
+                "[red]--confirm-text did not match the required phrase "
+                f"{VAULT_PURGE_CONFIRMATION!r}.[/red]",
+            )
+            return None
+        return VAULT_PURGE_CONFIRMATION
+
+    if not interactive:
+        return None
+
+    expected = str(engine_vault_path.resolve())
+    console.print(
+        "[bold red]This will destroy the entire vault contents.[/bold red]",
+    )
+    typed = typer.prompt(
+        f"Type the absolute vault path {expected!r} to continue",
+        default="",
+        show_default=False,
+    )
+    if typed.strip() != expected:
+        return None
+    return VAULT_PURGE_CONFIRMATION

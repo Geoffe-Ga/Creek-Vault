@@ -999,6 +999,241 @@ class TestListFilesCache:
         assert len(list_calls) == 2
 
 
+# ---- OAuth token revoke (SEC-008) -------------------------------------
+
+
+class _StubResponse:
+    """Minimal stand-in for httpx.Response inside the revoke tests."""
+
+    def __init__(self, status_code: int) -> None:
+        """Capture the response status code for ``is_success`` and inspection."""
+        self.status_code = status_code
+        self.is_success = 200 <= status_code < 300
+
+
+class TestRevokeToken:
+    """`revoke_token` deletes the local token and best-effort revokes upstream."""
+
+    def test_removes_existing_token_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cached token file is unlinked after revocation."""
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        token.write_text('{"refresh_token": "rt-abc"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        monkeypatch.setattr(
+            "creek.ingest.gdrive.httpx.post",
+            lambda *_a, **_kw: _StubResponse(200),
+        )
+
+        result = revoke_token(config)
+
+        assert result.token_file_existed is True
+        assert result.token_file_removed is True
+        assert result.remote_revoked is True
+        assert not token.exists()
+
+    def test_handles_missing_token_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revoking when no token is cached is a clean no-op."""
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        config = GoogleDriveConfig(token_file=str(token))
+
+        called = {"n": 0}
+
+        def _post(*_a: object, **_kw: object) -> _StubResponse:
+            called["n"] += 1
+            return _StubResponse(200)
+
+        monkeypatch.setattr("creek.ingest.gdrive.httpx.post", _post)
+
+        result = revoke_token(config)
+
+        assert result.token_file_existed is False
+        assert result.token_file_removed is False
+        assert result.remote_revoked is False
+        # No remote revoke is attempted when there's no token to revoke.
+        assert called["n"] == 0
+
+    def test_calls_google_revoke_endpoint_with_refresh_token(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The cached refresh token is POSTed to Google's revocation URL."""
+        # Importing the URL constant under its private name documents
+        # that this is a deliberate test-only coupling — production
+        # callers must not depend on the value Google uses here.
+        from creek.ingest.gdrive import _REVOKE_URL, revoke_token
+
+        token = tmp_path / "token.json"
+        token.write_text('{"refresh_token": "rt-secret"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        captured: list[tuple[str, dict[str, str] | None]] = []
+
+        def _post(
+            url: str,
+            data: dict[str, str] | None = None,
+            **_kw: object,
+        ) -> _StubResponse:
+            captured.append((url, data))
+            return _StubResponse(200)
+
+        monkeypatch.setattr("creek.ingest.gdrive.httpx.post", _post)
+
+        revoke_token(config)
+
+        assert captured == [(_REVOKE_URL, {"token": "rt-secret"})]
+
+    def test_continues_local_delete_when_remote_endpoint_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A network failure must not block local deletion of the token file."""
+        import httpx
+
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        token.write_text('{"refresh_token": "rt-abc"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        def _boom(*_a: object, **_kw: object) -> _StubResponse:
+            msg = "network down"
+            raise httpx.ConnectError(msg)
+
+        monkeypatch.setattr("creek.ingest.gdrive.httpx.post", _boom)
+
+        result = revoke_token(config)
+
+        assert not token.exists()
+        assert result.token_file_removed is True
+        assert result.remote_revoked is False
+        assert result.error is not None
+
+    def test_overwrites_token_bytes_before_unlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Best-effort secure erase: bytes are zeroed before unlinking.
+
+        We monkeypatch ``Path.unlink`` to leave the file in place so we
+        can inspect its contents and confirm the secure-erase pass ran.
+        """
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        original = '{"refresh_token": "rt-very-secret"}'
+        token.write_text(original, encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        monkeypatch.setattr(
+            "creek.ingest.gdrive.httpx.post",
+            lambda *_a, **_kw: _StubResponse(200),
+        )
+        # Suppress the unlink so the overwritten bytes survive long
+        # enough for us to inspect them.
+        monkeypatch.setattr(
+            "creek.ingest.gdrive.Path.unlink",
+            lambda _self, **_kw: None,
+        )
+
+        revoke_token(config)
+
+        on_disk = token.read_bytes()
+        assert "rt-very-secret" not in on_disk.decode("utf-8", errors="replace")
+        assert on_disk == b"\x00" * len(original)
+
+    def test_token_file_removed_reflects_unlink_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When unlink fails, ``token_file_removed`` must be ``False``.
+
+        Reviewer flagged that the previous implementation set
+        ``token_file_removed=existed`` *before* attempting the unlink,
+        producing a false assurance to the operator if the unlink
+        silently failed (read-only mount, transient OSError). The
+        result must accurately mirror the on-disk outcome.
+        """
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        token.write_text('{"refresh_token": "rt-abc"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        monkeypatch.setattr(
+            "creek.ingest.gdrive.httpx.post",
+            lambda *_a, **_kw: _StubResponse(200),
+        )
+
+        def _boom_unlink(_self: Path, **_kw: object) -> None:
+            msg = "simulated read-only filesystem"
+            raise OSError(msg)
+
+        monkeypatch.setattr("creek.ingest.gdrive.Path.unlink", _boom_unlink)
+
+        result = revoke_token(config)
+
+        assert result.token_file_existed is True
+        assert result.token_file_removed is False
+        # The file is still on disk because unlink raised.
+        assert token.exists()
+
+    def test_unparseable_token_file_populates_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A token file with no refresh token sets a meaningful ``error``.
+
+        Reviewer caught a user-facing bug: when ``_read_refresh_token``
+        returns ``None`` (file exists but is empty / has no
+        ``refresh_token`` field), ``revoke_token`` skipped the remote
+        call and returned ``error=None``. The CLI then printed
+        ``confirm: None`` to the operator. The result must instead
+        surface a human-readable explanation.
+        """
+        from creek.ingest.gdrive import revoke_token
+
+        token = tmp_path / "token.json"
+        # Valid JSON, but no `refresh_token` or `token` field.
+        token.write_text('{"client_id": "abc"}', encoding="utf-8")
+        config = GoogleDriveConfig(token_file=str(token))
+
+        called = {"n": 0}
+
+        def _post(*_a: object, **_kw: object) -> _StubResponse:
+            called["n"] += 1
+            return _StubResponse(200)
+
+        monkeypatch.setattr("creek.ingest.gdrive.httpx.post", _post)
+
+        result = revoke_token(config)
+
+        assert result.token_file_existed is True
+        assert result.token_file_removed is True
+        assert result.remote_revoked is False
+        # No remote call was made because there was no token to revoke.
+        assert called["n"] == 0
+        assert result.error is not None
+        assert "refresh token" in result.error.lower()
+
+
 # ---- AST-based read-only audit ---------------------------------------
 
 

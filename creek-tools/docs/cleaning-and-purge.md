@@ -7,6 +7,8 @@ Two adjacent command groups handle vault hygiene:
 
 `clean` finds problems and reports them. `purge` deletes things. They're separate tools because mistaking one for the other would be expensive.
 
+> Purge does best-effort deletion. It is **not** anti-forensic — modern SSDs and copy-on-write filesystems retain old block contents even after a successful unlink. See the [threat model](security/threat-model.md) for the full set of guarantees Creek does and doesn't make.
+
 ---
 
 ## Cleaning
@@ -110,11 +112,51 @@ creek purge daterange --start 2025-01-01 --end 2025-01-31 --vault ~/Obsidian/Cre
 
 ### `creek purge vault`
 
-Nuclear option: destroys every fragment, thread, eddy, and resonance. Leaves the directory structure and `00-Creek-Meta/` intact. This is **never** undoable; it requires `--yes` *and* an interactive prompt.
+Nuclear option: destroys every fragment, thread, eddy, and resonance. Leaves the directory structure and `00-Creek-Meta/` intact. This is **never** undoable.
+
+Outside of `--dry-run`, the command refuses to proceed unless one of these is true:
+
+- **Interactive run.** stdin is attached to a real TTY and the operator types the **absolute path** of the vault when prompted (not the literal string `"yes"`). Typing the wrong path aborts.
+- **Explicit non-interactive opt-in.** The command was invoked with `--force-non-interactive` *and* a valid `--confirm-text "I understand this is irreversible"`. This path emits a `WARNING` log entry so the audit trail records the bypass.
+
+A piped or redirected stdin without `--force-non-interactive` exits non-zero with a clear message — closing the OPS-002 gap where a misbehaving cron job could satisfy the prompt programmatically.
 
 ```bash
-creek purge vault --vault ~/Obsidian/Creek-Vault --yes
+# Interactive (recommended): prompts for the absolute vault path.
+creek purge vault --vault ~/Obsidian/Creek-Vault
+
+# Explicit non-interactive opt-in (CI / scripted teardown):
+creek purge vault \
+    --vault ~/Obsidian/Creek-Vault \
+    --confirm-text "I understand this is irreversible" \
+    --force-non-interactive
 ```
+
+#### Migration note (OPS-002)
+
+Earlier versions accepted any of the following as valid confirmation:
+
+```bash
+# Old (≤ Batch G-1): both forms worked.
+echo "I understand this is irreversible" | creek purge vault --vault ... --yes
+creek purge vault --vault ... --confirm-text "I understand this is irreversible"
+```
+
+Both now fail closed:
+
+- **Piping the phrase** is rejected because stdin is no longer a TTY. Wrap the call with `--force-non-interactive` and pass `--confirm-text` explicitly.
+- **The interactive prompt** no longer accepts the literal phrase; it asks for the absolute vault path. Operator runbooks that scripted the old phrase need updating to type the path instead.
+
+If your CI or teardown scripts depended on the old behaviour, the equivalent is:
+
+```bash
+creek purge vault \
+    --vault "$VAULT" \
+    --confirm-text "I understand this is irreversible" \
+    --force-non-interactive
+```
+
+The `WARNING` log entry written when `--force-non-interactive` is used will surface in `<vault>/00-Creek-Meta/audit/` going forward, giving you a record of every bypass.
 
 ---
 

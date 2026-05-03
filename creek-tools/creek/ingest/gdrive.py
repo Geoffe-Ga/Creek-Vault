@@ -36,6 +36,7 @@ Without these the module still imports cleanly and the
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import stat
@@ -43,6 +44,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+import httpx
 
 if TYPE_CHECKING:
     from creek.config import GoogleDriveConfig
@@ -484,6 +487,179 @@ def _write_token_file(path: Path, contents: str) -> None:
         if tmp_path.exists():
             tmp_path.unlink()
         raise
+
+
+# ---- OAuth token revocation (SEC-008) ---------------------------------
+
+
+_REVOKE_URL: str = "https://oauth2.googleapis.com/revoke"
+"""Google OAuth2 token revocation endpoint.
+
+Reference: https://developers.google.com/identity/protocols/oauth2/web-server#tokenrevoke.
+
+Private — Google has rotated this URL before, so callers shouldn't
+take a hard dependency on it. Tests that need the constant import it
+under its private name explicitly.
+"""
+
+
+_REVOKE_TIMEOUT: float = 10.0
+"""HTTP timeout for the best-effort revocation call."""
+
+
+@dataclass(frozen=True)
+class RevokeResult:
+    """Outcome of a :func:`revoke_token` call.
+
+    Attributes:
+        token_file_existed: ``True`` if a token file was present at
+            invocation time.
+        token_file_removed: ``True`` if the token file was unlinked
+            during this call.
+        remote_revoked: ``True`` if Google's revocation endpoint
+            confirmed the token was invalidated.
+        error: Optional human-readable description of why the remote
+            revocation did not succeed (network error, non-2xx status).
+            ``None`` on full success or when no remote call was made.
+    """
+
+    token_file_existed: bool
+    token_file_removed: bool
+    remote_revoked: bool
+    error: str | None = None
+
+
+def _read_refresh_token(path: Path) -> str | None:
+    """Best-effort read of the refresh token from a cached token file.
+
+    The file is JSON written by ``Credentials.to_json()``; the field is
+    typically ``refresh_token`` but older tokens may only carry the
+    short-lived ``token`` field. Returns ``None`` if neither is
+    present or the file is unreadable — revocation can still proceed
+    locally even if the remote endpoint cannot be informed.
+
+    Args:
+        path: Cached token file location.
+
+    Returns:
+        The refresh-token string when found, otherwise ``None``.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Could not parse token file %s for revocation: %s",
+            path,
+            exc,
+        )
+        return None
+    candidate = data.get("refresh_token") or data.get("token")
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    return candidate
+
+
+def _secure_erase(path: Path) -> bool:
+    """Best-effort overwrite of *path* with zero bytes before unlinking.
+
+    Modern SSDs and copy-on-write filesystems (APFS, btrfs, ZFS) cannot
+    guarantee that the original bytes are unrecoverable — only that the
+    visible file no longer references them. Writing zeros over the
+    file before unlinking still defeats casual recovery tools that
+    enumerate inodes. The unlink itself is unconditional: if the
+    overwrite fails we still drop the directory entry rather than
+    leaving the token in place.
+
+    The return value lets callers tell the operator whether the file
+    is actually gone — a previous version assumed it was, producing a
+    false assurance whenever the unlink raised on read-only or
+    permission-denied paths.
+
+    Args:
+        path: Token file to erase. Must exist when called.
+
+    Returns:
+        ``True`` when the directory entry was successfully removed,
+        ``False`` when the unlink raised ``OSError``.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("r+b") as handle:
+            handle.write(b"\x00" * size)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                # fsync is advisory; failure is non-fatal here.
+                logger.debug("fsync of %s failed during secure erase", path)
+    except OSError as exc:
+        logger.warning(
+            "Could not overwrite %s before unlink: %s",
+            path,
+            exc,
+        )
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.warning("Could not unlink %s: %s", path, exc)
+        return False
+    return True
+
+
+def revoke_token(config: GoogleDriveConfig) -> RevokeResult:
+    """Revoke the cached OAuth token and erase its on-disk copy.
+
+    Best-effort by design (SEC-008): if the remote revocation call
+    fails — network down, expired token, intermittent quota — the
+    local file is still erased and unlinked so a future ``creek
+    gdrive --download`` cannot reuse the cached credential. The
+    caller (``creek gdrive --revoke``) is expected to surface the
+    returned :class:`RevokeResult` so an operator can see whether a
+    follow-up manual step (e.g. visiting Google's revocation page) is
+    required.
+
+    Args:
+        config: Google Drive configuration whose ``token_file`` points
+            at the cached credential.
+
+    Returns:
+        A :class:`RevokeResult` describing local and remote outcomes.
+    """
+    token_path = Path(config.token_file)
+    existed = token_path.exists()
+    refresh_token = _read_refresh_token(token_path) if existed else None
+    removed = _secure_erase(token_path) if existed else False
+
+    remote_revoked = False
+    error: str | None = None
+    if refresh_token:
+        try:
+            response = httpx.post(
+                _REVOKE_URL,
+                data={"token": refresh_token},
+                timeout=_REVOKE_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            error = f"remote revocation failed: {type(exc).__name__}"
+            logger.warning("%s", error)
+        else:
+            remote_revoked = response.is_success
+            if not remote_revoked:
+                error = f"revocation endpoint returned HTTP {response.status_code}"
+                logger.warning("%s", error)
+    elif existed:
+        # File was on disk but unparseable / lacked a refresh token.
+        # Without an `error` here the CLI would surface a confusing
+        # ``confirm: None`` message to the operator.
+        error = "no refresh token found in token file; remote revocation skipped"
+        logger.warning("%s", error)
+
+    return RevokeResult(
+        token_file_existed=existed,
+        token_file_removed=removed,
+        remote_revoked=remote_revoked,
+        error=error,
+    )
 
 
 # ---- Routing helper ----------------------------------------------------

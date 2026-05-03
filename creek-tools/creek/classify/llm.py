@@ -108,6 +108,59 @@ _DOSAGE_AMBIGUOUS_MARKERS: frozenset[str] = frozenset(
 """String values treated as ``Dosage.AMBIGUOUS``."""
 
 
+_ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {"frequency", "wavelength", "voice"},
+)
+"""Top-level keys recognised in a documented LLM classification response.
+
+Mirrors the three sections in :data:`CLASSIFICATION_PROMPT`. Update
+both when adding a new classification dimension — ``validate_response``
+will otherwise reject the LLM's output as unexpected.
+"""
+
+
+_MAX_PROMPT_CONTENT_CHARS: int = 8192
+"""Cap on fragment content length before injection into the prompt (~8 KiB)."""
+
+
+_INJECTION_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("---", "[FENCE]"),
+    ("<!--", "[CMT-OPEN]"),
+    ("-->", "[CMT-CLOSE]"),
+)
+"""Substrings neutralised in fragment title/content before prompt formation.
+
+The first entry replaces YAML document separators, which an attacker
+could otherwise use to forge a second document the parser might
+accept. The second/third entries replace HTML comment delimiters,
+which can hide instructions from a casual reader while still being
+visible to the LLM.
+"""
+
+
+def _sanitise_for_prompt(text: str) -> str:
+    """Neutralise injection vectors in untrusted text before prompt formatting.
+
+    Replaces YAML-document separators and HTML-comment delimiters with
+    inert placeholders, then truncates the result to
+    :data:`_MAX_PROMPT_CONTENT_CHARS` so an oversized fragment cannot
+    push the model's response over its context window.
+
+    Args:
+        text: Raw, attacker-controlled fragment title or content.
+
+    Returns:
+        A sanitised, length-capped copy safe to ``str.format`` into the
+        classification prompt template.
+    """
+    cleaned = text
+    for needle, placeholder in _INJECTION_REPLACEMENTS:
+        cleaned = cleaned.replace(needle, placeholder)
+    if len(cleaned) > _MAX_PROMPT_CONTENT_CHARS:
+        cleaned = cleaned[:_MAX_PROMPT_CONTENT_CHARS]
+    return cleaned
+
+
 @dataclass
 class BatchStats:
     """Aggregated statistics for a batch classification run.
@@ -494,6 +547,12 @@ class LLMClassifier:
     ) -> str:
         """Build the classification prompt for a fragment.
 
+        The fragment title and content are attacker-controlled (they
+        originate from third-party messages, scraped material, etc.).
+        Each is passed through :func:`_sanitise_for_prompt` to neutralise
+        YAML-fence and HTML-comment injection and to cap the body length
+        before substitution — see SEC-004.
+
         Args:
             fragment: The fragment to classify.
             content: Optional content text for the fragment.
@@ -501,9 +560,12 @@ class LLMClassifier:
         Returns:
             The formatted prompt string.
         """
+        safe_title = _sanitise_for_prompt(fragment.title)
+        body = content if content else "(no content provided)"
+        safe_content = _sanitise_for_prompt(body)
         return CLASSIFICATION_PROMPT.format(
-            title=fragment.title,
-            content=content or "(no content provided)",
+            title=safe_title,
+            content=safe_content,
         )
 
     def _call_ollama(self, prompt: str) -> str:
@@ -533,9 +595,15 @@ class LLMClassifier:
             return str(data.get("response", ""))
 
     def validate_response(self, response_text: str) -> dict[str, object]:
-        """Parse and validate a YAML response from the LLM.
+        """Parse and strictly validate a YAML response from the LLM.
 
-        Strips markdown code fences if present, then parses YAML.
+        Strips markdown code fences, then parses the result with
+        ``yaml.safe_load_all`` so a multi-document stream — a classic
+        LLM-output-spoofing payload — is detected explicitly rather
+        than silently swallowing the first document. Top-level keys
+        outside the documented schema (``frequency``, ``wavelength``,
+        ``voice``) are also rejected so a successful injection cannot
+        smuggle in fields like ``privacy_tier`` (see SEC-004).
 
         Args:
             response_text: Raw YAML text from the LLM.
@@ -544,12 +612,22 @@ class LLMClassifier:
             Parsed dictionary with classification data.
 
         Raises:
-            ValueError: If the text is not valid YAML or not a dict.
+            ValueError: If the text is not a single YAML dict, or
+                contains undocumented top-level keys.
         """
         text = _strip_code_fences(response_text)
-        parsed: object = yaml.safe_load(text)
+        docs = list(yaml.safe_load_all(text))
+        if len(docs) > 1:
+            msg = f"multi-document YAML response rejected ({len(docs)} documents)"
+            raise ValueError(msg)
+        parsed: object = docs[0] if docs else None
         if not isinstance(parsed, dict):
             msg = f"Expected YAML dict, got {type(parsed).__name__}"
+            raise ValueError(msg)
+        keys = {str(k) for k in parsed}
+        extras = keys - _ALLOWED_TOP_LEVEL_KEYS
+        if extras:
+            msg = f"unexpected top-level keys in LLM response: {sorted(extras)}"
             raise ValueError(msg)
         return {str(k): v for k, v in parsed.items()}
 

@@ -2,6 +2,8 @@
 
 `creek redact` is the **first** thing you run on any new export. It scans for secrets, API keys, and PII before they enter your vault — and once they've entered, it can scrub them out.
 
+> Redaction is one defensive layer; it does not encrypt the vault and it cannot detect every secret format. Read the [threat model](security/threat-model.md) for the full picture of what Creek does and does not protect against.
+
 ## The three modes
 
 `creek redact` is dispatched by exactly one of `--scan`, `--apply`, or `--review`. Mixing them is an error.
@@ -70,7 +72,10 @@ For every queued match:
 
 1. Replaces the match with `[REDACTED:<pattern_name>]` (configurable via `RedactionConfig.replacement_template`).
 2. Marks the queue entry as `applied: true` and stamps the timestamp.
-3. Refuses to write through symlinks (path-traversal guard).
+3. Refuses to write through symlinks (path-traversal guard): before any
+   file is read or rewritten the source tree is walked and the run is
+   aborted if any descendant symlink resolves outside the source root.
+   The same guard is applied to `creek redact --review`.
 
 `--dry-run` walks the queue without modifying any source file — useful for sanity-checking a big batch before committing.
 
