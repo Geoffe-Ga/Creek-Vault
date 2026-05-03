@@ -10,7 +10,9 @@ import uuid
 from datetime import date, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from creek.time import now_la, today_la
 
 # ---- Enums ----
 
@@ -330,8 +332,8 @@ class Fragment(BaseModel):
     id: str
     title: str
     source: FragmentSource
-    created: datetime = Field(default_factory=datetime.now)
-    ingested: datetime = Field(default_factory=datetime.now)
+    created: datetime = Field(default_factory=now_la)
+    ingested: datetime = Field(default_factory=now_la)
     frequency: FrequencyClassification = Field(
         default_factory=FrequencyClassification,
     )
@@ -345,8 +347,23 @@ class Fragment(BaseModel):
     praxis_potential: PraxisPotential = PraxisPotential.NONE
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED
     context: list[str] = Field(default_factory=list)
-    voice_proxy_eligible: bool = True
     tags: list[str] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def voice_proxy_eligible(self) -> bool:
+        """Whether this fragment may feed voice-proxy generation.
+
+        Derived (BUG-009) so the flag cannot drift from ``privacy_tier``
+        and ``source.author``: only self-authored, non-INTIMATE fragments
+        are eligible. INTIMATE content is excluded per ontology §13.2,
+        and AI / collaborator / other-authored content is excluded per
+        the universal-constraints rule in :mod:`creek.clean.context`.
+        """
+        return (
+            self.privacy_tier != PrivacyTier.INTIMATE
+            and self.source.author == Authorship.SELF
+        )
 
 
 class DecisionCandidate(BaseModel):
@@ -381,8 +398,8 @@ class Thread(BaseModel):
     id: str = Field(default_factory=_generate_thread_id)
     title: str
     status: ThreadStatus = ThreadStatus.ACTIVE
-    first_seen: date = Field(default_factory=date.today)
-    last_seen: date = Field(default_factory=date.today)
+    first_seen: date = Field(default_factory=today_la)
+    last_seen: date = Field(default_factory=today_la)
     frequency_affinity: list[Frequency] = Field(default_factory=list)
     fragment_count: int = 0
     description: str = ""
@@ -400,7 +417,7 @@ class Eddy(BaseModel):
     type: str = "eddy"
     id: str = Field(default_factory=_generate_eddy_id)
     title: str
-    formed: date = Field(default_factory=date.today)
+    formed: date = Field(default_factory=today_la)
     fragment_count: int = 0
     threads: list[str] = Field(default_factory=list)
     description: str = ""
@@ -440,7 +457,7 @@ class Decision(BaseModel):
     id: str = Field(default_factory=_generate_decision_id)
     title: str
     status: DecisionStatus = DecisionStatus.SENSING
-    opened: date = Field(default_factory=date.today)
+    opened: date = Field(default_factory=today_la)
     decided: date | None = None
     frequency_context: list[Frequency] = Field(default_factory=list)
     wavelength_phase_at_opening: str = ""

@@ -44,7 +44,7 @@ creek ingest --type code         --input ~/projects/diary     --vault ~/Obsidian
 - `.xlsx` files emit **one fragment per sheet**; `.csv` files are a single-sheet workbook named after the file stem.
 - Sheets larger than 100 rows render as a `head 10 + tail 5 + total count` summary so giant exports stay legible.
 - Cells with `|` or embedded newlines are escaped to `\|` and `<br>` so the rendered GFM table never breaks.
-- CSV decoding probes `utf-8-sig` first (handles BOM + plain UTF-8), then falls back to `cp1252` (handles legacy Excel exports). You will not get a `UnicodeDecodeError`.
+- CSV decoding probes `utf-8-sig` first (handles BOM + plain UTF-8), then runs a `chardet` confidence-gated detection step (≥ 0.70 confidence) so non-Western encodings (Shift-JIS, GBK, ISO-8859-5, …) are decoded with the right codec. If neither succeeds, it falls back to `cp1252` (handles legacy Excel exports) and emits a `WARNING` log naming the file so the user can spot mojibake before it lands in the vault. You will not get a `UnicodeDecodeError`.
 - Header detection is currently a heuristic: the first row is treated as headers when every cell is a non-empty string. A `has_header` override is tracked in [#165](https://github.com/Geoffe-Ga/Creek-Vault/issues/165).
 
 ## Presentation (`presentation`)

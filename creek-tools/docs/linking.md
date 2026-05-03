@@ -68,6 +68,8 @@ linking:
 
 `creek.generate.synchronicity.SynchronicityDetector` (run via `creek report --type synchronicity`) flags resonance edges that are **surprising** — fragments from very different sources or registers that the embeddings consider similar. These are the most interesting findings in practice; they often surface unconscious connections between, say, a therapy reflection and a software design note. Output lands in `05-Wavelength/Synchronicities/`.
 
+The exact criteria for "surprising" — cosine similarity > 0.9, different source types, > 30 days apart, and "still working on X"-style status updates filtered out — live in [`emergence.md`](emergence.md) alongside the other §10 emergence sub-systems.
+
 ## Reading the graph
 
 Every linker writes both directions of every edge. The fragment frontmatter shows local neighbours; the thread / eddy notes show connected components; and `creek report --type linking` prints aggregate statistics:

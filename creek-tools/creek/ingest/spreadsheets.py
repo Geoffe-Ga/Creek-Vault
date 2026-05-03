@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import chardet
+
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -192,30 +194,72 @@ Excel emits for "CSV UTF-8" exports. ``cp1252`` is the Windows
 default for legacy Excel "CSV (Comma delimited)" exports — a near
 superset of Latin-1 that decodes any byte sequence without raising,
 so it serves as a guaranteed-success fallback.
+
+A ``chardet`` probe between the two catches non-Western encodings
+(Shift-JIS, GBK, ISO-8859-5, …) that ``cp1252`` would otherwise
+decode silently into mojibake (BUG-010).
+"""
+
+CSV_CHARDET_CONFIDENCE_THRESHOLD: float = 0.7
+"""Minimum ``chardet`` confidence required to trust an auto-detected encoding.
+
+Below this we fall through to ``cp1252`` and emit a warning so the
+user knows the result may be mojibake.
 """
 
 
 def _read_csv(path: Path) -> WorkbookData:
     """Read a CSV file as a single-sheet workbook.
 
-    Tries each encoding in :data:`CSV_ENCODING_FALLBACKS` in order —
-    decoding with the first that succeeds. ``cp1252`` is positioned
-    last because it accepts arbitrary bytes and so always succeeds,
-    guaranteeing the read never raises ``UnicodeDecodeError``.
+    Probe order:
+
+    1. ``utf-8-sig`` — handles BOM + plain UTF-8, the dominant case.
+    2. ``chardet`` — detects non-Western encodings (Shift-JIS, GBK,
+       ISO-8859-5, …) when its confidence exceeds
+       :data:`CSV_CHARDET_CONFIDENCE_THRESHOLD`.
+    3. ``cp1252`` — last-resort fallback that accepts any byte
+       sequence. Emits a ``WARNING`` log including the file path so
+       the user has a chance to spot mojibake before it lands in the
+       vault (BUG-010).
     """
     raw = path.read_bytes()
-    for encoding in CSV_ENCODING_FALLBACKS:
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    else:
+        return _csv_text_to_workbook(path, text)
+
+    detection = chardet.detect(raw)
+    detected = detection.get("encoding")
+    confidence = detection.get("confidence") or 0.0
+    if (
+        detected
+        and confidence >= CSV_CHARDET_CONFIDENCE_THRESHOLD
+        and detected.lower() not in {"ascii", "utf-8-sig", "cp1252"}
+    ):
         try:
-            text = raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        rows = [tuple(row) for row in csv.reader(text.splitlines())]
-        return WorkbookData(sheets=(_split_header(path.stem, rows),))
-    # Unreachable: ``cp1252`` accepts any byte sequence so the loop
-    # always returns. We keep this guard so a future change to the
-    # fallback list cannot silently produce an undefined return.
-    msg = f"Unable to decode CSV {path} with any known encoding."
-    raise AssertionError(msg)  # pragma: no cover
+            text = raw.decode(detected)
+        except (UnicodeDecodeError, LookupError):
+            pass
+        else:
+            return _csv_text_to_workbook(path, text)
+
+    text = raw.decode("cp1252")
+    logger.warning(
+        "CSV %s decoded as cp1252 (chardet best guess: %s @ %.2f); "
+        "non-Western content may render as mojibake.",
+        path,
+        detected or "unknown",
+        confidence,
+    )
+    return _csv_text_to_workbook(path, text)
+
+
+def _csv_text_to_workbook(path: Path, text: str) -> WorkbookData:
+    """Parse decoded CSV ``text`` into a single-sheet :class:`WorkbookData`."""
+    rows = [tuple(row) for row in csv.reader(text.splitlines())]
+    return WorkbookData(sheets=(_split_header(path.stem, rows),))
 
 
 def _split_header(

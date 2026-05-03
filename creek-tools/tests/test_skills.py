@@ -100,7 +100,15 @@ def _build_fragment(
     privacy: PrivacyTier = PrivacyTier.PERSONAL,
     proxy_eligible: bool = True,
 ) -> Fragment:
-    """Create a Fragment with the specified classification."""
+    """Create a Fragment with the specified classification.
+
+    ``proxy_eligible=False`` is honoured by routing through the
+    privacy-tier signal: voice-proxy ineligibility is now a derived
+    property (BUG-009) of ``privacy_tier`` and ``source.author``, so
+    forcing ineligibility is equivalent to escalating to ``INTIMATE``.
+    """
+    if not proxy_eligible:
+        privacy = PrivacyTier.INTIMATE
     return Fragment(
         id=frag_id,
         title=title,
@@ -115,7 +123,6 @@ def _build_fragment(
         ),
         voice=VoiceClassification(voice_register=register, confidence=confidence),
         privacy_tier=privacy,
-        voice_proxy_eligible=proxy_eligible,
     )
 
 

@@ -72,6 +72,16 @@ creek review --vault ~/Obsidian/Creek-Vault
 
 `creek review` prints a TUI of pending fragments, lets you accept / override / defer each one, and writes the human decisions back to frontmatter as `method: manual`. Manual decisions are stable across re-classification — `creek classify` will not overwrite a `method: manual` field unless you pass `--force`.
 
+## Crash recovery and resume (OPS-001)
+
+LLM classification of a 10k-fragment vault takes hours. To make a partial run survivable, `creek classify` writes each fragment back to disk **the moment the LLM call returns** — not at end-of-batch. If the process is killed (laptop closed, network blip, OOM), every fragment classified up to that point keeps its result on disk.
+
+Re-running `creek classify --method llm` after a crash is therefore the resume command — there is no separate `--resume` flag. The engine skips any fragment whose `classification_method` is already `llm` (or `manual`); only fragments still at `rules` or unclassified are sent to the provider. This means you do not pay the Anthropic provider twice for the same fragment.
+
+Pass `--force` if you genuinely want to re-classify everything (for example, after a model upgrade).
+
+The engine also appends each classified fragment ID to `<vault>/00-Creek-Meta/Processing-Log/llm-progress.json` for observability. The file is informational — the per-fragment frontmatter is the source of truth.
+
 ## LLM provider details
 
 ### Ollama (default, local)

@@ -478,6 +478,62 @@ class TestCsvFiles:
         assert "| name | note |" in markdown
         assert "café" in markdown
 
+    def test_csv_shift_jis_decodes_with_chardet(self, tmp_path: Path) -> None:
+        """A Shift-JIS CSV is decoded via the chardet probe (BUG-010).
+
+        Without the probe, ``cp1252`` would silently turn the multi-byte
+        Japanese sequences into mojibake. ``chardet`` needs a generous
+        sample to reach the confidence threshold, so this test uses
+        a long, varied corpus rather than a couple of rows.
+        """
+        csv_path = tmp_path / "shift_jis.csv"
+        # A varied phrase repeated until chardet has hundreds of bytes
+        # of distinguishing signal — small samples produce low
+        # confidence and would (correctly) fall through to cp1252.
+        phrase = (
+            "名前,都市,メモ\n"
+            "田中,東京,ありがとうございます\n"
+            "鈴木,大阪,初めまして、よろしくお願いします\n"
+            "佐藤,京都,日本語のテキストはマルチバイトです\n"
+        )
+        rows = phrase * 60
+        csv_path.write_bytes(rows.encode("shift_jis"))
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        # If we had decoded as cp1252 the kanji would be replaced by
+        # Latin-1 characters. The exact byte-for-byte output depends on
+        # chardet's choice (Shift-JIS / cp932 are equivalent for these
+        # characters), so the test asserts that at least one of the
+        # input kanji round-trips intact.
+        assert any(ch in markdown for ch in "東京名前田中大阪京都")
+
+    def test_csv_cp1252_fallback_logs_warning(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The cp1252 fallback logs a WARNING with the file path (BUG-010).
+
+        Pure-ASCII content fits every codec, so chardet declines to
+        commit (its top guess is ``ascii``, which we reject in favour
+        of cp1252 to keep behaviour stable). The warning lets the user
+        spot mojibake before it lands in the vault.
+        """
+        import logging
+
+        csv_path = tmp_path / "ascii.csv"
+        # Bytes invalid as utf-8 force the fallback path even on
+        # shorter samples where chardet is uncertain.
+        csv_path.write_bytes(b"name,note\r\nAlice,caf\xe9\r\n")
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        with caplog.at_level(logging.WARNING, logger="creek.ingest.spreadsheets"):
+            ingestor.parse(ingestor.discover(tmp_path)[0])
+        assert any(
+            "decoded as cp1252" in record.message and "ascii.csv" in record.message
+            for record in caplog.records
+        )
+
 
 # ---- OpenpyxlBackend lazy-import ---------------------------------------
 

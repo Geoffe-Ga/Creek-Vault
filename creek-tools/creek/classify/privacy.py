@@ -155,29 +155,21 @@ class PrivacyClassifier:
     ) -> Fragment:
         """Apply *tier*-specific handling rules and return a new fragment.
 
-        The resulting fragment carries:
-
-        * ``privacy_tier`` set to *tier*.
-        * ``voice_proxy_eligible`` set to ``False`` for ``INTIMATE`` and
-          ``True`` for ``PUBLIC`` and ``PERSONAL``. The reset on
-          downgrade matters: a fragment previously enforced as
-          ``INTIMATE`` and later re-classified to ``PERSONAL`` would
-          otherwise stay opted out of voice proxy generation.
+        The resulting fragment carries ``privacy_tier`` set to *tier*.
+        ``voice_proxy_eligible`` is a derived property
+        (:class:`Fragment.voice_proxy_eligible`, BUG-009) computed from
+        ``privacy_tier`` and ``source.author``, so re-classification
+        between tiers automatically flips eligibility without requiring
+        a paired write.
 
         Args:
             fragment: The fragment to update. Not mutated.
             tier: The privacy tier to apply.
 
         Returns:
-            A new :class:`Fragment` with ``privacy_tier`` and
-            ``voice_proxy_eligible`` set to match *tier*.
+            A new :class:`Fragment` with ``privacy_tier`` set to *tier*.
         """
-        return fragment.model_copy(
-            update={
-                "privacy_tier": tier,
-                "voice_proxy_eligible": tier != PrivacyTier.INTIMATE,
-            },
-        )
+        return fragment.model_copy(update={"privacy_tier": tier})
 
     def classify_and_enforce(
         self,

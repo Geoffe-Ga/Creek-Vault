@@ -32,6 +32,7 @@ from creek.generate.indexes import (
     FREQUENCY_THEMES,
 )
 from creek.models import (
+    Authorship,
     Eddy,
     Fragment,
     Frequency,
@@ -493,8 +494,17 @@ def _load_typed_model(
 
 
 def _is_snapshot_fragment(fragment: Fragment, *, allow_intimate: bool) -> bool:
-    """Return ``True`` when *fragment* is eligible for the snapshot."""
-    if not fragment.voice_proxy_eligible:
+    """Return ``True`` when *fragment* is eligible for the snapshot.
+
+    Eligibility derivation post-BUG-009:
+
+    * Non-self authorship is never eligible (mirrors the universal
+      constraint enforced by :class:`creek.clean.context.ContextExtractor`).
+    * INTIMATE content is excluded unless the operator passes
+      ``allow_intimate=True``; this opt-in matches the user-facing
+      ``--include-tier intimate`` switch on the generation CLI.
+    """
+    if str(fragment.source.author) != Authorship.SELF.value:
         return False
     is_intimate = str(fragment.privacy_tier) == PrivacyTier.INTIMATE.value
     return allow_intimate or not is_intimate
