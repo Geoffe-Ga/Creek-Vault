@@ -164,3 +164,59 @@ def test_creates_parent_directory(tmp_path: Path) -> None:
     log = AuditLog(tmp_path / "deep" / "nested" / "audit.jsonl")
     log.append({"op": "first"})
     assert log.path.exists()
+
+
+def test_repeated_appends_do_not_rescan_log_when_single_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long single-writer run reuses the cached prev_hash.
+
+    Regression for the O(N²) ``_last_line`` rescan flagged on PR #193:
+    the optimisation is to remember the last hash + post-write file
+    size on the instance, and re-read the file only when a foreign
+    process resizes it. We assert that after the first append the
+    fallback reader is not invoked again.
+    """
+    from creek.audit import log as log_module
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    log.append({"op": "first"})
+
+    rescans = {"count": 0}
+    real_last_line = log_module._last_line
+
+    def counting_last_line(path: object) -> object:
+        rescans["count"] += 1
+        return real_last_line(path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(log_module, "_last_line", counting_last_line)
+
+    for i in range(50):
+        log.append({"op": "x", "i": i})
+
+    assert rescans["count"] == 0
+    log.verify()
+
+
+def test_cache_invalidated_when_foreign_writer_resizes_file(
+    tmp_path: Path,
+) -> None:
+    """A foreign-process append (different instance) is detected on next write.
+
+    Two ``AuditLog`` instances on the same path simulate two processes:
+    instance A writes, instance B writes, then A writes again. A's cache
+    is now stale (B grew the file in between); A must rescan to find
+    the true last line, otherwise the chain breaks.
+    """
+    path = tmp_path / "audit.jsonl"
+    log_a = AuditLog(path)
+    log_b = AuditLog(path)
+
+    log_a.append({"op": "a1"})
+    log_b.append({"op": "b1"})
+    log_a.append({"op": "a2"})
+
+    AuditLog(path).verify()
+    entries = [e["op"] for e in AuditLog(path).read()]
+    assert entries == ["a1", "b1", "a2"]

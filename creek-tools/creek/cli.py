@@ -56,7 +56,9 @@ def _audit_privacy_override_if_needed(
     fragment_ids: list[str],
 ) -> None:
     """Append a privacy-override audit entry when *override* elevates."""
-    if not override_elevates(override) or override is None:
+    if override is None:
+        return
+    if not override_elevates(override):
         return
     record_privacy_override(
         vault_path=vault_path,

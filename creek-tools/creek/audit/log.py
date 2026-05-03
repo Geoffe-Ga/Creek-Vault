@@ -100,6 +100,13 @@ def _last_line(path: Path) -> str | None:
 class AuditLog:
     """Append-only JSONL log with a sha256 hash chain.
 
+    The instance caches the most recently written line's hash and the
+    file's post-write size so that repeated single-writer appends are
+    O(1) rather than O(N) — a regression flagged on PR #193 for the
+    vault writer's 10k-fragment ingest path. The cache is invalidated
+    transparently when a different process or instance grows the file
+    in between writes (size mismatch ⇒ rescan).
+
     Args:
         path: Filesystem path to the log file. Parent directories are
             created on first write.
@@ -108,6 +115,8 @@ class AuditLog:
     def __init__(self, path: Path) -> None:
         """Store the resolved log path; defer all I/O until first use."""
         self.path = path
+        self._cached_last_hash: str | None = None
+        self._cached_size: int | None = None
 
     def append(self, payload: dict[str, Any]) -> None:
         """Append *payload* as a JSON line, stamping in the chain hash.
@@ -134,14 +143,35 @@ class AuditLog:
             if _HAS_FCNTL:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
-                last = _last_line(self.path)
-                prev_hash = GENESIS_PREV_HASH if last is None else _hash_line(last)
+                prev_hash = self._compute_prev_hash()
                 chained = {**payload, _PREV_HASH_FIELD: prev_hash}
-                fh.write(json.dumps(chained, sort_keys=True) + "\n")
+                line = json.dumps(chained, sort_keys=True)
+                fh.write(line + "\n")
                 fh.flush()
+                self._cached_last_hash = _hash_line(line)
+                self._cached_size = self.path.stat().st_size
             finally:
                 if _HAS_FCNTL:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _compute_prev_hash(self) -> str:
+        """Return the chain hash for the next append.
+
+        Uses the per-instance cache when the on-disk file size still
+        matches the size we last wrote; otherwise falls back to a full
+        ``_last_line`` rescan. The size check correctly invalidates the
+        cache when a different process or another :class:`AuditLog`
+        instance has appended in between.
+        """
+        on_disk_size = self.path.stat().st_size if self.path.exists() else 0
+        if (
+            self._cached_last_hash is not None
+            and self._cached_size == on_disk_size
+            and on_disk_size > 0
+        ):
+            return self._cached_last_hash
+        last = _last_line(self.path)
+        return GENESIS_PREV_HASH if last is None else _hash_line(last)
 
     def read(self) -> Iterator[dict[str, Any]]:
         """Yield every entry in the log as a dict, oldest first.
