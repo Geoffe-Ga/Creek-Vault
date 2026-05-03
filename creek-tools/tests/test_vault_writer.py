@@ -1066,6 +1066,52 @@ class TestProvenanceLogging:
         ids = [e.get("id") for e in self._read_entries(new_path)]
         assert ids == ["already-here"]
 
+    def test_legacy_provenance_migration_with_empty_preexisting_jsonl(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Empty pre-created provenance.jsonl + legacy JSON migrates once.
+
+        Regression for PR #193 review (comment 4367110538 BLOCKING #3):
+        the size guard short-circuits only when the new log has size > 0.
+        An earlier code path may have opened ``provenance.jsonl`` for
+        append (creating it as a 0-byte file) without writing. This test
+        pins that the migration still runs, replays the legacy entries,
+        and a second writer constructed afterwards is a no-op so legacy
+        entries cannot double across instances.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(
+                [
+                    {"id": "frag-empty-pre", "type": "fragment"},
+                ],
+            ),
+            encoding="utf-8",
+        )
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        new_path.touch()
+        assert new_path.stat().st_size == 0
+
+        VaultWriter(vault_path=vault_path)
+
+        # First instance migrated cleanly.
+        assert not legacy_path.exists()
+        entries = self._read_entries(new_path)
+        ids = [e.get("id") for e in entries]
+        types = [e.get("type") for e in entries]
+        assert ids == ["frag-empty-pre", "_migration_"]
+        assert types == ["fragment", "provenance.migration"]
+
+        # A second writer must not re-migrate anything.
+        VaultWriter(vault_path=vault_path)
+        ids_after = [e.get("id") for e in self._read_entries(new_path)]
+        assert ids_after == ["frag-empty-pre", "_migration_"]
+
     def test_provenance_chain_intact_after_many_writes(
         self,
         writer: VaultWriter,

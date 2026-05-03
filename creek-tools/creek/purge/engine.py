@@ -55,6 +55,18 @@ _CLASSIFICATION_RESET_FIELDS: tuple[str, ...] = (
 )
 """Frontmatter fields wiped by ``purge_classifications``."""
 
+_FILE_DELETING_OPERATIONS: frozenset[str] = frozenset(
+    {"fragment", "source", "daterange", "vault"},
+)
+"""Explicit allowlist of operations that remove files from disk.
+
+Operations not listed here (currently only ``classifications``, which
+resets metadata in place) record ``fragments_deleted=0`` regardless of
+``fragments_affected``. Any new operation type added to this engine
+must be classified explicitly here — defaulting unknown operations to
+"deletes files" would risk over-counting deletions in audit entries.
+"""
+
 
 class PurgeResult(BaseModel):
     """Outcome of a single purge operation.
@@ -544,16 +556,33 @@ class PurgeEngine:
         """Append a :class:`PurgeAuditEntry` for a completed purge.
 
         ``fragments_deleted`` counts only operations that remove files
-        from disk; ``classifications`` resets metadata in place and
-        therefore reports zero deletions. ``embeddings_removed`` mirrors
+        from disk (see :data:`_FILE_DELETING_OPERATIONS`);
+        ``classifications`` resets metadata in place and therefore
+        reports zero deletions. ``embeddings_removed`` mirrors
         ``fragments_deleted`` because every deleted fragment's cached
         embedding is invalidated at the next ``creek link`` run; the
         engine does not maintain the embedding cache directly.
 
         Args:
             result: The result whose metadata should be logged.
+
+        Raises:
+            ValueError: If ``result.operation`` is not a known purge
+                operation. Unknown operations are rejected explicitly
+                so a new operation type cannot silently default to
+                ``deletes_files=True``.
         """
-        deletes_files = result.operation != "classifications"
+        if result.operation in _FILE_DELETING_OPERATIONS:
+            deletes_files = True
+        elif result.operation == "classifications":
+            deletes_files = False
+        else:
+            msg = (
+                f"Unknown purge operation {result.operation!r}; classify it "
+                f"explicitly in _FILE_DELETING_OPERATIONS or add a metadata-only "
+                f"branch before logging."
+            )
+            raise ValueError(msg)
         fragments_deleted = result.fragments_affected if deletes_files else 0
         entry = PurgeAuditEntry(
             operation=result.operation,

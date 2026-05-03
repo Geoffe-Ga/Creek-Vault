@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from creek.audit import AuditLog
 from creek.models import PrivacyTier
@@ -48,12 +48,20 @@ class PrivacyTierOverride(StrEnum):
     ALL = "all"
 
 
-def override_elevates(override: PrivacyTierOverride | None) -> bool:
+def override_elevates(
+    override: PrivacyTierOverride | None,
+) -> TypeGuard[PrivacyTierOverride]:
     """Return whether *override* expands access beyond the default.
 
     The default policy is "include open + personal-as-summary, exclude
     intimate". Anything other than ``None`` or ``OPEN`` raises the bar
     and therefore obliges the caller to write an audit entry.
+
+    Returns a :class:`~typing.TypeGuard` so callers that branch on this
+    predicate get the narrowed non-``None`` type for free — encoding the
+    fact that ``None`` and ``OPEN`` are operationally equivalent at the
+    type level prevents the redundant ``override is None`` guard the
+    PR #193 review flagged from ever reappearing.
     """
     if override is None:
         return False

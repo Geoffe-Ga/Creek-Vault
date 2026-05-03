@@ -885,7 +885,7 @@ class VaultWriter:
                 "id": model_id,
                 "type": model_type,
                 "path": str(file_path),
-                "written_at": datetime.now().isoformat(),
+                "written_at": datetime.now(tz=UTC).isoformat(),
             },
         )
 

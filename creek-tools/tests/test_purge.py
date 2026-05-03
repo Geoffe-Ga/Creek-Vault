@@ -1138,3 +1138,121 @@ def test_audit_log_legacy_corrupt_json_is_skipped(tmp_path: Path) -> None:
     entries = log.read()
 
     assert any(e.operation == "purge.audit.migration" for e in entries)
+
+
+def test_audit_log_migration_with_empty_preexisting_log_does_not_double(
+    tmp_path: Path,
+) -> None:
+    """Empty pre-created log_path + legacy file migrates exactly once.
+
+    Reproduces the edge case flagged in review: an earlier operation
+    may have opened the new JSONL log path in append mode without
+    writing, leaving it on disk at zero bytes. The size guard in
+    :meth:`PurgeAuditLog._migrate_legacy_if_needed` permits the
+    migration to proceed in that case (size > 0 is the only short-
+    circuit). A second construction afterwards must be a no-op,
+    otherwise legacy entries would double on every fresh instance.
+    """
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-empty-precreate",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+    new_log_path = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    new_log_path.parent.mkdir(parents=True, exist_ok=True)
+    new_log_path.touch()
+    assert new_log_path.stat().st_size == 0
+
+    first = PurgeAuditLog(vault)
+    first_entries = first.read()
+    first.verify()
+
+    # Migration ran exactly once: legacy fragment + migration marker.
+    assert not legacy_path.exists()
+    assert len(first_entries) == 2
+    assert first_entries[0].operation == "fragment"
+    assert first_entries[1].operation == "purge.audit.migration"
+
+    # A fresh instance must not re-migrate (legacy is gone, log has size).
+    second_entries = PurgeAuditLog(vault).read()
+    assert len(second_entries) == 2
+    assert [e.operation for e in second_entries] == [
+        "fragment",
+        "purge.audit.migration",
+    ]
+
+
+def test_write_audit_known_operations_use_explicit_allowlist(tmp_path: Path) -> None:
+    """Each known operation routes through the explicit allowlist.
+
+    Pins the contract that ``classifications`` records zero deletions
+    while file-deleting operations report ``fragments_affected`` as
+    ``fragments_deleted``. Replaces the previous string-equality
+    inference (``operation != "classifications"``), which would have
+    silently classified any new operation as file-deleting.
+    """
+    vault = _make_vault(tmp_path)
+    engine = PurgeEngine(vault, dry_run=True)
+
+    for operation in ("fragment", "source", "daterange", "vault"):
+        engine._write_audit(
+            PurgeResult(
+                operation=operation,
+                target=f"target-{operation}",
+                fragments_affected=2,
+                affected_fragment_ids=["frag-A", "frag-B"],
+                dry_run=True,
+            ),
+        )
+    engine._write_audit(
+        PurgeResult(
+            operation="classifications",
+            target="target-classifications",
+            fragments_affected=2,
+            affected_fragment_ids=["frag-A", "frag-B"],
+            dry_run=True,
+        ),
+    )
+
+    entries = engine.audit_log.read()
+    by_op = {e.operation: e for e in entries if e.operation != "purge.audit.migration"}
+    assert by_op["fragment"].fragments_deleted == 2
+    assert by_op["source"].fragments_deleted == 2
+    assert by_op["daterange"].fragments_deleted == 2
+    assert by_op["vault"].fragments_deleted == 2
+    assert by_op["classifications"].fragments_deleted == 0
+
+
+def test_write_audit_rejects_unknown_operation(tmp_path: Path) -> None:
+    """An unknown operation name must raise rather than default-include.
+
+    Defaulting unknown operations to ``deletes_files=True`` would silently
+    over-count deletions whenever a new purge type is introduced. This
+    test pins the explicit-rejection contract so any future operation
+    name is forced through the allowlist.
+    """
+    vault = _make_vault(tmp_path)
+    engine = PurgeEngine(vault)
+
+    with pytest.raises(ValueError, match="Unknown purge operation"):
+        engine._write_audit(
+            PurgeResult(
+                operation="brand-new-op",
+                target="t",
+                fragments_affected=99,
+                dry_run=False,
+            ),
+        )
