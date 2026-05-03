@@ -724,7 +724,18 @@ def report(
         help=_INCLUDE_TIER_HELP,
     ),
 ) -> None:
-    """Generate reports on vault state."""
+    """Generate reports on vault state.
+
+    Privacy override audit: ``report`` flows iterate vault content
+    internally (per-week digests, per-register profiles, …) rather
+    than operating on a caller-supplied fragment list, so the audit
+    entry is **invocation-level** and intentionally carries an empty
+    ``fragment_ids`` list. The ``command`` field encodes the report
+    type (e.g. ``"report.unnamed"``) so operators can still trace
+    *which* report was elevated, even though per-fragment scope is
+    not available. ``mine`` and ``draft`` audit *after* the handler
+    runs because the IDs are derived from mining seeds.
+    """
     config = load_config()
     vault_path = vault or config.vault_path
     override = _parse_include_tier(include_tier)

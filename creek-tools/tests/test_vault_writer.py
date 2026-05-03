@@ -919,3 +919,38 @@ class TestProvenanceLogging:
         writer.write_fragment(sample_fragment)
         entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 1
+
+    def test_provenance_chain_intact_after_many_writes(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+    ) -> None:
+        """Many writes share a single AuditLog and produce a valid chain.
+
+        Regression for PR #193 review (comment 4365147477): a transient
+        ``AuditLog`` per provenance write would defeat the per-instance
+        hash cache, re-reading the entire log every append. This test
+        writes ten fragments through ``write_fragment`` and asserts the
+        resulting chain still verifies — caching cannot have broken the
+        chain semantics.
+        """
+        from creek.audit import AuditLog
+
+        for i in range(10):
+            frag = Fragment(
+                id=f"frag-prov-{i:04d}",
+                title=f"Provenance Chain {i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 30, 0),
+            )
+            writer.write_fragment(frag)
+
+        log_path = self._provenance_path(vault_path)
+        entries = self._read_entries(log_path)
+        assert len(entries) == 10
+        AuditLog(log_path).verify()
+        # Same VaultWriter writes share one AuditLog instance per the
+        # __init__ change. We assert the cache was reused at least once
+        # by checking the cache fields are populated post-run.
+        assert writer._provenance_log._cached_last_hash is not None
+        assert writer._provenance_log._cached_size is not None

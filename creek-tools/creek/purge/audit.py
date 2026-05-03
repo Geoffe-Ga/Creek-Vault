@@ -118,6 +118,13 @@ class PurgeAuditLog:
         self.log_path = vault_path / PURGE_AUDIT_RELPATH
         self._legacy_path = vault_path / LEGACY_PURGE_LOG_RELPATH
         self._audit = AuditLog(self.log_path)
+        # Flip to True after a successful migration (or when there is
+        # nothing to migrate) so subsequent append/read calls skip the
+        # filesystem stat that the legacy-detection path would
+        # otherwise perform on every operation. Stays False until the
+        # first append/read so callers that construct the wrapper
+        # without ever touching it pay no migration cost.
+        self._migration_settled = False
 
     def append(self, entry: PurgeAuditEntry) -> None:
         """Append a new entry to the audit log.
@@ -158,20 +165,28 @@ class PurgeAuditLog:
         If the legacy file exists and the new JSONL log is empty, every
         legacy entry is replayed into the new chain in order, a
         ``purge.audit.migration`` marker is appended, and the legacy file
-        is unlinked. Subsequent calls become a cheap path-existence
-        check thanks to the unlink.
+        is unlinked. After the first call the instance flips
+        :attr:`_migration_settled` so subsequent calls skip the legacy
+        stat altogether — important for the vault-writer ingest path
+        where ``append`` is hot.
         """
+        if self._migration_settled:
+            return
         if not self._legacy_path.exists():
+            self._migration_settled = True
             return
         if self.log_path.exists() and self.log_path.stat().st_size > 0:
+            self._migration_settled = True
             return
         legacy_entries = self._load_legacy_entries()
         if legacy_entries is None:
+            self._migration_settled = True
             return
         for entry in legacy_entries:
             self._audit.append(_coerce_legacy_entry(entry))
         self._audit.append(self._migration_marker(len(legacy_entries)))
         self._legacy_path.unlink(missing_ok=True)
+        self._migration_settled = True
 
     def _load_legacy_entries(self) -> list[dict[str, Any]] | None:
         """Return parsed legacy entries, or ``None`` when unreadable."""

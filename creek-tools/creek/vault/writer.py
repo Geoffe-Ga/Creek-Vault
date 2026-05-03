@@ -198,6 +198,14 @@ class VaultWriter:
                 raise FileNotFoundError(msg)
 
         self.vault_path = vault_path
+        # Reuse a single AuditLog instance across every provenance
+        # append so the per-instance hash cache stays warm across the
+        # vault-writer ingest loop. A fresh AuditLog per call would
+        # collapse the cache and re-introduce the O(N²) read flagged
+        # on PR #193 (BLOCKING review item, comment 4365147477).
+        self._provenance_log = AuditLog(
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl",
+        )
 
     def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
         """Write a Fragment to the appropriate 01-Fragments/ subfolder.
@@ -438,15 +446,17 @@ class VaultWriter:
         cycle that made appends ``O(n)`` in log size and dropped
         concurrent writes (see PERF-002 / BUG-006).
 
+        Reuses :attr:`_provenance_log` so the per-instance hash cache
+        stays warm across calls — vital for 10k-fragment ingest paths
+        where a transient :class:`AuditLog` per call would re-read the
+        whole log every append.
+
         Args:
             model_id: The ID of the written model.
             model_type: The type string of the written model.
             file_path: The path where the model was written.
         """
-        log_path = (
-            self.vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
-        )
-        AuditLog(log_path).append(
+        self._provenance_log.append(
             {
                 "id": model_id,
                 "type": model_type,
