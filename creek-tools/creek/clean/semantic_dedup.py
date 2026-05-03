@@ -228,9 +228,11 @@ def _matmul_pair_indices(
     """
     import numpy as np
 
-    sim = matrix @ matrix.T
-    np.fill_diagonal(sim, -np.inf)
-    sim_upper = np.triu(sim, k=1)
+    # ``triu(k=1)`` already zeroes the diagonal and lower triangle, and
+    # configured thresholds are always > 0 (enforced in
+    # ``SemanticDeduplicator.__init__``), so the zeroed entries cannot
+    # masquerade as real matches.
+    sim_upper = np.triu(matrix @ matrix.T, k=1)
     rows, cols = np.where(sim_upper >= threshold)
     sims = sim_upper[rows, cols].astype(np.float32, copy=False)
     return rows.astype(np.int64), cols.astype(np.int64), sims
@@ -452,17 +454,28 @@ class SemanticDeduplicator:
         """Return ``(rows, cols, sims)`` for pairs above resonance threshold.
 
         Honors :attr:`DeduplicationConfig.use_faiss` and gracefully
-        degrades to the dense matmul if FAISS is not importable.
+        degrades to the dense matmul only if the top-level ``faiss``
+        import itself fails. ``ImportError`` raised from inside FAISS
+        (e.g. a missing submodule) is **not** swallowed so internal
+        FAISS bugs surface as real failures rather than silent
+        fallbacks.
         """
-        if self.config.use_faiss:
-            try:
-                return _faiss_pair_indices(normalised, self.resonance_threshold)
-            except ImportError:
-                logger.warning(
-                    "use_faiss=True but faiss is not installed — "
-                    "falling back to dense matmul.",
-                )
+        if self.config.use_faiss and self._faiss_available():
+            return _faiss_pair_indices(normalised, self.resonance_threshold)
         return _matmul_pair_indices(normalised, self.resonance_threshold)
+
+    @staticmethod
+    def _faiss_available() -> bool:
+        """Return whether the optional ``faiss`` package is importable."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "use_faiss=True but faiss is not installed — "
+                "falling back to dense matmul.",
+            )
+            return False
+        return True
 
     def check_fragment(
         self,

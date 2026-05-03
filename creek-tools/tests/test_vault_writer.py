@@ -1082,6 +1082,69 @@ class TestConcurrentWrites:
         assert len(written) == 1
 
 
+class TestAtomicWriteHardening:
+    """Regression tests for `_atomic_write_text` / `_atomic_create` review notes."""
+
+    def test_atomic_write_uses_unique_temp_filename(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        tmp_path: Path,
+    ) -> None:
+        """Concurrent index persists do not race on a fixed `.tmp` sidecar."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Trigger the index file to exist with one entry.
+        writer.write_fragment(sample_fragment)
+
+        # Now hammer the index path with parallel atomic writes — if a
+        # fixed-name temp file were used, the second writer would race
+        # the first's rename and could leave behind a corrupt JSON.
+        from creek.vault.writer import _atomic_write_text
+
+        target = tmp_path / "atomic-target.json"
+
+        def _write(i: int) -> None:
+            _atomic_write_text(target, f'{{"value": {i}}}')
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_write, range(50)))
+
+        # Final file must be readable as JSON — not truncated mid-write.
+        text = target.read_text(encoding="utf-8")
+        assert json.loads(text)["value"] in range(50)
+        # And no leftover ``.tmp`` files in the directory.
+        leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+        assert not leftovers
+
+    def test_atomic_create_caps_collision_retries(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_atomic_create`` raises rather than spinning when retries exhausted."""
+        from creek.vault import writer as writer_mod
+
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Force every os.open to raise FileExistsError so the retry
+        # loop must spin until it hits the cap.
+        def _always_exists(*args: object, **kwargs: object) -> int:
+            raise FileExistsError
+
+        monkeypatch.setattr(writer_mod.os, "open", _always_exists)
+        monkeypatch.setattr(writer_mod, "_MAX_FILENAME_COLLISION_RETRIES", 3)
+
+        with pytest.raises(RuntimeError, match="unique filename"):
+            writer_mod.VaultWriter._atomic_create(
+                target_dir,
+                "2025-01-15-collide",
+                "irrelevant",
+            )
+
+
 @pytest.mark.slow
 class TestVaultWriterScaling:
     """Benchmark guarding against PERF-001's quadratic ``_find_existing``."""

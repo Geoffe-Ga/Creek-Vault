@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import re
+import tempfile
 import threading
 from datetime import date, datetime
 from typing import TYPE_CHECKING
@@ -85,6 +86,14 @@ _ACTIVE_DECISION_STATUSES: set[str] = {
     DecisionStatus.DELIBERATING,
     DecisionStatus.COMMITTING,
 }
+
+_MAX_FILENAME_COLLISION_RETRIES = 10_000
+"""Cap on counter-suffix retries inside :meth:`VaultWriter._atomic_create`.
+
+10 000 leaves headroom for any realistic title-collision burst while
+still giving up before an infinite loop hides a bug (e.g. a directory
+that became read-only mid-write).
+"""
 
 INDEX_FILENAME = ".id-index.jsonl"
 """Per-directory append-only index file mapping ``id`` -> filename.
@@ -183,16 +192,28 @@ def _extract_date_str(model: BaseModel) -> str:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically write *content* to *path* via tempfile + ``os.replace``."""
-    tmp_path = path.with_name(f".{path.name}.tmp")
+    """Atomically write *content* to *path* via a unique tempfile + ``os.replace``.
+
+    The temp file is created with ``tempfile.NamedTemporaryFile`` in
+    *path*'s directory so two concurrent writers (in-process or
+    cross-process) do not collide on a fixed sidecar name. The rename
+    is atomic on POSIX once both files share a filesystem.
+    """
+    target_dir = path.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(target_dir),
+    )
     try:
-        with tmp_path.open("w", encoding="utf-8") as fp:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fp:
             fp.write(content)
-        os.replace(tmp_path, path)
+        os.replace(tmp_name, path)
     finally:
-        if tmp_path.exists():
+        if os.path.exists(tmp_name):
             with contextlib.suppress(OSError):
-                tmp_path.unlink()
+                os.unlink(tmp_name)
 
 
 class VaultWriter:
@@ -606,7 +627,10 @@ class VaultWriter:
 
         Uses ``O_CREAT | O_EXCL`` so two concurrent callers picking the
         same filename will not clobber each other — the second call
-        increments a counter suffix and retries.
+        increments a counter suffix and retries. The retry loop is
+        capped at :data:`_MAX_FILENAME_COLLISION_RETRIES` so a runaway
+        contention pattern surfaces as a loud ``RuntimeError`` rather
+        than spinning forever.
 
         Args:
             target_dir: Directory the file will live in.
@@ -615,23 +639,30 @@ class VaultWriter:
 
         Returns:
             The path of the created file.
+
+        Raises:
+            RuntimeError: If a unique filename cannot be obtained within
+                :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
         """
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         encoded = content.encode("utf-8")
-        counter = 0
-        while True:
+        for counter in range(_MAX_FILENAME_COLLISION_RETRIES):
             suffix = "" if counter == 0 else f"-{counter}"
             candidate = target_dir / f"{base_name}{suffix}.md"
             try:
                 fd = os.open(str(candidate), flags, 0o644)
             except FileExistsError:
-                counter += 1
                 continue
             try:
                 os.write(fd, encoded)
             finally:
                 os.close(fd)
             return candidate
+        msg = (
+            f"Could not allocate a unique filename for '{base_name}.md' in "
+            f"{target_dir} after {_MAX_FILENAME_COLLISION_RETRIES} attempts"
+        )
+        raise RuntimeError(msg)
 
     def _generate_filename(self, model: BaseModel, target_dir: Path) -> str:
         """Return a unique filename for *model* under *target_dir*.

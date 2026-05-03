@@ -183,9 +183,16 @@ class _JsonlWriter:
         self._fp = path.open("ab")
 
     def append(self, payload: dict[str, object]) -> None:
-        """Serialise *payload* as a single JSON line and append it."""
+        """Serialise *payload* as a single JSON line and append it.
+
+        Each line is flushed to the OS so an interrupted run (SIGKILL,
+        OOM) leaves a coherent prefix rather than half a line. The
+        flush is per-line; the kernel still buffers to disk, so this
+        is a debuggability gain rather than a durability guarantee.
+        """
         line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         self._fp.write(line)
+        self._fp.flush()
 
     def close(self) -> None:
         """Flush and close the underlying file handle."""

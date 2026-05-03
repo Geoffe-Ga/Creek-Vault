@@ -904,6 +904,26 @@ class TestStreamingAccumulator:
         # max_exemplars defaults to 10; we seeded 7.
         assert post.get("exemplar_count") == 7
 
+    def test_jsonl_writer_flushes_on_each_append(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``_JsonlWriter.append`` flushes per call to leave a coherent prefix."""
+        from creek.generate.voice import _JsonlWriter
+
+        target = tmp_path / "exemplar.jsonl"
+        writer = _JsonlWriter(target)
+        try:
+            writer.append({"a": 1})
+            # Without flush, the new line might still be in the userspace
+            # buffer; with the per-append flush, an out-of-band reader
+            # sees it immediately.
+            assert target.read_text(encoding="utf-8") == '{"a": 1}\n'
+            writer.append({"b": 2})
+            assert target.read_text(encoding="utf-8") == '{"a": 1}\n{"b": 2}\n'
+        finally:
+            writer.close()
+
 
 @pytest.mark.slow
 class TestVoiceMemoryFootprint:
