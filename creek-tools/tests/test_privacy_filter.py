@@ -108,6 +108,48 @@ def test_intimate_or_all_lets_everything_through(
     assert bodies == {"frag-i": "secret", "frag-p": "personal", "frag-o": "open"}
 
 
+def test_unclassified_tier_passes_through_with_full_body() -> None:
+    """``unclassified`` is treated as ``open`` — full body, no exclusion.
+
+    Documents and pins the existing fall-through behaviour. Fragments
+    that have not yet been classified are presumed non-sensitive; the
+    classifier should backfill an explicit tier before they enter
+    sensitive flows.
+    """
+    inputs = [
+        _frag(id_="frag-u", tier=PrivacyTier.UNCLASSIFIED, body="raw body"),
+    ]
+
+    out = list(filter_fragments_by_tier(inputs))
+
+    assert len(out) == 1
+    fragment, body = out[0]
+    assert fragment.id == "frag-u"
+    assert body == "raw body"
+
+
+def test_open_override_matches_default_behaviour() -> None:
+    """``--include-tier open`` explicitly == default (no flag).
+
+    The flag value exists for symmetry with ``personal``/``intimate``/
+    ``all``; users who pass it should observe identical filtering to
+    callers who pass nothing.
+    """
+    inputs = [
+        _frag(id_="frag-i", tier=PrivacyTier.INTIMATE, body="x"),
+        _frag(id_="frag-p", tier=PrivacyTier.PERSONAL, body="full"),
+        _frag(id_="frag-o", tier=PrivacyTier.PUBLIC, body="open"),
+    ]
+
+    default_out = list(filter_fragments_by_tier(inputs))
+    open_out = list(
+        filter_fragments_by_tier(inputs, override=PrivacyTierOverride.OPEN),
+    )
+
+    assert [f.id for f, _ in default_out] == [f.id for f, _ in open_out]
+    assert [body for _, body in default_out] == [body for _, body in open_out]
+
+
 def test_override_elevates_matrix() -> None:
     """The elevation predicate is true for everything except None/open."""
     assert not override_elevates(None)

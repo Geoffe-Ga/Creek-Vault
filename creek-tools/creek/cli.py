@@ -887,17 +887,17 @@ def skills(
     registers, threads, eddies, and two meta skills.
     """
     override = _parse_include_tier(include_tier)
-    if override is not None and override is not PrivacyTierOverride.OPEN:
-        # Skill tree generation already excludes intimate exemplars; the
-        # override is recorded as an explicit operator decision rather
-        # than mutating downstream behaviour.
-        vault_path_for_audit = _resolve_vault(vault)
-        _audit_privacy_override_if_needed(
-            vault_path=vault_path_for_audit,
-            command="skills",
-            override=override,
-            fragment_ids=[],
-        )
+    # Skill tree generation already excludes intimate exemplars; the
+    # override is recorded as an explicit operator decision rather
+    # than mutating downstream behaviour. _audit_privacy_override_if_
+    # needed already short-circuits for None / OPEN via override_elev-
+    # ates, so there is no extra guard to write at this call site.
+    _audit_privacy_override_if_needed(
+        vault_path=_resolve_vault(vault),
+        command="skills",
+        override=override,
+        fragment_ids=[],
+    )
 
     if not generate:
         console.print(

@@ -586,6 +586,49 @@ def test_audit_log_migrates_legacy_purge_log(tmp_path: Path) -> None:
     assert any(e.operation == "purge.audit.migration" for e in entries)
 
 
+def test_audit_log_legacy_migration_strips_prev_hash(tmp_path: Path) -> None:
+    """Legacy purge entries carrying ``prev_hash`` migrate cleanly.
+
+    Mirrors the provenance migration regression test. Without the
+    sanitiser in :meth:`PurgeAuditLog._migrate_legacy_if_needed`,
+    :meth:`creek.audit.AuditLog.append` would raise ``ValueError`` and
+    abort the entire migration with the legacy file still on disk.
+    """
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-with-prev",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                    "prev_hash": "deadbeef" * 8,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+
+    # Migration completed: legacy file removed, marker recorded.
+    assert not legacy_path.exists()
+    assert any(e.operation == "purge.audit.migration" for e in entries)
+    # Verify the chain — confirms append() did not blow up midway.
+    log.verify()
+    # The migrated entry's prev_hash on disk is the chain hash, not the
+    # legacy value the test seeded.
+    raw = log.log_path.read_text(encoding="utf-8").splitlines()
+    first = json.loads(raw[0])
+    assert first["prev_hash"] == "0" * 64
+
+
 def test_audit_log_concurrent_appends_lose_nothing(tmp_path: Path) -> None:
     """Threaded appends produce N entries with no losses."""
     from concurrent.futures import ThreadPoolExecutor

@@ -96,6 +96,12 @@ def filter_fragments_by_tier(
     * ``intimate`` → excluded.
     * ``personal`` → included with body replaced by a title-only summary.
     * ``open`` / ``public`` → included with full body.
+    * ``unclassified`` → treated as ``open`` (pass through with full
+      body). Fragments without an explicit privacy tier are presumed
+      non-sensitive; the classifier should backfill an explicit tier
+      before they enter sensitive flows. Operators uncomfortable with
+      this default should run ``creek classify`` first so every
+      fragment carries a deliberate tier.
 
     Override semantics:
 

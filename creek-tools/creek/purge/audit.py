@@ -183,7 +183,13 @@ class PurgeAuditLog:
             self._migration_settled = True
             return
         for entry in legacy_entries:
-            self._audit.append(_coerce_legacy_entry(entry))
+            # Strip prev_hash defensively: AuditLog.append rejects
+            # payloads carrying the reserved chain key, and a legacy
+            # log written by an earlier audit substrate (or hand-edited
+            # by an operator) could include one. Without this guard the
+            # whole migration aborts with ValueError.
+            sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
+            self._audit.append(_coerce_legacy_entry(sanitised))
         self._audit.append(self._migration_marker(len(legacy_entries)))
         self._legacy_path.unlink(missing_ok=True)
         self._migration_settled = True

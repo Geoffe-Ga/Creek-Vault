@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -126,12 +126,18 @@ def _provenance_migration_marker(
     migrated_count: int,
     status: str,
 ) -> dict[str, object]:
-    """Build the migration marker entry recorded in the new chain."""
+    """Build the migration marker entry recorded in the new chain.
+
+    Timestamp is UTC-stamped to match every other audit log entry in
+    the system; a naive ``datetime.now()`` would produce a local-time
+    string that would not be comparable to the ``timestamp`` fields in
+    the surrounding compliance entries.
+    """
     return {
         "id": "_migration_",
         "type": "provenance.migration",
         "path": str(legacy_path),
-        "written_at": datetime.now().isoformat(),
+        "written_at": datetime.now(tz=UTC).isoformat(),
         "migrated_entries": migrated_count,
         "migration_status": status,
     }
