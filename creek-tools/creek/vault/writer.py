@@ -110,6 +110,24 @@ JSONL format keeps each write O(1) and avoids the read-modify-write
 race that would otherwise lose entries under ``ThreadPoolExecutor``.
 """
 
+LEGACY_PROVENANCE_FILENAME = "provenance.json"
+"""Pre-Batch-E provenance filename. Migrated on first write to JSONL."""
+
+_PIPE_BUF_BYTES = 4096
+"""Linux ``PIPE_BUF`` — the upper bound for guaranteed atomic ``O_APPEND``.
+
+POSIX guarantees that a single ``write(2)`` of at most ``PIPE_BUF``
+bytes to a file opened with ``O_APPEND`` is atomic with respect to
+other appenders (i.e. the write lands as one contiguous chunk and
+cannot interleave with another writer). Larger writes can split.
+On Linux this is 4 096; on some BSDs it can be as low as 512. A
+JSON line of ``{id, type, path, written_at}`` is well under this
+in practice, but an unusually long fragment ID or path would push
+past it. The producers in this module assert their encoded line
+size against ``_PIPE_BUF_BYTES`` so a regression surfaces loudly
+rather than silently corrupting the log.
+"""
+
 
 def _sanitize_title(title: str) -> str:
     """Sanitise a title string into a safe filename component.
@@ -598,14 +616,24 @@ class VaultWriter:
         """Append a single ``{id, filename}`` JSON line to the index.
 
         Uses ``O_APPEND`` so concurrent appenders cannot interleave
-        partial writes (POSIX guarantees atomicity for line-sized writes
-        under append mode).
+        partial writes — POSIX guarantees this only for writes up to
+        :data:`_PIPE_BUF_BYTES`, so the encoded line size is checked
+        before the write to make a regression (e.g. an unusually long
+        fragment ID or filename) fail loudly rather than risk silent
+        interleaving.
         """
         target_dir.mkdir(parents=True, exist_ok=True)
         index_path = target_dir / INDEX_FILENAME
         encoded = (
             json.dumps({"id": model_id, "filename": filename}, sort_keys=True) + "\n"
         ).encode("utf-8")
+        if len(encoded) > _PIPE_BUF_BYTES:
+            msg = (
+                f"Index entry exceeds PIPE_BUF "
+                f"({len(encoded)} > {_PIPE_BUF_BYTES} bytes); "
+                "atomic O_APPEND cannot be guaranteed."
+            )
+            raise ValueError(msg)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         fd = os.open(str(index_path), flags, 0o644)
         try:
@@ -701,6 +729,12 @@ class VaultWriter:
         object per line — appended via ``O_APPEND`` so concurrent
         writers cannot lose entries in a read-modify-write race.
 
+        On the first call after a vault upgrade, any pre-Batch-E
+        ``provenance.json`` (a JSON array) is migrated forward into the
+        new JSONL log and removed, so vault history written by older
+        ``creek-tools`` releases is preserved rather than silently
+        orphaned.
+
         Args:
             model_id: The ID of the written model.
             model_type: The type string of the written model.
@@ -710,19 +744,73 @@ class VaultWriter:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / PROVENANCE_FILENAME
 
+        self._migrate_legacy_provenance_locked(log_dir, log_path)
+
         entry: dict[str, str] = {
             "id": model_id,
             "type": model_type,
             "path": str(file_path),
             "written_at": datetime.now().isoformat(),
         }
+        self._append_provenance_entry(log_path, entry)
+
+    @staticmethod
+    def _append_provenance_entry(log_path: Path, entry: dict[str, str]) -> None:
+        """Append a single JSON-encoded entry to *log_path* via ``O_APPEND``.
+
+        Each line is asserted to be at most :data:`_PIPE_BUF_BYTES` so
+        a malformed (oversized) entry trips an explicit error rather
+        than silently risking interleaving with concurrent writers.
+        """
         encoded = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+        if len(encoded) > _PIPE_BUF_BYTES:
+            msg = (
+                f"Provenance entry exceeds PIPE_BUF "
+                f"({len(encoded)} > {_PIPE_BUF_BYTES} bytes); "
+                "atomic O_APPEND cannot be guaranteed."
+            )
+            raise ValueError(msg)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         fd = os.open(str(log_path), flags, 0o644)
         try:
             os.write(fd, encoded)
         finally:
             os.close(fd)
+
+    def _migrate_legacy_provenance_locked(
+        self,
+        log_dir: Path,
+        log_path: Path,
+    ) -> None:
+        """Forward-migrate ``provenance.json`` entries into the JSONL log.
+
+        Caller must hold ``self._lock``. Entries from a pre-Batch-E
+        JSON array are appended one-per-line into the new file and the
+        legacy file is unlinked so repeated invocations do not double-
+        import. Malformed legacy files are silently dropped — the
+        caller's fresh write still succeeds.
+        """
+        legacy_path = log_dir / LEGACY_PROVENANCE_FILENAME
+        if not legacy_path.exists():
+            return
+        try:
+            raw = legacy_path.read_text(encoding="utf-8")
+            parsed = json.loads(raw) if raw.strip() else []
+        except (OSError, json.JSONDecodeError):
+            with contextlib.suppress(OSError):
+                legacy_path.unlink()
+            return
+        if not isinstance(parsed, list):
+            with contextlib.suppress(OSError):
+                legacy_path.unlink()
+            return
+        for raw_entry in parsed:
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = {str(k): str(v) for k, v in raw_entry.items() if isinstance(k, str)}
+            self._append_provenance_entry(log_path, entry)
+        with contextlib.suppress(OSError):
+            legacy_path.unlink()
 
     def _log_provenance(
         self,

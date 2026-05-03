@@ -915,6 +915,89 @@ class TestProvenanceLogging:
         assert len(entries) == 1
 
 
+class TestProvenanceLegacyMigration:
+    """Migration of pre-Batch-E `provenance.json` → `provenance.jsonl`."""
+
+    def test_legacy_json_array_is_migrated_to_jsonl(
+        self,
+        vault_path: Path,
+        sample_fragment: Fragment,
+    ) -> None:
+        """Legacy `provenance.json` content survives the first JSONL write."""
+        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        legacy_entry = {
+            "id": "frag-legacy0001",
+            "type": "fragment",
+            "path": str(vault_path / "01-Fragments" / "Notes" / "old.md"),
+            "written_at": "2025-01-01T00:00:00",
+        }
+        legacy_path = log_dir / "provenance.json"
+        legacy_path.write_text(json.dumps([legacy_entry], indent=2), encoding="utf-8")
+
+        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
+
+        new_entries = _read_provenance(vault_path)
+        ids = [e["id"] for e in new_entries]
+        # Both the legacy entry and the new one are present.
+        assert "frag-legacy0001" in ids
+        assert sample_fragment.id in ids
+        # The old file is removed so a third pass cannot duplicate-import.
+        assert not legacy_path.exists()
+
+    def test_migration_is_idempotent_across_multiple_writers(
+        self,
+        vault_path: Path,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A second writer on the same vault does not re-import the legacy file."""
+        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        legacy_entry = {
+            "id": "frag-legacy0001",
+            "type": "fragment",
+            "path": str(vault_path / "old.md"),
+            "written_at": "2025-01-01T00:00:00",
+        }
+        (log_dir / "provenance.json").write_text(
+            json.dumps([legacy_entry]),
+            encoding="utf-8",
+        )
+
+        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
+
+        # Spin up a fresh writer; it should not re-migrate.
+        second = VaultWriter(vault_path=vault_path)
+        second.write_fragment(
+            Fragment(
+                id="frag-fresh0002",
+                title="Fresh",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 2, 1, 12, 0, 0),
+            ),
+        )
+
+        entries = _read_provenance(vault_path)
+        legacy_count = sum(1 for e in entries if e["id"] == "frag-legacy0001")
+        assert legacy_count == 1
+
+    def test_migration_skips_malformed_legacy_file(
+        self,
+        vault_path: Path,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A corrupt legacy `provenance.json` is ignored; new writes still succeed."""
+        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "provenance.json").write_text("not json", encoding="utf-8")
+
+        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
+
+        entries = _read_provenance(vault_path)
+        assert len(entries) == 1
+        assert entries[0]["id"] == sample_fragment.id
+
+
 # ---- ID Index (PERF-001) ----
 
 
@@ -1116,6 +1199,19 @@ class TestAtomicWriteHardening:
         # And no leftover ``.tmp`` files in the directory.
         leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
         assert not leftovers
+
+    def test_oversized_index_entry_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An index line over PIPE_BUF surfaces a `ValueError` rather than racing."""
+        from creek.vault.writer import VaultWriter
+
+        target_dir = tmp_path
+        target_dir.mkdir(parents=True, exist_ok=True)
+        oversized_id = "x" * 5000  # exceeds the 4 096-byte cap
+        with pytest.raises(ValueError, match="exceeds PIPE_BUF"):
+            VaultWriter._append_index_entry(target_dir, oversized_id, "file.md")
 
     def test_atomic_create_caps_collision_retries(
         self,
