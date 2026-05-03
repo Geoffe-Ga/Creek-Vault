@@ -858,6 +858,48 @@ def test_gdrive_command_errors_when_api_unavailable(
     assert "Google API client unavailable" in result.output
 
 
+def test_gdrive_command_revoke_removes_local_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`creek gdrive --revoke` deletes the cached OAuth token (SEC-008)."""
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "rt-test"}', encoding="utf-8")
+
+    from creek.config import CreekConfig, GoogleDriveConfig
+
+    fake = CreekConfig(
+        google_drive=GoogleDriveConfig(token_file=str(token)),
+    )
+    monkeypatch.setattr("creek.cli.load_config", lambda: fake)
+
+    class _StubResponse:
+        status_code = 200
+        is_success = True
+
+    monkeypatch.setattr(
+        "creek.ingest.gdrive.httpx.post",
+        lambda *_a, **_kw: _StubResponse(),
+    )
+
+    result = runner.invoke(app, ["gdrive", "--revoke"])
+    assert result.exit_code == 0, result.output
+    assert not token.exists()
+    assert "revoked" in result.output.lower() or "token" in result.output.lower()
+
+
+def test_gdrive_command_rejects_download_and_revoke_together(
+    tmp_path: Path,
+) -> None:
+    """`--download` and `--revoke` together is rejected with a clear error."""
+    result = runner.invoke(
+        app,
+        ["gdrive", "--download", "--revoke", "--staging", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert "exactly one" in result.output.lower() or "either" in result.output.lower()
+
+
 def test_gdrive_command_downloads_files_through_stub_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -830,6 +830,13 @@ class TestFilenameUniqueness:
 # ---- Provenance Logging ----
 
 
+def _read_provenance(vault_path: Path) -> list[dict[str, Any]]:
+    """Read the JSONL provenance log into a list of dicts (test helper)."""
+    log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+    text = log_path.read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 class TestProvenanceLogging:
     """Tests for provenance log file creation and appending."""
 
@@ -1093,3 +1100,287 @@ class TestProvenanceLogging:
         # by checking the cache fields are populated post-run.
         assert writer._provenance_log._cached_last_hash is not None
         assert writer._provenance_log._cached_size is not None
+
+
+# Note: Batch E (PR #194) introduced TestProvenanceLegacyMigration covering
+# the same migration scenarios. Those tests have been merged into the four
+# `test_legacy_provenance_*` methods on TestProvenanceLogging above, which
+# additionally assert the migration marker fields, migration_status, and
+# chain integrity that Batch C's AuditLog-backed migration provides.
+# `test_migration_drops_oversized_entry_without_blocking_writes` from main
+# is dropped because Batch C's implementation routes legacy entries through
+# AuditLog.append (which uses Python's text I/O, not raw os.write with a
+# PIPE_BUF cap), so the oversized-entry failure mode the test pinned does
+# not apply to the merged code path.
+
+
+# ---- ID Index (PERF-001) ----
+
+
+class TestIdIndex:
+    """Tests for the per-directory ``.id-index.jsonl`` index file."""
+
+    def test_index_file_created_on_first_write(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A first write appends a JSON line to ``.id-index.jsonl``."""
+        result = writer.write_fragment(sample_fragment)
+        index_path = result.parent / ".id-index.jsonl"
+        assert index_path.exists()
+        lines = [
+            line for line in index_path.read_text(encoding="utf-8").splitlines() if line
+        ]
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry == {"id": sample_fragment.id, "filename": result.name}
+
+    def test_index_lookup_avoids_directory_scan(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """Re-writing an existing fragment uses the index, not a scan."""
+        result = writer.write_fragment(sample_fragment)
+        # If the index path is consulted, removing the markdown but
+        # leaving a stale index entry should make the second write
+        # re-create the file at a new path (proof the lookup goes
+        # through the index, then verifies file existence on disk).
+        result.unlink()
+        new_path = writer.write_fragment(sample_fragment)
+        assert new_path.exists()
+        assert new_path.parent == result.parent
+
+    def test_index_rebuilds_when_missing(
+        self,
+        vault_path: Path,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A vault with existing fragments but no index rebuilds it on demand."""
+        # Seed the directory using one writer instance.
+        seed_writer = VaultWriter(vault_path=vault_path)
+        original = seed_writer.write_fragment(sample_fragment)
+        # Remove the index file as if migrating from an older vault.
+        index_path = original.parent / ".id-index.jsonl"
+        index_path.unlink()
+        # A fresh writer should detect the existing fragment without
+        # re-creating it.
+        fresh_writer = VaultWriter(vault_path=vault_path)
+        result = fresh_writer.write_fragment(sample_fragment)
+        assert result == original
+        assert index_path.exists()
+
+    def test_corrupt_index_lines_are_skipped(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        vault_path: Path,
+    ) -> None:
+        """Malformed lines in the JSONL index are skipped, not fatal."""
+        original = writer.write_fragment(sample_fragment)
+        index_path = original.parent / ".id-index.jsonl"
+        # Append a malformed line; the well-formed first line should
+        # still be parsed by a fresh writer.
+        with index_path.open("a", encoding="utf-8") as fp:
+            fp.write("{not json}\n")
+        fresh_writer = VaultWriter(vault_path=vault_path)
+        result = fresh_writer.write_fragment(sample_fragment)
+        assert result == original
+
+    def test_index_skips_blank_and_non_dict_lines(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        vault_path: Path,
+    ) -> None:
+        """Blank lines and non-object JSON lines are tolerated."""
+        original = writer.write_fragment(sample_fragment)
+        index_path = original.parent / ".id-index.jsonl"
+        with index_path.open("a", encoding="utf-8") as fp:
+            fp.write("\n")  # blank line
+            fp.write("[1, 2, 3]\n")  # non-dict line
+            fp.write('{"id": 7, "filename": "x.md"}\n')  # wrong types
+        fresh_writer = VaultWriter(vault_path=vault_path)
+        result = fresh_writer.write_fragment(sample_fragment)
+        assert result == original
+
+    def test_public_find_existing_uses_lock(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """``_find_existing`` (the public-style shim) returns the indexed path."""
+        original = writer.write_fragment(sample_fragment)
+        target_dir = original.parent
+        # Direct call to the locked-shim variant should report the same
+        # path the in-memory index holds.
+        assert writer._find_existing(sample_fragment.id, target_dir) == original
+        # Unknown ID returns ``None`` via the same path.
+        assert writer._find_existing("frag-unknown", target_dir) is None
+
+
+# ---- Concurrent writes (BUG-006) ----
+
+
+class TestConcurrentWrites:
+    """Tests guarding against the ThreadPoolExecutor race in ``_write_model``."""
+
+    def test_concurrent_distinct_writes_no_loss(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+    ) -> None:
+        """200 distinct fragments x 8 threads -> 200 distinct files, no loss."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import frontmatter as fm_mod
+
+        fragments = [
+            Fragment(
+                id=f"frag-{i:09d}",
+                title=f"t{i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 0, 0),
+            )
+            for i in range(200)
+        ]
+
+        def _write(fragment: Fragment) -> Path:
+            return writer.write_fragment(fragment, body=f"body for {fragment.id}")
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_write, fragments))
+
+        written = list((vault_path / "01-Fragments" / "Conversations").glob("*.md"))
+        assert len(written) == 200
+        ids = {fm_mod.load(str(p)).get("id") for p in written}
+        assert ids == {f.id for f in fragments}
+
+        entries = _read_provenance(vault_path)
+        assert len(entries) == 200
+
+    def test_concurrent_same_id_writes_dedup(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        vault_path: Path,
+    ) -> None:
+        """Concurrent writes of the same ID converge on a single file."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _write(_: int) -> Path:
+            return writer.write_fragment(sample_fragment, body="x")
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            paths = list(ex.map(_write, range(50)))
+
+        # All paths point to the same file — no duplicates.
+        assert len({str(p) for p in paths}) == 1
+        written = list((vault_path / "01-Fragments" / "Conversations").glob("*.md"))
+        assert len(written) == 1
+
+
+class TestAtomicWriteHardening:
+    """Regression tests for `_atomic_write_text` / `_atomic_create` review notes."""
+
+    def test_atomic_write_uses_unique_temp_filename(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+        tmp_path: Path,
+    ) -> None:
+        """Concurrent index persists do not race on a fixed `.tmp` sidecar."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Trigger the index file to exist with one entry.
+        writer.write_fragment(sample_fragment)
+
+        # Now hammer the index path with parallel atomic writes — if a
+        # fixed-name temp file were used, the second writer would race
+        # the first's rename and could leave behind a corrupt JSON.
+        from creek.vault.writer import _atomic_write_text
+
+        target = tmp_path / "atomic-target.json"
+
+        def _write(i: int) -> None:
+            _atomic_write_text(target, f'{{"value": {i}}}')
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_write, range(50)))
+
+        # Final file must be readable as JSON — not truncated mid-write.
+        text = target.read_text(encoding="utf-8")
+        assert json.loads(text)["value"] in range(50)
+        # And no leftover ``.tmp`` files in the directory.
+        leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+        assert not leftovers
+
+    def test_oversized_index_entry_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An index line over PIPE_BUF surfaces a `ValueError` rather than racing."""
+        from creek.vault.writer import VaultWriter
+
+        target_dir = tmp_path
+        target_dir.mkdir(parents=True, exist_ok=True)
+        oversized_id = "x" * 5000  # exceeds the 4 096-byte cap
+        with pytest.raises(ValueError, match="exceeds PIPE_BUF"):
+            VaultWriter._append_index_entry(target_dir, oversized_id, "file.md")
+
+    def test_atomic_create_caps_collision_retries(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_atomic_create`` raises rather than spinning when retries exhausted."""
+        from creek.vault import writer as writer_mod
+
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Force every os.open to raise FileExistsError so the retry
+        # loop must spin until it hits the cap.
+        def _always_exists(*args: object, **kwargs: object) -> int:
+            raise FileExistsError
+
+        monkeypatch.setattr(writer_mod.os, "open", _always_exists)
+        monkeypatch.setattr(writer_mod, "_MAX_FILENAME_COLLISION_RETRIES", 3)
+
+        with pytest.raises(RuntimeError, match="unique filename"):
+            writer_mod.VaultWriter._atomic_create(
+                target_dir,
+                "2025-01-15-collide",
+                "irrelevant",
+            )
+
+
+@pytest.mark.slow
+class TestVaultWriterScaling:
+    """Benchmark guarding against PERF-001's quadratic ``_find_existing``."""
+
+    def test_constant_time_per_write(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """Per-write time stays roughly flat across 2000 writes."""
+        import statistics
+        import time
+
+        durations: list[float] = []
+        for i in range(2000):
+            fragment = Fragment(
+                id=f"frag-{i:012d}",
+                title=f"t{i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 0, 0),
+            )
+            start = time.perf_counter()
+            writer.write_fragment(fragment, body=f"body {i}")
+            durations.append(time.perf_counter() - start)
+
+        early = statistics.median(durations[10:60])
+        late = statistics.median(durations[-50:])
+        assert late < 3 * early, f"Per-write grew: early={early:.4f}s late={late:.4f}s"

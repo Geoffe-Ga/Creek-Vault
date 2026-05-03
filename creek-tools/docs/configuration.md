@@ -63,13 +63,15 @@ ocr:
   enabled: true
   engine: pytesseract
   languages: [eng]
+  min_confidence: 0.6
 ```
 
-| Field       | Default        | Notes |
-|-------------|----------------|-------|
-| `enabled`   | `true`         | If `false`, `creek ingest --type images` will skip OCR. |
-| `engine`    | `pytesseract`  | Engine name. (Custom engines are injected at the API level — see `creek.ingest.images.OcrEngine`.) |
-| `languages` | `[eng]`        | Tesseract language codes. |
+| Field            | Default        | Notes |
+|------------------|----------------|-------|
+| `enabled`        | `true`         | If `false`, `creek ingest --type images` will skip OCR. |
+| `engine`         | `pytesseract`  | Engine name. (Custom engines are injected at the API level — see `creek.ingest.images.OcrEngine`.) |
+| `languages`      | `[eng]`        | Tesseract language codes. |
+| `min_confidence` | `0.6`          | Per-page OCR confidence below which the resulting fragment is tagged `review: pending_review` in frontmatter and surfaced by `creek redact --review`. Range `[0.0, 1.0]`. |
 
 ## `linking` — resonance / thread / eddy thresholds
 
@@ -131,16 +133,20 @@ redaction:
   exclude_patterns:
     - .git/
     - node_modules/
+  min_confidence: 0.6
+  replacement_template: "[REDACTED:{name}]"
 ```
 
-| Field                       | Default | Notes |
-|-----------------------------|---------|-------|
-| `enabled`                   | `true`  | Master switch. |
-| `dry_run`                   | `false` | When `true`, `--apply` plans but doesn't write. |
-| `custom_patterns`           | `{}`    | Extra regex name → pattern map merged with built-ins. |
-| `false_positive_allowlist`  | `[]`    | Substrings that, when present in the surrounding context, suppress a match. |
-| `supported_extensions`      | (text)  | File extensions the scanner walks. |
-| `exclude_patterns`          | (vcs)   | Path globs to skip. |
+| Field                       | Default                | Notes |
+|-----------------------------|------------------------|-------|
+| `enabled`                   | `true`                 | Master switch. |
+| `dry_run`                   | `false`                | When `true`, `--apply` plans but doesn't write. |
+| `custom_patterns`           | `{}`                   | Extra regex name → pattern map merged with built-ins. |
+| `false_positive_allowlist`  | `[]`                   | Substrings that, when present in the surrounding context, suppress a match. |
+| `supported_extensions`      | (text)                 | File extensions the scanner walks. |
+| `exclude_patterns`          | (vcs)                  | Path globs to skip. |
+| `min_confidence`            | `0.6`                  | Threshold for the generic high-entropy detector; range `[0.0, 1.0]`. Higher demands more entropy before flagging. |
+| `replacement_template`      | `"[REDACTED:{name}]"`  | Marker template for `--apply`. Must contain the `{name}` placeholder; other placeholders are rejected at config-load time. |
 
 ## `google_drive`
 
@@ -159,6 +165,37 @@ google_drive:
 | `token_file`       | `token.json`                       | Refresh token cache. Created with mode `0o600`. |
 | `scopes`           | `[drive.readonly]`                 | OAuth scopes; **read-only by default and recommended**. |
 | `staging_dir`      | `google-drive-export/`             | Where mirrored files land. |
+
+### Security considerations
+
+The `token_file` stores a long-lived OAuth **refresh token** in
+plaintext. It is written at mode `0o600`, which keeps other Unix users
+out, but anything running as the same user — malware, an Obsidian
+plugin, an unencrypted backup, or a clipboard manager that snapshots
+the file — can lift the token. The token grants `drive.readonly`
+access until you revoke it.
+
+Recommended hygiene:
+
+- **Encrypt the disk.** Enable FileVault (macOS) or LUKS (Linux) so an
+  offline attacker cannot read the token from a stolen device. This is
+  the single most important mitigation; the rest of this section
+  assumes the disk is already encrypted at rest.
+- **Treat `token.json` as a secret.** Add it to `.gitignore` and to
+  any backup-tool exclusion list.
+- **Rotate or revoke after exposure.** If the file is ever copied off
+  the host (shared screenshot, accidental commit, third-party sync),
+  run `creek gdrive --revoke` to invalidate it both locally and at
+  Google. The command best-effort posts to
+  <https://oauth2.googleapis.com/revoke>, then overwrites the local
+  file with zeros and unlinks it. You can also revoke manually from
+  <https://myaccount.google.com/permissions>.
+- **Re-authorise sparingly.** Each `--download` run reuses the cached
+  token; you only need to re-authorise after a `--revoke` or after the
+  token expires.
+
+For the broader picture of what is and isn't protected, see
+[`security/threat-model.md`](security/threat-model.md).
 
 ## `cleaning` — per-source filters
 
