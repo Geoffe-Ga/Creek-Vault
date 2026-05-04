@@ -57,7 +57,12 @@ def test_today_la_uses_la_calendar_not_utc(
     class _FrozenDatetime(datetime):
         @classmethod
         def now(cls, tz: object = None) -> datetime:
-            del tz  # signature must match stdlib; tz argument is unused
+            # ``now_la`` must always pass the LA tz; if a future refactor
+            # drops the argument or passes UTC, the assertion makes the
+            # regression loud rather than silent.
+            assert tz == ZoneInfo("America/Los_Angeles"), (
+                f"now_la() must call now(tz=LA_TZ); got tz={tz!r}"
+            )
             return utc_moment.astimezone(ZoneInfo("America/Los_Angeles"))
 
     monkeypatch.setattr(creek_time, "datetime", _FrozenDatetime)

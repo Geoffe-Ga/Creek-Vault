@@ -80,7 +80,7 @@ Re-running `creek classify --method llm` after a crash is therefore the resume c
 
 Pass `--force` if you genuinely want to re-classify everything (for example, after a model upgrade).
 
-The engine also appends each classified fragment ID to `<vault>/00-Creek-Meta/Processing-Log/llm-progress.json` for observability. The file is informational — the per-fragment frontmatter is the source of truth.
+The engine also appends each classified fragment ID to `<vault>/00-Creek-Meta/Processing-Log/llm-progress.jsonl` for observability (newline-delimited JSON, one `{"id": ...}` object per line). The file is informational — the per-fragment frontmatter is the source of truth.
 
 ## LLM provider details
 
