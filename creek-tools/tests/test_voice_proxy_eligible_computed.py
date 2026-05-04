@@ -48,7 +48,7 @@ def test_personal_tier_self_author_is_eligible() -> None:
 
 def test_public_tier_self_author_is_eligible() -> None:
     """A PUBLIC self-authored fragment is voice-proxy eligible."""
-    frag = _make_fragment(privacy_tier=PrivacyTier.PUBLIC)
+    frag = _make_fragment(privacy_tier=PrivacyTier.OPEN)
     assert frag.voice_proxy_eligible is True
 
 
@@ -58,7 +58,7 @@ def test_public_tier_self_author_is_eligible() -> None:
 )
 def test_non_self_author_is_never_eligible(author: Authorship) -> None:
     """Non-self authorship excludes the fragment regardless of tier."""
-    frag = _make_fragment(privacy_tier=PrivacyTier.PUBLIC, author=author)
+    frag = _make_fragment(privacy_tier=PrivacyTier.OPEN, author=author)
     assert frag.voice_proxy_eligible is False
 
 
@@ -69,7 +69,7 @@ def test_voice_proxy_eligible_has_no_setter() -> None:
     routed at a computed field; callers must update the underlying
     ``privacy_tier`` / ``source.author`` instead.
     """
-    frag = _make_fragment(privacy_tier=PrivacyTier.PUBLIC)
+    frag = _make_fragment(privacy_tier=PrivacyTier.OPEN)
     with pytest.raises((AttributeError, ValueError)):
         frag.voice_proxy_eligible = False  # type: ignore[misc]
 

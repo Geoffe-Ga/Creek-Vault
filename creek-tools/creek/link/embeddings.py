@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import itertools
 import logging
+import sys
 from typing import TYPE_CHECKING, cast
+
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -225,7 +228,18 @@ class EmbeddingLinker:
         similarity_matrix = normalized @ normalized.T
 
         resonances: list[tuple[str, str, float]] = []
-        for i, j in itertools.combinations(range(len(ids)), 2):
+        # OPS-004: pairwise loop is O(N²); on a 10k-fragment vault this
+        # is ~50M iterations and runs for minutes. Show tqdm in TTYs and
+        # stay silent in non-interactive runs (CI logs, pipes).
+        n_pairs = len(ids) * (len(ids) - 1) // 2
+        pair_iter = tqdm(
+            itertools.combinations(range(len(ids)), 2),
+            total=n_pairs,
+            desc="Resonances",
+            unit="pair",
+            disable=not sys.stderr.isatty(),
+        )
+        for i, j in pair_iter:
             sim = float(similarity_matrix[i, j])
             if sim >= self.config.similarity_threshold:
                 resonances.append((ids[i], ids[j], sim))

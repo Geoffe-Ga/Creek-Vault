@@ -85,13 +85,29 @@ Use this when you've already identified the unwanted fragment (e.g. via `creek c
 
 ### `creek purge source`
 
-Delete every fragment ingested from a given source path. Useful when you imported a directory by accident, or when a person has asked for their messages to be removed.
+Delete every fragment ingested from a given source. Two complementary modes (INC-008):
 
-```bash
-creek purge source --source-path ~/exports/unwanted.zip --vault ~/Obsidian/Creek-Vault
-```
+- **By platform** (positional argument). Matches against `source.platform`. Useful when you want to wipe everything from a specific exporter:
 
-The source path is matched against `source.original_file` in each fragment's frontmatter — exact match by default, or substring with `--match substring`.
+  ```bash
+  creek purge source claude --vault ~/Obsidian/Creek-Vault
+  creek purge source discord --vault ~/Obsidian/Creek-Vault
+  ```
+
+- **By source path** (`--source-path`). Matches against `source.original_file` in each fragment's frontmatter. The `--match` mode controls how the path is compared:
+
+  ```bash
+  # Exact path equality (the default).
+  creek purge source --source-path ~/exports/unwanted.zip --vault ~/Obsidian/Creek-Vault
+
+  # Substring containment — handy when staged files share a directory.
+  creek purge source --source-path /exports/2026-04 --match substring --vault ~/Obsidian/Creek-Vault
+
+  # Regex — fail fast on a malformed pattern; no silent mismatches.
+  creek purge source --source-path "diary-2026-04-2[0-9]\.md$" --match regex --vault ~/Obsidian/Creek-Vault
+  ```
+
+Pass exactly one of the two modes; mixing them is a usage error. Both modes record the chosen criteria — including `--match` — to the audit log so an operator can reconstruct what each purge actually targeted.
 
 ### `creek purge classifications`
 

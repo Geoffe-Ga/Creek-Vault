@@ -204,12 +204,44 @@ class PrivacyTier(StrEnum):
 
     Controls visibility and handling restrictions. ``intimate`` content
     is reserved exclusively for self-authored fragments.
+
+    Naming history (INC-003): the canonical name is ``OPEN``
+    (``"open"``) per ontology §13.2 — "openly publishable", not
+    "internet-public". The legacy value ``"public"`` is accepted on
+    input via :meth:`_missing_` and silently mapped to ``OPEN``, with
+    a :class:`DeprecationWarning` so an operator running against an
+    older vault knows to migrate. Plan removal in the next minor
+    version.
     """
 
-    PUBLIC = "public"
+    OPEN = "open"
     PERSONAL = "personal"
     INTIMATE = "intimate"
     UNCLASSIFIED = "unclassified"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "PrivacyTier | None":
+        """Map the deprecated ``"public"`` string to :attr:`OPEN`.
+
+        Old vaults serialised the tier as ``public``. INC-003 renamed
+        the canonical value to ``open``; this hook keeps those vaults
+        loadable for one release while emitting a
+        :class:`DeprecationWarning` that names the migration path.
+        Any other unknown value still raises ``ValueError`` from the
+        StrEnum constructor.
+        """
+        if isinstance(value, str) and value == "public":
+            import warnings
+
+            warnings.warn(
+                "PrivacyTier value 'public' is deprecated; use 'open'. "
+                "INC-003: support for 'public' will be removed in the "
+                "next minor release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return cls.OPEN
+        return None
 
 
 # ---- ID Generation Helpers ----

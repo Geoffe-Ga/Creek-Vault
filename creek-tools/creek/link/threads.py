@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
+
+from tqdm import tqdm
 
 from creek.models import Frequency, Thread, ThreadStatus
 from creek.time import now_la
@@ -402,7 +405,16 @@ class ThreadDetector:
             uf.add(frag.id)
 
         window = timedelta(days=self.window_days)
-        for i, frag_a in enumerate(sorted_frags):
+        # OPS-004: outer loop drives the wall-time on a 10k-vault link
+        # rebuild. tqdm in TTYs, silent elsewhere.
+        outer = tqdm(
+            enumerate(sorted_frags),
+            total=len(sorted_frags),
+            desc="Threads",
+            unit="frag",
+            disable=not sys.stderr.isatty(),
+        )
+        for i, frag_a in outer:
             for frag_b in sorted_frags[i + 1 :]:
                 if frag_b.created - frag_a.created > window:
                     break

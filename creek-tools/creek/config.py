@@ -9,12 +9,15 @@ API keys (e.g. ``ANTHROPIC_API_KEY``) are **never** stored in the YAML
 file — they must come from environment variables.
 """
 
+import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class LLMConfig(BaseModel):
@@ -541,15 +544,27 @@ class CreekConfig(BaseSettings):
         return v
 
 
-def load_config(config_path: Path | None = None) -> CreekConfig:
+def load_config(
+    config_path: Path | None = None,
+    *,
+    warn_on_missing: bool = True,
+) -> CreekConfig:
     """Load configuration from a YAML file with environment variable overrides.
 
     If *config_path* does not exist, returns a ``CreekConfig`` populated
-    entirely from defaults and environment variables.
+    entirely from defaults and environment variables and (per ARCH-002)
+    emits a ``WARNING`` so the operator knows their data-handling
+    decisions are being made by the defaults rather than their own
+    config. Pass ``warn_on_missing=False`` to silence the warning when
+    the caller has already established that the missing file is
+    expected (e.g. ``creek init`` runs before any config exists).
 
     Args:
         config_path: Path to a ``creek_config.yaml`` file.  Defaults to
             ``creek_config.yaml`` in the current directory.
+        warn_on_missing: When ``True`` (default), log a WARNING if the
+            file does not exist. Suppress for CLI commands that
+            legitimately operate in the no-config state.
 
     Returns:
         A fully-validated ``CreekConfig`` instance.
@@ -562,6 +577,15 @@ def load_config(config_path: Path | None = None) -> CreekConfig:
             data: dict[str, object] = yaml.safe_load(f) or {}
         return CreekConfig.model_validate(data)
 
+    if warn_on_missing:
+        logger.warning(
+            "Config file %s not found; running with built-in defaults. "
+            "Run `creek init --vault <vault>` to write a starter config, "
+            "or pass --config <path> to point at one explicitly. "
+            "Pipeline behaviour (privacy, redaction, cleaning) depends on "
+            "this file — silent defaults are usually not what you want.",
+            config_path,
+        )
     return CreekConfig()
 
 

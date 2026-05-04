@@ -11,16 +11,17 @@ Every ingestor is registered in `creek.ingest.INGESTOR_REGISTRY`. The table maps
 | `claude`        | Claude conversation export ZIP / JSON.                                | none                          |
 | `chatgpt`       | ChatGPT conversation export ZIP.                                      | none                          |
 | `discord`       | Discord channel exports (DiscordChatExporter HTML or JSON).           | none                          |
-| `gdrive`        | Files mirrored by `creek gdrive --download` into the staging dir.     | (see [Google Drive](#google-drive)) |
 | `code`          | A directory tree of source files (`.py`, `.ts`, `.go`, `.md`, …).     | none                          |
-| `documents`     | `.docx` and `.pdf` documents.                                         | `python-docx`, `pdfminer.six` |
+| `document`      | `.docx` and `.pdf` documents.                                         | `python-docx`, `pdfminer.six` |
 | `markdown`      | Loose `.md` files.                                                    | none                          |
 | `spreadsheet`   | `.xlsx` (one fragment per sheet) and `.csv` (one fragment per file).  | `openpyxl` (XLSX only)        |
 | `presentation`  | `.pptx` (one fragment per deck; slides become sections).              | `python-pptx`                 |
-| `images`        | `.png` / `.jpg` / `.tiff` / `.pdf-page-as-image` via OCR.             | `pytesseract`, `pdf2image`, system `tesseract`, `poppler` |
+| `image`         | `.png` / `.jpg` / `.tiff` / `.pdf-page-as-image` via OCR.             | `pytesseract`, `pdf2image`, system `tesseract`, `poppler` |
 | `generic`       | Plain-text fallback for unknown extensions.                           | none                          |
 
 If `--type` is omitted, `creek process` picks ingestors by file extension.
+
+`gdrive` is **not** a `--type` (ARCH-001) — it is a downloader. Run `creek gdrive --download --staging <dir>` to mirror Drive files locally, then run `creek ingest --type document --input <dir>` (or `--type spreadsheet`, etc.) against the staged directory. See [Google Drive](#google-drive) below.
 
 ## Common patterns
 
@@ -66,9 +67,12 @@ creek ingest --type code         --input ~/projects/diary     --vault ~/Obsidian
 # First run opens a browser for OAuth; subsequent runs are non-interactive.
 creek gdrive --download --staging ~/staging/gdrive
 
-# The staging tree mirrors the Drive folder hierarchy.
-# Pipe it through ingest like any other directory.
-creek ingest --type gdrive --input ~/staging/gdrive --vault ~/Obsidian/Creek-Vault
+# The staging tree mirrors the Drive folder hierarchy. Run the
+# matching ingestor for each file family (ARCH-001 — there is no
+# ``--type gdrive``; passing it now prints a redirect message).
+creek ingest --type document    --input ~/staging/gdrive --vault ~/Obsidian/Creek-Vault
+creek ingest --type spreadsheet --input ~/staging/gdrive --vault ~/Obsidian/Creek-Vault
+creek ingest --type markdown    --input ~/staging/gdrive --vault ~/Obsidian/Creek-Vault
 ```
 
 Subsequent `--download` runs are **incremental** — unchanged files are skipped, deletions are mirrored as soft deletes (the staging file is removed; the vault fragment isn't, so you can choose whether to `creek purge source` it).

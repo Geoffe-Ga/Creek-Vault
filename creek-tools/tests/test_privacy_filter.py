@@ -59,7 +59,7 @@ def test_default_excludes_intimate_summarises_personal() -> None:
     inputs = [
         _frag(id_="frag-i", tier=PrivacyTier.INTIMATE, body="secret stuff"),
         _frag(id_="frag-p", tier=PrivacyTier.PERSONAL, body="personal stuff"),
-        _frag(id_="frag-o", tier=PrivacyTier.PUBLIC, body="open stuff"),
+        _frag(id_="frag-o", tier=PrivacyTier.OPEN, body="open stuff"),
     ]
 
     out = list(filter_fragments_by_tier(inputs))
@@ -99,7 +99,7 @@ def test_intimate_or_all_lets_everything_through(
     inputs = [
         _frag(id_="frag-i", tier=PrivacyTier.INTIMATE, body="secret"),
         _frag(id_="frag-p", tier=PrivacyTier.PERSONAL, body="personal"),
-        _frag(id_="frag-o", tier=PrivacyTier.PUBLIC, body="open"),
+        _frag(id_="frag-o", tier=PrivacyTier.OPEN, body="open"),
     ]
 
     out = list(filter_fragments_by_tier(inputs, override=override))
@@ -178,7 +178,7 @@ def test_open_override_matches_default_behaviour() -> None:
     inputs = [
         _frag(id_="frag-i", tier=PrivacyTier.INTIMATE, body="x"),
         _frag(id_="frag-p", tier=PrivacyTier.PERSONAL, body="full"),
-        _frag(id_="frag-o", tier=PrivacyTier.PUBLIC, body="open"),
+        _frag(id_="frag-o", tier=PrivacyTier.OPEN, body="open"),
     ]
 
     default_out = list(filter_fragments_by_tier(inputs))

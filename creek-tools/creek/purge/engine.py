@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ _CLASSIFICATION_RESET_FIELDS: tuple[str, ...] = (
 """Frontmatter fields wiped by ``purge_classifications``."""
 
 _FILE_DELETING_OPERATIONS: frozenset[str] = frozenset(
-    {"fragment", "source", "daterange", "vault"},
+    {"fragment", "source", "source-path", "daterange", "vault"},
 )
 """Explicit allowlist of operations that remove files from disk.
 
@@ -208,6 +209,60 @@ class PurgeEngine:
             Number of matching fragment files.
         """
         return len(self._fragments_from_source(source_type))
+
+    def purge_source_path(
+        self,
+        source_path: str,
+        *,
+        match: str = "exact",
+    ) -> PurgeResult:
+        """Delete every fragment whose ``source.original_file`` matches (INC-008).
+
+        Args:
+            source_path: The path (or substring / regex) to match against
+                each fragment's ``source.original_file``.
+            match: ``"exact"`` (full-string equality, default),
+                ``"substring"`` (Python ``in``), or ``"regex"``
+                (re.search). An invalid regex raises ``ValueError``
+                fast rather than silently mismatching.
+
+        Returns:
+            A :class:`PurgeResult` summarising the deletions and
+            recording the match mode in its criteria.
+
+        Raises:
+            ValueError: When ``match`` is unrecognised, or when
+                ``match="regex"`` and ``source_path`` is not a valid
+                regex.
+        """
+        result = PurgeResult(
+            operation="source-path",
+            target=source_path,
+            criteria={"source_path": source_path, "match": match},
+            dry_run=self.dry_run,
+        )
+        matches = self._fragments_from_source_path(source_path, match=match)
+        for frag_file, post in matches:
+            self._purge_single(frag_file, post, result)
+        self._write_audit(result)
+        return result
+
+    def count_fragments_from_source_path(
+        self,
+        source_path: str,
+        *,
+        match: str = "exact",
+    ) -> int:
+        """Count fragments whose ``source.original_file`` matches (INC-008).
+
+        Args:
+            source_path: The path / substring / regex to match.
+            match: One of ``"exact"`` / ``"substring"`` / ``"regex"``.
+
+        Returns:
+            Number of matching fragment files.
+        """
+        return len(self._fragments_from_source_path(source_path, match=match))
 
     # -- Classifications purge -------------------------------------------
 
@@ -402,6 +457,36 @@ class PurgeEngine:
             if post is None:
                 continue
             if _extract_source_platform(post) == source_type:
+                matches.append((frag_file, post))
+        return matches
+
+    def _fragments_from_source_path(
+        self,
+        source_path: str,
+        *,
+        match: str,
+    ) -> list[tuple[Path, frontmatter.Post]]:
+        """List fragments whose ``source.original_file`` matches *source_path*.
+
+        Args:
+            source_path: Path string / substring / regex.
+            match: ``"exact"`` / ``"substring"`` / ``"regex"``.
+
+        Returns:
+            List of ``(path, post)`` pairs.
+
+        Raises:
+            ValueError: When *match* is unrecognised, or when
+                ``match="regex"`` and *source_path* is not a valid regex.
+        """
+        predicate = _build_source_path_matcher(source_path, match=match)
+        matches: list[tuple[Path, frontmatter.Post]] = []
+        for frag_file in self._list_fragment_files():
+            post = self._load_frontmatter(frag_file)
+            if post is None:
+                continue
+            original_file = _extract_source_original_file(post)
+            if original_file is not None and predicate(original_file):
                 matches.append((frag_file, post))
         return matches
 
@@ -625,6 +710,65 @@ def _extract_source_platform(post: frontmatter.Post) -> str | None:
         platform = source.get("platform")
         return str(platform) if platform is not None else None
     return None
+
+
+def _extract_source_original_file(post: frontmatter.Post) -> str | None:
+    """Extract the ``source.original_file`` string from frontmatter (INC-008).
+
+    Args:
+        post: Parsed frontmatter post.
+
+    Returns:
+        The original file path, or ``None`` when missing.
+    """
+    source = post.get("source")
+    if isinstance(source, dict):
+        original = source.get("original_file")
+        return str(original) if original is not None else None
+    return None
+
+
+_VALID_SOURCE_PATH_MATCH_MODES: frozenset[str] = frozenset(
+    {"exact", "substring", "regex"},
+)
+
+
+def _build_source_path_matcher(
+    source_path: str,
+    *,
+    match: str,
+) -> Callable[[str], bool]:
+    """Build a per-fragment predicate from *source_path* and *match* mode.
+
+    Args:
+        source_path: Path string the operator passed.
+        match: One of ``"exact"`` / ``"substring"`` / ``"regex"``.
+
+    Returns:
+        A callable that takes a fragment's ``source.original_file`` and
+        returns ``True`` when the fragment should be purged.
+
+    Raises:
+        ValueError: When *match* is unrecognised, or when
+            ``match="regex"`` and *source_path* is not a valid regex.
+    """
+    if match not in _VALID_SOURCE_PATH_MATCH_MODES:
+        msg = (
+            f"Unknown match mode {match!r}; expected one of "
+            f"{sorted(_VALID_SOURCE_PATH_MATCH_MODES)}."
+        )
+        raise ValueError(msg)
+    if match == "exact":
+        return lambda candidate: candidate == source_path
+    if match == "substring":
+        return lambda candidate: source_path in candidate
+    # match == "regex"
+    try:
+        pattern = re.compile(source_path)
+    except re.error as exc:
+        msg = f"Invalid regex {source_path!r}: {exc}"
+        raise ValueError(msg) from exc
+    return lambda candidate: pattern.search(candidate) is not None
 
 
 def _build_wikilink_pattern(title: str) -> re.Pattern[str]:
