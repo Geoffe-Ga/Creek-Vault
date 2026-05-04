@@ -16,6 +16,7 @@ writing an entry to the privacy audit log via
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from creek.models import Fragment
+
+logger = logging.getLogger(__name__)
 
 
 PRIVACY_AUDIT_RELPATH = Path("00-Creek-Meta/audit/privacy.jsonl")
@@ -136,8 +139,28 @@ def filter_fragments_by_tier(
 
 
 def _tier_of(fragment: Fragment) -> PrivacyTier:
-    """Return the fragment's privacy tier as a :class:`PrivacyTier`."""
-    return PrivacyTier(fragment.privacy_tier)
+    """Return the fragment's privacy tier as a :class:`PrivacyTier`.
+
+    Pydantic's :class:`~creek.models.Fragment` validator constrains
+    ``privacy_tier`` to the enum values, so unrecognised strings should
+    not normally reach this helper. The defensive ``except`` exists for
+    fragments that bypassed Pydantic validation (e.g. legacy data hand-
+    edited in the vault, or a future schema migration that adds a tier
+    we don't yet know about). Failing closed to ``INTIMATE`` ensures an
+    unknown classification is treated as the most-restrictive tier
+    rather than silently defaulting to ``open`` and exposing the body.
+    """
+    try:
+        return PrivacyTier(fragment.privacy_tier)
+    except ValueError:
+        logger.warning(
+            "Fragment %s carries unrecognised privacy_tier %r; "
+            "treating as INTIMATE for fail-closed filtering. "
+            "Re-run `creek classify` to assign a recognised tier.",
+            fragment.id,
+            fragment.privacy_tier,
+        )
+        return PrivacyTier.INTIMATE
 
 
 def record_privacy_override(

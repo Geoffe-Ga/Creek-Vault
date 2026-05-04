@@ -1128,7 +1128,13 @@ def test_audit_log_empty_file_is_treated_as_empty(tmp_path: Path) -> None:
 
 
 def test_audit_log_legacy_corrupt_json_is_skipped(tmp_path: Path) -> None:
-    """A malformed legacy log is left alone but does not crash readers."""
+    """A malformed legacy log is left alone but does not crash readers.
+
+    The migration runs (the marker is written so an operator can see
+    that the corrupt file was observed), and the legacy file is then
+    unlinked so subsequent runs do not re-discover it. Asserting the
+    cleanup explicitly closes the gap noted in the PR #193 review.
+    """
     vault = _make_vault(tmp_path)
     legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1138,6 +1144,7 @@ def test_audit_log_legacy_corrupt_json_is_skipped(tmp_path: Path) -> None:
     entries = log.read()
 
     assert any(e.operation == "purge.audit.migration" for e in entries)
+    assert not legacy_path.exists()
 
 
 def test_audit_log_migration_with_empty_preexisting_log_does_not_double(

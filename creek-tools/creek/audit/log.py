@@ -212,6 +212,11 @@ class AuditLog:
         ):
             if _HAS_FCNTL:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            # Invariant: the flock above is acquired iff control reaches
+            # the ``try`` below. A failure of the ``flock`` call would
+            # raise out of the ``with`` block before ``finally`` runs,
+            # so the unlock there is the release for *this* lock — not
+            # for whatever happens to be locked at the OS level.
             try:
                 prev_hash = self._compute_prev_hash()
                 chained = {**payload, _PREV_HASH_FIELD: prev_hash}

@@ -128,6 +128,46 @@ def test_unclassified_tier_passes_through_with_full_body() -> None:
     assert body == "raw body"
 
 
+def test_tier_of_unknown_string_fails_closed_to_intimate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fragments carrying an unrecognised tier string fail closed.
+
+    Regression for PR #193 review (comment 4367360694 LOW): the prior
+    ``_tier_of`` did ``PrivacyTier(fragment.privacy_tier)`` with no
+    safety net, so a hand-edited or schema-migrated vault with an
+    unknown tier string would crash generation flows. The new helper
+    catches the :class:`ValueError`, logs a warning that names the
+    fragment ID, and returns :data:`PrivacyTier.INTIMATE` so the
+    fragment is excluded from the default-policy output.
+    """
+    from creek.classify.privacy_filter import _tier_of
+
+    # ``model_construct`` skips Pydantic validation, allowing us to
+    # plant a bogus tier value the same way a hand-edited markdown file
+    # or a forward-incompatible schema migration would.
+    bogus = Fragment.model_construct(
+        id="frag-bogus",
+        title="t",
+        source=FragmentSource(
+            platform=SourcePlatform.JOURNAL,
+            author=Authorship.SELF,
+            original_file="x.md",
+        ),
+        created=datetime(2025, 1, 1, tzinfo=UTC),
+        privacy_tier="brand-new-tier-v2",  # type: ignore[arg-type]
+        frequency=FrequencyClassification(primary=Frequency.UNCLASSIFIED, secondary=[]),
+    )
+
+    with caplog.at_level("WARNING", logger="creek.classify.privacy_filter"):
+        tier = _tier_of(bogus)
+
+    assert tier is PrivacyTier.INTIMATE
+    assert any(
+        "frag-bogus" in r.message and "INTIMATE" in r.message for r in caplog.records
+    )
+
+
 def test_open_override_matches_default_behaviour() -> None:
     """``--include-tier open`` explicitly == default (no flag).
 
