@@ -3,8 +3,9 @@
 After a partial ``creek classify --method llm`` run, re-running the
 command must not re-classify fragments that already carry
 ``classification_method: llm``. The progress checkpoint at
-``<vault>/00-Creek-Meta/Processing-Log/llm-progress.json`` must capture
-each newly-classified fragment ID so an operator can audit the run.
+``<vault>/00-Creek-Meta/Processing-Log/llm-progress.jsonl`` must
+capture each newly-classified fragment ID so an operator can audit the
+run.
 """
 
 from __future__ import annotations
