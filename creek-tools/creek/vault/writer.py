@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import tempfile
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.audit import AuditLog
 from creek.models import (
     DecisionStatus,
     PraxisType,
@@ -87,6 +89,9 @@ _ACTIVE_DECISION_STATUSES: set[str] = {
     DecisionStatus.COMMITTING,
 }
 
+logger = logging.getLogger(__name__)
+
+
 _MAX_FILENAME_COLLISION_RETRIES = 10_000
 """Cap on counter-suffix retries inside :meth:`VaultWriter._atomic_create`.
 
@@ -106,12 +111,13 @@ directory of 10 000 fragments does not produce O(N²) total work.
 PROVENANCE_FILENAME = "provenance.jsonl"
 """Append-only provenance log filename under ``00-Creek-Meta/Processing-Log/``.
 
-JSONL format keeps each write O(1) and avoids the read-modify-write
-race that would otherwise lose entries under ``ThreadPoolExecutor``.
+Backed by :class:`creek.audit.AuditLog` (sha256 hash chain + flock +
+fsync) per Batch C; the JSONL shape keeps each append O(1) and the
+chain detects post-hoc tampering via :meth:`AuditLog.verify`.
 """
 
 LEGACY_PROVENANCE_FILENAME = "provenance.json"
-"""Pre-Batch-E provenance filename. Migrated on first write to JSONL."""
+"""Pre-Batch-C/E provenance filename. Migrated on VaultWriter construction."""
 
 _PIPE_BUF_BYTES = 4096
 """Conservative upper bound on a single ``O_APPEND`` ``write(2)``.
@@ -134,6 +140,128 @@ it; the producers in this module assert their encoded line size
 against ``_PIPE_BUF_BYTES`` so a regression surfaces loudly rather
 than silently risking interleaved writes.
 """
+
+
+def _read_legacy_provenance_entries(
+    legacy_path: Path,
+) -> tuple[list[dict[str, object]], str]:
+    """Return (entries, status) for the legacy provenance log.
+
+    ``status`` is one of:
+
+    * ``"ok"`` — file parsed cleanly (entries may still be empty if the
+      file held an empty array).
+    * ``"read_failed"`` — :class:`OSError` while reading the file.
+    * ``"parse_failed"`` — file existed but did not parse as JSON or
+      did not contain a list.
+
+    The status is stamped on the migration marker so an operator
+    inspecting the audit log can distinguish a clean migration of an
+    empty legacy file from a transient I/O error that lost data.
+    """
+    try:
+        raw = legacy_path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("Could not read legacy provenance log %s", legacy_path)
+        return [], "read_failed"
+    if not raw.strip():
+        return [], "ok"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "Legacy provenance log %s is not valid JSON; skipping migration",
+            legacy_path,
+        )
+        return [], "parse_failed"
+    if not isinstance(data, list):
+        return [], "parse_failed"
+    return [item for item in data if isinstance(item, dict)], "ok"
+
+
+def _provenance_migration_marker(
+    legacy_path: Path,
+    migrated_count: int,
+    status: str,
+) -> dict[str, object]:
+    """Build the migration marker entry recorded in the new chain.
+
+    Timestamp is UTC-stamped to match every other audit log entry in
+    the system; a naive ``datetime.now()`` would produce a local-time
+    string that would not be comparable to the ``timestamp`` fields in
+    the surrounding compliance entries.
+    """
+    return {
+        "id": "_migration_",
+        "type": "provenance.migration",
+        "path": str(legacy_path),
+        "written_at": datetime.now(tz=UTC).isoformat(),
+        "migrated_entries": migrated_count,
+        "migration_status": status,
+    }
+
+
+def _migrate_legacy_provenance(
+    legacy_path: Path,
+    new_log: AuditLog,
+) -> None:
+    """One-shot migration of pre-Batch-C ``provenance.json`` array.
+
+    Older vaults shipped a JSON-array log at ``provenance.json``;
+    Batch C switched to JSONL via :class:`AuditLog` so the log is
+    chained, append-only, and crash-safe. We replay every legacy
+    entry into the new chain in original order, append a marker
+    line so the migration is auditable, and unlink the legacy
+    file. If the new log is already populated we leave the legacy
+    file alone so a partially-migrated state can be resolved by
+    inspection.
+
+    Defensively strips any caller-supplied ``prev_hash`` field from
+    legacy entries before append — :meth:`AuditLog.append` rejects
+    payloads that try to forge the chain key, and we want migration
+    of older logs to be tolerant rather than blow up at startup.
+    """
+    if not legacy_path.exists():
+        return
+    if new_log.path.exists() and new_log.path.stat().st_size > 0:
+        # JSONL already populated AND legacy still on disk: a previous
+        # attempt wrote some entries then crashed before unlinking, or
+        # an operator copied the legacy file back in. Either way the
+        # state is half-migrated and silently doing nothing would let
+        # the inconsistency drift indefinitely. Surface it explicitly
+        # so an operator inspecting logs notices.
+        logger.warning(
+            "Provenance migration: %s exists and %s also exists with content; "
+            "skipping migration. Inspect both files and remove %s by hand once "
+            "you have confirmed every legacy entry is in the new log.",
+            legacy_path,
+            new_log.path,
+            legacy_path,
+        )
+        return
+    legacy_entries, status = _read_legacy_provenance_entries(legacy_path)
+    try:
+        for entry in legacy_entries:
+            sanitised = {k: v for k, v in entry.items() if k != "prev_hash"}
+            new_log.append(sanitised)
+        new_log.append(
+            _provenance_migration_marker(legacy_path, len(legacy_entries), status),
+        )
+    except OSError:
+        # Mid-migration failure (disk full, permission flip). The new
+        # log now has partial content so the size guard above will
+        # short-circuit subsequent attempts; the legacy file is left
+        # in place deliberately so no entries are lost. Warn loudly so
+        # the operator can resolve it before the next run silently
+        # treats the partial state as "already migrated".
+        logger.exception(
+            "Provenance migration of %s into %s failed mid-write; legacy file "
+            "left intact for manual reconciliation.",
+            legacy_path,
+            new_log.path,
+        )
+        raise
+    legacy_path.unlink(missing_ok=True)
 
 
 def _sanitize_title(title: str) -> str:
@@ -290,15 +418,27 @@ class VaultWriter:
         # Loaded lazily on first access; persisted to disk on every
         # write so a second process picks up entries written by the first.
         self._dir_indexes: dict[Path, dict[str, str]] = {}
-        # Single process-level lock guards both the in-memory index
-        # cache and the provenance log read-modify-write. Cross-process
-        # safety is out of scope here (see BUG-006: optional fcntl).
+        # Single process-level lock guards the in-memory index cache.
+        # Cross-process safety for the index is out of scope (BUG-006);
+        # the provenance log uses creek.audit.AuditLog which has its own
+        # cross-process flock.
         self._lock = threading.Lock()
-        # Legacy ``provenance.json`` migration runs at most once per
-        # writer instance. The flag short-circuits the per-write
-        # ``legacy_path.exists()`` stat after the first migration,
-        # whether it succeeded, found nothing, or failed gracefully.
-        self._legacy_provenance_migrated = False
+        # Reuse a single AuditLog instance across every provenance
+        # append so the per-instance hash cache stays warm across the
+        # vault-writer ingest loop (Batch C, PR #193). A fresh AuditLog
+        # per call would collapse the cache and re-introduce the O(N²)
+        # read pattern that PERF-002 was supposed to eliminate.
+        processing_log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        self._provenance_log = AuditLog(processing_log_dir / PROVENANCE_FILENAME)
+        # Legacy provenance.json migration: replays into the chained
+        # JSONL on first VaultWriter construction, then unlinks. The
+        # _migrate_legacy_provenance helper short-circuits if the new
+        # log already has content, so subsequent VaultWriter instances
+        # in the same process pay only a single stat.
+        _migrate_legacy_provenance(
+            processing_log_dir / LEGACY_PROVENANCE_FILENAME,
+            self._provenance_log,
+        )
 
     def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
         """Write a Fragment to the appropriate 01-Fragments/ subfolder.
@@ -751,124 +891,32 @@ class VaultWriter:
     ) -> None:
         """Append a provenance entry to the JSONL processing log.
 
-        Caller must hold ``self._lock``. The log lives at
-        ``00-Creek-Meta/Processing-Log/provenance.jsonl`` with one JSON
-        object per line — appended via ``O_APPEND`` so concurrent
-        writers cannot lose entries in a read-modify-write race.
+        Caller must hold ``self._lock`` (Batch E lock-to-call-site
+        contract). The log is hash-chained JSONL via
+        :class:`creek.audit.AuditLog` (Batch C) — flock + fsync +
+        prev_hash chain — stored at
+        ``00-Creek-Meta/Processing-Log/provenance.jsonl``. Reusing the
+        single :attr:`_provenance_log` instance keeps the per-instance
+        hash cache warm across the ingest loop so each append is O(1)
+        rather than re-reading the growing log.
 
-        On the first call after a vault upgrade, any pre-Batch-E
-        ``provenance.json`` (a JSON array) is migrated forward into the
-        new JSONL log and removed, so vault history written by older
-        ``creek-tools`` releases is preserved rather than silently
-        orphaned.
+        Legacy ``provenance.json`` (a JSON array) is migrated forward
+        in :meth:`__init__` via :func:`_migrate_legacy_provenance`, so
+        this hot-path method does no per-write filesystem stat.
 
         Args:
             model_id: The ID of the written model.
             model_type: The type string of the written model.
             file_path: The path where the model was written.
         """
-        log_dir = self.vault_path / "00-Creek-Meta" / "Processing-Log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / PROVENANCE_FILENAME
-
-        self._migrate_legacy_provenance_locked(log_dir, log_path)
-
-        entry: dict[str, str] = {
-            "id": model_id,
-            "type": model_type,
-            "path": str(file_path),
-            "written_at": datetime.now().isoformat(),
-        }
-        self._append_provenance_entry(log_path, entry)
-
-    @staticmethod
-    def _append_provenance_entry(log_path: Path, entry: dict[str, str]) -> None:
-        """Append a single JSON-encoded entry to *log_path* via ``O_APPEND``.
-
-        Each line is asserted to be at most :data:`_PIPE_BUF_BYTES` so
-        a malformed (oversized) entry trips an explicit error rather
-        than silently risking interleaving with concurrent writers.
-        """
-        encoded = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
-        if len(encoded) > _PIPE_BUF_BYTES:
-            msg = (
-                f"Provenance entry exceeds PIPE_BUF "
-                f"({len(encoded)} > {_PIPE_BUF_BYTES} bytes); "
-                "atomic O_APPEND cannot be guaranteed."
-            )
-            raise ValueError(msg)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        fd = os.open(str(log_path), flags, 0o644)
-        try:
-            os.write(fd, encoded)
-        finally:
-            os.close(fd)
-
-    def _migrate_legacy_provenance_locked(
-        self,
-        log_dir: Path,
-        log_path: Path,
-    ) -> None:
-        """Forward-migrate ``provenance.json`` entries into the JSONL log.
-
-        Caller must hold ``self._lock``. Entries from a pre-Batch-E
-        JSON array are appended one-per-line into the new file and the
-        legacy file is **always** unlinked when this method returns —
-        even if some individual entries cannot be migrated (malformed,
-        oversized for ``PIPE_BUF``, etc.). Without that guarantee a
-        single bad entry would leave ``provenance.json`` in place and
-        the migration would re-fire on every subsequent write,
-        permanently blocking vault upgrades for unlucky vaults.
-
-        After the first successful (or first attempted) migration, the
-        ``_legacy_provenance_migrated`` flag short-circuits the stat on
-        every subsequent call so the steady-state per-write cost is one
-        boolean check rather than a filesystem hit.
-        """
-        if self._legacy_provenance_migrated:
-            return
-        legacy_path = log_dir / LEGACY_PROVENANCE_FILENAME
-        if not legacy_path.exists():
-            self._legacy_provenance_migrated = True
-            return
-        try:
-            self._migrate_legacy_provenance_body(legacy_path, log_path)
-        finally:
-            with contextlib.suppress(OSError):
-                legacy_path.unlink()
-            self._legacy_provenance_migrated = True
-
-    def _migrate_legacy_provenance_body(
-        self,
-        legacy_path: Path,
-        log_path: Path,
-    ) -> None:
-        """Read and append entries from *legacy_path*; tolerate per-entry failures.
-
-        Extracted so :meth:`_migrate_legacy_provenance_locked` can wrap
-        the whole body in a ``try/finally`` that always removes the
-        legacy file regardless of which entry tripped a recoverable
-        failure (oversized line, malformed shape, partial content).
-        """
-        try:
-            raw = legacy_path.read_text(encoding="utf-8")
-            parsed = json.loads(raw) if raw.strip() else []
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(parsed, list):
-            return
-        for raw_entry in parsed:
-            if not isinstance(raw_entry, dict):
-                continue
-            entry = {str(k): str(v) for k, v in raw_entry.items() if isinstance(k, str)}
-            try:
-                self._append_provenance_entry(log_path, entry)
-            except ValueError:
-                # Oversized legacy entry (rare: a path/id past PIPE_BUF).
-                # Drop it rather than aborting the migration — the
-                # alternative is to re-enter on every future write and
-                # block the vault forever.
-                continue
+        self._provenance_log.append(
+            {
+                "id": model_id,
+                "type": model_type,
+                "path": str(file_path),
+                "written_at": datetime.now(tz=UTC).isoformat(),
+            },
+        )
 
     def _log_provenance(
         self,

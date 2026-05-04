@@ -10,6 +10,7 @@ from __future__ import annotations
 import os as real_os
 from typing import TYPE_CHECKING
 
+import pytest
 from typer.testing import CliRunner
 
 from creek.cli import app
@@ -17,9 +18,19 @@ from creek.cli import app
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
-
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_audit_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run each test inside its own tmp_path so audit logs do not leak.
+
+    ``creek redact --apply`` writes to ``<vault>/00-Creek-Meta/audit/``
+    where ``<vault>`` defaults to ``Path(".")`` when no ``--vault`` is
+    supplied. Without this fixture the per-test audit JSONL would land
+    in the project's working directory and pollute the source tree.
+    """
+    monkeypatch.chdir(tmp_path)
 
 
 # ---------------------------------------------------------------------------

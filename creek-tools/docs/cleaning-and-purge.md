@@ -69,9 +69,9 @@ creek clean report --vault ~/Obsidian/Creek-Vault
 `creek purge` is destructive. Every command:
 
 1. **Refuses without confirmation** unless you pass `--yes`.
-2. **Records an audit entry** under `<vault>/00-Creek-Meta/audit/purge-<timestamp>.json` with the criteria, the affected fragment IDs, and the operator.
+2. **Records an audit entry** by appending one JSONL line to `<vault>/00-Creek-Meta/audit/purge.jsonl` with the criteria, the affected fragment IDs, and the operator. The file is hash-chained — see [Audit trail](#audit-trail) for the integrity guarantees.
 3. **Scrubs every reference** — wiki-links pointing at the deleted fragment(s) are removed from every other fragment's frontmatter and body.
-4. **Removes embeddings** from the cache so the deleted content is not surfaceable through resonances.
+4. **Removes embeddings** from the cache at the next `creek link` run so the deleted content is no longer surfaceable through resonances.
 
 ### `creek purge fragment`
 
@@ -162,20 +162,26 @@ The `WARNING` log entry written when `--force-non-interactive` is used will surf
 
 ## Audit trail
 
-Every purge writes an entry under `<vault>/00-Creek-Meta/audit/`:
+Every purge appends one JSONL line to `<vault>/00-Creek-Meta/audit/purge.jsonl`. Each entry carries an inline `prev_hash` (sha256 of the previous line) so a tampered or truncated log can be detected via the verification API:
 
 ```json
 {
-  "operation": "purge.source",
-  "criteria": {"source_path": "/home/me/exports/unwanted.zip"},
+  "operation": "source",
+  "criteria": {"source_type": "claude"},
   "affected_fragments": ["frag-...", "frag-..."],
   "operator": "sgsg",
   "timestamp": "2026-04-28T18:01:23Z",
   "fragments_deleted": 47,
   "references_scrubbed": 312,
-  "embeddings_removed": 47
+  "embeddings_removed": 47,
+  "dry_run": false,
+  "prev_hash": "0000…"
 }
 ```
+
+`creek redact --apply` writes alongside it at `<vault>/00-Creek-Meta/audit/redact.jsonl`. Privacy-tier overrides (e.g. `creek mine --include-tier intimate`) write to `<vault>/00-Creek-Meta/audit/privacy.jsonl`. Operational provenance from ingestion stays at `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl` (separate location: not compliance-grade, allowed to be lossy).
+
+A pre-Batch-C `Processing-Log/purge-log.json` from older installs is migrated automatically on first read or write — every legacy entry is replayed into the new chain, a `purge.audit.migration` marker is recorded, and the old file is removed.
 
 The audit trail itself is **not purgeable** by `creek` — it's the system's compliance record. You can `git rm` it manually, but that's outside the tool.
 

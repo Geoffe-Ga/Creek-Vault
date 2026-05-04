@@ -99,7 +99,7 @@ The Anthropic path is **not** the default — opt in deliberately. Cost on a 10k
 | `personal` | All                 | + named entities, locations, financial detail | Daily notes, journals, decisions. |
 | `intimate` | Title + tags only   | + body                  | Therapy / health / relationship reflections. |
 
-Generation flows (`mine`, `draft`, `report`) honour the tier: `intimate` fragments are excluded by default; `personal` fragments are included but have body text replaced with summaries; `open` fragments pass through unredacted. Override with `--include-tier intimate` if you genuinely want intimate fragments fed to the LLM (this is logged in the audit trail).
+Generation flows (`mine`, `draft`, `report`, `skills`) honour the tier via the shared filter in `creek/classify/privacy_filter.py`: `intimate` fragments are excluded by default; `personal` fragments are included with their body replaced by a title-only summary; `open` (or `public`) fragments pass through unredacted. Override with `--include-tier {open,personal,intimate,all}` if you genuinely want a richer scope; any value above the default writes an audit entry to `<vault>/00-Creek-Meta/audit/privacy.jsonl`.
 
 ## Re-classifying after taxonomy changes
 

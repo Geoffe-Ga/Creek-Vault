@@ -128,13 +128,14 @@ This means every draft can be **re-run** later from the same seed and skill stac
 
 ## Local-first ergonomics
 
-All generation flows respect the privacy tier configuration. By default:
+All generation flows (`mine`, `draft`, `report`, `skills`) respect the privacy tier configuration via the shared filter in `creek/classify/privacy_filter.py`. By default:
 
 - `intimate` fragments are **excluded** from prompts entirely.
-- `personal` fragments contribute summaries, not full bodies.
-- `open` fragments contribute full content.
+- `personal` fragments contribute a title-only summary, not the full body.
+- `open` (or `public`) fragments contribute full content.
+- `unclassified` fragments are treated as `open` (full body) on the assumption that anything still missing a tier was never deemed sensitive. **Run `creek classify` before generation flows** so each fragment carries an explicit tier; otherwise an unreviewed body could enter an LLM prompt that the privacy filter would have otherwise summarised or excluded. Fragments carrying a tier value the classifier doesn't recognise (e.g. hand-edited frontmatter, a forward-incompatible schema migration) fail **closed** to `intimate` and emit a warning that names the fragment ID.
 
-You can override with `--include-tier intimate` if you genuinely want intimate content in the prompt — the override is logged in the audit trail.
+You can override with `--include-tier {open,personal,intimate,all}` on any of those commands. The default (`open` or omitting the flag) keeps the policy above. `personal` lets personal bodies through unredacted; `intimate` and `all` let intimate bodies through as well. Any value that elevates inclusion above the default appends an entry to `<vault>/00-Creek-Meta/audit/privacy.jsonl` capturing the operator, command, fragment IDs, and timestamp.
 
 ## Common patterns
 

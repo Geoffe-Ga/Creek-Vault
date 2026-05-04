@@ -102,7 +102,7 @@ Redaction sanitises *content*; it doesn't delete the fragment. If you need a fra
 
 - **Always** scan before `creek ingest` on any new export.
 - **Re-scan** the vault after every classification pass, especially if you've turned on the LLM path — it can occasionally surface PII the rules missed.
-- **Audit** the report monthly. The audit log under `<vault>/00-Creek-Meta/audit/` records every apply.
+- **Audit** the report monthly. Every `creek redact --apply` invocation appends one JSONL entry per touched file to `<vault>/00-Creek-Meta/audit/redact.jsonl` — including dry-runs, marked with `dry_run: true`. The log shares the same hash-chain integrity as the purge audit log; see [cleaning-and-purge.md → Audit trail](cleaning-and-purge.md#audit-trail) for the full schema.
 
 ## How `creek process` interacts with redaction
 

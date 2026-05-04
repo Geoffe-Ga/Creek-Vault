@@ -840,6 +840,20 @@ def _read_provenance(vault_path: Path) -> list[dict[str, Any]]:
 class TestProvenanceLogging:
     """Tests for provenance log file creation and appending."""
 
+    @staticmethod
+    def _provenance_path(vault_path: Path) -> Path:
+        """Return the canonical JSONL provenance log path."""
+        return vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+
+    @staticmethod
+    def _read_entries(log_path: Path) -> list[dict[str, Any]]:
+        """Parse a JSONL provenance log into a list of dict entries."""
+        entries: list[dict[str, Any]] = []
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            if line:
+                entries.append(json.loads(line))
+        return entries
+
     def test_provenance_log_created(
         self,
         writer: VaultWriter,
@@ -848,8 +862,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Writing a fragment creates/updates the provenance log."""
         writer.write_fragment(sample_fragment)
-        log_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
-        assert log_path.exists()
+        assert self._provenance_path(vault_path).exists()
 
     def test_provenance_log_contains_entry(
         self,
@@ -859,7 +872,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log contains an entry for the written fragment."""
         writer.write_fragment(sample_fragment)
-        entries = _read_provenance(vault_path)
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 1
         assert entries[0]["id"] == "frag-test0001"
         assert entries[0]["type"] == "fragment"
@@ -874,7 +887,7 @@ class TestProvenanceLogging:
         """Multiple writes append to the provenance log."""
         writer.write_fragment(sample_fragment)
         writer.write_thread(sample_thread)
-        entries = _read_provenance(vault_path)
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 2
         ids = {e["id"] for e in entries}
         assert "frag-test0001" in ids
@@ -888,7 +901,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log entry includes the written file path."""
         result = writer.write_fragment(sample_fragment)
-        entries = _read_provenance(vault_path)
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert entries[0]["path"] == str(result)
 
     def test_provenance_log_has_timestamp(
@@ -899,7 +912,7 @@ class TestProvenanceLogging:
     ) -> None:
         """Provenance log entry includes a timestamp."""
         writer.write_fragment(sample_fragment)
-        entries = _read_provenance(vault_path)
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert "written_at" in entries[0]
 
     def test_duplicate_not_logged_again(
@@ -911,137 +924,276 @@ class TestProvenanceLogging:
         """Writing a duplicate does not add a second provenance entry."""
         writer.write_fragment(sample_fragment)
         writer.write_fragment(sample_fragment)
-        entries = _read_provenance(vault_path)
+        entries = self._read_entries(self._provenance_path(vault_path))
         assert len(entries) == 1
 
-
-class TestProvenanceLegacyMigration:
-    """Migration of pre-Batch-E `provenance.json` → `provenance.jsonl`."""
-
-    def test_legacy_json_array_is_migrated_to_jsonl(
+    def test_legacy_provenance_json_migrated_on_first_writer(
         self,
         vault_path: Path,
-        sample_fragment: Fragment,
     ) -> None:
-        """Legacy `provenance.json` content survives the first JSONL write."""
-        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        legacy_entry = {
-            "id": "frag-legacy0001",
-            "type": "fragment",
-            "path": str(vault_path / "01-Fragments" / "Notes" / "old.md"),
-            "written_at": "2025-01-01T00:00:00",
-        }
-        legacy_path = log_dir / "provenance.json"
-        legacy_path.write_text(json.dumps([legacy_entry], indent=2), encoding="utf-8")
+        """Pre-Batch-C provenance.json is replayed into provenance.jsonl.
 
-        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
-
-        new_entries = _read_provenance(vault_path)
-        ids = [e["id"] for e in new_entries]
-        # Both the legacy entry and the new one are present.
-        assert "frag-legacy0001" in ids
-        assert sample_fragment.id in ids
-        # The old file is removed so a third pass cannot duplicate-import.
-        assert not legacy_path.exists()
-
-    def test_migration_is_idempotent_across_multiple_writers(
-        self,
-        vault_path: Path,
-        sample_fragment: Fragment,
-    ) -> None:
-        """A second writer on the same vault does not re-import the legacy file."""
-        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        legacy_entry = {
-            "id": "frag-legacy0001",
-            "type": "fragment",
-            "path": str(vault_path / "old.md"),
-            "written_at": "2025-01-01T00:00:00",
-        }
-        (log_dir / "provenance.json").write_text(
-            json.dumps([legacy_entry]),
-            encoding="utf-8",
-        )
-
-        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
-
-        # Spin up a fresh writer; it should not re-migrate.
-        second = VaultWriter(vault_path=vault_path)
-        second.write_fragment(
-            Fragment(
-                id="frag-fresh0002",
-                title="Fresh",
-                source=FragmentSource(platform=SourcePlatform.CLAUDE),
-                created=datetime(2025, 2, 1, 12, 0, 0),
-            ),
-        )
-
-        entries = _read_provenance(vault_path)
-        legacy_count = sum(1 for e in entries if e["id"] == "frag-legacy0001")
-        assert legacy_count == 1
-
-    def test_migration_skips_malformed_legacy_file(
-        self,
-        vault_path: Path,
-        sample_fragment: Fragment,
-    ) -> None:
-        """A corrupt legacy `provenance.json` is ignored; new writes still succeed."""
-        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "provenance.json").write_text("not json", encoding="utf-8")
-
-        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
-
-        entries = _read_provenance(vault_path)
-        assert len(entries) == 1
-        assert entries[0]["id"] == sample_fragment.id
-
-    def test_migration_drops_oversized_entry_without_blocking_writes(
-        self,
-        vault_path: Path,
-        sample_fragment: Fragment,
-    ) -> None:
-        """A single oversized legacy entry must not permanently block upgrades.
-
-        The PIPE_BUF cap rejects oversized entries via ``ValueError``.
-        Without per-entry tolerance the migration would re-enter on
-        every write — leaving the vault stuck and surfacing only as a
-        confusing "exceeds PIPE_BUF" error from the unrelated user
-        write that triggered the migration.
+        Regression for PR #193 review (comment 4365568699 BLOCKING #2):
+        operators upgrading from a vault that already has the legacy
+        JSON-array log must not lose those entries when the new
+        :class:`creek.audit.AuditLog`-backed JSONL log is constructed.
         """
-        log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        oversized_entry = {
-            "id": "x" * 5000,  # forces encoded size > _PIPE_BUF_BYTES
-            "type": "fragment",
-            "path": "/old.md",
-            "written_at": "2025-01-01T00:00:00",
-        }
-        well_formed_entry = {
-            "id": "frag-legacy0001",
-            "type": "fragment",
-            "path": "/ok.md",
-            "written_at": "2025-01-02T00:00:00",
-        }
-        legacy_path = log_dir / "provenance.json"
+        from creek.audit import AuditLog
+
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
         legacy_path.write_text(
-            json.dumps([oversized_entry, well_formed_entry]),
+            json.dumps(
+                [
+                    {
+                        "id": "frag-old-001",
+                        "type": "fragment",
+                        "path": "/tmp/old-frag.md",
+                        "written_at": "2025-12-31T23:59:59",
+                    },
+                    {
+                        "id": "frag-old-002",
+                        "type": "fragment",
+                        "path": "/tmp/old-frag-2.md",
+                        "written_at": "2026-01-01T00:00:00",
+                    },
+                ],
+            ),
             encoding="utf-8",
         )
 
-        # First write must succeed — the oversized entry is dropped
-        # (with the legacy file removed) rather than failing the whole
-        # write.
-        VaultWriter(vault_path=vault_path).write_fragment(sample_fragment)
+        VaultWriter(vault_path=vault_path)
 
-        entries = _read_provenance(vault_path)
-        ids = [e["id"] for e in entries]
-        assert "frag-legacy0001" in ids  # well-formed legacy entry survived
-        assert sample_fragment.id in ids  # the user write itself landed
-        # The legacy file is removed even though one entry was dropped,
-        # so the second write does not re-enter the migration loop.
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        assert new_path.exists()
         assert not legacy_path.exists()
+        entries = self._read_entries(new_path)
+        ids = [e.get("id") for e in entries]
+        assert "frag-old-001" in ids
+        assert "frag-old-002" in ids
+        marker = next(e for e in entries if e.get("type") == "provenance.migration")
+        assert marker["migrated_entries"] == 2
+        assert marker["migration_status"] == "ok"
+        AuditLog(new_path).verify()
+
+    def test_legacy_provenance_migration_marks_corrupt_input(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Malformed legacy JSON is recorded as ``parse_failed``.
+
+        Distinguishes a clean migration of an empty legacy file from a
+        transient parse failure that lost data — the operator can audit
+        which case occurred.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text("{not valid json", encoding="utf-8")
+
+        VaultWriter(vault_path=vault_path)
+
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        entries = self._read_entries(new_path)
+        marker = next(e for e in entries if e.get("type") == "provenance.migration")
+        assert marker["migration_status"] == "parse_failed"
+        assert marker["migrated_entries"] == 0
+
+    def test_legacy_provenance_migration_strips_prev_hash(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Legacy entries carrying ``prev_hash`` are sanitised before append.
+
+        :meth:`AuditLog.append` rejects payloads that try to forge the
+        chain key. Migration must be tolerant of older logs that may
+        have stamped ``prev_hash`` themselves rather than blow up at
+        startup.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "frag-with-prev",
+                        "type": "fragment",
+                        "prev_hash": "deadbeef" * 8,
+                    },
+                ],
+            ),
+            encoding="utf-8",
+        )
+
+        VaultWriter(vault_path=vault_path)
+
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        entries = self._read_entries(new_path)
+        migrated = next(e for e in entries if e.get("id") == "frag-with-prev")
+        # The line's prev_hash field is the chain hash, not the legacy
+        # value. Genesis hash of an empty chain is 64 zeros.
+        assert migrated["prev_hash"] == "0" * 64
+
+    def test_legacy_provenance_migration_skipped_when_jsonl_already_populated(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """If the JSONL log already has entries, the legacy JSON is left alone.
+
+        Prevents a half-migrated state from being silently re-migrated;
+        the operator must resolve the inconsistency by inspection.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(json.dumps([{"id": "old", "type": "fragment"}]))
+        # Pre-populate the new log via a fresh AuditLog to simulate a
+        # prior partial migration.
+        from creek.audit import AuditLog
+
+        AuditLog(new_path).append({"id": "already-here", "type": "fragment"})
+
+        VaultWriter(vault_path=vault_path)
+
+        assert legacy_path.exists()  # Untouched.
+        ids = [e.get("id") for e in self._read_entries(new_path)]
+        assert ids == ["already-here"]
+
+    def test_legacy_provenance_migration_with_empty_preexisting_jsonl(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Empty pre-created provenance.jsonl + legacy JSON migrates once.
+
+        Regression for PR #193 review (comment 4367110538 BLOCKING #3):
+        the size guard short-circuits only when the new log has size > 0.
+        An earlier code path may have opened ``provenance.jsonl`` for
+        append (creating it as a 0-byte file) without writing. This test
+        pins that the migration still runs, replays the legacy entries,
+        and a second writer constructed afterwards is a no-op so legacy
+        entries cannot double across instances.
+        """
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps(
+                [
+                    {"id": "frag-empty-pre", "type": "fragment"},
+                ],
+            ),
+            encoding="utf-8",
+        )
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        new_path.touch()
+        assert new_path.stat().st_size == 0
+
+        VaultWriter(vault_path=vault_path)
+
+        # First instance migrated cleanly.
+        assert not legacy_path.exists()
+        entries = self._read_entries(new_path)
+        ids = [e.get("id") for e in entries]
+        types = [e.get("type") for e in entries]
+        assert ids == ["frag-empty-pre", "_migration_"]
+        assert types == ["fragment", "provenance.migration"]
+
+        # A second writer must not re-migrate anything.
+        VaultWriter(vault_path=vault_path)
+        ids_after = [e.get("id") for e in self._read_entries(new_path)]
+        assert ids_after == ["frag-empty-pre", "_migration_"]
+
+    def test_legacy_provenance_orphaned_file_logs_warning(
+        self,
+        vault_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Half-migrated state (both files present, JSONL non-empty) is logged.
+
+        Regression for PR #193 review (comment 4367360694 HIGH): the
+        size guard would silently skip migration when both the legacy
+        and the new log carried content, leaving an operator unaware
+        that the legacy file was orphaned. The warning makes the
+        inconsistency visible the first time it is encountered.
+        """
+        from creek.audit import AuditLog
+
+        legacy_path = (
+            vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.json"
+        )
+        new_path = vault_path / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text(
+            json.dumps([{"id": "orphan-frag", "type": "fragment"}]),
+            encoding="utf-8",
+        )
+        AuditLog(new_path).append({"id": "already-here", "type": "fragment"})
+
+        with caplog.at_level("WARNING", logger="creek.vault.writer"):
+            VaultWriter(vault_path=vault_path)
+
+        assert legacy_path.exists()
+        assert any(
+            "skipping migration" in record.message
+            and "provenance.json" in record.message
+            for record in caplog.records
+        )
+
+    def test_provenance_chain_intact_after_many_writes(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+    ) -> None:
+        """Many writes share a single AuditLog and produce a valid chain.
+
+        Regression for PR #193 review (comment 4365147477): a transient
+        ``AuditLog`` per provenance write would defeat the per-instance
+        hash cache, re-reading the entire log every append. This test
+        writes ten fragments through ``write_fragment`` and asserts the
+        resulting chain still verifies — caching cannot have broken the
+        chain semantics.
+        """
+        from creek.audit import AuditLog
+
+        for i in range(10):
+            frag = Fragment(
+                id=f"frag-prov-{i:04d}",
+                title=f"Provenance Chain {i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 30, 0),
+            )
+            writer.write_fragment(frag)
+
+        log_path = self._provenance_path(vault_path)
+        entries = self._read_entries(log_path)
+        assert len(entries) == 10
+        AuditLog(log_path).verify()
+        # Same VaultWriter writes share one AuditLog instance per the
+        # __init__ change. We assert the cache was reused at least once
+        # by checking the cache fields are populated post-run.
+        assert writer._provenance_log._cached_last_hash is not None
+        assert writer._provenance_log._cached_size is not None
+
+
+# Note: Batch E (PR #194) introduced TestProvenanceLegacyMigration covering
+# the same migration scenarios. Those tests have been merged into the four
+# `test_legacy_provenance_*` methods on TestProvenanceLogging above, which
+# additionally assert the migration marker fields, migration_status, and
+# chain integrity that Batch C's AuditLog-backed migration provides.
+# `test_migration_drops_oversized_entry_without_blocking_writes` from main
+# is dropped because Batch C's implementation routes legacy entries through
+# AuditLog.append (which uses Python's text I/O, not raw os.write with a
+# PIPE_BUF cap), so the oversized-entry failure mode the test pinned does
+# not apply to the merged code path.
 
 
 # ---- ID Index (PERF-001) ----

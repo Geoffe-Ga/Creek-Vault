@@ -276,8 +276,10 @@ def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
     assert len(entries) == 1
     entry = entries[0]
     assert entry.operation == "fragment"
-    assert entry.target == "frag-A"
-    assert entry.count == 1
+    assert entry.criteria == {"fragment_id": "frag-A"}
+    assert entry.affected_fragments == ["frag-A"]
+    assert entry.fragments_deleted == 1
+    assert entry.embeddings_removed == 1
     assert entry.operator == "human via CLI"
     assert entry.dry_run is False
 
@@ -492,44 +494,55 @@ def test_audit_log_appends_entries(tmp_path: Path) -> None:
     log = PurgeAuditLog(vault)
 
     log.append(
-        PurgeAuditEntry(operation="fragment", target="frag-A", count=1),
+        PurgeAuditEntry(
+            operation="fragment",
+            criteria={"fragment_id": "frag-A"},
+            affected_fragments=["frag-A"],
+            fragments_deleted=1,
+        ),
     )
     log.append(
-        PurgeAuditEntry(operation="source", target="claude", count=3),
+        PurgeAuditEntry(
+            operation="source",
+            criteria={"source_type": "claude"},
+            fragments_deleted=3,
+        ),
     )
 
     entries = log.read()
     assert len(entries) == 2
-    assert entries[0].target == "frag-A"
-    assert entries[1].target == "claude"
+    assert entries[0].criteria["fragment_id"] == "frag-A"
+    assert entries[1].criteria["source_type"] == "claude"
 
 
 def test_audit_log_path_location(tmp_path: Path) -> None:
-    """Audit log lives at 00-Creek-Meta/Processing-Log/purge-log.json."""
+    """Audit log lives at 00-Creek-Meta/audit/purge.jsonl."""
     vault = _make_vault(tmp_path)
     log = PurgeAuditLog(vault)
-    log.append(PurgeAuditEntry(operation="vault", target="x", count=0))
+    log.append(PurgeAuditEntry(operation="vault"))
 
-    expected = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    expected = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
     assert expected.exists()
-    data = json.loads(expected.read_text(encoding="utf-8"))
-    assert isinstance(data, list)
-    assert data[0]["operation"] == "vault"
+    lines = expected.read_text(encoding="utf-8").splitlines()
+    payload = json.loads(lines[0])
+    assert payload["operation"] == "vault"
+    assert payload["prev_hash"] == "0" * 64
 
 
-def test_audit_log_recovers_from_corruption(tmp_path: Path) -> None:
-    """Malformed log is rebuilt when appending a new entry."""
+def test_audit_log_chain_detects_tampering(tmp_path: Path) -> None:
+    """Removing the first entry breaks the chain on verify()."""
+    from creek.audit import AuditChainBroken
+
     vault = _make_vault(tmp_path)
     log = PurgeAuditLog(vault)
-    log.log_path.parent.mkdir(parents=True, exist_ok=True)
-    log.log_path.write_text("{not valid json", encoding="utf-8")
+    log.append(PurgeAuditEntry(operation="fragment", criteria={"id": "A"}))
+    log.append(PurgeAuditEntry(operation="fragment", criteria={"id": "B"}))
 
-    log.append(
-        PurgeAuditEntry(operation="fragment", target="frag-A", count=1),
-    )
+    lines = log.log_path.read_text(encoding="utf-8").splitlines()
+    log.log_path.write_text(lines[1] + "\n", encoding="utf-8")
 
-    entries = log.read()
-    assert len(entries) == 1
+    with pytest.raises(AuditChainBroken):
+        log.verify()
 
 
 def test_audit_log_read_missing_returns_empty(tmp_path: Path) -> None:
@@ -537,6 +550,108 @@ def test_audit_log_read_missing_returns_empty(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     log = PurgeAuditLog(vault)
     assert log.read() == []
+
+
+def test_audit_log_migrates_legacy_purge_log(tmp_path: Path) -> None:
+    """Pre-Batch-C purge-log.json is migrated to the new JSONL log."""
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-X",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+
+    assert not legacy_path.exists()
+    assert log.log_path.exists()
+    assert any(
+        (e.operation == "fragment" and "frag-X" in (e.target or ""))
+        or e.criteria.get("target") == "frag-X"
+        for e in entries
+    )
+    assert any(e.operation == "purge.audit.migration" for e in entries)
+
+
+def test_audit_log_legacy_migration_strips_prev_hash(tmp_path: Path) -> None:
+    """Legacy purge entries carrying ``prev_hash`` migrate cleanly.
+
+    Mirrors the provenance migration regression test. Without the
+    sanitiser in :meth:`PurgeAuditLog._migrate_legacy_if_needed`,
+    :meth:`creek.audit.AuditLog.append` would raise ``ValueError`` and
+    abort the entire migration with the legacy file still on disk.
+    """
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-with-prev",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                    "prev_hash": "deadbeef" * 8,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+
+    # Migration completed: legacy file removed, marker recorded.
+    assert not legacy_path.exists()
+    assert any(e.operation == "purge.audit.migration" for e in entries)
+    # Verify the chain — confirms append() did not blow up midway.
+    log.verify()
+    # The migrated entry's prev_hash on disk is the chain hash, not the
+    # legacy value the test seeded.
+    raw = log.log_path.read_text(encoding="utf-8").splitlines()
+    first = json.loads(raw[0])
+    assert first["prev_hash"] == "0" * 64
+
+
+def test_audit_log_concurrent_appends_lose_nothing(tmp_path: Path) -> None:
+    """Threaded appends produce N entries with no losses."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    vault = _make_vault(tmp_path)
+
+    def append_n(worker: int) -> None:
+        log = PurgeAuditLog(vault)
+        for j in range(20):
+            log.append(
+                PurgeAuditEntry(
+                    operation="fragment",
+                    criteria={"worker": worker, "j": j},
+                ),
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(append_n, range(4)))
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+    assert len(entries) == 80
+    log.verify()
 
 
 # ---------------------------------------------------------------------------
@@ -1012,11 +1127,248 @@ def test_audit_log_empty_file_is_treated_as_empty(tmp_path: Path) -> None:
     assert log.read() == []
 
 
-def test_audit_log_non_list_json_is_discarded(tmp_path: Path) -> None:
-    """A top-level non-list JSON value is discarded on read."""
-    vault = _make_vault(tmp_path)
-    log = PurgeAuditLog(vault)
-    log.log_path.parent.mkdir(parents=True, exist_ok=True)
-    log.log_path.write_text('{"not": "a list"}', encoding="utf-8")
+def test_audit_log_legacy_corrupt_json_is_skipped(tmp_path: Path) -> None:
+    """A malformed legacy log is left alone but does not crash readers.
 
-    assert log.read() == []
+    The migration runs (the marker is written so an operator can see
+    that the corrupt file was observed), and the legacy file is then
+    unlinked so subsequent runs do not re-discover it. Asserting the
+    cleanup explicitly closes the gap noted in the PR #193 review.
+    """
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text("{not json", encoding="utf-8")
+
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+
+    assert any(e.operation == "purge.audit.migration" for e in entries)
+    assert not legacy_path.exists()
+
+
+def test_audit_log_migration_with_empty_preexisting_log_does_not_double(
+    tmp_path: Path,
+) -> None:
+    """Empty pre-created log_path + legacy file migrates exactly once.
+
+    Reproduces the edge case flagged in review: an earlier operation
+    may have opened the new JSONL log path in append mode without
+    writing, leaving it on disk at zero bytes. The size guard in
+    :meth:`PurgeAuditLog._migrate_legacy_if_needed` permits the
+    migration to proceed in that case (size > 0 is the only short-
+    circuit). A second construction afterwards must be a no-op,
+    otherwise legacy entries would double on every fresh instance.
+    """
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-empty-precreate",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+    new_log_path = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    new_log_path.parent.mkdir(parents=True, exist_ok=True)
+    new_log_path.touch()
+    assert new_log_path.stat().st_size == 0
+
+    first = PurgeAuditLog(vault)
+    first_entries = first.read()
+    first.verify()
+
+    # Migration ran exactly once: legacy fragment + migration marker.
+    assert not legacy_path.exists()
+    assert len(first_entries) == 2
+    assert first_entries[0].operation == "fragment"
+    assert first_entries[1].operation == "purge.audit.migration"
+
+    # A fresh instance must not re-migrate (legacy is gone, log has size).
+    second_entries = PurgeAuditLog(vault).read()
+    assert len(second_entries) == 2
+    assert [e.operation for e in second_entries] == [
+        "fragment",
+        "purge.audit.migration",
+    ]
+
+
+def test_audit_log_migration_oserror_preserves_legacy_and_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-migration OSError keeps the legacy file and logs the failure.
+
+    Regression for PR #193 review (comment 4367360694 HIGH): without
+    the explicit try/except, a failed ``AuditLog.append`` (disk full,
+    permission flip) would leave the new JSONL with partial content
+    while silently losing the rest of the legacy entries — and the
+    next instance's size guard would treat the partial state as a
+    clean prior migration. The new code re-raises so the caller sees
+    the failure, leaves the legacy file intact, and emits an
+    EXCEPTION-level log entry the operator can act on.
+    """
+    from creek.audit.log import AuditLog
+
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-doomed",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    real_append = AuditLog.append
+
+    def failing_append(self: AuditLog, payload: dict[str, object]) -> None:
+        if payload.get("operation") == "fragment":
+            raise OSError("simulated disk full")
+        real_append(self, payload)
+
+    monkeypatch.setattr(AuditLog, "append", failing_append)
+
+    with caplog.at_level("ERROR", logger="creek.purge.audit"), pytest.raises(OSError):
+        PurgeAuditLog(vault).read()
+
+    # Legacy file preserved so no entries are lost.
+    assert legacy_path.exists()
+    # Operator has a high-signal log line to act on.
+    assert any(
+        "failed mid-write" in record.message and "purge-log.json" in record.message
+        for record in caplog.records
+    )
+
+
+def test_audit_log_orphaned_legacy_file_logs_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Half-migrated state (both files present, JSONL non-empty) is logged.
+
+    Regression for PR #193 review (comment 4367360694 HIGH): the size
+    guard would silently skip migration when both the legacy and new
+    log carried content, leaving an operator unaware that the legacy
+    file was orphaned. The warning makes the inconsistency visible
+    the first time it is encountered.
+    """
+    from creek.audit import AuditLog
+
+    vault = _make_vault(tmp_path)
+    legacy_path = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    new_path = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "operation": "fragment",
+                    "target": "frag-orphan",
+                    "count": 1,
+                    "operator": "legacy",
+                    "dry_run": False,
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+    AuditLog(new_path).append(
+        {
+            "timestamp": "2025-02-01T00:00:00+00:00",
+            "operation": "fragment",
+            "criteria": {"fragment_id": "frag-already"},
+        },
+    )
+
+    with caplog.at_level("WARNING", logger="creek.purge.audit"):
+        PurgeAuditLog(vault).read()
+
+    assert legacy_path.exists()
+    assert any(
+        "skipping migration" in record.message and "purge-log.json" in record.message
+        for record in caplog.records
+    )
+
+
+def test_write_audit_known_operations_use_explicit_allowlist(tmp_path: Path) -> None:
+    """Each known operation routes through the explicit allowlist.
+
+    Pins the contract that ``classifications`` records zero deletions
+    while file-deleting operations report ``fragments_affected`` as
+    ``fragments_deleted``. Replaces the previous string-equality
+    inference (``operation != "classifications"``), which would have
+    silently classified any new operation as file-deleting.
+    """
+    vault = _make_vault(tmp_path)
+    engine = PurgeEngine(vault, dry_run=True)
+
+    for operation in ("fragment", "source", "daterange", "vault"):
+        engine._write_audit(
+            PurgeResult(
+                operation=operation,
+                target=f"target-{operation}",
+                fragments_affected=2,
+                affected_fragment_ids=["frag-A", "frag-B"],
+                dry_run=True,
+            ),
+        )
+    engine._write_audit(
+        PurgeResult(
+            operation="classifications",
+            target="target-classifications",
+            fragments_affected=2,
+            affected_fragment_ids=["frag-A", "frag-B"],
+            dry_run=True,
+        ),
+    )
+
+    entries = engine.audit_log.read()
+    by_op = {e.operation: e for e in entries if e.operation != "purge.audit.migration"}
+    assert by_op["fragment"].fragments_deleted == 2
+    assert by_op["source"].fragments_deleted == 2
+    assert by_op["daterange"].fragments_deleted == 2
+    assert by_op["vault"].fragments_deleted == 2
+    assert by_op["classifications"].fragments_deleted == 0
+
+
+def test_write_audit_rejects_unknown_operation(tmp_path: Path) -> None:
+    """An unknown operation name must raise rather than default-include.
+
+    Defaulting unknown operations to ``deletes_files=True`` would silently
+    over-count deletions whenever a new purge type is introduced. This
+    test pins the explicit-rejection contract so any future operation
+    name is forced through the allowlist.
+    """
+    vault = _make_vault(tmp_path)
+    engine = PurgeEngine(vault)
+
+    with pytest.raises(ValueError, match="Unknown purge operation"):
+        engine._write_audit(
+            PurgeResult(
+                operation="brand-new-op",
+                target="t",
+                fragments_affected=99,
+                dry_run=False,
+            ),
+        )

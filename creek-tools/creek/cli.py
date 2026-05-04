@@ -13,6 +13,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    override_elevates,
+    parse_include_tier,
+    record_privacy_override,
+)
 from creek.config import load_config
 from creek.consent import ConsentManager
 from creek.pipeline import Pipeline, RedactionRequiredError
@@ -21,10 +27,49 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from creek.generate.drafts import DraftLLM
     from creek.ingest.base import Ingestor
     from creek.models import Phase
     from creek.purge import PurgeEngine, PurgeResult
+
+
+_INCLUDE_TIER_HELP = (
+    "Privacy-tier override: open, personal, intimate, or all. "
+    "Default policy excludes intimate fragments and replaces personal "
+    "bodies with title-only summaries. Elevated values are recorded in "
+    "<vault>/00-Creek-Meta/audit/privacy.jsonl."
+)
+
+
+def _parse_include_tier(value: str | None) -> PrivacyTierOverride | None:
+    """Parse --include-tier and exit 2 with a clear error on bad values."""
+    try:
+        return parse_include_tier(value)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+def _audit_privacy_override_if_needed(
+    *,
+    vault_path: Path,
+    command: str,
+    override: PrivacyTierOverride | None,
+    fragment_ids: list[str],
+) -> None:
+    """Append a privacy-override audit entry when *override* elevates."""
+    if not override_elevates(override):
+        return
+    record_privacy_override(
+        vault_path=vault_path,
+        command=command,
+        fragment_ids=fragment_ids,
+        operator=_operator_identity(),
+        override=override,
+    )
+
 
 app = typer.Typer(name="creek", help="Creek knowledge organization pipeline")
 clean_app = typer.Typer(name="clean", help="Vault hygiene commands")
@@ -435,6 +480,7 @@ def _dispatch_redact(
             verbose=verbose,
             assume_yes=assume_yes,
             console=console,
+            vault=vault,
         )
         return
     # Invariant: redact() rejects any flag combination where review is
@@ -594,88 +640,125 @@ def link(
     )
 
 
+def _report_tags(vault_path: Path) -> None:
+    """Generate the tag-garden report."""
+    from creek.generate.tags import TagGardenGenerator
+
+    path = TagGardenGenerator(vault_path=vault_path).generate_garden()
+    console.print(f"[bold green]Tag Garden generated: {path}[/bold green]")
+
+
+def _report_unnamed(vault_path: Path) -> None:
+    """Generate the weekly unnamed-fragment digest."""
+    from datetime import date as _date
+    from datetime import timedelta as _timedelta
+
+    from creek.generate.unnamed import UnnamedDigestGenerator
+    from creek.link.embeddings import EmbeddingLinker
+
+    config = load_config()
+    linker = EmbeddingLinker(config=config.embeddings)
+    digest_generator = UnnamedDigestGenerator(embedding_linker=linker)
+    today = _date.today()
+    week_start = today - _timedelta(days=today.weekday())
+    digest_path = digest_generator.generate_weekly_digest(vault_path, week_start)
+    console.print(
+        f"[bold green]Unnamed digest generated: {digest_path}[/bold green]",
+    )
+
+
+def _report_voice(vault_path: Path) -> None:
+    """Generate per-register voice profiles, if exemplars exist."""
+    from creek.generate.voice import VoiceProfileGenerator
+
+    profile_paths = VoiceProfileGenerator().generate_all_profiles(vault_path)
+    if not profile_paths:
+        console.print(
+            "[yellow]No voice profiles generated: "
+            "no qualifying exemplars found.[/yellow]",
+        )
+        return
+    names = ", ".join(path.stem for path in profile_paths)
+    console.print(
+        f"[bold green]Voice profiles generated ({len(profile_paths)}): "
+        f"{names}[/bold green]",
+    )
+
+
+def _report_wavelength(vault_path: Path, period: str | None) -> None:
+    """Generate weekly or monthly wavelength reports."""
+    from datetime import date as _date
+
+    from creek.generate.wavelength import WavelengthTracker
+
+    if period not in {"weekly", "monthly"}:
+        console.print(
+            "[red]--period must be 'weekly' or 'monthly' for wavelength reports.[/red]",
+        )
+        raise typer.Exit(code=2)
+    tracker = WavelengthTracker()
+    today = _date.today()
+    if period == "weekly":
+        wavelength_path = tracker.generate_weekly_report(vault_path, week_of=today)
+    else:
+        wavelength_path = tracker.generate_monthly_report(vault_path, month=today)
+    console.print(
+        f"[bold green]Wavelength {period} report generated: "
+        f"{wavelength_path}[/bold green]",
+    )
+
+
+_REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
+    "tags": _report_tags,
+    "unnamed": _report_unnamed,
+    "voice": _report_voice,
+}
+
+
 @app.command()
 def report(
     type: str | None = typer.Option(None, help="Report type"),
     period: str | None = typer.Option(None, help="Report period"),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=_INCLUDE_TIER_HELP,
+    ),
 ) -> None:
-    """Generate reports on vault state."""
+    """Generate reports on vault state.
+
+    Privacy override audit: ``report`` flows iterate vault content
+    internally (per-week digests, per-register profiles, …) rather
+    than operating on a caller-supplied fragment list, so the audit
+    entry is **invocation-level** and intentionally carries an empty
+    ``fragment_ids`` list. The ``command`` field encodes the report
+    type (e.g. ``"report.unnamed"``) so operators can still trace
+    *which* report was elevated, even though per-fragment scope is
+    not available. ``mine`` and ``draft`` audit *after* the handler
+    runs because the IDs are derived from mining seeds.
+    """
     config = load_config()
     vault_path = vault or config.vault_path
+    override = _parse_include_tier(include_tier)
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command=f"report.{type}" if type else "report",
+        override=override,
+        fragment_ids=[],
+    )
 
-    if type == "tags":
-        from creek.generate.tags import TagGardenGenerator
-
-        generator = TagGardenGenerator(vault_path=vault_path)
-        path = generator.generate_garden()
-        console.print(f"[bold green]Tag Garden generated: {path}[/bold green]")
-    elif type == "unnamed":
-        from datetime import date as _date
-        from datetime import timedelta as _timedelta
-
-        from creek.generate.unnamed import UnnamedDigestGenerator
-        from creek.link.embeddings import EmbeddingLinker
-
-        linker = EmbeddingLinker(config=config.embeddings)
-        digest_generator = UnnamedDigestGenerator(embedding_linker=linker)
-        today = _date.today()
-        week_start = today - _timedelta(days=today.weekday())
-        digest_path = digest_generator.generate_weekly_digest(
-            vault_path,
-            week_start,
-        )
-        console.print(
-            f"[bold green]Unnamed digest generated: {digest_path}[/bold green]",
-        )
-    elif type == "voice":
-        from creek.generate.voice import VoiceProfileGenerator
-
-        profile_generator = VoiceProfileGenerator()
-        profile_paths = profile_generator.generate_all_profiles(vault_path)
-        if profile_paths:
-            names = ", ".join(path.stem for path in profile_paths)
-            console.print(
-                f"[bold green]Voice profiles generated ({len(profile_paths)}): "
-                f"{names}[/bold green]",
-            )
-        else:
-            console.print(
-                "[yellow]No voice profiles generated: "
-                "no qualifying exemplars found.[/yellow]",
-            )
-    elif type == "wavelength":
-        from datetime import date as _date
-
-        from creek.generate.wavelength import WavelengthTracker
-
-        if period not in {"weekly", "monthly"}:
-            console.print(
-                "[red]--period must be 'weekly' or 'monthly' for "
-                "wavelength reports.[/red]",
-            )
-            raise typer.Exit(code=2)
-        wavelength_tracker = WavelengthTracker()
-        today = _date.today()
-        if period == "weekly":
-            wavelength_path = wavelength_tracker.generate_weekly_report(
-                vault_path,
-                week_of=today,
-            )
-        else:
-            wavelength_path = wavelength_tracker.generate_monthly_report(
-                vault_path,
-                month=today,
-            )
-        console.print(
-            f"[bold green]Wavelength {period} report generated: "
-            f"{wavelength_path}[/bold green]",
-        )
-    else:
-        console.print(
-            f"[bold green]Would report: type={type}, "
-            f"period={period}, vault={vault_path}[/bold green]"
-        )
+    handler = _REPORT_DISPATCH.get(type or "")
+    if handler is not None:
+        handler(vault_path)
+        return
+    if type == "wavelength":
+        _report_wavelength(vault_path, period)
+        return
+    console.print(
+        f"[bold green]Would report: type={type}, "
+        f"period={period}, vault={vault_path}[/bold green]",
+    )
 
 
 @app.command()
@@ -845,6 +928,11 @@ def skills(
     generate: bool = typer.Option(False, help="Generate voice skill files"),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     output: Path | None = typer.Option(None, help="Output path"),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=_INCLUDE_TIER_HELP,
+    ),
 ) -> None:
     """Generate the Voice Skill Tree (Section 11.4).
 
@@ -852,6 +940,19 @@ def skills(
     ``<vault>/creek-skills``) covering frequencies, phases, modes,
     registers, threads, eddies, and two meta skills.
     """
+    override = _parse_include_tier(include_tier)
+    # Skill tree generation already excludes intimate exemplars; the
+    # override is recorded as an explicit operator decision rather
+    # than mutating downstream behaviour. _audit_privacy_override_if_
+    # needed already short-circuits for None / OPEN via override_elev-
+    # ates, so there is no extra guard to write at this call site.
+    _audit_privacy_override_if_needed(
+        vault_path=_resolve_vault(vault),
+        command="skills",
+        override=override,
+        fragment_ids=[],
+    )
+
     if not generate:
         console.print(
             "[yellow]Pass --generate to create the Voice Skill Tree.[/yellow]",
@@ -902,6 +1003,11 @@ def mine(
         10,
         help="Maximum number of seeds to display (0 for all).",
     ),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=_INCLUDE_TIER_HELP,
+    ),
 ) -> None:
     """Mine blog and essay ideas from the vault (Section 11.5).
 
@@ -913,7 +1019,18 @@ def mine(
 
     vault_path = _resolve_vault(vault)
     current_phase = _parse_phase(phase)
-    seeds = IdeaMiner().mine_all(vault_path, current_phase=current_phase)
+    override = _parse_include_tier(include_tier)
+    seeds = IdeaMiner(privacy_override=override).mine_all(
+        vault_path,
+        current_phase=current_phase,
+    )
+    fragment_ids = sorted({fid for seed in seeds for fid in seed.source_fragments})
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="mine",
+        override=override,
+        fragment_ids=fragment_ids,
+    )
     if not seeds:
         console.print("[yellow]No idea seeds surfaced.[/yellow]")
         return
@@ -996,6 +1113,11 @@ def draft(
         "--voice-core",
         help="Path to a voice-core text file prepended to the prompt.",
     ),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=_INCLUDE_TIER_HELP,
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -1011,9 +1133,13 @@ def draft(
     skills_dir = skills_root if skills_root is not None else vault_path / "creek-skills"
     current_phase = _parse_phase(phase)
     voice_text = _read_voice_core(voice_core)
+    override = _parse_include_tier(include_tier)
     llm = _build_draft_llm()
 
-    seeds = IdeaMiner().mine_all(vault_path, current_phase=current_phase)
+    seeds = IdeaMiner(privacy_override=override).mine_all(
+        vault_path,
+        current_phase=current_phase,
+    )
     if not seeds:
         console.print("[yellow]No idea seeds surfaced; nothing to draft.[/yellow]")
         return
@@ -1024,10 +1150,17 @@ def draft(
         raise typer.Exit(code=2)
 
     idea = seeds[index]
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="draft",
+        override=override,
+        fragment_ids=list(idea.source_fragments),
+    )
     generator = DraftGenerator(
         llm=llm,
         skills_root=skills_dir,
         voice_core=voice_text,
+        privacy_override=override,
     )
 
     console.print(generator.present_idea(idea))

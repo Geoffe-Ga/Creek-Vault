@@ -20,18 +20,7 @@ if TYPE_CHECKING:
 from creek.config import CreekConfig
 from creek.pipeline import Pipeline
 
-pytestmark = [
-    pytest.mark.e2e,
-    pytest.mark.xfail(
-        reason=(
-            "INC-005: purge_source does not yet write to "
-            "00-Creek-Meta/Audit. strict=True so when the audit log "
-            "is wired up the test XPASSES, fails CI, and forces "
-            "removal of this xfail marker."
-        ),
-        strict=True,
-    ),
-]
+pytestmark = [pytest.mark.e2e]
 
 
 def test_purge_round_trip_clears_fragments_and_writes_audit(
@@ -66,6 +55,6 @@ def test_purge_round_trip_clears_fragments_and_writes_audit(
         "Purge engine returned None — purge command may be a stub (INC-002)"
     )
 
-    audit_dir = synthetic_vault / "00-Creek-Meta" / "Audit"
+    audit_dir = synthetic_vault / "00-Creek-Meta" / "audit"
     audit_files = list(audit_dir.glob("*"))
-    assert audit_files, "Purge produced no audit log entry — INC-004 / INC-005 sentinel"
+    assert audit_files, "Purge produced no audit log entry"

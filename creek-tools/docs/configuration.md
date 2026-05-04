@@ -274,6 +274,9 @@ Env-vars take precedence over the YAML file. This is how CI runs `creek-tools` a
 | YAML config                    | `<vault>/00-Creek-Meta/creek_config.yaml` |
 | OAuth refresh token            | `<google_drive.token_file>` (default `token.json`, mode `0o600`) |
 | Embedding cache                | `<vault>/00-Creek-Meta/embeddings.parquet` |
-| Audit log (purges, redactions) | `<vault>/00-Creek-Meta/audit/` |
+| Audit log (purges)             | `<vault>/00-Creek-Meta/audit/purge.jsonl` (hash-chained JSONL) |
+| Audit log (redactions)         | `<vault>/00-Creek-Meta/audit/redact.jsonl` (hash-chained JSONL) |
+| Audit log (privacy overrides)  | `<vault>/00-Creek-Meta/audit/privacy.jsonl` (hash-chained JSONL) |
+| Provenance log (ingest)        | `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl` (operational; not compliance-grade) |
 | Review queue                   | Frontmatter on each fragment (`review: pending`) |
 | Skill tree                     | `<vault>/creek-skills/` (override with `creek skills --output`) |
