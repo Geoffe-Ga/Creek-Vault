@@ -349,6 +349,11 @@ class Fragment(BaseModel):
     context: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
+    # BUG-009: the ``[prop-decorator]`` suppression below is a known
+    # mypy / Pydantic-v2 limitation when stacking ``@computed_field``
+    # over ``@property`` — see
+    # https://github.com/pydantic/pydantic/issues/6710. The bytes-on-disk
+    # behaviour is correct; mypy just can't model the descriptor stack.
     @computed_field  # type: ignore[prop-decorator]
     @property
     def voice_proxy_eligible(self) -> bool:

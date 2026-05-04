@@ -147,6 +147,71 @@ def test_progress_file_records_classified_fragment_ids(tmp_path: Path) -> None:
     assert set(recorded_ids) == {"frag-progress001", "frag-progress002"}
 
 
+def test_progress_file_appends_across_runs(tmp_path: Path) -> None:
+    """A second resume run appends to the existing progress file (OPS-001).
+
+    The recovery guarantee depends on the progress file growing —
+    truncating on every invocation would erase the audit trail of
+    fragments classified before a crash. This test seeds two
+    fragments, lets the first run classify only one of them, then
+    seeds a third, runs again, and confirms all three IDs are present
+    in the appended file.
+    """
+    vault = tmp_path / "vault"
+    _seed_unclassified_fragment(
+        vault=vault,
+        frag_id="frag-append0001",
+        title="first",
+    )
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify",
+        side_effect=lambda frag, content="": frag,
+    ):
+        run_classify(
+            vault_path=vault,
+            config=_llm_low_confidence_config(),
+            method="llm",
+            force=False,
+        )
+
+    # Add two more unclassified fragments and resume.
+    _seed_unclassified_fragment(
+        vault=vault,
+        frag_id="frag-append0002",
+        title="second",
+    )
+    _seed_unclassified_fragment(
+        vault=vault,
+        frag_id="frag-append0003",
+        title="third",
+    )
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify",
+        side_effect=lambda frag, content="": frag,
+    ):
+        run_classify(
+            vault_path=vault,
+            config=_llm_low_confidence_config(),
+            method="llm",
+            force=False,
+        )
+
+    progress_file = vault / "00-Creek-Meta" / "Processing-Log" / LLM_PROGRESS_FILENAME
+    recorded_ids = [
+        json.loads(line)["id"]
+        for line in progress_file.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    # The first ID survives the second run (file appended, not truncated).
+    assert set(recorded_ids) == {
+        "frag-append0001",
+        "frag-append0002",
+        "frag-append0003",
+    }
+
+
 def test_progress_file_not_created_for_rules_method(tmp_path: Path) -> None:
     """``--method rules`` does not touch the LLM-progress checkpoint."""
     vault = tmp_path / "vault"

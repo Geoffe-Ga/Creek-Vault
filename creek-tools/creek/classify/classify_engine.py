@@ -48,8 +48,13 @@ from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency
 from creek.vault.reader import try_load_fragment
 
-LLM_PROGRESS_FILENAME = "llm-progress.json"
-"""Per-vault progress log filename written under ``00-Creek-Meta/Processing-Log/``."""
+LLM_PROGRESS_FILENAME = "llm-progress.jsonl"
+"""Per-vault progress log filename written under ``00-Creek-Meta/Processing-Log/``.
+
+Newline-delimited JSON (one ``{"id": ...}`` object per line); the
+``.jsonl`` suffix signals the format honestly to an operator opening
+the file.
+"""
 
 _RESUMABLE_METHODS: frozenset[str] = frozenset({MANUAL_METHOD, LLM_METHOD})
 
@@ -76,9 +81,15 @@ class ClassifySummary:
             ``--method llm`` run that short-circuits to the rule
             result still counts as classified — the work is real and
             the file is rewritten.
-        preserved_manual: Fragments left unchanged because the operator
-            previously stamped them ``method: manual`` and ``--force``
-            was not passed.
+        preserved_manual: Fragments left unchanged because a prior run
+            already settled the classification and ``--force`` was not
+            passed. Covers both ``classification_method: manual`` (the
+            original operator-curated case) and ``classification_method:
+            llm`` (OPS-001 resume — re-running ``--method llm`` after a
+            crash skips fragments already classified by the LLM so the
+            operator does not re-pay for tokens). The field name is
+            kept for backwards compatibility; rename to ``preserved`` is
+            tracked alongside the next CLI message refresh.
         skipped_high_confidence: Subset of ``classified`` for which
             the LLM was not invoked because the rule classifier
             produced a high-confidence answer. The fragment is still
@@ -134,11 +145,14 @@ def run_classify(
     rules = RuleClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
     counts = _RunCounts()
-    progress_path = (
-        vault_path / "00-Creek-Meta" / "Processing-Log" / LLM_PROGRESS_FILENAME
-        if method == LLM_METHOD
-        else None
-    )
+    progress_path: Path | None = None
+    if method == LLM_METHOD:
+        progress_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        # Create the directory once, not per fragment — a 10k-fragment
+        # vault would otherwise issue 10k redundant ``mkdir`` syscalls
+        # in ``_record_llm_progress``.
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        progress_path = progress_dir / LLM_PROGRESS_FILENAME
 
     for md_file in sorted(fragments_root.rglob("*.md")):
         _process_file(
@@ -354,13 +368,15 @@ def _record_llm_progress(progress_path: Path, fragment_id: str) -> None:
     classification proceeds — losing the line costs at most extra log
     output on the next run, never a re-classification.
 
+    The parent directory is created up-front by :func:`run_classify`,
+    so this writer never issues ``mkdir`` per fragment.
+
     Args:
-        progress_path: Destination path. Parent directory is created
-            if missing.
+        progress_path: Destination path under
+            ``<vault>/00-Creek-Meta/Processing-Log/``.
         fragment_id: ID of the fragment just classified by the LLM.
     """
     try:
-        progress_path.parent.mkdir(parents=True, exist_ok=True)
         with progress_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"id": fragment_id}) + "\n")
     except OSError as exc:

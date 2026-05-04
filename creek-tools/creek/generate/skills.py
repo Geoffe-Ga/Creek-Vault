@@ -503,11 +503,17 @@ def _is_snapshot_fragment(fragment: Fragment, *, allow_intimate: bool) -> bool:
     * INTIMATE content is excluded unless the operator passes
       ``allow_intimate=True``; this opt-in matches the user-facing
       ``--include-tier intimate`` switch on the generation CLI.
+
+    The non-INTIMATE branch is exactly :attr:`Fragment.voice_proxy_eligible`;
+    the function does not delegate to the property because
+    ``allow_intimate=True`` deliberately overrides the INTIMATE
+    exclusion that the property bakes in.
     """
-    if str(fragment.source.author) != Authorship.SELF.value:
+    if fragment.source.author != Authorship.SELF:
         return False
-    is_intimate = str(fragment.privacy_tier) == PrivacyTier.INTIMATE.value
-    return allow_intimate or not is_intimate
+    if fragment.privacy_tier == PrivacyTier.INTIMATE:
+        return allow_intimate
+    return True
 
 
 def _collect_fragments(

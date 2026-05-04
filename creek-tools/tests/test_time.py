@@ -37,9 +37,32 @@ def test_now_la_is_tz_aware_in_la() -> None:
     assert moment.utcoffset() == ZoneInfo("America/Los_Angeles").utcoffset(moment)
 
 
-def test_today_la_returns_la_calendar_date() -> None:
-    """``today_la()`` agrees with ``now_la().date()`` regardless of host TZ."""
-    assert today_la() == now_la().date()
+def test_today_la_uses_la_calendar_not_utc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``today_la()`` reads the LA wall calendar, not the UTC one.
+
+    Replaces an earlier circular assertion. We freeze ``datetime.now``
+    inside ``creek.time`` to a moment that is **already the next day
+    in UTC but still the previous day in LA**: 03:30 UTC on May 4
+    = 20:30 PDT on May 3. ``today_la()`` must return ``2026-05-03``;
+    a naive implementation that called ``date.today()`` (host-tz
+    dependent) or ``datetime.now(tz=UTC).date()`` would return
+    ``2026-05-04`` and fail.
+    """
+    import creek.time as creek_time
+
+    utc_moment = datetime(2026, 5, 4, 3, 30, tzinfo=ZoneInfo("UTC"))
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            del tz  # signature must match stdlib; tz argument is unused
+            return utc_moment.astimezone(ZoneInfo("America/Los_Angeles"))
+
+    monkeypatch.setattr(creek_time, "datetime", _FrozenDatetime)
+
+    assert today_la().isoformat() == "2026-05-03"
 
 
 def test_la_tz_constant_matches_zoneinfo() -> None:

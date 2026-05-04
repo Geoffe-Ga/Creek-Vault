@@ -106,8 +106,21 @@ def _build_fragment(
     privacy-tier signal: voice-proxy ineligibility is now a derived
     property (BUG-009) of ``privacy_tier`` and ``source.author``, so
     forcing ineligibility is equivalent to escalating to ``INTIMATE``.
+
+    Mixing ``proxy_eligible=False`` with an explicit non-INTIMATE
+    ``privacy`` is rejected up-front rather than silently overriding
+    the caller's choice — the helper would otherwise hide a real
+    misconfiguration in a future test.
     """
     if not proxy_eligible:
+        if privacy not in (PrivacyTier.PERSONAL, PrivacyTier.INTIMATE):
+            msg = (
+                "_build_fragment(proxy_eligible=False, privacy=...) only accepts "
+                "PERSONAL (default) or INTIMATE; ineligibility is now derived "
+                "from privacy_tier so non-INTIMATE tiers cannot be forced "
+                "ineligible without changing source.author."
+            )
+            raise ValueError(msg)
         privacy = PrivacyTier.INTIMATE
     return Fragment(
         id=frag_id,
