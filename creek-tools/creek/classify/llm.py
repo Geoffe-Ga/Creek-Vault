@@ -693,8 +693,15 @@ class LLMClassifier:
                 ValueError,
                 yaml.YAMLError,
             ) as exc:
+                # OPS-003: include fragment ID + source path so the
+                # operator can find the failing fragment quickly when
+                # scanning logs. Prefix tag matches OPS-003 convention.
                 logger.warning(
-                    "Attempt %d/%d failed for '%s': %s",
+                    "[fragment=%s path=%s provider=%s] "
+                    "Classify attempt %d/%d failed for '%s': %s",
+                    fragment.id,
+                    fragment.source.original_file or "<inline>",
+                    self.config.provider,
                     attempt + 1,
                     self.MAX_RETRIES,
                     fragment.title,
@@ -704,7 +711,11 @@ class LLMClassifier:
                     time.sleep(self.RETRY_DELAY)
 
         logger.error(
+            "[fragment=%s path=%s provider=%s] "
             "All %d retries exhausted for '%s' — returning unchanged",
+            fragment.id,
+            fragment.source.original_file or "<inline>",
+            self.config.provider,
             self.MAX_RETRIES,
             fragment.title,
         )
@@ -765,17 +776,7 @@ class LLMClassifier:
 
             for future in future_iter:
                 idx = futures[future]
-                try:
-                    result = future.result()
-                    ordered[idx] = result
-                    if result.frequency.primary != Frequency.UNCLASSIFIED:
-                        stats.classified += 1
-                except Exception:
-                    logger.exception(
-                        "Unexpected error classifying fragment %d",
-                        idx,
-                    )
-                    stats.failed += 1
+                self._collect_one_result(future, idx, ordered, stats)
 
         logger.info(
             "Batch complete: %d total, %d classified, %d failed",
@@ -784,6 +785,36 @@ class LLMClassifier:
             stats.failed,
         )
         return ordered
+
+    def _collect_one_result(
+        self,
+        future: Future[Fragment],
+        idx: int,
+        ordered: list[Fragment],
+        stats: BatchStats,
+    ) -> None:
+        """Pull a future's result into ``ordered`` and update ``stats`` (OPS-003).
+
+        Extracted from :meth:`classify_batch` so the per-result error
+        path can include the failing fragment's ID and source path
+        without inflating the parent function's complexity.
+        """
+        try:
+            result = future.result()
+            ordered[idx] = result
+            if result.frequency.primary != Frequency.UNCLASSIFIED:
+                stats.classified += 1
+        except Exception:
+            failing = ordered[idx]
+            logger.exception(
+                "[fragment=%s path=%s provider=%s] "
+                "Unexpected error classifying fragment %d",
+                failing.id,
+                failing.source.original_file or "<inline>",
+                self.config.provider,
+                idx,
+            )
+            stats.failed += 1
 
 
 # ---- Private helpers for _apply_classification ----

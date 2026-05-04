@@ -380,9 +380,12 @@ def _record_llm_progress(progress_path: Path, fragment_id: str) -> None:
         with progress_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"id": fragment_id}) + "\n")
     except OSError as exc:
+        # OPS-003: keep the fragment-id prefix so this WARNING is
+        # grep-able alongside other per-fragment failures.
         logger.warning(
-            "Could not append %s to llm-progress checkpoint %s: %s",
+            "[fragment=%s path=%s] Could not append to llm-progress checkpoint %s: %s",
             fragment_id,
+            progress_path,
             progress_path,
             exc,
         )
