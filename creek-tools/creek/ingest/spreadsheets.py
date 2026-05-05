@@ -186,20 +186,6 @@ def _cell_to_str(value: Any) -> str:
     return str(value)
 
 
-CSV_ENCODING_FALLBACKS: tuple[str, ...] = ("utf-8-sig", "cp1252")
-"""Encoding probe order for CSV reads.
-
-``utf-8-sig`` decodes plain UTF-8 *and* strips the UTF-8 BOM that
-Excel emits for "CSV UTF-8" exports. ``cp1252`` is the Windows
-default for legacy Excel "CSV (Comma delimited)" exports — a near
-superset of Latin-1 that decodes any byte sequence without raising,
-so it serves as a guaranteed-success fallback.
-
-A ``chardet`` probe between the two catches non-Western encodings
-(Shift-JIS, GBK, ISO-8859-5, …) that ``cp1252`` would otherwise
-decode silently into mojibake (BUG-010).
-"""
-
 CSV_CHARDET_CONFIDENCE_THRESHOLD: float = 0.7
 """Minimum ``chardet`` confidence required to trust an auto-detected encoding.
 

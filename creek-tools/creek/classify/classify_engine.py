@@ -29,7 +29,6 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
@@ -45,8 +44,8 @@ from creek.classify.constants import (
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.rules import RuleClassifier
-from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency
+from creek.time import now_la
 from creek.vault.reader import try_load_fragment
 
 LLM_PROGRESS_FILENAME = "llm-progress.jsonl"
@@ -354,7 +353,11 @@ def _write_fragment(
     new_metadata = dict(raw)
     new_metadata.update(fragment.model_dump(mode="json"))
     new_metadata[CLASSIFICATION_METHOD_KEY] = method
-    new_metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
+    # BUG-002: route through the shared LA helper rather than calling
+    # ``datetime.now(tz=LA_TZ)`` directly, so every classified_at
+    # timestamp written to disk uses the same code path as every
+    # other LA-anchored timestamp in the pipeline.
+    new_metadata[CLASSIFIED_AT_KEY] = now_la().isoformat()
 
     post = frontmatter.Post(content=body, **new_metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")

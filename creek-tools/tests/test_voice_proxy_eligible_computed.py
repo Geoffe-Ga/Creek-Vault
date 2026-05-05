@@ -46,8 +46,8 @@ def test_personal_tier_self_author_is_eligible() -> None:
     assert frag.voice_proxy_eligible is True
 
 
-def test_public_tier_self_author_is_eligible() -> None:
-    """A PUBLIC self-authored fragment is voice-proxy eligible."""
+def test_open_tier_self_author_is_eligible() -> None:
+    """An OPEN self-authored fragment is voice-proxy eligible (post-INC-003 rename)."""
     frag = _make_fragment(privacy_tier=PrivacyTier.OPEN)
     assert frag.voice_proxy_eligible is True
 

@@ -61,6 +61,44 @@ def test_run_classify_rules_updates_fragments(tmp_path: Path) -> None:
     assert reloaded["classification_method"] == "rules"
 
 
+def test_classified_at_is_la_tz_aware(tmp_path: Path) -> None:
+    """The ``classified_at`` frontmatter timestamp is LA-tz-aware (BUG-002).
+
+    A naive implementation would call ``datetime.now()`` and silently
+    record host-tz timestamps that fail to compare against the LA-tz
+    timestamps elsewhere in the pipeline. Pin the contract.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-classifiedat",
+        title="Power and dominance",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    file = _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="Power dominance control conquest force aggression bold rage warrior",
+    )
+
+    run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    reloaded = frontmatter.load(str(file))
+    classified_at = reloaded["classified_at"]
+    assert isinstance(classified_at, str)
+    parsed = datetime.fromisoformat(classified_at)
+    assert parsed.tzinfo is not None
+    la_offset = ZoneInfo("America/Los_Angeles").utcoffset(parsed)
+    assert parsed.utcoffset() == la_offset
+
+
 def test_run_classify_preserves_manual_without_force(tmp_path: Path) -> None:
     """Manual decisions survive a ``--method rules`` pass."""
     vault = tmp_path / "vault"

@@ -1549,9 +1549,6 @@ def purge_source(
         raise typer.Exit(code=2)
 
     engine = _build_engine(vault, dry_run=dry_run)
-    # source_type guaranteed non-None by the XOR check above when
-    # source_path is None.
-    platform = source_type or ""
     if source_path is not None:
         try:
             count = engine.count_fragments_from_source_path(
@@ -1563,8 +1560,15 @@ def purge_source(
             raise typer.Exit(code=2) from exc
         target_repr = f"source path {source_path!r} (match={match})"
     else:
-        count = engine.count_fragments_from_source(platform)
-        target_repr = f"source platform {platform!r}"
+        # The XOR guard above guarantees source_type is non-None
+        # whenever source_path is None — assert that invariant
+        # explicitly so a future refactor that breaks it surfaces
+        # immediately rather than silently passing an empty platform.
+        assert source_type is not None, (  # nosec B101
+            "XOR guard failed: source_type required when source_path is None"
+        )
+        count = engine.count_fragments_from_source(source_type)
+        target_repr = f"source platform {source_type!r}"
     console.print(
         f"[bold]This will delete {count} fragments from {target_repr}.[/bold]",
     )
@@ -1574,7 +1578,10 @@ def purge_source(
     if source_path is not None:
         result = engine.purge_source_path(source_path, match=match)
     else:
-        result = engine.purge_source(platform)
+        assert source_type is not None, (  # nosec B101
+            "XOR guard failed: source_type required when source_path is None"
+        )
+        result = engine.purge_source(source_type)
     _render_purge_result(result)
 
 
