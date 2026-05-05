@@ -283,3 +283,82 @@ Excluded from this review with rationale:
 - All 10 review dimensions are weighted approximately equally; no dimension was deprioritised.
 
 **Net confidence:** I am highly confident in every Critical and High issue (each was verified in code, with file:line citations). I am moderately confident in the Medium issues. The Low issues are best-effort and worth re-checking before remediation.
+
+---
+
+## 9. Resolution status (post-grooming, 2026-05-05)
+
+Backlog grooming session: see `plans/2026-05-05_BACKLOG_GROOMING.md`.
+
+58 of 60 catalog items are resolved. Their issue files have moved to
+`plans/git-issues/done/`; only outstanding work remains at the top of
+this directory.
+
+| ID | Closing PR | Notes |
+|----|-----------:|:------|
+| ARCH-001 | #195 | `creek ingest --type gdrive` redirect message |
+| ARCH-002 | #195 | `load_config` warns on missing config; `creek init` added |
+| BUG-001 | #190 | Silent close — `_run_ingestion` rewritten to use `assemble_ingested_fragment` |
+| BUG-002 | #195 | `creek/time.py` LA-zone helper sweep |
+| BUG-003 | #190 | LLM gated by rule confidence + human-review-source list |
+| BUG-004 | #190 | `RedactionRequiredError` aborts ingest unless `dry_run` |
+| BUG-005 | #190 | Silent close — ingestor errors forwarded to `result.errors` |
+| BUG-006 | #194 | Atomic create + `threading.Lock` in `VaultWriter` |
+| BUG-007 | #169 | Deterministic `Fragment.id` required at construction |
+| BUG-008 | #190 | Silent close — `write_fragment(body=...)` persists body |
+| BUG-009 | #195 | `voice_proxy_eligible` is a Pydantic computed field |
+| BUG-010 | #195 | CSV decoding probe: utf-8-sig → chardet → cp1252 with WARNING |
+| BUG-011 | #169 | `SourcePlatform.MARKDOWN` added; total `_PLATFORM_SUBFOLDER` mapping |
+| CI-001 | #170 | `./scripts/typecheck.sh` strict; no `\|\| true` |
+| CI-002 | #170 | Pylint `--fail-under=9.0`; complexity blocking |
+| CI-003 | #170 | `./scripts/test.sh` excludes integration/e2e by default |
+| CI-004 | #170 | CI invokes the same scripts as local |
+| DEP-001 | #170 | `anthropic` in `[project.optional-dependencies].anthropic` |
+| DEP-002 | #170 | Optional extras + lazy imports |
+| DEP-003 | #170 | Documented `--ignore-vuln` set |
+| INC-001 | #190 | `creek ingest/classify/link` wired to engines |
+| INC-002 | #190 | `creek review` runner |
+| INC-003 | #195 | `PrivacyTier.PUBLIC` → `OPEN` with deprecation alias |
+| INC-004 | #193 | Audit-log schema matches docs |
+| INC-005 | #193 | Audit-log path moved to `/00-Creek-Meta/audit/purge.jsonl` |
+| INC-007 | #193 | `--include-tier` flag on mine/draft/report/skills |
+| INC-008 | #195 | `purge source --source-path --match {exact,substring,regex}` |
+| INC-009 | #191 | Silent close — `replacement_template` configurable with validator |
+| INC-010 | #190 | `ConsentManager` wired into `creek process`/`ingest` |
+| INC-011 | #190 | `--force` (classify) and `--rebuild` (link) flags |
+| INC-012 | #195 | README ingestor count corrected to 10 + gdrive downloader |
+| INC-013 | #195 | `docs/cleaning-pipeline.md` |
+| INC-014 | #191 | Silent close — IPv4 + IPv6 patterns in `creek/redact/patterns.py` |
+| INC-015 | #193 | `RedactionAuditLog` writes per-file entries from `creek redact --apply` |
+| INC-016 | #191 | Silent close — `min_confidence` on OCR config |
+| INC-017 | #195 | `docs/decisions.md` |
+| INC-018 | #195 | `docs/emergence.md` |
+| OPS-001 | #195 | LLM classify resumable + `llm-progress.jsonl` |
+| OPS-002 | #192 | `purge vault` refuses non-tty without `--force-non-interactive` |
+| OPS-003 | #195 | `[fragment=… path=… provider=…]` log prefix |
+| OPS-004 | #195 | `tqdm` on resonance/threads/eddies hot loops |
+| PERF-001 | #194 | Per-directory `.id-index.jsonl` (O(1) lookup) |
+| PERF-002 | #193 | `provenance.jsonl` append; `AuditLog` JSONL chain |
+| PERF-003 | #194 | Vectorised dedup; optional FAISS `IndexFlatIP` |
+| PERF-004 | #194 | Streaming voice-profile generator with per-register accumulators |
+| SEC-001 | #191 | Luhn post-validator on `credit_card` |
+| SEC-002 | #191 | Silent close — `discord_bot_token`, `github_pat`, `ipv4`, `ipv6` patterns |
+| SEC-003 | #192 | Symlink-escape guard in redact tree walk |
+| SEC-004 | #192 | LLM-prompt sanitiser + `safe_load_all` validator |
+| SEC-005 | #193 | `AuditLog`: `O_APPEND` + `flock` + sha256 chain |
+| SEC-006 | #193 | `privacy_filter` on mining/drafts; `--include-tier` audit |
+| SEC-007 | #192 | `docs/security/threat-model.md` |
+| SEC-008 | #192 | `creek gdrive --revoke` with secure erase |
+| STYLE-002 | #170 | CLAUDE.md paths and thresholds match reality; ADR-0001 added |
+| TEST-001 | #170 | `tests/e2e/` with 7 scenarios (real disk I/O) |
+| TEST-002 | #170 | `coverage-per-file.sh` 80%/65% gate + waivers |
+| TEST-003 | #170 | Hypothesis property tests added |
+| TEST-004 | #170 | `tests/fixtures/{corrupt,encoding,injection,scale,symlinks}/` |
+| TEST-005 | #170 | Hypothesis property tests cover IDs, redaction idempotency, frontmatter |
+
+### Outstanding (still in this directory)
+
+- **`INC-006`** — embeddings cache is `.npz`, not `parquet`; no
+  per-fragment freshness/content-hash invalidation.
+- **`STYLE-001`** — 134 `refurb` + 9 `tryceratops` violations; tools in
+  pre-commit but not in `lint-extended.sh` / CI.
