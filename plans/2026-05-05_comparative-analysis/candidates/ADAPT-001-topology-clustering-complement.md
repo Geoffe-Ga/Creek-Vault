@@ -3,7 +3,7 @@
 **Verdict:** ADAPT
 **Source system:** Graphify
 **Affects:** Creek Vault data layer
-**Roadmap target:** v0.2 (after the compiled layer is committed)
+**Roadmap target:** v1.1 (after the compiled layer is committed)
 **Estimated complexity:** M
 **Conflicts with non-negotiables?** none
 
@@ -32,7 +32,7 @@ Three places the Leiden view becomes useful:
 Two important Creek-flavored adaptations:
 
 1. **Don't drop density-based clustering for Leiden.** Run both. The eddies the user already has are produced by an algorithm tuned to Creek's needs; Leiden is an additional view, not a replacement. Configurable choice in `LinkingConfig`.
-2. **Wavelength-phase as a Leiden constraint.** The vanilla Leiden clusters by edge density alone. A Creek-flavored Leiden could incorporate phase as a node attribute and prefer communities that cohere in phase as well as in topology. This is a research direction, not a v0.2 deliverable, but worth flagging.
+2. **Wavelength-phase as a Leiden constraint.** The vanilla Leiden clusters by edge density alone. A Creek-flavored Leiden could incorporate phase as a node attribute and prefer communities that cohere in phase as well as in topology. This is a research direction, not a v1.1 deliverable, but worth flagging.
 
 Implementation: `graspologic` is what Graphify uses; `python-igraph` and `networkx` both have Leiden bindings. `sentence-transformers` and `scikit-learn` are already Creek dependencies; adding one of these for Leiden is small.
 

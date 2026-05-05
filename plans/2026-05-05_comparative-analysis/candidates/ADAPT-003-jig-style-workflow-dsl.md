@@ -3,7 +3,7 @@
 **Verdict:** ADAPT
 **Source system:** AlfredOS / Jig
 **Affects:** CrawDad agent layer (and creek-tools as the underlying tool surface)
-**Roadmap target:** v0.2 (after MCP surface lands in v1)
+**Roadmap target:** v1.1 (after MCP surface lands in v1.0)
 **Estimated complexity:** M
 **Conflicts with non-negotiables?** none
 
@@ -32,8 +32,11 @@ CrawDad-primary, with creek-tools as the tool registry the workflows compose ove
 
 A sketched Creek-flavored workflow file:
 
+The example below is **illustrative, not prescriptive syntax** — the workflow file format itself is open question #3 in the integration plan. The `{{step.field}}` interpolation is shown only to make step-chaining concrete; whether the real DSL uses Jinja, mustache, or a custom interpolator is a downstream choice. Per "Don't invent syntax" below, the recommendation is YAML or markdown frontmatter, not a custom grammar.
+
 ```yaml
 # crawdad/workflows/substack-draft-phase-transitions.jig.yaml
+# Illustrative only — variable interpolation syntax not specified.
 name: substack-draft-phase-transitions
 description: Draft a Substack post about phase transitions, scoped to recent material.
 trigger: "/draft phase-transitions"
@@ -85,5 +88,5 @@ The skill-based decomposition instinct is correct: each step is a single MCP too
 - Each step in a workflow corresponds to exactly one MCP tool call.
 - Workflows declare `phase_aware` and `privacy_tier_floor` as first-class attributes.
 - The dispatcher refuses to run a workflow when its declared constraints aren't satisfied.
-- At least three reference workflows ship in v0.2: a Substack draft pipeline, a Wavelength check-in, and a Compost surfacing.
+- At least three reference workflows ship in v1.1: a Substack draft pipeline, a Wavelength check-in, and a Compost surfacing.
 - Workflow files are checked into the repo; modifications go through the normal review/version-control flow.

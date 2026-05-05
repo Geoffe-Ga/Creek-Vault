@@ -3,7 +3,7 @@
 **Verdict:** ADAPT
 **Source system:** AlfredOS / `alfred-vault`
 **Affects:** Creek Vault data layer (vocabulary refactor) + CrawDad agent layer (background cadence)
-**Roadmap target:** v0.2 (vocabulary first; background-worker scheduling later)
+**Roadmap target:** v1.1 (vocabulary first; background-worker scheduling later)
 **Estimated complexity:** S (vocabulary refactor) + M (scheduled cadence)
 **Conflicts with non-negotiables?** liminal — must be careful with Distiller (see "Translation")
 
@@ -37,7 +37,7 @@ The renaming clarifies that "what the system does continuously" is one thing wit
 
 Two phases of adoption:
 
-**Phase 1 (v0.2): vocabulary refactor.** Rename the existing CLI subcommand families:
+**Phase 1 (v1.1): vocabulary refactor.** Rename the existing CLI subcommand families:
 
 - `creek curate` (alias-or-replacement for `creek ingest` + `creek classify`)
 - `creek janitor` (alias for `creek clean *`)
@@ -46,7 +46,7 @@ Two phases of adoption:
 
 The existing commands stay; the new names point at the same code paths. `creek lint` (ADOPT-002) becomes a meta-command that runs Distiller + parts of Janitor.
 
-**Phase 2 (v0.3+): scheduled background cadence.** Each worker runs on a schedule (daily Curator on inbox; weekly Janitor; weekly Distiller; nightly Surveyor for incremental re-linking). This requires a workflow runner (see DEFER-002 for Temporal). For personal-use scale, a cron + `creek` CLI is sufficient; durable-workflow infrastructure can wait.
+**Phase 2 (v1.2+): scheduled background cadence.** Each worker runs on a schedule (daily Curator on inbox; weekly Janitor; weekly Distiller; nightly Surveyor for incremental re-linking). This requires a workflow runner (see DEFER-002 for Temporal). For personal-use scale, a cron + `creek` CLI is sufficient; durable-workflow infrastructure can wait.
 
 ## Translation if adapted
 
@@ -70,5 +70,5 @@ The Curator naming is fine; the Janitor naming is fine; the Surveyor naming is f
 - `creek curate`, `creek janitor`, `creek distill`, and `creek survey` commands exist (as aliases or first-class commands; either is fine).
 - The four-worker vocabulary is documented in the README and in the ontology spec or a sibling doc.
 - Distiller's output explicitly routes paradoxes to `10-Liminal/Paradoxes/`, never to a "to-fix" queue. Tested by regression.
-- A scheduled-cadence story is documented (cron is fine for v0.2; durable workflow is DEFER-002).
+- A scheduled-cadence story is documented (cron is fine for v1.1; durable workflow is DEFER-002).
 - The vocabulary is also surfaced in CrawDad's intent schema — `intents` types like `curate.ingest`, `janitor.clean`, `distill.surface`, `survey.link` make the agent layer legible.

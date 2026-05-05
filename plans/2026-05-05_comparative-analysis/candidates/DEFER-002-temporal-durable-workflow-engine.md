@@ -3,7 +3,7 @@
 **Verdict:** DEFER
 **Source system:** AlfredOS / `alfred-vault`
 **Affects:** Both — Creek Vault background workers + CrawDad's long-horizon agent loops
-**Roadmap target:** unscheduled (revisit at v0.4+)
+**Roadmap target:** unscheduled (revisit at v1.3+)
 **Estimated complexity:** L
 **Conflicts with non-negotiables?** none
 
@@ -34,7 +34,7 @@ For now, the integration plan stays with cron + per-step-write-to-disk. The arch
 
 ## Dependencies
 
-- Adjacent to: ADAPT-002 (four-worker decomposition documents the cadence question that Temporal would solve), ADAPT-003 (workflow DSL — Temporal would be the runtime, but a simple step-walker is sufficient for v0.2).
+- Adjacent to: ADAPT-002 (four-worker decomposition documents the cadence question that Temporal would solve), ADAPT-003 (workflow DSL — Temporal would be the runtime, but a simple step-walker is sufficient for v1.1).
 
 ## Acceptance criteria
 

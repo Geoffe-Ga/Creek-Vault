@@ -3,7 +3,7 @@
 **Verdict:** ADAPT
 **Source system:** Graphify
 **Affects:** Creek Vault data layer
-**Roadmap target:** v0.3 (after compile-then-query is settled)
+**Roadmap target:** v1.2 (after compile-then-query is settled)
 **Estimated complexity:** M
 **Conflicts with non-negotiables?** privacy — adapt carefully (see "Translation")
 
@@ -28,7 +28,7 @@ Two new ingestors and one extension:
 2. **`creek ingest --type video`** — extracts the audio track and routes to the audio ingestor. Optionally samples frames for vision-based analysis (deferred — frame-level video understanding is real research and Creek doesn't need it).
 3. **`creek ingest --type image` extension** — adds a Claude-vision pass alongside OCR. Vision output goes into a separate frontmatter field (`vision_description`) so it's distinguishable from OCR text. This does call out to Anthropic, so it's gated by privacy tier and opt-in (`--vision`).
 
-For voice memos specifically, the wavelength-phase classification has high signal: the *prosodic* features (pace, pitch, pause length) are wavelength-relevant, but Whisper drops them. A v0.4+ enhancement would extract prosodic features alongside transcripts; v0.3 just gets the words.
+For voice memos specifically, the wavelength-phase classification has high signal: the *prosodic* features (pace, pitch, pause length) are wavelength-relevant, but Whisper drops them. A v1.3+ enhancement would extract prosodic features alongside transcripts; v1.2 just gets the words.
 
 ## Translation if adapted
 
@@ -38,7 +38,7 @@ Three Creek-specific adaptations:
 2. **Privacy-tier auto-classification of voice memos.** Default tier for an audio-derived fragment is `intimate` until classified otherwise. Force the user to opt in to non-intimate handling. This is stricter than the existing redaction-first policy because voice memos are typically more personal than text exports.
 3. **Vision pass is opt-in per ingestor invocation.** `creek ingest --type image --vision` calls Claude vision; without `--vision`, only OCR runs. Same opt-in discipline as the existing Anthropic-classification path.
 
-The multimodal scope is *not* "video frame analysis" — that's a different research project. v0.3 covers audio (Whisper) and vision-on-images (Claude). Frame-level video is DEFER.
+The multimodal scope is *not* "video frame analysis" — that's a different research project. v1.2 covers audio (Whisper) and vision-on-images (Claude). Frame-level video is DEFER.
 
 ## Dependencies
 

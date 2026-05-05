@@ -3,7 +3,7 @@
 **Verdict:** ADAPT
 **Source system:** Dontoh Alfred (April 2026 follow-up)
 **Affects:** CrawDad agent layer
-**Roadmap target:** v0.2
+**Roadmap target:** v1.1
 **Estimated complexity:** M
 **Conflicts with non-negotiables?** none, but trim the cognitive-science framing
 

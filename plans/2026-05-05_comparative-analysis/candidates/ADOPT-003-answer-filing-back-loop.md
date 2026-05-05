@@ -3,7 +3,7 @@
 **Verdict:** ADOPT
 **Source system:** Karpathy LLM Wiki
 **Affects:** both — Creek Vault data layer + CrawDad agent layer
-**Roadmap target:** v1 (foundational); v0.2 for the CrawDad → vault auto-filing path
+**Roadmap target:** v1 (foundational); v1.1 for the CrawDad → vault auto-filing path
 **Estimated complexity:** M
 **Conflicts with non-negotiables?** none
 
@@ -39,7 +39,7 @@ The save operation needs:
 
 ## Translation if adapted
 
-The destination decision is a classification problem. The simplest viable v1 is to ask the user — `/crawdad save` with a prompt for "thread / eddy / praxis / paradox / unnamed / draft." The smartest v0.2 is to have CrawDad propose the classification and let the user confirm, using the same rules-then-LLM pipeline as `creek classify`.
+The destination decision is a classification problem. The simplest viable v1 is to ask the user — `/crawdad save` with a prompt for "thread / eddy / praxis / paradox / unnamed / draft." The smartest v1.1 is to have CrawDad propose the classification and let the user confirm, using the same rules-then-LLM pipeline as `creek classify`.
 
 Two important rules:
 - **Personal-tier and intimate-tier conversations don't auto-file.** The privacy-tier system in `creek-tools` already gates body content; the save loop must respect it. Default behavior: intimate → never auto-file; personal → save title + summary, not full body; open → full save.
@@ -55,5 +55,5 @@ Two important rules:
 - A `creek save` CLI command exists that takes a body, a target type, optional fragment provenance, and writes a properly-classified note with full frontmatter.
 - The save command honors privacy tiers — intimate content cannot be auto-saved; personal content saves title-only by default.
 - Saved notes carry provenance frontmatter that links back to the conversation/source they came from (Discord message ID for CrawDad, conversation ID for Claude Code, etc.).
-- A `/crawdad save` (or equivalent) interaction is implemented in the CrawDad agent layer (v0.2 milestone) that wraps `creek save` via the MCP server (see ADAPT-004).
+- A `/crawdad save` (or equivalent) interaction is implemented in the CrawDad agent layer (v1.1 milestone) that wraps `creek save` via the MCP server (see ADAPT-004).
 - A regression test verifies that saving a paradox routes to `10-Liminal/Paradoxes/`, not to a synthesis page.

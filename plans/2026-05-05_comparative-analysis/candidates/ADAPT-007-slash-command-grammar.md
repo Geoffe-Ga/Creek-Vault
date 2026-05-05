@@ -3,7 +3,7 @@
 **Verdict:** ADAPT
 **Source system:** Graphify (`/graphify` family)
 **Affects:** CrawDad agent layer + developer's Claude Code experience
-**Roadmap target:** v1 (`/creek` family for Claude Code), v0.2 (`/crawdad` family for Discord)
+**Roadmap target:** v1 (`/creek` family for Claude Code), v1.1 (`/crawdad` family for Discord)
 **Estimated complexity:** S
 **Conflicts with non-negotiables?** none
 
