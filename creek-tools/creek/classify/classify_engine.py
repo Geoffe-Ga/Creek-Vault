@@ -4,14 +4,31 @@ Loads every fragment from ``<vault>/01-Fragments/``, dispatches to the
 configured classifier (rules or LLM), and rewrites each fragment file
 in place with the updated frontmatter. Records the chosen ``method``
 and ``classified_at`` timestamp on each fragment so that subsequent
-``creek classify`` runs can preserve manual decisions.
+``creek classify`` runs can preserve manual decisions and resume
+mid-run after a crash.
+
+Resume contract (OPS-001)
+-------------------------
+
+``creek classify --method llm`` is **resumable by default**:
+
+1. Each fragment's frontmatter is rewritten the moment the LLM call
+   returns, so progress is durable on per-fragment granularity.
+2. Re-running the command short-circuits any fragment whose
+   ``classification_method`` is already ``llm`` (or ``manual``). Pass
+   ``--force`` to re-classify everything from scratch.
+3. The set of fragment IDs touched during the current run is appended
+   to ``<vault>/00-Creek-Meta/Processing-Log/llm-progress.jsonl`` for
+   observability (newline-delimited JSON, one ``{"id": ...}`` object
+   per line); this file is informational and **not** the source of
+   truth — the per-fragment frontmatter is.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
@@ -21,14 +38,25 @@ import yaml
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
     CLASSIFIED_AT_KEY,
+    LLM_METHOD,
     MANUAL_METHOD,
     RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.rules import RuleClassifier
-from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency
+from creek.time import now_la
 from creek.vault.reader import try_load_fragment
+
+LLM_PROGRESS_FILENAME = "llm-progress.jsonl"
+"""Per-vault progress log filename written under ``00-Creek-Meta/Processing-Log/``.
+
+Newline-delimited JSON (one ``{"id": ...}`` object per line); the
+``.jsonl`` suffix signals the format honestly to an operator opening
+the file.
+"""
+
+_RESUMABLE_METHODS: frozenset[str] = frozenset({MANUAL_METHOD, LLM_METHOD})
 
 if TYPE_CHECKING:
     from creek.config import CreekConfig
@@ -53,9 +81,15 @@ class ClassifySummary:
             ``--method llm`` run that short-circuits to the rule
             result still counts as classified — the work is real and
             the file is rewritten.
-        preserved_manual: Fragments left unchanged because the operator
-            previously stamped them ``method: manual`` and ``--force``
-            was not passed.
+        preserved_manual: Fragments left unchanged because a prior run
+            already settled the classification and ``--force`` was not
+            passed. Covers both ``classification_method: manual`` (the
+            original operator-curated case) and ``classification_method:
+            llm`` (OPS-001 resume — re-running ``--method llm`` after a
+            crash skips fragments already classified by the LLM so the
+            operator does not re-pay for tokens). The field name is
+            kept for backwards compatibility; rename to ``preserved`` is
+            tracked alongside the next CLI message refresh.
         skipped_high_confidence: Subset of ``classified`` for which
             the LLM was not invoked because the rule classifier
             produced a high-confidence answer. The fragment is still
@@ -111,6 +145,14 @@ def run_classify(
     rules = RuleClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
     counts = _RunCounts()
+    progress_path: Path | None = None
+    if method == LLM_METHOD:
+        progress_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        # Create the directory once, not per fragment — a 10k-fragment
+        # vault would otherwise issue 10k redundant ``mkdir`` syscalls
+        # in ``_record_llm_progress``.
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        progress_path = progress_dir / LLM_PROGRESS_FILENAME
 
     for md_file in sorted(fragments_root.rglob("*.md")):
         _process_file(
@@ -121,6 +163,7 @@ def run_classify(
             llm=llm,
             confidence_threshold=config.classification.confidence_threshold,
             counts=counts,
+            progress_path=progress_path,
         )
 
     return ClassifySummary(
@@ -144,17 +187,23 @@ def _process_file(
     llm: LLMClassifier | None,
     confidence_threshold: float,
     counts: _RunCounts,
+    progress_path: Path | None,
 ) -> None:
     """Classify a single fragment file and update ``counts`` in place.
 
     Args:
         md_file: The file to consider.
         method: ``"rules"`` or ``"llm"``.
-        force: Whether to overwrite manual classifications.
+        force: Whether to overwrite previously-classified fragments.
         rules: Shared :class:`RuleClassifier` instance.
         llm: Shared :class:`LLMClassifier` (when ``method == "llm"``).
         confidence_threshold: Threshold below which the LLM is invoked.
         counts: Mutable per-run counters; mutated in place.
+        progress_path: Optional path to the LLM-progress checkpoint file
+            (OPS-001). When set, the fragment ID is appended after a
+            successful LLM classification. Manual / rules-shortcircuit
+            paths are not appended — only paid LLM calls need to be
+            recovered on resume.
     """
     try:
         record = _read_fragment(md_file)
@@ -171,7 +220,11 @@ def _process_file(
     counts.total += 1
     fragment, body, raw = record
 
-    if not force and raw.get(CLASSIFICATION_METHOD_KEY) == MANUAL_METHOD:
+    # Skip fragments whose previous run already settled the classification:
+    # ``manual`` is operator-curated; ``llm`` is a paid LLM call we don't
+    # want to repeat after a crash (OPS-001 resume contract). Pass
+    # ``--force`` to re-classify everything.
+    if not force and raw.get(CLASSIFICATION_METHOD_KEY) in _RESUMABLE_METHODS:
         counts.preserved += 1
         return
 
@@ -204,6 +257,8 @@ def _process_file(
     counts.classified += 1
     if was_skipped:
         counts.skipped += 1
+    elif progress_path is not None and write_method == LLM_METHOD:
+        _record_llm_progress(progress_path, new_fragment.id)
 
 
 def _classify_one(
@@ -298,7 +353,46 @@ def _write_fragment(
     new_metadata = dict(raw)
     new_metadata.update(fragment.model_dump(mode="json"))
     new_metadata[CLASSIFICATION_METHOD_KEY] = method
-    new_metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
+    # BUG-002: route through the shared LA helper rather than calling
+    # ``datetime.now(tz=LA_TZ)`` directly, so every classified_at
+    # timestamp written to disk uses the same code path as every
+    # other LA-anchored timestamp in the pipeline.
+    new_metadata[CLASSIFIED_AT_KEY] = now_la().isoformat()
 
     post = frontmatter.Post(content=body, **new_metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def _record_llm_progress(progress_path: Path, fragment_id: str) -> None:
+    """Append *fragment_id* to the per-vault LLM-progress checkpoint (OPS-001).
+
+    The progress file is informational: the per-fragment frontmatter is
+    the source of truth for "this was classified by the LLM". Failing
+    to write the checkpoint is logged at ``WARNING`` and the
+    classification proceeds — losing the line costs at most extra log
+    output on the next run, never a re-classification.
+
+    The parent directory is created up-front by :func:`run_classify`,
+    so this writer never issues ``mkdir`` per fragment.
+
+    Args:
+        progress_path: Destination path under
+            ``<vault>/00-Creek-Meta/Processing-Log/``.
+        fragment_id: ID of the fragment just classified by the LLM.
+    """
+    try:
+        with progress_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"id": fragment_id}) + "\n")
+    except OSError as exc:
+        # OPS-003: keep the fragment-id prefix so this WARNING is
+        # grep-able alongside other per-fragment failures. ``checkpoint=``
+        # rather than ``path=`` because the file path here is the
+        # progress checkpoint, not the fragment's source — the OPS-003
+        # convention reserves ``path=`` for ``source.original_file``.
+        logger.warning(
+            "[fragment=%s checkpoint=%s] "
+            "Could not append to llm-progress checkpoint: %s",
+            fragment_id,
+            progress_path,
+            exc,
+        )

@@ -215,8 +215,10 @@ class ContextExtractor:
 def _enforce_constraints(fragment: Fragment) -> Fragment:
     """Apply universal constraints to a non-self fragment.
 
-    - Sets ``voice_proxy_eligible`` to ``False``.
     - Downgrades ``intimate`` privacy tier to ``personal``.
+    - ``voice_proxy_eligible`` is a derived property (BUG-009): non-self
+      fragments are excluded automatically because the property requires
+      ``source.author == Authorship.SELF``. No explicit write needed.
 
     Args:
         fragment: The fragment to constrain.
@@ -225,7 +227,6 @@ def _enforce_constraints(fragment: Fragment) -> Fragment:
         A deep copy of the fragment with constraints applied.
     """
     updated = fragment.model_copy(deep=True)
-    updated.voice_proxy_eligible = False
 
     if updated.privacy_tier == PrivacyTier.INTIMATE:
         updated.privacy_tier = PrivacyTier.PERSONAL

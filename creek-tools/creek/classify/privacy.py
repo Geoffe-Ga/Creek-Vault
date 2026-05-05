@@ -15,7 +15,7 @@ Section 13.2 of the Creek Ontology defines three privacy tiers:
   by content signals.
 
 When in doubt the classifier returns :class:`PrivacyTier.PERSONAL`
-rather than :class:`PrivacyTier.PUBLIC` — leaking content the user
+rather than :class:`PrivacyTier.OPEN` — leaking content the user
 considered private is far worse than the inverse.
 """
 
@@ -113,7 +113,7 @@ class PrivacyClassifier:
         1. Self-authored + recovery keyword in title or body → ``INTIMATE``.
         2. Self-authored journal source → ``INTIMATE``.
         3. Self-authored confessional register with conviction → ``INTIMATE``.
-        4. Essay source → :class:`PrivacyTier.PUBLIC`.
+        4. Essay source → :class:`PrivacyTier.OPEN`.
         5. Discord with a non-DM channel name → ``PUBLIC``.
         6. Anything else (chatbots, DMs, unmapped sources, AI-authored
            content with sensitive keywords) → ``PERSONAL``.
@@ -141,7 +141,7 @@ class PrivacyClassifier:
             if self._is_high_confidence_confessional(fragment):
                 return PrivacyTier.INTIMATE
         if platform == SourcePlatform.ESSAY:
-            return PrivacyTier.PUBLIC
+            return PrivacyTier.OPEN
         if platform == SourcePlatform.DISCORD:
             return self._classify_discord(fragment)
         # Chatbots, DMs, unmapped sources, AI-authored sensitive content
@@ -155,29 +155,21 @@ class PrivacyClassifier:
     ) -> Fragment:
         """Apply *tier*-specific handling rules and return a new fragment.
 
-        The resulting fragment carries:
-
-        * ``privacy_tier`` set to *tier*.
-        * ``voice_proxy_eligible`` set to ``False`` for ``INTIMATE`` and
-          ``True`` for ``PUBLIC`` and ``PERSONAL``. The reset on
-          downgrade matters: a fragment previously enforced as
-          ``INTIMATE`` and later re-classified to ``PERSONAL`` would
-          otherwise stay opted out of voice proxy generation.
+        The resulting fragment carries ``privacy_tier`` set to *tier*.
+        ``voice_proxy_eligible`` is a derived property
+        (:class:`Fragment.voice_proxy_eligible`, BUG-009) computed from
+        ``privacy_tier`` and ``source.author``, so re-classification
+        between tiers automatically flips eligibility without requiring
+        a paired write.
 
         Args:
             fragment: The fragment to update. Not mutated.
             tier: The privacy tier to apply.
 
         Returns:
-            A new :class:`Fragment` with ``privacy_tier`` and
-            ``voice_proxy_eligible`` set to match *tier*.
+            A new :class:`Fragment` with ``privacy_tier`` set to *tier*.
         """
-        return fragment.model_copy(
-            update={
-                "privacy_tier": tier,
-                "voice_proxy_eligible": tier != PrivacyTier.INTIMATE,
-            },
-        )
+        return fragment.model_copy(update={"privacy_tier": tier})
 
     def classify_and_enforce(
         self,
@@ -237,4 +229,4 @@ class PrivacyClassifier:
         tokens = {token for token in _CHANNEL_TOKEN_SPLIT.split(channel) if token}
         if tokens & _PRIVATE_DISCORD_TOKENS:
             return PrivacyTier.PERSONAL
-        return PrivacyTier.PUBLIC
+        return PrivacyTier.OPEN

@@ -7,11 +7,11 @@ mandatory human review.
 """
 
 import logging
-from datetime import datetime
 from pathlib import Path
 
 from creek.config import ClassificationConfig
 from creek.models import Confidence, Fragment, Frequency, PrivacyTier
+from creek.time import now_la
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ class ReviewQueueGenerator:
             len(fragments),
         )
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        timestamp = now_la().strftime("%Y-%m-%d_%H%M%S")
         filename = f"review-queue-{timestamp}.md"
         output_path = vault_path / filename
 
@@ -120,7 +120,7 @@ class ReviewQueueGenerator:
         lines: list[str] = [
             "# Classification Review Queue",
             "",
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Generated: {now_la().strftime('%Y-%m-%d %H:%M:%S %Z')}",
             f"Fragments to review: {len(fragments)}",
             "",
         ]

@@ -157,11 +157,15 @@ See [`docs/configuration.md`](docs/configuration.md) for the full schema with ex
 
 ## Source platforms
 
-The ingestion pipeline currently supports **12** source platforms, each backed by a registered `Ingestor`:
+The ingestion pipeline currently ships **10** registered `Ingestor`s plus a read-only Google Drive downloader that routes mirrored files back through the matching ingestor:
 
-`claude`, `chatgpt`, `discord`, `gdrive`, `code`, `documents` (.docx / .pdf), `markdown`, `spreadsheet` (.xlsx / .csv), `presentation` (.pptx), `images` (with OCR), `generic` (fallback for unknown text), and `other`.
+`claude`, `chatgpt`, `discord`, `code`, `document` (.docx / .pdf), `markdown`, `spreadsheet` (.xlsx / .csv), `presentation` (.pptx), `image` (with OCR), and `generic` (fallback for unknown text).
+
+`gdrive` is a downloader, not an ingestor — it stages files locally and dispatches each one to the appropriate ingestor by extension. The `other` enum value on `SourcePlatform` is reserved for downstream consumers (e.g. fragments synthesised from praxes) and has no parser.
 
 Each ingestor follows the same four-stage contract — `discover` → `parse` → `convert_to_markdown` → `generate_frontmatter` — and writes one fragment per logical unit (per chat thread, per sheet, per slide deck, per file). See [`docs/ingestion.md`](docs/ingestion.md) for which is right for which export.
+
+The pinned count is exercised by `tests/test_ingest_registry.py` so any change to `INGESTOR_REGISTRY` lights up red until this paragraph is updated alongside it.
 
 ---
 

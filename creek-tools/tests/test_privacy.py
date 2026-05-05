@@ -57,7 +57,7 @@ class TestClassifyTier:
         """Essays are published outputs and get the PUBLIC tier."""
         classifier = PrivacyClassifier()
         frag = _make_fragment(platform=SourcePlatform.ESSAY)
-        assert classifier.classify_tier(frag) == PrivacyTier.PUBLIC
+        assert classifier.classify_tier(frag) == PrivacyTier.OPEN
 
     def test_journal_source_is_intimate(self) -> None:
         """Journal entries are always treated as INTIMATE."""
@@ -91,13 +91,13 @@ class TestClassifyTier:
         """Discord channels in named guild rooms are treated as PUBLIC."""
         classifier = PrivacyClassifier()
         frag = _make_fragment(platform=SourcePlatform.DISCORD, channel="general")
-        assert classifier.classify_tier(frag) == PrivacyTier.PUBLIC
+        assert classifier.classify_tier(frag) == PrivacyTier.OPEN
 
     def test_discord_admin_channel_is_not_falsely_personal(self) -> None:
         """``admin`` contains the ``dm`` substring but is not a DM token."""
         classifier = PrivacyClassifier()
         frag = _make_fragment(platform=SourcePlatform.DISCORD, channel="admin")
-        assert classifier.classify_tier(frag) == PrivacyTier.PUBLIC
+        assert classifier.classify_tier(frag) == PrivacyTier.OPEN
 
     def test_discord_without_channel_is_personal(self) -> None:
         """Discord without channel metadata defaults to PERSONAL (safer)."""
@@ -277,9 +277,9 @@ class TestEnforceTier:
         """PUBLIC content remains voice-proxy eligible."""
         classifier = PrivacyClassifier()
         frag = _make_fragment()
-        result = classifier.enforce_tier(frag, PrivacyTier.PUBLIC)
+        result = classifier.enforce_tier(frag, PrivacyTier.OPEN)
         assert result.voice_proxy_eligible is True
-        assert result.privacy_tier == PrivacyTier.PUBLIC
+        assert result.privacy_tier == PrivacyTier.OPEN
 
     def test_personal_keeps_voice_proxy_enabled(self) -> None:
         """PERSONAL content remains voice-proxy eligible."""
@@ -320,8 +320,8 @@ class TestEnforceTier:
         classifier = PrivacyClassifier()
         frag = _make_fragment()
         intimate = classifier.enforce_tier(frag, PrivacyTier.INTIMATE)
-        promoted = classifier.enforce_tier(intimate, PrivacyTier.PUBLIC)
-        assert promoted.privacy_tier == PrivacyTier.PUBLIC
+        promoted = classifier.enforce_tier(intimate, PrivacyTier.OPEN)
+        assert promoted.privacy_tier == PrivacyTier.OPEN
         assert promoted.voice_proxy_eligible is True
 
 
@@ -344,7 +344,7 @@ class TestClassifyAndEnforce:
         classifier = PrivacyClassifier()
         frag = _make_fragment(platform=SourcePlatform.ESSAY)
         result = classifier.classify_and_enforce(frag)
-        assert result.privacy_tier == PrivacyTier.PUBLIC
+        assert result.privacy_tier == PrivacyTier.OPEN
         assert result.voice_proxy_eligible is True
 
     def test_recovery_content_via_one_shot_method(self) -> None:
@@ -398,7 +398,7 @@ class TestReviewQueueIntegration:
             source=FragmentSource(platform=SourcePlatform.ESSAY),
             frequency=FrequencyClassification(primary=Frequency.F3),
             voice=VoiceClassification(confidence=Confidence.SETTLED),
-            privacy_tier=PrivacyTier.PUBLIC,
+            privacy_tier=PrivacyTier.OPEN,
         )
         assert generator.needs_review(frag) is False
 

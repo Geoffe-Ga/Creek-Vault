@@ -92,6 +92,39 @@ def test_ingest_command_rejects_unknown_type(tmp_path: Path) -> None:
     assert "Unknown ingestor type" in result.output
 
 
+def test_ingest_command_gdrive_type_redirects_to_two_stage_flow(
+    tmp_path: Path,
+) -> None:
+    """``--type gdrive`` prints the two-stage flow rather than the generic error.
+
+    ARCH-001: ``gdrive`` is a downloader, not an ingestor. The CLI
+    must direct the operator to ``creek gdrive --download`` followed
+    by the appropriate ``--type document`` / ``--type spreadsheet``
+    rather than failing with the bland "Unknown ingestor type" message.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+    src = tmp_path / "in"
+    src.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "gdrive",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "gdrive is a downloader" in result.output
+    assert "creek gdrive --download" in result.output
+
+
 def test_ingest_command_writes_fragments(tmp_path: Path) -> None:
     """The ingest command resolves the registry and writes fragments."""
     vault = tmp_path / "vault"

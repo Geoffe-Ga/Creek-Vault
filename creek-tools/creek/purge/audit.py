@@ -6,6 +6,17 @@ entry captures the timestamp, operation, criteria dict, affected
 fragment IDs, deletion counts, references scrubbed, embeddings removed,
 operator, and dry-run flag.
 
+Timezone (BUG-002): purge-audit entries deliberately stamp ``UTC``
+rather than ``America/Los_Angeles`` (the rest of the pipeline). The
+audit chain is forensic infrastructure — its consumers are operators
+investigating an incident, log-aggregation tooling, and downstream
+pipelines that may run on hosts in any timezone. UTC is the portable
+default for that audience and is what every other tamper-evident log
+in the repo (vault-writer provenance, redaction audit, privacy
+elevation audit) also uses. Fragment / thread / eddy timestamps stay
+on LA per ontology §8.3 because they describe the user's lived
+experience; audit timestamps describe a machine event.
+
 Backward compatibility: an existing legacy
 ``<vault>/00-Creek-Meta/Processing-Log/purge-log.json`` file is migrated
 into the new JSONL log on first read or write, then removed. The

@@ -259,9 +259,21 @@ def _resolve_ingestor(type_name: str) -> type[Ingestor]:
     cls = INGESTOR_REGISTRY.get(type_name)
     if cls is None:
         known = ", ".join(sorted(INGESTOR_REGISTRY.keys()))
-        console.print(
-            f"[red]Unknown ingestor type {type_name!r}. Known types: {known}[/red]",
-        )
+        if type_name == "gdrive":
+            # ARCH-001: gdrive is a downloader, not an ingestor. Direct
+            # the operator to the two-stage flow rather than failing
+            # with a generic "unknown type" message.
+            console.print(
+                "[red]gdrive is a downloader, not an ingestor. Run "
+                "[bold]creek gdrive --download --staging <dir>[/bold] to mirror "
+                "Drive files locally, then point the appropriate ingestor at "
+                "the staging directory (e.g. [bold]creek ingest --type document "
+                "--input <dir>[/bold] for .docx / .pdf files).[/red]",
+            )
+        else:
+            console.print(
+                f"[red]Unknown ingestor type {type_name!r}. Known types: {known}[/red]",
+            )
         raise typer.Exit(code=2)
     return cls
 
@@ -321,6 +333,47 @@ def _run_ingest(
         written += 1
 
     return written, errors
+
+
+@app.command()
+def init(
+    vault: Path = typer.Option(..., help="Vault root to initialise"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite an existing creek_config.yaml.",
+    ),
+) -> None:
+    """Write a starter ``creek_config.yaml`` under the vault (ARCH-002).
+
+    A vault without a config silently picks up the built-in defaults,
+    which rarely match what a careful operator wants. ``creek init``
+    materialises a starter config at
+    ``<vault>/00-Creek-Meta/creek_config.yaml`` so the operator can
+    edit a real file with their own privacy / redaction / cleaning
+    decisions before any ingestion runs.
+
+    Existing files are preserved unless ``--force`` is passed.
+    """
+    from creek.config import generate_default_config
+
+    config_dir = vault / "00-Creek-Meta"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "creek_config.yaml"
+    if config_path.exists() and not force:
+        console.print(
+            f"[yellow]{config_path} already exists; "
+            "pass --force to overwrite.[/yellow]",
+        )
+        raise typer.Exit(code=1)
+    generate_default_config(config_path)
+    console.print(
+        f"[bold green]Wrote starter config to {config_path}.[/bold green]",
+    )
+    console.print(
+        "[dim]Edit it before running [bold]creek process[/bold] — the "
+        "defaults are intentionally cautious.[/dim]",
+    )
 
 
 @app.command()
@@ -1425,11 +1478,41 @@ def purge_fragment(
     _render_purge_result(result)
 
 
+def _purge_source_match_modes() -> tuple[str, ...]:
+    """Return the canonical ``--match`` modes for ``purge source --source-path``.
+
+    Reuses :data:`creek.purge.engine.SOURCE_PATH_MATCH_MODES` (INC-008
+    review nit) so the CLI usage error can never drift from the engine
+    validator. Returned as a sorted tuple for deterministic CLI help
+    output.
+    """
+    from creek.purge.engine import SOURCE_PATH_MATCH_MODES
+
+    return tuple(sorted(SOURCE_PATH_MATCH_MODES))
+
+
 @purge_app.command(name="source")
 def purge_source(
-    source_type: str = typer.Argument(
-        ...,
-        help="Source platform (e.g. claude, discord)",
+    source_type: str | None = typer.Argument(
+        None,
+        help=(
+            "Source platform (e.g. claude, discord). Mutually exclusive "
+            "with --source-path."
+        ),
+    ),
+    source_path: str | None = typer.Option(
+        None,
+        "--source-path",
+        help=(
+            "Match against source.original_file in each fragment's "
+            "frontmatter (INC-008). Use with --match to choose the "
+            "comparison mode."
+        ),
+    ),
+    match: str = typer.Option(
+        "exact",
+        "--match",
+        help="How --source-path is compared: exact | substring | regex.",
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     dry_run: bool = typer.Option(False, help="Preview changes without deleting"),
@@ -1440,16 +1523,65 @@ def purge_source(
         help="Skip interactive confirmation",
     ),
 ) -> None:
-    """Delete every fragment ingested from a given source."""
+    """Delete every fragment ingested from a given source.
+
+    Two modes:
+
+    * Positional ``SOURCE_TYPE`` matches against ``source.platform``
+      (e.g. ``claude``, ``discord``) — the original behaviour.
+    * ``--source-path`` matches against ``source.original_file`` with
+      a configurable ``--match`` mode (INC-008): ``exact`` (default),
+      ``substring``, or ``regex``.
+
+    The two are mutually exclusive; pass exactly one.
+    """
+    if (source_type is None) == (source_path is None):
+        console.print(
+            "[red]Pass exactly one of SOURCE_TYPE or --source-path.[/red]",
+        )
+        raise typer.Exit(code=2)
+    valid_modes = _purge_source_match_modes()
+    if match not in valid_modes:
+        console.print(
+            f"[red]Unknown --match {match!r}; expected one of "
+            f"{', '.join(valid_modes)}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
     engine = _build_engine(vault, dry_run=dry_run)
-    count = engine.count_fragments_from_source(source_type)
+    if source_path is not None:
+        try:
+            count = engine.count_fragments_from_source_path(
+                source_path,
+                match=match,
+            )
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2) from exc
+        target_repr = f"source path {source_path!r} (match={match})"
+    else:
+        # The XOR guard above guarantees source_type is non-None
+        # whenever source_path is None — assert that invariant
+        # explicitly so a future refactor that breaks it surfaces
+        # immediately rather than silently passing an empty platform.
+        assert source_type is not None, (  # nosec B101
+            "XOR guard failed: source_type required when source_path is None"
+        )
+        count = engine.count_fragments_from_source(source_type)
+        target_repr = f"source platform {source_type!r}"
     console.print(
-        f"[bold]This will delete {count} fragments from {source_type!r}.[/bold]",
+        f"[bold]This will delete {count} fragments from {target_repr}.[/bold]",
     )
     if not dry_run and not _confirm("Continue?", assume_yes=yes):
         console.print("[yellow]Aborted.[/yellow]")
         return
-    result = engine.purge_source(source_type)
+    if source_path is not None:
+        result = engine.purge_source_path(source_path, match=match)
+    else:
+        assert source_type is not None, (  # nosec B101
+            "XOR guard failed: source_type required when source_path is None"
+        )
+        result = engine.purge_source(source_type)
     _render_purge_result(result)
 
 

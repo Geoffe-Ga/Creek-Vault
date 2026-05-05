@@ -331,6 +331,139 @@ def test_source_count_matches(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Engine tests — purge_source_path with match modes (INC-008)
+# ---------------------------------------------------------------------------
+
+
+def _write_fragment_with_original(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    original_file: str,
+) -> Path:
+    """Write a fragment with an explicit ``source.original_file`` path."""
+    target = vault / "01-Fragments" / "Conversations" / f"{title}.md"
+    metadata: dict[str, object] = {
+        "id": frag_id,
+        "title": title,
+        "type": "fragment",
+        "source": {"platform": "claude", "original_file": original_file},
+        "threads": [],
+        "eddies": [],
+        "frequency": {"primary": "F3", "secondary": []},
+        "wavelength": {
+            "phase": "rising",
+            "mode": "inhabit",
+            "orientation": "do",
+            "dosage": "medicine",
+            "color": "orange",
+            "descriptor": "bright",
+        },
+        "voice": {"voice_register": "analytical", "confidence": "settled"},
+    }
+    target.write_text(frontmatter.dumps(frontmatter.Post(content="x", **metadata)))
+    return target
+
+
+def test_purge_source_path_exact_match(tmp_path: Path) -> None:
+    """``--match exact`` deletes only the fragment with the exact path (INC-008)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault, "frag-A", "Alpha", original_file="/exports/claude/2026-04-28.json"
+    )
+    _write_fragment_with_original(
+        vault, "frag-B", "Bravo", original_file="/exports/claude/2026-04-29.json"
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source_path("/exports/claude/2026-04-28.json", match="exact")
+
+    assert result.fragments_affected == 1
+    remaining = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(remaining) == 1
+    assert remaining[0].name == "Bravo.md"
+
+
+def test_purge_source_path_substring_match(tmp_path: Path) -> None:
+    """``--match substring`` deletes every fragment whose path contains the term."""
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault, "frag-A", "Alpha", original_file="/exports/2026-04-28.json"
+    )
+    _write_fragment_with_original(
+        vault, "frag-B", "Bravo", original_file="/exports/2026-04-29.json"
+    )
+    _write_fragment_with_original(
+        vault, "frag-C", "Charlie", original_file="/notes/diary.md"
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source_path("/exports/", match="substring")
+
+    assert result.fragments_affected == 2
+    remaining = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(remaining) == 1
+    assert remaining[0].name == "Charlie.md"
+
+
+def test_purge_source_path_regex_match(tmp_path: Path) -> None:
+    """``--match regex`` accepts a regex pattern and deletes matching fragments."""
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault, "frag-A", "Alpha", original_file="/exports/2026-04-28.json"
+    )
+    _write_fragment_with_original(
+        vault, "frag-B", "Bravo", original_file="/exports/2026-04-29.json"
+    )
+    _write_fragment_with_original(
+        vault, "frag-C", "Charlie", original_file="/notes/diary.md"
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source_path(r"2026-04-2[89]\.json$", match="regex")
+
+    assert result.fragments_affected == 2
+    remaining = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(remaining) == 1
+    assert remaining[0].name == "Charlie.md"
+
+
+def test_purge_source_path_invalid_regex_raises(tmp_path: Path) -> None:
+    """A bad regex fails fast with ``ValueError`` rather than silently mismatching."""
+    vault = _make_vault(tmp_path)
+    engine = PurgeEngine(vault)
+
+    with pytest.raises(ValueError, match="Invalid regex"):
+        engine.purge_source_path("[unclosed", match="regex")
+
+
+def test_purge_source_path_unknown_match_mode_raises(tmp_path: Path) -> None:
+    """Unknown match modes are rejected up-front."""
+    vault = _make_vault(tmp_path)
+    engine = PurgeEngine(vault)
+
+    with pytest.raises(ValueError, match="Unknown match mode"):
+        engine.purge_source_path("/anywhere", match="fuzzy")
+
+
+def test_purge_source_path_audit_records_match_mode(tmp_path: Path) -> None:
+    """The audit entry captures both ``source_path`` and ``match`` (INC-008)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault, "frag-A", "Alpha", original_file="/exports/2026-04-28.json"
+    )
+    engine = PurgeEngine(vault)
+
+    engine.purge_source_path("/exports/", match="substring")
+
+    audit_entries = PurgeAuditLog(vault).read()
+    assert audit_entries[-1].operation == "source-path"
+    assert audit_entries[-1].criteria["source_path"] == "/exports/"
+    assert audit_entries[-1].criteria["match"] == "substring"
+
+
+# ---------------------------------------------------------------------------
 # Engine tests — purge_classifications
 # ---------------------------------------------------------------------------
 

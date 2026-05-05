@@ -32,8 +32,11 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from collections import Counter
 from typing import TYPE_CHECKING
+
+from tqdm import tqdm
 
 from creek.models import Eddy
 
@@ -437,7 +440,16 @@ class EddyDetector:
         """
         n = len(ids)
         labels = [_UNVISITED] * n
-        neighbour_cache = [self._neighbours(ids, i) for i in range(n)]
+        # OPS-004: neighbour-cache build is O(N²); progress bar in TTYs.
+        neighbour_cache = [
+            self._neighbours(ids, i)
+            for i in tqdm(
+                range(n),
+                desc="Eddy neighbours",
+                unit="frag",
+                disable=not sys.stderr.isatty(),
+            )
+        ]
         cluster_id = 0
         for i in range(n):
             if labels[i] != _UNVISITED:

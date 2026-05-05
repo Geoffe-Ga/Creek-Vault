@@ -15,7 +15,7 @@ The `generate` family of commands turns a classified, linked vault into the arte
 |------------------|--------------------------------------------|---------------|
 | `wavelength`     | `05-Wavelength/<period>-<date>.md`         | `creek.generate.wavelength` |
 | `synchronicity`  | `05-Wavelength/Synchronicities/`           | `creek.generate.synchronicity` |
-| `decision`       | `08-Decisions/<fragment>.md`               | `creek.generate.decisions` |
+| `decision`       | `08-Decisions/<fragment>.md`               | `creek.generate.decisions` — see [`decisions.md`](decisions.md) |
 | `paradox`        | `04-Praxis/Paradoxes/`                     | `creek.generate.paradox` |
 | `compost`        | `04-Praxis/Compost/`                       | `creek.generate.compost` |
 | `unnamed`        | `10-Liminal/Unnamed-Digest-<period>.md`    | `creek.generate.unnamed` |
@@ -34,6 +34,8 @@ creek report --type unnamed --period monthly --vault ~/Obsidian/Creek-Vault
 # Surprising cross-source resonances.
 creek report --type synchronicity --vault ~/Obsidian/Creek-Vault
 ```
+
+The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types collectively make up the **emergence infrastructure** described in Ontology §10. The exact criteria that decide whether content is surfaced (similarity thresholds, time-gap floors, project-name filters) live in [`emergence.md`](emergence.md).
 
 ## Voice Skill Tree
 

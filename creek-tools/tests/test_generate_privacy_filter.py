@@ -66,7 +66,7 @@ def test_mining_load_excludes_intimate_by_default(tmp_path: Path) -> None:
         fragments_dir, "frag-i", title="Diary", privacy_tier="intimate", body="x"
     )
     _write_fragment(
-        fragments_dir, "frag-o", title="Essay", privacy_tier="public", body="y"
+        fragments_dir, "frag-o", title="Essay", privacy_tier="open", body="y"
     )
 
     pairs = _load_fragments(fragments_dir)
@@ -122,7 +122,7 @@ def test_drafts_load_excludes_intimate_by_default(tmp_path: Path) -> None:
         fragments_dir, "frag-i", title="Diary", privacy_tier="intimate", body="x"
     )
     _write_fragment(
-        fragments_dir, "frag-o", title="Essay", privacy_tier="public", body="y"
+        fragments_dir, "frag-o", title="Essay", privacy_tier="open", body="y"
     )
 
     loaded = _load_fragments_by_id(fragments_dir)
