@@ -728,9 +728,16 @@ def _extract_source_original_file(post: frontmatter.Post) -> str | None:
     return None
 
 
-_VALID_SOURCE_PATH_MATCH_MODES: frozenset[str] = frozenset(
+SOURCE_PATH_MATCH_MODES: frozenset[str] = frozenset(
     {"exact", "substring", "regex"},
 )
+"""Canonical set of valid ``--match`` modes for ``purge source --source-path``.
+
+Exported (no leading underscore) so the CLI layer can re-use the same
+constant rather than duplicating it. The CLI iterates this set when
+rendering its own usage error and the engine validates against it
+inside :meth:`PurgeEngine.purge_source_path`. INC-008.
+"""
 
 
 def _build_source_path_matcher(
@@ -752,10 +759,10 @@ def _build_source_path_matcher(
         ValueError: When *match* is unrecognised, or when
             ``match="regex"`` and *source_path* is not a valid regex.
     """
-    if match not in _VALID_SOURCE_PATH_MATCH_MODES:
+    if match not in SOURCE_PATH_MATCH_MODES:
         msg = (
             f"Unknown match mode {match!r}; expected one of "
-            f"{sorted(_VALID_SOURCE_PATH_MATCH_MODES)}."
+            f"{sorted(SOURCE_PATH_MATCH_MODES)}."
         )
         raise ValueError(msg)
     if match == "exact":

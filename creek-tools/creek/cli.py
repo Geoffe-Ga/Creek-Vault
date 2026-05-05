@@ -1478,7 +1478,17 @@ def purge_fragment(
     _render_purge_result(result)
 
 
-_PURGE_SOURCE_MATCH_MODES = ("exact", "substring", "regex")
+def _purge_source_match_modes() -> tuple[str, ...]:
+    """Return the canonical ``--match`` modes for ``purge source --source-path``.
+
+    Reuses :data:`creek.purge.engine.SOURCE_PATH_MATCH_MODES` (INC-008
+    review nit) so the CLI usage error can never drift from the engine
+    validator. Returned as a sorted tuple for deterministic CLI help
+    output.
+    """
+    from creek.purge.engine import SOURCE_PATH_MATCH_MODES
+
+    return tuple(sorted(SOURCE_PATH_MATCH_MODES))
 
 
 @purge_app.command(name="source")
@@ -1530,10 +1540,11 @@ def purge_source(
             "[red]Pass exactly one of SOURCE_TYPE or --source-path.[/red]",
         )
         raise typer.Exit(code=2)
-    if match not in _PURGE_SOURCE_MATCH_MODES:
+    valid_modes = _purge_source_match_modes()
+    if match not in valid_modes:
         console.print(
             f"[red]Unknown --match {match!r}; expected one of "
-            f"{', '.join(_PURGE_SOURCE_MATCH_MODES)}.[/red]",
+            f"{', '.join(valid_modes)}.[/red]",
         )
         raise typer.Exit(code=2)
 

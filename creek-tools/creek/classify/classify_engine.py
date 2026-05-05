@@ -18,9 +18,10 @@ Resume contract (OPS-001)
    ``classification_method`` is already ``llm`` (or ``manual``). Pass
    ``--force`` to re-classify everything from scratch.
 3. The set of fragment IDs touched during the current run is appended
-   to ``<vault>/00-Creek-Meta/Processing-Log/llm-progress.json`` for
-   observability; this file is informational and **not** the source
-   of truth — the per-fragment frontmatter is.
+   to ``<vault>/00-Creek-Meta/Processing-Log/llm-progress.jsonl`` for
+   observability (newline-delimited JSON, one ``{"id": ...}`` object
+   per line); this file is informational and **not** the source of
+   truth — the per-fragment frontmatter is.
 """
 
 from __future__ import annotations
@@ -381,11 +382,14 @@ def _record_llm_progress(progress_path: Path, fragment_id: str) -> None:
             handle.write(json.dumps({"id": fragment_id}) + "\n")
     except OSError as exc:
         # OPS-003: keep the fragment-id prefix so this WARNING is
-        # grep-able alongside other per-fragment failures.
+        # grep-able alongside other per-fragment failures. ``checkpoint=``
+        # rather than ``path=`` because the file path here is the
+        # progress checkpoint, not the fragment's source — the OPS-003
+        # convention reserves ``path=`` for ``source.original_file``.
         logger.warning(
-            "[fragment=%s path=%s] Could not append to llm-progress checkpoint %s: %s",
+            "[fragment=%s checkpoint=%s] "
+            "Could not append to llm-progress checkpoint: %s",
             fragment_id,
-            progress_path,
             progress_path,
             exc,
         )
