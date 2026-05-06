@@ -1,6 +1,6 @@
 # Pre-Launch Issue Index — `creek-tools`
 
-This index aggregates 60 issues filed under `plans/git-issues/` after a comprehensive read-only review of `creek-tools/` against its documentation, the canonical ontology spec, and quality tooling.
+This index aggregates 61 issues filed under `plans/git-issues/` after a comprehensive read-only review of `creek-tools/` against its documentation, the canonical ontology spec, and quality tooling. INC-019 was added separately as a v1.0 prerequisite surfaced by [`plans/2026-05-05_comparative-analysis/`](../2026-05-05_comparative-analysis/) and is included in the counts and lists below.
 
 **One-line takeaway:** `creek-tools` is **not launch-ready in its current form.** The local quality story is strong (2678 tests pass, 93.6% branch coverage, MyPy strict clean once deps are present, Bandit zero-issue), but the headline pipeline is a series of stubs and lossy hand-offs that drop user data on the floor. Several documented privacy and audit guarantees are unimplemented. Pre-launch fixes are achievable in days, not weeks, but they are concrete and required.
 
@@ -12,7 +12,7 @@ This index aggregates 60 issues filed under `plans/git-issues/` after a comprehe
 |----------|---------:|-----:|-------:|----:|------:|
 | BUG      | 3 | 4 | 3 | 1 | 11 |
 | SEC      | 1 | 5 | 2 | 0 | 8  |
-| INC      | 1 | 5 | 9 | 3 | 18 |
+| INC      | 1 | 6 | 9 | 3 | 19 |
 | ARCH     | 0 | 0 | 1 | 1 | 2  |
 | TEST     | 0 | 1 | 3 | 1 | 5  |
 | OPS      | 0 | 2 | 1 | 1 | 4  |
@@ -20,9 +20,9 @@ This index aggregates 60 issues filed under `plans/git-issues/` after a comprehe
 | DEP      | 0 | 2 | 1 | 0 | 3  |
 | CI       | 0 | 1 | 2 | 1 | 4  |
 | STYLE    | 0 | 0 | 0 | 2 | 2  |
-| **Total**| **5** | **23** | **23** | **10** | **61** |
+| **Total**| **5** | **24** | **23** | **10** | **62** |
 
-The 5 Criticals are the launch blockers. The 23 Highs are the "ship only with explicit acknowledgement" set.
+The 5 Criticals are the launch blockers. The 24 Highs are the "ship only with explicit acknowledgement" set.
 
 ---
 
@@ -54,6 +54,7 @@ The minimum to launch (Critical + the Highs that block other work):
 - **INC-007** `--include-tier` CLI flag does not exist (paired with SEC-006).
 - **INC-010** Consent architecture exists but is not wired into the CLI — §13.5 of the spec is unenforced at the front door.
 - **INC-015** `creek redact --apply` writes no audit log despite the doc claim.
+- **INC-019** ([GH #201](https://github.com/Geoffe-Ga/Creek-Vault/issues/201)) Spec/implementation drift on phase, mode, and frequency taxonomy. v1.0 prerequisite for compile-then-query (blocks ADOPT-001, ADOPT-002, ADOPT-005 from [`plans/2026-05-05_comparative-analysis/`](../2026-05-05_comparative-analysis/)).
 - **OPS-001** No resume / checkpoint for the documented multi-hour LLM classification.
 - **OPS-002** `creek purge vault` interactive prompt is bypassable via piped stdin.
 - **PERF-001** `VaultWriter._find_existing` is O(N²) per write — non-trivial vaults grind.
@@ -181,7 +182,7 @@ SEC-003, SEC-004, SEC-007, SEC-008, OPS-002
 
 ### Batch H — Operational polish
 
-OPS-001, OPS-003, OPS-004, BUG-002, BUG-009, BUG-010, ARCH-001, ARCH-002, INC-003, INC-008, INC-012, INC-013, INC-017, INC-018
+OPS-001, OPS-003, OPS-004, BUG-002, BUG-009, BUG-010, ARCH-001, ARCH-002, INC-003, INC-008, INC-012, INC-013, INC-017, INC-018, INC-019
 
 *Rationale:* The remaining "smaller fish" — checkpoint/resume, structured logging, progress bars, the timezone sweep, voice-proxy-eligible cleanup, CSV encoding warning, gdrive ingestor / config fallback / privacy naming / purge --match / ingestor count / clean-modules-doc / decision-doc / emergence-doc. A grab-bag suitable for filling in after the structural batches.
 

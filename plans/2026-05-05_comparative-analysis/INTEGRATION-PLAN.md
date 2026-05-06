@@ -6,7 +6,7 @@ After this analysis the projects' identity has **sharpened**, not shifted. Creek
 
 ## Version-scheme note
 
-Milestones below read **`v1.0 → v1.1 → v1.2 → v1.3+`** as a chronological sequence: `v1.0` is the first launched version of each project, and subsequent dot-releases extend it in order. Earlier drafts of this plan used `v1` followed by `v0.2 / v0.3 / v0.4+`, which inverted SemVer ordering and confused sequencing. The numbering is fixed; the candidate assignments are unchanged.
+Versions follow SemVer: **`v1.0 → v1.1 → v1.2 → v1.3+`**. `v1.0` is the first launched version of each project; subsequent dot-releases extend it in order.
 
 ## Candidates index
 
@@ -42,7 +42,7 @@ The first launched version of each project should include the candidates that tu
 
 ### Creek Vault v1.0
 
-- **Reconcile spec/implementation drift first.** Before any of the candidates below land, the phase-name, mode-name, and frequency-name disagreements between `creek_ontology_agent_prompt.md` and `creek-tools/docs/` need resolving. Compile-then-query depends on one source of truth for the most load-bearing taxonomy in the system. **Tracked as [`INC-019`](../git-issues/INC-019-spec-impl-drift-phase-mode-frequency-taxonomy.md)** — file the issue and resolve it before any ADOPT/ADAPT candidate is acted on. (See `LANDSCAPE.md` closing paragraph and `DELTA-MATRIX.md` synthesis for context.)
+- **Reconcile spec/implementation drift first.** Before any of the candidates below land, the phase-name, mode-name, and frequency-name disagreements between `creek_ontology_agent_prompt.md` and `creek-tools/docs/` need resolving. Compile-then-query depends on one source of truth for the most load-bearing taxonomy in the system. **Tracked as [`INC-019`](../git-issues/INC-019-spec-impl-drift-phase-mode-frequency-taxonomy.md) / [GH #201](https://github.com/Geoffe-Ga/Creek-Vault/issues/201)** — resolve before any ADOPT/ADAPT candidate is acted on. (See `LANDSCAPE.md` closing paragraph and `DELTA-MATRIX.md` synthesis for context.)
 - **ADOPT-001 — Three-layer compiled architecture.** The structural fit is already good; the contract isn't. Commit to it.
 - **ADOPT-002 — `creek lint` unified hygiene.** Unify the five existing emergence reports under one named operation; preserve the explicit "do not resolve paradoxes" guard rail.
 - **ADOPT-003 — Answer-filing-back loop (`creek save`).** The CLI primitive ships in v1.0; the CrawDad-mediated invocation lands in v1.1.

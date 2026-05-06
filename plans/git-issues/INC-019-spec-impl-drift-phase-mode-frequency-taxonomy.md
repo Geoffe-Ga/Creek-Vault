@@ -5,6 +5,7 @@
 **Estimated complexity:** M (4–8h depending on which side becomes canonical)
 **Parallelizable with peers in same category:** no (this resolves the canonical taxonomy that other INCs / docs depend on)
 **Discovered by:** Comparative-analysis pass (`plans/2026-05-05_comparative-analysis/`); flagged in `LANDSCAPE.md` closing paragraph and `DELTA-MATRIX.md` synthesis as a v1 prerequisite for compile-then-query adoption.
+**GitHub issue:** [#201](https://github.com/Geoffe-Ga/Creek-Vault/issues/201)
 
 ## Files affected
 
