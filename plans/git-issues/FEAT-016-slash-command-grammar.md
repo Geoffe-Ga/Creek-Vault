@@ -33,6 +33,7 @@ Two small surfaces with a consistent grammar, both invoking the same MCP tools s
   - `/creek` (no args) → `creek state`.
   - `/crawdad` (no args) → opens reflective conversation mode (FEAT-015's loop with no preselected intents).
 - **All slash commands invoke MCP tools, not subprocess CLI calls.** This keeps Discord, Claude Code, and any future client on one tool surface.
+- **`/creek` commands live as Claude Code skill files** under `creek-tools/.claude/commands/` — these are *not* part of the `creek/` Python package. Each file is a markdown skill (frontmatter + body) that Claude Code reads when the user types `/creek <subcommand>`. This convention is added to the project; if `creek-tools/CLAUDE.md` doesn't already document `.claude/commands/`, this FEAT also adds a one-paragraph note there pointing at the new directory.
 - **Help discoverable from any prefix:** `/creek help`, `/creek mine help`, `/crawdad help` all return scoped help.
 - **Discord-specific formatting:** Discord doesn't render markdown link footnotes well, so `/crawdad` commands return code blocks for structured data and bullet lists for prose summaries. No tables.
 - **`/crawdad workflow` is a stub in v1.0** — it advertises the workflow DSL coming in v1.1 (ADAPT-003) but only supports `/crawdad workflow list` (returns "no workflows yet — coming in v1.1") in this PR. Full implementation lands with the v1.1 workflow DSL FEAT.

@@ -211,7 +211,7 @@ The 16 `FEAT-*` files in this directory translate the [comparative-analysis ADOP
 **Wave 0 — prerequisite (Batch 0, the existing INC-019)**
 - INC-019 — taxonomy reconciliation. Blocks the entire v1.0 roadmap.
 
-**Wave 1 — schema foundation (parallel after INC-019)**
+**Wave 1 — schema foundation (sequential after INC-019; FEAT-002 depends on FEAT-001)**
 | ID | Title | LOC | Depends |
 |---|---|---:|---|
 | [FEAT-001](FEAT-001-schema-skills-compile-lint-save.md) | Schema skills (compile / lint / save) + root `AGENTS.md` | ~400 | INC-019 |
@@ -247,7 +247,7 @@ The 16 `FEAT-*` files in this directory translate the [comparative-analysis ADOP
 | [FEAT-015](FEAT-015-crawdad-sonnet-composer-loop.md) | CrawDad — Sonnet composer + 5-round loop + voice-skill activation | ~450 | FEAT-014 |
 | [FEAT-016](FEAT-016-slash-command-grammar.md) | `/creek` and `/crawdad` slash-command grammars | ~400 | FEAT-010/011/012, FEAT-015 |
 
-**Critical path:** INC-019 → FEAT-001 → FEAT-003 → FEAT-004 → FEAT-006 → FEAT-008 → FEAT-009 → FEAT-010 → FEAT-013 → FEAT-014 → FEAT-015. Eleven sequential PRs; the rest parallelize. Total: 17 PRs (1 prerequisite + 16 FEATs) for full v1.0 (Creek Vault data layer + CrawDad agent layer).
+**Critical path:** INC-019 → FEAT-001 → FEAT-002 → FEAT-003 → FEAT-004 → FEAT-006 → FEAT-008 → FEAT-009 → FEAT-010 → FEAT-011 → FEAT-012 → FEAT-013 → FEAT-014 → FEAT-015. Fourteen sequential PRs (one prerequisite + thirteen FEATs); the remaining three FEATs (005, 007, 016) parallelize off the path. Total: 17 PRs for full v1.0 (Creek Vault data layer + CrawDad agent layer).
 
 **LOC envelope:** every FEAT is sized to ≤700 LOC. The largest is FEAT-009 (`creek save`, ~580 LOC).
 

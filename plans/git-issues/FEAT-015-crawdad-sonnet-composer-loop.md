@@ -23,7 +23,7 @@ Replace FEAT-014's "boring structured reply" with the Sonnet composer step. Wrap
 
 ## Pre-decided choices
 
-- **Composer model:** `claude-sonnet-4-6` (matches creek-tools defaults).
+- **Composer model:** read from `crawdad/crawdad/config.py:DEFAULT_COMPOSER_MODEL` (with `CRAWDAD_COMPOSER_MODEL` env override), same indirection pattern as FEAT-014's router model. Today's default is the Sonnet model documented in `creek-tools/docs/classification.md` (`claude-sonnet-4-6` at the time of writing); the constant is the contract, not the literal ID. Same no-literal-IDs-outside-config test applies.
 - **5-round cap:** hard. After 5 rounds without a final composer call, CrawDad replies with "I went too deep on this — let's back up. Can you reframe?" and resets the session state.
 - **Loop termination signal:** the router returns `{ intents: [], compose: true }` to signal "no more tool calls; compose the reply now." Otherwise the loop continues.
 - **Voice-skill activation per session:** at session start, load `voice-core/SKILL.md` always; load the phase skill matching the current wavelength snapshot; load the `confessional` register by default (the LTM reflective register). The router can request additional registers via an `activate_register` intent.

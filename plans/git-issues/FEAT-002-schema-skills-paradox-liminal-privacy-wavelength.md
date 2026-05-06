@@ -6,7 +6,7 @@
 **Estimated complexity:** S
 **Source candidate:** [`plans/2026-05-05_comparative-analysis/candidates/ADAPT-005-modular-skill-files-as-schema.md`](../2026-05-05_comparative-analysis/candidates/ADAPT-005-modular-skill-files-as-schema.md) (part 2 of 2)
 **Dependencies:** FEAT-001 (the root `AGENTS.md` it composes with)
-**Parallelizable with peers:** yes (with FEAT-005 and the FEAT-003/004 pair)
+**Parallelizable with peers:** yes (with FEAT-005 only; FEAT-003 and FEAT-004 hard-depend on this FEAT)
 **Wave:** 1 (schema foundation)
 
 ## Goal

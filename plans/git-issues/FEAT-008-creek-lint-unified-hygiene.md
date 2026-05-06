@@ -6,7 +6,7 @@
 **Estimated complexity:** M
 **Source candidate:** [`plans/2026-05-05_comparative-analysis/candidates/ADOPT-002-creek-lint-unified-hygiene.md`](../2026-05-05_comparative-analysis/candidates/ADOPT-002-creek-lint-unified-hygiene.md)
 **Dependencies:** FEAT-001 (lint.SKILL.md guard rails), FEAT-002 (paradox skill), FEAT-006 (audit-report append target)
-**Parallelizable with peers:** yes (with FEAT-006/007/009)
+**Parallelizable with peers:** yes (with FEAT-007 and FEAT-009; FEAT-006 must land first)
 **Wave:** 3
 
 ## Goal

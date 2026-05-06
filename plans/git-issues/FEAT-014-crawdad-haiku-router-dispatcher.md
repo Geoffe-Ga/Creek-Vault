@@ -24,7 +24,7 @@ Add the Haiku-driven intent extraction step to CrawDad's agent loop. Given a use
 
 ## Pre-decided choices
 
-- **Router model:** `claude-haiku-4-5-20251001` (matches creek-tools defaults documented in `creek-tools/docs/classification.md`).
+- **Router model:** read from `crawdad/crawdad/config.py:DEFAULT_ROUTER_MODEL`, which itself reads from `CRAWDAD_ROUTER_MODEL` env var with a fallback to whatever Haiku model `creek-tools/docs/classification.md` documents as current at implementation time. Do *not* hard-code the literal model ID string in agent code — model IDs move (today: `claude-haiku-4-5-20251001`; the constant is the contract, not the literal). Verified by a test that asserts no module under `crawdad/crawdad/` references a model ID string outside `config.py`.
 - **History truncation:** last 20 entries, each truncated to 2000 chars. Hard cliff per ADOPT-008; FEAT-016 refines this with smarter compression if needed.
 - **Intents schema:** generated from the MCP server's `tools/list` response so the router prompt always reflects the current tool surface. Regenerated at CrawDad startup; cached for the session.
 - **Router prompt structure:**

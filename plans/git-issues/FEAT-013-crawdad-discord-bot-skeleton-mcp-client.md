@@ -53,6 +53,7 @@ Stand up the CrawDad project as a sibling to `creek-tools/` — a Discord bot th
 - `load_session_state` reads `latest.md` at session start.
 - Allowlist is enforced — non-allowlisted users get no response.
 - Quality bar mirrors `creek-tools/`: ≥90% branch coverage on the new code, MyPy strict clean, Ruff zero violations, conventional commits.
+- **MCP subprocess resilience:** if the `creek-tools-mcp` subprocess exits or stops responding, the bot does *not* exit. It posts a graceful error reply to the active Discord channel ("creek-tools is unreachable; try again in a moment") and attempts a single restart with exponential backoff (capped at 3 retries / 30s) before staying disconnected and surfacing a status command response. Verified by a regression test that kills the subprocess mid-tool-call and asserts the bot keeps running.
 - `crawdad/CLAUDE.md` and `crawdad/README.md` exist.
 
 ## References

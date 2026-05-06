@@ -26,6 +26,7 @@ Expose the `creek purge.*` family via MCP behind an elevated-authorization gate 
 ## Pre-decided choices
 
 - **Elevated-auth mechanism:** environment variable `CREEK_MCP_ELEVATED_TOKEN` set at server startup. Requests that include matching `Authorization: Bearer <token>` (or MCP-equivalent metadata field) can call purge tools. Without the token, every purge tool returns a structured refusal.
+- **Token comparison uses `hmac.compare_digest`**, not `==`. Plain string equality is vulnerable to timing-based token inference; `compare_digest` is constant-time. Wire it correctly from day one.
 - **CrawDad does not get the token.** The Discord bot's MCP client connects with no `Authorization` header; purge calls fail-closed.
 - **The developer's Claude Code can be configured with the token.** Documented in `docs/mcp.md` as the deliberate setup step for destructive ops.
 - **`creek purge vault` requires *both* the token and a confirmation parameter** (`confirm_vault_path: <absolute-path>`). Mirrors the existing CLI behaviour (which prompts for the absolute vault path interactively).
@@ -49,6 +50,7 @@ Expose the `creek purge.*` family via MCP behind an elevated-authorization gate 
 - Concurrent-write safety is tested.
 - `docs/mcp.md` documents the elevated-auth model with explicit "do not give this token to CrawDad" guidance.
 - ≥90% branch coverage on `creek_mcp/{auth,audit,tools/purge}.py`.
+- `creek_mcp/auth.py` uses `hmac.compare_digest(expected, actual)` — not `==`. Verified by a unit test that asserts plain `==` is *not* used in the hot path (e.g., a static check or a compare-call interceptor).
 
 ## References
 

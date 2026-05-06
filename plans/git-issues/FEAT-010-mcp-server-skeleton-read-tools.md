@@ -34,6 +34,7 @@ Stand up a `creek-tools-mcp` server that exposes the existing read-only CLI surf
 - **Privacy-tier ceiling parameter:** every read tool takes a required `privacy_tier_ceiling` parameter (`open` | `personal` | `intimate` | `all`). Default is `open`. Returning content above the ceiling is impossible by construction; the tool returns title-only or refuses with a structured error.
 - **Read tools in this FEAT:** `creek.state.read`, `creek.state.render`, `creek.lint`, `creek.mine`, `creek.draft`. Write tools (save, ingest, classify, link, report, skills) land in FEAT-011. Purge tools land in FEAT-012.
 - **Audit log writes per tool call:** every MCP invocation appends to `00-Creek-Meta/audit/mcp.jsonl` — `{tool, args_summary, tier_ceiling, consumer, timestamp}`. Args-summary, not full args, to avoid leaking content into the audit log.
+- **Audit log lives in its own module from day 1.** Create `creek_mcp/audit.py` in this FEAT (not inline in `server.py`). FEAT-011 adds the write-side fields and FEAT-012 hardens it (hash chain + flock). Putting the module boundary in place now avoids a refactor pass during FEAT-012. The day-1 implementation in this FEAT can be a simple JSONL appender; the hardening is additive.
 - **Tool input schemas:** documented JSON Schema per tool, generated from Pydantic models that wrap the CLI argument structure.
 
 ## Test plan
