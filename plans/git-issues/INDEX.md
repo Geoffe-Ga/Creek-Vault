@@ -1,6 +1,6 @@
 # Pre-Launch Issue Index — `creek-tools`
 
-This index aggregates 61 issues filed under `plans/git-issues/` after a comprehensive read-only review of `creek-tools/` against its documentation, the canonical ontology spec, and quality tooling. INC-019 was added separately as a v1.0 prerequisite surfaced by [`plans/2026-05-05_comparative-analysis/`](../2026-05-05_comparative-analysis/) and is included in the counts and lists below.
+This index aggregates 62 issues filed under `plans/git-issues/` — 61 from a comprehensive read-only review of `creek-tools/` against its documentation, the canonical ontology spec, and quality tooling, plus 1 (INC-019) added separately as a v1.0 prerequisite surfaced by [`plans/2026-05-05_comparative-analysis/`](../2026-05-05_comparative-analysis/). All 62 are reflected in the counts, lists, and execution plan below.
 
 **One-line takeaway:** `creek-tools` is **not launch-ready in its current form.** The local quality story is strong (2678 tests pass, 93.6% branch coverage, MyPy strict clean once deps are present, Bandit zero-issue), but the headline pipeline is a series of stubs and lossy hand-offs that drop user data on the floor. Several documented privacy and audit guarantees are unimplemented. Pre-launch fixes are achievable in days, not weeks, but they are concrete and required.
 
@@ -138,6 +138,12 @@ No cycles detected.
 
 Suggested groupings for parallel work. Each batch shares enough context to be tackled in one session. Order is the recommended sequence (later batches depend on earlier).
 
+### Batch 0 — v1.0 prerequisite from comparative analysis
+
+INC-019
+
+*Rationale:* INC-019 ([GH #201](https://github.com/Geoffe-Ga/Creek-Vault/issues/201)) is the spec/implementation drift on phase, mode, and frequency taxonomy surfaced by [`plans/2026-05-05_comparative-analysis/`](../2026-05-05_comparative-analysis/). It blocks ADOPT-001, ADOPT-002, and ADOPT-005 — the compile-then-query foundation candidates — and must land before any of the comparative-analysis ADOPT/ADAPT work begins. It is *not* sequenced inside the original-audit batches because it is not a launch blocker for the existing 61-issue catalog; it is a prerequisite for the *next* roadmap layer (the v1.0 → v1.3+ work in `plans/2026-05-05_comparative-analysis/INTEGRATION-PLAN.md`). Run it before, alongside, or in parallel with the other batches — but do not let it slip behind them.
+
 ### Batch A — Pipeline correctness (the data-flow rebuild)
 
 BUG-001, BUG-005, BUG-007, BUG-008, BUG-011
@@ -182,16 +188,17 @@ SEC-003, SEC-004, SEC-007, SEC-008, OPS-002
 
 ### Batch H — Operational polish
 
-OPS-001, OPS-003, OPS-004, BUG-002, BUG-009, BUG-010, ARCH-001, ARCH-002, INC-003, INC-008, INC-012, INC-013, INC-017, INC-018, INC-019
+OPS-001, OPS-003, OPS-004, BUG-002, BUG-009, BUG-010, ARCH-001, ARCH-002, INC-003, INC-008, INC-012, INC-013, INC-017, INC-018
 
 *Rationale:* The remaining "smaller fish" — checkpoint/resume, structured logging, progress bars, the timezone sweep, voice-proxy-eligible cleanup, CSV encoding warning, gdrive ingestor / config fallback / privacy naming / purge --match / ingestor count / clean-modules-doc / decision-doc / emergence-doc. A grab-bag suitable for filling in after the structural batches.
 
 **Recommended sequence:**
 
-1. **Batches A and F in parallel** — A rebuilds the data path; F gets the e2e tests in place to catch any regression in A and the toolchain gates aligned. F is mostly mechanical and can be done by a different agent.
-2. **Batch B** — depends on A. Wires the rebuilt pipeline to the user-facing CLI.
-3. **Batches C, D, E, G in parallel** — all independent of each other; all independent of A/B once A/B have landed.
-4. **Batch H** — polish, runs last.
+1. **Batch 0** — runs at any point before the comparative-analysis ADOPT/ADAPT work begins; independent of Batches A–H, which target the original 61-issue launch catalog.
+2. **Batches A and F in parallel** — A rebuilds the data path; F gets the e2e tests in place to catch any regression in A and the toolchain gates aligned. F is mostly mechanical and can be done by a different agent.
+3. **Batch B** — depends on A. Wires the rebuilt pipeline to the user-facing CLI.
+4. **Batches C, D, E, G in parallel** — all independent of each other; all independent of A/B once A/B have landed.
+5. **Batch H** — polish, runs last.
 
 Critical-path-aware note: Batches A, B, C, D each contain at least one Critical or High that must land before launch. None of A/B/C/D can be skipped.
 

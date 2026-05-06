@@ -49,6 +49,7 @@ The first launched version of each project should include the candidates that tu
 - **ADOPT-004 — Deterministic-first pipeline (named).** Mostly already done; document the Pass 1/2/3 vocabulary, add the `--no-llm` end-to-end flag, expose pre-LLM yield in the audit report.
 - **ADOPT-005 — `creek state` audit report.** The single document an agent or human reads to know what's in the vault. Wavelength snapshot at the top.
 - **ADOPT-007 — `index.md` context-window contract.** Same artifact as `creek state`; pin the size budget.
+- **ADAPT-004 (creek-tools side) — MCP server surface.** Listed under CrawDad v1.0 below, but the *creek-tools side of the deliverable* — exposing the existing CLI surface as MCP tools with privacy-tier-ceiling enforcement and audit logging — is a Creek Vault v1.0 commitment. The MCP server lives in `creek-tools/`; CrawDad consumes it. Calling it out here so the work isn't deferred behind CrawDad's bot scaffolding.
 - **ADAPT-005 — Modular schema skills.** A small root `AGENTS.md` plus `00-Creek-Meta/Skills/` schema-skill tree. Don't try to make the canonical spec be the agent context.
 
 ### CrawDad v1.0
