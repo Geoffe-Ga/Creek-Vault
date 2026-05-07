@@ -51,12 +51,15 @@ wavelength:
   mode: inhabit | express | collaborate | integrate | absorb
   orientation: do | feel | do_feel
   dosage: medicine | toxic
+  observed_phase: rising | peaking | withdrawal | diminishing | bottoming_out | restoration  # optional; see save.SKILL.md
 frequency:
   primary: F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | F10 | unclassified
   secondary: []
 ```
 
 Inline claims that paraphrase a fragment carry a per-claim provenance pointer (e.g., `[^frag-abc12]`) so a downstream consumer (`creek draft`, CrawDad reflection) can verify against source. Lossy compression here is the load-bearing risk for voice fidelity; treat provenance loss as a compile bug.
+
+`wavelength.observed_phase` may appear when a saved note (`creek save`) inherited a phase from its source conversation but the conversation itself contradicted that phase — see `save.SKILL.md` for the dual-phase convention. Compile reads both when reconciling; downstream consumers should expect either field.
 
 ## Canonical taxonomy
 
