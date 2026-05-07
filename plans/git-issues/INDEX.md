@@ -204,6 +204,57 @@ Critical-path-aware note: Batches A, B, C, D each contain at least one Critical 
 
 ---
 
+## 4a. v1.0 implementation roadmap (FEAT-001…FEAT-016)
+
+The 16 `FEAT-*` files in this directory translate the [comparative-analysis ADOPT/ADAPT candidates](../2026-05-05_comparative-analysis/) into pull-ready work units. Each FEAT is sized for a single PR ≤~700 LOC, names the file paths it touches in `creek-tools/` (or in the new `crawdad/` project), pre-decides the open questions from its source candidate, and ships its own test plan + acceptance criteria. The `/work-issue FEAT-NNN` flow can pick any FEAT whose dependencies have landed.
+
+**Wave 0 — prerequisite (Batch 0, the existing INC-019)**
+- INC-019 — taxonomy reconciliation. Blocks the entire v1.0 roadmap.
+
+**Wave 1 — schema foundation (sequential after INC-019; FEAT-002 depends on FEAT-001)**
+| ID | Title | LOC | Depends |
+|---|---|---:|---|
+| [FEAT-001](FEAT-001-schema-skills-compile-lint-save.md) | Schema skills (compile / lint / save) + root `AGENTS.md` | ~400 | INC-019 |
+| [FEAT-002](FEAT-002-schema-skills-paradox-liminal-privacy-wavelength.md) | Schema skills (paradox / liminal / privacy-tier / wavelength-aware) | ~400 | FEAT-001 |
+
+**Wave 2 — compiled-layer primitives**
+| ID | Title | LOC | Depends |
+|---|---|---:|---|
+| [FEAT-003](FEAT-003-compile-primitive.md) | Compile primitive — `creek compile <fragment-id>` | ~450 | INC-019, FEAT-001/002 |
+| [FEAT-004](FEAT-004-compiled-layer-query-routing.md) | Compiled-layer query routing in `creek mine` / `creek draft` | ~450 | FEAT-003 |
+| [FEAT-005](FEAT-005-deterministic-first-pipeline.md) | Deterministic-first pipeline + `--no-llm` end-to-end | ~260 | none (parallelizable) |
+
+**Wave 3 — observability + hygiene**
+| ID | Title | LOC | Depends |
+|---|---|---:|---|
+| [FEAT-006](FEAT-006-creek-state-audit-report-core.md) | `creek state` audit report — core sections | ~450 | FEAT-005 |
+| [FEAT-007](FEAT-007-creek-state-wavelength-and-size-budget.md) | `creek state` wavelength snapshot + size-budget gate | ~450 | FEAT-006 |
+| [FEAT-008](FEAT-008-creek-lint-unified-hygiene.md) | `creek lint` unified vault hygiene | ~530 | FEAT-001/002/006 |
+| [FEAT-009](FEAT-009-creek-save-answer-filing-back.md) | `creek save` answer-filing-back primitive | ~580 | FEAT-001/002 |
+
+**Wave 4 — MCP surface**
+| ID | Title | LOC | Depends |
+|---|---|---:|---|
+| [FEAT-010](FEAT-010-mcp-server-skeleton-read-tools.md) | MCP server skeleton + read tools | ~500 | FEAT-006/007/008/004 |
+| [FEAT-011](FEAT-011-mcp-write-tools-tier-enforcement.md) | MCP write tools + tier-ceiling enforcement | ~500 | FEAT-010, FEAT-009 |
+| [FEAT-012](FEAT-012-mcp-purge-tools-elevated-auth.md) | MCP purge tools + elevated-auth + audit hardening | ~400 | FEAT-010/011 |
+
+**Wave 5 — CrawDad v1.0**
+| ID | Title | LOC | Depends |
+|---|---|---:|---|
+| [FEAT-013](FEAT-013-crawdad-discord-bot-skeleton-mcp-client.md) | CrawDad — Discord bot skeleton + MCP client | ~450 | FEAT-010/011/012 |
+| [FEAT-014](FEAT-014-crawdad-haiku-router-dispatcher.md) | CrawDad — Haiku router + tool dispatcher | ~450 | FEAT-013 |
+| [FEAT-015](FEAT-015-crawdad-sonnet-composer-loop.md) | CrawDad — Sonnet composer + 5-round loop + voice-skill activation | ~450 | FEAT-014 |
+| [FEAT-016](FEAT-016-slash-command-grammar.md) | `/creek` and `/crawdad` slash-command grammars | ~400 | FEAT-010/011/012, FEAT-015 |
+
+**Critical path:** INC-019 → FEAT-001 → FEAT-002 → FEAT-003 → FEAT-004 → FEAT-006 → FEAT-008 → FEAT-009 → FEAT-010 → FEAT-011 → FEAT-012 → FEAT-013 → FEAT-014 → FEAT-015. Fourteen sequential PRs (one prerequisite + thirteen FEATs); the remaining three FEATs (005, 007, 016) parallelize off the path. Total: 17 PRs for full v1.0 (Creek Vault data layer + CrawDad agent layer).
+
+**LOC envelope:** every FEAT is sized to ≤700 LOC. The largest is FEAT-009 (`creek save`, ~580 LOC).
+
+**Execution model:** `/work-issue FEAT-NNN` reads the FEAT file, branches, runs TDD against the named acceptance criteria, opens a PR. Open questions in each FEAT are pre-decided so the implementer doesn't pause mid-PR. If a candidate's `Pre-decided choices` block needs to change in light of implementation reality, that's a separate PR that updates the FEAT first.
+
+---
+
 ## 5. Critical path
 
 Longest dependency chain, from "today" to "ready to launch":
