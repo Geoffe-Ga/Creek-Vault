@@ -11,5 +11,19 @@ directly only when introducing a new compliance log surface.
 """
 
 from creek.audit.log import AuditChainBroken, AuditChainBrokenError, AuditLog
+from creek.audit.yield_summary import (
+    PreLLMYieldSummary,
+    format_yield_line,
+    write_yield_summary,
+    yield_summary_path,
+)
 
-__all__ = ["AuditChainBroken", "AuditChainBrokenError", "AuditLog"]
+__all__ = [
+    "AuditChainBroken",
+    "AuditChainBrokenError",
+    "AuditLog",
+    "PreLLMYieldSummary",
+    "format_yield_line",
+    "write_yield_summary",
+    "yield_summary_path",
+]

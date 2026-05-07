@@ -386,6 +386,17 @@ def process(
         "-y",
         help="Skip the consent prompt for first-time sources (logged).",
     ),
+    no_llm: bool = typer.Option(
+        False,
+        "--no-llm",
+        help=(
+            "Skip Pass 3 (LLM classification). Pass 1 (deterministic) "
+            "and Pass 2 (local model: embeddings, OCR) still run; "
+            "residue is reported but never sent to Anthropic / Ollama. "
+            "Wins over LLMConfig.provider — safe to combine with "
+            "provider: anthropic for an audited zero-egress run."
+        ),
+    ),
 ) -> None:
     """Run the full pipeline: redact, ingest, classify, link, index.
 
@@ -394,6 +405,11 @@ def process(
     clear them. Per-source consent is enforced — first-time sources
     prompt for confirmation before ingestion. Use ``--yes`` to skip the
     prompt in non-interactive contexts (the bypass is logged).
+
+    Pass ``--no-llm`` to run the deterministic and local-model passes
+    end-to-end without ever invoking Pass 3 (LLM classification). The
+    pre-LLM yield line emitted at the end of the run reports the
+    deterministic / local-model / residue counts.
     """
     config = load_config()
     source_path = source or config.source_drive
@@ -401,7 +417,8 @@ def process(
 
     console.print(
         f"[bold green]Running full pipeline: "
-        f"source={source_path}, vault={vault_path}[/bold green]"
+        f"source={source_path}, vault={vault_path}"
+        f"{' (no-LLM)' if no_llm else ''}[/bold green]"
     )
 
     consent_manager = _gate_consent(
@@ -411,7 +428,11 @@ def process(
         assume_yes=yes,
     )
 
-    pipeline = Pipeline(config=config, consent_manager=consent_manager)
+    pipeline = Pipeline(
+        config=config,
+        consent_manager=consent_manager,
+        no_llm=no_llm,
+    )
     try:
         result = pipeline.run(source_path=source_path, vault_path=vault_path)
     except RedactionRequiredError as exc:
@@ -423,6 +444,12 @@ def process(
     console.print(f"[bold]Classifications made:[/bold] {result.classifications_made}")
     console.print(f"[bold]Links found:[/bold] {result.links_found}")
     console.print(f"[bold]Indexes generated:[/bold] {result.indexes_generated}")
+    console.print(
+        f"[bold]Deterministic:[/bold] {result.deterministic_classified} classified | "
+        f"[bold]Local-model:[/bold] {result.local_model_processed} embedded/OCR'd | "
+        f"[bold]Residue:[/bold] {result.residue} "
+        "(would go to LLM if Pass-3 enabled)"
+    )
     error_count = len(result.errors)
     error_style = "red" if error_count else "dim"
     console.print(f"[bold {error_style}]Errors:[/bold {error_style}] {error_count}")

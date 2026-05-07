@@ -13,13 +13,29 @@ the scanner finds unresolved sensitive content, the pipeline raises
 ``creek redact --apply`` first. This trades a small ergonomic cost for the
 guarantee that ``creek process`` can never silently leak secrets into the
 vault.
+
+The pipeline runs in three named passes (FEAT-005):
+
+* **Pass 1 (deterministic, local):** redaction scan, ingestion, rules-based
+  classification, frontmatter generation. No network egress.
+* **Pass 2 (local model-based):** embeddings, OCR, future Whisper. Local
+  model inference; still no network egress.
+* **Pass 3 (network if opted in):** LLM classification of residue. Skipped
+  entirely when ``no_llm`` is set, in which case the privacy claim
+  "network egress only in Pass 3" is enforced by construction.
 """
 
 import logging
+import uuid
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from creek.audit.yield_summary import (
+    PreLLMYieldSummary,
+    format_yield_line,
+    write_yield_summary,
+)
 from creek.classify.llm import LLMClassifier
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
@@ -75,6 +91,17 @@ class PipelineResult(BaseModel):
         classifications_made: Number of fragments classified.
         links_found: Total link count across all linking stages.
         indexes_generated: Number of index notes generated.
+        deterministic_classified: Fragments confidently resolved by Pass 1
+            (rules + ``human_review_sources`` short-circuit). Reported on
+            every run so the audit report (FEAT-006) can graph the
+            deterministic-pass yield over time.
+        local_model_processed: Fragments that traversed Pass 2 (embeddings
+            / OCR). Equals the count handed to the linking pipeline; the
+            ``--no-llm`` flag does not change this number.
+        residue: Fragments the rule classifier left uncertain — i.e.
+            would have been routed to the LLM if Pass 3 were enabled.
+            Always reported, even on normal runs that did dispatch the
+            residue.
         errors: Human-readable error messages collected from each stage.
             Each entry is prefixed with its source ingestor name so the
             user can trace the failure back to the offending file.
@@ -85,6 +112,9 @@ class PipelineResult(BaseModel):
     classifications_made: int = 0
     links_found: int = 0
     indexes_generated: int = 0
+    deterministic_classified: int = 0
+    local_model_processed: int = 0
+    residue: int = 0
     errors: list[str] = Field(default_factory=list)
 
 
@@ -114,6 +144,8 @@ class Pipeline:
         self,
         config: CreekConfig,
         consent_manager: ConsentManager | None = None,
+        *,
+        no_llm: bool = False,
     ) -> None:
         """Initialise the pipeline and all subsystem components.
 
@@ -121,9 +153,17 @@ class Pipeline:
             config: Top-level Creek configuration.
             consent_manager: Optional consent manager. When provided,
                 ``run()`` checks for prior consent before ingesting.
+            no_llm: When ``True``, skip Pass 3 (LLM classification)
+                entirely. The deterministic and local-model passes still
+                run; the run summary records ``no_llm: true`` and the
+                pipeline never invokes ``llm_classifier.classify`` —
+                guaranteeing zero network egress along the LLM path.
+                The flag wins over ``LLMConfig.provider`` so passing
+                ``no_llm=True`` with ``provider: anthropic`` is safe.
         """
         self.config = config
         self.consent_manager = consent_manager
+        self.no_llm = no_llm
         self.scanner = RedactionScanner(config=config.redaction)
         self.rule_classifier = RuleClassifier()
         self.llm_classifier = LLMClassifier(config=config.llm)
@@ -195,8 +235,45 @@ class Pipeline:
         index_count = self._run_indexing(vault_path, result)
         result.indexes_generated = index_count
 
+        # Stage 7: Pre-LLM yield summary (FEAT-005). Always emit — even on
+        # consent-skipped runs the audit report wants a row, so callers
+        # writing dashboards do not silently lose the bookkeeping.
+        self._emit_yield_summary(vault_path, result)
+
         logger.info("Pipeline complete: %s", result)
         return result
+
+    def _emit_yield_summary(
+        self,
+        vault_path: Path,
+        result: PipelineResult,
+    ) -> None:
+        """Persist a one-line yield summary to ``run-summary.jsonl``.
+
+        Failure to write the summary must NOT abort the pipeline — the
+        audit substrate is observability, not a precondition for the
+        run. We log the exception and move on. The line itself is also
+        logged at INFO so operators reading stdout still see the yield.
+
+        Args:
+            vault_path: Vault root the run wrote into.
+            result: Populated pipeline result with yield counts.
+        """
+        summary = PreLLMYieldSummary(
+            run_id=uuid.uuid4().hex,
+            deterministic_classified=result.deterministic_classified,
+            local_model_processed=result.local_model_processed,
+            residue=result.residue,
+            no_llm=self.no_llm,
+        )
+        try:
+            write_yield_summary(vault_path=vault_path, summary=summary)
+        except OSError:
+            logger.exception(
+                "Failed to write pre-LLM yield summary under %s",
+                vault_path,
+            )
+        logger.info(format_yield_line(summary))
 
     def _check_consent(self, source_path: Path) -> bool:
         """Check if consent has been granted for the given source.
@@ -339,13 +416,19 @@ class Pipeline:
         is in ``human_review_sources`` are never sent to the LLM — they
         always go to the review queue for a human decision.
 
+        When ``self.no_llm`` is true, the LLM dispatch is skipped
+        regardless of confidence. The fragment keeps whatever the rule
+        classifier gave it, and the residue counter still increments so
+        the run summary records what *would* have been routed to Pass 3.
+
         Classification operates on the inner :class:`Fragment`; the body
         is preserved unchanged on the returned :class:`IngestedFragment`.
 
         Args:
             ingested: Ingested fragment+body bundles to classify.
             vault_path: Vault path for writing the review queue.
-            result: Pipeline result (unused; kept for symmetry).
+            result: Pipeline result; mutated to track per-pass yield
+                counts (``deterministic_classified`` / ``residue``).
 
         Returns:
             List of classified :class:`IngestedFragment` items.
@@ -358,7 +441,11 @@ class Pipeline:
         for item in ingested:
             frag = self.rule_classifier.classify(item.fragment, content=item.body)
             if self._needs_llm(frag, item.body):
-                frag = self.llm_classifier.classify(frag, content=item.body)
+                result.residue += 1
+                if not self.no_llm:
+                    frag = self.llm_classifier.classify(frag, content=item.body)
+            else:
+                result.deterministic_classified += 1
             classified.append(IngestedFragment(fragment=frag, body=item.body))
 
         self.review_generator.generate_queue(
@@ -464,10 +551,18 @@ class Pipeline:
     ) -> int:
         """Run the linking pipeline on classified fragments.
 
+        Treated as Pass 2 work for yield-summary purposes: every fragment
+        handed to the linker exercises local-model inference (sentence
+        transformers for embeddings, plus the deterministic temporal /
+        thread / eddy detectors that operate on those embeddings).
+        :attr:`PipelineResult.local_model_processed` is bumped here so
+        the audit report can attribute Pass-2 work back to the run.
+
         Args:
             fragments: Classified fragments to link.
             vault_path: Vault path for linking output.
-            result: Pipeline result (unused directly but kept for symmetry).
+            result: Pipeline result; mutated to record
+                ``local_model_processed``.
 
         Returns:
             Total link count across all linking stages.
@@ -476,6 +571,7 @@ class Pipeline:
             logger.info("No fragments to link.")
             return 0
 
+        result.local_model_processed += len(fragments)
         link_result = self.linking_pipeline.run(fragments, vault_path)
         return (
             link_result.resonance_count

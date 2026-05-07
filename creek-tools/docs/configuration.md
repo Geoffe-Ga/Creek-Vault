@@ -4,6 +4,26 @@
 
 This page is the field-by-field reference. Every section maps to a `BaseModel` you can read in `config.py`.
 
+## The three-pass pipeline
+
+`creek process` runs in three named passes (FEAT-005); **network egress only in Pass 3.**
+
+| Pass | Scope | What it does |
+|------|-------|--------------|
+| **Pass 1 — deterministic, local** | No network | Ingestion, redaction, rules-based classification, frontmatter generation. |
+| **Pass 2 — local model-based** | No network | Embeddings (sentence-transformers), OCR (pytesseract), future Whisper transcription. Local model inference only. |
+| **Pass 3 — network if opted in** | Network | LLM classification of residue (`creek classify --method llm`), LLM-driven compile, lint semantic checks. |
+
+Pass 3 is opt-in per run. Use `creek process --no-llm` to run Passes 1 and 2 to completion and skip Pass 3 entirely; the residue (unclassified or low-confidence fragments) is reported in the run summary. The flag wins over `LLMConfig.provider`, so passing `--no-llm` while `provider: anthropic` is configured is safe — no Anthropic call is ever made.
+
+After every run a one-line summary is appended to `<vault>/00-Creek-Meta/Processing-Log/run-summary.jsonl` and printed to stdout, e.g.
+
+```
+Deterministic: 7431 classified | Local-model: 9323 embedded/OCR'd | Residue: 1892 (would go to LLM if Pass-3 enabled)
+```
+
+The summary is consumed by the audit report (FEAT-006).
+
 ## Top-level
 
 ```yaml

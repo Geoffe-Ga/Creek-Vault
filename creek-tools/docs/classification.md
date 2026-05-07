@@ -10,10 +10,12 @@ Classification tags every fragment along five dimensions: **frequency** (the APT
 
 | Method   | Backend                        | When to use |
 |----------|--------------------------------|-------------|
-| `rules`  | Heuristic pattern matchers     | Default. Cheap, deterministic, runs offline. Captures roughly 70% of fragments confidently. |
-| `llm`    | Ollama (default) or Anthropic  | For the long tail of ambiguous fragments. Slower, requires either a local model or `ANTHROPIC_API_KEY`. |
+| `rules`  | Heuristic pattern matchers     | Default. Cheap, deterministic, runs offline. Captures roughly 70% of fragments confidently. **This is Pass 1 work — no network egress.** |
+| `llm`    | Ollama (default) or Anthropic  | For the long tail of ambiguous fragments. Slower, requires either a local model or `ANTHROPIC_API_KEY`. **This is Pass 3 work — the only pass that leaves the machine when the Anthropic provider is selected.** |
 
 A common workflow: run `--method rules` over the whole vault first, then run `--method llm` only on fragments whose classification is `unclassified` or whose confidence is below `ClassificationConfig.confidence_threshold`.
+
+Run `creek process --no-llm` for an end-to-end run that completes Passes 1 and 2 but never invokes the LLM — every fragment the rules left uncertain shows up as **residue** in the run summary instead. See [the three-pass pipeline](configuration.md#the-three-pass-pipeline) in the configuration reference for the full vocabulary.
 
 ```bash
 # Rules pass.
