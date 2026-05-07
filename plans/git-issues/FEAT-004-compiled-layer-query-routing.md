@@ -21,6 +21,7 @@ Make `creek mine` and `creek draft` route through the compiled layer first, fall
 - `creek-tools/tests/test_mining.py` — add cases that verify compiled-layer-first behaviour.
 - `creek-tools/tests/test_drafts.py` — same.
 - `creek-tools/docs/generation.md` — document the routing change and the `--bypass-compiled` flag.
+- `00-Creek-Meta/Skills/query.SKILL.md` (new) — extract the query contract from `AGENTS.md` (currently inline as 3 rules) into a dedicated schema-skill file, replacing the inline rules with a pointer. FEAT-001 deliberately shipped query inline and noted the asymmetry; this FEAT closes that gap so an agent loading only `AGENTS.md` gets full coverage of all four verbs.
 
 ## Pre-decided choices
 
@@ -44,6 +45,7 @@ Make `creek mine` and `creek draft` route through the compiled layer first, fall
 - A regression test verifies that `creek draft` without `--bypass-compiled` routes through the compiled layer in the absence of `--bypass-compiled` (this is the AC pinned in ADOPT-001).
 - ≥90% branch coverage on the changed paths.
 - Documentation in `docs/generation.md` updated.
+- `00-Creek-Meta/Skills/query.SKILL.md` exists, ≤1500 tokens, and `AGENTS.md`'s inline 3-rule query coverage is replaced with a pointer to it (closes the FEAT-001 asymmetry where compile/lint/save have dedicated skills but query is inline).
 
 ## References
 

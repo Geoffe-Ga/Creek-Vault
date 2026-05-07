@@ -12,6 +12,7 @@
 
 # --- Explicitly tracked root files ---
 !.gitignore
+!AGENTS.md
 !CLAUDE.md
 !README.md
 
@@ -92,7 +93,7 @@
 !10-Liminal/**/
 !10-Liminal/**/.gitkeep
 
-# 00-Creek-Meta — track Scripts/ fully, .gitkeep in others, Ontology prompt
+# 00-Creek-Meta — track Scripts/ and Skills/ fully, .gitkeep in others, Ontology prompt
 00-Creek-Meta/Templates/**
 !00-Creek-Meta/Templates/**/
 !00-Creek-Meta/Templates/**/.gitkeep
@@ -105,6 +106,10 @@
 !00-Creek-Meta/Ontology/**/
 !00-Creek-Meta/Ontology/**/.gitkeep
 !00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md
+
+# Schema-skill tree (FEAT-001) — fully tracked, parallel to creek-skills/
+!00-Creek-Meta/Skills/
+!00-Creek-Meta/Skills/**
 
 # ============================================================
 # DEVELOPMENT ARTIFACTS
