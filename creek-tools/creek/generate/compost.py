@@ -489,7 +489,7 @@ class CompostTracker:
             "",
             "# Compost Report",
             "",
-            "This report surveys every composting idea in the vault and ",
+            "This report surveys every composted note in the vault and ",
             "cross-references them against the threads currently alive.",
             "",
             "## All Compost Notes",
@@ -501,7 +501,7 @@ class CompostTracker:
             "SORT composted_date DESC",
             "```",
             "",
-            "## Composting Ideas (snapshot)",
+            "## Composted Notes (snapshot)",
             "",
         ]
         if compost_notes:

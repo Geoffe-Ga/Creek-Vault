@@ -1,0 +1,77 @@
+# Canonical Wavelength Taxonomy (INC-019)
+#
+# This file is the regression anchor for the spec/implementation
+# alignment of phase, mode, and frequency names. It mirrors, verbatim,
+# the canonical taxonomy in
+# ``00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md``:
+#
+#   - Frequencies: §6.1 (lines 396-407)
+#   - Phases:      §7.1 (lines 421-435)
+#   - Modes:       §7.2 (lines 451-463)
+#
+# The regression test in ``tests/test_taxonomy_alignment.py`` asserts
+# that the enums in ``creek/models.py`` use these exact lowercase
+# values. If the spec or the model drifts, this fixture must be
+# updated in lockstep — that is the point of the test.
+#
+# Drift values listed under ``deprecated_aliases`` come from the
+# pre-INC-019 documentation drift documented in
+# ``plans/git-issues/INC-019-spec-impl-drift-phase-mode-frequency-taxonomy.md``.
+# They are mapped to the canonical names so vaults written by older
+# tool versions remain loadable for one release with a deprecation
+# warning, after which the alias hooks will be removed.
+phases:
+  canonical:
+    - rising
+    - peaking
+    - withdrawal
+    - diminishing
+    - bottoming_out
+    - restoration
+  deprecated_aliases:
+    origins: rising
+    cresting: withdrawal
+    receding: diminishing
+    composting: restoration
+modes:
+  canonical:
+    - inhabit
+    - express
+    - collaborate
+    - integrate
+    - absorb
+  deprecated_aliases:
+    solo: inhabit
+    dialogue: express
+    reflective: integrate
+    analytic: collaborate
+frequencies:
+  # The frequencies are stored in the model as the F1..F10 codes; the
+  # human-readable names below come from §6.1 of the spec and are
+  # listed here so the regression test can assert the F-codes are
+  # complete and ordered.
+  canonical_codes:
+    - F1
+    - F2
+    - F3
+    - F4
+    - F5
+    - F6
+    - F7
+    - F8
+    - F9
+    - F10
+  canonical_names:
+    F1: Agency
+    F2: Receptivity
+    F3: Self-Love / Power
+    F4: Community Love / Conformity
+    F5: Achievism
+    F6: Pluralism
+    F7: Integration
+    F8: True Self / Transcendence
+    F9: Unity
+    F10: Emptiness
+  deprecated_aliases:
+    amplitude: F1
+    pitch: F2

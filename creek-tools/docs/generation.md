@@ -44,12 +44,12 @@ The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types co
 ```
 creek-skills/
 ├── frequencies/
-│   ├── amplitude/SKILL.md
-│   ├── pitch/SKILL.md
-│   └── …
-├── phases/{origins,rising,peaking,cresting,receding,composting}/SKILL.md
-├── modes/{solo,dialogue,reflective,analytic}/SKILL.md
-├── registers/{intimate,personal,public,professional}/SKILL.md
+│   ├── F1/SKILL.md
+│   ├── F2/SKILL.md
+│   └── …                                           # F1..F10 (APTITUDE)
+├── phases/{rising,peaking,withdrawal,diminishing,bottoming_out,restoration}/SKILL.md
+├── modes/{inhabit,express,collaborate,integrate,absorb}/SKILL.md
+├── registers/{confessional,analytical,playful,prophetic,instructional,raw,conversational}/SKILL.md
 ├── threads/<thread-id>/SKILL.md
 ├── eddies/<eddy-id>/SKILL.md
 └── meta/
@@ -83,8 +83,8 @@ Re-run any time after ingesting / classifying. The generator is idempotent — o
 # Print the top 10 ideas across all strategies.
 creek mine --vault ~/Obsidian/Creek-Vault --limit 10
 
-# Filter to ideas that fit a current Cresting phase.
-creek mine --vault ~/Obsidian/Creek-Vault --phase cresting --limit 5
+# Filter to ideas that fit a current Withdrawal phase.
+creek mine --vault ~/Obsidian/Creek-Vault --phase withdrawal --limit 5
 ```
 
 Each `IdeaSeed` has a strategy, a score, the contributing fragments, and a hint about the angle. You'll typically pick one (`--index N`) to feed into `creek draft`.
@@ -99,6 +99,7 @@ creek draft --vault ~/Obsidian/Creek-Vault
 
 # Pick the third-ranked idea and override the phase.
 creek draft --vault ~/Obsidian/Creek-Vault --index 2 --phase peaking
+
 
 # Prepend a voice-core text file to the prompt.
 creek draft --vault ~/Obsidian/Creek-Vault --voice-core ./voice-core.md
@@ -115,10 +116,10 @@ draft:
     - frag-5d4e9c1a7f31
     - frag-2a6b8e3c9d44
   skill_stack:
-    - skills/frequencies/amplitude
-    - skills/phases/cresting
-    - skills/modes/reflective
-    - skills/registers/intimate
+    - skills/frequencies/F1
+    - skills/phases/withdrawal
+    - skills/modes/integrate
+    - skills/registers/confessional
     - skills/meta/voice-core
   llm:
     provider: ollama
