@@ -23,15 +23,25 @@ COMPOST_PY = Path(__file__).resolve().parents[1] / "creek" / "generate" / "compo
 
 # Drift words that must not appear in user-facing copy. Word boundaries
 # protect substrings like ``analytical`` (a VoiceRegister, unrelated to
-# the drifted ``analytic`` mode) and ``compost.py`` filenames.
+# the drifted ``analytic`` mode) and ``compost.py`` filenames. Both
+# title-case (prose) and lowercase (YAML frontmatter / skill-tree
+# directory) forms are listed for the phase-name drift, since either
+# could leak back into the docs.
 DRIFT_PATTERNS = [
     r"\bOrigins\b",
+    r"\borigins\b",
     r"\bCresting\b",
     r"\bcresting\b",
     r"\bReceding\b",
+    r"\breceding\b",
     r"\bComposting\b",
-    r"\bamplitude\b",
-    r"\bpitch\b",
+    r"\bcomposting\b",
+    # ``amplitude`` and ``pitch`` are common English words; anchor to
+    # the contexts where they appeared as drift (frontmatter values
+    # and skill-tree directory paths) so prose like "the pitch of the
+    # voice" doesn't trip the gate as the docs grow.
+    r"frequency:\s*(?:amplitude|pitch)\b",
+    r"frequencies/(?:amplitude|pitch)\b",
     # Phrase-level drift that matches the INC's own grep recipes.
     r"solo\s*\|\s*dialogue\s*\|\s*reflective\s*\|\s*analytic",
     r"\{\s*solo\s*,\s*dialogue\s*,\s*reflective\s*,\s*analytic\s*\}",

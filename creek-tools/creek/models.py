@@ -7,6 +7,7 @@ for the APTITUDE frequency framework and Archetypal Wavelength mapping.
 """
 
 import uuid
+import warnings
 from datetime import date, datetime
 from enum import StrEnum
 from typing import TypeVar
@@ -18,14 +19,7 @@ from creek.time import now_la, today_la
 # ---- Enums ----
 
 
-# INC-019 migration aliases — drifted phase/mode/frequency strings
-# that pre-INC-019 vaults / hand-edited frontmatter may still carry.
-# Each enum below routes these legacy values through ``_missing_`` to
-# the matching canonical member with a one-release
-# :class:`DeprecationWarning`. The mappings come from
-# ``plans/git-issues/INC-019-spec-impl-drift-phase-mode-frequency-taxonomy.md``
-# and the regression tests in ``tests/test_taxonomy_aliases.py`` /
-# ``tests/fixtures/canonical_taxonomy.yaml``.
+# INC-019 one-release migration aliases — see the INC doc for context.
 _PHASE_LEGACY_ALIASES = {
     "origins": "rising",
     "cresting": "withdrawal",
@@ -54,24 +48,16 @@ def _legacy_alias_lookup(
     value: object,
     aliases: dict[str, str],
 ) -> _E | None:
-    """Resolve ``value`` through the INC-019 legacy alias table.
-
-    Returns the canonical enum member (warning the caller via
-    :class:`DeprecationWarning`) when ``value`` is one of the
-    drifted strings, or ``None`` otherwise so the StrEnum machinery
-    raises ``ValueError`` as it normally would.
-    """
+    """Resolve a legacy INC-019 string to its canonical enum member, or None."""
     if not isinstance(value, str):
         return None
     canonical = aliases.get(value)
     if canonical is None:
         return None
-    import warnings
-
     warnings.warn(
-        f"{cls.__name__} value {value!r} is deprecated; use "
-        f"{canonical!r}. INC-019: support for legacy phase/mode/"
-        "frequency names will be removed in the next minor release.",
+        f"{cls.__name__} value {value!r} is deprecated; use {canonical!r}. "
+        "INC-019: support for legacy phase/mode/frequency names will be "
+        "removed in the next minor release.",
         DeprecationWarning,
         stacklevel=3,
     )
@@ -79,15 +65,7 @@ def _legacy_alias_lookup(
 
 
 class Frequency(StrEnum):
-    """APTITUDE frequency classification (F1-F10 plus unclassified).
-
-    Naming history (INC-019): the canonical names are the F-codes
-    ``F1``..``F10`` matching ontology §6.1. Legacy wave-physics strings
-    (``"amplitude"``, ``"pitch"``) are accepted on input via
-    :meth:`_missing_` and silently mapped to the canonical F-code with
-    a :class:`DeprecationWarning`. Plan removal in the next minor
-    release.
-    """
+    """APTITUDE frequency F1..F10 (plus unclassified); see INC-019 for aliases."""
 
     F1 = "F1"
     F2 = "F2"
@@ -103,26 +81,12 @@ class Frequency(StrEnum):
 
     @classmethod
     def _missing_(cls, value: object) -> "Frequency | None":
-        """Map legacy wave-physics strings to canonical F-codes.
-
-        See INC-019 for the full mapping. Any other unknown value
-        still raises ``ValueError`` from the StrEnum constructor.
-        """
+        """Map legacy INC-019 wave-physics strings to canonical F-codes."""
         return _legacy_alias_lookup(cls, value, _FREQUENCY_LEGACY_ALIASES)
 
 
 class Phase(StrEnum):
-    """Archetypal Wavelength phase within the six-phase cycle.
-
-    Naming history (INC-019): the canonical names are
-    ``rising``/``peaking``/``withdrawal``/``diminishing``/
-    ``bottoming_out``/``restoration`` per ontology §7.1. Legacy
-    drift strings (``"origins"``, ``"cresting"``, ``"receding"``,
-    ``"composting"``) are accepted on input via :meth:`_missing_`
-    and silently mapped to the canonical phase with a
-    :class:`DeprecationWarning`. Plan removal in the next minor
-    release.
-    """
+    """Archetypal Wavelength six-phase cycle; see INC-019 for aliases."""
 
     RISING = "rising"
     PEAKING = "peaking"
@@ -134,25 +98,12 @@ class Phase(StrEnum):
 
     @classmethod
     def _missing_(cls, value: object) -> "Phase | None":
-        """Map legacy drift phase strings to canonical phases.
-
-        See INC-019 for the full mapping. Any other unknown value
-        still raises ``ValueError`` from the StrEnum constructor.
-        """
+        """Map legacy INC-019 drift phase strings to canonical phases."""
         return _legacy_alias_lookup(cls, value, _PHASE_LEGACY_ALIASES)
 
 
 class Mode(StrEnum):
-    """Engagement mode describing how a frequency is being experienced.
-
-    Naming history (INC-019): the canonical names are
-    ``inhabit``/``express``/``collaborate``/``integrate``/``absorb``
-    per ontology §7.2. Legacy drift strings (``"solo"``,
-    ``"dialogue"``, ``"reflective"``, ``"analytic"``) are accepted on
-    input via :meth:`_missing_` and silently mapped to the canonical
-    mode with a :class:`DeprecationWarning`. Plan removal in the next
-    minor release.
-    """
+    """Engagement mode for a fragment; see INC-019 for legacy aliases."""
 
     INHABIT = "inhabit"
     EXPRESS = "express"
@@ -163,11 +114,7 @@ class Mode(StrEnum):
 
     @classmethod
     def _missing_(cls, value: object) -> "Mode | None":
-        """Map legacy drift mode strings to canonical modes.
-
-        See INC-019 for the full mapping. Any other unknown value
-        still raises ``ValueError`` from the StrEnum constructor.
-        """
+        """Map legacy INC-019 drift mode strings to canonical modes."""
         return _legacy_alias_lookup(cls, value, _MODE_LEGACY_ALIASES)
 
 
