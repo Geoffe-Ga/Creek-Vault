@@ -12,6 +12,7 @@
 
 # --- Explicitly tracked root files ---
 !.gitignore
+!AGENTS.md
 !CLAUDE.md
 !README.md
 
