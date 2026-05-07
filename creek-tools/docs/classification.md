@@ -1,6 +1,6 @@
 # Classification
 
-Classification tags every fragment along five dimensions: **frequency** (the APTITUDE 10-frequency system), **archetypal phase** (Origins, Rising, Peaking, Cresting, Receding, Composting), **mode**, **register**, and **privacy tier**. The classifier writes its decisions into the fragment's frontmatter; downstream stages (linking, generation) consume those tags.
+Classification tags every fragment along five dimensions: **frequency** (the APTITUDE F1–F10 system), **archetypal phase** (Rising, Peaking, Withdrawal, Diminishing, Bottoming Out, Restoration), **mode** (Inhabit, Express, Collaborate, Integrate, Absorb), **register**, and **privacy tier**. The classifier writes its decisions into the fragment's frontmatter; downstream stages (linking, generation) consume those tags.
 
 > Routing fragments through the Anthropic provider sends content to a third party. The privacy-tier system gates this — `intimate` fragments stay local — but the broader trade-offs and the hardening done against prompt-injection (SEC-004) are documented in the [threat model](security/threat-model.md).
 
@@ -29,10 +29,12 @@ For each fragment the classifier appends frontmatter like:
 
 ```yaml
 classification:
-  frequency: amplitude       # one of the 10 APTITUDE frequencies
-  phase: rising              # one of 6 archetypal phases
-  mode: solo                 # solo | dialogue | reflective | analytic
-  register: intimate         # intimate | personal | public | professional
+  frequency: F1              # one of F1..F10 (APTITUDE)
+  phase: rising              # rising | peaking | withdrawal | diminishing | bottoming_out | restoration
+  mode: inhabit              # inhabit | express | collaborate | integrate | absorb
+  orientation: do            # do | feel | do_feel
+  dosage: medicine           # medicine | toxic | ambiguous
+  register: confessional     # confessional | analytical | playful | prophetic | instructional | raw | conversational
   confidence: 0.82
   method: rules              # rules | llm | manual
   classified_at: 2026-04-28T17:30:00Z

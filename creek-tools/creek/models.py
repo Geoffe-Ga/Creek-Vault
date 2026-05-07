@@ -7,8 +7,10 @@ for the APTITUDE frequency framework and Archetypal Wavelength mapping.
 """
 
 import uuid
+import warnings
 from datetime import date, datetime
 from enum import StrEnum
+from typing import TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
@@ -17,8 +19,53 @@ from creek.time import now_la, today_la
 # ---- Enums ----
 
 
+# INC-019 one-release migration aliases — see the INC doc for context.
+_PHASE_LEGACY_ALIASES = {
+    "origins": "rising",
+    "cresting": "withdrawal",
+    "receding": "diminishing",
+    "composting": "restoration",
+}
+
+_MODE_LEGACY_ALIASES = {
+    "solo": "inhabit",
+    "dialogue": "express",
+    "reflective": "integrate",
+    "analytic": "collaborate",
+}
+
+_FREQUENCY_LEGACY_ALIASES = {
+    "amplitude": "F1",
+    "pitch": "F2",
+}
+
+
+_E = TypeVar("_E", bound=StrEnum)
+
+
+def _legacy_alias_lookup(
+    cls: type[_E],
+    value: object,
+    aliases: dict[str, str],
+) -> _E | None:
+    """Resolve a legacy INC-019 string to its canonical enum member, or None."""
+    if not isinstance(value, str):
+        return None
+    canonical = aliases.get(value)
+    if canonical is None:
+        return None
+    warnings.warn(
+        f"{cls.__name__} value {value!r} is deprecated; use {canonical!r}. "
+        "INC-019: support for legacy phase/mode/frequency names will be "
+        "removed in the next minor release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return cls(canonical)
+
+
 class Frequency(StrEnum):
-    """APTITUDE frequency classification (F1-F10 plus unclassified)."""
+    """APTITUDE frequency F1..F10 (plus unclassified); see INC-019 for aliases."""
 
     F1 = "F1"
     F2 = "F2"
@@ -32,9 +79,14 @@ class Frequency(StrEnum):
     F10 = "F10"
     UNCLASSIFIED = "unclassified"
 
+    @classmethod
+    def _missing_(cls, value: object) -> "Frequency | None":
+        """Map legacy INC-019 wave-physics strings to canonical F-codes."""
+        return _legacy_alias_lookup(cls, value, _FREQUENCY_LEGACY_ALIASES)
+
 
 class Phase(StrEnum):
-    """Archetypal Wavelength phase within the six-phase cycle."""
+    """Archetypal Wavelength six-phase cycle; see INC-019 for aliases."""
 
     RISING = "rising"
     PEAKING = "peaking"
@@ -44,9 +96,14 @@ class Phase(StrEnum):
     RESTORATION = "restoration"
     UNCLASSIFIED = "unclassified"
 
+    @classmethod
+    def _missing_(cls, value: object) -> "Phase | None":
+        """Map legacy INC-019 drift phase strings to canonical phases."""
+        return _legacy_alias_lookup(cls, value, _PHASE_LEGACY_ALIASES)
+
 
 class Mode(StrEnum):
-    """Engagement mode describing how a frequency is being experienced."""
+    """Engagement mode for a fragment; see INC-019 for legacy aliases."""
 
     INHABIT = "inhabit"
     EXPRESS = "express"
@@ -54,6 +111,11 @@ class Mode(StrEnum):
     INTEGRATE = "integrate"
     ABSORB = "absorb"
     UNCLASSIFIED = "unclassified"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "Mode | None":
+        """Map legacy INC-019 drift mode strings to canonical modes."""
+        return _legacy_alias_lookup(cls, value, _MODE_LEGACY_ALIASES)
 
 
 class Orientation(StrEnum):
