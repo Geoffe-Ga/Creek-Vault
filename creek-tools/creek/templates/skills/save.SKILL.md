@@ -63,6 +63,7 @@ privacy_tier: open | personal | intimate
 consent: explicit | inherited      # required when tier is intimate
 wavelength:
   phase: rising | peaking | withdrawal | diminishing | bottoming_out | restoration
+  observed_phase: rising | peaking | withdrawal | diminishing | bottoming_out | restoration  # optional; written when source conversation contradicts inherited phase
   mode: inhabit | express | collaborate | integrate | absorb
   orientation: do | feel | do_feel
   dosage: medicine | toxic
