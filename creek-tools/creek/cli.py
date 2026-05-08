@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import typer
 from rich.console import Console
@@ -720,9 +720,6 @@ def link(
     )
 
 
-_COMPILE_TARGET_KINDS: tuple[str, ...] = ("thread", "eddy", "frequency_index")
-
-
 @app.command(name="compile")
 def compile_(
     fragment_id: str = typer.Argument(..., help="Source fragment ID to roll up"),
@@ -752,18 +749,18 @@ def compile_(
     side-channel log under ``00-Creek-Meta/Processing-Log/`` rather
     than flattened into the synthesis page.
     """
-    if target_kind not in _COMPILE_TARGET_KINDS:
+    from creek.compile.engine import TARGET_KINDS, _default_llm, compile_to_vault
+
+    if target_kind not in TARGET_KINDS:
         console.print(
             f"[red]Unknown --target-kind {target_kind!r}. "
-            f"Supported: {', '.join(_COMPILE_TARGET_KINDS)}.[/red]",
+            f"Supported: {', '.join(TARGET_KINDS)}.[/red]",
         )
         raise typer.Exit(code=2)
 
-    from creek.compile.engine import _default_llm, compile_to_vault
-
     config = load_config()
     vault_path = _resolve_vault(vault)
-    kind: CompileTargetKind = target_kind  # type: ignore[assignment]
+    kind = cast("CompileTargetKind", target_kind)
     written = compile_to_vault(
         fragment_ids=[fragment_id],
         vault_path=vault_path,

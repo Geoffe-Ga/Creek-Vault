@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING
 
 import frontmatter
 
@@ -32,6 +32,9 @@ from creek.audit import AuditLog
 from creek.compile.provenance import ProvenanceEntry, merge_provenance
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
 from creek.vault.reader import iter_vault_fragments
+
+if TYPE_CHECKING:
+    from creek.config import LLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +46,14 @@ PARADOX_LOG_RELPATH = Path(
 )
 """Side-channel log for LLM-detected paradoxes during compile."""
 
-_TARGET_KINDS: tuple[str, ...] = ("thread", "eddy", "frequency_index")
+TARGET_KINDS: tuple[str, ...] = ("thread", "eddy", "frequency_index")
+"""Public list of compiled-page surfaces.
+
+Re-used by :mod:`creek.cli` for ``--target-kind`` validation so a new
+kind added here automatically tightens the CLI gate too — no parallel
+constant to drift.
+"""
+
 _TARGET_DIRS: dict[str, Path] = {
     "thread": Path("02-Threads") / "Active",
     "eddy": Path("03-Eddies"),
@@ -105,10 +115,10 @@ def compile_fragments(
         ValueError: If *target_kind* is not one of the supported
             compiled-page surfaces.
     """
-    if target_kind not in _TARGET_KINDS:
+    if target_kind not in TARGET_KINDS:
         msg = (
             f"Unknown target_kind {target_kind!r}; "
-            f"supported: {', '.join(_TARGET_KINDS)}."
+            f"supported: {', '.join(TARGET_KINDS)}."
         )
         raise ValueError(msg)
 
@@ -118,6 +128,9 @@ def compile_fragments(
     raw = llm(prompt)
     payload = _parse_llm_payload(raw)
 
+    # Drop malformed claims (missing/empty id) before they reach the page body;
+    # otherwise `_render_body` would emit a broken Markdown footnote `[^]`.
+    valid_claims = [c for c in payload["claims"] if str(c.get("id", "")).strip()]
     new_provenance = [
         ProvenanceEntry(
             claim_id=str(claim["id"]),
@@ -126,10 +139,10 @@ def compile_fragments(
             compiled_at=timestamp,
             compile_method="llm",
         )
-        for claim in payload["claims"]
+        for claim in valid_claims
     ]
     provenance = merge_provenance(existing_provenance or [], new_provenance)
-    body = _render_body(target_title, payload["claims"])
+    body = _render_body(target_title, valid_claims)
 
     page = CompiledPage(
         target_kind=target_kind,
@@ -356,7 +369,7 @@ def _append_paradox_log(vault_path: Path, entries: list[ParadoxLogEntry]) -> Non
         log.append(record)
 
 
-def _default_llm(_config: object) -> CompileLLM:
+def _default_llm(config: LLMConfig) -> CompileLLM:
     """Return the default cloud LLM client for the CLI entry point.
 
     Tests monkeypatch this hook to inject a deterministic stub. The
@@ -365,9 +378,5 @@ def _default_llm(_config: object) -> CompileLLM:
     """
     from creek.classify.llm import AnthropicProvider
 
-    provider = AnthropicProvider(_config)  # type: ignore[arg-type]
+    provider = AnthropicProvider(config)
     return provider.call
-
-
-CompileMethodLiteral = Literal["rules", "llm", "manual"]
-"""Re-export for callers that need to type-annotate compile_method values."""

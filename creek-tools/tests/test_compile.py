@@ -572,6 +572,41 @@ def test_compile_fragments_rejects_non_array_claims() -> None:
         )
 
 
+def test_compile_fragments_skips_claim_with_missing_id() -> None:
+    """Claims with a missing or empty ``id`` are dropped before body render.
+
+    Without the guard, ``_render_body`` would emit a broken Markdown
+    footnote (``[^]``) and ``ProvenanceEntry`` construction would
+    KeyError. Treat both as a malformed-LLM signal and skip silently.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    response = json.dumps(
+        {
+            "claims": [
+                {"text": "no id here", "fragment_ids": ["frag-aaa"]},
+                {"id": "", "text": "empty id", "fragment_ids": ["frag-aaa"]},
+                {
+                    "id": "claim-002",
+                    "text": "well-formed claim.",
+                    "fragment_ids": ["frag-aaa"],
+                },
+            ],
+            "paradoxes": [],
+        },
+    )
+    llm, _ = _make_llm([response])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert "[^]" not in result.page.body
+    assert len(result.page.provenance) == 1
+    assert result.page.provenance[0].claim_id == "claim-002"
+
+
 def test_compile_fragments_skips_empty_claim_text() -> None:
     """Claims with empty text fall out of the body (still tracked in provenance)."""
     frag = _make_fragment(frag_id="frag-aaa")
