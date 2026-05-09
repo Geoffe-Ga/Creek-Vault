@@ -52,6 +52,10 @@ Quality checks include: formatting (Black + isort), linting (Ruff), type checkin
 
 No exceptions.
 
+### After Push: Await the Reviewer (if applicable)
+
+If the repo runs the Claude reviewer GitHub Action, "done" extends past local gates: the latest verdict for HEAD must be `LGTM`. Don't poll, don't `sleep`, and don't wait on "CI green" as a proxy — the PR webhook does **not** deliver CI passes, only comments and CI failures. Use `await-claude-review` to subscribe and end the turn; the bot's verdict comment wakes the session via `<github-webhook-activity>`. From there, `address-feedback` handles the merge gate or the fix loop.
+
 ## Examples
 
 ### Example 1: Adding a New Function
