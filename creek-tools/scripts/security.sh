@@ -90,6 +90,10 @@ fi
 #   - CVE-2026-24049: wheel — RECORD parsing edge case; wheel is build-
 #     tooling only and never reaches the production runtime.
 #     https://nvd.nist.gov/vuln/detail/CVE-2026-24049
+#
+# CVE-2026-6357 (pip < 26.1) is fixed upstream; ``requirements-dev.txt``
+# pins ``pip>=26.1`` so pip-audit no longer reports it. No --ignore-vuln
+# entry needed here.
 pip-audit \
     --ignore-vuln PYSEC-2022-42969 \
     --ignore-vuln CVE-2025-8869 \
