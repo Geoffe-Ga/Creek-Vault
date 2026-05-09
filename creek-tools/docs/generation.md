@@ -89,9 +89,38 @@ creek mine --vault ~/Obsidian/Creek-Vault --phase withdrawal --limit 5
 
 Each `IdeaSeed` has a strategy, a score, the contributing fragments, and a hint about the angle. You'll typically pick one (`--index N`) to feed into `creek draft`.
 
+### Compiled-layer routing (FEAT-004)
+
+`creek mine` and `creek draft` route through the compiled layer first.
+For every thread, eddy, or frequency the strategy needs, the miner
+reads the relevant `02-Threads/` / `03-Eddies/` / `06-Frequencies/`
+page (produced by `creek compile`, FEAT-003) and uses its body and
+provenance instead of rescanning raw fragments. When a compiled page
+is missing the miner falls back to fragments and appends a
+`compile-needed` entry to `<vault>/00-Creek-Meta/Processing-Log/
+compile-gaps.jsonl`; `creek lint` surfaces these gaps later so the
+operator can recompile.
+
+The contract is the four-verb rule documented in
+`00-Creek-Meta/Skills/query.SKILL.md` (compile-then-query): compile
+once, read many. Routine reads should not bypass it.
+
+The escape hatch is `--bypass-compiled` on both commands:
+
+```bash
+# Diagnostic: read fragments directly, skipping the compiled layer.
+creek mine  --vault ~/Obsidian/Creek-Vault --bypass-compiled
+creek draft --vault ~/Obsidian/Creek-Vault --bypass-compiled --index 0
+```
+
+When set, the flag emits a stderr warning ("the compiled-layer-first
+contract is being side-stepped"). Use it for verification — for
+example, comparing a compiled page against its source fragments — not
+as a default mode of operation.
+
 ## Drafting
 
-`creek draft` takes a mined idea, assembles the skill stack (frequency + phase + mode + register skills, plus the voice-core meta skill), gathers the source material (the seed's contributing fragments), prompts the LLM, and saves the draft to `07-Voice/Drafts/<date>-<slug>.md`.
+`creek draft` takes a mined idea, assembles the skill stack (frequency + phase + mode + register skills, plus the voice-core meta skill), gathers the source material (compile-first: the relevant compiled-layer page bodies, with fragments retained for exact-quote provenance traversal), prompts the LLM, and saves the draft to `07-Voice/Drafts/<date>-<slug>.md`.
 
 ```bash
 # Draft the top idea using the currently configured LLM.

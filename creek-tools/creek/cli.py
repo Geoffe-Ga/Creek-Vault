@@ -1104,6 +1104,20 @@ def skills(
     )
 
 
+def _warn_bypass_compiled(verb: str) -> None:
+    """Emit a stderr warning when ``--bypass-compiled`` is set.
+
+    The escape hatch lets an operator side-step the compiled-layer
+    routing introduced in FEAT-004. Warning loudly is the contract:
+    bypass should be a deliberate, visible choice, not silent.
+    """
+    print(  # operator-facing CLI warning
+        f"[creek {verb}] WARNING: --bypass-compiled is set; "
+        "the compiled-layer-first contract is being side-stepped.",
+        file=sys.stderr,
+    )
+
+
 def _parse_phase(phase: str) -> Phase:
     """Parse a phase CLI argument, exiting with code 2 on unknown values.
 
@@ -1142,19 +1156,38 @@ def mine(
         "--include-tier",
         help=_INCLUDE_TIER_HELP,
     ),
+    bypass_compiled: bool = typer.Option(
+        False,
+        "--bypass-compiled",
+        help=(
+            "Skip the compiled layer and read fragments directly. "
+            "Documented escape hatch — emits a stderr warning."
+        ),
+    ),
 ) -> None:
     """Mine blog and essay ideas from the vault (Section 11.5).
 
     Runs every strategy - liminal cross-eddy, thread terminus, resonance
     chain, and wavelength-phase window - then prints a deduped,
     score-ranked table of :class:`IdeaSeed` records.
+
+    By default the miner routes through the compiled layer first
+    (Threads, Eddies, Frequency indexes) and falls back to fragments
+    only when a compiled page is missing — appending a
+    ``compile-needed`` entry to ``compile-gaps.jsonl`` for ``creek
+    lint`` to surface later (FEAT-004).
     """
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
     current_phase = _parse_phase(phase)
     override = _parse_include_tier(include_tier)
-    seeds = IdeaMiner(privacy_override=override).mine_all(
+    if bypass_compiled:
+        _warn_bypass_compiled("mine")
+    seeds = IdeaMiner(
+        privacy_override=override,
+        bypass_compiled=bypass_compiled,
+    ).mine_all(
         vault_path,
         current_phase=current_phase,
     )
@@ -1252,6 +1285,14 @@ def draft(
         "--include-tier",
         help=_INCLUDE_TIER_HELP,
     ),
+    bypass_compiled: bool = typer.Option(
+        False,
+        "--bypass-compiled",
+        help=(
+            "Skip the compiled layer when gathering source material. "
+            "Documented escape hatch — emits a stderr warning."
+        ),
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -1269,8 +1310,13 @@ def draft(
     voice_text = _read_voice_core(voice_core)
     override = _parse_include_tier(include_tier)
     llm = _build_draft_llm()
+    if bypass_compiled:
+        _warn_bypass_compiled("draft")
 
-    seeds = IdeaMiner(privacy_override=override).mine_all(
+    seeds = IdeaMiner(
+        privacy_override=override,
+        bypass_compiled=bypass_compiled,
+    ).mine_all(
         vault_path,
         current_phase=current_phase,
     )
@@ -1295,6 +1341,7 @@ def draft(
         skills_root=skills_dir,
         voice_core=voice_text,
         privacy_override=override,
+        bypass_compiled=bypass_compiled,
     )
 
     console.print(generator.present_idea(idea))

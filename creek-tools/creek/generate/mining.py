@@ -40,6 +40,12 @@ from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
 )
+from creek.generate.compile_routing import (
+    CompiledPageIndex,
+    empty_index,
+    load_compiled_pages,
+    log_compile_gap,
+)
 from creek.models import (
     Eddy,
     Fragment,
@@ -208,6 +214,7 @@ class MiningSnapshot:
     eddies: tuple[Eddy, ...] = ()
     published_essay_titles: tuple[str, ...] = ()
     synchronicities: tuple[tuple[str, str, float], ...] = field(default_factory=tuple)
+    compiled_pages: CompiledPageIndex = field(default_factory=empty_index)
 
 
 def _safe_post(md_file: Path) -> frontmatter.Post | None:
@@ -373,12 +380,15 @@ def _load_mining_snapshot(
     vault_path: Path,
     *,
     privacy_override: PrivacyTierOverride | None = None,
+    bypass_compiled: bool = False,
 ) -> MiningSnapshot:
     """Scan *vault_path* for every record the miner needs.
 
     The privacy override flows through to fragment loaders so callers
     cannot accidentally bypass tier filtering by reading the snapshot
-    directly.
+    directly. When ``bypass_compiled`` is ``True`` the compiled-page
+    index is constructed in bypass mode — every lookup misses without
+    reading the compiled-layer subdirectories.
     """
     fragments = _load_fragments(
         vault_path / _FRAGMENTS_SUBDIR,
@@ -400,6 +410,13 @@ def _load_mining_snapshot(
     )
     essay_titles = _load_essay_titles(vault_path / _ESSAYS_SUBDIR)
     syncs = _load_synchronicities(vault_path / _SYNCHRONICITIES_SUBDIR)
+    compiled = (
+        empty_index(bypassed=True)
+        if bypass_compiled
+        else load_compiled_pages(
+            vault_path,
+        )
+    )
     return MiningSnapshot(
         fragments=tuple(fragments),
         liminal_fragments=tuple(liminal),
@@ -407,6 +424,7 @@ def _load_mining_snapshot(
         eddies=tuple(eddies),
         published_essay_titles=tuple(essay_titles),
         synchronicities=tuple(syncs),
+        compiled_pages=compiled,
     )
 
 
@@ -425,6 +443,7 @@ class IdeaMiner:
         similarity_liminal: float = DEFAULT_SIMILARITY_LIMINAL,
         similarity_resonance: float = DEFAULT_SIMILARITY_RESONANCE,
         privacy_override: PrivacyTierOverride | None = None,
+        bypass_compiled: bool = False,
     ) -> None:
         """Initialise with optional threshold and similarity overrides.
 
@@ -442,6 +461,10 @@ class IdeaMiner:
             privacy_override: Optional ``--include-tier`` value. The
                 default policy excludes intimate fragments and replaces
                 personal bodies with title-only summaries.
+            bypass_compiled: When ``True`` the miner skips the
+                compiled-layer index entirely and reads fragments
+                directly. Default ``False`` honours the FEAT-004
+                compile-then-query discipline.
         """
         self._similarity_fn: SimilarityFn = similarity_fn or _jaccard_similarity
         self.min_thread_fragments = min_thread_fragments
@@ -449,6 +472,7 @@ class IdeaMiner:
         self.similarity_liminal = similarity_liminal
         self.similarity_resonance = similarity_resonance
         self.privacy_override = privacy_override
+        self.bypass_compiled = bypass_compiled
 
     def _resolve_snapshot(
         self,
@@ -461,6 +485,7 @@ class IdeaMiner:
         return _load_mining_snapshot(
             vault_path,
             privacy_override=self.privacy_override,
+            bypass_compiled=self.bypass_compiled,
         )
 
     # ---- Strategy: Thread terminus ----
@@ -480,6 +505,11 @@ class IdeaMiner:
           :attr:`min_thread_fragments`.
         * No published essay title substantially overlaps with the
           thread title.
+
+        When a compiled thread page exists, ``source_fragments`` is
+        derived from its provenance rather than rescanned from raw
+        fragments. Missing pages append a ``compile-needed`` entry to
+        ``compile-gaps.jsonl``.
         """
         snap = self._resolve_snapshot(vault_path, snapshot)
         seeds: list[IdeaSeed] = []
@@ -490,7 +520,14 @@ class IdeaMiner:
                 continue
             if self._has_matching_essay(thread.title, snap.published_essay_titles):
                 continue
-            seeds.append(self._seed_from_thread(thread, snap.fragments))
+            seeds.append(
+                self._seed_from_thread(
+                    thread,
+                    snap.fragments,
+                    snap.compiled_pages,
+                    vault_path,
+                ),
+            )
         return seeds
 
     def _has_matching_essay(
@@ -508,11 +545,31 @@ class IdeaMiner:
         self,
         thread: Thread,
         fragments: tuple[tuple[Fragment, str], ...],
+        compiled: CompiledPageIndex,
+        vault_path: Path,
     ) -> IdeaSeed:
-        """Build an :class:`IdeaSeed` for a thread-terminus candidate."""
-        linked = tuple(
-            frag.id for frag, _body in fragments if thread.id in frag.threads
-        )
+        """Build an :class:`IdeaSeed` for a thread-terminus candidate.
+
+        Source fragments are read from the compiled thread page's
+        provenance when one exists; otherwise the miner falls back to
+        scanning raw-fragment ``threads`` membership and records the
+        gap so ``creek lint`` can surface it later.
+        """
+        compiled_thread = compiled.thread(thread.id)
+        if compiled_thread is not None:
+            linked = compiled.fragment_ids_for(compiled_thread)
+        else:
+            linked = tuple(
+                frag.id for frag, _body in fragments if thread.id in frag.threads
+            )
+            if not compiled.bypassed:
+                log_compile_gap(
+                    vault_path,
+                    target_kind="thread",
+                    target_id=thread.id,
+                    surfaced_by="mine.thread_terminus",
+                    reason="missing",
+                )
         description = (
             f"Thread '{thread.id}' has accumulated {thread.fragment_count} "
             "fragments without becoming a published essay. Its sustained "
@@ -651,18 +708,64 @@ class IdeaMiner:
         matches *current_phase* and its :attr:`praxis_potential` is
         :attr:`PraxisPotential.EXPLICIT`. Unclassified phases yield no
         seeds.
+
+        Compile-first routing: when a compiled ``06-Frequencies/{F}``
+        page exists for the fragment's primary frequency, only its
+        provenance fragments surface; fragments outside that
+        provenance are deferred until the index is recompiled. Missing
+        frequency indexes log a ``compile-needed`` entry.
         """
         if str(current_phase) == Phase.UNCLASSIFIED.value:
             return []
         snap = self._resolve_snapshot(vault_path, snapshot)
+        gaps_logged: set[str] = set()
         seeds: list[IdeaSeed] = []
         for fragment, _body in snap.fragments:
             if not _matches_phase(fragment, current_phase):
                 continue
             if str(fragment.praxis_potential) != PraxisPotential.EXPLICIT.value:
                 continue
+            if not self._frequency_admits_fragment(
+                fragment,
+                snap.compiled_pages,
+                vault_path,
+                gaps_logged,
+            ):
+                continue
             seeds.append(self._seed_from_phase_match(fragment, current_phase))
         return seeds
+
+    def _frequency_admits_fragment(
+        self,
+        fragment: Fragment,
+        compiled: CompiledPageIndex,
+        vault_path: Path,
+        gaps_logged: set[str],
+    ) -> bool:
+        """Return ``True`` when *fragment* survives compile-first routing.
+
+        - Compiled frequency-index page exists → fragment must appear in
+          its provenance.
+        - Compiled frequency-index page missing → log a gap once per
+          frequency and admit the fragment (fragments-as-fallback).
+        - Bypass mode → admit unconditionally without logging.
+        """
+        primary = str(fragment.frequency.primary)
+        compiled_freq = compiled.frequency_index(primary)
+        if compiled_freq is not None:
+            return fragment.id in compiled.fragment_ids_for(compiled_freq)
+        if compiled.bypassed:
+            return True
+        if primary not in gaps_logged:
+            gaps_logged.add(primary)
+            log_compile_gap(
+                vault_path,
+                target_kind="frequency_index",
+                target_id=primary,
+                surfaced_by="mine.wavelength_window",
+                reason="missing",
+            )
+        return True
 
     def _seed_from_phase_match(
         self,
@@ -698,12 +801,22 @@ class IdeaMiner:
         For every fragment under ``10-Liminal/{Unnamed,Compost}``, the
         best-scoring eddy above :attr:`similarity_liminal` becomes the
         anchor. The similarity score compares the liminal fragment's
-        title + body text with the eddy's title + description.
+        title + body text against the *compiled* eddy page's body when
+        one exists, falling back to the eddy's frontmatter description
+        and recording a ``compile-needed`` entry per missing eddy.
         """
         snap = self._resolve_snapshot(vault_path, snapshot)
+        gaps_logged: set[str] = set()
         seeds: list[IdeaSeed] = []
         for fragment, body, _kind in snap.liminal_fragments:
-            best = self._best_eddy_match(fragment, body, snap.eddies)
+            best = self._best_eddy_match(
+                fragment,
+                body,
+                snap.eddies,
+                snap.compiled_pages,
+                vault_path,
+                gaps_logged,
+            )
             if best is None:
                 continue
             eddy, score = best
@@ -715,12 +828,20 @@ class IdeaMiner:
         fragment: Fragment,
         body: str,
         eddies: tuple[Eddy, ...],
+        compiled: CompiledPageIndex,
+        vault_path: Path,
+        gaps_logged: set[str],
     ) -> tuple[Eddy, float] | None:
         """Return the eddy with the highest similarity above threshold."""
         frag_text = f"{fragment.title}\n{body}"
         scored: list[tuple[Eddy, float]] = []
         for eddy in eddies:
-            eddy_text = f"{eddy.title}\n{eddy.description}"
+            eddy_text = self._eddy_compare_text(
+                eddy,
+                compiled,
+                vault_path,
+                gaps_logged,
+            )
             score = self._similarity_fn(frag_text, eddy_text)
             if score >= self.similarity_liminal:
                 scored.append((eddy, score))
@@ -728,6 +849,38 @@ class IdeaMiner:
             return None
         scored.sort(key=operator.itemgetter(1), reverse=True)
         return scored[0]
+
+    def _eddy_compare_text(
+        self,
+        eddy: Eddy,
+        compiled: CompiledPageIndex,
+        vault_path: Path,
+        gaps_logged: set[str],
+    ) -> str:
+        """Return the comparison text for *eddy*, compile-first.
+
+        Uses the compiled eddy page's body when available; otherwise
+        falls back to the eddy's frontmatter description and logs a
+        compile-gap entry.
+
+        ``gaps_logged`` is a per-run accumulator of eddy IDs whose gap
+        has already been recorded; it ensures one entry per missing
+        eddy regardless of how many liminal fragments visit it,
+        mirroring the wavelength-window dedup contract.
+        """
+        compiled_eddy = compiled.eddy(eddy.id)
+        if compiled_eddy is not None:
+            return f"{compiled_eddy.title}\n{compiled_eddy.body}"
+        if not compiled.bypassed and eddy.id not in gaps_logged:
+            gaps_logged.add(eddy.id)
+            log_compile_gap(
+                vault_path,
+                target_kind="eddy",
+                target_id=eddy.id,
+                surfaced_by="mine.liminal_cross_eddy",
+                reason="missing",
+            )
+        return f"{eddy.title}\n{eddy.description}"
 
     def _seed_from_liminal(
         self,

@@ -36,7 +36,14 @@ from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
 )
+from creek.generate.compile_routing import (
+    CompiledPageIndex,
+    empty_index,
+    load_compiled_pages,
+    log_compile_gap,
+)
 from creek.models import (
+    CompiledPage,
     Eddy,
     Fragment,
     Phase,
@@ -256,6 +263,7 @@ class DraftGenerator:
         skills_root: Path,
         voice_core: str = "",
         privacy_override: PrivacyTierOverride | None = None,
+        bypass_compiled: bool = False,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -269,11 +277,16 @@ class DraftGenerator:
             privacy_override: Optional ``--include-tier`` value applied
                 when scanning vault fragments for skill inference and
                 source material gathering.
+            bypass_compiled: When ``True`` the source-material gathering
+                step skips the compiled layer and pulls fragments
+                directly. Default ``False`` honours the FEAT-004
+                compile-then-query discipline.
         """
         self._llm = llm
         self.skills_root = skills_root
         self.voice_core = voice_core
         self.privacy_override = privacy_override
+        self.bypass_compiled = bypass_compiled
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -385,21 +398,26 @@ class DraftGenerator:
         *,
         vault_path: Path,
         fragments: dict[str, tuple[Fragment, str]] | None = None,
+        compiled_pages: CompiledPageIndex | None = None,
     ) -> str:
-        """Collect fragment bodies and thread/eddy descriptions for *idea*.
+        """Collect compiled-layer summaries (compile-first) for *idea*.
 
-        Returns a markdown-shaped block the LLM can cite from. Missing
-        IDs are skipped quietly. The sections are:
-
-        * ``## Source fragments`` — ``### {id}: {title}`` followed by body.
-        * ``## Threads`` — ``### {id}: {title}`` followed by description.
-        * ``## Eddies`` — ``### {id}: {title}`` followed by description.
+        FEAT-004 routing: thread and eddy sections render the compiled
+        page body when one exists; missing pages fall back to the
+        frontmatter description and append a ``compile-needed`` entry
+        to ``00-Creek-Meta/Processing-Log/compile-gaps.jsonl``. Source
+        fragments are still pulled inline so drafts can quote them
+        verbatim — provenance traversal stays available even when the
+        compiled summary is the primary source.
 
         Args:
             idea: Idea seed whose IDs drive the lookup.
             vault_path: Vault root used to load fragments/threads/eddies.
             fragments: Optional pre-loaded ``{id: (Fragment, body)}`` map;
                 when provided the vault is not re-scanned for fragments.
+            compiled_pages: Optional pre-loaded compiled-page index. When
+                ``None`` the index is loaded (or bypassed) per
+                :attr:`bypass_compiled`.
 
         Returns:
             A newline-joined markdown string.
@@ -413,18 +431,93 @@ class DraftGenerator:
                 privacy_override=self.privacy_override,
             )
         )
+        compiled = self._resolve_compiled_pages(vault_path, compiled_pages)
         frag_block = _render_fragment_section(idea.source_fragments, loaded)
         if frag_block:
             sections.append(frag_block)
-        threads = _load_threads_by_id(vault_path / _THREADS_SUBDIR)
-        thread_block = _render_thread_section(idea.threads, threads)
+        thread_block = self._compose_thread_section(idea, vault_path, compiled)
         if thread_block:
             sections.append(thread_block)
-        eddies = _load_eddies_by_id(vault_path / _EDDIES_SUBDIR)
-        eddy_block = _render_eddy_section(idea.eddies, eddies)
+        eddy_block = self._compose_eddy_section(idea, vault_path, compiled)
         if eddy_block:
             sections.append(eddy_block)
         return "\n\n".join(sections)
+
+    def _resolve_compiled_pages(
+        self,
+        vault_path: Path,
+        compiled_pages: CompiledPageIndex | None,
+    ) -> CompiledPageIndex:
+        """Return *compiled_pages* if provided, otherwise load it."""
+        if compiled_pages is not None:
+            return compiled_pages
+        if self.bypass_compiled:
+            return empty_index(bypassed=True)
+        return load_compiled_pages(vault_path)
+
+    def _compose_thread_section(
+        self,
+        idea: IdeaSeed,
+        vault_path: Path,
+        compiled: CompiledPageIndex,
+    ) -> str:
+        """Render the ``## Threads`` block, compile-first."""
+        if not idea.threads:
+            return ""
+        threads = _load_threads_by_id(vault_path / _THREADS_SUBDIR)
+        entries: list[str] = []
+        for tid in idea.threads:
+            page = compiled.thread(tid)
+            if page is not None:
+                entries.append(_render_compiled_entry(tid, page))
+                continue
+            if not compiled.bypassed:
+                log_compile_gap(
+                    vault_path,
+                    target_kind="thread",
+                    target_id=tid,
+                    surfaced_by="draft",
+                    reason="missing",
+                )
+            thread = threads.get(tid)
+            if thread is not None:
+                desc = thread.description.strip() or "(no description)"
+                entries.append(f"### {tid}: {thread.title}\n{desc}")
+        if not entries:
+            return ""
+        return "## Threads\n\n" + "\n\n".join(entries)
+
+    def _compose_eddy_section(
+        self,
+        idea: IdeaSeed,
+        vault_path: Path,
+        compiled: CompiledPageIndex,
+    ) -> str:
+        """Render the ``## Eddies`` block, compile-first."""
+        if not idea.eddies:
+            return ""
+        eddies = _load_eddies_by_id(vault_path / _EDDIES_SUBDIR)
+        entries: list[str] = []
+        for eid in idea.eddies:
+            page = compiled.eddy(eid)
+            if page is not None:
+                entries.append(_render_compiled_entry(eid, page))
+                continue
+            if not compiled.bypassed:
+                log_compile_gap(
+                    vault_path,
+                    target_kind="eddy",
+                    target_id=eid,
+                    surfaced_by="draft",
+                    reason="missing",
+                )
+            eddy = eddies.get(eid)
+            if eddy is not None:
+                desc = eddy.description.strip() or "(no description)"
+                entries.append(f"### {eid}: {eddy.title}\n{desc}")
+        if not entries:
+            return ""
+        return "## Eddies\n\n" + "\n\n".join(entries)
 
     def _compose_prompt(
         self,
@@ -473,6 +566,7 @@ class DraftGenerator:
             vault_path / _FRAGMENTS_SUBDIR,
             privacy_override=self.privacy_override,
         )
+        compiled_pages = self._resolve_compiled_pages(vault_path, None)
         skill_stack = self.select_skill_stack(
             idea,
             vault_path=vault_path,
@@ -483,6 +577,7 @@ class DraftGenerator:
             idea,
             vault_path=vault_path,
             fragments=fragments,
+            compiled_pages=compiled_pages,
         )
         prompt = self._compose_prompt(idea, skill_stack, source_material)
         body = self._llm(prompt).strip()
@@ -536,6 +631,21 @@ class DraftGenerator:
         )
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
+
+
+def _render_compiled_entry(target_id: str, page: CompiledPage) -> str:
+    """Return a ``### {id}: {title}`` block sourced from the compiled page.
+
+    The body strips any leading ``# {title}`` heading (compile renders
+    the title as the first line) so the ``###`` header isn't shadowed.
+    """
+    body = page.body.strip()
+    lines = body.splitlines()
+    if lines and lines[0].lstrip("# ").strip() == page.title.strip():
+        body = "\n".join(lines[1:]).strip()
+    if not body:
+        body = "(compiled page has no body)"
+    return f"### {target_id}: {page.title}\n{body}"
 
 
 def _render_skill_section(path: Path) -> str:
