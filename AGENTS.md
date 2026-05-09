@@ -32,17 +32,13 @@ Every agent operating on the vault uses these four verbs. Each has a dedicated s
 | Verb | Skill file | What it does |
 |---|---|---|
 | `creek compile` | [`00-Creek-Meta/Skills/compile.SKILL.md`](00-Creek-Meta/Skills/compile.SKILL.md) | Per-source, interactive, provenance-preserving rollup of fragments → compiled-layer pages (Threads, Eddies, Praxis, Frequency indexes) |
-| `creek query` | (covered inline in this file; dedicated skill arrives with FEAT-004) | Read the compiled layer first; fall back to fragments only when the compiled page is missing or insufficient |
+| `creek query` | [`00-Creek-Meta/Skills/query.SKILL.md`](00-Creek-Meta/Skills/query.SKILL.md) | Read the compiled layer first; fall back to fragments only when the compiled page is missing or insufficient. `creek mine` and `creek draft` route through this contract; `--bypass-compiled` is a documented escape hatch. |
 | `creek lint` | [`00-Creek-Meta/Skills/lint.SKILL.md`](00-Creek-Meta/Skills/lint.SKILL.md) | Unified hygiene check across orphans, contradictions, stale claims, missing pages, data gaps. **Lint never resolves paradoxes; contradictions route to `10-Liminal/Paradoxes/`.** |
 | `creek save` | [`00-Creek-Meta/Skills/save.SKILL.md`](00-Creek-Meta/Skills/save.SKILL.md) | File a good answer back into the vault as thread / eddy / praxis / paradox / unnamed / draft, honoring privacy tiers |
 
 ### Query — the compiled-layer-first rule
 
-Until FEAT-004 ships a dedicated `query.SKILL.md`, the contract is:
-
-1. **Compiled-layer first.** When asked "what does the vault know about X?", read the relevant Thread, Eddy, or Frequency-index page first.
-2. **Fragments are the fallback.** Drop down to `01-Fragments/` only when the compiled page is missing, stale, or contradicts what fresh fragments say. When you do, surface the discrepancy as a `creek lint` candidate.
-3. **`10-Liminal/` is not a fallback.** It's a deliberate destination, not an overflow bin. Don't read from it as if it were a synthesis layer; read from it to honor what the system has refused to flatten.
+The full contract lives in [`00-Creek-Meta/Skills/query.SKILL.md`](00-Creek-Meta/Skills/query.SKILL.md). The rule, in one paragraph: read the relevant `02-Threads/` / `03-Eddies/` / `06-Frequencies/` page first; drop down to `01-Fragments/` only when the compiled page is missing, stale, or contradicts fresh fragments (and let `creek mine` / `creek draft` log a `compile-needed` entry to `00-Creek-Meta/Processing-Log/compile-gaps.jsonl` so `creek lint` can surface it); never treat `10-Liminal/` as an overflow bin — read it only when paradoxes or unnamed patterns are themselves the subject. `--bypass-compiled` is the documented escape hatch.
 
 ## Canonical taxonomy
 

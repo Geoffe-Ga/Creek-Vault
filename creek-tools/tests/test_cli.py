@@ -1210,3 +1210,46 @@ def test_draft_unknown_phase_errors() -> None:
         ["draft", "--vault", "/fake/vault", "--phase", "nonsense"],
     )
     assert result.exit_code == 2
+
+
+def test_mine_bypass_compiled_flag_advertised_in_help() -> None:
+    """``creek mine --help`` documents the FEAT-004 escape hatch."""
+    result = runner.invoke(app, ["mine", "--help"])
+    assert result.exit_code == 0
+    assert "--bypass-compiled" in result.output
+
+
+def test_draft_bypass_compiled_flag_advertised_in_help() -> None:
+    """``creek draft --help`` documents the FEAT-004 escape hatch."""
+    result = runner.invoke(app, ["draft", "--help"])
+    assert result.exit_code == 0
+    assert "--bypass-compiled" in result.output
+
+
+def test_mine_bypass_compiled_warns_and_skips_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--bypass-compiled`` constructs the miner in bypass mode and warns."""
+    from creek.generate.mining import IdeaMiner
+
+    captured: dict[str, bool] = {}
+    real_init = IdeaMiner.__init__
+
+    def _spy_init(self: IdeaMiner, **kwargs: object) -> None:
+        captured["bypass"] = bool(kwargs.get("bypass_compiled"))
+        real_init(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(IdeaMiner, "__init__", _spy_init)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = runner.invoke(
+        app,
+        ["mine", "--vault", str(vault), "--bypass-compiled"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["bypass"] is True
+    assert "--bypass-compiled" in result.output
+    assert "side-step" in result.output.lower()

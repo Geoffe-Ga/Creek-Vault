@@ -638,3 +638,189 @@ class TestSaveDraft:
         assert frontmatter.load(str(first)).content.strip() == "First."
         assert frontmatter.load(str(second)).content.strip() == "Second."
         assert frontmatter.load(str(third)).content.strip() == "Third."
+
+
+# ---- FEAT-004 compiled-layer routing ---------------------------------
+
+
+def _write_compiled_thread_page(
+    vault: Path,
+    *,
+    target_id: str,
+    title: str,
+    body: str,
+    fragment_ids: tuple[str, ...] = (),
+) -> Path:
+    """Persist a compiled-layer thread page in a non-colliding subfolder."""
+    from creek.compile.provenance import ProvenanceEntry
+    from creek.models import CompiledPage
+
+    page = CompiledPage(
+        target_kind="thread",
+        target_id=target_id,
+        title=title,
+        body=body,
+        provenance=[
+            ProvenanceEntry(
+                claim_id=f"claim-{i}",
+                claim_excerpt=f"excerpt {i}",
+                fragment_ids=[fid],
+                compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
+                compile_method="llm",
+            )
+            for i, fid in enumerate(fragment_ids, start=1)
+        ],
+    )
+    metadata = page.model_dump(mode="json", exclude={"body"})
+    target = vault / "02-Threads" / "Compiled" / f"{target_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=body, **metadata)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_compiled_eddy_page(
+    vault: Path,
+    *,
+    target_id: str,
+    title: str,
+    body: str,
+) -> Path:
+    """Persist a compiled-layer eddy page in a non-colliding subfolder."""
+    from creek.models import CompiledPage
+
+    page = CompiledPage(target_kind="eddy", target_id=target_id, title=title, body=body)
+    metadata = page.model_dump(mode="json", exclude={"body"})
+    target = vault / "03-Eddies" / "Compiled" / f"{target_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=body, **metadata)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+class TestGatherSourceMaterialCompileFirst:
+    """``gather_source_material`` reads the compiled layer before fragments."""
+
+    def test_compiled_thread_body_is_used_when_present(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """The compiled thread synthesis text replaces the description."""
+        thread = Thread(
+            id="thread-A",
+            title="Listening practice",
+            status=ThreadStatus.ACTIVE,
+            first_seen=date(2026, 1, 1),
+            last_seen=date(2026, 4, 1),
+            description="Bare frontmatter description.",
+        )
+        _write_thread(vault, thread)
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-A",
+            title="Listening practice",
+            body="# Listening practice\nThe synthesised body says listening matters.\n",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(threads=("thread-A",))
+
+        block = gen.gather_source_material(seed, vault_path=vault)
+
+        assert "synthesised body says listening matters" in block
+        assert "Bare frontmatter description" not in block
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert not gaps_log.exists()
+
+    def test_missing_compiled_thread_falls_back_and_logs_gap(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Without a compiled page, frontmatter description appears + gap entry."""
+        thread = Thread(
+            id="thread-A",
+            title="Listening practice",
+            status=ThreadStatus.ACTIVE,
+            first_seen=date(2026, 1, 1),
+            last_seen=date(2026, 4, 1),
+            description="Frontmatter fallback text.",
+        )
+        _write_thread(vault, thread)
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(threads=("thread-A",))
+
+        block = gen.gather_source_material(seed, vault_path=vault)
+
+        assert "Frontmatter fallback text" in block
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert gaps_log.exists()
+        contents = gaps_log.read_text(encoding="utf-8")
+        assert "thread-A" in contents
+        assert '"surfaced_by": "draft"' in contents
+
+    def test_compiled_eddy_body_replaces_description(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Same compile-first behaviour for eddies."""
+        eddy = Eddy(
+            id="eddy-A",
+            title="Water as teacher",
+            formed=date(2026, 1, 1),
+            description="Stale frontmatter description.",
+        )
+        _write_eddy(vault, eddy)
+        _write_compiled_eddy_page(
+            vault,
+            target_id="eddy-A",
+            title="Water as teacher",
+            body="# Water as teacher\nWater is the teacher we keep returning to.\n",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(eddies=("eddy-A",))
+
+        block = gen.gather_source_material(seed, vault_path=vault)
+
+        assert "Water is the teacher" in block
+        assert "Stale frontmatter description" not in block
+
+    def test_bypass_compiled_pulls_descriptions_and_skips_log(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """``bypass_compiled=True`` reads frontmatter only and never logs gaps."""
+        thread = Thread(
+            id="thread-A",
+            title="Listening practice",
+            status=ThreadStatus.ACTIVE,
+            first_seen=date(2026, 1, 1),
+            last_seen=date(2026, 4, 1),
+            description="Frontmatter description.",
+        )
+        _write_thread(vault, thread)
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-A",
+            title="Listening practice",
+            body="# Listening practice\nCompiled body that bypass should NOT see.\n",
+        )
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            bypass_compiled=True,
+        )
+        seed = _build_seed(threads=("thread-A",))
+
+        block = gen.gather_source_material(seed, vault_path=vault)
+
+        assert "Frontmatter description" in block
+        assert "bypass should NOT see" not in block
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert not gaps_log.exists()

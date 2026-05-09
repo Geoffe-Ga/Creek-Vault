@@ -903,3 +903,386 @@ class TestMineAll:
         )
 
         assert any(s.strategy is MiningStrategy.THREAD_TERMINUS for s in seeds)
+
+
+# ---- FEAT-004 compiled-layer routing -------------------------------------
+
+
+def _write_compiled_thread_page(
+    vault: Path,
+    *,
+    target_id: str,
+    title: str,
+    fragment_ids: tuple[str, ...],
+) -> Path:
+    """Persist a compiled-layer thread page under ``02-Threads/Active``."""
+    from creek.compile.provenance import ProvenanceEntry
+    from creek.models import CompiledPage
+
+    page = CompiledPage(
+        target_kind="thread",
+        target_id=target_id,
+        title=title,
+        body=f"# {title}\n",
+        provenance=[
+            ProvenanceEntry(
+                claim_id=f"claim-{i}",
+                claim_excerpt=f"excerpt {i}",
+                fragment_ids=[fid],
+                compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
+                compile_method="llm",
+            )
+            for i, fid in enumerate(fragment_ids, start=1)
+        ],
+    )
+    metadata = page.model_dump(mode="json", exclude={"body"})
+    # Use a distinct subfolder so the test fixture can coexist with the
+    # Thread-frontmatter note ``_write_thread`` places under Active/.
+    target = vault / "02-Threads" / "Compiled" / f"{target_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=page.body, **metadata)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_compiled_eddy_page(
+    vault: Path,
+    *,
+    target_id: str,
+    title: str,
+    body: str,
+) -> Path:
+    """Persist a compiled-layer eddy page under ``03-Eddies``."""
+    from creek.models import CompiledPage
+
+    page = CompiledPage(target_kind="eddy", target_id=target_id, title=title, body=body)
+    metadata = page.model_dump(mode="json", exclude={"body"})
+    # Distinct subfolder so the eddy frontmatter file at the canonical
+    # path coexists with the compiled page.
+    target = vault / "03-Eddies" / "Compiled" / f"{target_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=body, **metadata)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_compiled_frequency_page(
+    vault: Path,
+    *,
+    target_id: str,
+    fragment_ids: tuple[str, ...],
+) -> Path:
+    """Persist a compiled frequency-index page under ``06-Frequencies``."""
+    from creek.compile.provenance import ProvenanceEntry
+    from creek.models import CompiledPage
+
+    page = CompiledPage(
+        target_kind="frequency_index",
+        target_id=target_id,
+        title=f"{target_id} index",
+        body=f"# {target_id}\n",
+        provenance=[
+            ProvenanceEntry(
+                claim_id=f"claim-{i}",
+                claim_excerpt=f"excerpt {i}",
+                fragment_ids=[fid],
+                compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
+                compile_method="llm",
+            )
+            for i, fid in enumerate(fragment_ids, start=1)
+        ],
+    )
+    metadata = page.model_dump(mode="json", exclude={"body"})
+    target = vault / "06-Frequencies" / f"{target_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=page.body, **metadata)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+class TestCompileFirstThreadTerminus:
+    """``mine_thread_terminus`` reads compiled pages before fragments."""
+
+    def test_provenance_drives_source_fragments_when_compiled_page_exists(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Compiled-page provenance — not raw fragment scan — provides IDs."""
+        thread = _build_thread(
+            thread_id="thread-grief",
+            title="Grief rhythm",
+            fragment_count=12,
+        )
+        _write_thread(vault, thread)
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-grief",
+            title="Grief rhythm",
+            fragment_ids=("frag-compiled-1", "frag-compiled-2"),
+        )
+        for day in range(1, 13):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=f"frag-raw-{day}",
+                    title=f"raw {day}",
+                    threads=("thread-grief",),
+                    created_day=day,
+                ),
+                "Body.",
+            )
+
+        seeds = miner.mine_thread_terminus(vault)
+
+        assert len(seeds) == 1
+        assert set(seeds[0].source_fragments) == {
+            "frag-compiled-1",
+            "frag-compiled-2",
+        }
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert not gaps_log.exists()
+
+    def test_missing_compiled_page_falls_back_and_logs_gap(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Without a compiled page, fragments-as-fallback + gap entry."""
+        thread = _build_thread(
+            thread_id="thread-fallback",
+            title="Fallback thread",
+            fragment_count=12,
+        )
+        _write_thread(vault, thread)
+        for day in range(1, 13):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=f"frag-{day:02d}",
+                    title=f"raw {day}",
+                    threads=("thread-fallback",),
+                    created_day=day,
+                ),
+                "Body.",
+            )
+
+        seeds = miner.mine_thread_terminus(vault)
+
+        assert len(seeds) == 1
+        assert "frag-01" in seeds[0].source_fragments
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert gaps_log.exists()
+        contents = gaps_log.read_text(encoding="utf-8")
+        assert "thread-fallback" in contents
+        assert "mine.thread_terminus" in contents
+
+    def test_bypass_compiled_skips_log_and_uses_fragment_scan(
+        self,
+        vault: Path,
+    ) -> None:
+        """``bypass_compiled=True`` reads raw fragments and never logs."""
+        thread = _build_thread(
+            thread_id="thread-bypass",
+            title="Bypass thread",
+            fragment_count=12,
+        )
+        _write_thread(vault, thread)
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-bypass",
+            title="Bypass thread",
+            fragment_ids=("frag-compiled-1",),
+        )
+        for day in range(1, 13):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=f"frag-{day:02d}",
+                    title=f"raw {day}",
+                    threads=("thread-bypass",),
+                    created_day=day,
+                ),
+                "Body.",
+            )
+
+        bypass_miner = IdeaMiner(bypass_compiled=True)
+        seeds = bypass_miner.mine_thread_terminus(vault)
+
+        assert len(seeds) == 1
+        assert "frag-compiled-1" not in seeds[0].source_fragments
+        assert "frag-01" in seeds[0].source_fragments
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert not gaps_log.exists()
+
+
+class TestCompileFirstLiminalCrossEddy:
+    """``mine_liminal_cross_eddy`` compares against compiled eddy bodies."""
+
+    def test_compiled_eddy_body_drives_similarity(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Compile-first routing reads the eddy's compiled body, not its description."""
+        eddy = _build_eddy(
+            eddy_id="eddy-grief",
+            title="Bare frontmatter title",
+            description="bland",
+        )
+        _write_eddy(vault, eddy)
+        _write_compiled_eddy_page(
+            vault,
+            target_id="eddy-grief",
+            title="Grief rituals metabolise",
+            body="# Grief rituals\nGrief rituals metabolise the body slowly.\n",
+        )
+
+        frag = _build_fragment(frag_id="frag-w", title="Wandering")
+        _write_liminal_fragment(
+            vault,
+            frag,
+            "Grief rituals metabolise the body slowly.",
+            kind="Unnamed",
+        )
+
+        seeds = miner.mine_liminal_cross_eddy(vault)
+
+        assert len(seeds) == 1
+        assert seeds[0].eddies == ("eddy-grief",)
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert not gaps_log.exists()
+
+    def test_missing_compiled_eddy_logs_gap(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """A frontmatter-only eddy still seeds (fallback) but logs a gap."""
+        eddy = _build_eddy(
+            eddy_id="eddy-grief",
+            title="Grief practices",
+            description="Rituals for metabolising grief.",
+        )
+        _write_eddy(vault, eddy)
+
+        frag = _build_fragment(frag_id="frag-w", title="Wandering")
+        _write_liminal_fragment(
+            vault,
+            frag,
+            "Notes on grief rituals and metabolising grief slowly.",
+            kind="Unnamed",
+        )
+
+        miner.mine_liminal_cross_eddy(vault)
+
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert gaps_log.exists()
+        assert "eddy-grief" in gaps_log.read_text(encoding="utf-8")
+
+
+class TestCompileFirstWavelengthWindow:
+    """``mine_wavelength_windows`` admits via compiled frequency provenance."""
+
+    def test_compiled_frequency_filters_to_provenance(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Only fragments listed in the compiled F<x> page surface."""
+        in_provenance = _build_fragment(
+            frag_id="frag-listed",
+            title="Listed fragment",
+            phase=Phase.RISING,
+            praxis=PraxisPotential.EXPLICIT,
+            frequency=Frequency.F5,
+        )
+        outside_provenance = _build_fragment(
+            frag_id="frag-orphan",
+            title="Orphan fragment",
+            phase=Phase.RISING,
+            praxis=PraxisPotential.EXPLICIT,
+            frequency=Frequency.F5,
+        )
+        _write_fragment(vault, in_provenance, "body")
+        _write_fragment(vault, outside_provenance, "body")
+        _write_compiled_frequency_page(
+            vault,
+            target_id="F5",
+            fragment_ids=("frag-listed",),
+        )
+
+        seeds = miner.mine_wavelength_windows(vault, current_phase=Phase.RISING)
+
+        ids = {fid for seed in seeds for fid in seed.source_fragments}
+        assert ids == {"frag-listed"}
+
+    def test_missing_frequency_index_logs_one_gap_per_frequency(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """All fragments fall through and the gap log records one entry per F<x>."""
+        for fid in ("frag-1", "frag-2"):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=fid,
+                    title=fid,
+                    phase=Phase.RISING,
+                    praxis=PraxisPotential.EXPLICIT,
+                    frequency=Frequency.F5,
+                ),
+                "body",
+            )
+
+        seeds = miner.mine_wavelength_windows(vault, current_phase=Phase.RISING)
+
+        assert len(seeds) == 2
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        lines = gaps_log.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        assert "F5" in lines[0]
+
+
+class TestCompileFirstUnchangedExternalBehaviour:
+    """User-facing seeds are unchanged when the vault has compiled coverage."""
+
+    def test_present_vault_yields_same_seeds_with_or_without_routing(
+        self,
+        vault: Path,
+    ) -> None:
+        """Seeds from a fully-compiled vault match the bypass output (regression AC)."""
+        thread = _build_thread(
+            thread_id="thread-grief",
+            title="Grief rhythm",
+            fragment_count=12,
+        )
+        _write_thread(vault, thread)
+        for day in range(1, 13):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=f"frag-{day:02d}",
+                    title=f"raw {day}",
+                    threads=("thread-grief",),
+                    created_day=day,
+                ),
+                "Body.",
+            )
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-grief",
+            title="Grief rhythm",
+            fragment_ids=tuple(f"frag-{day:02d}" for day in range(1, 13)),
+        )
+
+        compiled_seeds = IdeaMiner().mine_all(vault, current_phase=Phase.UNCLASSIFIED)
+        bypass_seeds = IdeaMiner(bypass_compiled=True).mine_all(
+            vault,
+            current_phase=Phase.UNCLASSIFIED,
+        )
+
+        compiled_titles = {s.title for s in compiled_seeds}
+        bypass_titles = {s.title for s in bypass_seeds}
+        assert compiled_titles == bypass_titles
