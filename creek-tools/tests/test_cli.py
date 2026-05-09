@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
@@ -14,6 +15,20 @@ if TYPE_CHECKING:
     import pytest
 
 runner = CliRunner()
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Return *text* with ANSI escape sequences removed.
+
+    Typer/Click's Rich formatter splits long option names like
+    ``--bypass-compiled`` across colour-styled segments when CI's
+    terminal supports ANSI; the literal substring then disappears
+    from ``result.output``. Stripping ANSI before substring assertions
+    keeps the tests environment-independent.
+    """
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def test_help() -> None:
@@ -1216,14 +1231,14 @@ def test_mine_bypass_compiled_flag_advertised_in_help() -> None:
     """``creek mine --help`` documents the FEAT-004 escape hatch."""
     result = runner.invoke(app, ["mine", "--help"])
     assert result.exit_code == 0
-    assert "--bypass-compiled" in result.output
+    assert "--bypass-compiled" in _strip_ansi(result.output)
 
 
 def test_draft_bypass_compiled_flag_advertised_in_help() -> None:
     """``creek draft --help`` documents the FEAT-004 escape hatch."""
     result = runner.invoke(app, ["draft", "--help"])
     assert result.exit_code == 0
-    assert "--bypass-compiled" in result.output
+    assert "--bypass-compiled" in _strip_ansi(result.output)
 
 
 def test_mine_bypass_compiled_warns_and_skips_routing(
