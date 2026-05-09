@@ -12,6 +12,6 @@
 # in via pip's resolver. See ./scripts/security.sh for documented ignores.
 cryptography>=46.0.6
 pip>=26.1
-pyjwt>=2.12.0
+pyjwt>=2.12.1
 setuptools>=78.1.1
 wheel>=0.46.2
