@@ -8,6 +8,7 @@ wavelength-phase windows.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -1179,6 +1180,41 @@ class TestCompileFirstLiminalCrossEddy:
         gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
         assert gaps_log.exists()
         assert "eddy-grief" in gaps_log.read_text(encoding="utf-8")
+
+    def test_missing_compiled_eddy_logs_one_gap_per_eddy(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Per-run dedup: each eddy logs once regardless of liminal-fragment count.
+
+        Mirrors the wavelength-window dedup contract. With L liminal
+        fragments and E uncompiled eddies, the log should grow by E
+        entries per run, not L * E.
+        """
+        for eid in ("eddy-grief", "eddy-rituals"):
+            _write_eddy(
+                vault,
+                _build_eddy(
+                    eddy_id=eid,
+                    title=f"{eid} title",
+                    description="Notes on grief rituals and metabolising grief slowly.",
+                ),
+            )
+        for n in range(3):
+            _write_liminal_fragment(
+                vault,
+                _build_fragment(frag_id=f"frag-{n}", title=f"Wandering {n}"),
+                "Notes on grief rituals and metabolising grief slowly.",
+                kind="Unnamed",
+            )
+
+        miner.mine_liminal_cross_eddy(vault)
+
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        lines = gaps_log.read_text(encoding="utf-8").strip().splitlines()
+        eddy_ids_logged = [json.loads(line)["target_id"] for line in lines]
+        assert sorted(eddy_ids_logged) == sorted(["eddy-grief", "eddy-rituals"])
 
 
 class TestCompileFirstWavelengthWindow:

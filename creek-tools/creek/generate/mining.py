@@ -806,6 +806,7 @@ class IdeaMiner:
         and recording a ``compile-needed`` entry per missing eddy.
         """
         snap = self._resolve_snapshot(vault_path, snapshot)
+        gaps_logged: set[str] = set()
         seeds: list[IdeaSeed] = []
         for fragment, body, _kind in snap.liminal_fragments:
             best = self._best_eddy_match(
@@ -814,6 +815,7 @@ class IdeaMiner:
                 snap.eddies,
                 snap.compiled_pages,
                 vault_path,
+                gaps_logged,
             )
             if best is None:
                 continue
@@ -828,12 +830,18 @@ class IdeaMiner:
         eddies: tuple[Eddy, ...],
         compiled: CompiledPageIndex,
         vault_path: Path,
+        gaps_logged: set[str],
     ) -> tuple[Eddy, float] | None:
         """Return the eddy with the highest similarity above threshold."""
         frag_text = f"{fragment.title}\n{body}"
         scored: list[tuple[Eddy, float]] = []
         for eddy in eddies:
-            eddy_text = self._eddy_compare_text(eddy, compiled, vault_path)
+            eddy_text = self._eddy_compare_text(
+                eddy,
+                compiled,
+                vault_path,
+                gaps_logged,
+            )
             score = self._similarity_fn(frag_text, eddy_text)
             if score >= self.similarity_liminal:
                 scored.append((eddy, score))
@@ -847,17 +855,24 @@ class IdeaMiner:
         eddy: Eddy,
         compiled: CompiledPageIndex,
         vault_path: Path,
+        gaps_logged: set[str],
     ) -> str:
         """Return the comparison text for *eddy*, compile-first.
 
         Uses the compiled eddy page's body when available; otherwise
         falls back to the eddy's frontmatter description and logs a
         compile-gap entry.
+
+        ``gaps_logged`` is a per-run accumulator of eddy IDs whose gap
+        has already been recorded; it ensures one entry per missing
+        eddy regardless of how many liminal fragments visit it,
+        mirroring the wavelength-window dedup contract.
         """
         compiled_eddy = compiled.eddy(eddy.id)
         if compiled_eddy is not None:
             return f"{compiled_eddy.title}\n{compiled_eddy.body}"
-        if not compiled.bypassed:
+        if not compiled.bypassed and eddy.id not in gaps_logged:
+            gaps_logged.add(eddy.id)
             log_compile_gap(
                 vault_path,
                 target_kind="eddy",
