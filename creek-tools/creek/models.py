@@ -8,13 +8,28 @@ for the APTITUDE frequency framework and Archetypal Wavelength mapping.
 
 import uuid
 import warnings
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
+from creek.compile.provenance import CompileMethod, ProvenanceEntry
 from creek.time import now_la, today_la
+
+CompileTargetKind = Literal["thread", "eddy", "frequency_index"]
+"""The compiled-page surfaces ``creek compile`` may target (FEAT-003)."""
+
+
+def _utc_now() -> datetime:
+    """Return the current time in UTC (used as a Pydantic default factory).
+
+    The compile engine writes ``compiled_at`` as UTC; this default
+    keeps direct ``CompiledPage(...)`` constructions consistent so an
+    operator who skips the engine doesn't silently get LA-local time.
+    """
+    return datetime.now(tz=UTC)
+
 
 # ---- Enums ----
 
@@ -622,3 +637,39 @@ class Synchronicity(BaseModel):
     source_a: SourcePlatform
     source_b: SourcePlatform
     tags: list[str] = Field(default_factory=lambda: ["synchronicity"])
+
+
+class CompiledPage(BaseModel):
+    """A compiled-layer synthesis page produced by ``creek compile`` (FEAT-003).
+
+    Compile rolls fragments from ``01-Fragments/`` up into Threads,
+    Eddies, and per-frequency index notes. The page's YAML frontmatter
+    carries one :class:`ProvenanceEntry` per claim so every assertion
+    on the page traces back to the fragment(s) that produced it.
+
+    Attributes:
+        target_kind: Which compiled-layer surface this page lives on —
+            ``"thread"``, ``"eddy"``, or ``"frequency_index"``.
+        target_id: Stable identifier of the synthesis target (e.g.
+            ``"thread-systems"``).
+        title: Human-readable title rendered into the page heading.
+        body: Markdown body of the synthesis. Paradoxes are *never*
+            flattened into this body — they route to the side-channel
+            paradox log instead (ontology spec §10.2).
+        provenance: Per-claim provenance entries; merged across
+            idempotent re-runs.
+        compiled_at: UTC timestamp of the most recent compile run.
+        compile_method: How the page's claims were produced — one of
+            ``"rules"``, ``"llm"``, or ``"manual"``.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    type: str = "compiled_page"
+    target_kind: CompileTargetKind
+    target_id: str
+    title: str
+    body: str = ""
+    provenance: list[ProvenanceEntry] = Field(default_factory=list)
+    compiled_at: datetime = Field(default_factory=_utc_now)
+    compile_method: CompileMethod = "llm"

@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import typer
 from rich.console import Console
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
     from creek.generate.drafts import DraftLLM
     from creek.ingest.base import Ingestor
-    from creek.models import Phase
+    from creek.models import CompileTargetKind, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 
@@ -717,6 +717,60 @@ def link(
         f"[bold green]{method.capitalize()} linker: "
         f"{summary.fragment_count} fragment(s), "
         f"{summary.link_count} link(s).[/bold green]",
+    )
+
+
+@app.command(name="compile")
+def compile_(
+    fragment_id: str = typer.Argument(..., help="Source fragment ID to roll up"),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    target_kind: str = typer.Option(
+        "thread",
+        "--target-kind",
+        help="Compiled-page surface (thread|eddy|frequency_index)",
+    ),
+    target_id: str = typer.Option(
+        ...,
+        "--target-id",
+        help="Stable ID of the compiled page (e.g. thread-systems)",
+    ),
+    target_title: str = typer.Option(
+        ...,
+        "--target-title",
+        help="Human-readable title for the compiled page",
+    ),
+) -> None:
+    """Roll a fragment up into a compiled-layer page (FEAT-003).
+
+    Reads the source fragment from ``<vault>/01-Fragments``, calls the
+    configured LLM to synthesise claims with per-claim provenance back
+    to the fragment ID, and writes the result to the appropriate
+    compiled-layer directory. LLM-detected paradoxes are routed to the
+    side-channel log under ``00-Creek-Meta/Processing-Log/`` rather
+    than flattened into the synthesis page.
+    """
+    from creek.compile.engine import TARGET_KINDS, _default_llm, compile_to_vault
+
+    if target_kind not in TARGET_KINDS:
+        console.print(
+            f"[red]Unknown --target-kind {target_kind!r}. "
+            f"Supported: {', '.join(TARGET_KINDS)}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+    config = load_config()
+    vault_path = _resolve_vault(vault)
+    kind = cast("CompileTargetKind", target_kind)
+    written = compile_to_vault(
+        fragment_ids=[fragment_id],
+        vault_path=vault_path,
+        target_kind=kind,
+        target_id=target_id,
+        target_title=target_title,
+        llm=_default_llm(config.llm),
+    )
+    console.print(
+        f"[bold green]Compiled {fragment_id} -> {written}[/bold green]",
     )
 
 
