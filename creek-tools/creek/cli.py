@@ -896,6 +896,28 @@ def report(
 
 
 @app.command()
+def state(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Render ``00-Creek-Meta/State/<iso-week>.md`` audit report (FEAT-006).
+
+    The command is a *view* over the compiled vault layer — it never
+    re-runs classification, linking, or compile. It reads existing
+    fragments, threads, eddies, praxis, synchronicities, and the most
+    recent ``run-summary.jsonl`` line, and writes a single markdown
+    document organised in seven sections (vault summary, pre-LLM yield,
+    active eddies, active threads, surprising connections, hyperedges,
+    drift warnings). ``latest.md`` next to the ISO-week file always
+    points at the most recent report.
+    """
+    from creek.generate.state import StateReportGenerator
+
+    vault_path = _resolve_vault(vault)
+    written = StateReportGenerator(vault_path=vault_path).write()
+    console.print(f"[bold green]State report written: {written}[/bold green]")
+
+
+@app.command()
 def review(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     list_only: bool = typer.Option(
