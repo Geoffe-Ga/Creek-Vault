@@ -2,6 +2,8 @@
 
 The Creek Ontology §10 carves out five emergence sub-systems — places where the vault is allowed to grow patterns the ontology itself does not predict. Each is implemented under `creek/generate/`, surfaced via `creek report --type <kind>`, and pinned by tests in `tests/`. This page documents the *exact* criteria that decide whether content is surfaced, so a missing pattern is recognisable as a bug rather than mistaken for intended behaviour.
 
+> **FEAT-008** unifies all five subsystems under one verb: `creek lint`. The deterministic checks (broken wiki-links, orphan compiled pages, schema-skill size budgets, tags, compost) always run; the semantic checks (paradox, synchronicity, unnamed) run when `--since` is passed. See [`docs/lint.md`](lint.md) for the CLI surface and the non-negotiable "never resolve / never auto-create / never delete" rules. The legacy `creek report --type <kind>` entry points remain as thin wrappers.
+
 The audit below maps each §10 criterion to its code path and test, so a future change that drifts from the spec lights up red.
 
 | Spec | Module | Status |

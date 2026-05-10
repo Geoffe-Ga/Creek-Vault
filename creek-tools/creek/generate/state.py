@@ -52,11 +52,13 @@ SECTION_ORDER: tuple[str, ...] = (
     "## Surprising connections",
     "## Hyperedges",
     "## Drift warnings",
+    "## Lint summary",
 )
 """Section headers in the order pinned by FEAT-006.
 
-Wavelength snapshot + suggested questions (FEAT-007) will be inserted
-between ``## Vault summary`` and ``## Pre-LLM yield``.
+FEAT-007 inserts a wavelength snapshot and a suggested-questions
+section between ``## Vault summary`` and ``## Pre-LLM yield``. FEAT-008
+appends the latest ``creek lint`` summary as the final section.
 """
 
 EMPTY_PLACEHOLDER: str = "_No surfacing this week._"
@@ -479,6 +481,20 @@ class StateReportGenerator:
         ]
         return _section(SECTION_ORDER[5], body)
 
+    def section_lint_summary(self) -> str:
+        """Render section 8: the most recent ``creek lint`` summary (FEAT-008).
+
+        The state report appends the lint report verbatim. If no lint has
+        run yet, the section still renders with the empty-state placeholder
+        so the header is never silently dropped.
+        """
+        from creek.lint import latest_lint_report
+
+        body = latest_lint_report(self.vault_path)
+        if not body:
+            return _section(SECTION_ORDER[7], [])
+        return SECTION_ORDER[7] + "\n\n" + body.strip()
+
     def section_drift_warnings(self) -> str:
         """Render section 7: broken wiki-links + stale fragments."""
         broken = BrokenLinkScanner().scan(self.vault_path)
@@ -509,6 +525,7 @@ class StateReportGenerator:
             self.section_synchronicities(),
             self.section_hyperedges(),
             self.section_drift_warnings(),
+            self.section_lint_summary(),
         ]
         return self._document_header() + "\n\n" + "\n\n".join(sections) + "\n"
 
