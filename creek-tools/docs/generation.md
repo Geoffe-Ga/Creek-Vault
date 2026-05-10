@@ -37,11 +37,29 @@ creek report --type synchronicity --vault ~/Obsidian/Creek-Vault
 
 The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types collectively make up the **emergence infrastructure** described in Ontology §10. The exact criteria that decide whether content is surfaced (similarity thresholds, time-gap floors, project-name filters) live in [`emergence.md`](emergence.md).
 
-## State (audit report, FEAT-006 — in progress)
+## State (audit report)
 
-`creek state` will write a single weekly audit report to `00-Creek-Meta/State/<iso-year>-W<week>.md`. The first slice (this PR) ships the renderer skeleton in `creek.generate.state`: it loads the vault snapshot and produces the seven-section markdown — vault summary, pre-LLM yield, active eddies, active threads, surprising connections, hyperedges, drift warnings — with the deferred sections rendering an explicit `_No surfacing this week._` placeholder.
+`creek state` writes a single weekly snapshot of the entire vault to `00-Creek-Meta/State/<iso-year>-W<week>.md` (with `latest.md` always pointing at the most recent run). It is a **view**, not a pipeline — it re-reads existing fragments, threads, eddies, praxis, synchronicities, and the latest `run-summary.jsonl` line, and never invokes classify, link, or compile.
 
-The follow-up PR fills in the remaining five sections, adds the `write()` / `latest.md` plumbing, and exposes the `creek state` CLI command. FEAT-007 inserts wavelength snapshot + suggested questions between sections 1 and 2.
+```bash
+creek state --vault ~/Obsidian/Creek-Vault
+```
+
+The report is organised in seven sections, in this order (FEAT-006):
+
+1. **Vault summary** — fragment / eddy / thread counts plus the per-frequency distribution (sorted F1..F10, then UNCLASSIFIED).
+2. **Pre-LLM yield** — the most recent line of `00-Creek-Meta/Processing-Log/run-summary.jsonl` (deterministic / local-model / residue counts and the `--no-llm` flag).
+3. **Active eddies** — top 10 by `fragment_count`.
+4. **Active threads** — top 10 by `last_seen` recency.
+5. **Surprising connections** — synchronicities discovered under `10-Liminal/Synchronicities/`.
+6. **Hyperedges** — praxis whose `derived_from` fragments span two or more eddies.
+7. **Drift warnings** — broken wiki-links and stale (link-isolated, ≥90-day-old) fragments.
+
+Empty sections render an explicit `_No surfacing this week._` placeholder rather than disappearing — operators can tell at a glance whether a section had nothing to surface or whether the generator skipped it. Re-running in the same ISO week overwrites the existing file (idempotent).
+
+`latest.md` is created as a symlink where the filesystem supports it (POSIX hosts) and falls back to a copy on Windows or networked filesystems that reject `symlink(2)`. The report header renders the vault's leaf directory name only — never the absolute path — so committing or sharing the artefact does not leak an operator's home directory.
+
+FEAT-007 will insert a wavelength snapshot and a suggested-questions section between sections 1 and 2.
 
 ## Voice Skill Tree
 

@@ -17,32 +17,29 @@ This module is intentionally a *view* over the compiled layer — it
 never re-runs classification, linking, or compile passes. It only
 reads what is already on disk.
 
-This first slice (PR 1 of 2) implements section 1 (vault summary) and
-section 2 (pre-LLM yield), plus the section-ordering and empty-state
-contracts that every section must honour. The remaining five sections
-are wired into :data:`SECTION_ORDER` and :meth:`StateReportGenerator.render`
-as explicit empty-state placeholders so tests can pin the documented
-layout now; PR 2 will replace those placeholders with real content,
-add the ``write()`` / ``latest.md`` plumbing, and ship the ``creek state``
-CLI command. FEAT-007 inserts wavelength snapshot + suggested questions
-between sections 1 and 2 once those sections exist.
+FEAT-007 inserts a wavelength snapshot and a suggested-questions
+section between sections 1 and 2; the section-ordering contract
+pinned by tests here makes that insertion straightforward.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
 import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.clean.hygiene import BrokenLinkScanner, OrphanScanner
 from creek.generate.indexes import FREQUENCY_NAMES
-from creek.models import Eddy, Fragment, Frequency, Thread
+from creek.models import Eddy, Fragment, Frequency, Praxis, Thread
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +56,7 @@ SECTION_ORDER: tuple[str, ...] = (
 """Section headers in the order pinned by FEAT-006.
 
 Wavelength snapshot + suggested questions (FEAT-007) will be inserted
-between ``## Vault summary`` and ``## Pre-LLM yield``; this module
-renders only the seven structural sections.
+between ``## Vault summary`` and ``## Pre-LLM yield``.
 """
 
 EMPTY_PLACEHOLDER: str = "_No surfacing this week._"
@@ -70,9 +66,15 @@ FEAT-006 acceptance criteria require an explicit empty-state note —
 the section header must always render, never silently disappear.
 """
 
+_TOP_N: int = 10
+"""Cap on the number of items rendered in each list-style section."""
+
 _FRAGMENTS_SUBDIR: str = "01-Fragments"
 _THREADS_SUBDIR: str = "02-Threads"
 _EDDIES_SUBDIR: str = "03-Eddies"
+_PRAXIS_SUBDIR: str = "04-Praxis"
+_SYNCHRONICITIES_SUBDIR: str = "10-Liminal/Synchronicities"
+_STATE_SUBPATH: tuple[str, str] = ("00-Creek-Meta", "State")
 _YIELD_RELATIVE: tuple[str, str, str] = (
     "00-Creek-Meta",
     "Processing-Log",
@@ -88,12 +90,13 @@ def _yield_log_path(vault_path: Path) -> Path:
 _FREQUENCY_ORDER: dict[str, int] = {
     member.value: index for index, member in enumerate(Frequency)
 }
-"""Canonical sort position per :class:`Frequency` member value.
+"""Canonical sort position per :class:`Frequency` value (F1..F10 then UNCLASSIFIED)."""
 
-The enum is declared F1, F2, ..., F10, UNCLASSIFIED — this dict mirrors
-that order so the frequency distribution renders numerically (F10 after
-F9, not between F1 and F2 as a lexicographic sort would put it).
-"""
+_WIKILINK_PATTERN: re.Pattern[str] = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]")
+"""Match an Obsidian wikilink like ``[[Target]]`` or ``[[Target|Alias]]``."""
+
+_STALE_FRAGMENT_AGE_DAYS: int = 90
+"""Age threshold (days) before an unreferenced fragment is reported as stale."""
 
 
 # ---------------------------------------------------------------------------
@@ -101,19 +104,27 @@ F9, not between F1 and F2 as a lexicographic sort would put it).
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _SynchronicityRow:
+    """One synchronicity row read off disk for the surprising-connections section."""
+
+    sync_id: str
+    fragment_a_id: str
+    fragment_b_id: str
+    similarity: float
+    time_gap_days: int
+
+
 @dataclass
 class _VaultState:
     """Snapshot of every collection :class:`StateReportGenerator` reads.
-
-    Each section method consumes a subset of these fields directly, so
-    helpers can be exercised in isolation. The fields land here even
-    when their section has not yet been implemented (PR 2 fills in the
-    remaining sections without changing the snapshot shape).
 
     Attributes:
         fragments: Fragment models from ``01-Fragments``.
         threads: Thread models from ``02-Threads``.
         eddies: Eddy models from ``03-Eddies``.
+        praxis: Praxis models from ``04-Praxis``.
+        synchronicities: Synchronicity rows from ``10-Liminal/Synchronicities``.
         latest_yield: Most recent line of
             ``00-Creek-Meta/Processing-Log/run-summary.jsonl``, or
             ``None`` when the log is missing or empty.
@@ -122,6 +133,8 @@ class _VaultState:
     fragments: list[Fragment] = field(default_factory=list)
     threads: list[Thread] = field(default_factory=list)
     eddies: list[Eddy] = field(default_factory=list)
+    praxis: list[Praxis] = field(default_factory=list)
+    synchronicities: list[_SynchronicityRow] = field(default_factory=list)
     latest_yield: dict[str, object] | None = None
 
 
@@ -138,25 +151,17 @@ def _load_typed_models(
     root: Path,
     *,
     type_tag: str,
-    cls: type[Fragment] | type[Thread] | type[Eddy],
-) -> list[Fragment | Thread | Eddy]:
+    cls: type[Fragment] | type[Thread] | type[Eddy] | type[Praxis],
+) -> list[Fragment | Thread | Eddy | Praxis]:
     """Walk *root* and return every model whose ``type`` frontmatter matches.
 
     Files that fail YAML parsing or schema validation are skipped at
     DEBUG level rather than aborting the report — drift in a single
     fragment must not block the whole audit view.
-
-    Args:
-        root: Directory to scan.
-        type_tag: Required ``type`` frontmatter value.
-        cls: Pydantic model class used to validate the metadata.
-
-    Returns:
-        A list of validated models in filesystem order.
     """
     if not root.exists():
         return []
-    collected: list[Fragment | Thread | Eddy] = []
+    collected: list[Fragment | Thread | Eddy | Praxis] = []
     for md_file in sorted(root.rglob("*.md")):
         post = _safe_post(md_file)
         if post is None:
@@ -172,12 +177,50 @@ def _load_typed_models(
     return collected
 
 
+def _load_synchronicities(root: Path) -> list[_SynchronicityRow]:
+    """Read synchronicity notes from ``10-Liminal/Synchronicities``."""
+    if not root.exists():
+        return []
+    rows: list[_SynchronicityRow] = []
+    for md_file in sorted(root.rglob("*.md")):
+        post = _safe_post(md_file)
+        if post is None:
+            continue
+        meta = post.metadata
+        if meta.get("type") != "synchronicity":
+            continue
+        sync_id = meta.get("id")
+        frag_a = meta.get("fragment_a_id")
+        frag_b = meta.get("fragment_b_id")
+        similarity = meta.get("similarity")
+        time_gap = meta.get("time_gap_days")
+        if not (
+            isinstance(sync_id, str)
+            and isinstance(frag_a, str)
+            and isinstance(frag_b, str)
+            and isinstance(similarity, (int, float))
+            and isinstance(time_gap, int)
+        ):
+            logger.debug("Skipping malformed synchronicity: %s", md_file)
+            continue
+        rows.append(
+            _SynchronicityRow(
+                sync_id=sync_id,
+                fragment_a_id=frag_a,
+                fragment_b_id=frag_b,
+                similarity=float(similarity),
+                time_gap_days=int(time_gap),
+            ),
+        )
+    return rows
+
+
 def _load_latest_yield(log_path: Path) -> dict[str, object] | None:
     """Return the last non-empty line of the pre-LLM yield JSONL log.
 
     The whole file is read into memory because the report only needs the
     final line — operationally the log is a short one-line-per-run
-    stream, but rotation is the writer's responsibility (see FEAT-005's
+    stream. Rotation is the writer's responsibility (see FEAT-005's
     ``write_yield_summary``); this reader does not cap the input size.
     """
     if not log_path.exists():
@@ -201,61 +244,56 @@ def _load_latest_yield(log_path: Path) -> dict[str, object] | None:
 
 
 def _load_vault_state(vault_path: Path) -> _VaultState:
-    """Snapshot every collection the (PR 1) report needs from *vault_path*.
+    """Snapshot every collection the report needs from *vault_path*.
 
     The ``isinstance`` guards in each comprehension are a mypy narrow,
-    not a runtime safety check — :func:`_load_typed_models` only
-    appends to its result after ``cls.model_validate`` succeeds, so the
-    object's runtime type is already correct. The guard exists because
-    the helper's return type is the union ``list[Fragment | Thread |
-    Eddy]``, which mypy cannot narrow per-call. Removing the guards
-    triggers ``assignment`` errors under strict mode.
+    not a runtime safety check: :func:`_load_typed_models` only appends
+    after ``cls.model_validate`` succeeds, so the runtime type is
+    already correct. The guard exists because the helper's return type
+    is the union ``list[Fragment | Thread | Eddy | Praxis]``, which
+    mypy cannot narrow per-call. Removing the guards triggers
+    ``assignment`` errors under strict mode.
     """
+    fragments_root = vault_path / _FRAGMENTS_SUBDIR
+    threads_root = vault_path / _THREADS_SUBDIR
+    eddies_root = vault_path / _EDDIES_SUBDIR
+    praxis_root = vault_path / _PRAXIS_SUBDIR
     fragments = [
         f
-        for f in _load_typed_models(
-            vault_path / _FRAGMENTS_SUBDIR,
-            type_tag="fragment",
-            cls=Fragment,
-        )
+        for f in _load_typed_models(fragments_root, type_tag="fragment", cls=Fragment)
         if isinstance(f, Fragment)
     ]
     threads = [
         t
-        for t in _load_typed_models(
-            vault_path / _THREADS_SUBDIR,
-            type_tag="thread",
-            cls=Thread,
-        )
+        for t in _load_typed_models(threads_root, type_tag="thread", cls=Thread)
         if isinstance(t, Thread)
     ]
     eddies = [
         e
-        for e in _load_typed_models(
-            vault_path / _EDDIES_SUBDIR,
-            type_tag="eddy",
-            cls=Eddy,
-        )
+        for e in _load_typed_models(eddies_root, type_tag="eddy", cls=Eddy)
         if isinstance(e, Eddy)
     ]
-    latest_yield = _load_latest_yield(_yield_log_path(vault_path))
+    praxis = [
+        p
+        for p in _load_typed_models(praxis_root, type_tag="praxis", cls=Praxis)
+        if isinstance(p, Praxis)
+    ]
     return _VaultState(
         fragments=fragments,
         threads=threads,
         eddies=eddies,
-        latest_yield=latest_yield,
+        praxis=praxis,
+        synchronicities=_load_synchronicities(vault_path / _SYNCHRONICITIES_SUBDIR),
+        latest_yield=_load_latest_yield(_yield_log_path(vault_path)),
     )
 
 
 def _frequency_sort_key(freq_value: Frequency | str) -> tuple[int, str]:
     """Return a sort key that orders frequencies by their enum position.
 
-    Storing enum members in a :class:`Counter` would otherwise hand
-    ``sorted`` a string-comparison fallback that places ``F10`` between
-    ``F1`` and ``F2``. The canonical order on the report is the order
-    in which the enum is declared (F1..F10, then UNCLASSIFIED).
-    Unknown values sort after every known one, ordered alphabetically
-    among themselves.
+    The canonical order on the report is the order in which the enum
+    is declared (F1..F10, then UNCLASSIFIED). Unknown values sort after
+    every known one, ordered alphabetically among themselves.
     """
     raw = freq_value.value if isinstance(freq_value, Frequency) else str(freq_value)
     position = _FREQUENCY_ORDER.get(raw, len(_FREQUENCY_ORDER))
@@ -267,10 +305,8 @@ def _frequency_label(freq_value: Frequency | str) -> str:
 
     Accepts either a :class:`Frequency` enum member directly or a string.
     Storing enum members at the call site (rather than ``str(member)``)
-    avoids a fragile round-trip: if :class:`Frequency` ever loses its
-    :class:`enum.StrEnum` base, ``str(Frequency.F1)`` would silently
-    become ``"Frequency.F1"`` and every lookup would fall through to
-    the unknown-value branch.
+    avoids a fragile round-trip if :class:`Frequency` ever loses its
+    :class:`enum.StrEnum` base.
     """
     if isinstance(freq_value, Frequency):
         freq = freq_value
@@ -281,6 +317,19 @@ def _frequency_label(freq_value: Frequency | str) -> str:
             return freq_value
     name = FREQUENCY_NAMES.get(freq)
     return f"{freq.value} ({name})" if name else freq.value
+
+
+def _wikilink_targets(wikilinks: list[str]) -> list[str]:
+    """Return the inner targets of ``[[...]]`` wikilink strings.
+
+    Plain strings (no brackets) are returned unchanged so eddy fields
+    stored without ``[[...]]`` syntax still match.
+    """
+    targets: list[str] = []
+    for raw in wikilinks:
+        match = _WIKILINK_PATTERN.search(raw)
+        targets.append(match.group(1).strip() if match else raw.strip())
+    return targets
 
 
 def _section(header: str, body_lines: list[str]) -> str:
@@ -304,27 +353,31 @@ class StateReportGenerator:
 
     Attributes:
         vault_path: Root of the Obsidian vault.
+        today: Date used to derive the ISO-week filename. Defaults to
+            today (UTC) so the same week's report is overwritten on
+            successive runs.
     """
 
-    def __init__(self, vault_path: Path) -> None:
+    def __init__(self, vault_path: Path, *, today: date | None = None) -> None:
         """Load the vault snapshot and stash *vault_path* for later use.
 
         Args:
             vault_path: Root of the Obsidian vault.
+            today: Optional injected date for tests / week-pinning.
+                Defaults to ``datetime.now(UTC).date()``.
         """
         self.vault_path = vault_path
+        self.today = today or datetime.now(tz=UTC).date()
         self._state = _load_vault_state(vault_path)
 
-    # ---- Implemented sections ----------------------------------------
+    # ---- Sections ---------------------------------------------------
 
     def section_vault_summary(self) -> str:
         """Render section 1: vault summary (counts + frequency distribution).
 
         Bypasses :func:`_section` deliberately: section 1 always has
         content (the count lines) so the empty-state placeholder is
-        unreachable. An empty vault renders three ``: 0`` rows, not the
-        ``_No surfacing this week._`` body — the regression test pins
-        this contract.
+        unreachable.
         """
         state = self._state
         body = [
@@ -364,29 +417,87 @@ class StateReportGenerator:
         ]
         return SECTION_ORDER[1] + "\n\n" + "\n".join(body)
 
-    # ---- Sections deferred to PR 2 -----------------------------------
-
     def section_active_eddies(self) -> str:
-        """Render section 3: top eddies by ``fragment_count`` (PR 2)."""
-        return _section(SECTION_ORDER[2], [])
+        """Render section 3: top eddies by ``fragment_count`` (capped at ten)."""
+        eddies = sorted(
+            self._state.eddies,
+            key=lambda e: (-e.fragment_count, e.title),
+        )[:_TOP_N]
+        body = [
+            f"- {eddy.title} — {eddy.fragment_count} fragment(s)" for eddy in eddies
+        ]
+        return _section(SECTION_ORDER[2], body)
 
     def section_active_threads(self) -> str:
-        """Render section 4: most-recent threads by ``last_seen`` (PR 2)."""
-        return _section(SECTION_ORDER[3], [])
+        """Render section 4: most-recent threads by ``last_seen`` (capped at ten)."""
+        threads = sorted(
+            self._state.threads,
+            key=lambda t: (t.last_seen, t.title),
+            reverse=True,
+        )[:_TOP_N]
+        body = [
+            f"- {thread.title} — last seen {thread.last_seen.isoformat()} "
+            f"({thread.fragment_count} fragment(s))"
+            for thread in threads
+        ]
+        return _section(SECTION_ORDER[3], body)
 
     def section_synchronicities(self) -> str:
-        """Render section 5: surprising connections — synchronicities (PR 2)."""
-        return _section(SECTION_ORDER[4], [])
+        """Render section 5: surprising connections (synchronicities)."""
+        rows = sorted(
+            self._state.synchronicities,
+            key=lambda r: (-r.similarity, r.sync_id),
+        )[:_TOP_N]
+        body = [
+            f"- `{row.fragment_a_id}` ↔ `{row.fragment_b_id}` — "
+            f"similarity {row.similarity:.2f}, gap {row.time_gap_days}d"
+            for row in rows
+        ]
+        return _section(SECTION_ORDER[4], body)
 
     def section_hyperedges(self) -> str:
-        """Render section 6: praxis spanning multiple eddies (PR 2)."""
-        return _section(SECTION_ORDER[5], [])
+        """Render section 6: praxis whose source fragments span 2+ eddies.
+
+        Ranked by ``(-len(spanning), praxis.title)`` so the praxis that
+        bridges the most eddies appears first; matches the deterministic
+        ordering of sections 3-5 instead of falling back to filesystem
+        order. The em-dash separator matches the convention used by the
+        other list sections.
+        """
+        fragment_to_eddies = self._fragment_to_eddies()
+        candidates = [
+            (praxis, self._praxis_spans(praxis, fragment_to_eddies))
+            for praxis in self._state.praxis
+        ]
+        ranked = sorted(
+            ((p, s) for p, s in candidates if len(s) >= 2),
+            key=lambda pair: (-len(pair[1]), pair[0].title),
+        )[:_TOP_N]
+        body = [
+            f"- {praxis.title} — spans: {', '.join(sorted(spanning))}"
+            for praxis, spanning in ranked
+        ]
+        return _section(SECTION_ORDER[5], body)
 
     def section_drift_warnings(self) -> str:
-        """Render section 7: broken wiki-links + stale fragments (PR 2)."""
-        return _section(SECTION_ORDER[6], [])
+        """Render section 7: broken wiki-links + stale fragments."""
+        broken = BrokenLinkScanner().scan(self.vault_path)
+        orphans = OrphanScanner(age_days=_STALE_FRAGMENT_AGE_DAYS).scan(
+            self.vault_path,
+        )
+        body: list[str] = []
+        for source, targets in list(broken.broken_links.items())[:_TOP_N]:
+            label = ", ".join(targets)
+            body.append(f"- Broken links in `{source}`: {label}")
+        if orphans.orphan_paths:
+            if body:
+                body.append("")
+            body.append("**Stale fragments**")
+            for path in orphans.orphan_paths[:_TOP_N]:
+                body.append(f"- `{path}`")
+        return _section(SECTION_ORDER[6], body)
 
-    # ---- Render -----------------------------------------------------
+    # ---- Render and write -------------------------------------------
 
     def render(self) -> str:
         """Return the full markdown report (all seven sections in order)."""
@@ -401,7 +512,93 @@ class StateReportGenerator:
         ]
         return self._document_header() + "\n\n" + "\n\n".join(sections) + "\n"
 
+    def write(self) -> Path:
+        """Render the report and write it under ``00-Creek-Meta/State``.
+
+        Also refreshes ``latest.md`` (symlink where supported, copy on
+        Windows or when symlink creation fails). Returns the path of the
+        ISO-week file. Re-running in the same ISO week overwrites the
+        existing file.
+        """
+        state_dir = self.vault_path.joinpath(*_STATE_SUBPATH)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        iso_year, iso_week, _ = self.today.isocalendar()
+        target = state_dir / f"{iso_year}-W{iso_week:02d}.md"
+        target.write_text(self.render(), encoding="utf-8")
+        _refresh_latest(state_dir, target)
+        return target
+
+    # ---- Internal helpers -------------------------------------------
+
     def _document_header(self) -> str:
-        """Render the document title and generation metadata block."""
+        """Render the document title and generation metadata block.
+
+        The vault path is intentionally rendered as the leaf directory
+        name only, never the absolute path. If the audit file is ever
+        committed or shared, this avoids leaking an operator's home
+        directory into the artefact.
+        """
+        iso_year, iso_week, _ = self.today.isocalendar()
         generated = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-        return f"# Creek state\n\n_Generated {generated} from `{self.vault_path}`._"
+        vault_label = self.vault_path.name or str(self.vault_path)
+        return (
+            f"# Creek state — {iso_year}-W{iso_week:02d}\n\n"
+            f"_Generated {generated} from `{vault_label}`._"
+        )
+
+    def _fragment_to_eddies(self) -> dict[str, set[str]]:
+        """Return ``{fragment_id: {eddy_title, ...}}`` from fragment frontmatter.
+
+        Named in the direction of the mapping (fragment -> eddies) to
+        match Python ``dict`` semantics; ``_eddies_by_fragment`` was
+        ambiguous about which side was the key.
+        """
+        mapping: dict[str, set[str]] = {}
+        for fragment in self._state.fragments:
+            targets = set(_wikilink_targets(fragment.eddies))
+            if targets:
+                mapping[fragment.id] = targets
+        return mapping
+
+    @staticmethod
+    def _praxis_spans(
+        praxis: Praxis,
+        fragment_to_eddies: dict[str, set[str]],
+    ) -> set[str]:
+        """Return the union of eddies touched by a praxis's source fragments."""
+        spanning: set[str] = set()
+        for frag_id in praxis.derived_from:
+            spanning.update(fragment_to_eddies.get(frag_id, set()))
+        return spanning
+
+
+# ---------------------------------------------------------------------------
+# latest.md handling
+# ---------------------------------------------------------------------------
+
+
+def _refresh_latest(state_dir: Path, target: Path) -> Path:
+    """Point ``state_dir/latest.md`` at *target* (symlink or copy fallback).
+
+    Symlinks are preferred so the operator's editor can navigate to the
+    underlying ISO-week file in one click. Windows lacks an unprivileged
+    symlink path for non-developers, and some networked filesystems
+    reject symlinks with ``EPERM``; those cases fall back to a copy.
+    """
+    latest = state_dir / "latest.md"
+    try:
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+    except OSError:
+        # Warn rather than debug: an unlink failure here can mask a
+        # permissions issue and leave a dangling symlink behind, so the
+        # operator should see it in default-level logs.
+        logger.warning("Could not unlink existing latest.md")
+    if os.name != "nt":
+        try:
+            latest.symlink_to(target.name)
+            return latest
+        except OSError:
+            logger.debug("Symlink unsupported on this filesystem; copying")
+    latest.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+    return latest
