@@ -364,3 +364,22 @@ def test_pre_llm_yield_rejects_json_array_root(empty_vault: Path) -> None:
     ).section_pre_llm_yield()
 
     assert EMPTY_PLACEHOLDER in section
+
+
+def test_render_against_missing_vault_root(tmp_path: Path) -> None:
+    """A vault path that does not exist on disk renders an empty report.
+
+    Each loader checks ``root.exists()`` before walking — the report
+    must degrade to zero counts and empty-state placeholders rather
+    than raising. Pins the contract explicitly rather than relying on
+    every loader's individual ``not exists`` short-circuit.
+    """
+    missing = tmp_path / "no-such-vault"
+
+    rendered = StateReportGenerator(vault_path=missing).render()
+
+    assert "Fragments: 0" in rendered
+    assert "Eddies: 0" in rendered
+    assert "Threads: 0" in rendered
+    for header in SECTION_ORDER:
+        assert header in rendered

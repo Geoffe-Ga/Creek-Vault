@@ -35,7 +35,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
 import frontmatter
 import yaml
@@ -43,9 +43,6 @@ from pydantic import ValidationError
 
 from creek.generate.indexes import FREQUENCY_NAMES
 from creek.models import Eddy, Fragment, Frequency, Thread
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -234,12 +231,23 @@ def _load_vault_state(vault_path: Path) -> _VaultState:
     )
 
 
-def _frequency_label(freq_value: str) -> str:
-    """Return a human-readable label for a Frequency enum value."""
-    try:
-        freq = Frequency(freq_value)
-    except ValueError:
-        return freq_value
+def _frequency_label(freq_value: Frequency | str) -> str:
+    """Return a human-readable label for a frequency.
+
+    Accepts either a :class:`Frequency` enum member directly or a string.
+    Storing enum members at the call site (rather than ``str(member)``)
+    avoids a fragile round-trip: if :class:`Frequency` ever loses its
+    :class:`enum.StrEnum` base, ``str(Frequency.F1)`` would silently
+    become ``"Frequency.F1"`` and every lookup would fall through to
+    the unknown-value branch.
+    """
+    if isinstance(freq_value, Frequency):
+        freq = freq_value
+    else:
+        try:
+            freq = Frequency(freq_value)
+        except ValueError:
+            return freq_value
     name = FREQUENCY_NAMES.get(freq)
     return f"{freq.value} ({name})" if name else freq.value
 
@@ -293,11 +301,17 @@ class StateReportGenerator:
             f"- Eddies: {len(state.eddies)}",
             f"- Threads: {len(state.threads)}",
         ]
-        distribution = Counter(str(frag.frequency.primary) for frag in state.fragments)
+        # Store the enum member itself rather than ``str(member)`` — the
+        # round-trip is fragile if :class:`Frequency` ever stops being a
+        # :class:`enum.StrEnum`. ``_frequency_label`` accepts either form.
+        distribution = Counter(frag.frequency.primary for frag in state.fragments)
         if distribution:
             body.append("")
             body.append("**Frequency distribution**")
-            for freq, count in sorted(distribution.items()):
+            for freq, count in sorted(
+                distribution.items(),
+                key=lambda pair: str(pair[0]),
+            ):
                 body.append(f"- {_frequency_label(freq)}: {count}")
         return SECTION_ORDER[0] + "\n\n" + "\n".join(body)
 
