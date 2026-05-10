@@ -75,7 +75,9 @@ def _write_eddy(vault: Path, *, eddy_id: str, title: str) -> Path:
         "fragment_count": 1,
         "threads": [],
     }
-    target = vault / "03-Eddies" / f"{title}.md"
+    # Use ``eddy_id`` as the filename to avoid breaking when titles contain
+    # spaces, slashes, or other path-unfriendly characters.
+    target = vault / "03-Eddies" / f"{eddy_id}.md"
     target.write_text(
         frontmatter.dumps(frontmatter.Post(content="", **metadata)),
         encoding="utf-8",
@@ -202,6 +204,30 @@ def test_section_vault_summary_includes_frequency_distribution(
     assert "F1" in section and "F2" in section
     assert ": 2" in section
     assert ": 1" in section
+
+
+def test_frequency_distribution_sorts_numerically_not_lexicographically(
+    empty_vault: Path,
+) -> None:
+    """F10 sorts after F2 (and after F9), not between F1 and F2.
+
+    A naive ``sorted(items)`` on `StrEnum` values produces
+    ``F1, F10, F2, ...`` because ``"F10" < "F2"`` lexicographically.
+    The report must follow the canonical APTITUDE order.
+    """
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    _write_fragment(empty_vault, frag_id="frag-a", created=base, frequency="F1")
+    _write_fragment(empty_vault, frag_id="frag-b", created=base, frequency="F2")
+    _write_fragment(empty_vault, frag_id="frag-c", created=base, frequency="F10")
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_vault_summary()
+
+    f1_idx = section.index("F1 (")
+    f2_idx = section.index("F2 (")
+    f10_idx = section.index("F10 (")
+    assert f1_idx < f2_idx < f10_idx
 
 
 def test_section_vault_summary_empty(empty_vault: Path) -> None:

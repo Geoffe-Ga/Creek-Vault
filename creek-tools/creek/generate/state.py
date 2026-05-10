@@ -73,11 +73,27 @@ the section header must always render, never silently disappear.
 _FRAGMENTS_SUBDIR: str = "01-Fragments"
 _THREADS_SUBDIR: str = "02-Threads"
 _EDDIES_SUBDIR: str = "03-Eddies"
-_YIELD_SUBPATH: tuple[str, ...] = (
+_YIELD_RELATIVE: tuple[str, str, str] = (
     "00-Creek-Meta",
     "Processing-Log",
     "run-summary.jsonl",
 )
+
+
+def _yield_log_path(vault_path: Path) -> Path:
+    """Return the canonical path to ``run-summary.jsonl`` under *vault_path*."""
+    return vault_path / _YIELD_RELATIVE[0] / _YIELD_RELATIVE[1] / _YIELD_RELATIVE[2]
+
+
+_FREQUENCY_ORDER: dict[str, int] = {
+    member.value: index for index, member in enumerate(Frequency)
+}
+"""Canonical sort position per :class:`Frequency` member value.
+
+The enum is declared F1, F2, ..., F10, UNCLASSIFIED — this dict mirrors
+that order so the frequency distribution renders numerically (F10 after
+F9, not between F1 and F2 as a lexicographic sort would put it).
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +238,28 @@ def _load_vault_state(vault_path: Path) -> _VaultState:
         )
         if isinstance(e, Eddy)
     ]
-    latest_yield = _load_latest_yield(vault_path.joinpath(*_YIELD_SUBPATH))
+    latest_yield = _load_latest_yield(_yield_log_path(vault_path))
     return _VaultState(
         fragments=fragments,
         threads=threads,
         eddies=eddies,
         latest_yield=latest_yield,
     )
+
+
+def _frequency_sort_key(freq_value: Frequency | str) -> tuple[int, str]:
+    """Return a sort key that orders frequencies by their enum position.
+
+    Storing enum members in a :class:`Counter` would otherwise hand
+    ``sorted`` a string-comparison fallback that places ``F10`` between
+    ``F1`` and ``F2``. The canonical order on the report is the order
+    in which the enum is declared (F1..F10, then UNCLASSIFIED).
+    Unknown values sort after every known one, ordered alphabetically
+    among themselves.
+    """
+    raw = freq_value.value if isinstance(freq_value, Frequency) else str(freq_value)
+    position = _FREQUENCY_ORDER.get(raw, len(_FREQUENCY_ORDER))
+    return (position, raw)
 
 
 def _frequency_label(freq_value: Frequency | str) -> str:
@@ -310,7 +341,7 @@ class StateReportGenerator:
             body.append("**Frequency distribution**")
             for freq, count in sorted(
                 distribution.items(),
-                key=lambda pair: str(pair[0]),
+                key=lambda pair: _frequency_sort_key(pair[0]),
             ):
                 body.append(f"- {_frequency_label(freq)}: {count}")
         return SECTION_ORDER[0] + "\n\n" + "\n".join(body)
