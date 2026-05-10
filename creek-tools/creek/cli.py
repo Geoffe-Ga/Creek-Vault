@@ -918,6 +918,58 @@ def state(
 
 
 @app.command()
+def lint(
+    check: list[str] | None = typer.Option(
+        None,
+        "--check",
+        help=(
+            "Run only this check (repeatable). Names: paradox, unnamed, "
+            "synchronicity, compost, tags, broken-links, orphan-compiled, "
+            "skill-size."
+        ),
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Incremental window: 7d, 1w, 1mo, 30d.",
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Run unified vault hygiene checks (FEAT-008).
+
+    Default behaviour runs all deterministic checks. Pass ``--since`` to
+    also run the semantic checks (paradox, synchronicity, unnamed) over
+    the same window. Pass one or more ``--check NAME`` to run only the
+    named checks. Lint never resolves paradoxes, never auto-creates
+    compiled pages, and never deletes orphan fragments — those are the
+    load-bearing rules pinned by FEAT-008.
+    """
+    from creek.lint import LintRunner, parse_since
+
+    config = load_config()
+    vault_path = vault or config.vault_path
+    since_dt = None
+    if since is not None:
+        try:
+            since_dt = parse_since(since)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2) from exc
+    runner_ = LintRunner(
+        vault_path=vault_path,
+        since=since_dt,
+        since_text=since,
+    )
+    try:
+        report = runner_.run(checks=list(check) if check else None)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    written = runner_.write(report)
+    console.print(f"[bold green]Lint report written: {written}[/bold green]")
+
+
+@app.command()
 def review(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     list_only: bool = typer.Option(
