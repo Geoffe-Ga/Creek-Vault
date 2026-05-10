@@ -310,13 +310,29 @@ def test_section_vault_summary_includes_counts(populated_vault: Path) -> None:
 
 
 def test_section_vault_summary_empty(empty_vault: Path) -> None:
-    """An empty vault renders zero counts (not the placeholder)."""
+    """An empty vault renders zero counts on every primitive (not the placeholder)."""
     section = StateReportGenerator(
         vault_path=empty_vault,
     ).section_vault_summary()
 
     assert "Fragments: 0" in section
+    assert "Eddies: 0" in section
+    assert "Threads: 0" in section
     assert EMPTY_PLACEHOLDER not in section
+
+
+def test_section_vault_summary_includes_frequency_distribution(
+    populated_vault: Path,
+) -> None:
+    """The summary surfaces the per-frequency distribution under a header."""
+    section = StateReportGenerator(
+        vault_path=populated_vault,
+    ).section_vault_summary()
+
+    assert "**Frequency distribution**" in section
+    # Two F1 fragments and one F2 fragment in the populated fixture.
+    assert "F1 (Agency/Survival): 2" in section
+    assert "F2 (Receptivity/Kinship): 1" in section
 
 
 def test_frequency_distribution_sorts_numerically_not_lexicographically(
@@ -344,7 +360,11 @@ def test_frequency_distribution_sorts_numerically_not_lexicographically(
 
 
 def test_section_pre_llm_yield_reads_latest_run(populated_vault: Path) -> None:
-    """The pre-LLM yield section reflects the most recent run-summary line."""
+    """The pre-LLM yield section reflects the most recent run-summary line.
+
+    The populated fixture's only yield entry has ``no_llm: True``, so this
+    test pins both the count rendering and the truthy ``--no-llm`` token.
+    """
     section = StateReportGenerator(
         vault_path=populated_vault,
     ).section_pre_llm_yield()
@@ -353,6 +373,30 @@ def test_section_pre_llm_yield_reads_latest_run(populated_vault: Path) -> None:
     assert "Deterministic: 7" in section
     assert "Local-model: 5" in section
     assert "Residue: 2" in section
+    assert "`--no-llm`: yes" in section
+
+
+def test_section_pre_llm_yield_renders_no_llm_false(empty_vault: Path) -> None:
+    """When the latest run is *not* ``--no-llm``, the renderer prints ``no``."""
+    _write_yield_jsonl(
+        empty_vault,
+        [
+            {
+                "run_id": "run-pass3",
+                "deterministic_classified": 4,
+                "local_model_processed": 3,
+                "residue": 1,
+                "no_llm": False,
+                "timestamp": "2026-05-01T00:00:00+00:00",
+            },
+        ],
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_pre_llm_yield()
+
+    assert "`--no-llm`: no" in section
 
 
 def test_section_pre_llm_yield_empty(empty_vault: Path) -> None:
@@ -795,11 +839,18 @@ def test_pre_llm_yield_rejects_json_array_root(empty_vault: Path) -> None:
 
 
 def test_render_against_missing_vault_root(tmp_path: Path) -> None:
-    """A vault path that does not exist on disk renders an empty report."""
+    """A vault path that does not exist on disk renders an empty report.
+
+    Pins the contract for every loader's ``not exists`` short-circuit:
+    the report degrades to zero counts and empty-state placeholders
+    rather than raising.
+    """
     missing = tmp_path / "no-such-vault"
 
     rendered = StateReportGenerator(vault_path=missing).render()
 
     assert "Fragments: 0" in rendered
+    assert "Eddies: 0" in rendered
+    assert "Threads: 0" in rendered
     for header in SECTION_ORDER:
         assert header in rendered

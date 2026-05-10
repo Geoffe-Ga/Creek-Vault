@@ -461,11 +461,12 @@ class StateReportGenerator:
         Ranked by ``(-len(spanning), praxis.title)`` so the praxis that
         bridges the most eddies appears first; matches the deterministic
         ordering of sections 3-5 instead of falling back to filesystem
-        order.
+        order. The em-dash separator matches the convention used by the
+        other list sections.
         """
-        eddies_by_fragment = self._eddies_by_fragment()
+        fragment_to_eddies = self._fragment_to_eddies()
         candidates = [
-            (praxis, self._praxis_spans(praxis, eddies_by_fragment))
+            (praxis, self._praxis_spans(praxis, fragment_to_eddies))
             for praxis in self._state.praxis
         ]
         ranked = sorted(
@@ -473,7 +474,7 @@ class StateReportGenerator:
             key=lambda pair: (-len(pair[1]), pair[0].title),
         )[:_TOP_N]
         body = [
-            f"- {praxis.title} - spans: {', '.join(sorted(spanning))}"
+            f"- {praxis.title} — spans: {', '.join(sorted(spanning))}"
             for praxis, spanning in ranked
         ]
         return _section(SECTION_ORDER[5], body)
@@ -545,8 +546,13 @@ class StateReportGenerator:
             f"_Generated {generated} from `{vault_label}`._"
         )
 
-    def _eddies_by_fragment(self) -> dict[str, set[str]]:
-        """Return ``{fragment_id: {eddy_title, ...}}`` from fragment frontmatter."""
+    def _fragment_to_eddies(self) -> dict[str, set[str]]:
+        """Return ``{fragment_id: {eddy_title, ...}}`` from fragment frontmatter.
+
+        Named in the direction of the mapping (fragment -> eddies) to
+        match Python ``dict`` semantics; ``_eddies_by_fragment`` was
+        ambiguous about which side was the key.
+        """
         mapping: dict[str, set[str]] = {}
         for fragment in self._state.fragments:
             targets = set(_wikilink_targets(fragment.eddies))
@@ -557,12 +563,12 @@ class StateReportGenerator:
     @staticmethod
     def _praxis_spans(
         praxis: Praxis,
-        eddies_by_fragment: dict[str, set[str]],
+        fragment_to_eddies: dict[str, set[str]],
     ) -> set[str]:
         """Return the union of eddies touched by a praxis's source fragments."""
         spanning: set[str] = set()
         for frag_id in praxis.derived_from:
-            spanning.update(eddies_by_fragment.get(frag_id, set()))
+            spanning.update(fragment_to_eddies.get(frag_id, set()))
         return spanning
 
 
@@ -584,7 +590,10 @@ def _refresh_latest(state_dir: Path, target: Path) -> Path:
         if latest.exists() or latest.is_symlink():
             latest.unlink()
     except OSError:
-        logger.debug("Could not unlink existing latest.md")
+        # Warn rather than debug: an unlink failure here can mask a
+        # permissions issue and leave a dangling symlink behind, so the
+        # operator should see it in default-level logs.
+        logger.warning("Could not unlink existing latest.md")
     if os.name != "nt":
         try:
             latest.symlink_to(target.name)
