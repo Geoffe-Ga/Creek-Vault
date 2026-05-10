@@ -19,7 +19,7 @@ description: >-
   status polling (use `pull_request_read` directly).
 metadata:
   author: Geoff
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # Await Claude Review
@@ -61,6 +61,35 @@ Examples that match:
 
 If the regex does not match, treat the comment as malformed: do **not** infer a verdict from prose ("looks good to me" is not a verdict). Surface to the user.
 
+## Iteration-Trigger Wake (Owner-Authored Summary)
+
+Some repos run an **iteration-trigger workflow** (`.github/workflows/iteration-trigger.yml`) that, after CI completes green, posts an executive-summary comment **as the repo owner** (via PAT) on the PR. The comment carries an HTML marker and a structured body:
+
+```
+<!-- iteration-trigger -->
+**CI**: 5/5 Green
+**VERDICT**: LGTM
+**Action**: You are cleared to squash merge, delete the branch, ...
+```
+
+This comment is not authored by `claude[bot]` — it's authored by the human user via a PAT — but it **is** the wake signal you want when one is configured, because it bundles the verdict and the CI status into a single delivered event after the underlying claude-review comment has landed. Mobile-app sessions in particular rely on this trigger because their webhook recognises owner-authored comments.
+
+**Recognition.** A comment qualifies as an iteration-trigger summary when **all** of:
+
+1. The body contains the literal marker `<!-- iteration-trigger -->`.
+2. A line matches `^\*\*VERDICT\*\*:\s*(LGTM|CHANGES[_ ]REQUESTED|COMMENTS)`.
+3. A line matches `^\*\*CI\*\*:\s*(\d+)/(\d+)\s+Green` (use this to decide `merge` vs `iterate`).
+
+**Routing.** When this comment wakes the session:
+
+- `VERDICT == LGTM` and `CI: N/N Green` (full match) → caller proceeds to merge gate. The `Action:` line will say "cleared to squash merge…".
+- `VERDICT == CHANGES_REQUESTED` or `VERDICT == COMMENTS` → caller enters fix loop. The `Action:` line will reference a comment ID to read for in-depth feedback. Pull that comment via `mcp__github__pull_request_read` `get_comments` and feed the body into `address-feedback`.
+- `CI: x/y Green` where `x < y` → CI is not actually green; do not merge even on `LGTM`. Investigate the failing run before proceeding.
+
+**Currency check still applies.** The trigger fires on a `workflow_run` for a specific HEAD SHA, but the comment may arrive minutes after the push. Use the standard `created_at >= headPushedAt` guard before treating it as authoritative for the current HEAD.
+
+**Cap awareness.** The workflow caps itself at 10 self-posts per PR (it counts prior `<!-- iteration-trigger -->` markers). If you don't get a wake event after the eleventh push, the trigger has gone silent — fall back to checking the underlying claude-review comment directly via `get_comments`.
+
 ## Instructions
 
 ### Step 1: Pin the HEAD You're Waiting For
@@ -85,6 +114,7 @@ Then **stop**. Do not poll. Do not `sleep`. Do not call `pull_request_read get_c
 
 When a `<github-webhook-activity>` message arrives, decide what kind of event it is:
 
+- **Owner-authored iteration-trigger summary** (body contains `<!-- iteration-trigger -->`) → go to Step 4a. This is the preferred wake on repos that run `iteration-trigger.yml`; it short-circuits the per-event classification because the verdict is already summarised.
 - **Top-level PR comment from a reviewer bot** (`claude[bot]`, `github-actions[bot]`, or whichever account posts reviews on this repo) → go to Step 4.
 - **Line-level review comment** → not a verdict; if you're tracking thread resolutions for `address-feedback`, handle there. Otherwise stay subscribed and wait for the next event.
 - **CI failure event** → go to Step 5.
@@ -103,6 +133,16 @@ Re-fetch the comments to read the full body (the webhook payload may be truncate
    - `CHANGES_REQUESTED` → caller enters fix loop.
    - `COMMENTS` → caller decides (usually mergeable as-is).
    - **Malformed** → surface to user; do not guess.
+
+### Step 4a: Iteration-Trigger Summary
+
+When the wake event is the owner-authored iteration-trigger comment:
+
+1. **Currency check**: require `created_at >= headPushedAt`.
+2. Parse `**VERDICT**:` and `**CI**: x/y Green` from the body.
+3. If `VERDICT == LGTM` AND `x == y` (CI fully green): return `LGTM` to the caller. The follow-up `Action:` line typically reads "cleared to squash merge…". The caller proceeds to merge.
+4. Otherwise: extract the comment ID referenced in `Action: pull comment <id> …`, fetch that comment's body via `get_comments`, and pass the body to the caller (typically `address-feedback`) for triage. Treat the underlying verdict (`CHANGES_REQUESTED` or `COMMENTS`) as authoritative for the next loop.
+5. If the body is malformed (marker present but verdict line missing/unparseable): surface to user. Do not infer a verdict from the `Action:` prose.
 
 ### Step 5: On CI Failure for Current HEAD
 

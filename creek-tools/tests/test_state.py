@@ -743,6 +743,35 @@ def test_loader_skips_unparsable_yaml(empty_vault: Path) -> None:
     assert "Fragments: 1" in section
 
 
+def test_loader_skips_non_fragment_markdown(empty_vault: Path) -> None:
+    """Plain notes coexist with fragments and are skipped silently."""
+    note = empty_vault / "01-Fragments" / "Notes" / "note.md"
+    note.write_text("---\ntitle: Plain note\n---\nbody\n", encoding="utf-8")
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_vault_summary()
+
+    assert "Fragments: 0" in section
+
+
+def test_section_pre_llm_yield_skips_corrupt_last_line(empty_vault: Path) -> None:
+    """A bare non-JSON last line falls back to the empty-state placeholder.
+
+    Distinct from ``test_pre_llm_yield_rejects_json_array_root``: that
+    test pins the *valid-JSON-wrong-shape* branch; this one pins the
+    truly corrupt input that hits ``json.JSONDecodeError`` directly.
+    """
+    log = empty_vault / "00-Creek-Meta" / "Processing-Log" / "run-summary.jsonl"
+    log.write_text("not json at all\n", encoding="utf-8")
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_pre_llm_yield()
+
+    assert EMPTY_PLACEHOLDER in section
+
+
 def test_frequency_label_renders_known_aptitude_name() -> None:
     """Known frequencies render with their canonical APTITUDE name."""
     assert _frequency_label("F1") == "F1 (Agency/Survival)"

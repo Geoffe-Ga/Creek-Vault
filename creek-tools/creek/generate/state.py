@@ -17,10 +17,9 @@ This module is intentionally a *view* over the compiled layer — it
 never re-runs classification, linking, or compile passes. It only
 reads what is already on disk.
 
-PR 1 of FEAT-006 shipped the scaffold plus sections 1 and 2; this PR 2
-fills in sections 3-7, the ``write()`` / ``latest.md`` plumbing, and
-the ``creek state`` CLI command. FEAT-007 inserts wavelength snapshot
-+ suggested questions between sections 1 and 2.
+FEAT-007 inserts a wavelength snapshot and a suggested-questions
+section between sections 1 and 2; the section-ordering contract
+pinned by tests here makes that insertion straightforward.
 """
 
 from __future__ import annotations
@@ -202,6 +201,7 @@ def _load_synchronicities(root: Path) -> list[_SynchronicityRow]:
             and isinstance(similarity, (int, float))
             and isinstance(time_gap, int)
         ):
+            logger.debug("Skipping malformed synchronicity: %s", md_file)
             continue
         rows.append(
             _SynchronicityRow(
@@ -456,17 +456,26 @@ class StateReportGenerator:
         return _section(SECTION_ORDER[4], body)
 
     def section_hyperedges(self) -> str:
-        """Render section 6: praxis whose source fragments span 2+ eddies."""
+        """Render section 6: praxis whose source fragments span 2+ eddies.
+
+        Ranked by ``(-len(spanning), praxis.title)`` so the praxis that
+        bridges the most eddies appears first; matches the deterministic
+        ordering of sections 3-5 instead of falling back to filesystem
+        order.
+        """
         eddies_by_fragment = self._eddies_by_fragment()
-        body: list[str] = []
-        for praxis in self._state.praxis:
-            spanning = self._praxis_spans(praxis, eddies_by_fragment)
-            if len(spanning) < 2:
-                continue
-            spans = ", ".join(sorted(spanning))
-            body.append(f"- {praxis.title} — spans: {spans}")
-            if len(body) >= _TOP_N:
-                break
+        candidates = [
+            (praxis, self._praxis_spans(praxis, eddies_by_fragment))
+            for praxis in self._state.praxis
+        ]
+        ranked = sorted(
+            ((p, s) for p, s in candidates if len(s) >= 2),
+            key=lambda pair: (-len(pair[1]), pair[0].title),
+        )[:_TOP_N]
+        body = [
+            f"- {praxis.title} - spans: {', '.join(sorted(spanning))}"
+            for praxis, spanning in ranked
+        ]
         return _section(SECTION_ORDER[5], body)
 
     def section_drift_warnings(self) -> str:
