@@ -17,6 +17,7 @@ writing an entry to the privacy audit log via
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -231,8 +232,6 @@ def _title_only_summary(title: str | None) -> str:
 
 def _stub_relpath_for(title: str | None) -> Path:
     """Compose the gitignored stub path for an intimate body."""
-    import re
-
     raw = (title or "intimate").strip().lower() or "intimate"
     slug = re.sub(r"[^\w\-]+", "-", raw).strip("-") or "intimate"
     return _PRE_SAVE_INTIMATE_STUB_RELPATH / f"{slug[:64]}.md"

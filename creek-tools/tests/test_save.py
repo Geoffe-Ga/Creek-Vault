@@ -24,19 +24,10 @@ from creek.save import (
     save_to_vault,
     target_directory,
 )
+from creek.save.router import _TARGET_SUBDIRS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-
-_TARGET_DIRS: dict[SaveTarget, tuple[str, ...]] = {
-    SaveTarget.THREAD: ("02-Threads", "Active"),
-    SaveTarget.EDDY: ("03-Eddies",),
-    SaveTarget.PRAXIS: ("04-Praxis", "Situational"),
-    SaveTarget.PARADOX: ("10-Liminal", "Paradoxes"),
-    SaveTarget.UNNAMED: ("10-Liminal", "Unnamed"),
-    SaveTarget.DRAFT: ("07-Voice", "Drafts"),
-}
 
 
 @pytest.fixture
@@ -45,7 +36,7 @@ def vault(tmp_path: Path) -> Iterator[Path]:
     for relparts in {
         ("00-Creek-Meta",),
         ("01-Fragments",),
-        *_TARGET_DIRS.values(),
+        *_TARGET_SUBDIRS.values(),
         ("10-Liminal", "Compost", "intimate-stubs"),
     }:
         (tmp_path.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
@@ -77,7 +68,7 @@ def _make_request(
 # ---- Router ----
 
 
-@pytest.mark.parametrize(("target", "parts"), list(_TARGET_DIRS.items()))
+@pytest.mark.parametrize(("target", "parts"), list(_TARGET_SUBDIRS.items()))
 def test_router_maps_each_target_to_canonical_subdir(
     vault: Path,
     target: SaveTarget,
@@ -278,7 +269,7 @@ def _scaffold_vault(root: Path) -> Path:
     for parts in {
         ("00-Creek-Meta",),
         ("01-Fragments",),
-        *_TARGET_DIRS.values(),
+        *_TARGET_SUBDIRS.values(),
         ("10-Liminal", "Compost", "intimate-stubs"),
     }:
         root.joinpath(*parts).mkdir(parents=True, exist_ok=True)

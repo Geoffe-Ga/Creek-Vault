@@ -89,11 +89,20 @@ def save_to_vault(request: SaveRequest, *, vault_path: Path) -> Path:
         full_body=request.full_body,
     )
 
-    stub_path: Path | None = None
+    stub_written: Path | None = None
     intimate_pointer: str | None = None
     if filtered.stub_relpath is not None and filtered.stub_body is not None:
-        stub_path = vault_path / filtered.stub_relpath
-        intimate_pointer = str(filtered.stub_relpath)
+        # Write the intimate stub *before* the vault note so that if the
+        # second write fails, the body is preserved on disk and only a
+        # harmless orphan stub remains. Doing it the other way around
+        # would leave the vault note pointing at a stub that never
+        # existed — the intimate body would be permanently lost.
+        stub_written = _write_intimate_stub(
+            vault_path / filtered.stub_relpath,
+            filtered.stub_body,
+            request,
+        )
+        intimate_pointer = str(stub_written.relative_to(vault_path))
 
     metadata = _compose_metadata(
         request,
@@ -106,12 +115,7 @@ def save_to_vault(request: SaveRequest, *, vault_path: Path) -> Path:
     base_name = _compose_base_name(str(title))
 
     post = frontmatter.Post(content=filtered.vault_body.rstrip() + "\n", **metadata)
-    written = _atomic_create(target_dir, base_name, frontmatter.dumps(post))
-
-    if stub_path is not None and filtered.stub_body is not None:
-        _write_intimate_stub(stub_path, filtered.stub_body, request, written)
-
-    return written
+    return _atomic_create(target_dir, base_name, frontmatter.dumps(post))
 
 
 def _compose_metadata(
@@ -191,7 +195,7 @@ def _atomic_create(target_dir: Path, base_name: str, content: str) -> Path:
         suffix = "" if counter == 0 else f"-{counter}"
         candidate = target_dir / f"{base_name}{suffix}.md"
         try:
-            fd = os.open(str(candidate), flags, 0o644)
+            fd = os.open(candidate, flags, 0o644)
         except FileExistsError:
             continue
         try:
@@ -210,9 +214,19 @@ def _write_intimate_stub(
     stub_path: Path,
     body: str,
     request: SaveRequest,
-    vault_note: Path,
-) -> None:
-    """Write the full intimate body to the gitignored compost directory."""
+) -> Path:
+    """Write the full intimate body atomically to the gitignored compost dir.
+
+    Uses the same ``O_CREAT|O_EXCL`` primitive as :func:`_atomic_create`
+    so a concurrent or repeat save cannot clobber an existing stub, and
+    so exhaustion raises a :class:`RuntimeError` rather than silently
+    overwriting the last candidate. The vault note has not been written
+    yet — see :func:`save_to_vault` — so a stub failure leaves no
+    dangling pointer behind.
+
+    Returns the actual path the stub landed at (which may include a
+    counter suffix if the desired filename was already in use).
+    """
     stub_path.parent.mkdir(parents=True, exist_ok=True)
     post = frontmatter.Post(
         content=body.rstrip() + "\n",
@@ -223,14 +237,10 @@ def _write_intimate_stub(
             "source_kind": request.source_kind,
             "source_id": request.source_id or "",
             "contributing_fragments": list(request.provenance),
-            "vault_note": str(vault_note),
         },
     )
-    if stub_path.exists():
-        stem = stub_path.stem
-        for counter in range(1, _MAX_COLLISION_RETRIES):
-            candidate = stub_path.with_name(f"{stem}-{counter}.md")
-            if not candidate.exists():
-                stub_path = candidate
-                break
-    stub_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return _atomic_create(
+        stub_path.parent,
+        stub_path.stem,
+        frontmatter.dumps(post),
+    )
