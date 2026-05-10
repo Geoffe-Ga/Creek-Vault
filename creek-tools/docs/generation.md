@@ -37,6 +37,12 @@ creek report --type synchronicity --vault ~/Obsidian/Creek-Vault
 
 The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types collectively make up the **emergence infrastructure** described in Ontology §10. The exact criteria that decide whether content is surfaced (similarity thresholds, time-gap floors, project-name filters) live in [`emergence.md`](emergence.md).
 
+## State (audit report, FEAT-006 — in progress)
+
+`creek state` will write a single weekly audit report to `00-Creek-Meta/State/<iso-year>-W<week>.md`. The first slice (this PR) ships the renderer skeleton in `creek.generate.state`: it loads the vault snapshot and produces the seven-section markdown — vault summary, pre-LLM yield, active eddies, active threads, surprising connections, hyperedges, drift warnings — with the deferred sections rendering an explicit `_No surfacing this week._` placeholder.
+
+The follow-up PR fills in the remaining five sections, adds the `write()` / `latest.md` plumbing, and exposes the `creek state` CLI command. FEAT-007 inserts wavelength snapshot + suggested questions between sections 1 and 2.
+
 ## Voice Skill Tree
 
 `creek skills` writes a tree of `SKILL.md` files under `<output>` (default `<vault>/creek-skills/`):
