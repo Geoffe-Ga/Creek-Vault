@@ -1,0 +1,95 @@
+name: Iteration Trigger
+
+# Posts a brief executive summary on a PR (commenting as Geoffe-Ga via PAT)
+# whenever CI completes fully green AND a Claude review has been posted.
+# The comment is intended to fire a webhook that wakes the Claude Code mobile
+# app via MCP so it can continue iterating on feedback. Capped at 10 self-posts
+# per PR to avoid runaway loops.
+#
+# Required secrets:
+#   GEOFFE_GA_PAT  - personal access token for Geoffe-Ga with `pull-requests: write`.
+#                    Without this the comment would post as github-actions[bot]
+#                    and the mobile webhook would not recognize the author.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  nudge:
+    name: Post executive summary
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR number from head branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          PR=$(gh pr list -R "$REPO" --head "$BRANCH" --state open \
+                 --json number --jq '.[0].number // empty')
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+
+      - name: Compose and post summary
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GEOFFE_GA_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          MARKER: '<!-- iteration-trigger -->'
+        run: |
+          set -euo pipefail
+
+          # Pull PR comments once (first 100 is plenty for an active PR).
+          gh api "repos/$REPO/issues/$PR/comments?per_page=100" > comments.json
+
+          # Cap: stop after 10 prior self-posts on this PR.
+          PRIOR=$(grep -c "$MARKER" comments.json || true)
+          if [ "$PRIOR" -ge 10 ]; then
+            echo "Cap reached ($PRIOR/10) - skipping"
+            exit 0
+          fi
+
+          # Find latest Claude review comment (its body contains 'Verdict').
+          CLAUDE=$(jq -c '[.[] | select(.body | test("Verdict"))] | last // empty' comments.json)
+          if [ -z "$CLAUDE" ]; then
+            echo "No Claude review yet - skipping"
+            exit 0
+          fi
+          ID=$(jq -r '.id'   <<<"$CLAUDE")
+          BODY=$(jq -r '.body' <<<"$CLAUDE")
+
+          # Summarize verdict via grep on the Claude comment body.
+          if   grep -qE 'CHANGES[_ ]REQUESTED' <<<"$BODY"; then VERDICT='CHANGES REQUESTED'
+          elif grep -q   'LGTM'                <<<"$BODY"; then VERDICT='LGTM'
+          else                                                  VERDICT='COMMENTS'
+          fi
+
+          # CI status from check-runs on the head SHA.
+          gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" > runs.json
+          TOTAL=$(jq '.check_runs | length'                                       runs.json)
+          GREEN=$(jq '[.check_runs[] | select(.conclusion=="success")] | length' runs.json)
+
+          if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
+            ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
+          else
+            ACTION="pull comment ${ID} to see in-depth feedback and continue iterating"
+          fi
+
+          BODY=$(printf '%s\n%s\n%s\n%s\n' \
+            "$MARKER" \
+            "**CI**: ${GREEN}/${TOTAL} Green" \
+            "**VERDICT**: ${VERDICT}" \
+            "**Action**: ${ACTION}")
+          gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$BODY"
