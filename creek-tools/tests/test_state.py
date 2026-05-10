@@ -339,7 +339,28 @@ def test_loader_skips_non_fragment_markdown(empty_vault: Path) -> None:
     assert "Fragments: 0" in section
 
 
+def test_frequency_label_renders_known_aptitude_name() -> None:
+    """Known frequencies render with their canonical APTITUDE name."""
+    assert _frequency_label("F1") == "F1 (Agency/Survival)"
+
+
 def test_frequency_label_handles_unknown_value() -> None:
     """An unrecognised frequency string round-trips unchanged."""
-    assert _frequency_label("F1").startswith("F1")
     assert _frequency_label("F-99") == "F-99"
+
+
+def test_pre_llm_yield_rejects_json_array_root(empty_vault: Path) -> None:
+    """A JSONL line whose root is a JSON array (not a dict) is rejected.
+
+    ``_load_latest_yield`` only accepts dict-shaped payloads — anything
+    else falls back to the empty-state placeholder, matching the type
+    contract callers rely on.
+    """
+    log = empty_vault / "00-Creek-Meta" / "Processing-Log" / "run-summary.jsonl"
+    log.write_text("[1, 2, 3]\n", encoding="utf-8")
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_pre_llm_yield()
+
+    assert EMPTY_PLACEHOLDER in section

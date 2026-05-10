@@ -160,7 +160,13 @@ def _load_typed_models(
 
 
 def _load_latest_yield(log_path: Path) -> dict[str, object] | None:
-    """Return the last non-empty line of the pre-LLM yield JSONL log."""
+    """Return the last non-empty line of the pre-LLM yield JSONL log.
+
+    The whole file is read into memory because the report only needs the
+    final line — operationally the log is a short one-line-per-run
+    stream, but rotation is the writer's responsibility (see FEAT-005's
+    ``write_yield_summary``); this reader does not cap the input size.
+    """
     if not log_path.exists():
         return None
     try:
@@ -176,11 +182,22 @@ def _load_latest_yield(log_path: Path) -> dict[str, object] | None:
     except json.JSONDecodeError:
         logger.debug("Last run-summary line is not valid JSON")
         return None
+    # JSON allows non-object roots (e.g. an array) — reject them so the
+    # rest of the pipeline can rely on dict-shaped yields.
     return payload if isinstance(payload, dict) else None
 
 
 def _load_vault_state(vault_path: Path) -> _VaultState:
-    """Snapshot every collection the (PR 1) report needs from *vault_path*."""
+    """Snapshot every collection the (PR 1) report needs from *vault_path*.
+
+    The ``isinstance`` guards in each comprehension are a mypy narrow,
+    not a runtime safety check — :func:`_load_typed_models` only
+    appends to its result after ``cls.model_validate`` succeeds, so the
+    object's runtime type is already correct. The guard exists because
+    the helper's return type is the union ``list[Fragment | Thread |
+    Eddy]``, which mypy cannot narrow per-call. Removing the guards
+    triggers ``assignment`` errors under strict mode.
+    """
     fragments = [
         f
         for f in _load_typed_models(
@@ -262,7 +279,14 @@ class StateReportGenerator:
     # ---- Implemented sections ----------------------------------------
 
     def section_vault_summary(self) -> str:
-        """Render section 1: vault summary (counts + frequency distribution)."""
+        """Render section 1: vault summary (counts + frequency distribution).
+
+        Bypasses :func:`_section` deliberately: section 1 always has
+        content (the count lines) so the empty-state placeholder is
+        unreachable. An empty vault renders three ``: 0`` rows, not the
+        ``_No surfacing this week._`` body — the regression test pins
+        this contract.
+        """
         state = self._state
         body = [
             f"- Fragments: {len(state.fragments)}",
