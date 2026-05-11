@@ -17,6 +17,8 @@ writing an entry to the privacy audit log via
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -190,6 +192,98 @@ def record_privacy_override(
         "fragment_ids": list(fragment_ids),
     }
     log.append(payload)
+
+
+@dataclass(frozen=True)
+class PreSaveFilterResult:
+    """Outcome of :func:`pre_save_filter`.
+
+    Attributes:
+        vault_body: Markdown body to write into the vault note. For
+            non-open tiers this is a title-only summary.
+        stub_body: Full body destined for the gitignored intimate-stub
+            file, or ``None`` when the tier does not require off-vault
+            stashing.
+        stub_relpath: Vault-relative path under which the stub will be
+            written (``10-Liminal/Compost/intimate-stubs/<slug>.md``),
+            or ``None`` when no stub is needed.
+    """
+
+    vault_body: str
+    stub_body: str | None
+    stub_relpath: Path | None
+
+
+_PRE_SAVE_INTIMATE_STUB_RELPATH = Path("10-Liminal/Compost/intimate-stubs")
+"""Mirror of :data:`creek.save.router.INTIMATE_STUB_RELPATH`.
+
+Duplicated here to keep ``privacy_filter`` free of a circular import
+back into the save module. The save module owns the canonical
+constant; this private mirror is only used to compose the stub
+relative path returned to callers.
+"""
+
+
+def _title_only_summary(title: str | None) -> str:
+    """Return the body that gets written when only the title is safe."""
+    safe_title = (title or "").strip() or "(untitled)"
+    return f"[Tier-redacted summary: {safe_title}]\n"
+
+
+def _stub_relpath_for(title: str | None) -> Path:
+    """Compose the gitignored stub path for an intimate body."""
+    raw = (title or "intimate").strip().lower() or "intimate"
+    slug = re.sub(r"[^\w\-]+", "-", raw).strip("-") or "intimate"
+    return _PRE_SAVE_INTIMATE_STUB_RELPATH / f"{slug[:64]}.md"
+
+
+def pre_save_filter(
+    body: str,
+    *,
+    tier: PrivacyTier,
+    title: str | None,
+    full_body: bool = False,
+) -> PreSaveFilterResult:
+    """Apply tier-aware redaction to a ``creek save`` body.
+
+    The contract follows FEAT-009's "privacy enforcement" block:
+
+    * ``open`` — full body is written into the vault.
+    * ``personal`` — body is replaced with a title-only summary unless
+      *full_body* is explicitly ``True``.
+    * ``intimate`` — body is replaced with a title-only summary in the
+      vault, and the full body is routed to the gitignored
+      ``10-Liminal/Compost/intimate-stubs/`` directory.
+
+    Args:
+        body: The raw answer body the operator wants to file back.
+        tier: Privacy tier inherited from provenance or supplied via
+            ``--tier``.
+        title: Optional title — used to compose the title-only summary
+            and the stub filename.
+        full_body: When ``True``, allow personal-tier bodies through
+            unredacted. Ignored for ``intimate``.
+
+    Returns:
+        A :class:`PreSaveFilterResult` describing what to write where.
+    """
+    if tier == PrivacyTier.INTIMATE:
+        return PreSaveFilterResult(
+            vault_body=_title_only_summary(title),
+            stub_body=body,
+            stub_relpath=_stub_relpath_for(title),
+        )
+    if tier == PrivacyTier.PERSONAL and not full_body:
+        return PreSaveFilterResult(
+            vault_body=_title_only_summary(title),
+            stub_body=None,
+            stub_relpath=None,
+        )
+    return PreSaveFilterResult(
+        vault_body=body,
+        stub_body=None,
+        stub_relpath=None,
+    )
 
 
 def parse_include_tier(value: str | None) -> PrivacyTierOverride | None:

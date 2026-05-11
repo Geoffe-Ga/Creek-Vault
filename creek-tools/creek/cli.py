@@ -21,7 +21,9 @@ from creek.classify.privacy_filter import (
 )
 from creek.config import load_config
 from creek.consent import ConsentManager
+from creek.models import PrivacyTier
 from creek.pipeline import Pipeline, RedactionRequiredError
+from creek.save import SaveTarget
 
 logger = logging.getLogger(__name__)
 
@@ -1426,6 +1428,227 @@ def draft(
     )
     saved_path = generator.save_draft(draft_obj, vault_path)
     console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+
+
+# ---------------------------------------------------------------------------
+# `creek save` — answer-filing-back primitive (FEAT-009)
+# ---------------------------------------------------------------------------
+
+
+_SAVE_TARGET_HELP = (
+    "Destination type: thread, eddy, praxis, paradox, unnamed, or draft. "
+    "Paradox always routes to 10-Liminal/Paradoxes/ regardless of other inputs."
+)
+_SAVE_TIER_HELP = (
+    "Privacy tier (open|personal|intimate). Required when stdin is the body "
+    "source; defaults to the source fragments' max tier when --provenance "
+    "is supplied."
+)
+_SAVE_SOURCE_KINDS: tuple[str, ...] = (
+    "discord",
+    "claude-session",
+    "manual",
+    "mcp",
+)
+"""Allowed ``--source-kind`` values; mirrors the ``saved_from`` schema.
+
+Validated at the CLI boundary (rather than typing :class:`SaveRequest`
+as a ``Literal``) so the CLI exits 2 with a clear error listing the
+accepted values, consistent with how ``--target`` and ``--tier`` are
+parsed. A stricter type on the dataclass would silently accept any
+string at the library boundary, which is exactly what the reviewer
+flagged before the MCP surface (FEAT-016) goes live."""
+
+
+def _parse_save_source_kind(value: str) -> str:
+    """Validate ``--source-kind`` or exit 2 with a clear listing."""
+    if value in _SAVE_SOURCE_KINDS:
+        return value
+    options = ", ".join(_SAVE_SOURCE_KINDS)
+    console.print(
+        f"[red]Unknown --source-kind {value!r}. Supported: {options}.[/red]",
+    )
+    raise typer.Exit(code=2)
+
+
+def _read_save_body(body_arg: str | None) -> tuple[str, bool]:
+    """Return ``(body_text, came_from_stdin)`` for the ``--body`` option.
+
+    ``--body`` accepts a path or ``-`` (explicit stdin); omitting it
+    also reads from stdin. A non-existent path is a hard error rather
+    than a silent inline fallback — for a privacy-sensitive filing
+    tool, filing the path string itself when the operator mistyped a
+    file path is dangerously confusing (the resulting note's body is
+    the path, and the operator believes their answer was filed).
+    """
+    if body_arg is None or body_arg == "-":
+        return sys.stdin.read(), True
+    body_path = Path(body_arg)
+    if not body_path.exists():
+        console.print(
+            f"[red]--body path does not exist: {body_arg}. "
+            "Pass '-' (or omit --body) to read the body from stdin.[/red]",
+        )
+        raise typer.Exit(code=2)
+    return body_path.read_text(encoding="utf-8"), False
+
+
+def _parse_save_target(value: str) -> SaveTarget:
+    """Parse the ``--target`` value or exit 2 with a clear listing."""
+    try:
+        return SaveTarget(value)
+    except ValueError as exc:
+        options = ", ".join(member.value for member in SaveTarget)
+        console.print(
+            f"[red]Unknown --target {value!r}. Supported: {options}.[/red]",
+        )
+        raise typer.Exit(code=2) from exc
+
+
+def _parse_save_tier(value: str | None) -> PrivacyTier | None:
+    """Parse ``--tier`` into a :class:`PrivacyTier`, or ``None`` if unset."""
+    if value is None:
+        return None
+    try:
+        return PrivacyTier(value)
+    except ValueError as exc:
+        options = ", ".join(
+            member.value for member in PrivacyTier if member != PrivacyTier.UNCLASSIFIED
+        )
+        console.print(
+            f"[red]Unknown --tier {value!r}. Supported: {options}.[/red]",
+        )
+        raise typer.Exit(code=2) from exc
+
+
+def _warn_if_paradox_downgrades_tier(
+    target: SaveTarget,
+    tier: PrivacyTier | None,
+) -> None:
+    """Print a stderr warning when paradox saves silently widen the tier.
+
+    Per the FEAT, ``--target paradox`` always lands in
+    ``10-Liminal/Paradoxes/`` with the body filtered as ``open`` —
+    *the fact* of the contradiction is what's preserved, not a
+    tier-protected summary. A user who passes ``--tier intimate`` or
+    ``--tier personal`` for protection is likely surprised when the
+    body lands in the vault unredacted, so we surface the override
+    explicitly rather than letting it pass silently.
+    """
+    if target != SaveTarget.PARADOX:
+        return
+    if tier is None or tier == PrivacyTier.OPEN:
+        return
+    console.print(
+        f"[yellow]Note: --target paradox forces tier=open for the body; "
+        f"--tier {tier.value} will be widened. The contradiction will be "
+        "written in full to 10-Liminal/Paradoxes/. Use --target unnamed "
+        "(or thread/eddy/praxis) with --tier intimate if you want the "
+        "body protected.[/yellow]",
+    )
+
+
+def _resolve_save_tier(
+    tier: PrivacyTier | None,
+    provenance: tuple[str, ...],
+    *,
+    came_from_stdin: bool,
+) -> PrivacyTier:
+    """Resolve the effective tier per FEAT-009's tier-defaulting rule.
+
+    * Explicit ``--tier`` always wins.
+    * Otherwise, when ``--provenance`` is supplied *and* the body did
+      not come from stdin, default to ``open`` (the v1 surface; a
+      future revision will derive from the source fragments' max tier).
+    * No tier and either no provenance or stdin body → refuse so the
+      operator makes an intentional choice.
+    """
+    if tier is not None:
+        return tier
+    if not provenance or came_from_stdin:
+        console.print(
+            "[red]--tier is required when --provenance is empty or the body "
+            "comes from stdin. Pass --tier open|personal|intimate explicitly.[/red]",
+        )
+        raise typer.Exit(code=2)
+    return PrivacyTier.OPEN
+
+
+@app.command(name="save")
+def save_cmd(
+    target: str = typer.Option(
+        ...,
+        "--target",
+        help=_SAVE_TARGET_HELP,
+    ),
+    body: str | None = typer.Option(
+        None,
+        "--body",
+        help="Path to the body file, '-' for stdin, or omitted for stdin.",
+    ),
+    title: str | None = typer.Option(None, "--title", help="Optional title."),
+    provenance: str | None = typer.Option(
+        None,
+        "--provenance",
+        help="Comma-separated contributing fragment IDs (e.g. frag-001,frag-002).",
+    ),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Opaque source ID (conversation/discord-msg/claude-session).",
+    ),
+    source_kind: str = typer.Option(
+        "manual",
+        "--source-kind",
+        help="Source kind: discord, claude-session, manual, or mcp.",
+    ),
+    tier: str | None = typer.Option(None, "--tier", help=_SAVE_TIER_HELP),
+    full_body: bool = typer.Option(
+        False,
+        "--full-body",
+        help="Allow personal-tier bodies into the vault unredacted.",
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """File an answer back into the vault (FEAT-009).
+
+    Writes a properly-classified note with full ``saved_from``
+    frontmatter to the directory chosen by ``--target``. Honours
+    privacy-tier policy: intimate bodies are diverted to the
+    gitignored ``10-Liminal/Compost/intimate-stubs/`` directory and
+    only a title-only summary is written into the vault; personal
+    bodies are summarised unless ``--full-body`` is passed; paradox
+    saves always land in ``10-Liminal/Paradoxes/``.
+    """
+    from creek.save import SaveRequest, save_to_vault
+
+    save_target = _parse_save_target(target)
+    parsed_source_kind = _parse_save_source_kind(source_kind)
+    body_text, came_from_stdin = _read_save_body(body)
+    parsed_tier = _parse_save_tier(tier)
+    fragments = tuple(
+        frag.strip() for frag in (provenance or "").split(",") if frag.strip()
+    )
+    effective_tier = _resolve_save_tier(
+        parsed_tier,
+        fragments,
+        came_from_stdin=came_from_stdin,
+    )
+    _warn_if_paradox_downgrades_tier(save_target, parsed_tier)
+    vault_path = _resolve_vault(vault)
+    request = SaveRequest(
+        target=save_target,
+        body=body_text,
+        title=title,
+        tier=effective_tier,
+        provenance=fragments,
+        source_kind=parsed_source_kind,
+        source_id=source,
+        saved_by=_operator_identity(),
+        full_body=full_body,
+    )
+    written = save_to_vault(request, vault_path=vault_path)
+    console.print(f"[bold green]Saved {save_target.value} -> {written}[/bold green]")
 
 
 # ---------------------------------------------------------------------------
