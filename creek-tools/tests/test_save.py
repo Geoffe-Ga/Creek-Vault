@@ -424,6 +424,58 @@ def test_intimate_stub_collision_increments_suffix(vault: Path) -> None:
     assert any(s.stem.endswith("-1") for s in stubs)
 
 
+def test_intimate_stub_records_saved_at_and_saved_by(vault: Path) -> None:
+    """Stub frontmatter carries the full ``saved_from`` block.
+
+    The stub directory is gitignored — without a ``saved_at`` field on
+    the stub itself, operators recovering from disk would have no
+    timestamp to reason about. The block also identifies who saved it.
+    """
+    request = _make_request(
+        SaveTarget.UNNAMED,
+        body="Intimate confession.",
+        title="With timestamp",
+        tier=PrivacyTier.INTIMATE,
+    )
+    save_to_vault(request, vault_path=vault)
+    stubs_dir = vault / "10-Liminal" / "Compost" / "intimate-stubs"
+    stub = next(iter(stubs_dir.glob("*.md")))
+    post = frontmatter.load(str(stub))
+    saved_from = post["saved_from"]
+    assert saved_from.get("saved_at")
+    assert saved_from["saved_by"] == "tester"
+    # The stub *is* the body, so it must not point back at itself or
+    # leak an intimate_body_pointer.
+    assert "intimate_body_pointer" not in saved_from
+
+
+def test_cli_save_unknown_source_kind_exits_two(tmp_path: Path) -> None:
+    """Reject free-form ``--source-kind`` values with a clear error."""
+    vault = _scaffold_vault(tmp_path / "vault")
+    body_file = tmp_path / "answer.md"
+    body_file.write_text("body", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "thread",
+            "--body",
+            str(body_file),
+            "--provenance",
+            "frag-001",
+            "--source-kind",
+            "smoke-signal",
+            "--tier",
+            "open",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "source-kind" in result.output.lower()
+
+
 def test_cli_save_unknown_target_exits_two(tmp_path: Path) -> None:
     """An unknown --target value exits 2 with a hint listing valid options."""
     vault = _scaffold_vault(tmp_path / "vault")

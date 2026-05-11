@@ -1444,6 +1444,31 @@ _SAVE_TIER_HELP = (
     "source; defaults to the source fragments' max tier when --provenance "
     "is supplied."
 )
+_SAVE_SOURCE_KINDS: tuple[str, ...] = (
+    "discord",
+    "claude-session",
+    "manual",
+    "mcp",
+)
+"""Allowed ``--source-kind`` values; mirrors the ``saved_from`` schema.
+
+Validated at the CLI boundary (rather than typing :class:`SaveRequest`
+as a ``Literal``) so the CLI exits 2 with a clear error listing the
+accepted values, consistent with how ``--target`` and ``--tier`` are
+parsed. A stricter type on the dataclass would silently accept any
+string at the library boundary, which is exactly what the reviewer
+flagged before the MCP surface (FEAT-016) goes live."""
+
+
+def _parse_save_source_kind(value: str) -> str:
+    """Validate ``--source-kind`` or exit 2 with a clear listing."""
+    if value in _SAVE_SOURCE_KINDS:
+        return value
+    options = ", ".join(_SAVE_SOURCE_KINDS)
+    console.print(
+        f"[red]Unknown --source-kind {value!r}. Supported: {options}.[/red]",
+    )
+    raise typer.Exit(code=2)
 
 
 def _read_save_body(body_arg: str | None) -> tuple[str, bool]:
@@ -1498,11 +1523,11 @@ def _resolve_save_tier(
     """Resolve the effective tier per FEAT-009's tier-defaulting rule.
 
     * Explicit ``--tier`` always wins.
-    * Otherwise, when ``--provenance`` is supplied, default to ``open``
-      (the v1 surface; a future revision will derive from the source
-      fragments' max tier).
-    * No tier, no provenance → refuse so the operator makes an
-      intentional choice.
+    * Otherwise, when ``--provenance`` is supplied *and* the body did
+      not come from stdin, default to ``open`` (the v1 surface; a
+      future revision will derive from the source fragments' max tier).
+    * No tier and either no provenance or stdin body → refuse so the
+      operator makes an intentional choice.
     """
     if tier is not None:
         return tier
@@ -1564,6 +1589,7 @@ def save_cmd(
     from creek.save import SaveRequest, save_to_vault
 
     save_target = _parse_save_target(target)
+    parsed_source_kind = _parse_save_source_kind(source_kind)
     body_text, came_from_stdin = _read_save_body(body)
     parsed_tier = _parse_save_tier(tier)
     fragments = tuple(
@@ -1581,7 +1607,7 @@ def save_cmd(
         title=title,
         tier=effective_tier,
         provenance=fragments,
-        source_kind=source_kind,
+        source_kind=parsed_source_kind,
         source_id=source,
         saved_by=_operator_identity(),
         full_body=full_body,

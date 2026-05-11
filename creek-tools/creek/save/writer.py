@@ -128,7 +128,10 @@ def _compose_metadata(
     metadata = _shape_for_target(request)
     metadata["type"] = request.target.value
     metadata["privacy_tier"] = effective_tier.value
-    metadata["saved_from"] = _saved_from_block(request, intimate_pointer)
+    metadata["saved_from"] = _saved_from_block(
+        request,
+        intimate_pointer=intimate_pointer,
+    )
     return metadata
 
 
@@ -155,6 +158,7 @@ def _shape_for_target(request: SaveRequest) -> dict[str, Any]:
 
 def _saved_from_block(
     request: SaveRequest,
+    *,
     intimate_pointer: str | None,
 ) -> dict[str, Any]:
     """Compose the ``saved_from`` provenance block."""
@@ -233,11 +237,12 @@ def _write_intimate_stub(
         type="intimate-stub",
         title=(request.title or "untitled"),
         privacy_tier=PrivacyTier.INTIMATE.value,
-        saved_from={
-            "source_kind": request.source_kind,
-            "source_id": request.source_id or "",
-            "contributing_fragments": list(request.provenance),
-        },
+        # Reuse the canonical block so the stub records ``saved_at`` and
+        # ``saved_by`` alongside source / provenance — useful for
+        # debugging because the stub directory is gitignored and so has
+        # no git-side timestamp. ``intimate_body_pointer`` is None here:
+        # the stub *is* the body, not a pointer to one.
+        saved_from=_saved_from_block(request, intimate_pointer=None),
     )
     return _atomic_create(
         stub_path.parent,
