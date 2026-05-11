@@ -19,12 +19,12 @@ from creek.cli import app
 from creek.models import PrivacyTier
 from creek.save import (
     INTIMATE_STUB_RELPATH,
+    TARGET_SUBDIRS,
     SaveRequest,
     SaveTarget,
     save_to_vault,
     target_directory,
 )
-from creek.save.router import _TARGET_SUBDIRS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -36,7 +36,7 @@ def vault(tmp_path: Path) -> Iterator[Path]:
     for relparts in {
         ("00-Creek-Meta",),
         ("01-Fragments",),
-        *_TARGET_SUBDIRS.values(),
+        *TARGET_SUBDIRS.values(),
         ("10-Liminal", "Compost", "intimate-stubs"),
     }:
         (tmp_path.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
@@ -68,7 +68,7 @@ def _make_request(
 # ---- Router ----
 
 
-@pytest.mark.parametrize(("target", "parts"), list(_TARGET_SUBDIRS.items()))
+@pytest.mark.parametrize(("target", "parts"), list(TARGET_SUBDIRS.items()))
 def test_router_maps_each_target_to_canonical_subdir(
     vault: Path,
     target: SaveTarget,
@@ -269,7 +269,7 @@ def _scaffold_vault(root: Path) -> Path:
     for parts in {
         ("00-Creek-Meta",),
         ("01-Fragments",),
-        *_TARGET_SUBDIRS.values(),
+        *TARGET_SUBDIRS.values(),
         ("10-Liminal", "Compost", "intimate-stubs"),
     }:
         root.joinpath(*parts).mkdir(parents=True, exist_ok=True)

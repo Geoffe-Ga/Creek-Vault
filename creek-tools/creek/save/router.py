@@ -27,7 +27,7 @@ class SaveTarget(StrEnum):
     DRAFT = "draft"
 
 
-_TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
+TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
     SaveTarget.THREAD: ("02-Threads", "Active"),
     SaveTarget.EDDY: ("03-Eddies",),
     SaveTarget.PRAXIS: ("04-Praxis", "Situational"),
@@ -35,8 +35,16 @@ _TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
     SaveTarget.UNNAMED: ("10-Liminal", "Unnamed"),
     SaveTarget.DRAFT: ("07-Voice", "Drafts"),
 }
+"""Canonical mapping of save targets to vault subdirectories.
+
+Exposed publicly so tests and downstream callers (e.g. the MCP wrapper
+in FEAT-016) can parametrize against the same data the router uses,
+rather than re-declaring the mapping and risking drift. The underscore
+prefix was dropped in PR #220 round 4 after a reviewer flagged the
+private-symbol coupling in :mod:`tests.test_save`.
+"""
 
 
 def target_directory(vault_path: Path, target: SaveTarget) -> Path:
     """Return the vault subdirectory for *target* under *vault_path*."""
-    return vault_path.joinpath(*_TARGET_SUBDIRS[target])
+    return vault_path.joinpath(*TARGET_SUBDIRS[target])

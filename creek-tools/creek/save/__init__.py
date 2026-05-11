@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from creek.save.router import (
     INTIMATE_STUB_RELPATH,
+    TARGET_SUBDIRS,
     SaveTarget,
     target_directory,
 )
@@ -17,6 +18,7 @@ from creek.save.writer import SaveRequest, save_to_vault
 
 __all__ = [
     "INTIMATE_STUB_RELPATH",
+    "TARGET_SUBDIRS",
     "SaveRequest",
     "SaveTarget",
     "save_to_vault",
