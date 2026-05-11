@@ -1,9 +1,4 @@
-"""Per-tool integration tests for the MCP wrappers (FEAT-010).
-
-This PR covers ``creek.state.read`` and ``creek.state.render``. The
-``lint``/``mine``/``draft`` wrappers land in FEAT-010 part 2 with their
-own per-tool tests.
-"""
+"""Per-tool integration tests for the MCP wrappers (FEAT-010)."""
 
 from __future__ import annotations
 
@@ -16,6 +11,9 @@ import pytest
 
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.lint import lint_tool
+from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
 
@@ -34,7 +32,9 @@ def _seed_vault(vault: Path) -> None:
         "02-Threads/Active",
         "03-Eddies",
         "04-Praxis/Daily",
+        "07-Voice/Drafts",
         "10-Liminal/Synchronicities",
+        "creek-skills",
     ):
         (vault / sub).mkdir(parents=True, exist_ok=True)
 
@@ -154,3 +154,222 @@ def test_state_render_writes_audit_entry(vault: Path) -> None:
     entry = json.loads(raw.splitlines()[0])
     assert entry["tool"] == "creek.state.render"
     assert entry["consumer"] == "crawdad"
+
+
+# ---------------------------------------------------------------------------
+# lint
+# ---------------------------------------------------------------------------
+
+
+def test_lint_runs_default_checks(vault: Path) -> None:
+    """The default invocation returns one ``checks`` entry per ran check."""
+    result = lint_tool(vault_path=vault)
+    assert result["status"] == "ok"
+    assert result["tool"] == "creek.lint"
+    assert len(result["checks"]) >= 1
+    assert all("name" in check for check in result["checks"])
+
+
+def test_lint_writes_audit_entry_with_checks_summary(vault: Path) -> None:
+    """The audit entry captures the check list as a count summary."""
+    lint_tool(vault_path=vault, checks=["broken-links"], consumer="crawdad")
+    raw = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    entry = json.loads(raw.splitlines()[0])
+    assert entry["tool"] == "creek.lint"
+    # ``checks=["broken-links"]`` collapses to ``{"count": 1}`` via
+    # summarise_args, so the audit log never grows with check names.
+    assert entry["args_summary"]["checks"] == {"count": 1}
+
+
+def test_lint_since_window(vault: Path) -> None:
+    """``since`` triggers semantic checks via ``parse_since``."""
+    result = lint_tool(vault_path=vault, since="7d")
+    assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# mine
+# ---------------------------------------------------------------------------
+
+
+def test_mine_returns_empty_list_for_fresh_vault(vault: Path) -> None:
+    """An empty vault yields zero seeds without raising."""
+    result = mine_tool(vault_path=vault, phase="rising")
+    assert result["status"] == "ok"
+    assert result["total"] == 0
+    assert result["seeds"] == []
+
+
+def test_mine_honours_tier_ceiling(vault: Path) -> None:
+    """``ceiling=open`` maps to ``PrivacyTierOverride.OPEN`` for the miner."""
+    result = mine_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        phase="unclassified",
+    )
+    assert result["tier_ceiling"] == "open"
+
+
+def test_mine_writes_audit_entry(vault: Path) -> None:
+    """The audit entry pins phase + limit but not vault contents."""
+    mine_tool(vault_path=vault, phase="rising", limit=5, consumer="crawdad")
+    raw = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    entry = json.loads(raw.splitlines()[0])
+    assert entry["tool"] == "creek.mine"
+    assert entry["args_summary"]["phase"] == "rising"
+    assert entry["args_summary"]["limit"] == 5
+
+
+# ---------------------------------------------------------------------------
+# draft
+# ---------------------------------------------------------------------------
+
+
+def _stub_seed() -> object:
+    """Build a minimal :class:`IdeaSeed`-shaped object for draft tests."""
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+
+    return IdeaSeed(
+        strategy=MiningStrategy.THREAD_TERMINUS,
+        title="Stub idea",
+        source_fragments=("frag-1",),
+        threads=("thread-1",),
+        eddies=("eddy-1",),
+        frequency_affinity=(),
+        brief_description="brief",
+        score=0.75,
+    )
+
+
+def test_draft_returns_empty_when_no_seeds(vault: Path) -> None:
+    """No seeds → structured empty (not a crash, not a refusal)."""
+    result = draft_tool(
+        vault_path=vault,
+        llm=lambda prompt: "ignored",
+        phase="rising",
+    )
+    assert result["status"] == "empty"
+    assert result["reason"] == "no idea seeds surfaced"
+
+
+def test_draft_writes_audit_entry_for_empty_seed_path(vault: Path) -> None:
+    """Audit happens even when the draft cannot proceed (empty seeds)."""
+    draft_tool(
+        vault_path=vault,
+        llm=lambda prompt: "ignored",
+        phase="rising",
+        consumer="crawdad",
+    )
+    raw = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    entry = json.loads(raw.splitlines()[0])
+    assert entry["tool"] == "creek.draft"
+    assert entry["consumer"] == "crawdad"
+    # Body never embedded in args_summary — LLM responses live outside
+    # the audit log.
+    assert "body" not in entry["args_summary"]
+
+
+def test_draft_success_path_saves_file(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When seeds exist, ``draft_tool`` saves a draft and returns its path."""
+    from creek.generate.drafts import Draft
+
+    monkeypatch.setattr(
+        "creek_mcp.tools.draft.IdeaMiner",
+        lambda **kw: type(
+            "_M",
+            (),
+            {"mine_all": lambda self, vault_path, *, current_phase: [_stub_seed()]},
+        )(),
+    )
+
+    class _StubGenerator:
+        def __init__(self, **kw: object) -> None:
+            pass
+
+        def generate_draft(self, idea: object, *, vault_path: Path) -> Draft:
+            return Draft(
+                title="Stub idea",
+                body="drafted",
+                idea_strategy="thread_terminus",
+                source_fragments=("frag-1",),
+                threads=("thread-1",),
+                eddies=("eddy-1",),
+                skill_stack=(),
+                prompt="prompt",
+                generated_date=datetime(2026, 5, 11, tzinfo=UTC),
+            )
+
+        def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+            target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-stub.md"
+            target.write_text("body", encoding="utf-8")
+            return target
+
+    monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _StubGenerator)
+    result = draft_tool(
+        vault_path=vault,
+        llm=lambda prompt: "drafted",
+        phase="rising",
+    )
+    assert result["status"] == "ok"
+    assert result["draft_path"] == "07-Voice/Drafts/2026-05-11-stub.md"
+    assert result["title"] == "Stub idea"
+    assert result["source_fragments"] == ["frag-1"]
+
+
+def test_draft_refuses_when_llm_returns_empty(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``RuntimeError`` from the generator is converted into a refusal."""
+    monkeypatch.setattr(
+        "creek_mcp.tools.draft.IdeaMiner",
+        lambda **kw: type(
+            "_M",
+            (),
+            {"mine_all": lambda self, vault_path, *, current_phase: [_stub_seed()]},
+        )(),
+    )
+
+    class _BrokenGenerator:
+        def __init__(self, **kw: object) -> None:
+            pass
+
+        def generate_draft(self, idea: object, *, vault_path: Path) -> object:
+            msg = "LLM returned an empty draft body"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _BrokenGenerator)
+    result = draft_tool(
+        vault_path=vault,
+        llm=lambda prompt: "",
+        phase="rising",
+    )
+    assert result["status"] == "refused"
+    assert "LLM" in result["reason"]
+
+
+def test_draft_raises_for_out_of_range_index(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An out-of-range index raises :class:`TierCeilingViolationError`."""
+    from creek_mcp.tier_ceiling import TierCeilingViolationError
+
+    monkeypatch.setattr(
+        "creek_mcp.tools.draft.IdeaMiner",
+        lambda **kw: type(
+            "_M",
+            (),
+            {"mine_all": lambda self, vault_path, *, current_phase: [_stub_seed()]},
+        )(),
+    )
+    with pytest.raises(TierCeilingViolationError):
+        draft_tool(
+            vault_path=vault,
+            llm=lambda prompt: "x",
+            phase="rising",
+            index=99,
+        )

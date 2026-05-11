@@ -15,15 +15,18 @@ The entry point is registered by `pyproject.toml` as
 `creek-tools-mcp`. The server speaks JSON-RPC over stdio; running it
 interactively will appear to hang, which is correct.
 
-## Tools (FEAT-010 part 1)
+## Tools
 
 | Tool                  | Purpose                                                    |
 |-----------------------|------------------------------------------------------------|
 | `creek.state.read`    | Return the latest `00-Creek-Meta/State/latest.md` content. |
 | `creek.state.render`  | Re-render the audit report (expensive).                    |
+| `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
+| `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
+| `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
 
-The follow-up PR adds `creek.lint`, `creek.mine`, and `creek.draft`.
-FEAT-011 adds write tools; FEAT-012 adds `purge.*`.
+FEAT-011 adds write tools (`save`, `ingest`, `classify`, `link`,
+`report`, `skills.generate`); FEAT-012 adds `purge.*`.
 
 Every tool requires a `privacy_tier_ceiling` parameter
 (`open` | `personal` | `intimate` | `all`); default is `open`. Content
@@ -82,3 +85,16 @@ become `{"count": N}`, dicts become `{"keys": [...]}`. A draft request
 for an `intimate`-tier fragment never leaks the body into the audit
 trail. Hash chaining is provided by `creek.audit.AuditLog`; FEAT-012's
 hardening pass extends the entry shape, not the storage layer.
+
+## Troubleshooting
+
+- **Server appears to hang:** correct. It speaks JSON-RPC over stdio.
+  Use `python -m creek_mcp.server` for the same effect.
+- **`No module named "mcp"`:** install with `pip install -e .` — FEAT-010
+  added the `mcp` SDK to `pyproject.toml`.
+- **`creek.draft` returns "LLM provider unavailable":** the server
+  loads the LLM lazily so only `draft` requires it. Configure
+  `ANTHROPIC_API_KEY` or a running Ollama instance.
+- **Fewer mine seeds than expected:** the ceiling is filtering intimate
+  fragments by design. Raise the ceiling to `intimate` or `all` only
+  when the caller is authorised.

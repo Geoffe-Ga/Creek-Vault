@@ -14,7 +14,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-EXPECTED_TOOLS = {"creek.state.read", "creek.state.render"}
+EXPECTED_TOOLS = {
+    "creek.state.read",
+    "creek.state.render",
+    "creek.lint",
+    "creek.mine",
+    "creek.draft",
+}
 
 
 @pytest.fixture
@@ -27,6 +33,7 @@ def vault(tmp_path: Path) -> Iterator[Path]:
         "01-Fragments/Notes",
         "02-Threads/Active",
         "03-Eddies",
+        "creek-skills",
     ):
         (tmp_path / sub).mkdir(parents=True, exist_ok=True)
     yield tmp_path
@@ -39,18 +46,19 @@ def _structured(result: object) -> dict[str, object]:
 
 def test_build_server_returns_fastmcp_instance(vault: Path) -> None:
     """The bootstrap returns a configured :class:`FastMCP` instance."""
-    server = build_server(vault_path=vault)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
     assert server.name == SERVER_NAME
 
 
-def test_build_server_registers_part_one_tools(vault: Path) -> None:
-    """The state read/render tools surface via ``list_tools``.
-
-    FEAT-010 part 2 adds ``creek.lint``, ``creek.mine``, and
-    ``creek.draft`` — those land in the follow-up PR. This test pins
-    the part-1 surface so the registration regression is caught early.
-    """
-    server = build_server(vault_path=vault)
+def test_build_server_registers_five_read_tools(vault: Path) -> None:
+    """All five FEAT-010 read tools surface via ``list_tools``."""
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
     tools = asyncio.run(server.list_tools())
     names = {tool.name for tool in tools}
     assert names == EXPECTED_TOOLS
@@ -58,7 +66,10 @@ def test_build_server_registers_part_one_tools(vault: Path) -> None:
 
 def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None:
     """The FEAT-010 acceptance criterion: ceiling is in every tool's schema."""
-    server = build_server(vault_path=vault)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
     tools = asyncio.run(server.list_tools())
     for tool in tools:
         schema = tool.inputSchema
@@ -73,7 +84,10 @@ def test_call_tool_state_read_through_mcp(vault: Path) -> None:
         "# Audit\n\nhello\n",
         encoding="utf-8",
     )
-    server = build_server(vault_path=vault)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
     result = asyncio.run(
         server.call_tool("creek.state.read", {"privacy_tier_ceiling": "open"}),
     )
@@ -85,7 +99,10 @@ def test_call_tool_state_read_through_mcp(vault: Path) -> None:
 
 def test_call_tool_state_render_through_mcp(vault: Path) -> None:
     """The render path is reachable via ``call_tool``."""
-    server = build_server(vault_path=vault)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
     result = asyncio.run(
         server.call_tool(
             "creek.state.render",
@@ -94,6 +111,53 @@ def test_call_tool_state_render_through_mcp(vault: Path) -> None:
     )
     structured = _structured(result)
     assert structured["status"] == "ok"
+
+
+def test_call_tool_lint_through_mcp(vault: Path) -> None:
+    """The lint path is reachable via ``call_tool`` and returns ``checks``."""
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool("creek.lint", {"privacy_tier_ceiling": "open"}),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert "checks" in structured
+
+
+def test_call_tool_mine_through_mcp(vault: Path) -> None:
+    """The mine path is reachable via ``call_tool``."""
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.mine",
+            {"privacy_tier_ceiling": "open", "phase": "rising", "limit": 3},
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+
+
+def test_call_tool_draft_through_mcp(vault: Path) -> None:
+    """The draft path is reachable via ``call_tool``."""
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.draft",
+            {"privacy_tier_ceiling": "open", "phase": "rising"},
+        ),
+    )
+    structured = _structured(result)
+    # Empty vault → no seeds; tool returns structured ``empty``.
+    assert structured["status"] == "empty"
 
 
 def test_build_server_falls_back_to_load_config(
@@ -106,8 +170,55 @@ def test_build_server_falls_back_to_load_config(
         vault_path = vault
 
     monkeypatch.setattr("creek_mcp.server.load_config", lambda: _StubConfig())
-    server = build_server()
+    server = build_server(draft_llm_factory=lambda: lambda prompt: "x")
     assert server.name == SERVER_NAME
+
+
+def test_build_draft_llm_raises_when_classifier_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production factory bubbles a clear error when no LLM is reachable."""
+    from creek_mcp import server as server_module
+
+    class _UnavailableClassifier:
+        available = False
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def invoke_prompt(self, prompt: str) -> str:  # pragma: no cover
+            return ""
+
+    monkeypatch.setattr(
+        "creek.classify.llm.LLMClassifier",
+        _UnavailableClassifier,
+    )
+    with pytest.raises(RuntimeError, match="LLM provider unavailable"):
+        server_module._build_draft_llm()
+
+
+def test_build_draft_llm_returns_invoke_prompt_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the classifier reports ``available``, the factory returns the callable."""
+    from creek_mcp import server as server_module
+
+    class _AvailableClassifier:
+        available = True
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def invoke_prompt(self, prompt: str) -> str:
+            return "drafted body"
+
+    monkeypatch.setattr(
+        "creek.classify.llm.LLMClassifier",
+        _AvailableClassifier,
+    )
+    llm = server_module._build_draft_llm()
+    assert callable(llm)
+    assert llm("hi") == "drafted body"
 
 
 def test_main_invokes_server_run(monkeypatch: pytest.MonkeyPatch) -> None:

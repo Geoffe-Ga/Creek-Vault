@@ -2,10 +2,10 @@
 
 Exposes the read-only ``creek`` CLI surface as MCP tools so CrawDad and
 the developer's Claude Code consume the same vault interface with
-privacy-tier ceiling enforcement at the protocol boundary. This PR
-(part 1 of 2) ships the ``state.read`` / ``state.render`` tools and
-the audit + tier-ceiling substrate; the ``lint`` / ``mine`` / ``draft``
-tools land in the follow-up.
+privacy-tier ceiling enforcement at the protocol boundary. Ships the
+five read tools — ``state.read``, ``state.render``, ``lint``, ``mine``,
+``draft`` — and the audit + tier-ceiling substrate that FEAT-011's
+write tools and FEAT-012's purge tools will share.
 """
 
 from creek_mcp.tier_ceiling import TierCeiling, TierCeilingViolationError
