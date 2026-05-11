@@ -35,6 +35,12 @@ from creek.generate.state import (
     StateReportGenerator,
     _frequency_label,
 )
+from creek.generate.state_budget import (
+    SIZE_BUDGET_TOKENS,
+    BudgetResult,
+    check_budget,
+    estimate_tokens,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -66,6 +72,11 @@ def _write_fragment(
     frequency: str = "F1",
     eddies: list[str] | None = None,
     body: str = "body",
+    phase: str = "unclassified",
+    mode: str = "unclassified",
+    dosage: str = "unclassified",
+    praxis_potential: str = "none",
+    source_platform: str = "journal",
 ) -> Path:
     """Write a Creek fragment markdown file under ``01-Fragments/Notes``."""
     when = created or datetime(2026, 5, 1, tzinfo=UTC)
@@ -75,9 +86,11 @@ def _write_fragment(
         "title": title,
         "created": when.isoformat(),
         "ingested": when.isoformat(),
-        "source": {"platform": "journal", "author": "self"},
+        "source": {"platform": source_platform, "author": "self"},
         "frequency": {"primary": frequency, "secondary": []},
+        "wavelength": {"phase": phase, "mode": mode, "dosage": dosage},
         "eddies": list(eddies or []),
+        "praxis_potential": praxis_potential,
     }
     target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
     target.write_text(
@@ -854,3 +867,424 @@ def test_render_against_missing_vault_root(tmp_path: Path) -> None:
     assert "Threads: 0" in rendered
     for header in SECTION_ORDER:
         assert header in rendered
+
+
+# ---------------------------------------------------------------------------
+# FEAT-007: wavelength snapshot, suggested questions, liminal watch
+# ---------------------------------------------------------------------------
+
+
+def _write_liminal_unnamed(vault: Path, name: str, *, created: datetime) -> Path:
+    """Write a minimal Unnamed fragment under ``10-Liminal/Unnamed``."""
+    (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
+    target = vault / "10-Liminal" / "Unnamed" / f"{name}.md"
+    metadata = {
+        "type": "fragment",
+        "id": name,
+        "title": name.replace("-", " ").title(),
+        "created": created.isoformat(),
+        "ingested": created.isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "unclassified", "secondary": []},
+    }
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="unnamed body", **metadata)),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _write_liminal_paradox(vault: Path, name: str, *, created: datetime) -> Path:
+    """Write a minimal Paradox note under ``10-Liminal/Paradoxes``."""
+    (vault / "10-Liminal" / "Paradoxes").mkdir(parents=True, exist_ok=True)
+    target = vault / "10-Liminal" / "Paradoxes" / f"{name}.md"
+    metadata = {
+        "type": "paradox",
+        "id": name,
+        "title": name.replace("-", " ").title(),
+        "created": created.isoformat(),
+    }
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="held tension", **metadata)),
+        encoding="utf-8",
+    )
+    return target
+
+
+# ---- Wavelength snapshot ----
+
+
+def test_section_wavelength_snapshot_has_header_and_first(empty_vault: Path) -> None:
+    """The wavelength snapshot is the very first section header in render output.
+
+    Pre-decided choice (FEAT-007): the snapshot interprets every other
+    section, so it must precede ``## Vault summary``.
+    """
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_wavelength_snapshot()
+    assert section.startswith("## Wavelength snapshot")
+
+
+def test_section_wavelength_snapshot_reports_dominant_phase_and_mode(
+    empty_vault: Path,
+) -> None:
+    """A populated vault surfaces the dominant phase, mode, and dosage shares."""
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    for index in range(3):
+        _write_fragment(
+            empty_vault,
+            frag_id=f"frag-r{index}",
+            created=base + timedelta(days=index),
+            phase="rising",
+            mode="express",
+            dosage="medicine",
+            frequency="F1",
+        )
+    _write_fragment(
+        empty_vault,
+        frag_id="frag-other",
+        created=base + timedelta(days=3),
+        phase="peaking",
+        mode="inhabit",
+        dosage="toxic",
+        frequency="F2",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+        today=date(2026, 5, 7),
+    ).section_wavelength_snapshot()
+
+    assert "rising" in section.lower()
+    assert "express" in section.lower()
+    # Medicine share rendered as a percentage.
+    assert "Medicine" in section
+    assert "Toxic" in section
+
+
+def test_section_wavelength_snapshot_empty_when_no_fragments(
+    empty_vault: Path,
+) -> None:
+    """An empty vault renders the empty-state placeholder under the header."""
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_wavelength_snapshot()
+    assert section.startswith("## Wavelength snapshot")
+    assert EMPTY_PLACEHOLDER in section
+
+
+# ---- Suggested questions (phase-aware) ----
+
+
+def _seed_rising_fixture(vault: Path) -> None:
+    """Populate a vault biased toward Rising-phase thread-terminus candidates."""
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    # Active thread with high fragment_count → terminus candidate.
+    _write_thread(
+        vault,
+        thread_id="thread-rising",
+        title="Rising essay topic",
+        last_seen=date(2026, 5, 8),
+        fragment_count=20,
+    )
+    # Companion fragments classified as Rising with explicit praxis potential.
+    for index in range(2):
+        _write_fragment(
+            vault,
+            frag_id=f"frag-rise-{index}",
+            title=f"Rise {index}",
+            created=base + timedelta(days=index),
+            phase="rising",
+            praxis_potential="explicit",
+            frequency="F1",
+        )
+
+
+def _seed_bottoming_fixture(vault: Path) -> None:
+    """Populate a vault biased toward Bottoming-Out compost/synchronicity prompts."""
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    # Liminal "Unnamed" fragment plus matching eddy → liminal-cross-eddy seed.
+    (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
+    unnamed_meta = {
+        "type": "fragment",
+        "id": "frag-unnamed",
+        "title": "Compost stirring",
+        "created": base.isoformat(),
+        "ingested": base.isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F4", "secondary": []},
+    }
+    unnamed = vault / "10-Liminal" / "Unnamed" / "frag-unnamed.md"
+    unnamed.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content=(
+                    "winter darkness composting receptivity quiet stillness "
+                    "synchronicity grief rest"
+                ),
+                **unnamed_meta,
+            ),
+        ),
+        encoding="utf-8",
+    )
+    _write_eddy(vault, eddy_id="eddy-compost", title="Compost", fragment_count=4)
+    eddy = vault / "03-Eddies" / "eddy-compost.md"
+    eddy_meta = {
+        "type": "eddy",
+        "id": "eddy-compost",
+        "title": "Compost",
+        "formed": date(2026, 1, 1).isoformat(),
+        "fragment_count": 4,
+        "threads": [],
+        "description": (
+            "winter darkness composting receptivity quiet stillness synchronicity "
+            "grief rest"
+        ),
+    }
+    eddy.write_text(
+        frontmatter.dumps(frontmatter.Post(content="", **eddy_meta)),
+        encoding="utf-8",
+    )
+
+
+def test_section_suggested_questions_bottoming_surfaces_compost(
+    empty_vault: Path,
+) -> None:
+    """Bottoming Out fixture surfaces liminal/compost prompts (not drafting prompts)."""
+    _seed_bottoming_fixture(empty_vault)
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+        today=date(2026, 5, 7),
+        current_phase="bottoming_out",
+    ).section_suggested_questions()
+
+    assert section.startswith("## Suggested questions")
+    # The compost eddy or its name should appear as a prompt.
+    assert "compost" in section.lower()
+    # Drafting prompts (thread-terminus titles) should not appear in a
+    # Bottoming Out report — the fixture has no thread-terminus seeds at
+    # all, but the assertion pins the phase filter regardless.
+    assert "Rising essay topic" not in section
+
+
+def test_section_suggested_questions_rising_surfaces_drafting(
+    empty_vault: Path,
+) -> None:
+    """Rising fixture surfaces drafting/mining prompts (not compost prompts)."""
+    _seed_rising_fixture(empty_vault)
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+        today=date(2026, 5, 7),
+        current_phase="rising",
+    ).section_suggested_questions()
+
+    assert section.startswith("## Suggested questions")
+    assert "Rising essay topic" in section
+
+
+def test_section_suggested_questions_empty(empty_vault: Path) -> None:
+    """A vault with no seeds renders the empty-state placeholder."""
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_suggested_questions()
+    assert section.startswith("## Suggested questions")
+    assert EMPTY_PLACEHOLDER in section
+
+
+def test_section_suggested_questions_caps_at_five(empty_vault: Path) -> None:
+    """At most five prompts are listed (FEAT-007 pre-decided 4-5)."""
+    # Generate plenty of thread-terminus candidates.
+    for index in range(10):
+        _write_thread(
+            empty_vault,
+            thread_id=f"thread-{index}",
+            title=f"Active thread {index}",
+            last_seen=date(2026, 5, 8),
+            fragment_count=15 + index,
+        )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+        current_phase="rising",
+    ).section_suggested_questions()
+
+    bullet_count = sum(1 for line in section.splitlines() if line.startswith("- "))
+    assert 1 <= bullet_count <= 5
+
+
+# ---- Liminal watch ----
+
+
+def test_section_liminal_watch_surfaces_unnamed_and_paradoxes(
+    empty_vault: Path,
+) -> None:
+    """Liminal watch surfaces fresh content from Unnamed and Paradoxes."""
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    _write_liminal_unnamed(empty_vault, "stirring-of-doubt", created=base)
+    _write_liminal_paradox(empty_vault, "freedom-and-form", created=base)
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_liminal_watch()
+
+    assert section.startswith("## Liminal Watch")
+    assert "stirring-of-doubt" in section.lower() or "stirring Of Doubt" in section
+    assert "freedom-and-form" in section.lower() or "Freedom And Form" in section
+
+
+def test_section_liminal_watch_empty(empty_vault: Path) -> None:
+    """Liminal watch renders the empty placeholder when nothing has surfaced."""
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_liminal_watch()
+    assert section.startswith("## Liminal Watch")
+    assert EMPTY_PLACEHOLDER in section
+
+
+def test_section_liminal_watch_excludes_synchronicities(
+    empty_vault: Path,
+) -> None:
+    """Synchronicities live in their own section and must not double up here."""
+    _write_synchronicity(
+        empty_vault,
+        sync_id="sync-lw",
+        frag_a="frag-001",
+        frag_b="frag-002",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_liminal_watch()
+
+    assert "sync-lw" not in section
+
+
+# ---- Section ordering & wavelength-first contract ----
+
+
+def test_render_wavelength_snapshot_is_first(populated_vault: Path) -> None:
+    """``## Wavelength snapshot`` precedes ``## Vault summary`` in render output."""
+    rendered = StateReportGenerator(vault_path=populated_vault).render()
+    wavelength_idx = rendered.index("## Wavelength snapshot")
+    summary_idx = rendered.index("## Vault summary")
+    assert wavelength_idx < summary_idx
+
+
+def test_render_emits_feat007_section_order(populated_vault: Path) -> None:
+    """The FEAT-007 documented section order is preserved end-to-end."""
+    rendered = StateReportGenerator(vault_path=populated_vault).render()
+    ordered_headers = [
+        "## Wavelength snapshot",
+        "## Vault summary",
+        "## Pre-LLM yield",
+        "## Liminal Watch",
+        "## Active eddies",
+        "## Active threads",
+        "## Surprising connections",
+        "## Hyperedges",
+        "## Drift warnings",
+        "## Suggested questions",
+    ]
+    indices = [rendered.index(header) for header in ordered_headers]
+    assert indices == sorted(indices)
+
+
+# ---- Size-budget gate ----
+
+
+def test_estimate_tokens_returns_positive_for_text() -> None:
+    """``estimate_tokens`` is positive for non-empty text and zero for empty."""
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("hello world") > 0
+
+
+def test_check_budget_passes_for_small_file(tmp_path: Path) -> None:
+    """A short ``latest.md`` passes the budget without complaint."""
+    target = tmp_path / "latest.md"
+    target.write_text("# Creek state\n\n## Vault summary\n\nshort.\n", encoding="utf-8")
+
+    result = check_budget(target)
+
+    assert isinstance(result, BudgetResult)
+    assert result.ok is True
+    assert result.tokens < SIZE_BUDGET_TOKENS
+
+
+def test_check_budget_fails_when_file_exceeds_budget(tmp_path: Path) -> None:
+    """A file over the size budget fails and names the section that grew."""
+    big_payload = "lorem ipsum dolor sit amet " * 80_000  # well over 200KB
+    target = tmp_path / "latest.md"
+    target.write_text(
+        "# Creek state\n\n"
+        "## Wavelength snapshot\n\nshort.\n\n"
+        "## Vault summary\n\nshort.\n\n"
+        "## Hyperedges\n\n"
+        f"{big_payload}\n",
+        encoding="utf-8",
+    )
+
+    result = check_budget(target)
+
+    assert result.ok is False
+    assert result.tokens > SIZE_BUDGET_TOKENS
+    # The failure message must surface the section that consumed the budget.
+    assert "## Hyperedges" in result.largest_sections[0][0]
+
+
+def test_check_budget_missing_file_passes(tmp_path: Path) -> None:
+    """A missing ``latest.md`` is treated as a no-op (CI safety net)."""
+    result = check_budget(tmp_path / "no-such.md")
+    assert result.ok is True
+    assert result.tokens == 0
+
+
+def test_check_budget_message_is_not_a_cap_to_raise(tmp_path: Path) -> None:
+    """The failure message frames the budget as a fragmentation signal."""
+    big_payload = "x " * 200_000
+    target = tmp_path / "latest.md"
+    target.write_text(
+        "## Vault summary\n\n" + big_payload,
+        encoding="utf-8",
+    )
+
+    result = check_budget(target)
+
+    assert result.ok is False
+    # The exact wording matters: this gate exists to surface fragmentation,
+    # not to be raised. The CLI summary should make that clear.
+    assert "consolidate" in result.message.lower()
+
+
+# ---- CLI: budget command surface ----
+
+
+def test_cli_state_budget_passes_after_state_run(populated_vault: Path) -> None:
+    """``creek state-budget`` exits 0 when ``latest.md`` is under budget."""
+    StateReportGenerator(
+        vault_path=populated_vault,
+        today=date(2026, 5, 9),
+    ).write()
+
+    result = runner.invoke(app, ["state-budget", "--vault", str(populated_vault)])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_cli_state_budget_fails_when_over_budget(populated_vault: Path) -> None:
+    """``creek state-budget`` exits non-zero when ``latest.md`` exceeds budget."""
+    state_dir = populated_vault / "00-Creek-Meta" / "State"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    target = state_dir / "latest.md"
+    big_payload = "lorem ipsum " * 100_000
+    target.write_text(
+        f"# Creek state\n\n## Vault summary\n\n{big_payload}\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["state-budget", "--vault", str(populated_vault)])
+
+    assert result.exit_code != 0
+    assert "budget" in result.output.lower()

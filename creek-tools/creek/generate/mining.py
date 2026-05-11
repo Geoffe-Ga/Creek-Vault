@@ -979,3 +979,91 @@ def _is_active(thread: Thread) -> bool:
     :attr:`ThreadStatus.ACTIVE`'s value.
     """
     return str(thread.status) == ThreadStatus.ACTIVE.value
+
+
+_PHASE_AWARE_STRATEGIES: dict[str, frozenset[MiningStrategy]] = {
+    # Down phases prefer compost / synchronicity seeds; surfacing a
+    # "draft your next essay" prompt during Bottoming Out misreads the
+    # season. The ontology treats these phases as receptive.
+    Phase.BOTTOMING_OUT.value: frozenset(
+        {MiningStrategy.LIMINAL_CROSS_EDDY, MiningStrategy.RESONANCE_CHAIN},
+    ),
+    Phase.DIMINISHING.value: frozenset(
+        {MiningStrategy.LIMINAL_CROSS_EDDY, MiningStrategy.RESONANCE_CHAIN},
+    ),
+    Phase.WITHDRAWAL.value: frozenset(
+        {MiningStrategy.LIMINAL_CROSS_EDDY, MiningStrategy.RESONANCE_CHAIN},
+    ),
+    # Up phases prefer drafting / mining prompts that act on momentum.
+    Phase.RISING.value: frozenset(
+        {MiningStrategy.THREAD_TERMINUS, MiningStrategy.WAVELENGTH_WINDOW},
+    ),
+    Phase.PEAKING.value: frozenset(
+        {MiningStrategy.THREAD_TERMINUS, MiningStrategy.WAVELENGTH_WINDOW},
+    ),
+    # Restoration is transitional; surface all four to mirror that.
+    Phase.RESTORATION.value: frozenset(
+        {
+            MiningStrategy.LIMINAL_CROSS_EDDY,
+            MiningStrategy.RESONANCE_CHAIN,
+            MiningStrategy.THREAD_TERMINUS,
+            MiningStrategy.WAVELENGTH_WINDOW,
+        },
+    ),
+}
+"""Which mining strategies surface for each phase (FEAT-007 pre-decided).
+
+Bottoming Out / Diminishing / Withdrawal lean compost; Rising / Peaking
+lean drafting; Restoration mixes both. Unclassified passes all four
+through (handled in :func:`phase_filtered_seeds`).
+"""
+
+DEFAULT_PHASE_FILTERED_SEEDS: int = 5
+"""Default cap on phase-filtered seeds (FEAT-007: 4-5 suggested questions)."""
+
+
+def phase_filtered_seeds(
+    vault_path: Path,
+    phase: Phase | str,
+    *,
+    n: int = DEFAULT_PHASE_FILTERED_SEEDS,
+    miner: IdeaMiner | None = None,
+) -> list[IdeaSeed]:
+    """Return up to *n* :class:`IdeaSeed` objects filtered for *phase*.
+
+    The miner runs every strategy via :meth:`IdeaMiner.mine_all`, then
+    keeps only the strategies appropriate for *phase* (see
+    :data:`_PHASE_AWARE_STRATEGIES`). Unrecognised phases — including
+    :attr:`Phase.UNCLASSIFIED` — fall through with no strategy filter:
+    every seed competes on score.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        phase: Current wavelength phase. Accepts :class:`Phase` members
+            or their string values for ergonomics from callers that
+            already hold the raw string from frontmatter.
+        n: Maximum number of seeds to return. Negative values clamp to
+            zero.
+        miner: Optional pre-configured :class:`IdeaMiner`. Defaults to
+            a fresh instance with library defaults.
+
+    Returns:
+        Up to *n* seeds ordered by descending score, then strategy, then
+        title — matching :meth:`IdeaMiner.mine_all`'s ordering.
+    """
+    phase_value = phase.value if isinstance(phase, Phase) else str(phase)
+    if n <= 0:
+        return []
+    try:
+        current_phase = Phase(phase_value)
+    except ValueError:
+        current_phase = Phase.UNCLASSIFIED
+    active_miner = miner if miner is not None else IdeaMiner()
+    all_seeds = active_miner.mine_all(vault_path, current_phase=current_phase)
+    allowed = _PHASE_AWARE_STRATEGIES.get(phase_value)
+    filtered = (
+        all_seeds
+        if allowed is None
+        else [seed for seed in all_seeds if seed.strategy in allowed]
+    )
+    return filtered[:n]
