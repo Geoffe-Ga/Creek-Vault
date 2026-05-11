@@ -24,6 +24,7 @@ from creek.generate.mining import (
     IdeaSeed,
     MiningStrategy,
     _jaccard_similarity,
+    phase_filtered_seeds,
 )
 from creek.models import (
     Eddy,
@@ -1322,3 +1323,46 @@ class TestCompileFirstUnchangedExternalBehaviour:
         compiled_titles = {s.title for s in compiled_seeds}
         bypass_titles = {s.title for s in bypass_seeds}
         assert compiled_titles == bypass_titles
+
+
+# ---------------------------------------------------------------------------
+# FEAT-007: phase_filtered_seeds edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestPhaseFilteredSeedsEdgeCases:
+    """Edge-case contract pinning for ``phase_filtered_seeds`` (FEAT-007)."""
+
+    def test_zero_n_returns_empty_list(self, vault: Path) -> None:
+        """``n == 0`` short-circuits to an empty list without scanning the vault."""
+        seeds = phase_filtered_seeds(vault, Phase.RISING, n=0)
+        assert seeds == []
+
+    def test_negative_n_clamps_to_empty(self, vault: Path) -> None:
+        """A negative ``n`` is clamped to zero (no negative-slice surprises)."""
+        seeds = phase_filtered_seeds(vault, Phase.RISING, n=-5)
+        assert seeds == []
+
+    def test_unrecognised_phase_string_falls_through_permissively(
+        self,
+        vault: Path,
+    ) -> None:
+        """A garbage phase string is treated as UNCLASSIFIED → no strategy filter.
+
+        The fallthrough is the documented contract — see the
+        ``_PHASE_AWARE_STRATEGIES.get(...)`` call in mining.py. Pinning
+        it here makes the permissive default a load-bearing test.
+        """
+        thread = _build_thread(
+            thread_id="thread-active",
+            title="Active thread",
+            fragment_count=DEFAULT_MIN_THREAD_FRAGMENTS + 5,
+        )
+        _write_thread(vault, thread)
+
+        seeds = phase_filtered_seeds(vault, "not-a-real-phase", n=5)
+        # The unclassified fallthrough means every strategy contributes —
+        # the thread-terminus seed should be present.
+        assert any(s.strategy == MiningStrategy.THREAD_TERMINUS for s in seeds), (
+            "unrecognised phase must fall through to all strategies"
+        )

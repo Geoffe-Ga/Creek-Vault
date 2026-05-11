@@ -85,11 +85,9 @@ closes the FEAT-007 content; FEAT-008's ``## Lint summary`` is the
 final appendix.
 """
 
-_WAVELENGTH_SUMMARY_WINDOW_DAYS: int = 28
-"""Lookback used for the wavelength snapshot rendered in section 1."""
-
 _LIMINAL_WATCH_TOP_N: int = 5
-"""Cap on the number of fresh liminal items rendered."""
+"""Cap on the number of fresh liminal items rendered **per subfolder** — see
+:meth:`StateReportGenerator.section_liminal_watch`."""
 
 _LIMINAL_SUBDIRS: tuple[str, ...] = ("Unnamed", "Paradoxes")
 """Subfolders under ``10-Liminal`` that the liminal watch surfaces.
@@ -474,7 +472,11 @@ class StateReportGenerator:
         Synchronicities live in ``## Surprising connections`` and are
         excluded here to avoid duplication. Items are sorted by file
         modification time (newest first), capped at
-        :data:`_LIMINAL_WATCH_TOP_N`.
+        :data:`_LIMINAL_WATCH_TOP_N` **per subfolder** (so a vault with
+        both Unnamed and Paradoxes surfaces will list up to
+        ``2 * _LIMINAL_WATCH_TOP_N`` rows total). The per-subfolder cap
+        is intentional: a quiet week in one subfolder shouldn't starve
+        the other.
         """
         body: list[str] = []
         for sub in _LIMINAL_SUBDIRS:
