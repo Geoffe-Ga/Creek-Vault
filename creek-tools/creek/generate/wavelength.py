@@ -16,7 +16,7 @@ from __future__ import annotations
 import itertools
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -780,7 +780,7 @@ class WavelengthTracker:
         start, end = _month_bounds(month)
         in_window = [f for f in loaded if _fragment_in_window(f, start, end)]
         snapshot = self.analyze_period(in_window, start, end)
-        weekly_snapshots = self._weekly_snapshots(in_window, start, end)
+        weekly_snapshots = self.weekly_snapshots(in_window, start, end)
         prev_start, prev_end = _month_bounds(start - timedelta(days=1))
         prev_window = [
             f for f in loaded if _fragment_in_window(f, prev_start, prev_end)
@@ -812,13 +812,19 @@ class WavelengthTracker:
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
 
-    def _weekly_snapshots(
+    def weekly_snapshots(
         self,
         fragments: list[Fragment],
         start: date,
         end: date,
     ) -> list[WavelengthSnapshot]:
-        """Return one snapshot per ISO week between *start* and *end*."""
+        """Return one snapshot per ISO week between *start* and *end*.
+
+        Public since FEAT-007: ``current_phase_summary`` (and any future
+        caller that needs week-bucketed snapshots without the report
+        rendering) calls it. Earlier versions kept it private when the
+        only call site was :meth:`generate_monthly_report`.
+        """
         snapshots: list[WavelengthSnapshot] = []
         cursor = _week_start(start)
         while cursor <= end:
@@ -1221,14 +1227,96 @@ def _render_monthly_body(
     return "\n".join(lines)
 
 
+DEFAULT_CURRENT_PHASE_WINDOW_DAYS: int = 28
+"""Window (days) used by :func:`current_phase_summary` for stable phase reads."""
+
+
+@dataclass(frozen=True)
+class CurrentPhaseSummary:
+    """Compact descriptive view of the vault's current wavelength state.
+
+    Used by ``creek state`` (FEAT-007) to render the wavelength snapshot
+    that primes the rest of the audit report. The summary is descriptive
+    only — no prescription, no normative phase ranking.
+
+    Attributes:
+        phase: Dominant phase value within the analysis window, or
+            :attr:`Phase.UNCLASSIFIED` when no classified fragments exist.
+        mode: Dominant engagement mode value.
+        medicine_percent: Share of classified fragments marked ``medicine``.
+        toxic_percent: Share of classified fragments marked ``toxic``.
+        transitions: Phase transitions detected between adjacent week
+            buckets within the analysis window, oldest first.
+        fragment_count: Number of fragments that fell inside the window.
+        confidence: Share of classified phases that match :attr:`phase`,
+            in ``[0.0, 1.0]``.
+    """
+
+    phase: str
+    mode: str
+    medicine_percent: float
+    toxic_percent: float
+    transitions: tuple[PhaseTransition, ...]
+    fragment_count: int
+    confidence: float
+
+
+def current_phase_summary(
+    vault_path: Path,
+    *,
+    today: date | None = None,
+    window_days: int = DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
+) -> CurrentPhaseSummary:
+    """Return a :class:`CurrentPhaseSummary` for the trailing *window_days*.
+
+    Reads classified fragments under ``01-Fragments``, aggregates them
+    into one whole-window snapshot, and detects phase transitions between
+    consecutive ISO-weeks within the window. When the vault has no
+    classified fragments the summary degrades gracefully to an
+    unclassified phase with zero counts.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        today: Optional pinned date for tests. Defaults to today (UTC),
+            matching the convention used by :class:`StateReportGenerator`
+            and the rest of the audit-report pipeline. ``date.today()``
+            (system-local) would silently shift the 28-day window by a
+            day near midnight UTC on a non-UTC host.
+        window_days: Lookback (inclusive). Defaults to 28 days — long
+            enough that one quiet week does not flip the dominant phase.
+
+    Returns:
+        A :class:`CurrentPhaseSummary`.
+    """
+    anchor = today or datetime.now(tz=UTC).date()
+    start = anchor - timedelta(days=window_days - 1)
+    fragments = _load_fragments_from_vault(vault_path)
+    tracker = WavelengthTracker()
+    snapshot = tracker.analyze_period(fragments, start, anchor)
+    weekly = tracker.weekly_snapshots(fragments, start, anchor)
+    transitions = tracker.detect_transitions(weekly)
+    return CurrentPhaseSummary(
+        phase=snapshot.dominant_phase,
+        mode=snapshot.dominant_mode,
+        medicine_percent=snapshot.medicine_percent,
+        toxic_percent=snapshot.toxic_percent,
+        transitions=tuple(transitions),
+        fragment_count=snapshot.fragment_count,
+        confidence=snapshot.confidence,
+    )
+
+
 __all__ = [
+    "DEFAULT_CURRENT_PHASE_WINDOW_DAYS",
     "DEFAULT_ROLLING_WEEKS",
     "DEFAULT_TOXIC_CONSECUTIVE_WEEKS",
     "DEFAULT_TOXIC_THRESHOLD",
     "DEFAULT_WINDOW_DAYS",
     "PHASE_DOMAIN_MAPPINGS",
+    "CurrentPhaseSummary",
     "DosageTrend",
     "PhaseTransition",
     "WavelengthSnapshot",
     "WavelengthTracker",
+    "current_phase_summary",
 ]

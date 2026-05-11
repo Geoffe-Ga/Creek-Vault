@@ -39,26 +39,61 @@ from pydantic import ValidationError
 
 from creek.clean.hygiene import BrokenLinkScanner, OrphanScanner
 from creek.generate.indexes import FREQUENCY_NAMES
+from creek.generate.mining import IdeaSeed, phase_filtered_seeds
+from creek.generate.wavelength import (
+    DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
+    CurrentPhaseSummary,
+    current_phase_summary,
+)
 from creek.models import Eddy, Fragment, Frequency, Praxis, Thread
 
 logger = logging.getLogger(__name__)
 
 
-SECTION_ORDER: tuple[str, ...] = (
-    "## Vault summary",
-    "## Pre-LLM yield",
-    "## Active eddies",
-    "## Active threads",
-    "## Surprising connections",
-    "## Hyperedges",
-    "## Drift warnings",
-    "## Lint summary",
-)
-"""Section headers in the order pinned by FEAT-006.
+_HEADER_WAVELENGTH: str = "## Wavelength snapshot"
+_HEADER_VAULT_SUMMARY: str = "## Vault summary"
+_HEADER_PRE_LLM_YIELD: str = "## Pre-LLM yield"
+_HEADER_LIMINAL_WATCH: str = "## Liminal Watch"
+_HEADER_ACTIVE_EDDIES: str = "## Active eddies"
+_HEADER_ACTIVE_THREADS: str = "## Active threads"
+_HEADER_SYNCHRONICITIES: str = "## Surprising connections"
+_HEADER_HYPEREDGES: str = "## Hyperedges"
+_HEADER_DRIFT_WARNINGS: str = "## Drift warnings"
+_HEADER_SUGGESTED_QUESTIONS: str = "## Suggested questions"
+_HEADER_LINT_SUMMARY: str = "## Lint summary"
 
-FEAT-007 inserts a wavelength snapshot and a suggested-questions
-section between ``## Vault summary`` and ``## Pre-LLM yield``. FEAT-008
-appends the latest ``creek lint`` summary as the final section.
+
+SECTION_ORDER: tuple[str, ...] = (
+    _HEADER_WAVELENGTH,
+    _HEADER_VAULT_SUMMARY,
+    _HEADER_PRE_LLM_YIELD,
+    _HEADER_LIMINAL_WATCH,
+    _HEADER_ACTIVE_EDDIES,
+    _HEADER_ACTIVE_THREADS,
+    _HEADER_SYNCHRONICITIES,
+    _HEADER_HYPEREDGES,
+    _HEADER_DRIFT_WARNINGS,
+    _HEADER_SUGGESTED_QUESTIONS,
+    _HEADER_LINT_SUMMARY,
+)
+"""Section headers in the order pinned by FEAT-006 and extended by FEAT-007.
+
+FEAT-007 prepends ``## Wavelength snapshot`` (the audit report's
+interpretive prime) and inserts ``## Liminal Watch`` between the
+pre-LLM yield and the active-eddies section. ``## Suggested questions``
+closes the FEAT-007 content; FEAT-008's ``## Lint summary`` is the
+final appendix.
+"""
+
+_LIMINAL_WATCH_TOP_N: int = 5
+"""Cap on the number of fresh liminal items rendered **per subfolder** — see
+:meth:`StateReportGenerator.section_liminal_watch`."""
+
+_LIMINAL_SUBDIRS: tuple[str, ...] = ("Unnamed", "Paradoxes")
+"""Subfolders under ``10-Liminal`` that the liminal watch surfaces.
+
+``Synchronicities`` is excluded because it has its own section under
+``## Surprising connections``.
 """
 
 EMPTY_PLACEHOLDER: str = "_No surfacing this week._"
@@ -341,6 +376,18 @@ def _section(header: str, body_lines: list[str]) -> str:
     return header + "\n\n" + "\n".join(body_lines)
 
 
+def _seed_as_prompt(seed: IdeaSeed) -> str:
+    """Format a phase-filtered :class:`IdeaSeed` as one bullet of prompt text.
+
+    The seed's title carries the essay-worthy framing; the brief
+    description supplies the "why now" so the prompt is actionable
+    without opening the linked compiled pages.
+    """
+    if seed.brief_description:
+        return f"{seed.title} — {seed.brief_description}"
+    return seed.title
+
+
 # ---------------------------------------------------------------------------
 # Generator
 # ---------------------------------------------------------------------------
@@ -360,19 +407,140 @@ class StateReportGenerator:
             successive runs.
     """
 
-    def __init__(self, vault_path: Path, *, today: date | None = None) -> None:
+    def __init__(
+        self,
+        vault_path: Path,
+        *,
+        today: date | None = None,
+        current_phase: str | None = None,
+    ) -> None:
         """Load the vault snapshot and stash *vault_path* for later use.
 
         Args:
             vault_path: Root of the Obsidian vault.
             today: Optional injected date for tests / week-pinning.
                 Defaults to ``datetime.now(UTC).date()``.
+            current_phase: Optional override for the dominant phase used
+                by the suggested-questions filter. When ``None`` the
+                generator derives the phase from the vault via
+                :func:`current_phase_summary`. Tests use this hook to
+                pin phase behaviour without fabricating fragments.
         """
         self.vault_path = vault_path
         self.today = today or datetime.now(tz=UTC).date()
         self._state = _load_vault_state(vault_path)
+        self._current_phase_override = current_phase
+        self._wavelength_summary: CurrentPhaseSummary | None = None
 
     # ---- Sections ---------------------------------------------------
+
+    def section_wavelength_snapshot(self) -> str:
+        """Render section 0: current wavelength phase, mode, dosage shares.
+
+        FEAT-007 places this section first. The dominant phase context
+        interprets every other section — Karpathy's ``index.md`` discipline
+        adapted to Creek. The snapshot is descriptive only: no
+        prescriptive ranking, no "should" language.
+
+        Falls back to the empty-state placeholder when the vault has no
+        classified fragments in the 28-day window.
+        """
+        summary = self._resolve_wavelength_summary()
+        if summary.fragment_count == 0:
+            return _section(_HEADER_WAVELENGTH, [])
+        body = [
+            f"- Phase: **{summary.phase}** (confidence {summary.confidence:.2f})",
+            f"- Mode: **{summary.mode}**",
+            f"- Fragments observed: {summary.fragment_count} "
+            f"(last {DEFAULT_CURRENT_PHASE_WINDOW_DAYS} days)",
+            f"- Medicine share: {summary.medicine_percent * 100:.1f}% | "
+            f"Toxic share: {summary.toxic_percent * 100:.1f}%",
+        ]
+        if summary.transitions:
+            body.append("")
+            body.append("**Recent transitions**")
+            for trans in summary.transitions:
+                body.append(
+                    f"- {trans.from_date.isoformat()} → {trans.to_date.isoformat()}: "
+                    f"{trans.from_phase} → {trans.to_phase}",
+                )
+        return _section(_HEADER_WAVELENGTH, body)
+
+    def section_liminal_watch(self) -> str:
+        """Render the Liminal Watch section: fresh Unnamed + Paradox surfaces.
+
+        Synchronicities live in ``## Surprising connections`` and are
+        excluded here to avoid duplication. Items are sorted by file
+        modification time (newest first), capped at
+        :data:`_LIMINAL_WATCH_TOP_N` **per subfolder** (so a vault with
+        both Unnamed and Paradoxes surfaces will list up to
+        ``2 * _LIMINAL_WATCH_TOP_N`` rows total). The per-subfolder cap
+        is intentional: a quiet week in one subfolder shouldn't starve
+        the other.
+        """
+        body: list[str] = []
+        for sub in _LIMINAL_SUBDIRS:
+            entries = self._collect_liminal_entries(sub)
+            if not entries:
+                continue
+            body.append(f"**{sub}**")
+            for name in entries[:_LIMINAL_WATCH_TOP_N]:
+                body.append(f"- {name}")
+            body.append("")
+        # Drop the trailing blank line so _section's placeholder logic
+        # treats a no-content result correctly.
+        while body and not body[-1]:
+            body.pop()
+        return _section(_HEADER_LIMINAL_WATCH, body)
+
+    def section_suggested_questions(self) -> str:
+        """Render section: phase-aware suggested questions (FEAT-007).
+
+        Pulls 4-5 prompts from
+        :func:`creek.generate.mining.phase_filtered_seeds`. Down phases
+        (Bottoming Out / Diminishing / Withdrawal) surface compost and
+        synchronicity prompts; Rising and Peaking surface drafting and
+        mining prompts; Restoration mixes both.
+        """
+        phase = self._resolve_current_phase()
+        seeds = phase_filtered_seeds(self.vault_path, phase)
+        body = [f"- {_seed_as_prompt(seed)}" for seed in seeds]
+        return _section(_HEADER_SUGGESTED_QUESTIONS, body)
+
+    def _resolve_wavelength_summary(self) -> CurrentPhaseSummary:
+        """Compute the wavelength summary once per generator instance."""
+        if self._wavelength_summary is None:
+            self._wavelength_summary = current_phase_summary(
+                self.vault_path,
+                today=self.today,
+            )
+        return self._wavelength_summary
+
+    def _resolve_current_phase(self) -> str:
+        """Return the active phase value (override > derived > unclassified)."""
+        if self._current_phase_override is not None:
+            return self._current_phase_override
+        return self._resolve_wavelength_summary().phase
+
+    def _collect_liminal_entries(self, subfolder: str) -> list[str]:
+        """Return file display names under ``10-Liminal/<subfolder>``.
+
+        Files are sorted by modification time (newest first). A missing
+        subfolder returns an empty list — the section renders the
+        placeholder only when every subfolder is empty.
+
+        Note: ``st_mtime`` is best-effort. Networked filesystems and
+        fresh checkouts (CI containers, ``git clone``) frequently flatten
+        mtimes to the checkout time, which makes the primary key a tie.
+        The secondary ``p.name`` sort key keeps the order deterministic
+        when that happens.
+        """
+        target = self.vault_path / "10-Liminal" / subfolder
+        if not target.exists():
+            return []
+        files = [p for p in target.glob("*.md") if p.is_file()]
+        files.sort(key=lambda p: (-p.stat().st_mtime, p.name))
+        return [path.stem for path in files]
 
     def section_vault_summary(self) -> str:
         """Render section 1: vault summary (counts + frequency distribution).
@@ -399,13 +567,13 @@ class StateReportGenerator:
                 key=lambda pair: _frequency_sort_key(pair[0]),
             ):
                 body.append(f"- {_frequency_label(freq)}: {count}")
-        return SECTION_ORDER[0] + "\n\n" + "\n".join(body)
+        return _HEADER_VAULT_SUMMARY + "\n\n" + "\n".join(body)
 
     def section_pre_llm_yield(self) -> str:
         """Render section 2: pre-LLM yield from the latest pipeline run."""
         latest = self._state.latest_yield
         if latest is None:
-            return _section(SECTION_ORDER[1], [])
+            return _section(_HEADER_PRE_LLM_YIELD, [])
         deterministic = latest.get("deterministic_classified", "?")
         local_model = latest.get("local_model_processed", "?")
         residue = latest.get("residue", "?")
@@ -417,7 +585,7 @@ class StateReportGenerator:
             f"- Residue: {residue} (would go to LLM if Pass-3 enabled)",
             f"- `--no-llm`: {'yes' if latest.get('no_llm') else 'no'}",
         ]
-        return SECTION_ORDER[1] + "\n\n" + "\n".join(body)
+        return _HEADER_PRE_LLM_YIELD + "\n\n" + "\n".join(body)
 
     def section_active_eddies(self) -> str:
         """Render section 3: top eddies by ``fragment_count`` (capped at ten)."""
@@ -428,7 +596,7 @@ class StateReportGenerator:
         body = [
             f"- {eddy.title} — {eddy.fragment_count} fragment(s)" for eddy in eddies
         ]
-        return _section(SECTION_ORDER[2], body)
+        return _section(_HEADER_ACTIVE_EDDIES, body)
 
     def section_active_threads(self) -> str:
         """Render section 4: most-recent threads by ``last_seen`` (capped at ten)."""
@@ -442,7 +610,7 @@ class StateReportGenerator:
             f"({thread.fragment_count} fragment(s))"
             for thread in threads
         ]
-        return _section(SECTION_ORDER[3], body)
+        return _section(_HEADER_ACTIVE_THREADS, body)
 
     def section_synchronicities(self) -> str:
         """Render section 5: surprising connections (synchronicities)."""
@@ -455,7 +623,7 @@ class StateReportGenerator:
             f"similarity {row.similarity:.2f}, gap {row.time_gap_days}d"
             for row in rows
         ]
-        return _section(SECTION_ORDER[4], body)
+        return _section(_HEADER_SYNCHRONICITIES, body)
 
     def section_hyperedges(self) -> str:
         """Render section 6: praxis whose source fragments span 2+ eddies.
@@ -479,10 +647,10 @@ class StateReportGenerator:
             f"- {praxis.title} — spans: {', '.join(sorted(spanning))}"
             for praxis, spanning in ranked
         ]
-        return _section(SECTION_ORDER[5], body)
+        return _section(_HEADER_HYPEREDGES, body)
 
     def section_lint_summary(self) -> str:
-        """Render section 8: the most recent ``creek lint`` summary (FEAT-008).
+        """Render section 11: the most recent ``creek lint`` summary (FEAT-008).
 
         The state report appends the lint report verbatim. If no lint has
         run yet, the section still renders with the empty-state placeholder
@@ -492,8 +660,8 @@ class StateReportGenerator:
 
         body = latest_lint_report(self.vault_path)
         if not body:
-            return _section(SECTION_ORDER[7], [])
-        return SECTION_ORDER[7] + "\n\n" + body.strip()
+            return _section(_HEADER_LINT_SUMMARY, [])
+        return _HEADER_LINT_SUMMARY + "\n\n" + body.strip()
 
     def section_drift_warnings(self) -> str:
         """Render section 7: broken wiki-links + stale fragments."""
@@ -511,20 +679,23 @@ class StateReportGenerator:
             body.append("**Stale fragments**")
             for path in orphans.orphan_paths[:_TOP_N]:
                 body.append(f"- `{path}`")
-        return _section(SECTION_ORDER[6], body)
+        return _section(_HEADER_DRIFT_WARNINGS, body)
 
     # ---- Render and write -------------------------------------------
 
     def render(self) -> str:
-        """Return the full markdown report (all seven sections in order)."""
+        """Return the full markdown report in the FEAT-007 section order."""
         sections = [
+            self.section_wavelength_snapshot(),
             self.section_vault_summary(),
             self.section_pre_llm_yield(),
+            self.section_liminal_watch(),
             self.section_active_eddies(),
             self.section_active_threads(),
             self.section_synchronicities(),
             self.section_hyperedges(),
             self.section_drift_warnings(),
+            self.section_suggested_questions(),
             self.section_lint_summary(),
         ]
         return self._document_header() + "\n\n" + "\n\n".join(sections) + "\n"

@@ -919,6 +919,30 @@ def state(
     console.print(f"[bold green]State report written: {written}[/bold green]")
 
 
+@app.command(name="state-budget")
+def state_budget(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Verify ``00-Creek-Meta/State/latest.md`` is within its size budget (FEAT-007).
+
+    The audit report is the session-start context for CrawDad and Claude
+    Code — it must fit in a single context window. This command checks
+    the rendered ``latest.md`` against the 50,000-token budget and exits
+    non-zero when the budget is exceeded. A missing report (e.g. CI
+    without a populated vault) is treated as a pass.
+    """
+    from creek.generate.state_budget import check_budget
+
+    vault_path = _resolve_vault(vault)
+    latest = vault_path / "00-Creek-Meta" / "State" / "latest.md"
+    result = check_budget(latest)
+    if result.ok:
+        console.print(f"[bold green]{result.message}[/bold green]")
+        return
+    console.print(f"[bold red]{result.message}[/bold red]")
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def lint(
     check: list[str] | None = typer.Option(

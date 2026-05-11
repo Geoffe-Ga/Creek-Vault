@@ -95,6 +95,7 @@ run_check "Complexity analysis" "complexity.sh"
 run_check "Unit tests" "test.sh" --unit
 run_check "Coverage report" "coverage.sh" --json
 run_check "Per-file coverage gate" "coverage-per-file.sh"
+run_check "State report size budget" "state-budget.sh"
 
 echo "=== Quality Checks Summary ==="
 echo "Passed: ${#PASSED_CHECKS[@]}"

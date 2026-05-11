@@ -45,21 +45,34 @@ The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types co
 creek state --vault ~/Obsidian/Creek-Vault
 ```
 
-The report is organised in seven sections, in this order (FEAT-006):
+The report is organised in eleven sections, in this order (FEAT-006 + FEAT-007 + FEAT-008):
 
-1. **Vault summary** — fragment / eddy / thread counts plus the per-frequency distribution (sorted F1..F10, then UNCLASSIFIED).
-2. **Pre-LLM yield** — the most recent line of `00-Creek-Meta/Processing-Log/run-summary.jsonl` (deterministic / local-model / residue counts and the `--no-llm` flag).
-3. **Active eddies** — top 10 by `fragment_count`.
-4. **Active threads** — top 10 by `last_seen` recency.
-5. **Surprising connections** — synchronicities discovered under `10-Liminal/Synchronicities/`.
-6. **Hyperedges** — praxis whose `derived_from` fragments span two or more eddies.
-7. **Drift warnings** — broken wiki-links and stale (link-isolated, ≥90-day-old) fragments.
+1. **Wavelength snapshot** — current dominant phase, mode, dosage shares, and any detected transitions over the trailing 28 days. Placed first because phase context interprets every other section (FEAT-007).
+2. **Vault summary** — fragment / eddy / thread counts plus the per-frequency distribution (sorted F1..F10, then UNCLASSIFIED).
+3. **Pre-LLM yield** — the most recent line of `00-Creek-Meta/Processing-Log/run-summary.jsonl` (deterministic / local-model / residue counts and the `--no-llm` flag).
+4. **Liminal Watch** — recently surfaced content under `10-Liminal/Unnamed/` and `10-Liminal/Paradoxes/` (FEAT-007).
+5. **Active eddies** — top 10 by `fragment_count`.
+6. **Active threads** — top 10 by `last_seen` recency.
+7. **Surprising connections** — synchronicities discovered under `10-Liminal/Synchronicities/`.
+8. **Hyperedges** — praxis whose `derived_from` fragments span two or more eddies.
+9. **Drift warnings** — broken wiki-links and stale (link-isolated, ≥90-day-old) fragments.
+10. **Suggested questions** — 4-5 phase-aware essay prompts derived from `creek.generate.mining.phase_filtered_seeds`. Bottoming Out / Diminishing / Withdrawal surface compost and synchronicity prompts; Rising and Peaking surface drafting prompts; Restoration mixes both (FEAT-007).
+11. **Lint summary** — the most recent `creek lint` summary, appended verbatim (FEAT-008).
 
 Empty sections render an explicit `_No surfacing this week._` placeholder rather than disappearing — operators can tell at a glance whether a section had nothing to surface or whether the generator skipped it. Re-running in the same ISO week overwrites the existing file (idempotent).
 
 `latest.md` is created as a symlink where the filesystem supports it (POSIX hosts) and falls back to a copy on Windows or networked filesystems that reject `symlink(2)`. The report header renders the vault's leaf directory name only — never the absolute path — so committing or sharing the artefact does not leak an operator's home directory.
 
-FEAT-007 will insert a wavelength snapshot and a suggested-questions section between sections 1 and 2.
+### Size budget (FEAT-007)
+
+`latest.md` is the session-start context for CrawDad and Claude Code: it must fit in a single Claude context window. `./scripts/check-all.sh` enforces a **50,000-token budget** (≈200KB at a conservative four-characters-per-token estimate) via the `creek state-budget` command:
+
+```bash
+# Standalone budget check (set CREEK_VAULT or pass --vault).
+creek state-budget --vault ~/Obsidian/Creek-Vault
+```
+
+A budget failure is **not** a cap to raise. It is a quality signal that the compiled layer is fragmenting; the fix is consolidation via `creek lint`'s synchronicity and tag-cluster checks, not a higher cap. The failure message names the three largest sections so the operator can see at a glance which surface is overgrowing.
 
 ## Voice Skill Tree
 
