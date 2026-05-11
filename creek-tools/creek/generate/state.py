@@ -39,7 +39,7 @@ from pydantic import ValidationError
 
 from creek.clean.hygiene import BrokenLinkScanner, OrphanScanner
 from creek.generate.indexes import FREQUENCY_NAMES
-from creek.generate.mining import phase_filtered_seeds
+from creek.generate.mining import IdeaSeed, phase_filtered_seeds
 from creek.generate.wavelength import (
     DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
     CurrentPhaseSummary,
@@ -378,18 +378,16 @@ def _section(header: str, body_lines: list[str]) -> str:
     return header + "\n\n" + "\n".join(body_lines)
 
 
-def _seed_as_prompt(seed: object) -> str:
+def _seed_as_prompt(seed: IdeaSeed) -> str:
     """Format a phase-filtered :class:`IdeaSeed` as one bullet of prompt text.
 
     The seed's title carries the essay-worthy framing; the brief
     description supplies the "why now" so the prompt is actionable
     without opening the linked compiled pages.
     """
-    title = getattr(seed, "title", "Untitled")
-    brief = getattr(seed, "brief_description", "")
-    if brief:
-        return f"{title} — {brief}"
-    return str(title)
+    if seed.brief_description:
+        return f"{seed.title} — {seed.brief_description}"
+    return seed.title
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +466,7 @@ class StateReportGenerator:
                     f"- {trans.from_date.isoformat()} → {trans.to_date.isoformat()}: "
                     f"{trans.from_phase} → {trans.to_phase}",
                 )
-        return _HEADER_WAVELENGTH + "\n\n" + "\n".join(body)
+        return _section(_HEADER_WAVELENGTH, body)
 
     def section_liminal_watch(self) -> str:
         """Render the Liminal Watch section: fresh Unnamed + Paradox surfaces.
@@ -528,6 +526,12 @@ class StateReportGenerator:
         Files are sorted by modification time (newest first). A missing
         subfolder returns an empty list — the section renders the
         placeholder only when every subfolder is empty.
+
+        Note: ``st_mtime`` is best-effort. Networked filesystems and
+        fresh checkouts (CI containers, ``git clone``) frequently flatten
+        mtimes to the checkout time, which makes the primary key a tie.
+        The secondary ``p.name`` sort key keeps the order deterministic
+        when that happens.
         """
         target = self.vault_path / "10-Liminal" / subfolder
         if not target.exists():

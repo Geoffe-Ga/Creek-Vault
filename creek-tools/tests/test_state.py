@@ -41,6 +41,7 @@ from creek.generate.state_budget import (
     check_budget,
     estimate_tokens,
 )
+from creek.generate.state_budget import main as state_budget_main
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1112,7 +1113,10 @@ def test_section_suggested_questions_caps_at_five(empty_vault: Path) -> None:
     ).section_suggested_questions()
 
     bullet_count = sum(1 for line in section.splitlines() if line.startswith("- "))
-    assert 1 <= bullet_count <= 5
+    # Ten thread-terminus candidates feed five slots → all five fill;
+    # tightened from ``1 <= bullet_count <= 5`` so a regression that
+    # drops to zero seeds would now fail.
+    assert bullet_count == 5
 
 
 # ---- Liminal watch ----
@@ -1131,8 +1135,10 @@ def test_section_liminal_watch_surfaces_unnamed_and_paradoxes(
     ).section_liminal_watch()
 
     assert section.startswith("## Liminal Watch")
-    assert "stirring-of-doubt" in section.lower() or "stirring Of Doubt" in section
-    assert "freedom-and-form" in section.lower() or "Freedom And Form" in section
+    # ``path.stem`` keeps the original hyphenated lowercase filename, so
+    # a plain substring check is sufficient — no case-folding needed.
+    assert "stirring-of-doubt" in section
+    assert "freedom-and-form" in section
 
 
 def test_section_liminal_watch_empty(empty_vault: Path) -> None:
@@ -1174,7 +1180,12 @@ def test_render_wavelength_snapshot_is_first(populated_vault: Path) -> None:
 
 
 def test_render_emits_feat007_section_order(populated_vault: Path) -> None:
-    """The FEAT-007 documented section order is preserved end-to-end."""
+    """The FEAT-007 documented section order is preserved end-to-end.
+
+    Includes FEAT-008's ``## Lint summary`` as the final appendix so the
+    assertion pins the entire eleven-section contract, not just the
+    FEAT-007 subset.
+    """
     rendered = StateReportGenerator(vault_path=populated_vault).render()
     ordered_headers = [
         "## Wavelength snapshot",
@@ -1187,6 +1198,7 @@ def test_render_emits_feat007_section_order(populated_vault: Path) -> None:
         "## Hyperedges",
         "## Drift warnings",
         "## Suggested questions",
+        "## Lint summary",
     ]
     indices = [rendered.index(header) for header in ordered_headers]
     assert indices == sorted(indices)
@@ -1271,6 +1283,41 @@ def test_cli_state_budget_passes_after_state_run(populated_vault: Path) -> None:
     result = runner.invoke(app, ["state-budget", "--vault", str(populated_vault)])
 
     assert result.exit_code == 0, result.output
+
+
+def test_state_budget_main_with_explicit_argv_under_budget(tmp_path: Path) -> None:
+    """``main`` accepts an explicit argv and returns 0 when the file is small."""
+    target = tmp_path / "latest.md"
+    target.write_text("# Creek state\n\n## Vault summary\n\nshort.\n", encoding="utf-8")
+
+    assert state_budget_main([str(target)]) == 0
+
+
+def test_state_budget_main_with_explicit_argv_over_budget(tmp_path: Path) -> None:
+    """``main`` returns 1 when the explicit-argv file exceeds the budget."""
+    target = tmp_path / "latest.md"
+    target.write_text(
+        "## Vault summary\n\n" + ("lorem ipsum " * 80_000),
+        encoding="utf-8",
+    )
+
+    assert state_budget_main([str(target)]) == 1
+
+
+def test_state_budget_main_missing_argv_returns_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``main([])`` prints a usage hint to stderr and returns 2."""
+    assert state_budget_main([]) == 2
+    captured = capsys.readouterr()
+    assert "usage" in captured.err.lower()
+
+
+def test_budget_result_largest_sections_is_immutable() -> None:
+    """``BudgetResult.largest_sections`` is a tuple — ``append`` must fail."""
+    result = BudgetResult(ok=True, tokens=0, largest_sections=(("## A", 1),))
+    with pytest.raises(AttributeError):
+        result.largest_sections.append(("## B", 2))  # type: ignore[attr-defined]
 
 
 def test_cli_state_budget_fails_when_over_budget(populated_vault: Path) -> None:

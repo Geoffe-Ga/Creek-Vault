@@ -780,7 +780,7 @@ class WavelengthTracker:
         start, end = _month_bounds(month)
         in_window = [f for f in loaded if _fragment_in_window(f, start, end)]
         snapshot = self.analyze_period(in_window, start, end)
-        weekly_snapshots = self._weekly_snapshots(in_window, start, end)
+        weekly_snapshots = self.weekly_snapshots(in_window, start, end)
         prev_start, prev_end = _month_bounds(start - timedelta(days=1))
         prev_window = [
             f for f in loaded if _fragment_in_window(f, prev_start, prev_end)
@@ -812,13 +812,19 @@ class WavelengthTracker:
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
 
-    def _weekly_snapshots(
+    def weekly_snapshots(
         self,
         fragments: list[Fragment],
         start: date,
         end: date,
     ) -> list[WavelengthSnapshot]:
-        """Return one snapshot per ISO week between *start* and *end*."""
+        """Return one snapshot per ISO week between *start* and *end*.
+
+        Public since FEAT-007: ``current_phase_summary`` (and any future
+        caller that needs week-bucketed snapshots without the report
+        rendering) calls it. Earlier versions kept it private when the
+        only call site was :meth:`generate_monthly_report`.
+        """
         snapshots: list[WavelengthSnapshot] = []
         cursor = _week_start(start)
         while cursor <= end:
@@ -1283,7 +1289,7 @@ def current_phase_summary(
     fragments = _load_fragments_from_vault(vault_path)
     tracker = WavelengthTracker()
     snapshot = tracker.analyze_period(fragments, start, anchor)
-    weekly = tracker._weekly_snapshots(fragments, start, anchor)
+    weekly = tracker.weekly_snapshots(fragments, start, anchor)
     transitions = tracker.detect_transitions(weekly)
     return CurrentPhaseSummary(
         phase=snapshot.dominant_phase,

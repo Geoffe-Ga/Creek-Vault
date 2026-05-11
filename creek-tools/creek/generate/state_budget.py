@@ -16,7 +16,7 @@ lint``'s synchronicity and tag-cluster checks point at the work.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 SIZE_BUDGET_TOKENS: int = 50_000
@@ -62,14 +62,16 @@ class BudgetResult:
         budget: The active budget (always :data:`SIZE_BUDGET_TOKENS`).
         largest_sections: Up to three ``(header, tokens)`` pairs, ordered
             by descending size. Used by failure messages to name the
-            sections that grew.
+            sections that grew. An immutable tuple so ``frozen=True``
+            actually means frozen — a ``list`` here would still permit
+            mutation via ``.append``.
         message: Human-readable summary suitable for shell or CI output.
     """
 
     ok: bool
     tokens: int
     budget: int = SIZE_BUDGET_TOKENS
-    largest_sections: list[tuple[str, int]] = field(default_factory=list)
+    largest_sections: tuple[tuple[str, int], ...] = ()
     message: str = ""
 
 
@@ -115,7 +117,7 @@ def check_budget(latest_path: Path) -> BudgetResult:
         )
     text = latest_path.read_text(encoding="utf-8")
     tokens = estimate_tokens(text)
-    ranked = _rank_sections(text)[:_TOP_SECTION_REPORT_LIMIT]
+    ranked = tuple(_rank_sections(text)[:_TOP_SECTION_REPORT_LIMIT])
     if tokens <= SIZE_BUDGET_TOKENS:
         return BudgetResult(
             ok=True,
