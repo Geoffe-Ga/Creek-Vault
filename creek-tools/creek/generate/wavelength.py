@@ -16,7 +16,7 @@ from __future__ import annotations
 import itertools
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -1277,14 +1277,18 @@ def current_phase_summary(
 
     Args:
         vault_path: Root of the Obsidian vault.
-        today: Optional pinned date for tests. Defaults to ``date.today``.
+        today: Optional pinned date for tests. Defaults to today (UTC),
+            matching the convention used by :class:`StateReportGenerator`
+            and the rest of the audit-report pipeline. ``date.today()``
+            (system-local) would silently shift the 28-day window by a
+            day near midnight UTC on a non-UTC host.
         window_days: Lookback (inclusive). Defaults to 28 days — long
             enough that one quiet week does not flip the dominant phase.
 
     Returns:
         A :class:`CurrentPhaseSummary`.
     """
-    anchor = today or date.today()
+    anchor = today or datetime.now(tz=UTC).date()
     start = anchor - timedelta(days=window_days - 1)
     fragments = _load_fragments_from_vault(vault_path)
     tracker = WavelengthTracker()

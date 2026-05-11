@@ -1096,7 +1096,13 @@ def test_section_suggested_questions_empty(empty_vault: Path) -> None:
 
 
 def test_section_suggested_questions_caps_at_five(empty_vault: Path) -> None:
-    """At most five prompts are listed (FEAT-007 pre-decided 4-5)."""
+    """At most five prompts are listed (FEAT-007 pre-decided 4-5).
+
+    Thread-terminus does not filter on fragment phase — a thread becomes
+    a terminus candidate based on its own ``fragment_count`` and
+    ``ACTIVE`` status. That's why this fixture writes 10 threads
+    without any classified fragments and still expects 5 prompts.
+    """
     # Generate plenty of thread-terminus candidates.
     for index in range(10):
         _write_thread(
@@ -1285,16 +1291,30 @@ def test_cli_state_budget_passes_after_state_run(populated_vault: Path) -> None:
     assert result.exit_code == 0, result.output
 
 
-def test_state_budget_main_with_explicit_argv_under_budget(tmp_path: Path) -> None:
-    """``main`` accepts an explicit argv and returns 0 when the file is small."""
+def test_state_budget_main_with_explicit_argv_under_budget(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``main`` returns 0 and prints the ok message to stdout (not stderr)."""
     target = tmp_path / "latest.md"
     target.write_text("# Creek state\n\n## Vault summary\n\nshort.\n", encoding="utf-8")
 
     assert state_budget_main([str(target)]) == 0
+    captured = capsys.readouterr()
+    assert "ok" in captured.out.lower()
+    assert captured.err == ""
 
 
-def test_state_budget_main_with_explicit_argv_over_budget(tmp_path: Path) -> None:
-    """``main`` returns 1 when the explicit-argv file exceeds the budget."""
+def test_state_budget_main_with_explicit_argv_over_budget(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``main`` returns 1 and writes the failure message to stderr.
+
+    Pins the stderr-vs-stdout dispatch contract: a failing budget is
+    surfaced on stderr so shells that pipe stdout into a CI summary or
+    Slack post don't lose the actionable consolidation hint.
+    """
     target = tmp_path / "latest.md"
     target.write_text(
         "## Vault summary\n\n" + ("lorem ipsum " * 80_000),
@@ -1302,6 +1322,12 @@ def test_state_budget_main_with_explicit_argv_over_budget(tmp_path: Path) -> Non
     )
 
     assert state_budget_main([str(target)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    # The over-budget message names the section that grew + the
+    # consolidate-don't-raise hint; both live on stderr.
+    assert "exceeds budget" in captured.err.lower()
+    assert "consolidate" in captured.err.lower()
 
 
 def test_state_budget_main_missing_argv_returns_usage_error(
