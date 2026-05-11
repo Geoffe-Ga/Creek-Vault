@@ -99,7 +99,7 @@ def test_save_writes_note_under_correct_directory(
     assert saved_from["source_id"] == "conv-001"
     assert saved_from["contributing_fragments"] == ["frag-aaa", "frag-bbb"]
     assert saved_from["saved_by"] == "tester"
-    assert saved_from["saved_at"].endswith("Z") or "+" in saved_from["saved_at"]
+    assert saved_from["saved_at"].endswith("Z")
 
 
 def test_thread_save_carries_thread_model_fields(vault: Path) -> None:
@@ -474,6 +474,37 @@ def test_cli_save_unknown_source_kind_exits_two(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "source-kind" in result.output.lower()
+
+
+def test_cli_save_missing_body_path_exits_two(tmp_path: Path) -> None:
+    """A nonexistent ``--body`` path is a hard error, not a silent inline body.
+
+    Regression for the bug where ``--body /typo.md`` would file the
+    path string itself as the note body. For a privacy-sensitive
+    primitive that silent fallback is dangerous: the operator believes
+    they filed their answer when they actually filed a path.
+    """
+    vault = _scaffold_vault(tmp_path / "vault")
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "thread",
+            "--body",
+            str(tmp_path / "does-not-exist.md"),
+            "--provenance",
+            "frag-001",
+            "--tier",
+            "open",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "does not exist" in result.output.lower()
+    # And nothing got written into the vault — no thread file.
+    assert not list((vault / "02-Threads" / "Active").glob("*.md"))
 
 
 def test_cli_save_unknown_target_exits_two(tmp_path: Path) -> None:

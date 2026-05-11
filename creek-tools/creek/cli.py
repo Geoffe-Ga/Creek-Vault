@@ -1474,16 +1474,23 @@ def _parse_save_source_kind(value: str) -> str:
 def _read_save_body(body_arg: str | None) -> tuple[str, bool]:
     """Return ``(body_text, came_from_stdin)`` for the ``--body`` option.
 
-    ``--body`` accepts a path, ``-`` (explicit stdin), or may be
-    omitted to read from stdin. Empty bodies are accepted — the
-    operator may want a title-only stub note.
+    ``--body`` accepts a path or ``-`` (explicit stdin); omitting it
+    also reads from stdin. A non-existent path is a hard error rather
+    than a silent inline fallback — for a privacy-sensitive filing
+    tool, filing the path string itself when the operator mistyped a
+    file path is dangerously confusing (the resulting note's body is
+    the path, and the operator believes their answer was filed).
     """
     if body_arg is None or body_arg == "-":
         return sys.stdin.read(), True
     body_path = Path(body_arg)
-    if body_path.exists():
-        return body_path.read_text(encoding="utf-8"), False
-    return body_arg, False
+    if not body_path.exists():
+        console.print(
+            f"[red]--body path does not exist: {body_arg}. "
+            "Pass '-' (or omit --body) to read the body from stdin.[/red]",
+        )
+        raise typer.Exit(code=2)
+    return body_path.read_text(encoding="utf-8"), False
 
 
 def _parse_save_target(value: str) -> SaveTarget:
