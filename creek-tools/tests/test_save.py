@@ -148,17 +148,30 @@ def test_paradox_tier_is_open_even_if_caller_passes_intimate(vault: Path) -> Non
     """Per the FEAT, a paradox save records *the fact* of the contradiction.
 
     Tier-filtering for the paradox target is forced to ``open`` so the
-    full title and pointer survive into the vault.
+    body lands in the vault unredacted — what's preserved is the
+    contradiction, not a tier-protected summary. This is a deliberate
+    privacy trade-off the operator opts into by choosing ``paradox``;
+    the CLI emits a stderr warning when ``--tier intimate`` (or
+    ``personal``) is combined with ``--target paradox`` so the
+    behaviour isn't silent.
     """
+    paradox_body = "Both A and not-A appear true under different framings."
     request = _make_request(
         SaveTarget.PARADOX,
-        body="The body of the contradiction itself stays out of the vault.",
+        body=paradox_body,
         tier=PrivacyTier.INTIMATE,
     )
     path = save_to_vault(request, vault_path=vault)
     post = frontmatter.load(str(path))
     assert post["type"] == "paradox"
     assert post["privacy_tier"] == "open"
+    # Force-to-open must actually let the body through, otherwise the
+    # rule would be a no-op: assert the body content lands in the
+    # vault note rather than just trusting the tier field.
+    assert paradox_body in post.content
+    # And nothing gets diverted to the intimate-stubs directory.
+    stubs_dir = vault / "10-Liminal" / "Compost" / "intimate-stubs"
+    assert not list(stubs_dir.glob("*.md"))
 
 
 # ---- pre_save_filter ----
@@ -222,6 +235,23 @@ def test_pre_save_filter_intimate_redirects_body_to_gitignored_stubs() -> None:
 def test_intimate_stub_relpath_constant_matches_gitignored_dir() -> None:
     """The published constant is the canonical gitignored stubs path."""
     assert Path("10-Liminal/Compost/intimate-stubs") == INTIMATE_STUB_RELPATH
+
+
+def test_intimate_stub_relpath_constants_do_not_drift() -> None:
+    """Drift guard: the private mirror in privacy_filter must match the
+    public constant in router.
+
+    ``creek/classify/privacy_filter.py`` keeps a private copy of the
+    stub-relpath constant to avoid a circular import back into
+    ``creek.save``. If the two ever drift, the vault note's
+    ``intimate_body_pointer`` field will point to a directory where
+    the stub didn't land — a silent data-integrity bug. The test
+    imports the private symbol explicitly so it fails noisily the
+    moment either side moves.
+    """
+    from creek.classify.privacy_filter import _PRE_SAVE_INTIMATE_STUB_RELPATH
+
+    assert _PRE_SAVE_INTIMATE_STUB_RELPATH == INTIMATE_STUB_RELPATH
 
 
 # ---- Intimate full-body never lands in the vault tree ----
@@ -474,6 +504,68 @@ def test_cli_save_unknown_source_kind_exits_two(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "source-kind" in result.output.lower()
+
+
+def test_cli_save_paradox_intimate_warns_about_tier_widening(tmp_path: Path) -> None:
+    """``--target paradox --tier intimate`` warns that the body is unprotected.
+
+    Paradox saves force tier=open per the FEAT — the body lands in
+    the vault unredacted. A user passing ``--tier intimate`` for
+    protection deserves a visible heads-up rather than silent
+    widening; the CLI emits a yellow stderr note explaining the
+    consequence and pointing at unprotected target alternatives.
+    """
+    vault = _scaffold_vault(tmp_path / "vault")
+    body_file = tmp_path / "answer.md"
+    body_file.write_text("Two contradictory framings.", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "paradox",
+            "--body",
+            str(body_file),
+            "--title",
+            "Both true",
+            "--provenance",
+            "frag-001",
+            "--tier",
+            "intimate",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "tier=open" in result.output.lower() or "widened" in result.output.lower()
+    # Open-tier paradox: nothing diverted to the intimate-stubs dir.
+    stubs_dir = vault / "10-Liminal" / "Compost" / "intimate-stubs"
+    assert not list(stubs_dir.glob("*.md"))
+
+
+def test_cli_save_paradox_open_does_not_warn(tmp_path: Path) -> None:
+    """``--target paradox --tier open`` is the expected path; no warning."""
+    vault = _scaffold_vault(tmp_path / "vault")
+    body_file = tmp_path / "answer.md"
+    body_file.write_text("contradiction body", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "paradox",
+            "--body",
+            str(body_file),
+            "--provenance",
+            "frag-001",
+            "--tier",
+            "open",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "widened" not in result.output.lower()
 
 
 def test_cli_save_missing_body_path_exits_two(tmp_path: Path) -> None:

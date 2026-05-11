@@ -49,6 +49,15 @@ flags are passed. The paradox tier-filter is forced to `open` because
 what we're preserving is the *fact* of the contradiction, not the
 contradictory content itself.
 
+> ⚠️ **Paradox saves are always `tier=open`.** Even if you pass
+> `--tier intimate` (or `--tier personal`) the body is written to the
+> vault in full. The paradox target preserves the contradiction, not
+> a tier-protected summary. The CLI emits a yellow stderr warning
+> when this widening happens. If you need the body protected, use
+> `--target unnamed --tier intimate` instead — that diverts the
+> sensitive body to the gitignored compost directory and writes only
+> a title-only summary into the vault.
+
 ## Privacy-tier rules
 
 `creek save` honours the tier system in `docs/security/` and

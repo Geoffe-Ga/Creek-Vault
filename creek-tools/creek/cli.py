@@ -1521,6 +1521,33 @@ def _parse_save_tier(value: str | None) -> PrivacyTier | None:
         raise typer.Exit(code=2) from exc
 
 
+def _warn_if_paradox_downgrades_tier(
+    target: SaveTarget,
+    tier: PrivacyTier | None,
+) -> None:
+    """Print a stderr warning when paradox saves silently widen the tier.
+
+    Per the FEAT, ``--target paradox`` always lands in
+    ``10-Liminal/Paradoxes/`` with the body filtered as ``open`` —
+    *the fact* of the contradiction is what's preserved, not a
+    tier-protected summary. A user who passes ``--tier intimate`` or
+    ``--tier personal`` for protection is likely surprised when the
+    body lands in the vault unredacted, so we surface the override
+    explicitly rather than letting it pass silently.
+    """
+    if target != SaveTarget.PARADOX:
+        return
+    if tier is None or tier == PrivacyTier.OPEN:
+        return
+    console.print(
+        f"[yellow]Note: --target paradox forces tier=open for the body; "
+        f"--tier {tier.value} will be widened. The contradiction will be "
+        "written in full to 10-Liminal/Paradoxes/. Use --target unnamed "
+        "(or thread/eddy/praxis) with --tier intimate if you want the "
+        "body protected.[/yellow]",
+    )
+
+
 def _resolve_save_tier(
     tier: PrivacyTier | None,
     provenance: tuple[str, ...],
@@ -1607,6 +1634,7 @@ def save_cmd(
         fragments,
         came_from_stdin=came_from_stdin,
     )
+    _warn_if_paradox_downgrades_tier(save_target, parsed_tier)
     vault_path = _resolve_vault(vault)
     request = SaveRequest(
         target=save_target,
