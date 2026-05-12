@@ -5,7 +5,7 @@
 **Estimated LOC:** ~400
 **Estimated complexity:** S
 **Source candidate:** [`plans/2026-05-05_comparative-analysis/candidates/ADAPT-005-modular-skill-files-as-schema.md`](../2026-05-05_comparative-analysis/candidates/ADAPT-005-modular-skill-files-as-schema.md) (part 2 of 2)
-**Dependencies:** FEAT-001 (the root `AGENTS.md` it composes with)
+**Dependencies:** FEAT-019 (vault-sovereignty topology — canonical schema-skill source lives in the repo template, gets deployed to the user vault), FEAT-001 (the root `AGENTS.md` it composes with)
 **Parallelizable with peers:** yes (with FEAT-005 only; FEAT-003 and FEAT-004 hard-depend on this FEAT)
 **Wave:** 1 (schema foundation)
 
@@ -15,10 +15,17 @@ Author the four remaining schema-skill files under `00-Creek-Meta/Skills/` cover
 
 ## Files to touch
 
-- `00-Creek-Meta/Skills/paradox.SKILL.md` (new) — how to handle contradictions: route to `10-Liminal/Paradoxes/`, never resolve.
-- `00-Creek-Meta/Skills/liminal.SKILL.md` (new) — when to leave content uncategorized; the four-layer architecture's fourth layer.
-- `00-Creek-Meta/Skills/privacy-tier.SKILL.md` (new) — the `open` / `personal` / `intimate` ladder and the fail-closed defaults.
-- `00-Creek-Meta/Skills/wavelength-aware.SKILL.md` (new) — phase as the lens through which every other tag is interpreted.
+**Canonical (in repo, version-controlled — deployed by FEAT-019's `creek init`):**
+- `creek-tools/creek/templates/skills/paradox.SKILL.md` (new)
+- `creek-tools/creek/templates/skills/liminal.SKILL.md` (new)
+- `creek-tools/creek/templates/skills/privacy-tier.SKILL.md` (new)
+- `creek-tools/creek/templates/skills/wavelength-aware.SKILL.md` (new)
+
+**Per-vault (materialized at `creek init`-time; user can edit; `creek skills sync` re-deploys canonical updates):**
+- `<vault>/00-Creek-Meta/Skills/paradox.SKILL.md` — how to handle contradictions: route to `10-Liminal/Paradoxes/`, never resolve.
+- `<vault>/00-Creek-Meta/Skills/liminal.SKILL.md` — when to leave content uncategorized; the four-layer architecture's fourth layer.
+- `<vault>/00-Creek-Meta/Skills/privacy-tier.SKILL.md` — the `open` / `personal` / `intimate` ladder and the fail-closed defaults.
+- `<vault>/00-Creek-Meta/Skills/wavelength-aware.SKILL.md` — phase as the lens through which every other tag is interpreted.
 
 ## Pre-decided choices
 
