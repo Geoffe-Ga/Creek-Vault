@@ -187,6 +187,20 @@ def test_lint_since_window(vault: Path) -> None:
     assert result["status"] == "ok"
 
 
+def test_lint_empty_checks_list_runs_nothing(vault: Path) -> None:
+    """``checks=[]`` must be distinct from ``checks=None``.
+
+    Regression for PR #224 review: a falsy-check (``if checks``) on the
+    parameter previously collapsed ``[]`` into ``None`` and ran the
+    full default check set, the opposite of what an explicit empty
+    list signals.
+    """
+    result_empty = lint_tool(vault_path=vault, checks=[])
+    result_default = lint_tool(vault_path=vault)
+    assert len(result_empty["checks"]) == 0
+    assert len(result_default["checks"]) > 0
+
+
 # ---------------------------------------------------------------------------
 # mine
 # ---------------------------------------------------------------------------
@@ -351,13 +365,18 @@ def test_draft_refuses_when_llm_returns_empty(
     assert "LLM" in result["reason"]
 
 
-def test_draft_raises_for_out_of_range_index(
+def test_draft_refuses_for_out_of_range_index(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An out-of-range index raises :class:`TierCeilingViolationError`."""
-    from creek_mcp.tier_ceiling import TierCeilingViolationError
+    """An out-of-range index returns a structured refusal, not a raise.
 
+    Regression for PR #224 review: the previous implementation raised
+    ``TierCeilingViolationError`` for caller input errors, conflating
+    privacy refusals with programmer mistakes and bypassing the
+    refusal-response JSON path. The graceful pattern mirrors the
+    ``"no idea seeds"`` empty path already in ``draft_tool``.
+    """
     monkeypatch.setattr(
         "creek_mcp.tools.draft.IdeaMiner",
         lambda **kw: type(
@@ -366,10 +385,12 @@ def test_draft_raises_for_out_of_range_index(
             {"mine_all": lambda self, vault_path, *, current_phase: [_stub_seed()]},
         )(),
     )
-    with pytest.raises(TierCeilingViolationError):
-        draft_tool(
-            vault_path=vault,
-            llm=lambda prompt: "x",
-            phase="rising",
-            index=99,
-        )
+    result = draft_tool(
+        vault_path=vault,
+        llm=lambda prompt: "x",
+        phase="rising",
+        index=99,
+    )
+    assert result["status"] == "refused"
+    assert result["tool"] == "creek.draft"
+    assert "out of range" in result["reason"]

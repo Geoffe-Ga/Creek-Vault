@@ -20,7 +20,7 @@ dependencies = [
     "chardet>=7.4.3",
     "httpx>=0.27.0",
     "tqdm>=4.66.0",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2.0.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

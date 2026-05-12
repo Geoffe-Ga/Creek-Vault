@@ -10,6 +10,10 @@ guard ``redact.jsonl`` also guard ``mcp.jsonl``.
 The module records ``args_summary``, not raw arguments: long strings
 become ``{"len": N}``, lists become counts, dicts become key sets, so
 an ``intimate``-tier draft request never leaks the body to the log.
+Callers are expected to pass *only* the MCP-supplied parameters into
+``append(args=...)`` — never internal state such as ``vault_path``,
+which is resolved by the server bootstrap and so does not enter the
+audit trail.
 """
 
 from __future__ import annotations

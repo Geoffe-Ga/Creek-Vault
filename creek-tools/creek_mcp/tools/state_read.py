@@ -35,7 +35,7 @@ def state_read_tool(
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
-        args={"vault_path": str(vault_path)},
+        args={},
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
     )

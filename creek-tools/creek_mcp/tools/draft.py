@@ -15,7 +15,6 @@ from creek.models import Phase
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
     TierCeiling,
-    TierCeilingViolationError,
     refusal_response,
     to_privacy_override,
 )
@@ -48,11 +47,7 @@ def draft_tool(
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
-        args={
-            "vault_path": str(vault_path),
-            "phase": phase,
-            "index": index,
-        },
+        args={"phase": phase, "index": index},
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
     )
@@ -70,8 +65,11 @@ def draft_tool(
             "reason": "no idea seeds surfaced",
         }
     if index < 0 or index >= len(seeds):
-        msg = f"--index {index} out of range (0..{len(seeds) - 1})"
-        raise TierCeilingViolationError(msg)
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=f"index {index} out of range (0..{len(seeds) - 1})",
+        )
     idea = seeds[index]
     generator = DraftGenerator(
         llm=llm,

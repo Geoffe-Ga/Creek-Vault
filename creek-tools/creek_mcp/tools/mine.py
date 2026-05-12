@@ -34,11 +34,7 @@ def mine_tool(
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
-        args={
-            "vault_path": str(vault_path),
-            "phase": phase,
-            "limit": limit,
-        },
+        args={"phase": phase, "limit": limit},
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
     )

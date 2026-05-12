@@ -29,9 +29,14 @@ FEAT-011 adds write tools (`save`, `ingest`, `classify`, `link`,
 `report`, `skills.generate`); FEAT-012 adds `purge.*`.
 
 Every tool requires a `privacy_tier_ceiling` parameter
-(`open` | `personal` | `intimate` | `all`); default is `open`. Content
-above the ceiling is omitted or returned as a title-only stub — the
-ceiling cannot be bypassed by the caller.
+(`open` | `personal` | `intimate` | `all`); default is `open`. Note
+that `open` is the *most restrictive* setting — it restricts the
+caller to open-tier (publishable) content only, not "open access".
+The ladder goes `open` (publishable) → `personal` (summarised
+personal allowed) → `intimate` (everything self-authored) → `all`
+(every tier including unclassified). Content above the ceiling is
+omitted or returned as a title-only stub — the ceiling cannot be
+bypassed by the caller.
 
 ## Claude Code
 
@@ -71,8 +76,8 @@ Every tool invocation appends one entry to
 
 ```json
 {
-  "tool": "creek.state.read",
-  "args_summary": {"vault_path": "/path/to/vault"},
+  "tool": "creek.mine",
+  "args_summary": {"phase": "rising", "limit": 10},
   "tier_ceiling": "open",
   "consumer": "claude-code",
   "timestamp": "2026-05-11T12:34:56+00:00",
@@ -80,9 +85,13 @@ Every tool invocation appends one entry to
 }
 ```
 
-`args_summary` is compact: long strings become `{"len": N}`, lists
-become `{"count": N}`, dicts become `{"keys": [...]}`. A draft request
-for an `intimate`-tier fragment never leaks the body into the audit
+`args_summary` captures the MCP-supplied arguments to the tool (the
+ceiling is already a top-level field, so it's not duplicated here).
+The vault path is *not* recorded — it's resolved internally from
+`load_config()` and never enters the audit trail. Compact summary
+rules: long strings become `{"len": N}`, lists become `{"count": N}`,
+dicts become `{"keys": [...]}`. A draft request for an
+`intimate`-tier fragment never leaks the body into the audit
 trail. Hash chaining is provided by `creek.audit.AuditLog`; FEAT-012's
 hardening pass extends the entry shape, not the storage layer.
 

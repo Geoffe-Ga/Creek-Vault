@@ -29,11 +29,11 @@ def lint_tool(
     bodies — but the parameter is still required per FEAT-010 to keep
     tool signatures uniform.
     """
+    resolved_checks = list(checks) if checks is not None else None
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={
-            "vault_path": str(vault_path),
-            "checks": list(checks) if checks else None,
+            "checks": resolved_checks,
             "since": since,
         },
         tier_ceiling=privacy_tier_ceiling,
@@ -41,7 +41,7 @@ def lint_tool(
     )
     since_dt = parse_since(since) if since else None
     runner = LintRunner(vault_path=vault_path, since=since_dt, since_text=since)
-    report = runner.run(checks=list(checks) if checks else None)
+    report = runner.run(checks=resolved_checks)
     written = runner.write(report)
     return {
         "status": "ok",
