@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# scripts/format.sh — Ruff format. Pass --check for a non-mutating check.
+# scripts/format.sh — Ruff format.
+#   default: apply (write) — the "--fix" mode for Ruff format.
+#   --check: dry-run, fail on diffs (CI-safe).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +11,6 @@ MODE=""
 for arg in "$@"; do
     case "$arg" in
         --check) MODE="--check" ;;
-        --fix)   MODE="" ;;
     esac
 done
 

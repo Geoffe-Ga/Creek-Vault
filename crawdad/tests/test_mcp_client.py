@@ -85,7 +85,8 @@ class _BrokenSession:
 
 async def test_session_list_tools_translates_underlying_failure() -> None:
     """The adapter maps SDK errors to :class:`MCPUnavailableError`."""
-    session = MCPSession(_BrokenSession())  # type: ignore[arg-type]
+    broken: Any = _BrokenSession()
+    session = MCPSession(broken)
 
     with pytest.raises(MCPUnavailableError, match="list_tools"):
         await session.list_tools()
@@ -93,7 +94,8 @@ async def test_session_list_tools_translates_underlying_failure() -> None:
 
 async def test_session_call_tool_translates_underlying_failure() -> None:
     """The adapter maps SDK errors to :class:`MCPUnavailableError`."""
-    session = MCPSession(_BrokenSession())  # type: ignore[arg-type]
+    broken: Any = _BrokenSession()
+    session = MCPSession(broken)
 
     with pytest.raises(MCPUnavailableError, match="call_tool"):
         await session.call_tool("anything", {})

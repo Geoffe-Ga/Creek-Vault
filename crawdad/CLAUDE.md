@@ -93,6 +93,20 @@ Four gates, each must pass before the next:
 Both allowlists must be non-empty — an empty list is a configuration
 error, not "open to everyone".
 
+### 5.1 Trust boundary
+
+`crawdad.yaml` is **trusted input**. `mcp_server_command` is executed
+verbatim as a subprocess argv, so anyone with write access to
+`crawdad.yaml` can run arbitrary code as the bot user. For the
+single-user / personal-tool deployment target this is acceptable, but
+it means:
+
+- The YAML file lives wherever the operator runs the bot — keep it out
+  of any directory writable by less-trusted processes.
+- Do *not* feed user-controlled content into `crawdad.yaml`.
+- Multi-user / shared deployments are out of scope for v1.0; revisit
+  this assumption before broadening access.
+
 ## 6. MCP subprocess resilience
 
 The bot does **not** exit on MCP subprocess failure. The pattern is:

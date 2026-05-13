@@ -140,6 +140,7 @@ class CrawDadClient(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         """Forward Discord messages to :func:`handle_message`."""
         if self.user is None:
+            _LOGGER.debug("on_message before client ready; dropping event")
             return
         await handle_message(
             cast("_MessageLike", message),

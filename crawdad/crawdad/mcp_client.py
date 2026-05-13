@@ -16,6 +16,7 @@ Both ``connect`` failures and mid-session subprocess deaths surface as
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,8 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+_LOGGER = logging.getLogger("crawdad.mcp_client")
 
 
 class MCPUnavailableError(RuntimeError):
@@ -47,6 +50,7 @@ class MCPSession:
         try:
             result = await self._session.list_tools()
         except Exception as exc:
+            _LOGGER.debug("list_tools raised %s: %r", type(exc).__name__, exc)
             msg = "list_tools failed; the MCP subprocess may have exited"
             raise MCPUnavailableError(msg) from exc
         return tuple(tool.name for tool in result.tools)
@@ -66,6 +70,7 @@ class MCPSession:
         try:
             result = await self._session.call_tool(name, arguments or {})
         except Exception as exc:
+            _LOGGER.debug("call_tool(%r) raised %s: %r", name, type(exc).__name__, exc)
             msg = f"call_tool({name!r}) failed; the MCP subprocess may have exited"
             raise MCPUnavailableError(msg) from exc
         if result.isError:
@@ -113,10 +118,17 @@ class MCPClient:
 
 
 def _text_payload(content: list[Any]) -> str:
-    """Concatenate every text fragment in *content* into a single string."""
+    """Concatenate every text fragment in *content* into a single string.
+
+    Non-text content items (e.g. ``ImageContent``, ``EmbeddedResource``)
+    are dropped with a DEBUG log so FEAT-014 authors discovering a
+    missing tool response can see what was discarded.
+    """
     parts: list[str] = []
     for item in content:
         text = getattr(item, "text", None)
-        if text is not None:
-            parts.append(str(text))
+        if text is None:
+            _LOGGER.debug("dropping non-text content item: %r", type(item).__name__)
+            continue
+        parts.append(str(text))
     return "\n".join(parts)

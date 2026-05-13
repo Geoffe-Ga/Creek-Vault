@@ -294,13 +294,12 @@ async def test_crawdad_client_on_message_skips_when_not_ready(
     )
 
     channel = _FakeChannel(id=999, sent=[])
-    await client.on_message(
-        _FakeMessage(  # type: ignore[arg-type]
-            author=_FakeAuthor(id=111),
-            channel=channel,
-            content="hi",
-        )
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="hi",
     )
+    await client.on_message(message)
 
     assert called is False
 

@@ -53,10 +53,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def run_bot(config: CrawDadConfig) -> None:
     """Boot the Discord client; load session state once at start.
 
-    The MCP subprocess is connected on demand by FEAT-014's dispatcher;
-    in this scaffold we just verify the connect/list_tools path during
-    startup so a misconfigured argv surfaces immediately rather than on
-    first message.
+    Startup runs two short-lived event loops in sequence: ``asyncio.run``
+    drives :func:`_probe_mcp` (which spawns and tears down the MCP
+    subprocess to verify connectivity), then ``discord.Client.run``
+    spins up the permanent loop. The probe's subprocess is therefore
+    *not* the same subprocess FEAT-014's dispatcher will use at message
+    time — each MCP call spawns a fresh subprocess until FEAT-014
+    introduces a long-lived connection.
     """
     logging.basicConfig(level=logging.INFO)
     session_state = _safe_load_state(config.vault_path)
@@ -75,7 +78,18 @@ def _safe_load_state(vault_path: Path) -> SessionState | None:
 
 
 async def _probe_mcp(config: CrawDadConfig) -> None:
-    """Fail fast on a broken MCP argv; non-startup outages are handled later."""
+    """Connectivity check only — does NOT validate the tool schema.
+
+    Spawns the MCP subprocess, calls ``list_tools``, logs the advertised
+    names, then disconnects. A misconfigured ``mcp_server_command`` that
+    starts successfully but exposes zero tools will still pass this
+    probe — FEAT-014's dispatcher is responsible for verifying the
+    specific tools it needs (``creek.state.read`` et al.) are present.
+
+    Probe failure is logged at WARNING and swallowed so the bot still
+    starts; mid-session outages are handled by ``MCPUnavailableError``
+    in :mod:`crawdad.bot`.
+    """
     try:
         async with MCPClient(config.mcp_server_command).connect() as session:
             tools = await session.list_tools()
