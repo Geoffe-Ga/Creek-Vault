@@ -37,14 +37,17 @@ import yaml
 
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
+    CLASSIFICATION_REASONING_KEY,
+    CLASSIFICATION_REASONING_MAX_CHARS,
     CLASSIFIED_AT_KEY,
+    CLASSIFY_TRACE_LOG_FILENAME,
     LLM_METHOD,
     MANUAL_METHOD,
     RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.rules import RuleClassifier
-from creek.models import Fragment, Frequency
+from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
 from creek.vault.reader import try_load_fragment
 
@@ -55,6 +58,9 @@ Newline-delimited JSON (one ``{"id": ...}`` object per line); the
 ``.jsonl`` suffix signals the format honestly to an operator opening
 the file.
 """
+
+_PROCESSING_LOG_SUBDIR = ("00-Creek-Meta", "Processing-Log")
+"""Per-vault subdirectory carrying the LLM progress + trace logs."""
 
 _RESUMABLE_METHODS: frozenset[str] = frozenset({MANUAL_METHOD, LLM_METHOD})
 
@@ -146,13 +152,15 @@ def run_classify(
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
     counts = _RunCounts()
     progress_path: Path | None = None
+    trace_log_path: Path | None = None
     if method == LLM_METHOD:
-        progress_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        progress_dir = vault_path.joinpath(*_PROCESSING_LOG_SUBDIR)
         # Create the directory once, not per fragment — a 10k-fragment
         # vault would otherwise issue 10k redundant ``mkdir`` syscalls
         # in ``_record_llm_progress``.
         progress_dir.mkdir(parents=True, exist_ok=True)
         progress_path = progress_dir / LLM_PROGRESS_FILENAME
+        trace_log_path = progress_dir / CLASSIFY_TRACE_LOG_FILENAME
 
     for md_file in sorted(fragments_root.rglob("*.md")):
         _process_file(
@@ -164,6 +172,7 @@ def run_classify(
             confidence_threshold=config.classification.confidence_threshold,
             counts=counts,
             progress_path=progress_path,
+            trace_log_path=trace_log_path,
         )
 
     return ClassifySummary(
@@ -188,6 +197,7 @@ def _process_file(
     confidence_threshold: float,
     counts: _RunCounts,
     progress_path: Path | None,
+    trace_log_path: Path | None,
 ) -> None:
     """Classify a single fragment file and update ``counts`` in place.
 
@@ -204,6 +214,10 @@ def _process_file(
             successful LLM classification. Manual / rules-shortcircuit
             paths are not appended — only paid LLM calls need to be
             recovered on resume.
+        trace_log_path: Optional path to the FEAT-017 reasoning trace
+            log. When set, ``intimate``-tier fragments route their full
+            reasoning trace here instead of into frontmatter; other
+            tiers store a truncated trace in frontmatter regardless.
     """
     try:
         record = _read_fragment(md_file)
@@ -228,7 +242,7 @@ def _process_file(
         counts.preserved += 1
         return
 
-    new_fragment, was_skipped = _classify_one(
+    new_fragment, was_skipped, reasoning = _classify_one(
         fragment=fragment,
         body=body,
         method=method,
@@ -243,6 +257,12 @@ def _process_file(
     # persisted — we never skip the write, only the LLM call.
     write_method = RULES_METHOD if was_skipped else method
 
+    reasoning_for_frontmatter = _route_reasoning(
+        fragment=new_fragment,
+        reasoning=reasoning,
+        method=write_method,
+        trace_log_path=trace_log_path,
+    )
     try:
         _write_fragment(
             md_file=md_file,
@@ -250,6 +270,7 @@ def _process_file(
             body=body,
             method=write_method,
             raw=raw,
+            reasoning=reasoning_for_frontmatter,
         )
     except OSError as exc:
         counts.errors.append(f"failed to update {md_file}: {exc}")
@@ -269,7 +290,7 @@ def _classify_one(
     rules: RuleClassifier,
     llm: LLMClassifier | None,
     confidence_threshold: float,
-) -> tuple[Fragment, bool]:
+) -> tuple[Fragment, bool, str]:
     """Run the chosen classifier on a single fragment.
 
     Args:
@@ -282,23 +303,108 @@ def _classify_one(
             during ``--method llm`` runs.
 
     Returns:
-        Tuple of ``(updated_fragment, skipped)``. ``skipped`` is
+        ``(updated_fragment, skipped, reasoning)``. ``skipped`` is
         ``True`` when the LLM was not invoked because the rule
-        classifier already produced a confident answer.
+        classifier already produced a confident answer. ``reasoning``
+        is the LLM's reasoning trace (FEAT-017); empty string for the
+        rules path or when the LLM produced no preamble.
     """
     if method == "rules":
-        return rules.classify(fragment, content=body), False
+        return rules.classify(fragment, content=body), False, ""
 
     rule_result = rules.classify(fragment, content=body)
     if rule_result.frequency.primary != Frequency.UNCLASSIFIED:
         confidence = rules.confidence_score(rule_result, content=body)
         if confidence >= confidence_threshold:
-            return rule_result, True
+            return rule_result, True, ""
 
     if llm is None:  # pragma: no cover  # no issue: defensive guard, unreachable
         msg = "LLM classifier required when method='llm'"
         raise RuntimeError(msg)
-    return llm.classify(rule_result, content=body), False
+    llm_result = llm.classify_with_reasoning(rule_result, content=body)
+    return llm_result.fragment, False, llm_result.reasoning
+
+
+def _route_reasoning(
+    *,
+    fragment: Fragment,
+    reasoning: str,
+    method: str,
+    trace_log_path: Path | None,
+) -> str:
+    """Persist the LLM reasoning trace per FEAT-017 tier-routing rules.
+
+    For ``intimate``-tier fragments the full reasoning is appended to
+    ``trace_log_path`` (gitignored per FEAT-019) and the frontmatter
+    receives an empty string — keeping intimate model traces out of
+    files that may be synced or shared. For all other tiers the trace
+    is truncated to :data:`CLASSIFICATION_REASONING_MAX_CHARS` and
+    returned for direct embedding in frontmatter.
+
+    Args:
+        fragment: The fragment whose tier dictates routing.
+        reasoning: The raw reasoning preamble; may be empty.
+        method: ``"rules"`` (no-op routing), ``"llm"``, or
+            ``"manual"``.
+        trace_log_path: Destination for intimate-tier full traces.
+
+    Returns:
+        The string the engine should store in
+        ``classification_reasoning`` frontmatter. Empty when there is
+        no reasoning to persist (rules path) or the fragment is
+        intimate (the full trace goes to the log file instead).
+    """
+    if method != LLM_METHOD or not reasoning:
+        return ""
+    if fragment.privacy_tier == PrivacyTier.INTIMATE.value:
+        if trace_log_path is not None:
+            _append_trace_log(trace_log_path, fragment, reasoning)
+        return ""
+    return _truncate_reasoning(reasoning)
+
+
+def _truncate_reasoning(text: str) -> str:
+    """Truncate *text* to :data:`CLASSIFICATION_REASONING_MAX_CHARS`.
+
+    The truncation marker is a single ``…`` so a downstream reader can
+    tell the trace was cropped without parsing the byte length.
+    """
+    if len(text) <= CLASSIFICATION_REASONING_MAX_CHARS:
+        return text
+    return text[: CLASSIFICATION_REASONING_MAX_CHARS - 1] + "…"
+
+
+def _append_trace_log(
+    trace_log_path: Path,
+    fragment: Fragment,
+    reasoning: str,
+) -> None:
+    """Append a full reasoning trace to the intimate-tier log file.
+
+    Failing to write the trace is logged at ``WARNING`` and the
+    classification proceeds — losing the log entry costs observability,
+    never a re-classification.
+
+    Args:
+        trace_log_path: Destination JSONL file.
+        fragment: Source fragment for the ID + tier in the record.
+        reasoning: Full reasoning text (un-truncated).
+    """
+    record = {
+        "id": fragment.id,
+        "tier": fragment.privacy_tier,
+        "reasoning": reasoning,
+    }
+    try:
+        with trace_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "[fragment=%s trace=%s] Could not append to classify-trace log: %s",
+            fragment.id,
+            trace_log_path,
+            exc,
+        )
 
 
 def _read_fragment(md_file: Path) -> tuple[Fragment, str, dict[str, object]] | None:
@@ -335,12 +441,17 @@ def _write_fragment(
     body: str,
     method: str,
     raw: dict[str, object],
+    reasoning: str,
 ) -> None:
     """Persist updated fragment metadata back to its file.
 
     Preserves the existing classification provenance keys so that
     ``classified_at`` reflects the most recent update and the prior
-    ``method`` is replaced.
+    ``method`` is replaced. The reasoning trace (FEAT-017) is stored
+    in :data:`creek.classify.constants.CLASSIFICATION_REASONING_KEY`
+    when non-empty, and removed from the frontmatter otherwise so an
+    intimate-tier fragment never inherits a stale trace from a
+    previous run at a different tier.
 
     Args:
         md_file: Destination file (rewritten in place).
@@ -349,6 +460,9 @@ def _write_fragment(
         method: ``"rules"``, ``"llm"``, or ``"manual"``.
         raw: Original frontmatter dict — used to preserve any
             non-Fragment keys (e.g. operator-applied tags).
+        reasoning: Per-FEAT-017 ``classification_reasoning`` value
+            already truncated / tier-routed by :func:`_route_reasoning`.
+            Empty string clears the field on disk.
     """
     new_metadata = dict(raw)
     new_metadata.update(fragment.model_dump(mode="json"))
@@ -358,6 +472,10 @@ def _write_fragment(
     # timestamp written to disk uses the same code path as every
     # other LA-anchored timestamp in the pipeline.
     new_metadata[CLASSIFIED_AT_KEY] = now_la().isoformat()
+    if reasoning:
+        new_metadata[CLASSIFICATION_REASONING_KEY] = reasoning
+    else:
+        new_metadata.pop(CLASSIFICATION_REASONING_KEY, None)
 
     post = frontmatter.Post(content=body, **new_metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")

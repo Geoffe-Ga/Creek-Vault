@@ -14,6 +14,7 @@ from unittest.mock import patch
 import frontmatter
 
 from creek.classify.classify_engine import run_classify
+from creek.classify.llm import LLMClassificationResult
 from creek.config import CreekConfig
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from tests.helpers import write_fragment_file as _write_fragment
@@ -273,7 +274,9 @@ def test_run_classify_llm_skips_high_confidence(tmp_path: Path) -> None:
     config = CreekConfig()
     config.classification.confidence_threshold = 0.0
 
-    with patch("creek.classify.classify_engine.LLMClassifier.classify") as mock_llm:
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+    ) as mock_llm:
         summary = run_classify(
             vault_path=vault,
             config=config,
@@ -345,8 +348,11 @@ def test_run_classify_llm_invoked_for_low_confidence(tmp_path: Path) -> None:
     config = CreekConfig()
 
     with patch(
-        "creek.classify.classify_engine.LLMClassifier.classify",
-        side_effect=lambda f, content="": f,
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=lambda f, content="": LLMClassificationResult(
+            fragment=f,
+            reasoning="",
+        ),
     ) as mock_llm:
         run_classify(
             vault_path=vault,
@@ -356,3 +362,178 @@ def test_run_classify_llm_invoked_for_low_confidence(tmp_path: Path) -> None:
         )
 
     mock_llm.assert_called_once()
+
+
+# ---- FEAT-017a: classification_reasoning tier-routing ----
+
+
+_LONG_REASONING: str = (
+    "I worked through this in detail. "
+    "The frequency is clearly F3 because the operator is exercising "
+    "authority over a decision. "
+    + ("the same point repeated until we hit the cap. " * 20)
+)
+
+
+def _run_with_reasoning(
+    vault: Path,
+    fragment: Fragment,
+    body: str,
+    reasoning: str,
+) -> None:
+    """Seed *fragment* into *vault* and run the engine with a canned reasoning trace."""
+    _write_fragment(vault=vault, fragment=fragment, body=body)
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force LLM path
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=lambda f, content="": LLMClassificationResult(
+            fragment=f,
+            reasoning=reasoning,
+        ),
+    ):
+        run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+
+def test_open_tier_truncates_reasoning_into_frontmatter(tmp_path: Path) -> None:
+    """An ``open``-tier fragment carries a truncated trace in its frontmatter."""
+    import importlib
+
+    from creek.models import PrivacyTier
+
+    vault = tmp_path / "vault"
+    frag = Fragment(
+        id="frag-opentier001",
+        title="open",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        privacy_tier=PrivacyTier.OPEN,
+    )
+    _run_with_reasoning(vault, frag, body="open content", reasoning=_LONG_REASONING)
+
+    constants = importlib.import_module("creek.classify.constants")
+    reloaded = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-opentier001.md"),
+    )
+    stored = reloaded[constants.CLASSIFICATION_REASONING_KEY]
+    assert isinstance(stored, str)
+    assert stored.endswith("…")
+    assert len(stored) == constants.CLASSIFICATION_REASONING_MAX_CHARS
+
+
+def test_personal_tier_truncates_reasoning_into_frontmatter(tmp_path: Path) -> None:
+    """A ``personal``-tier fragment also gets the truncated trace in frontmatter."""
+    import importlib
+
+    from creek.models import PrivacyTier
+
+    vault = tmp_path / "vault"
+    frag = Fragment(
+        id="frag-personal001",
+        title="personal",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        privacy_tier=PrivacyTier.PERSONAL,
+    )
+    _run_with_reasoning(vault, frag, body="personal content", reasoning=_LONG_REASONING)
+
+    constants = importlib.import_module("creek.classify.constants")
+    reloaded = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-personal001.md"),
+    )
+    stored = reloaded[constants.CLASSIFICATION_REASONING_KEY]
+    assert isinstance(stored, str)
+    assert stored
+    assert len(stored) <= constants.CLASSIFICATION_REASONING_MAX_CHARS
+
+
+def test_intimate_tier_writes_full_trace_to_log_not_frontmatter(
+    tmp_path: Path,
+) -> None:
+    """An ``intimate``-tier fragment's full trace lives in the log file only."""
+    import json as _json
+
+    from creek.classify.constants import (
+        CLASSIFICATION_REASONING_KEY,
+        CLASSIFY_TRACE_LOG_FILENAME,
+    )
+    from creek.models import PrivacyTier
+
+    vault = tmp_path / "vault"
+    frag = Fragment(
+        id="frag-intimate001",
+        title="intimate",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        privacy_tier=PrivacyTier.INTIMATE,
+    )
+    _run_with_reasoning(vault, frag, body="intimate content", reasoning=_LONG_REASONING)
+
+    reloaded = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-intimate001.md"),
+    )
+    # Frontmatter MUST NOT carry the reasoning for intimate-tier fragments.
+    assert CLASSIFICATION_REASONING_KEY not in reloaded.metadata
+
+    # Full trace lives in the gitignorable trace log.
+    log_path = vault / "00-Creek-Meta" / "Processing-Log" / CLASSIFY_TRACE_LOG_FILENAME
+    assert log_path.exists()
+    records = [
+        _json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(records) == 1
+    assert records[0]["id"] == frag.id
+    assert records[0]["tier"] == "intimate"
+    assert records[0]["reasoning"] == _LONG_REASONING
+
+
+def test_short_reasoning_is_persisted_verbatim(tmp_path: Path) -> None:
+    """A trace shorter than the cap is stored without truncation marker."""
+    from creek.classify.constants import CLASSIFICATION_REASONING_KEY
+    from creek.models import PrivacyTier
+
+    vault = tmp_path / "vault"
+    frag = Fragment(
+        id="frag-shortreas01",
+        title="short",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        privacy_tier=PrivacyTier.OPEN,
+    )
+    short = "Brief reasoning."
+    _run_with_reasoning(vault, frag, body="content", reasoning=short)
+
+    reloaded = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-shortreas01.md"),
+    )
+    assert reloaded[CLASSIFICATION_REASONING_KEY] == short
+
+
+def test_rules_method_does_not_persist_reasoning(tmp_path: Path) -> None:
+    """``--method rules`` runs never emit a classification_reasoning field."""
+    from creek.classify.constants import CLASSIFICATION_REASONING_KEY
+
+    vault = tmp_path / "vault"
+    frag = Fragment(
+        id="frag-rulesreas01",
+        title="rules-only",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=frag,
+        body="power dominance bold rage warrior",
+    )
+    run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+    reloaded = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-rulesreas01.md"),
+    )
+    assert CLASSIFICATION_REASONING_KEY not in reloaded.metadata
