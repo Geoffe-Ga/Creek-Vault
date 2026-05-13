@@ -177,7 +177,7 @@ def test_report_help_mentions_include_tier() -> None:
 
 
 def test_skills_help_mentions_include_tier() -> None:
-    """``creek skills --help`` advertises the new flag."""
-    result = runner.invoke(app, ["skills", "--help"])
+    """``creek skills generate --help`` advertises the privacy-tier flag."""
+    result = runner.invoke(app, ["skills", "generate", "--help"])
     assert result.exit_code == 0
     assert "--include-tier" in _plain(result.output)

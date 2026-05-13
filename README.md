@@ -21,30 +21,45 @@ The pipeline runs in five stages:
 - **Deterministic.** Fragment IDs are hashed from `(source, timestamp, content)` so re-processing is idempotent.
 - **Voice-aware generation.** The `creek skills` / `creek mine` / `creek draft` flow turns vault contents into a per-frequency Voice Skill Tree and uses it to draft new essays in your style.
 
-## Repository layout
+## Repository topology
+
+This repository is the **toolchain** plus the **canonical reference material**. Your personal vault — fragments, threads, journal, voice exemplars — lives *elsewhere on disk* and is never checked in. See FEAT-019 for the sovereignty rationale.
 
 ```
-Creek-Vault/                       # The Obsidian vault itself (this repo)
-├── 00-Creek-Meta/Ontology/        # Master ontology spec + APTITUDE / Wavelength docs
-├── 01-Fragments/                  # Atomic content units (one MD per chat / doc / sheet / slide deck)
-├── 02-Threads/                    # Narrative currents
-├── 03-Eddies/                     # Topic clusters
-├── 04-Praxis/                     # Actionable insights
-├── 05-Wavelength/                 # Phase reports
-├── 06-Frequencies/                # APTITUDE frequency notes
-├── 07-Voice/                      # Voice Skill Tree, drafts, register profiles
-├── 08-Decisions/                  # Decision context notes
-├── 09-Reference/                  # External reference material
-├── 10-Liminal/                    # In-between content awaiting classification
-├── creek-tools/                   # The Python CLI + pipeline (this is where the code lives)
-└── CLAUDE.md                      # Top-level repo guidance for Claude Code
+Creek-Vault/                            # This repo (toolchain + canonical material)
+├── creek-tools/                        # Python CLI + pipeline + canonical templates
+│   └── creek/templates/
+│       ├── vault/                      # Canonical vault scaffold (.gitkeep markers)
+│       ├── skills/                     # Canonical schema-skill tree (*.SKILL.md)
+│       └── AGENTS.md                   # Canonical agent contract template
+├── docs/Ontology/                      # Canonical ontology specification
+├── plans/                              # Planning + comparative-analysis docs
+├── CLAUDE.md                           # Repo guidance for Claude Code
+└── README.md                           # You are here
 ```
 
-The Obsidian vault and the `creek-tools` codebase share one git repository, so changes to the pipeline and to the vault content are versioned together.
+```
+~/Obsidian/Creek-Vault/                 # Your vault (NOT this repo). Scaffolded by `creek init`.
+├── 00-Creek-Meta/{Ontology,Skills,...} # Per-vault: ontology copy, schema skills, config, logs
+├── 01-Fragments/                       # Atomic content units (journal, conversations, etc.)
+├── 02-Threads/, 03-Eddies/, 04-Praxis/ # Compiled narrative / cluster / actionable layers
+├── 05-Wavelength/, 06-Frequencies/     # APTITUDE / Archetypal Wavelength notes
+├── 07-Voice/, 08-Decisions/            # Voice skill tree, decision frameworks
+├── 09-Reference/, 10-Liminal/          # External references, in-between content
+└── AGENTS.md                           # Per-vault agent contract (deployed from template)
+```
 
 ## Quickstart
 
-See [`creek-tools/README.md`](creek-tools/README.md) for install instructions, the full command reference, and configuration. The end-to-end task guides are under [`creek-tools/docs/`](creek-tools/docs/):
+```bash
+pip install -e creek-tools
+creek init --vault ~/Obsidian/Creek-Vault     # Required: pick a vault path OUTSIDE this repo.
+creek skills sync --vault ~/Obsidian/Creek-Vault   # Re-deploy upstream skills after upgrades.
+```
+
+`creek init` refuses paths inside a git repository by default; pass `--allow-in-repo` to override (with a warning).
+
+See [`creek-tools/README.md`](creek-tools/README.md) for the full command reference and configuration. End-to-end task guides are under [`creek-tools/docs/`](creek-tools/docs/):
 
 | If you want to… | Read |
 |-----------------|------|

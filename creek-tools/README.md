@@ -1,6 +1,6 @@
 # creek-tools
 
-The Python pipeline behind the **Creek** knowledge organization system. `creek-tools` ingests semi-structured personal data — chat exports, documents, notes, screenshots — redacts sensitive content, classifies it along the [APTITUDE / Archetypal Wavelength](../00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md) ontology, links semantically related fragments, and writes a richly interlinked Obsidian vault.
+The Python pipeline behind the **Creek** knowledge organization system. `creek-tools` ingests semi-structured personal data — chat exports, documents, notes, screenshots — redacts sensitive content, classifies it along the [APTITUDE / Archetypal Wavelength](../docs/Ontology/creek_ontology_agent_prompt.md) ontology, links semantically related fragments, and writes a richly interlinked Obsidian vault.
 
 The pipeline is **local-first by default**: classification uses Ollama, embeddings use sentence-transformers, and no content leaves your machine unless you explicitly opt in to the Anthropic API path.
 
@@ -41,6 +41,9 @@ pre-commit install
 ## Quickstart
 
 ```bash
+# 0. Scaffold your vault somewhere OUTSIDE this repo (FEAT-019).
+creek init --vault ~/Obsidian/Creek-Vault
+
 # 1. Scan for secrets before anything else.
 creek redact --scan --source ~/exports --report
 

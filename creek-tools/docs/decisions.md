@@ -2,7 +2,7 @@
 
 The decision-support layer (Ontology §12) detects decision-relevant fragments, drafts a Decision note in the vault, gathers cross-vault context, and enforces the **anti-manipulation guardrails** in §12.4 — the rules that keep this from becoming a recommender system.
 
-This page is the user-facing manual for what the implementation actually does. It complements [`generation.md`](generation.md), which lists the CLI route, and [Ontology §12](../../00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md), which is the spec.
+This page is the user-facing manual for what the implementation actually does. It complements [`generation.md`](generation.md), which lists the CLI route, and [Ontology §12](../../docs/Ontology/creek_ontology_agent_prompt.md), which is the spec.
 
 ---
 
@@ -121,5 +121,5 @@ Drives the detector across `01-Fragments/`, drafts notes for newly-detected cand
 ## See also
 
 - [`generation.md`](generation.md) — broader generation surface, including `report --type decision`.
-- [Ontology §12](../../00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md) — full spec.
+- [Ontology §12](../../docs/Ontology/creek_ontology_agent_prompt.md) — full spec.
 - `creek/models.py:Decision`, `DecisionStatus`, `DecisionCandidate` — frontmatter schema.

@@ -79,8 +79,13 @@ purge_app = typer.Typer(
     name="purge",
     help="Right-to-be-forgotten deletion operations",
 )
+skills_app = typer.Typer(
+    name="skills",
+    help="Voice Skill Tree generation and schema-skill template sync.",
+)
 app.add_typer(clean_app, name="clean")
 app.add_typer(purge_app, name="purge")
+app.add_typer(skills_app, name="skills")
 console = Console()
 
 
@@ -337,45 +342,103 @@ def _run_ingest(
     return written, errors
 
 
+def _guard_vault_path(vault: Path, allow_in_repo: bool) -> None:
+    """Refuse vault paths inside a git repo unless ``--allow-in-repo`` (FEAT-019)."""
+    from creek.scaffold import find_enclosing_git_repo
+
+    enclosing = find_enclosing_git_repo(vault)
+    if enclosing is None:
+        return
+    if not allow_in_repo:
+        console.print(
+            f"[red]{vault} is inside a git repository ({enclosing}). "
+            "Personal vault data should not be version-controlled. "
+            "Pass --allow-in-repo to override.[/red]",
+        )
+        raise typer.Exit(code=1)
+    console.print(
+        f"[yellow]Warning: {vault} is inside a git repository "
+        f"({enclosing}). Personal data committed here will be tracked. "
+        "Proceeding under --allow-in-repo.[/yellow]",
+    )
+
+
 @app.command()
 def init(
-    vault: Path = typer.Option(..., help="Vault root to initialise"),
+    vault: Path = typer.Option(..., "--vault", help="Vault root to initialise"),
     force: bool = typer.Option(
         False,
         "--force",
         help="Overwrite an existing creek_config.yaml.",
     ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help=(
+            "Re-copy canonical templates (ontology, AGENTS.md, schema "
+            "skills, scaffold) into an existing vault. User data and "
+            "creek_config.yaml are preserved."
+        ),
+    ),
+    allow_in_repo: bool = typer.Option(
+        False,
+        "--allow-in-repo",
+        help=(
+            "Allow scaffolding inside a git repository. Off by default "
+            "to protect against accidental version-control of personal "
+            "vault data (FEAT-019)."
+        ),
+    ),
 ) -> None:
-    """Write a starter ``creek_config.yaml`` under the vault (ARCH-002).
+    """Scaffold a Creek vault at ``--vault <path>`` (FEAT-019 / ARCH-002).
 
-    A vault without a config silently picks up the built-in defaults,
-    which rarely match what a careful operator wants. ``creek init``
-    materialises a starter config at
-    ``<vault>/00-Creek-Meta/creek_config.yaml`` so the operator can
-    edit a real file with their own privacy / redaction / cleaning
+    Materialises the canonical folder topology, copies the ontology
+    spec, AGENTS.md, and the schema-skill tree into the user-chosen
+    vault, then writes a starter ``creek_config.yaml`` so the operator
+    can edit a real file with their own privacy / redaction / cleaning
     decisions before any ingestion runs.
 
-    Existing files are preserved unless ``--force`` is passed.
+    The user's vault lives wherever they want it (default suggestion:
+    ``~/Obsidian/Creek-Vault/``). It is NEVER inside this repository.
+    By default ``creek init`` refuses to scaffold inside a git repo;
+    pass ``--allow-in-repo`` to override.
+
+    ``--refresh`` re-copies canonical material into an existing vault
+    without touching user-edited content or ``creek_config.yaml``.
     """
     from creek.config import generate_default_config
+    from creek.scaffold import deploy_canonical
+
+    _guard_vault_path(vault, allow_in_repo)
 
     config_dir = vault / "00-Creek-Meta"
-    config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "creek_config.yaml"
-    if config_path.exists() and not force:
+
+    if not refresh and config_path.exists() and not force:
         console.print(
-            f"[yellow]{config_path} already exists; "
-            "pass --force to overwrite.[/yellow]",
+            f"[yellow]{config_path} already exists; pass --force to "
+            "overwrite or --refresh to update canonical templates only.[/yellow]",
         )
         raise typer.Exit(code=1)
-    generate_default_config(config_path)
-    console.print(
-        f"[bold green]Wrote starter config to {config_path}.[/bold green]",
-    )
-    console.print(
-        "[dim]Edit it before running [bold]creek process[/bold] — the "
-        "defaults are intentionally cautious.[/dim]",
-    )
+
+    result = deploy_canonical(vault)
+
+    if not refresh:
+        generate_default_config(config_path)
+        console.print(
+            f"[bold green]Vault scaffolded at {vault}.[/bold green] "
+            f"(folders: {result.folders_created}, skills: {result.skills_synced})",
+        )
+        console.print(
+            "[dim]Edit [bold]<vault>/00-Creek-Meta/creek_config.yaml[/bold] "
+            "before running [bold]creek process[/bold] — the defaults are "
+            "intentionally cautious.[/dim]",
+        )
+    else:
+        console.print(
+            f"[bold green]Refreshed canonical templates in {vault}.[/bold green] "
+            f"(skills: {result.skills_synced})",
+        )
 
 
 @app.command()
@@ -1157,8 +1220,8 @@ def gdrive(
     )
 
 
-@app.command()
-def skills(
+@skills_app.command("generate")
+def skills_generate(
     generate: bool = typer.Option(False, help="Generate voice skill files"),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     output: Path | None = typer.Option(None, help="Output path"),
@@ -1201,6 +1264,45 @@ def skills(
     console.print(
         f"[bold green]Voice Skill Tree generated ({len(written)} files) "
         f"at {output_dir}[/bold green]",
+    )
+
+
+@skills_app.command("sync")
+def skills_sync(
+    vault: Path = typer.Option(
+        ...,
+        "--vault",
+        help="Vault root whose schema-skill tree should be re-deployed.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite locally-modified skill files.",
+    ),
+) -> None:
+    """Re-deploy the canonical schema-skill tree into ``<vault>/00-Creek-Meta/Skills/``.
+
+    Pulls upstream changes from
+    ``creek-tools/creek/templates/skills/*.SKILL.md`` after upgrading
+    ``creek-tools``. Local edits to deployed skill files block the
+    overwrite unless ``--force`` is passed.
+    """
+    from creek.scaffold import deploy_skills, detect_drifted_skills
+
+    drifted = detect_drifted_skills(vault)
+    if drifted and not force:
+        names = ", ".join(p.name for p in drifted)
+        console.print(
+            f"[red]Refusing to sync: local changes detected in "
+            f"{len(drifted)} skill file(s): {names}. "
+            "Pass --force to overwrite.[/red]",
+        )
+        raise typer.Exit(code=1)
+
+    synced = deploy_skills(vault)
+    console.print(
+        f"[bold green]Synced {synced} skill file(s) to "
+        f"{vault / '00-Creek-Meta' / 'Skills'}.[/bold green]",
     )
 
 
