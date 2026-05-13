@@ -77,6 +77,9 @@ class MCPAuditLog:
         args: dict[str, Any],
         tier_ceiling: TierCeiling,
         consumer: str,
+        created_path: str | None = None,
+        created_tier: str | None = None,
+        affected_fragment_ids: list[str] | None = None,
     ) -> None:
         """Append one structured entry for an MCP tool call.
 
@@ -89,12 +92,25 @@ class MCPAuditLog:
                 ``"claude-code"``, ``"unknown"``) recording who invoked
                 the tool. CrawDad and Claude Code register distinct
                 values; unknown consumers fall back to ``"unknown"``.
+            created_path: Path of the file the tool produced
+                (FEAT-011 write-side field). Read tools pass ``None``.
+            created_tier: Privacy tier of the produced content
+                (FEAT-011 write-side field).
+            affected_fragment_ids: IDs of fragments touched by the call
+                (FEAT-011 write-side field). Stored as IDs, never as
+                bodies, so the audit log remains body-free.
         """
-        entry = {
+        entry: dict[str, Any] = {
             "tool": tool,
             "args_summary": summarise_args(args),
             "tier_ceiling": tier_ceiling.value,
             "consumer": consumer,
             "timestamp": datetime.now(tz=UTC).isoformat(),
         }
+        if created_path is not None:
+            entry["created_path"] = created_path
+        if created_tier is not None:
+            entry["created_tier"] = created_tier
+        if affected_fragment_ids is not None:
+            entry["affected_fragment_ids"] = list(affected_fragment_ids)
         self._audit.append(entry)

@@ -85,6 +85,19 @@ def tier_allowed(tier: PrivacyTier, ceiling: TierCeiling) -> bool:
     return _TIER_RANK[tier] <= _CEILING_RANK[ceiling]
 
 
+def write_tier_allowed(write_tier: PrivacyTier, ceiling: TierCeiling) -> bool:
+    """Return ``True`` when a *write_tier*-producing call is admissible.
+
+    Mirrors :func:`tier_allowed` but expresses the FEAT-011 write-side
+    rule explicitly: a write tool that *would create* content at tier
+    ``T`` requires the caller's ``privacy_tier_ceiling`` to admit ``T``.
+    A caller with ``ceiling=open`` cannot create ``personal`` /
+    ``intimate`` content via MCP; the write must be refused rather than
+    silently downgraded.
+    """
+    return tier_allowed(write_tier, ceiling)
+
+
 def refusal_response(
     *,
     tool: str,
