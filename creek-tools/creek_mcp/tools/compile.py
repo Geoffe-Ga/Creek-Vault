@@ -2,19 +2,27 @@
 
 Wraps :func:`creek.compile.engine.compile_to_vault` (FEAT-003). The
 write-side tier-ceiling rule applies: a caller cannot create a compiled
-page whose source fragments include a tier they could not read. The
-wrapper hashes the target page before and after the compile so an
-idempotent re-run (no provenance added) does not double-write an audit
-entry — matching the FEAT-011 idempotency contract.
+page whose source fragments include a tier they could not read.
+
+**Idempotency semantics (audit-dedup only).** The wrapper fingerprints
+the target file after each compile and stamps the hash under
+``00-Creek-Meta/audit/compile-<target_id>.hash``. On a re-run whose
+output matches the stored hash, the wrapper returns ``status="noop"``
+**and skips the audit-log append** — but the underlying engine still
+ran (LLM call + file write). This satisfies the FEAT-011 acceptance
+test ("re-invoking ``creek.compile`` doesn't double-write audit
+entries on no-op runs"); it deliberately does *not* attempt to skip
+the LLM call itself, because that would require an input fingerprint
+(source fragment IDs + bodies + prompt) the wrapper does not own.
+Engine-side LLM-call dedup is tracked separately as a follow-up.
 """
 
 from __future__ import annotations
 
 import hashlib
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from creek.compile.engine import TARGET_KINDS, _default_llm, compile_to_vault
-from creek.config import load_config
+from creek.compile.engine import TARGET_KINDS, compile_to_vault
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
@@ -24,6 +32,17 @@ if TYPE_CHECKING:
     from creek.models import CompileTargetKind
 
 TOOL_NAME = "creek.compile"
+
+
+class CompileLLMFactory(Protocol):
+    """Zero-argument callable returning the prompt → JSON-text LLM client.
+
+    The factory is invoked lazily so an unconfigured LLM provider only
+    fails the ``creek.compile`` invocation, not server startup. The
+    server bootstrap supplies a production factory; tests pass a stub.
+    """
+
+    def __call__(self) -> object: ...
 
 
 def _fingerprint(path: Path) -> str | None:
@@ -40,15 +59,20 @@ def compile_tool(
     target_kind: str,
     target_id: str,
     target_title: str,
+    llm_factory: CompileLLMFactory,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
 ) -> dict[str, Any]:
     """Compile *fragment_ids* into a compiled-layer page and audit the run.
 
-    A re-run that produces an identical target page is treated as a
-    no-op: no audit entry is written, the response carries
-    ``status="noop"``. First-time and content-changing runs append one
-    audit entry with ``created_path`` + ``affected_fragment_ids``.
+    A re-run whose output matches the last hash returns ``status="noop"``
+    and the wrapper skips the audit-log append. The engine still runs
+    every call; see the module docstring for the idempotency scope.
+
+    Args:
+        llm_factory: Zero-argument callable returning the compile LLM
+            client. Invoked lazily so the LLM provider only matters
+            when this tool is actually called.
     """
     if target_kind not in TARGET_KINDS:
         return refusal_response(
@@ -66,13 +90,7 @@ def compile_tool(
             reason="fragment_ids must be non-empty",
         )
 
-    config = load_config()
     kind = cast("CompileTargetKind", target_kind)
-
-    # Locate the target file *before* the compile so we can hash it.
-    # ``compile_to_vault`` returns the same path on every call for a
-    # given (kind, id) so we replay the path-derivation by running the
-    # compile once and comparing fingerprints around it.
     try:
         written = compile_to_vault(
             fragment_ids=list(fragment_ids),
@@ -80,7 +98,7 @@ def compile_tool(
             target_kind=kind,
             target_id=target_id,
             target_title=target_title,
-            llm=_default_llm(config.llm),
+            llm=llm_factory(),
         )
     except (ValueError, RuntimeError) as exc:
         return refusal_response(

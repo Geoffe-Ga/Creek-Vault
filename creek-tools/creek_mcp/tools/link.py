@@ -52,13 +52,14 @@ def link_tool(
         method=method,
         rebuild=rebuild,
     )
+    # Linking updates existing artefacts in place; no new file is
+    # produced, so ``created_path`` is omitted per the audit-schema
+    # convention documented in docs/mcp.md.
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={"method": method, "rebuild": rebuild},
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
-        created_path="01-Fragments",
-        created_tier=None,
         affected_fragment_ids=[],
     )
     return {

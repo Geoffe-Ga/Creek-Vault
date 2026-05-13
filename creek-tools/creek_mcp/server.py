@@ -75,12 +75,26 @@ def _build_draft_llm() -> Callable[[str], str]:
     return classifier.invoke_prompt
 
 
+def _build_compile_llm() -> Callable[[str], str]:
+    """Return the compile-side LLM callable, mirroring ``creek compile``.
+
+    Lazy import so the server still boots when the LLM provider is not
+    configured; only ``creek.compile`` then fails. Calls into the CLI's
+    private factory rather than re-deriving the configuration so the
+    behaviour stays in lock-step with ``creek compile``.
+    """
+    from creek.compile.engine import _default_llm as _engine_default_llm
+
+    return _engine_default_llm(load_config().llm)
+
+
 def build_server(
     *,
     vault_path: Path | None = None,
     draft_llm_factory: Callable[[], Callable[[str], str]] | None = None,
+    compile_llm_factory: Callable[[], Callable[[str], str]] | None = None,
 ) -> FastMCP:
-    """Construct a :class:`FastMCP` instance with all five FEAT-010 tools.
+    """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
     Args:
         vault_path: Override vault root. Defaults to
@@ -89,11 +103,15 @@ def build_server(
         draft_llm_factory: Optional factory for the draft LLM. The
             factory is invoked lazily so only ``creek.draft`` needs an
             LLM provider.
+        compile_llm_factory: Optional factory for the compile LLM.
+            Invoked lazily so only ``creek.compile`` needs an LLM
+            provider.
     """
     server: FastMCP = FastMCP(SERVER_NAME)
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
     factory = draft_llm_factory or _build_draft_llm
+    compile_factory = compile_llm_factory or _build_compile_llm
 
     @server.tool(name="creek.state.read")
     def _state_read(
@@ -276,6 +294,7 @@ def build_server(
             target_kind=target_kind,
             target_id=target_id,
             target_title=target_title,
+            llm_factory=compile_factory,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )

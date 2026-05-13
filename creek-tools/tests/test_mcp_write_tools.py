@@ -178,6 +178,29 @@ def test_save_refuses_when_tier_exceeds_ceiling(vault: Path) -> None:
     assert body not in raw
 
 
+def test_save_success_path_does_not_embed_body(vault: Path) -> None:
+    """Success path must not stash the body verbatim in ``mcp.jsonl``.
+
+    Regression for PR #228 review: a body shorter than the
+    ``summarise_args`` 64-char threshold previously rode along
+    verbatim because the success-path audit dict carried ``body=body``.
+    The fix records ``body_len`` instead, mirroring the refusal path.
+    """
+    body = "secret answer"  # short — would NOT be truncated by summarise_args.
+    save_tool(
+        vault_path=vault,
+        target="thread",
+        body=body,
+        title="Saved insight",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    raw = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    assert body not in raw
+    entry = _read_audit(vault)[0]
+    assert entry["args_summary"]["body_len"] == len(body)
+
+
 def test_save_refuses_unknown_target(vault: Path) -> None:
     """An unknown ``target`` returns a structured refusal."""
     result = save_tool(
@@ -442,6 +465,11 @@ def test_skills_refresh_writes_audit_entry(vault: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _noop_llm_factory() -> object:
+    """Return a deterministic stub LLM for compile-tool tests."""
+    return lambda _prompt: "{}"
+
+
 def test_compile_refuses_unknown_target_kind(vault: Path) -> None:
     """An unknown target_kind returns a structured refusal."""
     result = compile_tool(
@@ -450,6 +478,7 @@ def test_compile_refuses_unknown_target_kind(vault: Path) -> None:
         target_kind="not-a-kind",
         target_id="x",
         target_title="x",
+        llm_factory=_noop_llm_factory,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "refused"
@@ -464,6 +493,7 @@ def test_compile_refuses_empty_fragment_ids(vault: Path) -> None:
         target_kind="thread",
         target_id="x",
         target_title="x",
+        llm_factory=_noop_llm_factory,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "refused"
@@ -493,10 +523,7 @@ def test_compile_writes_audit_then_noop_on_re_run(
         "creek_mcp.tools.compile.compile_to_vault",
         _stub_compile,
     )
-    monkeypatch.setattr(
-        "creek_mcp.tools.compile._default_llm",
-        lambda _llm_cfg: lambda _prompt: "{}",
-    )
+    stub_factory = lambda: lambda _prompt: "{}"  # noqa: E731
 
     first = compile_tool(
         vault_path=vault,
@@ -504,6 +531,7 @@ def test_compile_writes_audit_then_noop_on_re_run(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
+        llm_factory=stub_factory,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert first["status"] == "ok"
@@ -516,6 +544,7 @@ def test_compile_writes_audit_then_noop_on_re_run(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
+        llm_factory=stub_factory,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert second["status"] == "noop"
@@ -536,16 +565,13 @@ def test_compile_propagates_engine_errors_as_refusal(
         raise ValueError(msg)
 
     monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _broken)
-    monkeypatch.setattr(
-        "creek_mcp.tools.compile._default_llm",
-        lambda _llm_cfg: lambda _prompt: "{}",
-    )
     result = compile_tool(
         vault_path=vault,
         fragment_ids=["frag-1"],
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
+        llm_factory=lambda: lambda _prompt: "{}",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "refused"

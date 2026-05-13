@@ -68,11 +68,7 @@ def save_tool(
     if not write_tier_allowed(save_tier, privacy_tier_ceiling):
         MCPAuditLog(vault_path).append(
             tool=TOOL_NAME,
-            args={
-                "target": target,
-                "tier": tier,
-                "body_len": len(body),
-            },
+            args={"target": target, "tier": tier, "body_len": len(body)},
             tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )
@@ -101,7 +97,7 @@ def save_tool(
             "target": target,
             "tier": tier,
             "title": title,
-            "body": body,
+            "body_len": len(body),
         },
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,

@@ -137,11 +137,22 @@ schema:
 ```
 
 `created_path` is the relative path of the produced file (or the
-container directory for batch tools); `created_tier` is the tier the
-content was written at; `affected_fragment_ids` is an ID list — never
-fragment bodies. `creek.compile` skips the audit append on no-op
-re-runs (idempotent per FEAT-003), so the audit log never grows when
-a re-compile produces an identical target page.
+container directory for batch tools like `creek.skills.refresh`);
+`created_tier` is the tier the content was written at;
+`affected_fragment_ids` is an ID list — never fragment bodies. Tools
+that update artefacts **in place** (`creek.classify`, `creek.link`) do
+not produce new files, so they omit `created_path` and `created_tier`
+from their audit entry.
+
+For tools that accept a `body` argument (`creek.save`), the audit entry
+records `body_len` rather than `body` — on both the success and the
+refusal path — so a fragment body never lands in `mcp.jsonl` verbatim,
+regardless of length.
+
+`creek.compile` skips the audit append on no-op re-runs (idempotent
+per FEAT-003) — the engine still runs (the LLM call is not yet
+skipped), but the audit log does not grow when a re-compile produces
+an identical target page.
 
 ## Troubleshooting
 
