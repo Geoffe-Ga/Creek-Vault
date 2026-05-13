@@ -19,6 +19,7 @@
 # --- Explicitly tracked directories ---
 !.claude/
 !.github/
+!crawdad/
 !creek-tools/
 !plans/
 **/git-issues/
