@@ -427,7 +427,8 @@ def init(
         generate_default_config(config_path)
         console.print(
             f"[bold green]Vault scaffolded at {vault}.[/bold green] "
-            f"(folders: {result.folders_created}, skills: {result.skills_synced})",
+            f"(folders ensured: {result.folders_ensured}, "
+            f"skills: {result.skills_synced})",
         )
         console.print(
             "[dim]Edit [bold]<vault>/00-Creek-Meta/creek_config.yaml[/bold] "

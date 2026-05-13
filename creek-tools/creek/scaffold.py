@@ -31,7 +31,7 @@ ONTOLOGY_SPEC_FILE = REPO_ROOT / "docs" / "Ontology" / "creek_ontology_agent_pro
 class ScaffoldResult:
     """Summary of what a scaffold/refresh deployment touched."""
 
-    folders_created: int
+    folders_ensured: int
     skills_synced: int
     ontology_deployed: bool
     agents_deployed: bool
@@ -71,10 +71,13 @@ def scaffold_vault(vault: Path) -> int:
         vault: Target vault root.
 
     Returns:
-        The number of directories that exist in the scaffold tree.
+        The number of canonical directories ensured to exist. This is
+        the count of directories defined in the template — a stable
+        number that does not depend on whether the vault is fresh or
+        being refreshed.
     """
     shutil.copytree(VAULT_TEMPLATE_DIR, vault, dirs_exist_ok=True)
-    return sum(1 for _ in vault.rglob("*") if _.is_dir())
+    return sum(1 for entry in VAULT_TEMPLATE_DIR.rglob("*") if entry.is_dir())
 
 
 def deploy_skills(vault: Path) -> int:
@@ -96,17 +99,20 @@ def deploy_skills(vault: Path) -> int:
 
 
 def detect_drifted_skills(vault: Path) -> list[Path]:
-    """Return deployed skill files whose contents diverge from canonical.
+    """Return *deployed* skill paths whose bytes diverge from the canonical template.
 
     A skill file is considered *drifted* when it exists in the user's
     vault but its bytes differ from the canonical template. Missing
-    files are not drift — they are simply pending sync.
+    files are not drift — they are simply pending sync. The returned
+    paths point at the *deployed* copies (under
+    ``<vault>/00-Creek-Meta/Skills/``) so callers can surface them
+    directly to the operator.
 
     Args:
         vault: Target vault root.
 
     Returns:
-        The list of drifted deployed skill paths (sorted by name).
+        The list of drifted *deployed* skill paths (sorted by name).
     """
     target = vault / "00-Creek-Meta" / "Skills"
     if not target.exists():
@@ -168,7 +174,7 @@ def deploy_canonical(vault: Path) -> ScaffoldResult:
     ontology = deploy_ontology(vault)
     agents = deploy_agents_md(vault)
     return ScaffoldResult(
-        folders_created=folders,
+        folders_ensured=folders,
         skills_synced=synced,
         ontology_deployed=ontology,
         agents_deployed=agents,

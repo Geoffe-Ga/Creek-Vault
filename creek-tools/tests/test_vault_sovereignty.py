@@ -282,6 +282,27 @@ def test_init_refresh_overwrites_canonical_material(tmp_path: Path) -> None:
     assert user_note.read_text(encoding="utf-8") == "dear diary\n"
 
 
+def test_init_refresh_preserves_user_content_across_topology(tmp_path: Path) -> None:
+    """``--refresh`` leaves user-authored files alone across every vault subtree."""
+    vault = tmp_path / "vault"
+    runner.invoke(app, ["init", "--vault", str(vault)])
+
+    user_files = {
+        vault / "01-Fragments" / "Journal" / "2026-05-13.md": "morning pages\n",
+        vault / "02-Threads" / "Active" / "thread-a.md": "active narrative\n",
+        vault / "04-Praxis" / "Daily" / "ritual.md": "rise and shine\n",
+        vault / "07-Voice" / "Drafts" / "essay.md": "first sentence\n",
+    }
+    for path, body in user_files.items():
+        path.write_text(body, encoding="utf-8")
+
+    refresh = runner.invoke(app, ["init", "--vault", str(vault), "--refresh"])
+    assert refresh.exit_code == 0, refresh.output
+
+    for path, body in user_files.items():
+        assert path.read_text(encoding="utf-8") == body, f"refresh mutated {path}"
+
+
 def test_init_does_not_overwrite_user_config_without_force(tmp_path: Path) -> None:
     """The existing config-preservation contract still holds."""
     vault = tmp_path / "vault"
