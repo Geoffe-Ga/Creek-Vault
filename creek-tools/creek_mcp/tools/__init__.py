@@ -1,15 +1,29 @@
-"""MCP tool implementations exposed by ``creek_mcp.server`` (FEAT-010)."""
+"""MCP tool implementations exposed by ``creek_mcp.server`` (FEAT-010/011)."""
 
+from creek_mcp.tools.classify import classify_tool
+from creek_mcp.tools.compile import compile_tool
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.ingest import ingest_tool
+from creek_mcp.tools.link import link_tool
 from creek_mcp.tools.lint import lint_tool
 from creek_mcp.tools.mine import mine_tool
+from creek_mcp.tools.report import report_tool
+from creek_mcp.tools.save import save_tool
+from creek_mcp.tools.skills import skills_refresh_tool
 from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
 
 __all__ = [
+    "classify_tool",
+    "compile_tool",
     "draft_tool",
+    "ingest_tool",
+    "link_tool",
     "lint_tool",
     "mine_tool",
+    "report_tool",
+    "save_tool",
+    "skills_refresh_tool",
     "state_read_tool",
     "state_render_tool",
 ]

@@ -17,6 +17,8 @@ interactively will appear to hang, which is correct.
 
 ## Tools
 
+### Read tools (FEAT-010)
+
 | Tool                  | Purpose                                                    |
 |-----------------------|------------------------------------------------------------|
 | `creek.state.read`    | Return the latest `00-Creek-Meta/State/latest.md` content. |
@@ -25,8 +27,19 @@ interactively will appear to hang, which is correct.
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
 
-FEAT-011 adds write tools (`save`, `ingest`, `classify`, `link`,
-`report`, `skills.generate`); FEAT-012 adds `purge.*`.
+### Write tools (FEAT-011)
+
+| Tool                    | Inputs                                                      | Write-side tier rule                                              |
+|-------------------------|-------------------------------------------------------------|-------------------------------------------------------------------|
+| `creek.save`            | `target`, `body`, `title?`, `tier`, `provenance?`           | Caller's `ceiling` must admit `tier` — intimate via open refused. |
+| `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused.     |
+| `creek.classify`        | `method` (`rules`\|`llm`), `force`                          | Rewrites in place; no new tier produced — any ceiling permitted.  |
+| `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`), `rebuild`    | Links existing artefacts in place — any ceiling permitted.        |
+| `creek.report`          | `report_type` (`tags`\|`voice`)                             | Renders a vault-state report — any ceiling permitted.             |
+| `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars already excluded.      |
+| `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Idempotent per FEAT-003; no-op re-runs do not log a duplicate.    |
+
+FEAT-012 adds `purge.*` and consent-elevated paths.
 
 Every tool requires a `privacy_tier_ceiling` parameter
 (`open` | `personal` | `intimate` | `all`); default is `open`. Note
@@ -37,6 +50,16 @@ personal allowed) → `intimate` (everything self-authored) → `all`
 (every tier including unclassified). Content above the ceiling is
 omitted or returned as a title-only stub — the ceiling cannot be
 bypassed by the caller.
+
+### Write-side tier-ceiling rule (FEAT-011)
+
+A write tool that would *create* content at tier `T` requires the
+caller's `privacy_tier_ceiling` to admit `T`. So `creek.save` with
+`ceiling=open` and `tier=intimate` is refused with `status="refused"`
+rather than silently downgraded — the body never lands in the vault
+and the audit entry records the refusal without the body. The same
+gate applies to `creek.ingest` because the default ingestor tier is
+`personal`.
 
 ## Claude Code
 
@@ -94,6 +117,31 @@ dicts become `{"keys": [...]}`. A draft request for an
 `intimate`-tier fragment never leaks the body into the audit
 trail. Hash chaining is provided by `creek.audit.AuditLog`; FEAT-012's
 hardening pass extends the entry shape, not the storage layer.
+
+#### Write-tool audit fields (FEAT-011)
+
+Write-tool entries add three optional fields on top of the read-tool
+schema:
+
+```json
+{
+  "tool": "creek.save",
+  "args_summary": {"target": "thread", "tier": "open", "body": {"len": 4096}},
+  "tier_ceiling": "open",
+  "consumer": "crawdad",
+  "timestamp": "2026-05-12T12:34:56+00:00",
+  "created_path": "02-Threads/Active/2026-05-12-saved-thread.md",
+  "created_tier": "open",
+  "affected_fragment_ids": ["frag-a", "frag-b"]
+}
+```
+
+`created_path` is the relative path of the produced file (or the
+container directory for batch tools); `created_tier` is the tier the
+content was written at; `affected_fragment_ids` is an ID list — never
+fragment bodies. `creek.compile` skips the audit append on no-op
+re-runs (idempotent per FEAT-003), so the audit log never grows when
+a re-compile produces an identical target page.
 
 ## Troubleshooting
 

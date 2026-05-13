@@ -1,9 +1,10 @@
-"""creek-tools MCP server bootstrap (FEAT-010).
+"""creek-tools MCP server bootstrap (FEAT-010/011).
 
 Stdio transport per the FEAT-010 pre-decided choice. Five read tools
-land in this PR — ``creek.state.read``, ``creek.state.render``,
-``creek.lint``, ``creek.mine``, and ``creek.draft`` — plus the
-audit-log + tier-ceiling substrate they share.
+landed in FEAT-010; FEAT-011 adds seven write tools — ``creek.save``,
+``creek.ingest``, ``creek.classify``, ``creek.link``, ``creek.report``,
+``creek.skills.refresh``, and ``creek.compile``. All share the same
+audit-log + tier-ceiling substrate.
 
 The bootstrap is a single function so it can be exercised by unit
 tests (``build_server``) and serve as the ``creek-tools-mcp`` entry
@@ -20,8 +21,15 @@ from mcp.server.fastmcp import FastMCP
 from creek.config import load_config
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import (
+    classify_tool,
+    compile_tool,
+    ingest_tool,
+    link_tool,
     lint_tool,
     mine_tool,
+    report_tool,
+    save_tool,
+    skills_refresh_tool,
     state_read_tool,
     state_render_tool,
 )
@@ -152,6 +160,123 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.save")
+    def _save(
+        target: str,
+        body: str,
+        title: str | None = None,
+        tier: str = "open",
+        provenance: list[str] | None = None,
+        source_kind: str = "mcp",
+        source_id: str | None = None,
+        saved_by: str = "mcp",
+        full_body: bool = False,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Save a Discord/Claude answer back into the vault."""
+        return save_tool(
+            vault_path=vault,
+            target=target,
+            body=body,
+            title=title,
+            tier=tier,
+            provenance=provenance,
+            source_kind=source_kind,
+            source_id=source_id,
+            saved_by=saved_by,
+            full_body=full_body,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.ingest")
+    def _ingest(
+        source_type: str,
+        input_path: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Ingest a single source into the vault."""
+        return ingest_tool(
+            vault_path=vault,
+            source_type=source_type,
+            input_path=input_path,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.classify")
+    def _classify(
+        method: str = "rules",
+        force: bool = False,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Re-classify existing fragments via rules or LLM."""
+        return classify_tool(
+            vault_path=vault,
+            method=method,
+            force=force,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.link")
+    def _link(
+        method: str = "embeddings",
+        rebuild: bool = False,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Run a single linker stage."""
+        return link_tool(
+            vault_path=vault,
+            method=method,
+            rebuild=rebuild,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.report")
+    def _report(
+        report_type: str = "tags",
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Generate a vault-state report (``tags`` or ``voice``)."""
+        return report_tool(
+            vault_path=vault,
+            report_type=report_type,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.skills.refresh")
+    def _skills_refresh(
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Regenerate the voice-skill tree."""
+        return skills_refresh_tool(
+            vault_path=vault,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.compile")
+    def _compile(
+        fragment_ids: list[str],
+        target_kind: str,
+        target_id: str,
+        target_title: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Roll fragments up into a compiled-layer page (FEAT-003)."""
+        return compile_tool(
+            vault_path=vault,
+            fragment_ids=fragment_ids,
+            target_kind=target_kind,
+            target_id=target_id,
+            target_title=target_title,
+            privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )
 
