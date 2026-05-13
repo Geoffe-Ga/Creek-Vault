@@ -38,6 +38,17 @@ class LLMConfig(BaseModel):
     max_concurrent: int = 5
     """Maximum number of concurrent LLM requests."""
 
+    unclassified_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    """Per-dimension confidence floor below which Mode / Orientation /
+    Dosage default to ``unclassified`` rather than the model's pick (FEAT-017).
+
+    Frequency, Phase, and Voice Register are not gated by this knob —
+    they are more stable signals empirically and using them is the
+    point of having an LLM pass at all. The 0.55 default is deliberately
+    lenient; tighten it once a calibration set exists (FEAT-017b) and
+    the per-dimension agreement rate on your corpus is known.
+    """
+
 
 class EmbeddingsConfig(BaseModel):
     """Embedding model configuration."""

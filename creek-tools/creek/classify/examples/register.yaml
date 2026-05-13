@@ -1,0 +1,38 @@
+# Few-shot examples for Voice Register.
+# Registers: confessional | analytical | playful | prophetic | instructional | raw | conversational
+- title: What I have not told anyone
+  body: I have been afraid of this for months and I have not said it out loud.
+    I am saying it now because the silence is heavier than the truth.
+  label: confessional
+  rationale: First-person disclosure of a withheld interior; vulnerability is the
+    point.
+- title: Why the rollout failed
+  body: Three factors compounded. The dependency graph had a cycle, the
+    rollback path was untested, and the on-call rota had a gap.
+  label: analytical
+  rationale: Dispassionate breakdown of causes; structure over feeling.
+- title: The cat negotiations
+  body: She wants the chair, I want the chair, the chair has opinions about who
+    deserves the chair. Diplomacy is ongoing.
+  label: playful
+  rationale: Lightness and wordplay; the form is the texture.
+- title: What the next decade demands
+  body: The systems we built will not survive the conditions we built them for.
+    We will either rebuild them or be rebuilt by what comes.
+  label: prophetic
+  rationale: Future-tense, declarative, weight-bearing; not a forecast, a call.
+- title: How to set up the dev env
+  body: Clone the repo. Run ./scripts/setup.sh. Source the venv. If pre-commit
+    fails, run pre-commit install once and try again.
+  label: instructional
+  rationale: Imperative, sequential, transferable; pedagogy is the point.
+- title: It is two in the morning
+  body: Everything I write tonight is going to be wrong. I am writing anyway
+    because I cannot sleep and the inside of my head will not be quiet.
+  label: raw
+  rationale: Unfiltered, unedited, present-tense affect.
+- title: Coffee with M
+  body: We caught up. She is well. I told her about the move and she laughed
+    in the good way.
+  label: conversational
+  rationale: Companionable, low-stakes, register of catching up.

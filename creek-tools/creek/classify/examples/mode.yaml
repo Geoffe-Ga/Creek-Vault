@@ -1,0 +1,27 @@
+# Few-shot examples for engagement Mode.
+# Modes: inhabit | express | collaborate | integrate | absorb
+- title: Just being with the grief
+  body: I did not journal it or talk it out. I let it be there with me and went
+    about the day with it close.
+  label: inhabit
+  rationale: Inside the felt experience without externalising; living-in.
+- title: Speaking the speech
+  body: I wrote the keynote in one sitting, said it out loud twice, then walked
+    onstage and delivered it as written.
+  label: express
+  rationale: Outward articulation of an internal state; voice-forward.
+- title: Working out a design with R
+  body: We sketched the schema on a napkin, took turns poking holes, and now we
+    both know what we are building.
+  label: collaborate
+  rationale: Joint construction with a peer; neither person alone produced it.
+- title: After the workshop
+  body: I am chewing on what L said about boundaries. It connects to the therapy
+    homework and to the disagreement I had at work last week.
+  label: integrate
+  rationale: Cross-context synthesis; pulling threads together internally.
+- title: Reading without taking notes
+  body: I read the chapter, set the book down, and let it sit. I do not want to
+    summarise it. I want it to soak.
+  label: absorb
+  rationale: Receptive uptake; no output, no analysis, just intake.

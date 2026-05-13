@@ -1,0 +1,52 @@
+# Few-shot examples for APTITUDE frequency classification (F1..F10).
+# Each entry: title (short), body (representative excerpt), label (one of F1..F10), rationale (why).
+- title: Locked out again
+  body: My keys are gone and I cannot get into the apartment tonight. Stomach is in
+    a knot. I keep checking my pockets like that will change something.
+  label: F1
+  rationale: Bodily safety and shelter rupture; survival texture, not strategy.
+- title: Team retro
+  body: We circled the same complaint three times and never landed. People want to
+    belong to a competent group more than they want to be right.
+  label: F2
+  rationale: Tribal-belonging concern; whose group, whose loyalty.
+- title: Saying no to the contract
+  body: I am the one with the authority to walk away. If I do not exercise it now,
+    I never will.
+  label: F3
+  rationale: Power and agency over a decision; F3 is about owning the choice.
+- title: Inbox triage rules
+  body: I need three folders, a daily clearing time, and a hard rule about not
+    checking after 7pm. Order will save me here.
+  label: F4
+  rationale: Order and structure as the medicine for the problem.
+- title: Roadmap stake
+  body: If the launch slips past Q3 the whole funding round shifts. I have to plan
+    backwards from the demo date.
+  label: F5
+  rationale: Achievement and strategy under a deadline; explicit goal framing.
+- title: Sitting with grief
+  body: She just needed someone to be in the room while she cried. I did not try
+    to fix anything.
+  label: F6
+  rationale: Community and empathy without a fix; presence as the gift.
+- title: Wiring two services
+  body: The auth proxy and the billing API have to agree on the customer ID space.
+    The whole system breaks otherwise.
+  label: F7
+  rationale: Integration of multiple systems; thinking in interfaces.
+- title: Watershed walk
+  body: The creek I grew up beside is gone. The aquifer it fed is the same one
+    under the new development.
+  label: F8
+  rationale: Ecological holism; the personal and the planetary as one body.
+- title: Just watching
+  body: I sat on the back step and the cat came over. I did not need anything
+    to happen.
+  label: F9
+  rationale: Witness mode, being rather than doing.
+- title: One thing
+  body: There is no separation between the dishwasher humming and the question
+    I am sitting with.
+  label: F10
+  rationale: Non-dual, unity texture; F10 collapses subject and object.

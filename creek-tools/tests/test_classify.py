@@ -577,9 +577,10 @@ class TestBuildPromptSanitisation:
         huge = "x" * (32 * 1024)
         frag = _make_fragment(title="ok")
         prompt = classifier._build_prompt(frag, content=huge)
-        # Cap is 8 KiB plus a few hundred chars of prompt header.
+        # FEAT-017: 8 KiB content cap + ~3 KiB CoT header + ~5 KiB
+        # rotated few-shot examples block (capped per fixture body too).
         assert len(prompt) < len(huge)
-        assert len(prompt) <= 8192 + 4096
+        assert len(prompt) <= 8192 + 8192
 
 
 # ---- Apply Classification ----
@@ -2068,3 +2069,241 @@ class TestMatchConfidenceNoDeadCode:
             "",
         )
         assert isinstance(result, Confidence)
+
+
+# ---- FEAT-017a: two-step pipeline, reasoning, unclassified bias ----
+
+
+_REASONING_PROSE: str = (
+    "I read this as F3 because the operator names walking away from "
+    "the contract. Rising phase, express mode, do orientation, medicine "
+    "dosage, analytical register, forming confidence."
+)
+
+_RESPONSE_WITH_REASONING: str = (
+    _REASONING_PROSE
+    + "\n\n```yaml\n"
+    + _VALID_YAML_RESPONSE
+    + "confidence_scores:\n"
+    + "  mode: 0.9\n"
+    + "  orientation: 0.9\n"
+    + "  dosage: 0.9\n"
+    + "```\n"
+)
+
+
+class TestPromptHasFewShotAndThreshold:
+    """The FEAT-017 prompt embeds the few-shot block and the threshold."""
+
+    def test_prompt_contains_few_shot_dimension_headings(self) -> None:
+        """Each dimension that has examples is named in the rendered prompt."""
+        classifier = LLMClassifier(config=LLMConfig())
+        prompt = classifier._build_prompt(_make_fragment())
+        assert "Frequency examples" in prompt
+        assert "Phase examples" in prompt
+        assert "Mode examples" in prompt
+        assert "Dosage examples" in prompt
+        assert "Register examples" in prompt
+
+    def test_prompt_renders_threshold(self) -> None:
+        """The threshold the model is asked to honour is shown verbatim."""
+        classifier = LLMClassifier(
+            config=LLMConfig(unclassified_threshold=0.6),
+        )
+        prompt = classifier._build_prompt(_make_fragment())
+        assert "0.60" in prompt
+
+    def test_prompt_is_deterministic_per_fragment_id(self) -> None:
+        """A given fragment ID always picks the same few-shot examples."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        first = classifier._build_prompt(frag)
+        second = classifier._build_prompt(frag)
+        assert first == second
+
+
+class TestSplitReasoningAndYaml:
+    """`_split_reasoning_and_yaml` handles the three response shapes."""
+
+    def test_fenced_block_separates_reasoning(self) -> None:
+        """A fenced YAML block extracts reasoning preamble from prose."""
+        from creek.classify.llm import _split_reasoning_and_yaml
+
+        reasoning, yaml_text = _split_reasoning_and_yaml(_RESPONSE_WITH_REASONING)
+        assert "F3 because" in reasoning
+        assert "frequency:" in yaml_text
+        assert "```" not in yaml_text
+
+    def test_bare_yaml_after_prose_is_split(self) -> None:
+        """Reasoning followed by bare YAML (no fences) still splits."""
+        from creek.classify.llm import _split_reasoning_and_yaml
+
+        raw = "Some musing then the answer.\n\n" + _VALID_YAML_RESPONSE
+        reasoning, yaml_text = _split_reasoning_and_yaml(raw)
+        assert reasoning == "Some musing then the answer."
+        assert yaml_text.startswith("frequency:")
+
+    def test_pure_yaml_returns_empty_reasoning(self) -> None:
+        """Backwards-compat: a pre-FEAT-017 pure-YAML response yields no trace."""
+        from creek.classify.llm import _split_reasoning_and_yaml
+
+        reasoning, yaml_text = _split_reasoning_and_yaml(_VALID_YAML_RESPONSE)
+        assert reasoning == ""
+        assert yaml_text.startswith("frequency:")
+
+
+class TestClassifyWithReasoning:
+    """`classify_with_reasoning` returns Fragment plus a reasoning trace."""
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_returns_reasoning_when_model_provides_one(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """A fenced response yields the prose preamble in ``reasoning``."""
+        mock_call.return_value = _RESPONSE_WITH_REASONING
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        result = classifier.classify_with_reasoning(_make_fragment())
+        assert result.fragment.frequency.primary == Frequency.F3
+        assert "F3 because" in result.reasoning
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_returns_empty_reasoning_for_pure_yaml(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The pre-FEAT-017 pure-YAML response shape still works (empty trace)."""
+        mock_call.return_value = _VALID_YAML_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        result = classifier.classify_with_reasoning(_make_fragment())
+        assert result.fragment.frequency.primary == Frequency.F3
+        assert result.reasoning == ""
+
+    def test_returns_unchanged_when_unavailable(self) -> None:
+        """An unavailable provider yields the fragment unchanged + empty trace."""
+        classifier = _make_classifier_unavailable(LLMClassifier(config=LLMConfig()))
+        frag = _make_fragment()
+        result = classifier.classify_with_reasoning(frag)
+        assert result.fragment is frag
+        assert result.reasoning == ""
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    @patch("creek.classify.llm.time.sleep")
+    def test_returns_empty_reasoning_after_retries_exhausted(
+        self,
+        _mock_sleep: MagicMock,
+        mock_call: MagicMock,
+    ) -> None:
+        """All-retries-failed yields the original fragment + empty trace."""
+        mock_call.side_effect = httpx.ConnectError("fail")
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        classifier.MAX_RETRIES = 2
+        result = classifier.classify_with_reasoning(_make_fragment())
+        assert result.reasoning == ""
+
+
+class TestUnclassifiedBias:
+    """FEAT-017 default-unclassified bias for Mode / Orientation / Dosage."""
+
+    def _yaml_with_scores(self, **scores: float) -> str:
+        """Return a YAML payload that picks all dimensions then declares scores."""
+        score_block = "\n".join(f"  {k}: {v}" for k, v in scores.items())
+        return _VALID_YAML_RESPONSE + "confidence_scores:\n" + score_block + "\n"
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_low_mode_confidence_forces_unclassified(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """A mode confidence below the threshold downgrades to unclassified."""
+        mock_call.return_value = self._yaml_with_scores(
+            mode=0.3,
+            orientation=0.9,
+            dosage=0.9,
+        )
+        classifier = _make_classifier_available(
+            LLMClassifier(config=LLMConfig(unclassified_threshold=0.55)),
+        )
+        result = classifier.classify(_make_fragment())
+        assert result.wavelength.mode == Mode.UNCLASSIFIED
+        # Phase / Frequency / Register are not gated.
+        assert result.wavelength.phase == Phase.RISING
+        assert result.frequency.primary == Frequency.F3
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_high_confidence_preserves_pick(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """A model-reported confidence at-or-above threshold keeps the model's pick."""
+        mock_call.return_value = self._yaml_with_scores(
+            mode=0.9,
+            orientation=0.9,
+            dosage=0.9,
+        )
+        classifier = _make_classifier_available(
+            LLMClassifier(config=LLMConfig(unclassified_threshold=0.55)),
+        )
+        result = classifier.classify(_make_fragment())
+        assert result.wavelength.mode == Mode.EXPRESS
+        assert result.wavelength.orientation == Orientation.DO
+        assert result.wavelength.dosage == Dosage.MEDICINE
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_bias_applies_to_orientation_and_dosage(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """Low orientation + dosage confidences both downgrade independently."""
+        mock_call.return_value = self._yaml_with_scores(
+            mode=0.9,
+            orientation=0.2,
+            dosage=0.4,
+        )
+        classifier = _make_classifier_available(
+            LLMClassifier(config=LLMConfig(unclassified_threshold=0.55)),
+        )
+        result = classifier.classify(_make_fragment())
+        assert result.wavelength.mode == Mode.EXPRESS
+        assert result.wavelength.orientation == Orientation.UNCLASSIFIED
+        assert result.wavelength.dosage == Dosage.UNCLASSIFIED
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_missing_confidence_score_keeps_model_pick(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """Without a confidence_scores block, the model's pick is unchanged."""
+        mock_call.return_value = _VALID_YAML_RESPONSE
+        classifier = _make_classifier_available(
+            LLMClassifier(config=LLMConfig(unclassified_threshold=0.55)),
+        )
+        result = classifier.classify(_make_fragment())
+        assert result.wavelength.mode == Mode.EXPRESS
+        assert result.wavelength.orientation == Orientation.DO
+
+    @patch.object(LLMClassifier, "_call_ollama")
+    def test_unparseable_confidence_keeps_model_pick(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """A non-numeric confidence value is treated as 'no score reported'."""
+        mock_call.return_value = (
+            _VALID_YAML_RESPONSE + "confidence_scores:\n  mode: not-a-number\n"
+        )
+        classifier = _make_classifier_available(
+            LLMClassifier(config=LLMConfig(unclassified_threshold=0.55)),
+        )
+        result = classifier.classify(_make_fragment())
+        assert result.wavelength.mode == Mode.EXPRESS
+
+    def test_phase_is_not_gated_even_at_zero_confidence(self) -> None:
+        """Phase has no entry in :data:`_BIASED_DIMENSIONS`; the bias must skip it."""
+        from creek.classify.llm import _BIASED_DIMENSIONS
+
+        assert "phase" not in _BIASED_DIMENSIONS
+        assert "frequency" not in _BIASED_DIMENSIONS
+        assert "voice_register" not in _BIASED_DIMENSIONS
+        assert "mode" in _BIASED_DIMENSIONS
+        assert "orientation" in _BIASED_DIMENSIONS
+        assert "dosage" in _BIASED_DIMENSIONS
