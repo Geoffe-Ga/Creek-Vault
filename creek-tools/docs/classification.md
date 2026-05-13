@@ -101,6 +101,41 @@ llm:
 
 The CLI selects rules vs LLM via `--method`. Rule-based classification reads frequency / phase keyword atlases bundled with the package; you can override or extend them at runtime by editing the relevant module data.
 
+## Calibration (FEAT-017b)
+
+Per-fragment LLM classification is noisy. To turn that noise into a gauge an operator can act on, `creek classify --calibrate` runs the configured LLM against a hand-labelled fixture and prints per-dimension agreement rates:
+
+```bash
+creek classify --calibrate \
+  --calibration-fixture tests/fixtures/classification/calibration_set.yaml
+```
+
+The fixture (`tests/fixtures/classification/calibration_set.yaml`) ships with ≥30 hand-labelled entries covering every Frequency, Phase, Mode, Orientation, Dosage, and Voice Register value. Re-label entries or add to the set as your corpus's tone drifts.
+
+Add `--enforce-floors` to exit non-zero when any dimension regresses below the FEAT-017 floor — drop this in CI on PRs that touch `creek/classify/`:
+
+```bash
+creek classify --calibrate --enforce-floors
+```
+
+### Default per-dimension floors (`creek.classify.calibration.DEFAULT_FLOORS`)
+
+| Dimension       | Floor | Rationale |
+|-----------------|------:|-----------|
+| Frequency       |  60%  | F1..F10 is high-cardinality but the values are well-separated. |
+| Phase           |  60%  | Six values, fairly stable signal. |
+| Mode            |  40%  | Subject to the FEAT-017 unclassified bias; lenient on purpose. |
+| Orientation     |  40%  | Three values but the boundary is fuzzy in real text. |
+| Dosage          |  40%  | Medicine / Toxic / Ambiguous is genuinely hard from the body alone. |
+| Voice Register  |  75%  | Most stable signal — the tone usually leaks into the first sentence. |
+
+These are starter values calibrated for the v1.0 prompt + few-shot set against Sonnet. A model swap or a major prompt edit warrants re-running the calibration to re-baseline. Adjust `DEFAULT_FLOORS` in the source rather than monkey-patching it at runtime.
+
+### Cadence
+
+- **PR-time (CI):** the calibration code is exercised by `tests/test_calibration.py` against a deterministic stub so the scoring mechanism itself can never silently regress. Real-LLM calibration is operator-run because CI does not carry API keys.
+- **Operator-run (`--calibrate`):** run after every prompt edit, every fixture addition, every model swap. Compare the new per-dimension rates against the prior run committed in the fixture.
+
 ## The review queue
 
 Anything with `confidence < classification.confidence_threshold` is added to the **review queue**:
