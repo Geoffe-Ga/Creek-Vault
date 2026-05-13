@@ -206,22 +206,25 @@ Critical-path-aware note: Batches A, B, C, D each contain at least one Critical 
 
 ## 4a. v1.0 implementation roadmap (FEAT-001…FEAT-016)
 
-The 16 `FEAT-*` files in this directory translate the [comparative-analysis ADOPT/ADAPT candidates](../2026-05-05_comparative-analysis/) into pull-ready work units. Each FEAT is sized for a single PR ≤~700 LOC, names the file paths it touches in `creek-tools/` (or in the new `crawdad/` project), pre-decides the open questions from its source candidate, and ships its own test plan + acceptance criteria. The `/work-issue FEAT-NNN` flow can pick any FEAT whose dependencies have landed.
+The 19 `FEAT-*` files in this directory translate the [comparative-analysis ADOPT/ADAPT candidates](../2026-05-05_comparative-analysis/) plus three post-merge additions (FEAT-017 / 018 / 019) into pull-ready work units. Each FEAT is sized for a single PR ≤~700 LOC, names the file paths it touches in `creek-tools/` (or in the new `crawdad/` project), pre-decides the open questions from its source candidate, and ships its own test plan + acceptance criteria. The `/work-issue FEAT-NNN` flow can pick any FEAT whose dependencies have landed.
 
-**Wave 0 — prerequisite (Batch 0, the existing INC-019)**
-- INC-019 — taxonomy reconciliation. Blocks the entire v1.0 roadmap.
+**Wave 0 — prerequisites**
+- **INC-019** — taxonomy reconciliation (done).
+- **FEAT-019** — vault sovereignty: separate user vault from repo, scaffold via `creek init --vault <path>`. Sequence *before* FEAT-001 so "vault root" semantics are unambiguous.
 
-**Wave 1 — schema foundation (sequential after INC-019; FEAT-002 depends on FEAT-001)**
+**Wave 1 — schema foundation (sequential after FEAT-019; FEAT-002 depends on FEAT-001)**
 | ID | Title | LOC | Depends |
 |---|---|---:|---|
-| [FEAT-001](FEAT-001-schema-skills-compile-lint-save.md) | Schema skills (compile / lint / save) + root `AGENTS.md` | ~400 | INC-019 |
-| [FEAT-002](FEAT-002-schema-skills-paradox-liminal-privacy-wavelength.md) | Schema skills (paradox / liminal / privacy-tier / wavelength-aware) | ~400 | FEAT-001 |
+| [FEAT-001](FEAT-001-schema-skills-compile-lint-save.md) | Schema skills (compile / lint / save) + root `AGENTS.md` (deployed) | ~400 | INC-019, FEAT-019 |
+| [FEAT-002](FEAT-002-schema-skills-paradox-liminal-privacy-wavelength.md) | Schema skills (paradox / liminal / privacy-tier / wavelength-aware) (deployed) | ~400 | FEAT-019, FEAT-001 |
 
-**Wave 2 — compiled-layer primitives**
+**Wave 2 — compiled-layer primitives + classification quality**
 | ID | Title | LOC | Depends |
 |---|---|---:|---|
 | [FEAT-003](FEAT-003-compile-primitive.md) | Compile primitive — `creek compile <fragment-id>` | ~450 | INC-019, FEAT-001/002 |
-| [FEAT-004](FEAT-004-compiled-layer-query-routing.md) | Compiled-layer query routing in `creek mine` / `creek draft` | ~450 | FEAT-003 |
+| [FEAT-017](FEAT-017-classification-prompt-hardening.md) | Classification prompt hardening (few-shot + CoT + calibration + default-unclassified) | ~600 (splittable) | INC-019, FEAT-001/002 |
+| [FEAT-018](FEAT-018-compost-embeddings-llm-upgrade.md) | Compost: embeddings + LLM verification (replaces 5-phrase regex) | ~350 | FEAT-017, FEAT-001 |
+| [FEAT-004](FEAT-004-compiled-layer-query-routing.md) | Compiled-layer query routing in `creek mine` / `creek draft` | ~450 | FEAT-003, FEAT-017 |
 | [FEAT-005](FEAT-005-deterministic-first-pipeline.md) | Deterministic-first pipeline + `--no-llm` end-to-end | ~260 | none (parallelizable) |
 
 **Wave 3 — observability + hygiene**
@@ -247,9 +250,11 @@ The 16 `FEAT-*` files in this directory translate the [comparative-analysis ADOP
 | [FEAT-015](FEAT-015-crawdad-sonnet-composer-loop.md) | CrawDad — Sonnet composer + 5-round loop + voice-skill activation | ~450 | FEAT-014 |
 | [FEAT-016](FEAT-016-slash-command-grammar.md) | `/creek` and `/crawdad` slash-command grammars | ~400 | FEAT-010/011/012, FEAT-015 |
 
-**Critical path:** INC-019 → FEAT-001 → FEAT-002 → FEAT-003 → FEAT-004 → FEAT-006 → FEAT-008 → FEAT-009 → FEAT-010 → FEAT-011 → FEAT-012 → FEAT-013 → FEAT-014 → FEAT-015. Fourteen sequential PRs (one prerequisite + thirteen FEATs); the remaining three FEATs (005, 007, 016) parallelize off the path. Total: 17 PRs for full v1.0 (Creek Vault data layer + CrawDad agent layer).
+**Critical path:** INC-019 → **FEAT-019** → FEAT-001 → FEAT-002 → FEAT-003 → **FEAT-017** → FEAT-004 → FEAT-006 → FEAT-008 → FEAT-009 → FEAT-010 → FEAT-011 → FEAT-012 → FEAT-013 → FEAT-014 → FEAT-015. Sixteen sequential PRs (one taxonomy prerequisite + fifteen FEATs); the remaining four FEATs (005, 007, 016, 018) parallelize off the path. Total: 20 PRs for full v1.0 (Creek Vault data layer + CrawDad agent layer).
 
-**LOC envelope:** every FEAT is sized to ≤700 LOC. The largest is FEAT-009 (`creek save`, ~580 LOC).
+FEAT-017 may split into 017a/017b if the implementing PR exceeds 500 LOC of non-fixture code (see the FEAT for the split criterion).
+
+**LOC envelope:** every FEAT is sized to ≤700 LOC. The largest is FEAT-017 (~600 LOC, splittable) and FEAT-009 (`creek save`, ~580 LOC).
 
 **Execution model:** `/work-issue FEAT-NNN` reads the FEAT file, branches, runs TDD against the named acceptance criteria, opens a PR. Open questions in each FEAT are pre-decided so the implementer doesn't pause mid-PR. If a candidate's `Pre-decided choices` block needs to change in light of implementation reality, that's a separate PR that updates the FEAT first.
 

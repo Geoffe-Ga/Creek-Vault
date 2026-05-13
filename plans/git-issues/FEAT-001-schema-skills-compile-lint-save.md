@@ -5,7 +5,7 @@
 **Estimated LOC:** ~400
 **Estimated complexity:** S
 **Source candidate:** [`plans/2026-05-05_comparative-analysis/candidates/ADAPT-005-modular-skill-files-as-schema.md`](../2026-05-05_comparative-analysis/candidates/ADAPT-005-modular-skill-files-as-schema.md) (part 1 of 2)
-**Dependencies:** INC-019 (must land first — schema skills reference canonical taxonomy)
+**Dependencies:** INC-019 (done), **FEAT-019** (vault-sovereignty topology must be settled — "vault root" means the user's local vault, not the repo root; schema-skill source lives in the repo template, gets deployed to the user vault)
 **Parallelizable with peers:** yes (with FEAT-002, FEAT-005)
 **Wave:** 1 (schema foundation)
 
@@ -15,10 +15,17 @@ Author a small root `AGENTS.md` plus the first three schema-skill files under `0
 
 ## Files to touch
 
-- `AGENTS.md` (new, vault root) — points at `00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md` as canonical and defines the compile/query/lint/save contract in ≤3000 tokens.
-- `00-Creek-Meta/Skills/compile.SKILL.md` (new) — how to compile fragments → wiki pages, per-source, manual trigger, with provenance preservation.
-- `00-Creek-Meta/Skills/lint.SKILL.md` (new) — what `creek lint` does, with the explicit "do not resolve paradoxes" guard rail.
-- `00-Creek-Meta/Skills/save.SKILL.md` (new) — when and where to file good answers back, with privacy-tier rules.
+**Canonical (in repo, version-controlled — source of truth):**
+- `creek-tools/creek/templates/AGENTS.md` (new) — canonical template; FEAT-019's `creek init` deploys this to the user vault.
+- `creek-tools/creek/templates/skills/compile.SKILL.md` (new) — canonical template.
+- `creek-tools/creek/templates/skills/lint.SKILL.md` (new) — canonical template.
+- `creek-tools/creek/templates/skills/save.SKILL.md` (new) — canonical template.
+
+**Per-vault (deployed by `creek init` — not version-controlled in the repo, only in the user's local vault):**
+- `<vault>/AGENTS.md` — points at `<vault>/00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md` as canonical and defines the compile/query/lint/save contract in ≤3000 tokens.
+- `<vault>/00-Creek-Meta/Skills/compile.SKILL.md` — how to compile fragments → wiki pages.
+- `<vault>/00-Creek-Meta/Skills/lint.SKILL.md` — what `creek lint` does, with the explicit "do not resolve paradoxes" guard rail.
+- `<vault>/00-Creek-Meta/Skills/save.SKILL.md` — when and where to file good answers back, with privacy-tier rules.
 
 ## Pre-decided choices
 
