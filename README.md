@@ -37,6 +37,7 @@ Creek-Vault/                       # The Obsidian vault itself (this repo)
 ├── 09-Reference/                  # External reference material
 ├── 10-Liminal/                    # In-between content awaiting classification
 ├── creek-tools/                   # The Python CLI + pipeline (this is where the code lives)
+├── crawdad/                       # Discord bot — the chat-side interface to the vault (consumes creek-tools-mcp)
 └── CLAUDE.md                      # Top-level repo guidance for Claude Code
 ```
 
