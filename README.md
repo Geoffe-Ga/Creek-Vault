@@ -32,6 +32,7 @@ Creek-Vault/                            # This repo (toolchain + canonical mater
 │       ├── vault/                      # Canonical vault scaffold (.gitkeep markers)
 │       ├── skills/                     # Canonical schema-skill tree (*.SKILL.md)
 │       └── AGENTS.md                   # Canonical agent contract template
+├── crawdad/                            # Discord bot — chat-side interface to the vault (consumes creek-tools-mcp)
 ├── docs/Ontology/                      # Canonical ontology specification
 ├── plans/                              # Planning + comparative-analysis docs
 ├── CLAUDE.md                           # Repo guidance for Claude Code

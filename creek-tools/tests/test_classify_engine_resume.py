@@ -17,9 +17,17 @@ from unittest.mock import patch
 import frontmatter
 
 from creek.classify.classify_engine import LLM_PROGRESS_FILENAME, run_classify
+from creek.classify.llm import LLMClassificationResult
 from creek.config import CreekConfig
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from tests.helpers import write_fragment_file as _write_fragment
+
+
+def _stub_llm_result(frag: Fragment, content: str = "") -> LLMClassificationResult:
+    """Stub for ``classify_with_reasoning`` used across resume tests."""
+    del content
+    return LLMClassificationResult(fragment=frag, reasoning="")
+
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -69,7 +77,9 @@ def test_already_llm_classified_fragment_is_skipped(tmp_path: Path) -> None:
         method="llm",
     )
 
-    with patch("creek.classify.classify_engine.LLMClassifier.classify") as mock_llm:
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning"
+    ) as mock_llm:
         summary = run_classify(
             vault_path=vault,
             config=_llm_low_confidence_config(),
@@ -100,8 +110,8 @@ def test_force_overrides_resume_skip(tmp_path: Path) -> None:
     )
 
     with patch(
-        "creek.classify.classify_engine.LLMClassifier.classify",
-        side_effect=lambda frag, content="": frag,
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_stub_llm_result,
     ) as mock_llm:
         run_classify(
             vault_path=vault,
@@ -128,8 +138,8 @@ def test_progress_file_records_classified_fragment_ids(tmp_path: Path) -> None:
     )
 
     with patch(
-        "creek.classify.classify_engine.LLMClassifier.classify",
-        side_effect=lambda frag, content="": frag,
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_stub_llm_result,
     ):
         run_classify(
             vault_path=vault,
@@ -166,8 +176,8 @@ def test_progress_file_appends_across_runs(tmp_path: Path) -> None:
     )
 
     with patch(
-        "creek.classify.classify_engine.LLMClassifier.classify",
-        side_effect=lambda frag, content="": frag,
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_stub_llm_result,
     ):
         run_classify(
             vault_path=vault,
@@ -189,8 +199,8 @@ def test_progress_file_appends_across_runs(tmp_path: Path) -> None:
     )
 
     with patch(
-        "creek.classify.classify_engine.LLMClassifier.classify",
-        side_effect=lambda frag, content="": frag,
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_stub_llm_result,
     ):
         run_classify(
             vault_path=vault,

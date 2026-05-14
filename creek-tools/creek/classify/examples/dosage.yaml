@@ -1,0 +1,27 @@
+# Few-shot examples for Dosage (Medicine vs Toxic vs Ambiguous).
+# Dosages: medicine | toxic | ambiguous
+- title: Long walk after the hard call
+  body: I needed to move my body and not talk to anyone. By the second mile I had
+    stopped replaying the conversation in my head.
+  label: medicine
+  rationale: The frequency-expression genuinely metabolised the difficulty.
+- title: Doom-scrolling at midnight
+  body: I told myself I was staying informed. Three hours in I was just
+    accelerating the dread.
+  label: toxic
+  rationale: The frequency-expression amplified harm rather than processed it.
+- title: Drink with old colleagues
+  body: It was warm and familiar and I felt seen. I also said things I would
+    not have said sober and woke up uneasy.
+  label: ambiguous
+  rationale: Medicine and toxicity present simultaneously; do not collapse to one.
+- title: Quiet morning with the journal
+  body: I wrote three pages of nonsense and then the actual thing I have been
+    avoiding finally came out.
+  label: medicine
+  rationale: Practice produced honest contact; the expression did its work.
+- title: Picking the fight again
+  body: I knew where it would go before I said the first sentence. I said it
+    anyway, and we both lost the evening.
+  label: toxic
+  rationale: Repeating a known-harmful pattern; the dosage was wrong.

@@ -43,9 +43,43 @@ classification:
 privacy:
   tier: personal             # open | personal | intimate
   reasoning: "Mentions financial detail; default-personal."
+classification_reasoning: |  # FEAT-017: present only for --method llm at open/personal tiers
+  This is F3 because the operator owns the decision; rising phase because the
+  energy is accelerating into commitment; express mode because the speech is
+  outward; analytical register and forming confidence.
 ```
 
 Privacy tiers are enforced by `creek.classify.privacy.PrivacyClassifier`. The default policy is **fail-closed**: ambiguous fragments are tagged `personal` (not `open`), and `intimate` requires explicit signals.
+
+## The two-step LLM pipeline (FEAT-017)
+
+`--method llm` runs use a chain-of-thought prompt that asks the model first for a short reasoning trace, then for the YAML tuple. The classifier splits the response into:
+
+- a **reasoning preamble** persisted as `classification_reasoning` in fragment frontmatter (truncated to 400 characters) for `open` and `personal` tiers, and
+- a **YAML payload** whose fields drive the standard `classification:` block.
+
+For `intimate`-tier fragments the reasoning preamble is **never** stored in the fragment file. The full trace lands in `<vault>/00-Creek-Meta/Processing-Log/classify-llm-trace.jsonl` — gitignorable per FEAT-019, so vault sharing cannot leak intimate-tier model traces.
+
+The prompt also embeds a **few-shot example block** sampled deterministically per fragment ID from `creek/classify/examples/<dimension>.yaml`. Same fragment → same examples on every re-run (reproducible classifications); different fragments rotate through the corpus.
+
+### Default-unclassified bias
+
+The new prompt asks the model to emit a `confidence_scores` map alongside its picks:
+
+```yaml
+confidence_scores:
+  mode: 0.7
+  orientation: 0.4
+  dosage: 0.9
+```
+
+For **Mode**, **Orientation**, and **Dosage** specifically, any reported confidence below `LLMConfig.unclassified_threshold` (default `0.55`) downgrades the model's pick to `unclassified` rather than guessing. **Frequency**, **Phase**, and **Voice Register** are not gated by this bias — they are more stable signals empirically and using them is the point of running an LLM pass.
+
+Per-fragment LLM classification is inherently noisy. The reliable wavelength signal is the **weekly aggregation** of many fragments (consumed by the `creek state` audit report in FEAT-006/007), not any single-fragment certainty.
+
+### Recommended model floor
+
+Mistral via Ollama and Haiku via Anthropic are too small for reliable 7-dimensional picks on subtle content. Reach for **Sonnet** (`claude-sonnet-4-6`) when classification quality matters. The prompt itself is model-agnostic; only the achievable agreement rate changes.
 
 ## Configuration
 
@@ -62,6 +96,7 @@ llm:
   model: mistral
   batch_size: 50
   max_concurrent: 5
+  unclassified_threshold: 0.55           # FEAT-017: bias for Mode / Orientation / Dosage
 ```
 
 The CLI selects rules vs LLM via `--method`. Rule-based classification reads frequency / phase keyword atlases bundled with the package; you can override or extend them at runtime by editing the relevant module data.

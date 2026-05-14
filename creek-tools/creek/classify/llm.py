@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from typing import TYPE_CHECKING, TypeVar
 import httpx
 import yaml
 from tqdm import tqdm
+
+from creek.classify import few_shot
 
 if TYPE_CHECKING:
     import anthropic
@@ -76,8 +79,22 @@ instructional, raw, conversational
 
 7. **Confidence**: musing, exploring, forming, settled, conviction
 
-Respond ONLY with valid YAML in this exact format (no extra text):
+A few labelled examples (do not include these in your YAML output):
 
+{examples}
+
+Two-step protocol (FEAT-017):
+
+Step 1 — Reason briefly. Walk through which frequency this most resonates
+with and why, then which phase, then which mode, orientation, and dosage,
+and finally the voice register. Two to four short sentences total.
+
+Step 2 — Emit your classification as valid YAML inside a fenced
+```yaml ... ``` block. The YAML must follow this exact schema (do not
+include any other keys; ``confidence_scores`` reports how certain you
+are about each gated dimension, on a 0.0-1.0 scale):
+
+```yaml
 frequency:
   primary: F3
   secondary: [F5]
@@ -89,12 +106,32 @@ wavelength:
 voice:
   voice_register: analytical
   confidence: forming
+confidence_scores:
+  mode: 0.7
+  orientation: 0.7
+  dosage: 0.7
+```
+
+If a dimension is genuinely unclear, set ``unclassified`` rather than
+guessing. For Mode / Orientation / Dosage we will treat any
+``confidence_scores`` entry below {threshold:.2f} as ``unclassified``,
+so calibrate honestly.
 
 Fragment title: {title}
 Fragment content:
 {content}
 """
-"""Prompt template for LLM-based fragment classification."""
+"""Prompt template for two-step LLM-based fragment classification (FEAT-017).
+
+Placeholders:
+
+- ``{examples}``: rendered few-shot block from :mod:`creek.classify.few_shot`.
+- ``{threshold}``: ``LLMConfig.unclassified_threshold`` (decimal, two
+  decimals) shown to the model so honesty about uncertainty is
+  rewarded rather than penalised.
+- ``{title}``, ``{content}``: the fragment being classified, after
+  :func:`_sanitise_for_prompt` neutralises injection vectors.
+"""
 
 _DOSAGE_AMBIGUOUS_MARKERS: frozenset[str] = frozenset(
     {
@@ -109,13 +146,15 @@ _DOSAGE_AMBIGUOUS_MARKERS: frozenset[str] = frozenset(
 
 
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {"frequency", "wavelength", "voice"},
+    {"frequency", "wavelength", "voice", "confidence_scores"},
 )
 """Top-level keys recognised in a documented LLM classification response.
 
-Mirrors the three sections in :data:`CLASSIFICATION_PROMPT`. Update
-both when adding a new classification dimension — ``validate_response``
-will otherwise reject the LLM's output as unexpected.
+Mirrors the sections in :data:`CLASSIFICATION_PROMPT`. ``confidence_scores``
+was added by FEAT-017 to carry per-dimension self-reported confidence
+for the default-unclassified bias on Mode / Orientation / Dosage.
+Update both when adding a new section — ``validate_response`` will
+otherwise reject the LLM's output as unexpected.
 """
 
 
@@ -159,6 +198,72 @@ def _sanitise_for_prompt(text: str) -> str:
     if len(cleaned) > _MAX_PROMPT_CONTENT_CHARS:
         cleaned = cleaned[:_MAX_PROMPT_CONTENT_CHARS]
     return cleaned
+
+
+_BIASED_DIMENSIONS: frozenset[str] = frozenset({"mode", "orientation", "dosage"})
+"""Dimensions gated by ``LLMConfig.unclassified_threshold`` (FEAT-017).
+
+Frequency, Phase, and Voice Register are not biased because they are
+more stable signals empirically; using them is the point of having an
+LLM pass at all.
+"""
+
+_YAML_FENCE_RE: re.Pattern[str] = re.compile(
+    r"```(?:yaml)?\s*\n(.*?)```",
+    flags=re.DOTALL,
+)
+"""Match a fenced YAML block; group 1 is the inner YAML text."""
+
+_YAML_HEAD_RE: re.Pattern[str] = re.compile(
+    r"^(frequency|wavelength|voice):", re.MULTILINE
+)
+"""Match the start of an unfenced YAML payload (a documented top-level key)."""
+
+
+def _split_reasoning_and_yaml(response: str) -> tuple[str, str]:
+    r"""Split a two-step LLM response into reasoning preamble and YAML payload.
+
+    Tolerates three response shapes the model produces in practice:
+
+    1. A fenced ``\`\`\`yaml ... \`\`\`\`` block preceded by reasoning prose.
+    2. Reasoning prose followed by bare YAML starting at column 0.
+    3. Pure YAML with no reasoning (backwards-compat with the
+       pre-FEAT-017 prompt).
+
+    Args:
+        response: Raw LLM response text.
+
+    Returns:
+        ``(reasoning, yaml_text)``. ``reasoning`` is the stripped
+        preamble, possibly empty. ``yaml_text`` is the YAML block,
+        with code fences stripped if present.
+    """
+    fenced = _YAML_FENCE_RE.search(response)
+    if fenced is not None:
+        return response[: fenced.start()].strip(), fenced.group(1).strip()
+    head = _YAML_HEAD_RE.search(response)
+    if head is not None:
+        return response[: head.start()].strip(), response[head.start() :].strip()
+    return "", response.strip()
+
+
+@dataclass(frozen=True)
+class LLMClassificationResult:
+    """Outcome of a single FEAT-017 two-step classification call.
+
+    Attributes:
+        fragment: The fragment with updated classification fields.
+            When the call short-circuits (provider unavailable, retries
+            exhausted), this is the input fragment unchanged.
+        reasoning: Reasoning preamble emitted by the model before the
+            YAML payload. Empty when the model produced pure YAML (the
+            pre-FEAT-017 response shape) or the call short-circuited.
+            Truncation / tier-routing is the engine's responsibility,
+            not this dataclass's — the raw trace lives here.
+    """
+
+    fragment: Fragment
+    reasoning: str
 
 
 @dataclass
@@ -545,13 +650,20 @@ class LLMClassifier:
         fragment: Fragment,
         content: str = "",
     ) -> str:
-        """Build the classification prompt for a fragment.
+        """Build the FEAT-017 two-step classification prompt for a fragment.
 
         The fragment title and content are attacker-controlled (they
         originate from third-party messages, scraped material, etc.).
         Each is passed through :func:`_sanitise_for_prompt` to neutralise
         YAML-fence and HTML-comment injection and to cap the body length
         before substitution — see SEC-004.
+
+        A deterministic-per-fragment few-shot block is rendered from
+        :mod:`creek.classify.few_shot` and substituted into the
+        ``{examples}`` placeholder so the model sees worked examples
+        before classifying the new fragment. The threshold value is
+        shown to the model so it has an incentive to report honest
+        per-dimension confidence rather than pad numbers up.
 
         Args:
             fragment: The fragment to classify.
@@ -563,7 +675,11 @@ class LLMClassifier:
         safe_title = _sanitise_for_prompt(fragment.title)
         body = content if content else "(no content provided)"
         safe_content = _sanitise_for_prompt(body)
+        samples = few_shot.sample_examples(fragment.id)
+        examples_block = few_shot.render_block(samples) or "(no examples bundled)"
         return CLASSIFICATION_PROMPT.format(
+            examples=examples_block,
+            threshold=self.config.unclassified_threshold,
             title=safe_title,
             content=safe_content,
         )
@@ -647,7 +763,11 @@ class LLMClassifier:
         """
         updates: dict[str, object] = {}
         _apply_frequency(data, updates)
-        _apply_wavelength(data, updates)
+        _apply_wavelength(
+            data,
+            updates,
+            unclassified_threshold=self.config.unclassified_threshold,
+        )
         _apply_voice(data, updates)
         if not updates:
             return fragment
@@ -660,11 +780,12 @@ class LLMClassifier:
     ) -> Fragment:
         """Classify a fragment using the configured LLM provider.
 
-        Builds a prompt, dispatches it to the configured provider (Ollama
-        or Anthropic), parses the YAML response, and updates the
-        fragment.  Retries on failure up to ``MAX_RETRIES`` times.
-        Returns the fragment unchanged if the provider is unavailable
-        or all retries are exhausted.
+        Back-compat wrapper around :meth:`classify_with_reasoning` that
+        drops the reasoning trace. Existing callers that only need the
+        Fragment continue to work unchanged. New callers (e.g. the
+        classification engine in :mod:`creek.classify.classify_engine`)
+        should call :meth:`classify_with_reasoning` so the reasoning
+        can be persisted alongside the classification.
 
         Args:
             fragment: The fragment to classify.
@@ -673,20 +794,50 @@ class LLMClassifier:
         Returns:
             The fragment with updated classification fields.
         """
+        return self.classify_with_reasoning(fragment, content).fragment
+
+    def classify_with_reasoning(
+        self,
+        fragment: Fragment,
+        content: str = "",
+    ) -> LLMClassificationResult:
+        """Run the FEAT-017 two-step pipeline and return Fragment + reasoning.
+
+        Builds the two-step prompt, dispatches it to the configured
+        provider (Ollama or Anthropic), splits the response into a
+        reasoning preamble and YAML payload, parses the YAML, and
+        applies the classification. Retries on failure up to
+        ``MAX_RETRIES`` times. Returns the fragment unchanged with an
+        empty reasoning trace if the provider is unavailable or all
+        retries are exhausted.
+
+        Args:
+            fragment: The fragment to classify.
+            content: Optional content text for the fragment.
+
+        Returns:
+            :class:`LLMClassificationResult` carrying the updated
+            fragment and the raw reasoning trace (empty when the call
+            short-circuited or the model returned pure YAML).
+        """
         if not self.available:
             logger.warning(
                 "LLM provider unavailable — returning fragment '%s' unchanged",
                 fragment.title,
             )
-            return fragment
+            return LLMClassificationResult(fragment=fragment, reasoning="")
 
         prompt = self._build_prompt(fragment, content)
 
         for attempt in range(self.MAX_RETRIES):
             try:
                 raw = self._invoke_llm(prompt)
-                data = self.validate_response(raw)
-                return self._apply_classification(fragment, data)
+                reasoning, yaml_text = _split_reasoning_and_yaml(raw)
+                data = self.validate_response(yaml_text)
+                return LLMClassificationResult(
+                    fragment=self._apply_classification(fragment, data),
+                    reasoning=reasoning,
+                )
             except (
                 httpx.HTTPError,
                 RuntimeError,
@@ -719,7 +870,7 @@ class LLMClassifier:
             self.MAX_RETRIES,
             fragment.title,
         )
-        return fragment
+        return LLMClassificationResult(fragment=fragment, reasoning="")
 
     def classify_batch(
         self,
@@ -851,37 +1002,122 @@ def _apply_frequency(
     )
 
 
+def _confidence_score(scores: object, dimension: str) -> float | None:
+    """Return the per-dimension confidence value from a ``confidence_scores`` map.
+
+    Args:
+        scores: The ``confidence_scores`` value from the parsed YAML
+            (any type — the LLM may emit garbage).
+        dimension: ``"mode"``, ``"orientation"``, or ``"dosage"``.
+
+    Returns:
+        The float in ``[0.0, 1.0]`` when reported and parseable, else
+        ``None`` (treated by the bias as "no score reported — keep
+        the model's pick").
+    """
+    if not isinstance(scores, dict):
+        return None
+    value = scores.get(dimension)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _apply_wavelength(
     data: dict[str, object],
     updates: dict[str, object],
+    *,
+    unclassified_threshold: float,
 ) -> None:
-    """Extract wavelength classification from parsed data.
+    """Extract wavelength classification from parsed data with FEAT-017 bias.
+
+    Mode, Orientation, and Dosage are downgraded to ``unclassified``
+    when the model's self-reported per-dimension confidence (read from
+    ``data['confidence_scores'][dimension]``) is below
+    ``unclassified_threshold``. A missing or unparseable score leaves
+    the model's pick intact — the bias only fires when the model
+    explicitly reports low confidence.
+
+    Phase is **not** gated by the bias (FEAT-017 calls phase a stable
+    signal; gating it would be more cost than benefit).
 
     Args:
         data: Parsed LLM response.
         updates: Dict to populate with wavelength updates.
+        unclassified_threshold: Minimum confidence to keep the model's
+            pick for Mode / Orientation / Dosage; below this the
+            dimension defaults to ``unclassified``.
     """
     wave_data = data.get("wavelength")
     if not isinstance(wave_data, dict):
         return
+    scores = data.get("confidence_scores")
     updates["wavelength"] = WavelengthClassification(
-        phase=_parse_enum(
-            wave_data.get("phase"),
-            Phase,
-            Phase.UNCLASSIFIED,
-        ),
-        mode=_parse_enum(
+        phase=_parse_enum(wave_data.get("phase"), Phase, Phase.UNCLASSIFIED),
+        mode=_biased_enum(
             wave_data.get("mode"),
             Mode,
             Mode.UNCLASSIFIED,
+            score=_confidence_score(scores, "mode"),
+            threshold=unclassified_threshold,
         ),
-        orientation=_parse_enum(
+        orientation=_biased_enum(
             wave_data.get("orientation"),
             Orientation,
             Orientation.UNCLASSIFIED,
+            score=_confidence_score(scores, "orientation"),
+            threshold=unclassified_threshold,
         ),
-        dosage=_parse_dosage(wave_data.get("dosage")),
+        dosage=_biased_dosage(
+            wave_data.get("dosage"),
+            score=_confidence_score(scores, "dosage"),
+            threshold=unclassified_threshold,
+        ),
     )
+
+
+def _biased_enum(
+    value: object,
+    enum_type: type[_EnumT],
+    default: _EnumT,
+    *,
+    score: float | None,
+    threshold: float,
+) -> _EnumT:
+    """Apply :data:`_BIASED_DIMENSIONS` gating to a regular enum parse.
+
+    A reported confidence strictly below the threshold overrides the
+    model's pick with ``default`` (always the ``unclassified`` member
+    of the enum). When ``score`` is ``None`` (no value reported), the
+    bias does not fire — the model's pick stands.
+    """
+    if score is not None and score < threshold:
+        return default
+    return _parse_enum(value, enum_type, default)
+
+
+def _biased_dosage(
+    value: object,
+    *,
+    score: float | None,
+    threshold: float,
+) -> Dosage:
+    """Apply :data:`_BIASED_DIMENSIONS` gating to dosage parsing.
+
+    A separate helper because dosage uses :func:`_parse_dosage` (which
+    treats ambiguity markers specially) rather than the plain
+    :func:`_parse_enum` used by mode/orientation.
+    """
+    if score is not None and score < threshold:
+        return Dosage.UNCLASSIFIED
+    return _parse_dosage(value)
 
 
 def _apply_voice(

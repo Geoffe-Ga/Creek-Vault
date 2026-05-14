@@ -20,6 +20,13 @@ EXPECTED_TOOLS = {
     "creek.lint",
     "creek.mine",
     "creek.draft",
+    "creek.save",
+    "creek.ingest",
+    "creek.classify",
+    "creek.link",
+    "creek.report",
+    "creek.skills.refresh",
+    "creek.compile",
 }
 
 
@@ -53,8 +60,8 @@ def test_build_server_returns_fastmcp_instance(vault: Path) -> None:
     assert server.name == SERVER_NAME
 
 
-def test_build_server_registers_five_read_tools(vault: Path) -> None:
-    """All five FEAT-010 read tools surface via ``list_tools``."""
+def test_build_server_registers_all_tools(vault: Path) -> None:
+    """All FEAT-010 read + FEAT-011 write tools surface via ``list_tools``."""
     server = build_server(
         vault_path=vault,
         draft_llm_factory=lambda: lambda prompt: "ignored",
@@ -62,6 +69,34 @@ def test_build_server_registers_five_read_tools(vault: Path) -> None:
     tools = asyncio.run(server.list_tools())
     names = {tool.name for tool in tools}
     assert names == EXPECTED_TOOLS
+
+
+def test_call_tool_save_through_mcp(vault: Path) -> None:
+    """End-to-end: ``call_tool("creek.save")`` writes the note and returns path."""
+    for relparts in (
+        ("02-Threads", "Active"),
+        ("00-Creek-Meta", "audit"),
+    ):
+        (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.save",
+            {
+                "target": "thread",
+                "body": "Note worth keeping.",
+                "title": "Saved thread",
+                "tier": "open",
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["tool"] == "creek.save"
 
 
 def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None:

@@ -1,0 +1,32 @@
+# Few-shot examples for Archetypal Wavelength phase.
+# Phases: rising | peaking | withdrawal | diminishing | bottoming_out | restoration
+- title: New project gathering momentum
+  body: I cannot wait to start. The ideas are stacking faster than I can write
+    them down and every conversation feeds the next.
+  label: rising
+  rationale: Energy accelerating into commitment; novelty-fuelled lift.
+- title: Launch week
+  body: We are in it. The product is live, calls are nonstop, every decision
+    matters and nothing waits.
+  label: peaking
+  rationale: Top of the curve; full output, no slack.
+- title: I need to step back
+  body: I have been sprinting for a month and I can feel the diminishing returns.
+    I am going to cancel two meetings tomorrow and just think.
+  label: withdrawal
+  rationale: Conscious pulling-back at the top of the curve, not collapse.
+- title: Losing interest in the side project
+  body: The same code that lit me up in January feels like homework now. I am not
+    sure I have anything more to say about it.
+  label: diminishing
+  rationale: Voluntary or involuntary decline of energy and meaning.
+- title: I cannot move
+  body: I have been on the couch for three days. The work is undone, my partner
+    is patient, and I am still flat.
+  label: bottoming_out
+  rationale: Trough; flatness without obvious cause or path back.
+- title: Slow walk after the fever
+  body: I made tea and read one chapter and went to bed early. Small things felt
+    like enough, which is new.
+  label: restoration
+  rationale: Coming back online gently; capacity returning before activity does.
