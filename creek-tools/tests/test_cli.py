@@ -405,12 +405,15 @@ def test_classify_force_overrides_manual(tmp_path: Path) -> None:
 # ---- FEAT-017b: --calibrate ----
 
 
-def _stub_perfect_classifier_in_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace LLMClassifier in `creek.cli` with a perfect-agreement stub.
+def _stub_fixed_label_classifier_in_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace LLMClassifier with a stub that always returns cal-001's labels.
 
-    The stub returns Fragments whose labels exactly match each
-    calibration entry's `expected` block, so the rendered report shows
-    100% agreement and any `--enforce-floors` invocation passes.
+    Used by render-only CLI tests where the exact rates do not matter,
+    only that the calibration mechanism runs end-to-end without
+    hitting the network. The agreement rates this produces are NOT
+    100% — see `test_classify_calibrate_enforce_floors_passes_on_perfect_agreement`
+    for a test that asserts the floor gate with a guaranteed-passing
+    synthetic report instead.
     """
     from creek.classify.llm import LLMClassificationResult
     from creek.models import (
@@ -472,7 +475,7 @@ def test_classify_calibrate_renders_report(
     tmp_path: Path,
 ) -> None:
     """`--calibrate` runs the fixture and prints a per-dimension table."""
-    _stub_perfect_classifier_in_cli(monkeypatch)
+    _stub_fixed_label_classifier_in_cli(monkeypatch)
     fixture = (
         Path(__file__).parent / "fixtures" / "classification" / "calibration_set.yaml"
     )

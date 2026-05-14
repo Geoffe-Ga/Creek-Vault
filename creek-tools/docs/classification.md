@@ -106,11 +106,16 @@ The CLI selects rules vs LLM via `--method`. Rule-based classification reads fre
 Per-fragment LLM classification is noisy. To turn that noise into a gauge an operator can act on, `creek classify --calibrate` runs the configured LLM against a hand-labelled fixture and prints per-dimension agreement rates:
 
 ```bash
-creek classify --calibrate \
-  --calibration-fixture tests/fixtures/classification/calibration_set.yaml
+creek classify --calibrate
 ```
 
-The fixture (`tests/fixtures/classification/calibration_set.yaml`) ships with ≥30 hand-labelled entries covering every Frequency, Phase, Mode, Orientation, Dosage, and Voice Register value. Re-label entries or add to the set as your corpus's tone drifts.
+The fixture path defaults to `tests/fixtures/classification/calibration_set.yaml`, resolved from the `creek-tools/` source layout regardless of your current working directory. To point at a custom fixture, pass `--calibration-fixture`:
+
+```bash
+creek classify --calibrate --calibration-fixture path/to/my_fixture.yaml
+```
+
+The shipped fixture carries ≥30 hand-labelled entries covering every Frequency, Phase, Mode, Orientation, Dosage, and Voice Register value. Re-label entries or add to the set as your corpus's tone drifts.
 
 Add `--enforce-floors` to exit non-zero when any dimension regresses below the FEAT-017 floor — drop this in CI on PRs that touch `creek/classify/`:
 

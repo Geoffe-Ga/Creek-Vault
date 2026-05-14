@@ -714,13 +714,19 @@ def classify(
             console.print(f"  [dim]{err}[/dim]")
 
 
-_DEFAULT_CALIBRATION_FIXTURE: Path = Path(
-    "tests/fixtures/classification/calibration_set.yaml",
+_DEFAULT_CALIBRATION_FIXTURE: Path = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fixtures"
+    / "classification"
+    / "calibration_set.yaml"
 )
-"""Default path for `creek classify --calibrate`.
+"""Default fixture path for `creek classify --calibrate`.
 
-Used when the operator omits ``--calibration-fixture``; resolved
-relative to the project root.
+Anchored to the source layout (``creek-tools/creek/cli.py`` →
+``parents[1]`` = ``creek-tools/``) so the command works regardless of
+the operator's current working directory. Used when
+``--calibration-fixture`` is omitted.
 """
 
 

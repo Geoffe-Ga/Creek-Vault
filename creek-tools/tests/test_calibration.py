@@ -14,8 +14,12 @@ Three layers of coverage:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from creek.classify.calibration import (
     DEFAULT_FLOORS,
@@ -111,7 +115,10 @@ def _classified_fragment(
 class _FixedStub:
     """Classifier stub whose verdict on every call comes from a callable."""
 
-    def __init__(self, verdict: callable) -> None:
+    def __init__(
+        self,
+        verdict: Callable[[Fragment], LLMClassificationResult],
+    ) -> None:
         self.verdict = verdict
         self.calls = 0
 
@@ -386,3 +393,36 @@ class TestDefaultFloors:
         assert DEFAULT_FLOORS["mode"] == 0.40
         assert DEFAULT_FLOORS["orientation"] == 0.40
         assert DEFAULT_FLOORS["dosage"] == 0.40
+
+
+# ---- Internals ----
+
+
+class TestExtractLabel:
+    """`_extract_label` is the dimension dispatch; unknown names must raise."""
+
+    def test_unknown_dimension_raises(self) -> None:
+        """An unhandled dimension surfaces loud, not as a silent 0% rate."""
+        from creek.classify.calibration import _extract_label
+
+        fragment = _classified_fragment("frag-x")
+        with pytest.raises(AssertionError, match="unhandled dimension"):
+            _extract_label(fragment, "not_a_real_dimension")
+
+
+class TestDefaultFixturePath:
+    """The packaged default fixture must resolve regardless of CWD."""
+
+    def test_default_fixture_resolves_from_arbitrary_cwd(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`creek classify --calibrate` must work from any working directory."""
+        from creek.cli import _DEFAULT_CALIBRATION_FIXTURE
+
+        monkeypatch.chdir(tmp_path)
+        assert _DEFAULT_CALIBRATION_FIXTURE.is_absolute()
+        assert _DEFAULT_CALIBRATION_FIXTURE.is_file()
+        # Sanity: still points at the shipped fixture.
+        assert _DEFAULT_CALIBRATION_FIXTURE.name == "calibration_set.yaml"

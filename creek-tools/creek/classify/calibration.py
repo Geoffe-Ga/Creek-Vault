@@ -17,7 +17,7 @@ code itself.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
 import yaml
@@ -135,7 +135,7 @@ class CalibrationReport:
     """
 
     entries: int
-    agreements: tuple[DimensionAgreement, ...] = field(default_factory=tuple)
+    agreements: tuple[DimensionAgreement, ...] = ()
 
     def for_dimension(self, name: str) -> DimensionAgreement:
         """Return the :class:`DimensionAgreement` for *name*.
@@ -274,6 +274,12 @@ def _extract_label(fragment: Fragment, dimension: str) -> str | None:
         classifier left this dimension unclassified (the unclassified
         sentinel signals "no opinion" and should not count as
         agreement against any ground-truth label).
+
+    Raises:
+        AssertionError: When *dimension* is not one of
+            :data:`DIMENSIONS`. Surfaces a missing dispatch branch at
+            test time rather than silently reporting 0% agreement for
+            a misnamed dimension.
     """
     if dimension == "frequency":
         return _none_if_unclassified(fragment.frequency.primary)
@@ -286,9 +292,16 @@ def _extract_label(fragment: Fragment, dimension: str) -> str | None:
     if dimension == "dosage":
         return _none_if_unclassified(fragment.wavelength.dosage)
     if dimension == "voice_register":
+        # Asymmetry vs `_none_if_unclassified`: `VoiceRegister` has no
+        # `UNCLASSIFIED` enum member — the schema uses `None` to mean
+        # "no opinion" (see FEAT-017a's voice classification). So we
+        # only need to map None → None; there is no sentinel string to
+        # collapse. If a future schema adds VoiceRegister.UNCLASSIFIED,
+        # route this through `_none_if_unclassified` instead.
         register = fragment.voice.voice_register
         return None if register is None else str(register)
-    return None
+    msg = f"unhandled dimension: {dimension!r}"
+    raise AssertionError(msg)
 
 
 def _none_if_unclassified(value: object) -> str | None:
