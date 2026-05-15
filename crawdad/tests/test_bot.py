@@ -324,3 +324,245 @@ async def test_crawdad_client_on_ready_logs(
     await client.on_ready()
 
     assert any("connected" in record.message for record in caplog.records)
+
+
+def test_format_structured_reply_renders_each_tool_result() -> None:
+    """Each tool result becomes one bullet line in the reply."""
+    from crawdad.bot import format_structured_reply
+    from crawdad.dispatcher import ToolResult
+
+    reply = format_structured_reply(
+        [
+            ToolResult(intent_type="creek.state.read", body="state body"),
+            ToolResult(intent_type="creek.mine", body="seed one\nseed two"),
+        ]
+    )
+
+    assert "creek.state.read" in reply
+    assert "state body" in reply
+    assert "creek.mine" in reply
+
+
+def test_format_structured_reply_handles_empty_results() -> None:
+    """No intents produced means the router skipped tools — surface that."""
+    from crawdad.bot import format_structured_reply
+
+    reply = format_structured_reply([])
+
+    assert "no tool call" in reply.lower()
+
+
+def test_format_structured_reply_truncates_long_body() -> None:
+    """Long tool bodies get capped per-line."""
+    from crawdad.bot import format_structured_reply
+    from crawdad.dispatcher import ToolResult
+
+    long_body = "x" * 1000
+    reply = format_structured_reply(
+        [ToolResult(intent_type="creek.state.read", body=long_body)]
+    )
+
+    assert "..." in reply
+
+
+class _StubRouter:
+    """Async-compatible router stand-in for handler tests."""
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
+
+    async def extract_intents(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+class _StubSession:
+    """Stand-in for :class:`crawdad.mcp_client.MCPSession`."""
+
+    def __init__(
+        self,
+        *,
+        replies: dict[str, str] | None = None,
+        errors: dict[str, Exception] | None = None,
+    ) -> None:
+        self.replies = replies or {}
+        self.errors = errors or {}
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> str:
+        if name in self.errors:
+            raise self.errors[name]
+        return self.replies.get(name, "")
+
+
+class _StubMCPClient:
+    """Stand-in for :class:`crawdad.mcp_client.MCPClient`."""
+
+    def __init__(self, session: _StubSession) -> None:
+        self._session = session
+
+    def connect(self) -> Any:
+        session = self._session
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _ctx() -> Any:
+            yield session
+
+        return _ctx()
+
+
+async def test_handle_message_runs_router_and_dispatcher(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """An allowlisted message flows through router → dispatcher → reply."""
+    from crawdad.history import ConversationHistory
+    from crawdad.intents import Intent, RouterResponse
+
+    router = _StubRouter(RouterResponse(intents=[Intent(type="creek.state.read")]))
+    session = _StubSession(replies={"creek.state.read": "state body"})
+    mcp_client = _StubMCPClient(session)
+    history = ConversationHistory()
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="what's surfacing?",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        mcp_client=mcp_client,  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=history,
+    )
+
+    assert len(channel.sent) == 1
+    assert "creek.state.read" in channel.sent[0]
+    # History gets both the user message and the assistant reply.
+    entries = history.as_list()
+    assert entries[0].role == "user"
+    assert entries[-1].role == "assistant"
+
+
+async def test_handle_message_translates_router_parse_error(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """RouterParseError → "I lost the thread" reply, not a crash."""
+    from crawdad.router import RouterParseError
+
+    router = _StubRouter(RouterParseError("not JSON"))
+    mcp_client = _StubMCPClient(_StubSession())
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="hi",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        mcp_client=mcp_client,  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+    )
+
+    assert len(channel.sent) == 1
+    assert "rephrase" in channel.sent[0].lower()
+
+
+async def test_handle_message_translates_unknown_intent(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """UnknownIntentError → "I tried to use a tool I don't have" reply."""
+    from crawdad.intents import Intent, RouterResponse
+
+    router = _StubRouter(RouterResponse(intents=[Intent(type="creek.bogus")]))
+    mcp_client = _StubMCPClient(_StubSession())
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="hi",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        mcp_client=mcp_client,  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+    )
+
+    assert len(channel.sent) == 1
+    assert "tool" in channel.sent[0].lower()
+
+
+async def test_handle_message_translates_mcp_unavailable_in_dispatch(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """MCPUnavailableError during dispatch → graceful soft-error reply."""
+    from crawdad.intents import Intent, RouterResponse
+    from crawdad.mcp_client import MCPUnavailableError
+
+    router = _StubRouter(RouterResponse(intents=[Intent(type="creek.state.read")]))
+    session = _StubSession(
+        errors={"creek.state.read": MCPUnavailableError("subprocess died")}
+    )
+    mcp_client = _StubMCPClient(session)
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="hi",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        mcp_client=mcp_client,  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+    )
+
+    assert len(channel.sent) == 1
+    assert "unreachable" in channel.sent[0].lower()
+
+
+async def test_handle_message_without_router_uses_stub_reply(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """When router=None (test mode), the FEAT-013 stub reply is still posted."""
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="hi",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=None,
+        mcp_client=None,
+    )
+
+    assert len(channel.sent) == 1
+    assert "scaffold" in channel.sent[0].lower()

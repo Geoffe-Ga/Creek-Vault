@@ -4,6 +4,13 @@ Secrets — the Discord bot token and the Anthropic API key — come from
 environment variables (``DISCORD_BOT_TOKEN``, ``ANTHROPIC_API_KEY``).
 Everything else (vault path, MCP server command, allowlists) comes from
 ``crawdad.yaml``. The two sources are merged in :func:`load_config`.
+
+FEAT-014 adds the agent-loop knobs. The Haiku router model identifier
+lives here so no other module under ``crawdad/crawdad/`` references a
+model ID literal — model IDs move (today: ``claude-haiku-4-5-20251001``;
+the constant is the contract, not the literal). The
+``CRAWDAD_ROUTER_MODEL`` env var overrides the fallback for
+local-only experiments.
 """
 
 from __future__ import annotations
@@ -16,7 +23,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _ENV_DISCORD_TOKEN = "DISCORD_BOT_TOKEN"
 _ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
+_ENV_ROUTER_MODEL = "CRAWDAD_ROUTER_MODEL"
 _DEFAULT_MCP_COMMAND: tuple[str, ...] = ("creek-tools-mcp",)
+
+# The single place a Haiku model literal lives in this package. Other
+# modules must read ``DEFAULT_ROUTER_MODEL`` (or accept a model argument
+# resolved from it) — see the regression test that enforces this.
+_DEFAULT_ROUTER_MODEL_FALLBACK = "claude-haiku-4-5-20251001"
+DEFAULT_ROUTER_MODEL: str = os.environ.get(
+    _ENV_ROUTER_MODEL, _DEFAULT_ROUTER_MODEL_FALLBACK
+)
+
+# History truncation knobs (ADOPT-008 hard cliff; FEAT-016 may refine).
+HISTORY_MAX_ENTRIES: int = 20
+HISTORY_MAX_CHARS_PER_ENTRY: int = 2000
 
 
 class CrawDadConfig(BaseModel):

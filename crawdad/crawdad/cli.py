@@ -2,7 +2,8 @@
 
 The CLI is intentionally small: parse argv, resolve config, hand off to
 :func:`run_bot`. The runtime wires together :func:`load_session_state`,
-:class:`MCPClient`, and :class:`CrawDadClient`.
+:class:`MCPClient`, an :class:`IntentRouter`, and
+:class:`CrawDadClient`.
 """
 
 from __future__ import annotations
@@ -13,15 +14,21 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import anthropic
+
 from crawdad.bot import CrawDadClient
-from crawdad.config import load_config
+from crawdad.config import DEFAULT_ROUTER_MODEL, load_config
+from crawdad.history import ConversationHistory
+from crawdad.intents import ToolInfo
 from crawdad.mcp_client import MCPClient, MCPUnavailableError
+from crawdad.router import IntentRouter
 from crawdad.state import StateUnavailableError, load_session_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from crawdad.config import CrawDadConfig
+    from crawdad.mcp_client import ToolDetails
     from crawdad.state import SessionState
 
 _LOGGER = logging.getLogger("crawdad.cli")
@@ -54,18 +61,62 @@ def run_bot(config: CrawDadConfig) -> None:
     """Boot the Discord client; load session state once at start.
 
     Startup runs two short-lived event loops in sequence: ``asyncio.run``
-    drives :func:`_probe_mcp` (which spawns and tears down the MCP
-    subprocess to verify connectivity), then ``discord.Client.run``
-    spins up the permanent loop. The probe's subprocess is therefore
-    *not* the same subprocess FEAT-014's dispatcher will use at message
-    time — each MCP call spawns a fresh subprocess until FEAT-014
-    introduces a long-lived connection.
+    drives :func:`_startup_probe` (which spawns and tears down the MCP
+    subprocess to verify connectivity and snapshot the advertised
+    tools), then ``discord.Client.run`` spins up the permanent loop.
+    Each user-message turn spawns its own MCP subprocess via
+    :class:`crawdad.mcp_client.MCPClient` until FEAT-014's loop is
+    upgraded to share a long-lived connection.
     """
     logging.basicConfig(level=logging.INFO)
     session_state = _safe_load_state(config.vault_path)
-    asyncio.run(_probe_mcp(config))
-    client = CrawDadClient(config=config, session_state=session_state)
+    tool_details = asyncio.run(_startup_probe(config))
+    router, mcp_client, known_tools, history = _build_agent_components(
+        config=config, tool_details=tool_details
+    )
+    client = CrawDadClient(
+        config=config,
+        session_state=session_state,
+        router=router,
+        mcp_client=mcp_client,
+        known_tools=known_tools,
+        history=history,
+    )
     client.run(config.discord_bot_token)
+
+
+def _build_agent_components(
+    *,
+    config: CrawDadConfig,
+    tool_details: tuple[ToolDetails, ...],
+) -> tuple[IntentRouter | None, MCPClient, tuple[str, ...], ConversationHistory]:
+    """Construct the long-lived router + MCP client + history for the session.
+
+    Returns ``router=None`` when no tools were advertised (the probe
+    failed); the bot falls back to the FEAT-013 stub reply rather than
+    asking Haiku to route into an empty tool set.
+    """
+    mcp_client = MCPClient(config.mcp_server_command)
+    known_tools = tuple(tool.name for tool in tool_details)
+    history = ConversationHistory()
+    if not tool_details:
+        _LOGGER.warning("no MCP tools advertised; router is disabled this session")
+        return None, mcp_client, known_tools, history
+    anthropic_client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
+    router_tools = [
+        ToolInfo(
+            name=tool.name,
+            description=tool.description,
+            input_schema=tool.input_schema,
+        )
+        for tool in tool_details
+    ]
+    router = IntentRouter(
+        anthropic_client=anthropic_client,
+        model=DEFAULT_ROUTER_MODEL,
+        tools=router_tools,
+    )
+    return router, mcp_client, known_tools, history
 
 
 def _safe_load_state(vault_path: Path) -> SessionState | None:
@@ -77,14 +128,15 @@ def _safe_load_state(vault_path: Path) -> SessionState | None:
         return None
 
 
-async def _probe_mcp(config: CrawDadConfig) -> None:
-    """Connectivity check only — does NOT validate the tool schema.
+async def _startup_probe(config: CrawDadConfig) -> tuple[ToolDetails, ...]:
+    """Connectivity check + tool-surface snapshot.
 
-    Spawns the MCP subprocess, calls ``list_tools``, logs the advertised
-    names, then disconnects. A misconfigured ``mcp_server_command`` that
-    starts successfully but exposes zero tools will still pass this
-    probe — FEAT-014's dispatcher is responsible for verifying the
-    specific tools it needs (``creek.state.read`` et al.) are present.
+    Calls :meth:`MCPSession.list_tool_details` so FEAT-014's router can
+    build its intents schema and the dispatcher can refuse intents
+    referencing unadvertised tool names. A misconfigured
+    ``mcp_server_command`` that starts but advertises no tools yields
+    an empty tuple — the caller sees that and disables the router for
+    the session (still starts the bot, still posts the FEAT-013 stub).
 
     Probe failure is logged at WARNING and swallowed so the bot still
     starts; mid-session outages are handled by ``MCPUnavailableError``
@@ -92,13 +144,18 @@ async def _probe_mcp(config: CrawDadConfig) -> None:
     """
     try:
         async with MCPClient(config.mcp_server_command).connect() as session:
-            tools = await session.list_tools()
-            _LOGGER.info("MCP tools advertised: %s", ", ".join(tools))
+            details = await session.list_tool_details()
+            _LOGGER.info(
+                "MCP tools advertised: %s",
+                ", ".join(tool.name for tool in details),
+            )
+            return details
     except MCPUnavailableError as exc:
         _LOGGER.warning(
             "MCP probe failed at startup; the bot will start anyway: %s",
             exc,
         )
+        return ()
 
 
 if __name__ == "__main__":  # pragma: no cover - executed via entry point
