@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
+from crawdad.intents import PrivacyTierCeiling
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -36,12 +38,19 @@ class UnknownIntentError(RuntimeError):
 
 
 class ToolResult(BaseModel):
-    """One tool's response, threaded back through the loop."""
+    """One tool's response, threaded back through the loop.
+
+    ``privacy_tier_ceiling`` mirrors the source intent's ceiling so
+    downstream consumers (e.g. the loop's paradox-routing helper) can
+    re-authorise follow-up tool calls at the same or higher tier
+    without rediscovering the source authorization.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     intent_type: str
     body: str
+    privacy_tier_ceiling: PrivacyTierCeiling = PrivacyTierCeiling.OPEN
 
 
 class IntentDispatcher:
@@ -90,7 +99,13 @@ class IntentDispatcher:
                 raise UnknownIntentError(msg)
             body = await self._session.call_tool(intent.type, _build_arguments(intent))
             _LOGGER.debug("dispatched %s: %d chars returned", intent.type, len(body))
-            results.append(ToolResult(intent_type=intent.type, body=body))
+            results.append(
+                ToolResult(
+                    intent_type=intent.type,
+                    body=body,
+                    privacy_tier_ceiling=intent.privacy_tier_ceiling,
+                )
+            )
         return results
 
 

@@ -126,6 +126,34 @@ def test_load_skills_handles_state_without_wavelength(
     assert any("Confessional" in body for body in bodies)
 
 
+def test_load_skills_refuses_unsafe_register_name(
+    vault_with_voice_tree: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Register names with path-separator / traversal chars are refused.
+
+    FEAT-016 will let slash commands set extra registers from user
+    input; without this guard a name like ``../../etc/passwd`` would
+    escape ``creek-skills/registers/``.
+    """
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="crawdad.skill_loader")
+
+    stack = load_skills_for_session(
+        vault_path=vault_with_voice_tree,
+        state=_make_state("rising"),
+        extra_registers=("../../etc/passwd", "Praxis"),  # uppercase too
+    )
+
+    names = stack.names()
+    # voice-core + phase:rising + register:confessional only.
+    # Both invalid register names ("../..." and "Praxis") are refused.
+    assert "register:../../etc/passwd" not in names
+    assert "register:Praxis" not in names
+    assert any("must match" in record.message for record in caplog.records)
+
+
 def test_voice_skill_stack_as_prompt_context(vault_with_voice_tree: Path) -> None:
     """``as_prompt_context`` concatenates with separators for the composer prompt."""
     state = _make_state("rising")

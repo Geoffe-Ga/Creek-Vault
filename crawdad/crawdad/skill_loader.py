@@ -43,6 +43,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger("crawdad.skill_loader")
 
 _PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z\-]+)", re.IGNORECASE)
+# Same shape as the captured phase slug. Used to validate caller-supplied
+# register names so path construction can't be tricked into traversal.
+_SAFE_NAME_RE = re.compile(r"^[a-z][a-z\-]*$")
 _PROMPT_SEPARATOR = "\n\n---\n\n"
 
 
@@ -125,6 +128,14 @@ def load_skills_for_session(
         if register in seen:
             continue
         seen.add(register)
+        if not _SAFE_NAME_RE.match(register):
+            # FEAT-016 will let slash commands set extra registers from
+            # user input; refuse any name that would escape the registers/
+            # subdirectory (path traversal, absolute paths, dotfiles).
+            _LOGGER.warning(
+                "ignoring register name %r — must match [a-z][a-z-]*", register
+            )
+            continue
         register_path = root / "registers" / f"{register}.SKILL.md"
         _append_if_present(collected, register_path, name=f"register:{register}")
 
