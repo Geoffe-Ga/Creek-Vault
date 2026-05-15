@@ -118,3 +118,29 @@ async def test_dispatcher_preserves_privacy_tier_ceiling() -> None:
     )
 
     assert session.calls[0][1]["privacy_tier_ceiling"] == "personal"
+
+
+async def test_dispatcher_intent_ceiling_overrides_conflicting_args() -> None:
+    """The Intent's declared ceiling wins over a conflicting key in args.
+
+    Regression for review feedback: Haiku could otherwise smuggle a
+    looser tier through ``args["privacy_tier_ceiling"]``. The Intent
+    model is authoritative — the MCP server must see the ceiling the
+    router declared, not the one Haiku tucked into the args dict.
+    """
+    session: Any = _FakeSession(replies={"creek.state.read": "ok"})
+    dispatcher = IntentDispatcher(session=session, known_tools=("creek.state.read",))
+
+    await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type="creek.state.read",
+                    privacy_tier_ceiling="personal",
+                    args={"privacy_tier_ceiling": "all"},  # Haiku tried to smuggle
+                )
+            ]
+        )
+    )
+
+    assert session.calls[0][1]["privacy_tier_ceiling"] == "personal"

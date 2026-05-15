@@ -220,6 +220,49 @@ async def test_router_rejects_missing_intents_key(
         )
 
 
+class _RaisingAnthropic:
+    """``messages.create`` raises an injected exception, modeling SDK errors."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.messages = self
+
+    async def create(self, **_kwargs: Any) -> Any:
+        raise self._exc
+
+
+async def test_router_translates_anthropic_api_error_to_parse_error(
+    tools: list[ToolInfo], session_state: SessionState
+) -> None:
+    """Rate-limit / connection / auth errors surface as ``RouterParseError``.
+
+    The bot maps ``RouterParseError`` to a user-visible reply; without
+    this translation the SDK error would propagate through
+    ``handle_message`` into discord.py and the user would receive no
+    reply at all.
+    """
+    import anthropic
+
+    # ``APIError`` requires a request kwarg in modern SDK versions; we
+    # construct a minimal subclass exception that still belongs to the
+    # base ``AnthropicError`` hierarchy.
+    fake_haiku = _RaisingAnthropic(
+        anthropic.AnthropicError("simulated rate-limit / API failure")
+    )
+    router = IntentRouter(
+        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        model="claude-haiku-test",
+        tools=tools,
+    )
+
+    with pytest.raises(RouterParseError, match="Haiku API call failed"):
+        await router.extract_intents(
+            message="hi",
+            history=ConversationHistory(),
+            state=session_state,
+        )
+
+
 async def test_router_extracts_fenced_json_blocks(
     tools: list[ToolInfo], session_state: SessionState
 ) -> None:

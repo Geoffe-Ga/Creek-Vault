@@ -100,8 +100,10 @@ def _build_arguments(intent: Intent) -> dict[str, object]:
     The MCP server reads ``privacy_tier_ceiling`` from the call args as
     a sibling of any tool-specific arguments — see FEAT-010's tool
     signatures. The router carries it on the :class:`Intent` model;
-    we flatten it into the MCP call here.
+    the intent model is authoritative, so we *overwrite* any
+    conflicting key inside ``intent.args`` rather than letting Haiku
+    smuggle a looser tier through the args dict.
     """
     payload: dict[str, object] = dict(intent.args)
-    payload.setdefault("privacy_tier_ceiling", intent.privacy_tier_ceiling.value)
+    payload["privacy_tier_ceiling"] = intent.privacy_tier_ceiling.value
     return payload

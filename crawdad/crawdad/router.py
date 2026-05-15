@@ -31,6 +31,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+import anthropic
 from pydantic import ValidationError
 
 from crawdad.intents import RouterResponse, ToolInfo, build_intents_schema
@@ -161,18 +162,31 @@ class IntentRouter:
         history: ConversationHistory,
         state: SessionState | None,
     ) -> RouterResponse:
-        """Return the parsed :class:`RouterResponse` for ``message``."""
+        """Return the parsed :class:`RouterResponse` for ``message``.
+
+        Raises:
+            RouterParseError: when the SDK call fails (rate-limit,
+                auth, connection, etc.) or when the response body is
+                not parseable JSON. The bot handler maps both to the
+                "I lost the thread; can you rephrase?" user-facing
+                reply rather than crashing.
+        """
         prompt = build_router_prompt(
             message=message,
             history=history,
             state=state,
             tools=self._tools,
         )
-        response = await self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.AnthropicError as exc:
+            _LOGGER.warning("Haiku API call failed: %s: %r", type(exc).__name__, exc)
+            msg = f"Haiku API call failed: {type(exc).__name__}"
+            raise RouterParseError(msg) from exc
         raw_text = _extract_text(response)
         return _parse_router_payload(raw_text)
 

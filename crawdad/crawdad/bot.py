@@ -18,13 +18,13 @@ from typing import TYPE_CHECKING, Protocol, cast
 import discord
 
 from crawdad.dispatcher import IntentDispatcher, UnknownIntentError
+from crawdad.history import ConversationHistory
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.router import RouterParseError
 
 if TYPE_CHECKING:
     from crawdad.config import CrawDadConfig
     from crawdad.dispatcher import ToolResult
-    from crawdad.history import ConversationHistory
     from crawdad.mcp_client import MCPClient
     from crawdad.router import IntentRouter
     from crawdad.state import SessionState, StateUnavailableError
@@ -143,7 +143,7 @@ async def _route_and_dispatch(
     try:
         response = await router.extract_intents(
             message=message.content,
-            history=history or _empty_history(),
+            history=history or ConversationHistory(),
             state=session_state,
         )
     except RouterParseError as exc:
@@ -207,13 +207,6 @@ def _stub_reply() -> str:
         "crawdad here — wiring scaffold is up. "
         "(FEAT-015 will swap this for the composer-driven reply.)"
     )
-
-
-def _empty_history() -> ConversationHistory:
-    """Return a throwaway empty history for callers that opt out of tracking."""
-    from crawdad.history import ConversationHistory
-
-    return ConversationHistory()
 
 
 class CrawDadClient(discord.Client):
