@@ -463,6 +463,13 @@ def _stub_fixed_label_classifier_in_cli(monkeypatch: pytest.MonkeyPatch) -> None
 
     from creek.classify.llm import LLMClassifier as _RealLLMClassifier
 
+    # Patch __init__ (the public constructor) rather than the private
+    # `_check_availability` hook — patching by private name silently
+    # breaks if the implementation renames the method, masking the
+    # test's intent. Replacing __init__ with a no-op bypasses the
+    # health check while leaving `classify_with_reasoning` (the
+    # contract we actually exercise) wired in below.
+    monkeypatch.setattr(_RealLLMClassifier, "__init__", lambda self, **_: None)
     monkeypatch.setattr(
         _RealLLMClassifier,
         "classify_with_reasoning",
@@ -475,14 +482,11 @@ def test_classify_calibrate_renders_report(
     tmp_path: Path,
 ) -> None:
     """`--calibrate` runs the fixture and prints a per-dimension table."""
+    del tmp_path
     _stub_fixed_label_classifier_in_cli(monkeypatch)
     fixture = (
         Path(__file__).parent / "fixtures" / "classification" / "calibration_set.yaml"
     )
-    # Make the LLMClassifier availability check return True without HTTP.
-    from creek.classify.llm import LLMClassifier
-
-    monkeypatch.setattr(LLMClassifier, "_check_availability", lambda _self: True)
     result = runner.invoke(
         app,
         [

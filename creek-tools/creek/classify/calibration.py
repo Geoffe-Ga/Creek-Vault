@@ -276,10 +276,11 @@ def _extract_label(fragment: Fragment, dimension: str) -> str | None:
         agreement against any ground-truth label).
 
     Raises:
-        AssertionError: When *dimension* is not one of
-            :data:`DIMENSIONS`. Surfaces a missing dispatch branch at
-            test time rather than silently reporting 0% agreement for
-            a misnamed dimension.
+        ValueError: When *dimension* is not one of :data:`DIMENSIONS`.
+            Surfaces a missing dispatch branch at call time rather
+            than silently reporting 0% agreement for a misnamed
+            dimension. ``ValueError`` (not ``AssertionError``) so the
+            guard fires even under ``python -O``.
     """
     if dimension == "frequency":
         return _none_if_unclassified(fragment.frequency.primary)
@@ -301,7 +302,7 @@ def _extract_label(fragment: Fragment, dimension: str) -> str | None:
         register = fragment.voice.voice_register
         return None if register is None else str(register)
     msg = f"unhandled dimension: {dimension!r}"
-    raise AssertionError(msg)
+    raise ValueError(msg)
 
 
 def _none_if_unclassified(value: object) -> str | None:

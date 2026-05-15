@@ -727,6 +727,16 @@ Anchored to the source layout (``creek-tools/creek/cli.py`` →
 ``parents[1]`` = ``creek-tools/``) so the command works regardless of
 the operator's current working directory. Used when
 ``--calibration-fixture`` is omitted.
+
+Source-tree assumption: ``parents[1]`` resolves to ``creek-tools/``
+for editable / direct-run installs (which is how this tool is used
+today). A non-editable pip install of ``creek`` would place
+``cli.py`` inside ``site-packages/creek/`` without an adjacent
+``tests/`` directory; in that scenario the operator must supply
+``--calibration-fixture`` explicitly. If the project is ever
+distributed as a wheel, the long-term fix is to re-ship the fixture
+as package data inside ``creek/classify/`` and load via
+``importlib.resources``.
 """
 
 

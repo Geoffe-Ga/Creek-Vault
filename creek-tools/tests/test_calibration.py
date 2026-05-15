@@ -406,7 +406,7 @@ class TestExtractLabel:
         from creek.classify.calibration import _extract_label
 
         fragment = _classified_fragment("frag-x")
-        with pytest.raises(AssertionError, match="unhandled dimension"):
+        with pytest.raises(ValueError, match="unhandled dimension"):
             _extract_label(fragment, "not_a_real_dimension")
 
 
