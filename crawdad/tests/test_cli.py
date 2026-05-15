@@ -116,7 +116,10 @@ def test_run_bot_wires_state_and_starts_client(
     assert captured["probed"] is True
     assert captured["init_kwargs"]["session_state"] is not None
     assert captured["init_kwargs"]["router"] is not None
+    assert captured["init_kwargs"]["composer"] is not None
     assert captured["init_kwargs"]["known_tools"] == ("creek.state.read",)
+    # Voice-skill stack is always constructed (empty when vault has none).
+    assert captured["init_kwargs"]["skills"] is not None
 
 
 def test_run_bot_swallows_missing_state(
@@ -144,8 +147,9 @@ def test_run_bot_swallows_missing_state(
     cli.run_bot(config)
 
     assert captured["init_kwargs"]["session_state"] is None
-    # Empty tool surface disables the router.
+    # Empty tool surface disables the agent loop.
     assert captured["init_kwargs"]["router"] is None
+    assert captured["init_kwargs"]["composer"] is None
     assert captured["ran"] is True
 
 
@@ -216,24 +220,23 @@ async def test_startup_probe_returns_empty_on_failure(
     assert any("MCP probe failed" in record.message for record in caplog.records)
 
 
-def test_build_agent_components_disables_router_when_no_tools(
+def test_build_agent_components_disables_loop_when_no_tools(
     patched_config: CrawDadConfig,
 ) -> None:
-    """Empty tool list → router=None, history still constructed."""
-    router, mcp_client, known_tools, history = cli._build_agent_components(
-        config=patched_config, tool_details=()
-    )
+    """Empty tool list → router and composer both ``None``."""
+    components = cli._build_agent_components(config=patched_config, tool_details=())
 
-    assert router is None
-    assert mcp_client is not None
-    assert known_tools == ()
-    assert history is not None
+    assert components.router is None
+    assert components.composer is None
+    assert components.mcp_client is not None
+    assert components.known_tools == ()
+    assert components.history is not None
 
 
-def test_build_agent_components_constructs_router_when_tools_present(
+def test_build_agent_components_wires_router_and_composer(
     patched_config: CrawDadConfig,
 ) -> None:
-    """A non-empty tool surface produces a wired ``IntentRouter``."""
+    """A non-empty tool surface produces wired router + composer."""
     from crawdad.mcp_client import ToolDetails
 
     details = (
@@ -244,9 +247,10 @@ def test_build_agent_components_constructs_router_when_tools_present(
         ),
     )
 
-    router, _client, known_tools, _history = cli._build_agent_components(
+    components = cli._build_agent_components(
         config=patched_config, tool_details=details
     )
 
-    assert router is not None
-    assert known_tools == ("creek.state.read",)
+    assert components.router is not None
+    assert components.composer is not None
+    assert components.known_tools == ("creek.state.read",)

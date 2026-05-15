@@ -326,45 +326,6 @@ async def test_crawdad_client_on_ready_logs(
     assert any("connected" in record.message for record in caplog.records)
 
 
-def test_format_structured_reply_renders_each_tool_result() -> None:
-    """Each tool result becomes one bullet line in the reply."""
-    from crawdad.bot import format_structured_reply
-    from crawdad.dispatcher import ToolResult
-
-    reply = format_structured_reply(
-        [
-            ToolResult(intent_type="creek.state.read", body="state body"),
-            ToolResult(intent_type="creek.mine", body="seed one\nseed two"),
-        ]
-    )
-
-    assert "creek.state.read" in reply
-    assert "state body" in reply
-    assert "creek.mine" in reply
-
-
-def test_format_structured_reply_handles_empty_results() -> None:
-    """No intents produced means the router skipped tools — surface that."""
-    from crawdad.bot import format_structured_reply
-
-    reply = format_structured_reply([])
-
-    assert "no tool call" in reply.lower()
-
-
-def test_format_structured_reply_truncates_long_body() -> None:
-    """Long tool bodies get capped per-line."""
-    from crawdad.bot import format_structured_reply
-    from crawdad.dispatcher import ToolResult
-
-    long_body = "x" * 1000
-    reply = format_structured_reply(
-        [ToolResult(intent_type="creek.state.read", body=long_body)]
-    )
-
-    assert "..." in reply
-
-
 class _StubRouter:
     """Async-compatible router stand-in for handler tests."""
 
@@ -377,6 +338,21 @@ class _StubRouter:
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
+
+
+class _StubComposer:
+    """Async-compatible composer stand-in returning a fixed reply."""
+
+    def __init__(self, reply: str | Exception) -> None:
+        self._reply = reply
+        self.calls: list[dict[str, Any]] = []
+
+    async def compose(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        if isinstance(self._reply, Exception):
+            raise self._reply
+        assert isinstance(self._reply, str)
+        return self._reply
 
 
 class _StubSession:
@@ -416,16 +392,29 @@ class _StubMCPClient:
         return _ctx()
 
 
-async def test_handle_message_runs_router_and_dispatcher(
+async def test_handle_message_runs_full_loop(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """An allowlisted message flows through router → dispatcher → reply."""
+    """An allowlisted message flows through router → dispatch → composer."""
     from crawdad.history import ConversationHistory
     from crawdad.intents import Intent, RouterResponse
 
-    router = _StubRouter(RouterResponse(intents=[Intent(type="creek.state.read")]))
-    session = _StubSession(replies={"creek.state.read": "state body"})
-    mcp_client = _StubMCPClient(session)
+    # Router emits one tool call, then signals compose.
+    router_responses = iter(
+        [
+            RouterResponse(intents=[Intent(type="creek.state.read")]),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+
+    class _SeqRouter:
+        async def extract_intents(self, **_kwargs: Any) -> Any:
+            return next(router_responses)
+
+    composer = _StubComposer("voice-faithful reply")
+    mcp_client = _StubMCPClient(
+        _StubSession(replies={"creek.state.read": "state body"})
+    )
     history = ConversationHistory()
     channel = _FakeChannel(id=999, sent=[])
     message: Any = _FakeMessage(
@@ -439,28 +428,28 @@ async def test_handle_message_runs_router_and_dispatcher(
         config=config,
         session_state=session_state,
         bot_user_id=42,
-        router=router,  # type: ignore[arg-type]
+        router=_SeqRouter(),  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
         mcp_client=mcp_client,  # type: ignore[arg-type]
         known_tools=("creek.state.read",),
         history=history,
     )
 
     assert len(channel.sent) == 1
-    assert "creek.state.read" in channel.sent[0]
-    # History gets both the user message and the assistant reply.
+    assert channel.sent[0] == "voice-faithful reply"
+    # History records the user turn and the assistant reply.
     entries = history.as_list()
-    assert entries[0].role == "user"
-    assert entries[-1].role == "assistant"
+    assert [e.role for e in entries] == ["user", "assistant"]
 
 
-async def test_handle_message_translates_router_parse_error(
+async def test_handle_message_router_parse_error_uses_soft_reply(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """RouterParseError → "I lost the thread" reply, not a crash."""
+    """Router parse error → loop returns the "rephrase" outcome."""
     from crawdad.router import RouterParseError
 
     router = _StubRouter(RouterParseError("not JSON"))
-    mcp_client = _StubMCPClient(_StubSession())
+    composer = _StubComposer("(unused)")
     channel = _FakeChannel(id=999, sent=[])
     message: Any = _FakeMessage(
         author=_FakeAuthor(id=111),
@@ -474,22 +463,24 @@ async def test_handle_message_translates_router_parse_error(
         session_state=session_state,
         bot_user_id=42,
         router=router,  # type: ignore[arg-type]
-        mcp_client=mcp_client,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
         known_tools=("creek.state.read",),
     )
 
     assert len(channel.sent) == 1
     assert "rephrase" in channel.sent[0].lower()
+    assert composer.calls == []
 
 
-async def test_handle_message_translates_unknown_intent(
+async def test_handle_message_unknown_intent_uses_soft_reply(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """UnknownIntentError → "I tried to use a tool I don't have" reply."""
+    """Unknown intent → loop returns the "no such tool" outcome."""
     from crawdad.intents import Intent, RouterResponse
 
     router = _StubRouter(RouterResponse(intents=[Intent(type="creek.bogus")]))
-    mcp_client = _StubMCPClient(_StubSession())
+    composer = _StubComposer("(unused)")
     channel = _FakeChannel(id=999, sent=[])
     message: Any = _FakeMessage(
         author=_FakeAuthor(id=111),
@@ -503,7 +494,8 @@ async def test_handle_message_translates_unknown_intent(
         session_state=session_state,
         bot_user_id=42,
         router=router,  # type: ignore[arg-type]
-        mcp_client=mcp_client,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
         known_tools=("creek.state.read",),
     )
 
@@ -511,18 +503,18 @@ async def test_handle_message_translates_unknown_intent(
     assert "tool" in channel.sent[0].lower()
 
 
-async def test_handle_message_translates_mcp_unavailable_in_dispatch(
+async def test_handle_message_mcp_unavailable_uses_soft_reply(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """MCPUnavailableError during dispatch → graceful soft-error reply."""
+    """MCP subprocess death → loop returns the "unreachable" outcome."""
     from crawdad.intents import Intent, RouterResponse
     from crawdad.mcp_client import MCPUnavailableError
 
     router = _StubRouter(RouterResponse(intents=[Intent(type="creek.state.read")]))
+    composer = _StubComposer("(unused)")
     session = _StubSession(
         errors={"creek.state.read": MCPUnavailableError("subprocess died")}
     )
-    mcp_client = _StubMCPClient(session)
     channel = _FakeChannel(id=999, sent=[])
     message: Any = _FakeMessage(
         author=_FakeAuthor(id=111),
@@ -536,7 +528,8 @@ async def test_handle_message_translates_mcp_unavailable_in_dispatch(
         session_state=session_state,
         bot_user_id=42,
         router=router,  # type: ignore[arg-type]
-        mcp_client=mcp_client,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(session),  # type: ignore[arg-type]
         known_tools=("creek.state.read",),
     )
 
@@ -544,10 +537,41 @@ async def test_handle_message_translates_mcp_unavailable_in_dispatch(
     assert "unreachable" in channel.sent[0].lower()
 
 
-async def test_handle_message_without_router_uses_stub_reply(
+async def test_handle_message_truncates_long_composer_output(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """When router=None (test mode), the FEAT-013 stub reply is still posted."""
+    """Composer outputs over the Discord cap are truncated with an ellipsis."""
+    from crawdad.intents import RouterResponse
+
+    router = _StubRouter(RouterResponse(intents=[], compose=True))
+    composer = _StubComposer("x" * 5000)
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="hi",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=(),
+    )
+
+    assert len(channel.sent) == 1
+    assert channel.sent[0].endswith("...")
+    assert len(channel.sent[0]) < 5000
+
+
+async def test_handle_message_without_loop_components_uses_stub_reply(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Missing router/composer/mcp_client → FEAT-013 stub reply (test-only path)."""
     channel = _FakeChannel(id=999, sent=[])
     message: Any = _FakeMessage(
         author=_FakeAuthor(id=111),
@@ -561,6 +585,7 @@ async def test_handle_message_without_router_uses_stub_reply(
         session_state=session_state,
         bot_user_id=42,
         router=None,
+        composer=None,
         mcp_client=None,
     )
 

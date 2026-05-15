@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _ENV_DISCORD_TOKEN = "DISCORD_BOT_TOKEN"
 _ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
 _ENV_ROUTER_MODEL = "CRAWDAD_ROUTER_MODEL"
+_ENV_COMPOSER_MODEL = "CRAWDAD_COMPOSER_MODEL"
 _DEFAULT_MCP_COMMAND: tuple[str, ...] = ("creek-tools-mcp",)
 
 # The single place a Haiku model literal lives in this package. Other
@@ -34,9 +35,31 @@ DEFAULT_ROUTER_MODEL: str = os.environ.get(
     _ENV_ROUTER_MODEL, _DEFAULT_ROUTER_MODEL_FALLBACK
 )
 
+# Same indirection for the FEAT-015 Sonnet composer. The literal Sonnet
+# model ID lives ONLY here; the regression test in
+# ``test_no_model_literals.py`` enforces that no other module references
+# any ``claude-sonnet-*`` string.
+_DEFAULT_COMPOSER_MODEL_FALLBACK = "claude-sonnet-4-6"
+DEFAULT_COMPOSER_MODEL: str = os.environ.get(
+    _ENV_COMPOSER_MODEL, _DEFAULT_COMPOSER_MODEL_FALLBACK
+)
+
 # History truncation knobs (ADOPT-008 hard cliff; FEAT-016 may refine).
 HISTORY_MAX_ENTRIES: int = 20
 HISTORY_MAX_CHARS_PER_ENTRY: int = 2000
+
+# Agent-loop knobs (FEAT-015 §pre-decided choices).
+# Hard cap — the 6th attempt is refused with a documented user reply
+# and a session reset. Tune later.
+MAX_LOOP_ROUNDS: int = 5
+
+# Voice-skill tree directory inside the user's vault. The loader reads
+# ``<vault>/creek-skills/voice-core/SKILL.md`` plus phase- and
+# register-specific files; missing files yield empty skill lists so a
+# vault without a fleshed-out voice tree still gets a response (just a
+# less voice-faithful one).
+CREEK_SKILLS_DIRNAME: str = "creek-skills"
+DEFAULT_REGISTER: str = "confessional"
 
 
 class CrawDadConfig(BaseModel):

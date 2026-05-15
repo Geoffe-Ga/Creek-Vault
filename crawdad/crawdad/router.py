@@ -104,7 +104,13 @@ def build_router_prompt(
     return (
         "You are the intent-extraction router for the CrawDad spiritual "
         "companion. Your job is to read the user's latest message and emit "
-        'ONLY a JSON object of the form {"intents": [...]}.\n\n'
+        'ONLY a JSON object of the form {"intents": [...], "compose": bool}.\n\n'
+        "Set `compose: true` (with `intents: []`) ONLY when no more tool "
+        "calls are needed and the Sonnet composer should produce the "
+        "user-facing reply right now. If prior tool results in the history "
+        "include a paradox surfacing, include a `creek.save` intent "
+        "(target=paradox) BEFORE setting `compose: true` so paradoxes are "
+        "routed to `10-Liminal/Paradoxes/`. Never propose paradox resolution.\n\n"
         f"{phase_hint}\n\n"
         f"{wavelength_block}\n\n"
         f"{history_block}\n\n"
