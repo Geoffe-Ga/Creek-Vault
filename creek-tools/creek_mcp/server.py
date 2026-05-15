@@ -27,6 +27,11 @@ from creek_mcp.tools import (
     link_tool,
     lint_tool,
     mine_tool,
+    purge_classifications_tool,
+    purge_daterange_tool,
+    purge_fragment_tool,
+    purge_source_tool,
+    purge_vault_tool,
     report_tool,
     save_tool,
     skills_refresh_tool,
@@ -296,6 +301,81 @@ def build_server(
             target_title=target_title,
             llm_factory=compile_factory,
             privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.purge.fragment")
+    def _purge_fragment(
+        fragment_id: str,
+        auth_token: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete one fragment by ID (elevated authorization required)."""
+        return purge_fragment_tool(
+            vault_path=vault,
+            fragment_id=fragment_id,
+            auth_token=auth_token,
+            dry_run=dry_run,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.purge.source")
+    def _purge_source(
+        source_type: str,
+        auth_token: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete every fragment from *source_type* (elevated auth required)."""
+        return purge_source_tool(
+            vault_path=vault,
+            source_type=source_type,
+            auth_token=auth_token,
+            dry_run=dry_run,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.purge.classifications")
+    def _purge_classifications(
+        auth_token: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Reset classification metadata vault-wide (elevated auth required)."""
+        return purge_classifications_tool(
+            vault_path=vault,
+            auth_token=auth_token,
+            dry_run=dry_run,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.purge.daterange")
+    def _purge_daterange(
+        start: str,
+        end: str,
+        auth_token: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete fragments created in ``[start, end]`` (elevated auth required)."""
+        return purge_daterange_tool(
+            vault_path=vault,
+            start=start,
+            end=end,
+            auth_token=auth_token,
+            dry_run=dry_run,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.purge.vault")
+    def _purge_vault(
+        confirm_vault_path: str | None = None,
+        auth_token: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Destroy all vault content (elevated auth + path confirmation)."""
+        return purge_vault_tool(
+            vault_path=vault,
+            confirm_vault_path=confirm_vault_path,
+            auth_token=auth_token,
+            dry_run=dry_run,
             consumer=consumer,
         )
 
