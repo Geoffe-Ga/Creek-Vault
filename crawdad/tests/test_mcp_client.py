@@ -99,3 +99,27 @@ async def test_session_call_tool_translates_underlying_failure() -> None:
 
     with pytest.raises(MCPUnavailableError, match="call_tool"):
         await session.call_tool("anything", {})
+
+
+async def test_list_tool_details_returns_name_description_and_schema() -> None:
+    """``list_tool_details`` powers FEAT-014's intents-schema generation."""
+    async with MCPClient(_fixture_command()).connect() as session:
+        details = await session.list_tool_details()
+
+    names = {tool.name for tool in details}
+    assert {"echo", "ping"}.issubset(names)
+    echo = next(tool for tool in details if tool.name == "echo")
+    assert echo.input_schema["type"] == "object"
+    # FastMCP wraps the function signature; ``message`` is the kwarg.
+    assert "message" in echo.input_schema.get("properties", {})
+
+
+async def test_list_tool_details_translates_underlying_failure() -> None:
+    """Failures during the detailed listing map to MCPUnavailableError."""
+    from crawdad.mcp_client import MCPSession
+
+    broken: Any = _BrokenSession()
+    session = MCPSession(broken)
+
+    with pytest.raises(MCPUnavailableError, match="list_tool_details"):
+        await session.list_tool_details()

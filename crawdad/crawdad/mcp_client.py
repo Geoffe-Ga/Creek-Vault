@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -36,6 +37,21 @@ class MCPUnavailableError(RuntimeError):
     subprocess exits or stops responding, the bot does NOT exit. It
     catches this error and replies gracefully to Discord.
     """
+
+
+class ToolDetails(BaseModel):
+    """Normalised view of one tool from MCP ``tools/list``.
+
+    FEAT-014's router uses these to build the intents JSON Schema.
+    Kept here (not in :mod:`crawdad.intents`) so the wrapper module
+    owns the SDK ↔ Pydantic translation in one place.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
 
 
 class MCPSession:
@@ -54,6 +70,29 @@ class MCPSession:
             msg = "list_tools failed; the MCP subprocess may have exited"
             raise MCPUnavailableError(msg) from exc
         return tuple(tool.name for tool in result.tools)
+
+    async def list_tool_details(self) -> tuple[ToolDetails, ...]:
+        """Return tool name + description + input schema for every tool.
+
+        FEAT-014's router needs the descriptions and JSON Schemas to
+        build an :func:`intents.build_intents_schema` payload. The names
+        accessor (:meth:`list_tools`) stays for callers that only need
+        the connectivity probe.
+        """
+        try:
+            result = await self._session.list_tools()
+        except Exception as exc:
+            _LOGGER.debug("list_tool_details raised %s: %r", type(exc).__name__, exc)
+            msg = "list_tool_details failed; the MCP subprocess may have exited"
+            raise MCPUnavailableError(msg) from exc
+        return tuple(
+            ToolDetails(
+                name=tool.name,
+                description=tool.description or "",
+                input_schema=dict(tool.inputSchema or {}),
+            )
+            for tool in result.tools
+        )
 
     async def call_tool(
         self,

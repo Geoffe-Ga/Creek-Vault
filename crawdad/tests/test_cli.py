@@ -85,6 +85,8 @@ def test_run_bot_wires_state_and_starts_client(
     vault_with_state: Path,
 ) -> None:
     """``run_bot`` loads state, probes MCP, and hands the token to discord."""
+    from crawdad.mcp_client import ToolDetails
+
     config = patched_config.model_copy(update={"vault_path": vault_with_state})
     captured: dict[str, Any] = {}
 
@@ -95,17 +97,26 @@ def test_run_bot_wires_state_and_starts_client(
         def run(self, token: str) -> None:
             captured["token"] = token
 
-    async def _ok_probe(_c: CrawDadConfig) -> None:
+    async def _ok_probe(_c: CrawDadConfig) -> tuple[ToolDetails, ...]:
         captured["probed"] = True
+        return (
+            ToolDetails(
+                name="creek.state.read",
+                description="Read latest.md",
+                input_schema={"type": "object"},
+            ),
+        )
 
     monkeypatch.setattr(cli, "CrawDadClient", _FakeClient)
-    monkeypatch.setattr(cli, "_probe_mcp", _ok_probe)
+    monkeypatch.setattr(cli, "_startup_probe", _ok_probe)
 
     cli.run_bot(config)
 
     assert captured["token"] == config.discord_bot_token
     assert captured["probed"] is True
     assert captured["init_kwargs"]["session_state"] is not None
+    assert captured["init_kwargs"]["router"] is not None
+    assert captured["init_kwargs"]["known_tools"] == ("creek.state.read",)
 
 
 def test_run_bot_swallows_missing_state(
@@ -124,29 +135,39 @@ def test_run_bot_swallows_missing_state(
         def run(self, _token: str) -> None:
             captured["ran"] = True
 
-    async def _ok_probe(_c: CrawDadConfig) -> None:
-        return None
+    async def _ok_probe(_c: CrawDadConfig) -> tuple[Any, ...]:
+        return ()
 
     monkeypatch.setattr(cli, "CrawDadClient", _FakeClient)
-    monkeypatch.setattr(cli, "_probe_mcp", _ok_probe)
+    monkeypatch.setattr(cli, "_startup_probe", _ok_probe)
 
     cli.run_bot(config)
 
     assert captured["init_kwargs"]["session_state"] is None
+    # Empty tool surface disables the router.
+    assert captured["init_kwargs"]["router"] is None
     assert captured["ran"] is True
 
 
-async def test_probe_mcp_logs_tools_on_success(
+async def test_startup_probe_returns_tool_details_on_success(
     patched_config: CrawDadConfig,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A working MCP subprocess produces an INFO log listing tool names."""
+    """``_startup_probe`` returns the advertised tool surface for the router."""
     from contextlib import asynccontextmanager
 
+    from crawdad.mcp_client import ToolDetails
+
     class _Session:
-        async def list_tools(self) -> tuple[str, ...]:
-            return ("echo",)
+        async def list_tool_details(self) -> tuple[ToolDetails, ...]:
+            return (
+                ToolDetails(
+                    name="echo",
+                    description="echo back",
+                    input_schema={"type": "object"},
+                ),
+            )
 
     class _Client:
         def __init__(self, _command: tuple[str, ...]) -> None:
@@ -159,17 +180,19 @@ async def test_probe_mcp_logs_tools_on_success(
     monkeypatch.setattr(cli, "MCPClient", _Client)
     caplog.set_level("INFO", logger="crawdad.cli")
 
-    await cli._probe_mcp(patched_config)
+    details = await cli._startup_probe(patched_config)
 
+    assert len(details) == 1
+    assert details[0].name == "echo"
     assert any("echo" in record.message for record in caplog.records)
 
 
-async def test_probe_mcp_logs_warning_on_failure(
+async def test_startup_probe_returns_empty_on_failure(
     patched_config: CrawDadConfig,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A broken MCP probe logs a warning but does NOT raise — bot keeps running."""
+    """A broken probe returns an empty tuple — bot still starts."""
     from contextlib import asynccontextmanager
 
     class _Client:
@@ -187,6 +210,43 @@ async def test_probe_mcp_logs_warning_on_failure(
     monkeypatch.setattr(cli, "MCPClient", _Client)
     caplog.set_level("WARNING", logger="crawdad.cli")
 
-    await cli._probe_mcp(patched_config)
+    details = await cli._startup_probe(patched_config)
 
+    assert details == ()
     assert any("MCP probe failed" in record.message for record in caplog.records)
+
+
+def test_build_agent_components_disables_router_when_no_tools(
+    patched_config: CrawDadConfig,
+) -> None:
+    """Empty tool list → router=None, history still constructed."""
+    router, mcp_client, known_tools, history = cli._build_agent_components(
+        config=patched_config, tool_details=()
+    )
+
+    assert router is None
+    assert mcp_client is not None
+    assert known_tools == ()
+    assert history is not None
+
+
+def test_build_agent_components_constructs_router_when_tools_present(
+    patched_config: CrawDadConfig,
+) -> None:
+    """A non-empty tool surface produces a wired ``IntentRouter``."""
+    from crawdad.mcp_client import ToolDetails
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    )
+
+    router, _client, known_tools, _history = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+
+    assert router is not None
+    assert known_tools == ("creek.state.read",)
