@@ -1075,7 +1075,7 @@ def test_skills_help() -> None:
 
 
 def test_skills_command(tmp_path: Path) -> None:
-    """Test that skills command runs with required args."""
+    """Test that ``creek skills generate`` runs with required args."""
     vault = tmp_path / "vault"
     vault.mkdir()
     output = tmp_path / "out"
@@ -1083,6 +1083,7 @@ def test_skills_command(tmp_path: Path) -> None:
         app,
         [
             "skills",
+            "generate",
             "--generate",
             "--vault",
             str(vault),

@@ -114,5 +114,5 @@ require the corresponding test and this doc to move together. If you find a §10
 ## See also
 
 - [`generation.md`](generation.md) — `creek report --type` table.
-- [Ontology §10](../../00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md) — full spec.
+- [Ontology §10](../../docs/Ontology/creek_ontology_agent_prompt.md) — full spec.
 - [`linking.md`](linking.md) — embedding linker that feeds the synchronicity and unnamed-digest detectors.

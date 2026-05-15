@@ -99,8 +99,8 @@ build-backend = "setuptools.build_meta"
 include = ["creek", "creek.*", "creek_mcp", "creek_mcp.*"]
 
 [tool.setuptools.package-data]
+"creek.templates" = ["**/*", "**/.gitkeep"]
 "creek.classify.examples" = ["*.yaml"]
-
 
 [tool.pytest.ini_options]
 minversion = "7.0"

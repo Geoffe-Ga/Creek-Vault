@@ -1,6 +1,6 @@
 # creek-tools
 
-The Python pipeline behind the **Creek** knowledge organization system. `creek-tools` ingests semi-structured personal data — chat exports, documents, notes, screenshots — redacts sensitive content, classifies it along the [APTITUDE / Archetypal Wavelength](../00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md) ontology, links semantically related fragments, and writes a richly interlinked Obsidian vault.
+The Python pipeline behind the **Creek** knowledge organization system. `creek-tools` ingests semi-structured personal data — chat exports, documents, notes, screenshots — redacts sensitive content, classifies it along the [APTITUDE / Archetypal Wavelength](../docs/Ontology/creek_ontology_agent_prompt.md) ontology, links semantically related fragments, and writes a richly interlinked Obsidian vault.
 
 The pipeline is **local-first by default**: classification uses Ollama, embeddings use sentence-transformers, and no content leaves your machine unless you explicitly opt in to the Anthropic API path.
 
@@ -41,6 +41,9 @@ pre-commit install
 ## Quickstart
 
 ```bash
+# 0. Scaffold your vault somewhere OUTSIDE this repo (FEAT-019).
+creek init --vault ~/Obsidian/Creek-Vault
+
 # 1. Scan for secrets before anything else.
 creek redact --scan --source ~/exports --report
 
@@ -101,7 +104,8 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 
 | Command | Purpose | Doc |
 |---------|---------|-----|
-| `creek skills`   | Generate the **Voice Skill Tree** under `<vault>/creek-skills/` (one `SKILL.md` per frequency, phase, mode, register, plus thread/eddy/meta skills). | [generation](docs/generation.md#voice-skill-tree) |
+| `creek skills generate` | Generate the **Voice Skill Tree** under `<vault>/creek-skills/` (one `SKILL.md` per frequency, phase, mode, register, plus thread/eddy/meta skills). Previously `creek skills`; see [`CHANGELOG.md`](CHANGELOG.md) for the FEAT-019 rename. | [generation](docs/generation.md#voice-skill-tree) |
+| `creek skills sync` | Re-deploy the canonical schema-skill tree from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/`. Refuses to overwrite locally-modified skill files unless `--force` is passed. | [generation](docs/generation.md#voice-skill-tree) |
 | `creek mine`     | Mine blog/essay seed ideas from the vault using four discovery strategies (liminal cross-eddy, thread terminus, resonance chain, wavelength-phase window). | [generation](docs/generation.md#mining) |
 | `creek draft`    | Draft an essay from a mined idea using the activated skill stack. Saves to `07-Voice/Drafts/` with full provenance. | [generation](docs/generation.md#drafting) |
 

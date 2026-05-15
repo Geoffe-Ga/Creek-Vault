@@ -1,7 +1,10 @@
-"""Tests for Obsidian vault folder structure.
+"""Tests for the canonical vault scaffold under ``creek/templates/vault/``.
 
-Verifies that all vault directories, .gitkeep files, the moved
-ontology file, and the .obsidian configuration exist at the repo root.
+FEAT-019 moved the vault folder structure out of the repo root and into
+a versioned template directory. This file pins the topology of that
+template: every per-vault directory that ``creek init`` is expected to
+materialise must have a ``.gitkeep`` marker so it round-trips through
+git. The repo-level ``.obsidian/`` config also stays asserted here.
 """
 
 from __future__ import annotations
@@ -9,9 +12,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-# Repo root is two levels up from this test file:
-# <repo>/creek-tools/tests/test_vault_structure.py
 REPO_ROOT = Path(__file__).resolve().parents[2]
+VAULT_TEMPLATE_ROOT = REPO_ROOT / "creek-tools" / "creek" / "templates" / "vault"
 
 # ---------- expected structure ----------
 
@@ -76,53 +78,48 @@ EXPECTED_PLUGINS: list[str] = [
 # ---------- tests ----------
 
 
-def test_top_level_folders_exist() -> None:
-    """All 11 top-level vault folders must exist at the repo root."""
+def test_top_level_template_folders_exist() -> None:
+    """Every top-level vault folder has a template directory."""
     for folder in TOP_LEVEL_FOLDERS:
-        path = REPO_ROOT / folder
-        assert path.is_dir(), f"Missing top-level folder: {folder}"
+        assert (VAULT_TEMPLATE_ROOT / folder).is_dir(), (
+            f"Missing template folder: {folder}"
+        )
 
 
-def test_subdirectories_exist() -> None:
-    """Every expected subdirectory must exist under its parent."""
+def test_template_subdirectories_exist() -> None:
+    """Every expected subdirectory is present in the template."""
     for parent, children in SUBDIRECTORIES.items():
         for child in children:
-            path = REPO_ROOT / parent / child
-            assert path.is_dir(), f"Missing subdirectory: {parent}/{child}"
+            assert (VAULT_TEMPLATE_ROOT / parent / child).is_dir(), (
+                f"Missing template subdirectory: {parent}/{child}"
+            )
 
 
 def test_gitkeep_files_in_leaf_directories() -> None:
-    """Leaf directories (and parents with no other tracked content) have .gitkeep."""
+    """Every leaf directory in the template ships a ``.gitkeep`` marker."""
     for parent, children in SUBDIRECTORIES.items():
         if not children:
-            # The parent itself is a leaf
-            gitkeep = REPO_ROOT / parent / ".gitkeep"
-            assert gitkeep.is_file(), f"Missing .gitkeep in {parent}"
+            keep = VAULT_TEMPLATE_ROOT / parent / ".gitkeep"
+            assert keep.is_file(), f"Missing .gitkeep in {parent}"
         else:
             for child in children:
-                gitkeep = REPO_ROOT / parent / child / ".gitkeep"
-                assert gitkeep.is_file(), f"Missing .gitkeep in {parent}/{child}"
+                keep = VAULT_TEMPLATE_ROOT / parent / child / ".gitkeep"
+                assert keep.is_file(), f"Missing .gitkeep in {parent}/{child}"
 
 
-def test_ontology_file_moved() -> None:
-    """The ontology prompt must reside in 00-Creek-Meta/Ontology/."""
-    target = REPO_ROOT / "00-Creek-Meta" / "Ontology" / "creek_ontology_agent_prompt.md"
-    assert target.is_file(), "Ontology prompt not found in 00-Creek-Meta/Ontology/"
-
-    old_location = REPO_ROOT / "scripts" / "Ontology" / "creek_ontology_agent_prompt.md"
-    assert not old_location.exists(), (
-        "Ontology prompt still exists at old location scripts/Ontology/"
-    )
+def test_ontology_spec_lives_in_repo() -> None:
+    """The canonical ontology spec ships at ``docs/Ontology/``."""
+    target = REPO_ROOT / "docs" / "Ontology" / "creek_ontology_agent_prompt.md"
+    assert target.is_file(), "Ontology prompt not found in docs/Ontology/"
 
 
 def test_obsidian_directory_exists() -> None:
-    """The .obsidian/ config directory must exist at the repo root."""
-    obsidian_dir = REPO_ROOT / ".obsidian"
-    assert obsidian_dir.is_dir(), "Missing .obsidian/ directory"
+    """The ``.obsidian/`` config directory remains at the repo root."""
+    assert (REPO_ROOT / ".obsidian").is_dir(), "Missing .obsidian/ directory"
 
 
 def test_community_plugins_json() -> None:
-    """community-plugins.json must list the required plugins."""
+    """``community-plugins.json`` lists the required plugins."""
     plugins_file = REPO_ROOT / ".obsidian" / "community-plugins.json"
     assert plugins_file.is_file(), "Missing .obsidian/community-plugins.json"
 
@@ -131,7 +128,7 @@ def test_community_plugins_json() -> None:
 
 
 def test_gitignore_obsidian_entries() -> None:
-    """Root .gitignore must contain entries for Obsidian workspace and cache."""
+    """Root ``.gitignore`` ignores Obsidian workspace state and cache."""
     gitignore = REPO_ROOT / ".gitignore"
     content = gitignore.read_text(encoding="utf-8")
     assert ".obsidian/workspace.json" in content

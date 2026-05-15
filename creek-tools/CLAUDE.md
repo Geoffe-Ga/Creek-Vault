@@ -17,6 +17,22 @@
 
 ---
 
+## 0. Repo topology
+
+This repository is the **toolchain plus canonical material**, not a vault. Per FEAT-019, the user's vault — fragments, threads, journal, voice exemplars — lives elsewhere on disk and is never checked in.
+
+| Lives in this repo | Lives in the user's vault |
+|--------------------|---------------------------|
+| `creek-tools/` (CLI + pipeline) | `01-Fragments/`, `02-Threads/`, `03-Eddies/`, `04-Praxis/`, `05-Wavelength/`, `06-Frequencies/`, `07-Voice/`, `08-Decisions/`, `09-Reference/`, `10-Liminal/` |
+| `creek-tools/creek/templates/vault/` (canonical scaffold) | `00-Creek-Meta/Skills/` (deployed from templates) |
+| `creek-tools/creek/templates/skills/*.SKILL.md` (canonical schema-skill tree) | `00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md` (deployed copy) |
+| `creek-tools/creek/templates/AGENTS.md` (canonical agent contract) | `AGENTS.md` (deployed copy) |
+| `docs/Ontology/creek_ontology_agent_prompt.md` (canonical spec) | `00-Creek-Meta/creek_config.yaml` (per-vault config) |
+
+`creek init --vault <path>` materialises the canonical templates into the user's vault. `creek skills sync --vault <path>` re-deploys upstream schema-skill changes after a `creek-tools` upgrade. Never commit user-vault content into this repo.
+
+---
+
 ## 1. Critical Principles
 
 These principles are **non-negotiable** and must be followed without exception:

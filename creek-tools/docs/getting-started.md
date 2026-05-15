@@ -14,26 +14,28 @@ The pipeline imports optional dependencies lazily, so you only need to install t
 
 ## 2. Initialize the vault
 
-The Obsidian vault is the parent repository (`Creek-Vault/`). Its top-level layout is fixed:
+Per FEAT-019, the repository is the *toolchain* — your personal vault lives elsewhere on disk. Pick a vault path *outside* this repo (suggested default: `~/Obsidian/Creek-Vault/`), then scaffold it:
 
-```
-Creek-Vault/
-├── 00-Creek-Meta/Ontology/   # Master ontology spec
-├── 01-Fragments/              # One MD per ingested unit
-├── 02-Threads/                # Narrative currents
-├── 03-Eddies/                 # Topic clusters
-├── 04-Praxis/                 # Actionable insights
-├── 05-Wavelength/             # Phase reports
-├── 06-Frequencies/            # APTITUDE frequency notes
-├── 07-Voice/                  # Voice Skill Tree, drafts
-├── 08-Decisions/              # Decision context
-├── 09-Reference/              # External material
-└── 10-Liminal/                # Awaiting classification
+```bash
+creek init --vault ~/Obsidian/Creek-Vault
 ```
 
-**One vault setup tip:** since `Creek-Vault/` *is* the Obsidian vault and Obsidian recursively indexes every `.md` file, the project's own docs (`creek-tools/`, this guide, `CLAUDE.md`, etc.) will otherwise show up as orphan nodes in the graph view. Open Obsidian → Settings → Files & Links → **"Excluded files"** and add `creek-tools/`. (Equivalently, edit `<vault>/.obsidian/app.json` and add `"creek-tools/"` to `userIgnoreFilters`.)
+`--vault` is required (no implicit default — that's how personal data ends up in repos). `creek init` refuses paths inside a git repository by default; pass `--allow-in-repo` to override with a warning.
 
-Open the repo in Obsidian and add a config file at `00-Creek-Meta/creek_config.yaml`. A minimal starter:
+The scaffold materialises the canonical folder topology, copies the ontology spec, the schema-skill tree, and `AGENTS.md`, and writes a starter `creek_config.yaml`:
+
+```
+~/Obsidian/Creek-Vault/
+├── 00-Creek-Meta/{Ontology,Skills,Templates,Scripts,Processing-Log,creek_config.yaml}
+├── 01-Fragments/                  # One MD per ingested unit
+├── 02-Threads/, 03-Eddies/, 04-Praxis/, 05-Wavelength/
+├── 06-Frequencies/, 07-Voice/, 08-Decisions/, 09-Reference/, 10-Liminal/
+└── AGENTS.md
+```
+
+After upgrading `creek-tools`, re-deploy upstream schema-skill changes with `creek skills sync --vault <path>` (add `--force` to overwrite local edits). To re-copy templates without touching user content, run `creek init --vault <path> --refresh`.
+
+A minimal starter `creek_config.yaml` (already written by `creek init`):
 
 ```yaml
 llm:
