@@ -697,6 +697,33 @@ def classify(
         "--force",
         help="Overwrite fragments classified as method: manual.",
     ),
+    calibrate: bool = typer.Option(
+        False,
+        "--calibrate",
+        help=(
+            "Run the LLM classifier against the calibration fixture and "
+            "print per-dimension agreement (FEAT-017b). Skips the vault "
+            "run, but still requires a valid creek_config.yaml because "
+            "the LLM provider settings come from `llm:` there."
+        ),
+    ),
+    calibration_fixture: Path | None = typer.Option(
+        None,
+        "--calibration-fixture",
+        help=(
+            "Path to a calibration fixture YAML. Defaults to "
+            "tests/fixtures/classification/calibration_set.yaml."
+        ),
+    ),
+    enforce_floors: bool = typer.Option(
+        False,
+        "--enforce-floors",
+        help=(
+            "Exit non-zero if any per-dimension agreement falls below the "
+            "documented FEAT-017 floor. Use in CI runs that should fail "
+            "loud on a regressed prompt or example set."
+        ),
+    ),
 ) -> None:
     """Run classification on existing vault fragments.
 
@@ -707,9 +734,22 @@ def classify(
     ``classification.method: manual`` are preserved unless ``--force``
     is supplied.
 
+    ``--calibrate`` flips this into FEAT-017b mode: instead of touching
+    the vault, the classifier runs against the calibration fixture and
+    prints per-dimension agreement. Pair with ``--enforce-floors`` in
+    CI to fail the build when a dimension regresses below the
+    :data:`creek.classify.calibration.DEFAULT_FLOORS` threshold.
+
     LLM concurrency is governed by ``llm.max_concurrent`` in the
     config, not a CLI flag.
     """
+    if calibrate:
+        _run_calibration_cli(
+            fixture_path=calibration_fixture,
+            enforce_floors=enforce_floors,
+        )
+        return
+
     if method not in _CLASSIFY_METHODS:
         console.print(
             f"[red]Unknown method {method!r}. "
@@ -738,6 +778,86 @@ def classify(
         console.print(f"[yellow]Errors: {len(summary.errors)}[/yellow]")
         for err in summary.errors:
             console.print(f"  [dim]{err}[/dim]")
+
+
+_DEFAULT_CALIBRATION_FIXTURE: Path = (
+    Path(__file__).resolve().parents[1]
+    / "tests"
+    / "fixtures"
+    / "classification"
+    / "calibration_set.yaml"
+)
+"""Default fixture path for `creek classify --calibrate`.
+
+Anchored to the source layout (``creek-tools/creek/cli.py`` →
+``parents[1]`` = ``creek-tools/``) so the command works regardless of
+the operator's current working directory. Used when
+``--calibration-fixture`` is omitted.
+
+Source-tree assumption: ``parents[1]`` resolves to ``creek-tools/``
+for editable / direct-run installs (which is how this tool is used
+today). A non-editable pip install of ``creek`` would place
+``cli.py`` inside ``site-packages/creek/`` without an adjacent
+``tests/`` directory; in that scenario the operator must supply
+``--calibration-fixture`` explicitly. If the project is ever
+distributed as a wheel, the long-term fix is to re-ship the fixture
+as package data inside ``creek/classify/`` and load via
+``importlib.resources``.
+"""
+
+
+def _run_calibration_cli(
+    *,
+    fixture_path: Path | None,
+    enforce_floors: bool,
+) -> None:
+    """Drive `creek classify --calibrate` end-to-end (FEAT-017b).
+
+    Loads the fixture, builds an :class:`LLMClassifier` from the
+    current config, runs the calibration, and prints the per-dimension
+    agreement report. When ``enforce_floors`` is set, exits with code
+    1 on a floor breach so a CI invocation surfaces the regression.
+
+    Args:
+        fixture_path: Operator-supplied fixture path; ``None`` falls
+            back to :data:`_DEFAULT_CALIBRATION_FIXTURE`.
+        enforce_floors: Exit non-zero on floor breach when ``True``.
+    """
+    from creek.classify.calibration import (
+        CalibrationFloorBreachError,
+        assert_floors,
+        load_fixture,
+        run_calibration,
+    )
+    from creek.classify.llm import LLMClassifier
+
+    resolved = fixture_path or _DEFAULT_CALIBRATION_FIXTURE
+    if not resolved.exists():
+        message = f"[red]Calibration fixture not found: {resolved}.[/red] "
+        if fixture_path is None:
+            message += (
+                "The default path is anchored to the source tree; if you "
+                "installed `creek` via a non-editable `pip install`, the "
+                "`tests/fixtures/...` directory is not packaged. Pass "
+                "--calibration-fixture explicitly, or re-install in "
+                "editable mode (`pip install -e .`)."
+            )
+        else:
+            message += "Pass --calibration-fixture to point at a fixture file."
+        console.print(message)
+        raise typer.Exit(code=2)
+
+    config = load_config()
+    classifier = LLMClassifier(config=config.llm)
+    report = run_calibration(classifier, load_fixture(resolved))
+    console.print(report.render())
+
+    if enforce_floors:
+        try:
+            assert_floors(report)
+        except CalibrationFloorBreachError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from None
 
 
 @app.command()

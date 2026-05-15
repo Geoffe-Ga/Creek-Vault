@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
@@ -10,8 +11,6 @@ from typer.testing import CliRunner
 from creek.cli import app
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import pytest
 
 runner = CliRunner()
@@ -401,6 +400,211 @@ def test_classify_force_overrides_manual(tmp_path: Path) -> None:
     assert result.exit_code == 0
     reloaded = frontmatter.load(str(file))
     assert reloaded["classification_method"] == "rules"
+
+
+# ---- FEAT-017b: --calibrate ----
+
+
+def _stub_fixed_label_classifier_in_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace LLMClassifier with a stub that always returns cal-001's labels.
+
+    Used by render-only CLI tests where the exact rates do not matter,
+    only that the calibration mechanism runs end-to-end without
+    hitting the network. The agreement rates this produces are NOT
+    100% — see `test_classify_calibrate_enforce_floors_passes_on_perfect_agreement`
+    for a test that asserts the floor gate with a guaranteed-passing
+    synthetic report instead.
+    """
+    from creek.classify.llm import LLMClassificationResult
+    from creek.models import (
+        Authorship,
+        Dosage,
+        Fragment,
+        FragmentSource,
+        Frequency,
+        FrequencyClassification,
+        Mode,
+        Orientation,
+        Phase,
+        SourcePlatform,
+        VoiceClassification,
+        VoiceRegister,
+        WavelengthClassification,
+    )
+
+    def _classify_perfectly(
+        self: object,
+        fragment: Fragment,
+        content: str = "",
+    ) -> LLMClassificationResult:
+        del self, content
+        # Build a Fragment carrying the labels the perfect classifier
+        # claims; the stub mirrors the expected labels from cal-001
+        # so every fixture entry agrees on at least one dimension.
+        return LLMClassificationResult(
+            fragment=Fragment(
+                id=fragment.id,
+                title=fragment.title,
+                source=FragmentSource(
+                    platform=SourcePlatform.MARKDOWN,
+                    author=Authorship.SELF,
+                ),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+                wavelength=WavelengthClassification(
+                    phase=Phase.PEAKING,
+                    mode=Mode.INHABIT,
+                    orientation=Orientation.FEEL,
+                    dosage=Dosage.AMBIGUOUS,
+                ),
+                voice=VoiceClassification(voice_register=VoiceRegister.RAW),
+            ),
+            reasoning="stub",
+        )
+
+    from creek.classify.llm import LLMClassifier as _RealLLMClassifier
+
+    # Patch __init__ (the public constructor) rather than the private
+    # `_check_availability` hook — patching by private name silently
+    # breaks if the implementation renames the method, masking the
+    # test's intent. Replacing __init__ with a no-op bypasses the
+    # health check while leaving `classify_with_reasoning` (the
+    # contract we actually exercise) wired in below.
+    monkeypatch.setattr(_RealLLMClassifier, "__init__", lambda self, **_: None)
+    monkeypatch.setattr(
+        _RealLLMClassifier,
+        "classify_with_reasoning",
+        _classify_perfectly,
+    )
+
+
+def test_classify_calibrate_renders_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--calibrate` runs the fixture and prints a per-dimension table."""
+    _stub_fixed_label_classifier_in_cli(monkeypatch)
+    fixture = (
+        Path(__file__).parent / "fixtures" / "classification" / "calibration_set.yaml"
+    )
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--calibrate",
+            "--calibration-fixture",
+            str(fixture),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Dimension" in result.output
+    assert "frequency" in result.output
+    assert "Entries scored:" in result.output
+
+
+def test_classify_calibrate_missing_fixture_exits_two(tmp_path: Path) -> None:
+    """`--calibrate` with a bad fixture path exits with code 2."""
+    missing = tmp_path / "nope.yaml"
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--calibrate",
+            "--calibration-fixture",
+            str(missing),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "not found" in result.output
+
+
+def test_classify_calibrate_enforce_floors_passes_on_perfect_agreement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--enforce-floors` exits 0 when every floor is met."""
+    from creek.classify.calibration import (
+        CalibrationReport,
+        DimensionAgreement,
+    )
+
+    # Bypass real classification entirely by stubbing run_calibration to
+    # return a guaranteed-passing report.
+    def _perfect_report(*_args: object, **_kwargs: object) -> CalibrationReport:
+        return CalibrationReport(
+            entries=10,
+            agreements=tuple(
+                DimensionAgreement(dimension=d, matches=10, total=10)
+                for d in (
+                    "frequency",
+                    "phase",
+                    "mode",
+                    "orientation",
+                    "dosage",
+                    "voice_register",
+                )
+            ),
+        )
+
+    monkeypatch.setattr(
+        "creek.classify.calibration.run_calibration",
+        _perfect_report,
+    )
+    fixture = (
+        Path(__file__).parent / "fixtures" / "classification" / "calibration_set.yaml"
+    )
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--calibrate",
+            "--calibration-fixture",
+            str(fixture),
+            "--enforce-floors",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_classify_calibrate_enforce_floors_fails_on_breach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--enforce-floors` exits 1 when at least one dimension is below floor."""
+    from creek.classify.calibration import (
+        CalibrationReport,
+        DimensionAgreement,
+    )
+
+    def _below_floor_report(*_args: object, **_kwargs: object) -> CalibrationReport:
+        return CalibrationReport(
+            entries=10,
+            agreements=(
+                # Every dimension at 0% agreement → breaches every floor.
+                DimensionAgreement(dimension="frequency", matches=0, total=10),
+                DimensionAgreement(dimension="phase", matches=0, total=10),
+                DimensionAgreement(dimension="mode", matches=0, total=10),
+                DimensionAgreement(dimension="orientation", matches=0, total=10),
+                DimensionAgreement(dimension="dosage", matches=0, total=10),
+                DimensionAgreement(dimension="voice_register", matches=0, total=10),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "creek.classify.calibration.run_calibration",
+        _below_floor_report,
+    )
+    fixture = (
+        Path(__file__).parent / "fixtures" / "classification" / "calibration_set.yaml"
+    )
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--calibrate",
+            "--calibration-fixture",
+            str(fixture),
+            "--enforce-floors",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert "floors breached" in result.output
 
 
 def test_link_help() -> None:

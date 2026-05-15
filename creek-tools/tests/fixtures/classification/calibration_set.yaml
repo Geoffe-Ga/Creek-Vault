@@ -1,0 +1,375 @@
+# Calibration set for FEAT-017 LLM classification quality.
+#
+# Each entry is a fragment with hand-labelled expected classifications.
+# `creek classify --calibrate` runs the configured classifier against this
+# fixture and reports per-dimension agreement rates. The CI floors live in
+# creek.classify.calibration.DEFAULT_FLOORS; a drop below floor signals the
+# prompt/example set has regressed.
+#
+# Format (per entry):
+#   id:              stable cal-NNN identifier
+#   title:           short headline (LLM sees this)
+#   body:            representative fragment text (LLM sees this)
+#   expected:        per-dimension hand-labelled ground truth
+#     frequency:        F1..F10
+#     phase:            rising | peaking | withdrawal | diminishing | bottoming_out | restoration
+#     mode:             inhabit | express | collaborate | integrate | absorb
+#     orientation:      do | feel | do_feel
+#     dosage:           medicine | toxic | ambiguous
+#     voice_register:   confessional | analytical | playful | prophetic | instructional | raw | conversational
+#
+# Coverage targets: every frequency at least once; every phase at least once;
+# every mode, dosage, register, and orientation appears in ≥3 entries so the
+# agreement metric has signal on every value.
+- id: cal-001
+  title: Lockout
+  body: My keys are gone and I cannot get into the apartment tonight. Stomach is in
+    a knot. I keep checking my pockets like that will change something.
+  expected:
+    frequency: F1
+    phase: peaking
+    mode: inhabit
+    orientation: feel
+    dosage: ambiguous
+    voice_register: raw
+- id: cal-002
+  title: Team retro
+  body: We circled the same complaint three times and never landed. People want to
+    belong to a competent group more than they want to be right.
+  expected:
+    frequency: F2
+    phase: withdrawal
+    mode: integrate
+    orientation: do_feel
+    dosage: medicine
+    voice_register: analytical
+- id: cal-003
+  title: Walking away from the contract
+  body: I am the one with the authority to say no. If I do not exercise it now I
+    never will, and we both know it.
+  expected:
+    frequency: F3
+    phase: peaking
+    mode: express
+    orientation: do
+    dosage: medicine
+    voice_register: confessional
+- id: cal-004
+  title: Inbox triage rules
+  body: Three folders, one daily clearing time, hard rule about not checking after
+    seven. Order will save me here, even if it feels small.
+  expected:
+    frequency: F4
+    phase: rising
+    mode: express
+    orientation: do
+    dosage: medicine
+    voice_register: instructional
+- id: cal-005
+  title: Roadmap stake
+  body: If the launch slips past Q3 the whole funding round shifts. I am planning
+    backwards from the demo date.
+  expected:
+    frequency: F5
+    phase: rising
+    mode: collaborate
+    orientation: do
+    dosage: medicine
+    voice_register: analytical
+- id: cal-006
+  title: Sitting with the grief
+  body: She just needed someone to be in the room while she cried. I did not try
+    to fix anything.
+  expected:
+    frequency: F6
+    phase: withdrawal
+    mode: inhabit
+    orientation: feel
+    dosage: medicine
+    voice_register: confessional
+- id: cal-007
+  title: Two services agreeing
+  body: The auth proxy and the billing API have to share a customer ID space. The
+    whole system breaks otherwise.
+  expected:
+    frequency: F7
+    phase: rising
+    mode: integrate
+    orientation: do
+    dosage: medicine
+    voice_register: analytical
+- id: cal-008
+  title: Watershed walk
+  body: The creek I grew up beside is gone, and the aquifer it fed is the same one
+    under the new development.
+  expected:
+    frequency: F8
+    phase: diminishing
+    mode: absorb
+    orientation: feel
+    dosage: medicine
+    voice_register: prophetic
+- id: cal-009
+  title: Just watching
+  body: I sat on the back step and the cat came over. I did not need anything to
+    happen.
+  expected:
+    frequency: F9
+    phase: restoration
+    mode: inhabit
+    orientation: feel
+    dosage: medicine
+    voice_register: conversational
+- id: cal-010
+  title: One thing
+  body: There is no separation between the dishwasher humming and the question I
+    am sitting with.
+  expected:
+    frequency: F10
+    phase: peaking
+    mode: absorb
+    orientation: feel
+    dosage: medicine
+    voice_register: prophetic
+- id: cal-011
+  title: New project gathering momentum
+  body: I cannot wait to start. The ideas are stacking faster than I can write
+    them down and every conversation feeds the next.
+  expected:
+    frequency: F5
+    phase: rising
+    mode: express
+    orientation: do
+    dosage: medicine
+    voice_register: playful
+- id: cal-012
+  title: Launch week
+  body: We are in it. The product is live, calls are nonstop, every decision
+    matters and nothing waits.
+  expected:
+    frequency: F5
+    phase: peaking
+    mode: collaborate
+    orientation: do
+    dosage: ambiguous
+    voice_register: raw
+- id: cal-013
+  title: Need to step back
+  body: I have been sprinting for a month and I can feel the diminishing returns.
+    I am going to cancel two meetings tomorrow and just think.
+  expected:
+    frequency: F4
+    phase: withdrawal
+    mode: integrate
+    orientation: do_feel
+    dosage: medicine
+    voice_register: confessional
+- id: cal-014
+  title: Losing interest in the side project
+  body: The same code that lit me up in January feels like homework now. I am not
+    sure I have anything more to say about it.
+  expected:
+    frequency: F9
+    phase: diminishing
+    mode: absorb
+    orientation: feel
+    dosage: ambiguous
+    voice_register: confessional
+- id: cal-015
+  title: Cannot move
+  body: I have been on the couch for three days. The work is undone, my partner is
+    patient, and I am still flat.
+  expected:
+    frequency: F1
+    phase: bottoming_out
+    mode: inhabit
+    orientation: feel
+    dosage: toxic
+    voice_register: raw
+- id: cal-016
+  title: Slow walk after the fever
+  body: I made tea and read one chapter and went to bed early. Small things felt
+    like enough, which is new.
+  expected:
+    frequency: F9
+    phase: restoration
+    mode: inhabit
+    orientation: feel
+    dosage: medicine
+    voice_register: conversational
+- id: cal-017
+  title: Doom scrolling at midnight
+  body: I told myself I was staying informed. Three hours in I was just
+    accelerating the dread.
+  expected:
+    frequency: F1
+    phase: peaking
+    mode: absorb
+    orientation: feel
+    dosage: toxic
+    voice_register: confessional
+- id: cal-018
+  title: Picking the fight again
+  body: I knew where it would go before I said the first sentence. I said it
+    anyway and we both lost the evening.
+  expected:
+    frequency: F2
+    phase: peaking
+    mode: express
+    orientation: do
+    dosage: toxic
+    voice_register: confessional
+- id: cal-019
+  title: What the next decade demands
+  body: The systems we built will not survive the conditions we built them for.
+    We will rebuild them or be rebuilt by what comes.
+  expected:
+    frequency: F8
+    phase: rising
+    mode: express
+    orientation: do
+    dosage: medicine
+    voice_register: prophetic
+- id: cal-020
+  title: How to set up the dev env
+  body: Clone the repo. Run scripts setup. Source the venv. If pre-commit fails,
+    run pre-commit install once and try again.
+  expected:
+    frequency: F7
+    phase: rising
+    mode: express
+    orientation: do
+    dosage: medicine
+    voice_register: instructional
+- id: cal-021
+  title: Cat negotiations
+  body: She wants the chair, I want the chair, the chair has opinions about who
+    deserves the chair. Diplomacy is ongoing.
+  expected:
+    frequency: F6
+    phase: rising
+    mode: express
+    orientation: feel
+    dosage: medicine
+    voice_register: playful
+- id: cal-022
+  title: Why the rollout failed
+  body: Three factors compounded. The dependency graph had a cycle, the rollback
+    path was untested, and the on-call rota had a gap.
+  expected:
+    frequency: F7
+    phase: withdrawal
+    mode: integrate
+    orientation: do
+    dosage: medicine
+    voice_register: analytical
+- id: cal-023
+  title: What I have not told anyone
+  body: I have been afraid of this for months and I have not said it out loud. I
+    am saying it now because the silence is heavier than the truth.
+  expected:
+    frequency: F9
+    phase: peaking
+    mode: express
+    orientation: feel
+    dosage: medicine
+    voice_register: confessional
+- id: cal-024
+  title: Working out a design with R
+  body: We sketched the schema on a napkin, took turns poking holes, and now we
+    both know what we are building.
+  expected:
+    frequency: F7
+    phase: rising
+    mode: collaborate
+    orientation: do
+    dosage: medicine
+    voice_register: analytical
+- id: cal-025
+  title: After the workshop
+  body: I am chewing on what L said about boundaries. It connects to the therapy
+    homework and to the disagreement at work last week.
+  expected:
+    frequency: F6
+    phase: withdrawal
+    mode: integrate
+    orientation: feel
+    dosage: medicine
+    voice_register: confessional
+- id: cal-026
+  title: Reading without taking notes
+  body: I read the chapter, set the book down, and let it sit. I do not want to
+    summarise it. I want it to soak.
+  expected:
+    frequency: F9
+    phase: withdrawal
+    mode: absorb
+    orientation: feel
+    dosage: medicine
+    voice_register: conversational
+- id: cal-027
+  title: Saying no to the contract
+  body: We talked it through and I told them no. It was clean and it was final
+    and I am not going to second guess it tonight.
+  expected:
+    frequency: F3
+    phase: peaking
+    mode: collaborate
+    orientation: do
+    dosage: medicine
+    voice_register: analytical
+- id: cal-028
+  title: It is two in the morning
+  body: Everything I write tonight is going to be wrong. I am writing anyway
+    because I cannot sleep and the inside of my head will not be quiet.
+  expected:
+    frequency: F9
+    phase: bottoming_out
+    mode: express
+    orientation: feel
+    dosage: ambiguous
+    voice_register: raw
+- id: cal-029
+  title: Quiet morning with the journal
+  body: I wrote three pages of nonsense and then the actual thing I have been
+    avoiding finally came out.
+  expected:
+    frequency: F9
+    phase: withdrawal
+    mode: express
+    orientation: feel
+    dosage: medicine
+    voice_register: confessional
+- id: cal-030
+  title: Coffee with M
+  body: We caught up. She is well. I told her about the move and she laughed in
+    the good way.
+  expected:
+    frequency: F6
+    phase: rising
+    mode: collaborate
+    orientation: feel
+    dosage: medicine
+    voice_register: conversational
+- id: cal-031
+  title: Drink with old colleagues
+  body: It was warm and familiar and I felt seen. I also said things I would not
+    have said sober and woke up uneasy.
+  expected:
+    frequency: F2
+    phase: peaking
+    mode: express
+    orientation: do_feel
+    dosage: ambiguous
+    voice_register: confessional
+- id: cal-032
+  title: Long walk after the hard call
+  body: I needed to move my body and not talk to anyone. By the second mile I had
+    stopped replaying the conversation in my head.
+  expected:
+    frequency: F9
+    phase: restoration
+    mode: inhabit
+    orientation: do_feel
+    dosage: medicine
+    voice_register: confessional
