@@ -27,6 +27,11 @@ EXPECTED_TOOLS = {
     "creek.report",
     "creek.skills.refresh",
     "creek.compile",
+    "creek.purge.fragment",
+    "creek.purge.source",
+    "creek.purge.classifications",
+    "creek.purge.daterange",
+    "creek.purge.vault",
 }
 
 
@@ -100,16 +105,39 @@ def test_call_tool_save_through_mcp(vault: Path) -> None:
 
 
 def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None:
-    """The FEAT-010 acceptance criterion: ceiling is in every tool's schema."""
+    """The FEAT-010 acceptance criterion: ceiling is in every tool's schema.
+
+    FEAT-012 carve-out: ``creek.purge.*`` tools don't read vault
+    content — they take an elevated ``auth_token`` instead — so the
+    tier-ceiling invariant doesn't apply to them.
+    """
     server = build_server(
         vault_path=vault,
         draft_llm_factory=lambda: lambda prompt: "ignored",
     )
     tools = asyncio.run(server.list_tools())
     for tool in tools:
+        if tool.name.startswith("creek.purge."):
+            continue
         schema = tool.inputSchema
         assert "privacy_tier_ceiling" in schema["properties"], (
             f"{tool.name} missing privacy_tier_ceiling in its input schema"
+        )
+
+
+def test_purge_tools_require_auth_token_parameter(vault: Path) -> None:
+    """FEAT-012: every ``creek.purge.*`` tool exposes an ``auth_token`` slot."""
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    tools = asyncio.run(server.list_tools())
+    purge_tools = [t for t in tools if t.name.startswith("creek.purge.")]
+    assert len(purge_tools) == 5
+    for tool in purge_tools:
+        schema = tool.inputSchema
+        assert "auth_token" in schema["properties"], (
+            f"{tool.name} missing auth_token in its input schema"
         )
 
 

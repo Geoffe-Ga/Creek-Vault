@@ -39,7 +39,21 @@ interactively will appear to hang, which is correct.
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars already excluded.      |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Idempotent per FEAT-003; no-op re-runs do not log a duplicate.    |
 
-FEAT-012 adds `purge.*` and consent-elevated paths.
+### Purge tools (FEAT-012, elevated authorization required)
+
+| Tool                            | Inputs                                              | Authorization                                              |
+|---------------------------------|-----------------------------------------------------|------------------------------------------------------------|
+| `creek.purge.fragment`          | `fragment_id`, `auth_token`, `dry_run?`             | `auth_token` must match `CREEK_MCP_ELEVATED_TOKEN`         |
+| `creek.purge.source`            | `source_type`, `auth_token`, `dry_run?`             | `auth_token` must match `CREEK_MCP_ELEVATED_TOKEN`         |
+| `creek.purge.classifications`   | `auth_token`, `dry_run?`                            | `auth_token` must match `CREEK_MCP_ELEVATED_TOKEN`         |
+| `creek.purge.daterange`         | `start`, `end` (ISO dates), `auth_token`, `dry_run?`| `auth_token` must match `CREEK_MCP_ELEVATED_TOKEN`         |
+| `creek.purge.vault`             | `confirm_vault_path`, `auth_token`, `dry_run?`      | BOTH the token AND `confirm_vault_path` matching the vault |
+
+Purge tools deliberately do not accept a `privacy_tier_ceiling`
+parameter: they do not return vault content, so the ceiling
+invariant from FEAT-010 does not apply. Authorization is the only
+gate, and refusals are themselves audited so a hostile client
+cannot probe the gate silently.
 
 Every tool requires a `privacy_tier_ceiling` parameter
 (`open` | `personal` | `intimate` | `all`); default is `open`. Note
@@ -60,6 +74,65 @@ rather than silently downgraded — the body never lands in the vault
 and the audit entry records the refusal without the body. The same
 gate applies to `creek.ingest` because the default ingestor tier is
 `personal`.
+
+### Elevated-authorization model (FEAT-012)
+
+The `creek.purge.*` family is gated by a separate token from the
+tier-ceiling system. The server reads `CREEK_MCP_ELEVATED_TOKEN`
+from its environment at startup; callers present a matching string
+via the `auth_token` parameter on each purge tool. Comparison runs
+through `hmac.compare_digest` (constant-time), not `==`, so a hostile
+client cannot probe the token byte-by-byte through timing.
+
+Operational rules:
+
+- **CrawDad does not get the token.** The Discord bot's MCP client
+  (FEAT-013+) is launched without `CREEK_MCP_ELEVATED_TOKEN`, and its
+  MCP requests omit `auth_token`. Every purge call from CrawDad
+  therefore returns `status="refused"` — there is no Discord command
+  surface that could accidentally destroy vault content.
+- **The developer's Claude Code can be configured with the token.**
+  Generate one with high entropy:
+  ```bash
+  python -c "import secrets; print(secrets.token_hex(32))"
+  ```
+  Add `"CREEK_MCP_ELEVATED_TOKEN": "<generated-token>"` to the `env`
+  block of `.mcp.json` (alongside `CREEK_MCP_CONSUMER`). Treat the
+  token like any other vault secret — keep it out of public dotfiles
+  and shared shells.
+- **`creek.purge.vault` requires both the token AND
+  `confirm_vault_path`.** The confirmation must match the resolved
+  absolute path of the target vault, mirroring the CLI's interactive
+  "type the vault path to proceed" prompt. Either guard alone
+  refuses the call.
+- **Refusals are audited.** A refused purge attempt still appends an
+  entry to `mcp.jsonl`, so a token-less probe leaves a trail. The
+  `auth_token` value never enters the audit log — only the
+  refusal-or-success outcome and the structured args summary.
+
+Example `.mcp.json` for a Claude Code instance configured for
+destructive ops (replace the token with a freshly generated one — the
+sample shown here is high-entropy hex from `secrets.token_hex(32)` and
+must not be reused):
+
+```json
+{
+  "mcpServers": {
+    "creek-tools": {
+      "command": "creek-tools-mcp",
+      "env": {
+        "CREEK_MCP_CONSUMER": "claude-code",
+        "CREEK_MCP_ELEVATED_TOKEN": "REPLACE_WITH_secrets.token_hex(32)"
+      }
+    }
+  }
+}
+```
+
+> Do **not** copy this `env` block into the CrawDad host config. The
+> token is deliberately withheld from CrawDad so a Discord-side
+> intent can never escalate into a vault deletion. If you need to
+> rotate the token, rotate it on the developer's Claude Code only.
 
 ## Claude Code
 
@@ -115,8 +188,28 @@ The vault path is *not* recorded — it's resolved internally from
 rules: long strings become `{"len": N}`, lists become `{"count": N}`,
 dicts become `{"keys": [...]}`. A draft request for an
 `intimate`-tier fragment never leaks the body into the audit
-trail. Hash chaining is provided by `creek.audit.AuditLog`; FEAT-012's
-hardening pass extends the entry shape, not the storage layer.
+trail. Hash chaining is provided by `creek.audit.AuditLog`; FEAT-012
+adds the per-entry `entry_hash` and a verifier on top — see below.
+
+#### Tamper-evidence (FEAT-012)
+
+Every entry carries two integrity fields:
+
+- `prev_hash` — SHA-256 of the previous line's bytes (chain link).
+  Removing or reordering an entry invalidates the chain at the next
+  line.
+- `entry_hash` — SHA-256 of the entry's payload (excluding
+  `entry_hash` and `prev_hash`). Mutating any other field — `tool`,
+  `consumer`, `tier_ceiling`, the args summary — invalidates this
+  hash on its own, even if the line position survives.
+
+`creek_mcp.audit.verify_mcp_audit_chain(vault_path)` walks both
+invariants and raises `MCPAuditChainBrokenError` on the first
+mismatch. The walk is cheap (one read pass, one hash per line) and
+is safe to call from any operator script. Writes hold an exclusive
+`flock` on the log so two processes appending in parallel cannot
+interleave half-written lines; concurrent-write safety is exercised
+by `tests/test_mcp_audit.py::test_concurrent_process_appends_do_not_corrupt_log`.
 
 #### Write-tool audit fields (FEAT-011)
 
