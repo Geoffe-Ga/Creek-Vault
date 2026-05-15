@@ -204,14 +204,16 @@ def test_verifier_reads_log_file_only_once(
             consumer="claude-code",
         )
 
+    from typing import Any
+
     log_path = tmp_path / MCP_AUDIT_RELPATH
     opens: list[None] = []
-    real_open = Path.open
+    real_open: Any = Path.open
 
-    def counting_open(self: Path, *args: object, **kwargs: object) -> object:
+    def counting_open(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self.resolve() == log_path.resolve():
             opens.append(None)
-        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", counting_open)
     verify_mcp_audit_chain(tmp_path)

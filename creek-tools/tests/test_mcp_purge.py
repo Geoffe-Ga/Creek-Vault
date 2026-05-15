@@ -325,6 +325,129 @@ def test_purge_audit_entry_records_operation_and_consumer(vault: Path) -> None:
     assert "auth_token" not in entry["args_summary"]
 
 
+# ---------------------------------------------------------------------------
+# Engine-exception path: the audit-completeness invariant
+# ---------------------------------------------------------------------------
+
+
+_EXPLOSIVE_FAILURE = "engine boom"
+
+
+def _explode(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for a :class:`PurgeEngine` method that raises mid-call."""
+    raise RuntimeError(_EXPLOSIVE_FAILURE)
+
+
+def test_purge_fragment_audits_engine_exception(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raise from ``PurgeEngine.purge_fragment`` still writes one audit entry.
+
+    Regression for the audit-completeness invariant flagged on PR #233.
+    The module docstring promises "every call appends an audit entry to
+    ``mcp.jsonl`` regardless of whether the purge proceeded" — an
+    unhandled exception in the engine would silently break that.
+    """
+    from creek.purge import PurgeEngine as _PurgeEngine
+
+    monkeypatch.setattr(_PurgeEngine, "purge_fragment", _explode)
+    result = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+    )
+    assert result["status"] == "refused"
+    assert _EXPLOSIVE_FAILURE in result["reason"]
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.fragment"
+
+
+def test_purge_source_audits_engine_exception(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raise from ``PurgeEngine.purge_source`` still writes one audit entry."""
+    from creek.purge import PurgeEngine as _PurgeEngine
+
+    monkeypatch.setattr(_PurgeEngine, "purge_source", _explode)
+    result = purge_source_tool(
+        vault_path=vault,
+        source_type="journal",
+        auth_token=ELEVATED_TOKEN,
+    )
+    assert result["status"] == "refused"
+    assert _EXPLOSIVE_FAILURE in result["reason"]
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.source"
+
+
+def test_purge_classifications_audits_engine_exception(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raise from ``PurgeEngine.purge_classifications`` still writes audit."""
+    from creek.purge import PurgeEngine as _PurgeEngine
+
+    monkeypatch.setattr(_PurgeEngine, "purge_classifications", _explode)
+    result = purge_classifications_tool(
+        vault_path=vault,
+        auth_token=ELEVATED_TOKEN,
+    )
+    assert result["status"] == "refused"
+    assert _EXPLOSIVE_FAILURE in result["reason"]
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.classifications"
+
+
+def test_purge_vault_audits_engine_exception(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raise from ``PurgeEngine.purge_vault`` still writes one audit entry.
+
+    The path-confirmation guards both passed at this point; the failure
+    happens inside the engine. The audit must still capture it.
+    """
+    from creek.purge import PurgeEngine as _PurgeEngine
+
+    monkeypatch.setattr(_PurgeEngine, "purge_vault", _explode)
+    result = purge_vault_tool(
+        vault_path=vault,
+        confirm_vault_path=str(vault),
+        auth_token=ELEVATED_TOKEN,
+    )
+    assert result["status"] == "refused"
+    assert _EXPLOSIVE_FAILURE in result["reason"]
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.vault"
+
+
+def test_purge_daterange_audits_engine_exception(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``daterange`` already handled ValueError; this pins the general case."""
+    from creek.purge import PurgeEngine as _PurgeEngine
+
+    monkeypatch.setattr(_PurgeEngine, "purge_daterange", _explode)
+    result = purge_daterange_tool(
+        vault_path=vault,
+        start="2026-05-01",
+        end="2026-05-02",
+        auth_token=ELEVATED_TOKEN,
+    )
+    assert result["status"] == "refused"
+    assert _EXPLOSIVE_FAILURE in result["reason"]
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.daterange"
+
+
 def test_crawdad_consumer_cannot_purge(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,

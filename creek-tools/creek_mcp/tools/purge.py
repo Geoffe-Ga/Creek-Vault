@@ -5,8 +5,9 @@ Code (configured with ``CREEK_MCP_ELEVATED_TOKEN``) can drive
 destructive operations through MCP while CrawDad's Discord bot — which
 deliberately is not given the token — fails closed. Every call
 appends an audit entry to ``mcp.jsonl`` regardless of whether the
-purge proceeded; a silent denial would defeat the whole point of an
-elevated gate.
+purge proceeded — including engine exceptions, which are caught and
+audited via :func:`_audit_engine_error`. A silent denial (or silent
+failure) would defeat the whole point of an elevated gate.
 
 The five tools mirror the CLI:
 
@@ -129,6 +130,29 @@ def _result_payload(
     }
 
 
+def _audit_engine_error(
+    vault_path: Path,
+    *,
+    tool: str,
+    args: dict[str, Any],
+    consumer: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    """Audit an engine-side exception and return a structured refusal.
+
+    The module docstring promises every call writes an audit entry; an
+    uncaught raise from :class:`PurgeEngine` would break that promise.
+    Catching ``Exception`` is deliberate — engine failures can be any
+    subclass (``OSError``, ``ValueError``, ``RuntimeError``) and a
+    silent leak would skip the audit.
+
+    ``BaseException`` is left uncaught so ``KeyboardInterrupt`` and
+    ``SystemExit`` still propagate as the operator expects.
+    """
+    _audit_refusal(vault_path, tool=tool, args=args, consumer=consumer)
+    return _refusal(tool=tool, reason=f"purge engine failed: {exc}")
+
+
 def _gate(
     *,
     tool: str,
@@ -169,7 +193,16 @@ def purge_fragment_tool(
     if refusal is not None:
         return refusal
     engine = PurgeEngine(vault_path, dry_run=dry_run)
-    result = engine.purge_fragment(fragment_id)
+    try:
+        result = engine.purge_fragment(fragment_id)
+    except Exception as exc:
+        return _audit_engine_error(
+            vault_path,
+            tool=_FRAGMENT_TOOL,
+            args=args,
+            consumer=consumer,
+            exc=exc,
+        )
     _audit_success(
         vault_path,
         tool=_FRAGMENT_TOOL,
@@ -200,7 +233,16 @@ def purge_source_tool(
     if refusal is not None:
         return refusal
     engine = PurgeEngine(vault_path, dry_run=dry_run)
-    result = engine.purge_source(source_type)
+    try:
+        result = engine.purge_source(source_type)
+    except Exception as exc:
+        return _audit_engine_error(
+            vault_path,
+            tool=_SOURCE_TOOL,
+            args=args,
+            consumer=consumer,
+            exc=exc,
+        )
     _audit_success(
         vault_path,
         tool=_SOURCE_TOOL,
@@ -230,7 +272,16 @@ def purge_classifications_tool(
     if refusal is not None:
         return refusal
     engine = PurgeEngine(vault_path, dry_run=dry_run)
-    result = engine.purge_classifications()
+    try:
+        result = engine.purge_classifications()
+    except Exception as exc:
+        return _audit_engine_error(
+            vault_path,
+            tool=_CLASSIFICATIONS_TOOL,
+            args=args,
+            consumer=consumer,
+            exc=exc,
+        )
     _audit_success(
         vault_path,
         tool=_CLASSIFICATIONS_TOOL,
@@ -279,9 +330,14 @@ def purge_daterange_tool(
     engine = PurgeEngine(vault_path, dry_run=dry_run)
     try:
         result = engine.purge_daterange(start_date, end_date)
-    except ValueError as exc:
-        _audit_refusal(vault_path, tool=_DATERANGE_TOOL, args=args, consumer=consumer)
-        return _refusal(tool=_DATERANGE_TOOL, reason=str(exc))
+    except Exception as exc:
+        return _audit_engine_error(
+            vault_path,
+            tool=_DATERANGE_TOOL,
+            args=args,
+            consumer=consumer,
+            exc=exc,
+        )
     _audit_success(
         vault_path,
         tool=_DATERANGE_TOOL,
@@ -339,7 +395,16 @@ def purge_vault_tool(
             ),
         )
     engine = PurgeEngine(vault_path, dry_run=dry_run)
-    result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+    try:
+        result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+    except Exception as exc:
+        return _audit_engine_error(
+            vault_path,
+            tool=_VAULT_TOOL,
+            args=args,
+            consumer=consumer,
+            exc=exc,
+        )
     _audit_success(
         vault_path,
         tool=_VAULT_TOOL,
