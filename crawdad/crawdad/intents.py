@@ -46,11 +46,19 @@ class Intent(BaseModel):
 
 
 class RouterResponse(BaseModel):
-    """The exact JSON shape Haiku must emit — no prose, no extras."""
+    """The exact JSON shape Haiku must emit — no prose, no extras.
+
+    FEAT-015 adds the ``compose`` flag: when ``True`` (or when
+    ``intents`` is empty) the loop terminates router iteration and
+    invokes the Sonnet composer. The pair ``{intents: [], compose:
+    true}`` is the canonical "I have enough context; compose now"
+    signal.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     intents: list[Intent]
+    compose: bool = False
 
 
 class ToolInfo(BaseModel):
@@ -104,6 +112,15 @@ def build_intents_schema(tools: list[ToolInfo]) -> dict[str, Any]:
                     },
                     "required": ["type"],
                 },
+            },
+            "compose": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Set true ONLY when no more tool calls are needed and "
+                    "the composer should produce the user-facing reply. "
+                    "Pair with ``intents: []`` for the terminal signal."
+                ),
             },
         },
         "required": ["intents"],

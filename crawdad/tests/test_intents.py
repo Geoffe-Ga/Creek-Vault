@@ -71,6 +71,29 @@ def test_router_response_rejects_missing_intents_key() -> None:
         RouterResponse.model_validate({"reply": "hello"})
 
 
+def test_router_response_compose_defaults_false() -> None:
+    """The FEAT-015 ``compose`` field defaults to ``False`` for back-compat."""
+    response = RouterResponse(intents=[])
+
+    assert response.compose is False
+
+
+def test_router_response_compose_true_signals_termination() -> None:
+    """``{intents: [], compose: true}`` is the canonical 'compose now' signal."""
+    response = RouterResponse.model_validate({"intents": [], "compose": True})
+
+    assert response.intents == []
+    assert response.compose is True
+
+
+def test_build_intents_schema_includes_compose_field() -> None:
+    """The schema advertises the ``compose`` flag so Haiku knows to emit it."""
+    schema = build_intents_schema([])
+
+    assert "compose" in schema["properties"]
+    assert schema["properties"]["compose"]["type"] == "boolean"
+
+
 def test_build_intents_schema_lists_each_tool() -> None:
     """The schema's ``type`` enum reflects every advertised MCP tool."""
     tools = [
