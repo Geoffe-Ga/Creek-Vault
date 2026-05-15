@@ -39,7 +39,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from creek.audit import AuditChainBrokenError, AuditLog
+from creek.audit import AuditLog
+from creek.audit.log import GENESIS_PREV_HASH
 
 if TYPE_CHECKING:
     from creek_mcp.tier_ceiling import TierCeiling
@@ -180,14 +181,23 @@ class MCPAuditLog:
 def verify_mcp_audit_chain(vault_path: Path) -> None:
     """Walk ``mcp.jsonl`` under *vault_path* and validate both invariants.
 
-    Two checks run in tandem:
+    The function reads the log exactly once and validates both checks
+    against the same byte snapshot:
 
-    * ``prev_hash`` chain — delegated to :class:`creek.audit.AuditLog`,
-      which detects removal / reordering by comparing each entry's
-      ``prev_hash`` against ``sha256`` of the previous full line.
+    * ``prev_hash`` chain — each entry's stored ``prev_hash`` is
+      compared against ``sha256`` of the previous full line. Removing
+      or reordering an entry breaks the link at the next line.
     * ``entry_hash`` per entry — recomputed from the stored payload
-      (sans the field itself) and compared to the persisted digest, so
-      a mutation of any other field is flagged on its own.
+      (excluding ``entry_hash``/``prev_hash`` to avoid circularity)
+      and compared to the persisted digest. Mutating any other field
+      invalidates the hash on its own.
+
+    Reading once is intentional: an earlier two-pass version (verify
+    chain via :class:`AuditLog.verify`, then iterate via
+    :class:`AuditLog.read`) had a TOCTOU window. A concurrent appender
+    could grow the file between the two opens, leaving the trailing
+    new entries unchecked by ``entry_hash``. The single snapshot here
+    closes that gap — both invariants see the same set of lines.
 
     A missing log is trivially valid (no entries to disagree about).
 
@@ -197,21 +207,54 @@ def verify_mcp_audit_chain(vault_path: Path) -> None:
     log_path = vault_path / MCP_AUDIT_RELPATH
     if not log_path.exists():
         return
-    audit_log = AuditLog(log_path)
-    try:
-        audit_log.verify()
-    except AuditChainBrokenError as exc:
-        msg = f"MCP audit chain broken: {exc}"
-        raise MCPAuditChainBrokenError(msg) from exc
-    for index, entry in enumerate(audit_log.read()):
-        stored = entry.get(ENTRY_HASH_FIELD)
-        if stored is None:
-            msg = f"MCP audit line {index} is missing 'entry_hash'"
-            raise MCPAuditChainBrokenError(msg)
-        expected = _content_hash(entry)
-        if stored != expected:
-            msg = (
-                f"MCP audit entry_hash mismatch at line {index}: "
-                f"expected {expected!r}, found {stored!r}"
-            )
-            raise MCPAuditChainBrokenError(msg)
+    with log_path.open("r", encoding="utf-8") as handle:
+        lines = [
+            stripped for stripped in (raw.rstrip("\n") for raw in handle) if stripped
+        ]
+    previous_line: str | None = None
+    for index, raw_line in enumerate(lines):
+        try:
+            entry = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            msg = f"MCP audit line {index} is not valid JSON"
+            raise MCPAuditChainBrokenError(msg) from exc
+        _verify_prev_hash(entry, previous_line, index)
+        _verify_entry_hash(entry, index)
+        previous_line = raw_line
+
+
+def _verify_prev_hash(
+    entry: dict[str, Any],
+    previous_line: str | None,
+    index: int,
+) -> None:
+    """Confirm *entry*'s ``prev_hash`` matches ``sha256`` of *previous_line*."""
+    if "prev_hash" not in entry:
+        msg = f"MCP audit line {index} is missing 'prev_hash'"
+        raise MCPAuditChainBrokenError(msg)
+    expected = (
+        GENESIS_PREV_HASH
+        if previous_line is None
+        else hashlib.sha256(previous_line.encode("utf-8")).hexdigest()
+    )
+    if entry["prev_hash"] != expected:
+        msg = (
+            f"MCP audit chain broken at line {index}: "
+            f"expected prev_hash {expected!r}, found {entry['prev_hash']!r}"
+        )
+        raise MCPAuditChainBrokenError(msg)
+
+
+def _verify_entry_hash(entry: dict[str, Any], index: int) -> None:
+    """Confirm *entry*'s stored ``entry_hash`` matches recomputed content."""
+    stored = entry.get(ENTRY_HASH_FIELD)
+    if stored is None:
+        msg = f"MCP audit line {index} is missing 'entry_hash'"
+        raise MCPAuditChainBrokenError(msg)
+    expected = _content_hash(entry)
+    if stored != expected:
+        msg = (
+            f"MCP audit entry_hash mismatch at line {index}: "
+            f"expected {expected!r}, found {stored!r}"
+        )
+        raise MCPAuditChainBrokenError(msg)

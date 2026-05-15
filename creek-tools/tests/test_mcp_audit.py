@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing as mp
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -17,9 +17,6 @@ from creek_mcp.audit import (
     verify_mcp_audit_chain,
 )
 from creek_mcp.tier_ceiling import TierCeiling
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_summarise_args_keeps_short_scalars() -> None:
@@ -182,6 +179,45 @@ def test_verifier_detects_removed_entry(tmp_path: Path) -> None:
 
     with pytest.raises(MCPAuditChainBrokenError):
         verify_mcp_audit_chain(tmp_path)
+
+
+def test_verifier_reads_log_file_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verifier snapshots the file so chain + entry_hash share one view.
+
+    Regression for the TOCTOU window flagged on PR #233: the old
+    implementation called ``AuditLog.verify()`` and then
+    ``AuditLog.read()`` separately, so a concurrent append between
+    the two opens would let the chain check pass on N+1 lines while
+    the ``entry_hash`` loop iterated only N. The fix is to read the
+    log once and run both checks on that snapshot — observable here
+    by counting opens of the log path.
+    """
+    log = MCPAuditLog(tmp_path)
+    for i in range(3):
+        log.append(
+            tool="creek.lint",
+            args={"i": i},
+            tier_ceiling=TierCeiling.OPEN,
+            consumer="claude-code",
+        )
+
+    log_path = tmp_path / MCP_AUDIT_RELPATH
+    opens: list[None] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args: object, **kwargs: object) -> object:
+        if self.resolve() == log_path.resolve():
+            opens.append(None)
+        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    verify_mcp_audit_chain(tmp_path)
+    assert len(opens) == 1, (
+        f"verify_mcp_audit_chain must read the log once; saw {len(opens)} opens"
+    )
 
 
 def test_verifier_handles_missing_log(tmp_path: Path) -> None:

@@ -92,10 +92,14 @@ Operational rules:
   therefore returns `status="refused"` — there is no Discord command
   surface that could accidentally destroy vault content.
 - **The developer's Claude Code can be configured with the token.**
-  Add `"CREEK_MCP_ELEVATED_TOKEN": "<your-token>"` to the `env` block
-  of `.mcp.json` (alongside `CREEK_MCP_CONSUMER`). Treat the token
-  like any other vault secret — keep it out of public dotfiles and
-  shared shells.
+  Generate one with high entropy:
+  ```bash
+  python -c "import secrets; print(secrets.token_hex(32))"
+  ```
+  Add `"CREEK_MCP_ELEVATED_TOKEN": "<generated-token>"` to the `env`
+  block of `.mcp.json` (alongside `CREEK_MCP_CONSUMER`). Treat the
+  token like any other vault secret — keep it out of public dotfiles
+  and shared shells.
 - **`creek.purge.vault` requires both the token AND
   `confirm_vault_path`.** The confirmation must match the resolved
   absolute path of the target vault, mirroring the CLI's interactive
@@ -107,7 +111,9 @@ Operational rules:
   refusal-or-success outcome and the structured args summary.
 
 Example `.mcp.json` for a Claude Code instance configured for
-destructive ops:
+destructive ops (replace the token with a freshly generated one — the
+sample shown here is high-entropy hex from `secrets.token_hex(32)` and
+must not be reused):
 
 ```json
 {
@@ -116,7 +122,7 @@ destructive ops:
       "command": "creek-tools-mcp",
       "env": {
         "CREEK_MCP_CONSUMER": "claude-code",
-        "CREEK_MCP_ELEVATED_TOKEN": "rotate-this-monthly"
+        "CREEK_MCP_ELEVATED_TOKEN": "REPLACE_WITH_secrets.token_hex(32)"
       }
     }
   }
