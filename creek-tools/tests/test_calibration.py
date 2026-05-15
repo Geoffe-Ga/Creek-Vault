@@ -320,7 +320,16 @@ class TestFixtureLoad:
         assert len(entries) >= 30
 
     def test_every_entry_has_complete_expected_block(self) -> None:
-        """Every entry labels every scored dimension."""
+        """Every entry in the SHIPPED fixture labels every scored dimension.
+
+        Note: this is a quality gate on the shipped fixture only, not an
+        engine invariant. The calibration engine (see
+        `TestRunCalibration::test_partial_expected_block_decrements_total`)
+        supports entries that omit dimensions — that path is for operator-
+        supplied fixtures that want to score only a subset. The shipped
+        starter set is held to the higher bar so the default
+        `--calibrate` invocation exercises every dimension.
+        """
         entries = load_fixture(_FIXTURE_PATH)
         for entry in entries:
             assert set(entry.expected.keys()) >= set(DIMENSIONS), (

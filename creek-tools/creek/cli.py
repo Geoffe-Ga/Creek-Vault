@@ -638,7 +638,9 @@ def classify(
         "--calibrate",
         help=(
             "Run the LLM classifier against the calibration fixture and "
-            "print per-dimension agreement (FEAT-017b). Skips the vault run."
+            "print per-dimension agreement (FEAT-017b). Skips the vault "
+            "run, but still requires a valid creek_config.yaml because "
+            "the LLM provider settings come from `llm:` there."
         ),
     ),
     calibration_fixture: Path | None = typer.Option(
@@ -767,10 +769,18 @@ def _run_calibration_cli(
 
     resolved = fixture_path or _DEFAULT_CALIBRATION_FIXTURE
     if not resolved.exists():
-        console.print(
-            f"[red]Calibration fixture not found: {resolved}.[/red] "
-            "Pass --calibration-fixture to point at one.",
-        )
+        message = f"[red]Calibration fixture not found: {resolved}.[/red] "
+        if fixture_path is None:
+            message += (
+                "The default path is anchored to the source tree; if you "
+                "installed `creek` via a non-editable `pip install`, the "
+                "`tests/fixtures/...` directory is not packaged. Pass "
+                "--calibration-fixture explicitly, or re-install in "
+                "editable mode (`pip install -e .`)."
+            )
+        else:
+            message += "Pass --calibration-fixture to point at a fixture file."
+        console.print(message)
         raise typer.Exit(code=2)
 
     config = load_config()

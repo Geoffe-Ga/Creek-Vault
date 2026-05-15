@@ -479,10 +479,8 @@ def _stub_fixed_label_classifier_in_cli(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_classify_calibrate_renders_report(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """`--calibrate` runs the fixture and prints a per-dimension table."""
-    del tmp_path
     _stub_fixed_label_classifier_in_cli(monkeypatch)
     fixture = (
         Path(__file__).parent / "fixtures" / "classification" / "calibration_set.yaml"
