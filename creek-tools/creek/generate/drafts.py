@@ -22,6 +22,7 @@ module.
 from __future__ import annotations
 
 import logging
+import operator
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -207,7 +208,7 @@ def _dominant(values: list[str]) -> str | None:
         counts[value] = counts.get(value, 0) + 1
     if not counts:
         return None
-    return max(counts.items(), key=lambda pair: (pair[1], pair[0]))[0]
+    return max(counts.items(), key=operator.itemgetter(1, 0))[0]
 
 
 def _dominant_classified(values: Iterable[object]) -> str | None:

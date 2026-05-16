@@ -11,6 +11,7 @@ matches count 2x, and body matches count 1x.  Word-boundary matching
 """
 
 import logging
+import operator
 import re
 from enum import Enum
 from typing import TypeVar
@@ -692,7 +693,7 @@ class RuleClassifier:
         """
         sorted_items = sorted(
             scores.items(),
-            key=lambda x: x[1],
+            key=operator.itemgetter(1),
             reverse=True,
         )
 
@@ -722,7 +723,7 @@ class RuleClassifier:
         if not scores:
             return Phase.UNCLASSIFIED
 
-        best_key, best_score = max(scores.items(), key=lambda x: x[1])
+        best_key, best_score = max(scores.items(), key=operator.itemgetter(1))
         if best_score >= self.SECONDARY_THRESHOLD:
             return best_key
         return Phase.UNCLASSIFIED
@@ -742,7 +743,7 @@ class RuleClassifier:
         if not scores:
             return Mode.UNCLASSIFIED
 
-        best_key, best_score = max(scores.items(), key=lambda x: x[1])
+        best_key, best_score = max(scores.items(), key=operator.itemgetter(1))
         if best_score >= self.SECONDARY_THRESHOLD:
             return best_key
         return Mode.UNCLASSIFIED
@@ -817,7 +818,7 @@ class RuleClassifier:
             body,
             VOICE_REGISTER_SIGNALS,
         )
-        best_key, best_score = max(scores.items(), key=lambda x: x[1])
+        best_key, best_score = max(scores.items(), key=operator.itemgetter(1))
         if best_score >= self.SECONDARY_THRESHOLD:
             return best_key
         return None
@@ -844,7 +845,7 @@ class RuleClassifier:
             body,
             CONFIDENCE_SIGNALS,
         )
-        best_key, best_score = max(scores.items(), key=lambda x: x[1])
+        best_key, best_score = max(scores.items(), key=operator.itemgetter(1))
         if best_score >= self.SECONDARY_THRESHOLD:
             return best_key
         return None

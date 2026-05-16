@@ -299,8 +299,7 @@ def _epoch_to_la_datetime(epoch: float | None) -> datetime:
     """
     if epoch is None or epoch == 0.0:
         return _MISSING_TIMESTAMP_SENTINEL
-    utc_dt = datetime.fromtimestamp(epoch, tz=UTC)
-    return utc_dt.astimezone(LA_TZ)
+    return datetime.fromtimestamp(epoch, tz=UTC).astimezone(LA_TZ)
 
 
 def _linearize_tree(
@@ -453,8 +452,7 @@ def _get_message_role(msg: dict[str, Any]) -> str:
         The role string (e.g., 'user', 'assistant', 'system').
     """
     author = msg.get("author", {})
-    role: str = author.get("role", "unknown")
-    return role
+    return str(author.get("role", "unknown"))
 
 
 def _pair_messages_to_fragments(

@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import hashlib
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -183,8 +184,7 @@ def normalize_timestamp(ts_string: str, source_tz: str | None) -> datetime:
         ValueError: If the timestamp string cannot be parsed.
     """
     parsed = _parse_timestamp_string(ts_string)
-    localized = _localize_naive_timestamp(parsed, source_tz)
-    return localized.astimezone(LA_TZ)
+    return _localize_naive_timestamp(parsed, source_tz).astimezone(LA_TZ)
 
 
 def _parse_timestamp_string(ts_string: str) -> datetime:
@@ -202,10 +202,8 @@ def _parse_timestamp_string(ts_string: str) -> datetime:
         ValueError: If none of the known formats match.
     """
     # Try ISO 8601 first (handles timezone offsets)
-    try:
+    with suppress(ValueError):
         return datetime.fromisoformat(ts_string)
-    except ValueError:
-        pass
 
     # Try common formats
     formats = [

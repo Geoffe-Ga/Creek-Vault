@@ -235,7 +235,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     vb = np.asarray(b, dtype=np.float32)
     na = float(np.linalg.norm(va))
     nb = float(np.linalg.norm(vb))
-    if na == 0.0 or nb == 0.0:
+    if 0.0 in (na, nb):
         return 0.0
     return float(np.dot(va, vb) / (na * nb))
 
@@ -304,7 +304,7 @@ def _spearman_with_time(distances: list[float]) -> float:
     )
     denom_t = sum((t - mean_rank) ** 2 for t in time_ranks)
     denom_d = sum((d - mean_rank) ** 2 for d in dist_ranks)
-    if denom_t == 0.0 or denom_d == 0.0:
+    if 0.0 in (denom_t, denom_d):
         return 0.0
     return float(numerator / (denom_t * denom_d) ** 0.5)
 
@@ -382,7 +382,7 @@ class EddyDetector:
         Returns:
             A copy of the internal mapping. Empty until detection runs.
         """
-        return dict(self._eddy_members)
+        return self._eddy_members.copy()
 
     def detect_eddies(
         self,
@@ -497,7 +497,7 @@ class EddyDetector:
             cluster_id: Label to assign to reachable points.
         """
         labels[seed] = cluster_id
-        queue = list(neighbour_cache[seed])
+        queue = neighbour_cache[seed].copy()
         while queue:
             current = queue.pop()
             if labels[current] == _NOISE:
@@ -686,7 +686,7 @@ class EddyDetector:
             if not new_links:
                 updated.append(frag)
                 continue
-            merged = list(frag.eddies)
+            merged = frag.eddies.copy()
             for link in new_links:
                 if link not in merged:
                     merged.append(link)

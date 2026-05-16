@@ -274,10 +274,11 @@ class UnnamedDigestGenerator:
         norms = np.maximum(norms, 1e-10)
         normalized = vectors / norms
         similarity_matrix = normalized @ normalized.T
-        pairs: list[tuple[int, int]] = []
-        for i, j in itertools.combinations(range(len(ids)), 2):
-            if float(similarity_matrix[i, j]) >= self.similarity_threshold:
-                pairs.append((i, j))
+        pairs: list[tuple[int, int]] = [
+            (i, j)
+            for i, j in itertools.combinations(range(len(ids)), 2)
+            if float(similarity_matrix[i, j]) >= self.similarity_threshold
+        ]
         return pairs
 
     def _render_body(
@@ -441,10 +442,10 @@ def _load_fragment(md_file: Path) -> Fragment | None:
     except (OSError, ValueError):
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
-    metadata = dict(post.metadata)
+    metadata = post.metadata
     if metadata.get("type") != "fragment":
         return None
-    try:
+    try:  # noqa: TRY101  # Separate failure modes: file IO vs schema validation each return None with distinct debug logs.
         return Fragment.model_validate(metadata)
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
@@ -547,9 +548,13 @@ def _render_fragments_section(
         return "\n".join(lines) + "\n"
     for frag in fragments:
         created = frag.created.date().isoformat()
-        lines.append(f"### {frag.title}\n")
-        lines.append(f"- Link: [[{frag.id}]]")
-        lines.append(f"- Created: {created}")
+        lines.extend(
+            (
+                f"### {frag.title}\n",
+                f"- Link: [[{frag.id}]]",
+                f"- Created: {created}",
+            )
+        )
         excerpt = excerpts.get(frag.id, "")
         if excerpt:
             lines.append(f"- Excerpt: {excerpt}")
@@ -625,18 +630,21 @@ def _render_growth_section(
     Returns:
         Markdown string for the growth section.
     """
-    lines = ["## Week-over-Week Growth\n"]
-    lines.append(f"- This week: {this_week_count} unnamed fragment(s)")
+    lines = [
+        "## Week-over-Week Growth\n",
+        f"- This week: {this_week_count} unnamed fragment(s)",
+    ]
     if previous is None:
-        lines.append("- Previous week: (no prior digest recorded)")
-        lines.append("")
+        lines.extend(("- Previous week: (no prior digest recorded)", ""))
         return "\n".join(lines) + "\n"
     delta = this_week_count - previous.fragment_count
     sign = "+" if delta >= 0 else ""
-    lines.append(
-        f"- Previous week ({previous.week_start}): {previous.fragment_count}"
-        f" unnamed fragment(s)",
+    lines.extend(
+        (
+            f"- Previous week ({previous.week_start}): {previous.fragment_count}"
+            f" unnamed fragment(s)",
+            f"- Change: {sign}{delta}",
+            "",
+        )
     )
-    lines.append(f"- Change: {sign}{delta}")
-    lines.append("")
     return "\n".join(lines) + "\n"

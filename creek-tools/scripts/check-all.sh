@@ -23,13 +23,18 @@ Usage: $(basename "$0") [OPTIONS]
 Run all quality checks in sequence.
 
 Runs:
-  1. Linting (Ruff)
-  2. Formatting (Ruff)
-  3. Type checking (MyPy)
-  4. Security checks (Bandit + pip-audit)
-  5. Complexity analysis (Radon)
-  6. Unit tests
-  7. Coverage report
+   1. Linting (Ruff)
+   2. Formatting (Ruff)
+   3. Type checking (MyPy)
+   4. Pylint
+   5. Security checks (Bandit + pip-audit)
+   6. Complexity analysis (Radon)
+   7. Refurb (modernisation; STYLE-001)
+   8. Tryceratops (exception hygiene; STYLE-001)
+   9. Unit tests
+  10. Coverage report
+  11. Per-file coverage gate
+  12. State report size budget
 
 OPTIONS:
     --verbose   Show detailed output
@@ -92,6 +97,8 @@ run_check "Type checking" "typecheck.sh"
 run_check "Pylint" "pylint.sh"
 run_check "Security checks" "security.sh"
 run_check "Complexity analysis" "complexity.sh"
+run_check "Refurb (modernisation)" "lint-refurb.sh"
+run_check "Tryceratops (exceptions)" "lint-tryceratops.sh"
 run_check "Unit tests" "test.sh" --unit
 run_check "Coverage report" "coverage.sh" --json
 run_check "Per-file coverage gate" "coverage-per-file.sh"

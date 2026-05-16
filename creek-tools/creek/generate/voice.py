@@ -31,6 +31,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -250,10 +251,10 @@ def _load_fragment_with_body(
     except (OSError, ValueError, yaml.YAMLError):
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
-    metadata = dict(post.metadata)
+    metadata = post.metadata
     if metadata.get("type") != "fragment":
         return None
-    try:
+    try:  # noqa: TRY101  # Separate failure modes: file IO vs schema validation each return None with distinct debug logs.
         fragment = Fragment.model_validate(metadata)
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
@@ -1173,7 +1174,7 @@ class VoicePatternExtractor:
         """Find words absent from the reference word set."""
         if self._lower_ref is None:
             return ()
-        all_words = {w for doc in documents for w in doc}
+        all_words = set(chain.from_iterable(documents))
         coined = sorted(w for w in all_words if w not in self._lower_ref)
         return tuple(coined)
 

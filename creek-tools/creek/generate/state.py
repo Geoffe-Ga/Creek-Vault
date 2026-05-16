@@ -270,7 +270,7 @@ def _load_latest_yield(log_path: Path) -> dict[str, object] | None:
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
         return None
-    try:
+    try:  # noqa: TRY101  # Separate failure modes: file IO vs JSON parsing each return None with distinct debug logs.
         payload = json.loads(lines[-1])
     except json.JSONDecodeError:
         logger.debug("Last run-summary line is not valid JSON")
@@ -457,8 +457,7 @@ class StateReportGenerator:
             f"Toxic share: {summary.toxic_percent * 100:.1f}%",
         ]
         if summary.transitions:
-            body.append("")
-            body.append("**Recent transitions**")
+            body.extend(("", "**Recent transitions**"))
             for trans in summary.transitions:
                 body.append(
                     f"- {trans.from_date.isoformat()} → {trans.to_date.isoformat()}: "
@@ -560,8 +559,7 @@ class StateReportGenerator:
         # :class:`enum.StrEnum`. ``_frequency_label`` accepts either form.
         distribution = Counter(frag.frequency.primary for frag in state.fragments)
         if distribution:
-            body.append("")
-            body.append("**Frequency distribution**")
+            body.extend(("", "**Frequency distribution**"))
             for freq, count in sorted(
                 distribution.items(),
                 key=lambda pair: _frequency_sort_key(pair[0]),
@@ -785,8 +783,9 @@ def _refresh_latest(state_dir: Path, target: Path) -> Path:
     if os.name != "nt":
         try:
             latest.symlink_to(target.name)
-            return latest
         except OSError:
             logger.debug("Symlink unsupported on this filesystem; copying")
+        else:
+            return latest
     latest.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
     return latest

@@ -84,6 +84,17 @@ jobs:
         # script runs `mypy creek/` so local and CI agree.
         run: ./scripts/typecheck.sh
 
+      - name: Run Refurb (STYLE-001 modernisation gate)
+        # Backlog closed in STYLE-001 (148 → 0). Any new violation
+        # blocks CI; `# noqa: FURB…` is available for documented
+        # carve-outs (see creek-tools/CLAUDE.md §6.2).
+        run: ./scripts/lint-refurb.sh
+
+      - name: Run Tryceratops (STYLE-001 exception-hygiene gate)
+        # Backlog closed in STYLE-001 (21 → 0). Any new violation
+        # blocks CI; `# noqa: TRY…` covers documented carve-outs.
+        run: ./scripts/lint-tryceratops.sh
+
       - name: Check docstring coverage
         run: |
           interrogate -vv \

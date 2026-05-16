@@ -264,7 +264,7 @@ def _split_header(
     if first and all(cell.strip() for cell in first):
         return SheetData(
             name=name,
-            headers=tuple(first),
+            headers=first,
             rows=tuple(rows[1:]),
         )
     return SheetData(name=name, headers=None, rows=tuple(rows))

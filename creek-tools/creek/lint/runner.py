@@ -117,10 +117,14 @@ class LintReport:
             "",
         ]
         for result in self.results:
-            lines.append(f"## {result.name}")
-            lines.append("")
-            lines.append(f"_{result.summary}_")
-            lines.append("")
+            lines.extend(
+                (
+                    f"## {result.name}",
+                    "",
+                    f"_{result.summary}_",
+                    "",
+                )
+            )
             if result.findings:
                 lines.extend(result.findings)
                 lines.append("")

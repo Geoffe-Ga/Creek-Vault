@@ -95,7 +95,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     """
     if "criteria" in raw and "affected_fragments" in raw:
         return raw
-    upgraded = dict(raw)
+    upgraded = raw.copy()
     target = raw.get("target")
     if target is not None and "criteria" not in raw:
         upgraded["criteria"] = {"target": target}
@@ -245,7 +245,7 @@ class PurgeAuditLog:
             return None
         if not raw.strip():
             return []
-        try:
+        try:  # noqa: TRY101  # Separate failure modes: file IO vs JSON parsing each have distinct logging contexts.
             data = json.loads(raw)
         except json.JSONDecodeError:
             logger.warning(

@@ -142,8 +142,7 @@ def _run_embeddings(
         rebuild=rebuild,
     )
 
-    linker = EmbeddingLinker(config=config.embeddings)
-    resonances = linker.find_resonances(embeddings)
+    resonances = EmbeddingLinker(config=config.embeddings).find_resonances(embeddings)
     return len(resonances)
 
 
@@ -175,7 +174,7 @@ def _load_or_compute_embeddings(
             cached = {}
         existing_ids = {fragment.id for fragment in fragments} & cached.keys()
         new = linker.generate_embeddings(fragments, existing_ids=existing_ids)
-        merged = {**cached, **new}
+        merged = cached | new
     else:
         merged = linker.generate_embeddings(fragments)
 

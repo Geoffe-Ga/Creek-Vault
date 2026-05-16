@@ -219,7 +219,7 @@ class AuditLog:
             # for whatever happens to be locked at the OS level.
             try:
                 prev_hash = self._compute_prev_hash()
-                chained = {**payload, _PREV_HASH_FIELD: prev_hash}
+                chained = payload | {_PREV_HASH_FIELD: prev_hash}
                 line = json.dumps(chained, sort_keys=True)
                 fh.write(line + "\n")
                 fh.flush()

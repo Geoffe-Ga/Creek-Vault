@@ -433,7 +433,7 @@ class ParadoxDetector:
         """Check whether two fragments share a classified primary frequency."""
         primary_a = str(a.frequency.primary)
         primary_b = str(b.frequency.primary)
-        if primary_a == "unclassified" or primary_b == "unclassified":
+        if "unclassified" in (primary_a, primary_b):
             return False
         return primary_a == primary_b
 
@@ -477,18 +477,26 @@ class ParadoxDetector:
             zip(paradox.fragment_ids, paradox.excerpts, strict=False),
             start=1,
         ):
-            lines.append(f"## Fragment {idx}: [[{fid}]]")
-            lines.append("")
-            lines.append(f"> {excerpt}")
-            lines.append("")
+            lines.extend(
+                (
+                    f"## Fragment {idx}: [[{fid}]]",
+                    "",
+                    f"> {excerpt}",
+                    "",
+                )
+            )
 
-        lines.append("## Observed Tension")
-        lines.append("")
-        lines.append(self._describe_contradiction(paradox))
-        lines.append("")
-        lines.append("## Reflection Prompt")
-        lines.append("")
-        lines.append(REFLECTION_PROMPT)
+        lines.extend(
+            (
+                "## Observed Tension",
+                "",
+                self._describe_contradiction(paradox),
+                "",
+                "## Reflection Prompt",
+                "",
+                REFLECTION_PROMPT,
+            )
+        )
         return "\n".join(lines)
 
     @staticmethod

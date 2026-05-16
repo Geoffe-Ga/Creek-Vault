@@ -316,8 +316,7 @@ def _run_ingest(
         console.print(f"[red]Vault unavailable: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    ingestor = ingestor_cls()
-    ingest_result = ingestor.ingest(input_path)
+    ingest_result = ingestor_cls().ingest(input_path)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
@@ -1927,8 +1926,7 @@ def clean_orphans(
     from creek.clean.hygiene import OrphanScanner
 
     vault_path = _resolve_vault(vault)
-    scanner = OrphanScanner(age_days=age_days)
-    result = scanner.scan(vault_path)
+    result = OrphanScanner(age_days=age_days).scan(vault_path)
 
     mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
     console.print(f"\n[bold]Orphan Scan[/bold] ({mode})")
@@ -1953,8 +1951,7 @@ def clean_stale_reviews(
     from creek.clean.hygiene import StaleReviewScanner
 
     vault_path = _resolve_vault(vault)
-    scanner = StaleReviewScanner(age_days=age_days)
-    result = scanner.scan(vault_path)
+    result = StaleReviewScanner(age_days=age_days).scan(vault_path)
 
     mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
     console.print(f"\n[bold]Stale Review Scan[/bold] ({mode})")
@@ -1978,8 +1975,7 @@ def clean_broken_links(
     from creek.clean.hygiene import BrokenLinkScanner
 
     vault_path = _resolve_vault(vault)
-    scanner = BrokenLinkScanner()
-    result = scanner.scan(vault_path)
+    result = BrokenLinkScanner().scan(vault_path)
 
     mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
     console.print(f"\n[bold]Broken Link Scan[/bold] ({mode})")
@@ -2007,8 +2003,7 @@ def clean_duplicates(
     from creek.clean.hygiene import DuplicateScanner
 
     vault_path = _resolve_vault(vault)
-    scanner = DuplicateScanner()
-    result = scanner.scan(vault_path)
+    result = DuplicateScanner().scan(vault_path)
 
     mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
     console.print(f"\n[bold]Duplicate Scan[/bold] ({mode})")

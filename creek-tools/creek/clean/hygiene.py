@@ -389,11 +389,11 @@ class StaleReviewScanner:
         """
         review_files = sorted(vault_path.rglob("review-queue-*.md"))
         now = datetime.now(tz=UTC)
-        stale: list[str] = []
-
-        for review_file in review_files:
-            if self._is_stale(review_file, now):
-                stale.append(str(review_file))
+        stale: list[str] = [
+            str(review_file)
+            for review_file in review_files
+            if self._is_stale(review_file, now)
+        ]
 
         return StaleReviewResult(
             stale_paths=stale,
@@ -500,11 +500,11 @@ class BrokenLinkScanner:
             List of broken link targets found in this file.
         """
         content = frag_file.read_text(encoding="utf-8", errors="replace")
-        broken: list[str] = []
-
-        for target in _extract_wikilinks(content):
-            if target not in all_stems:
-                broken.append(f"[[{target}]]")
+        broken: list[str] = [
+            f"[[{target}]]"
+            for target in _extract_wikilinks(content)
+            if target not in all_stems
+        ]
 
         for target in _extract_relative_links(content):
             resolved = (frag_file.parent / target).resolve()
@@ -699,10 +699,11 @@ class HygieneReporter:
         """
         try:
             post = frontmatter.load(str(frag_file))
-            return post.content if post.content else ""
         except Exception:
             logger.debug("Failed to read content from %s", frag_file)
             return ""
+        else:
+            return post.content or ""
 
     def _format_report(self, report: HygieneReport) -> list[str]:
         """Format a hygiene report as markdown lines.

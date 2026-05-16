@@ -336,11 +336,8 @@ def _build_note(frontmatter: dict[str, str], body: str) -> str:
         Complete markdown string with ``---`` delimited frontmatter.
     """
     lines = ["---"]
-    for key, value in frontmatter.items():
-        lines.append(f"{key}: {value}")
-    lines.append("---")
-    lines.append("")
-    lines.append(body)
+    lines.extend(f"{key}: {value}" for key, value in frontmatter.items())
+    lines.extend(("---", "", body))
     return "\n".join(lines)
 
 
@@ -358,58 +355,57 @@ def _build_frequency_body(freq: Frequency, freq_code: str, name: str) -> str:
     Returns:
         Complete markdown body string.
     """
-    parts: list[str] = []
-
-    # Title
-    parts.append(f"# {freq_code} — {name}\n")
-
-    # Description
-    parts.append("## Description\n")
-    parts.append(f"**Core Theme:** {FREQUENCY_THEMES[freq]}\n")
-    parts.append(f"**Color:** {FREQUENCY_COLORS[freq].replace('_', ' ').title()}\n")
-    parts.append(f"**Signals:** {FREQUENCY_SIGNALS[freq]}\n")
-
-    # Primary fragments query
-    parts.append("## Fragments\n")
-    parts.append("```dataview")
-    parts.append("TABLE frequency.primary, wavelength.phase, created")
-    parts.append('FROM "01-Fragments"')
-    parts.append(f'WHERE frequency.primary = "{freq_code}"')
-    parts.append("SORT created DESC")
-    parts.append("```\n")
-
-    # Secondary frequency query
-    parts.append("## Secondary Frequency Appearances\n")
-    parts.append("```dataview")
-    parts.append("TABLE frequency.primary, frequency.secondary, created")
-    parts.append('FROM "01-Fragments"')
-    parts.append(f'WHERE contains(frequency.secondary, "{freq_code}")')
-    parts.append("SORT created DESC")
-    parts.append("```\n")
-
-    # Threads by frequency affinity
-    parts.append("## Threads\n")
-    parts.append("```dataview")
-    parts.append("TABLE status, first_seen, last_seen, fragment_count")
-    parts.append('FROM "02-Threads"')
-    parts.append(f'WHERE contains(frequency_affinity, "{freq_code}")')
-    parts.append("SORT last_seen DESC")
-    parts.append("```\n")
-
-    # Statistics
-    parts.append("## Statistics\n")
-    parts.append("```dataview")
-    parts.append("TABLE length(rows) AS count")
-    parts.append('FROM "01-Fragments"')
-    parts.append(f'WHERE frequency.primary = "{freq_code}"')
-    parts.append('GROUP BY dateformat(created, "yyyy-MM") AS month')
-    parts.append("SORT month DESC")
-    parts.append("```\n")
+    parts: list[str] = [
+        # Title
+        f"# {freq_code} — {name}\n",
+        # Description
+        "## Description\n",
+        f"**Core Theme:** {FREQUENCY_THEMES[freq]}\n",
+        f"**Color:** {FREQUENCY_COLORS[freq].replace('_', ' ').title()}\n",
+        f"**Signals:** {FREQUENCY_SIGNALS[freq]}\n",
+        # Primary fragments query
+        "## Fragments\n",
+        "```dataview",
+        "TABLE frequency.primary, wavelength.phase, created",
+        'FROM "01-Fragments"',
+        f'WHERE frequency.primary = "{freq_code}"',
+        "SORT created DESC",
+        "```\n",
+        # Secondary frequency query
+        "## Secondary Frequency Appearances\n",
+        "```dataview",
+        "TABLE frequency.primary, frequency.secondary, created",
+        'FROM "01-Fragments"',
+        f'WHERE contains(frequency.secondary, "{freq_code}")',
+        "SORT created DESC",
+        "```\n",
+        # Threads by frequency affinity
+        "## Threads\n",
+        "```dataview",
+        "TABLE status, first_seen, last_seen, fragment_count",
+        'FROM "02-Threads"',
+        f'WHERE contains(frequency_affinity, "{freq_code}")',
+        "SORT last_seen DESC",
+        "```\n",
+        # Statistics
+        "## Statistics\n",
+        "```dataview",
+        "TABLE length(rows) AS count",
+        'FROM "01-Fragments"',
+        f'WHERE frequency.primary = "{freq_code}"',
+        'GROUP BY dateformat(created, "yyyy-MM") AS month',
+        "SORT month DESC",
+        "```\n",
+    ]
 
     # Dosage table (F10 has no dosage mapping in the ontology)
     if freq in _DOSAGE_MEDICINE:
-        parts.append("## Medicine vs. Toxic Dose\n")
-        parts.append(_build_dosage_table(freq))
+        parts.extend(
+            (
+                "## Medicine vs. Toxic Dose\n",
+                _build_dosage_table(freq),
+            )
+        )
 
     # Cross-frequency links
     parts.append("## Cross-Frequency Links\n")
@@ -658,12 +654,15 @@ class IndexGenerator:
         Returns:
             Combined list of all generated index file paths.
         """
-        generated: list[Path] = []
-        generated.extend(self.generate_frequency_indexes())
-        generated.append(self.generate_thread_index())
-        generated.append(self.generate_eddy_map())
-        generated.append(self.generate_temporal_index())
-        generated.append(self.generate_source_index())
+        generated: list[Path] = self.generate_frequency_indexes()
+        generated.extend(
+            (
+                self.generate_thread_index(),
+                self.generate_eddy_map(),
+                self.generate_temporal_index(),
+                self.generate_source_index(),
+            )
+        )
         return generated
 
     @staticmethod

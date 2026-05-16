@@ -98,8 +98,7 @@ class MarkdownFilter:
         Returns:
             A :class:`FilterResult` indicating whether to keep the file.
         """
-        body = self._extract_body(content)
-        stripped_body = body.strip()
+        stripped_body = self._extract_body(content).strip()
 
         # --- Gate: empty / stub body ---
         if len(stripped_body) < self.min_body_length:
@@ -162,10 +161,9 @@ class MarkdownFilter:
             A list of warning strings for each detected marker type.
         """
         warnings: list[str] = []
-        found_labels: list[str] = []
-        for label, pattern in _TEMPLATE_PATTERNS:
-            if pattern.search(body):
-                found_labels.append(label)
+        found_labels: list[str] = [
+            label for label, pattern in _TEMPLATE_PATTERNS if pattern.search(body)
+        ]
         if found_labels:
             markers = ", ".join(found_labels)
             warnings.append(f"Template residue detected: {markers}")

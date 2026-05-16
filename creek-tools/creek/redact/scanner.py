@@ -142,7 +142,7 @@ class RedactionScanner:
         Returns:
             Combined dictionary of pattern name to compiled regex.
         """
-        patterns: dict[str, re.Pattern[str]] = dict(REDACTION_PATTERNS)
+        patterns: dict[str, re.Pattern[str]] = REDACTION_PATTERNS.copy()
         for name, raw in self.config.custom_patterns.items():
             patterns[name] = re.compile(raw)
         return patterns
@@ -423,8 +423,7 @@ class RedactionScanner:
         for match_type, count in sorted(by_type.items()):
             lines.append(f"  {match_type}: {count}")
 
-        lines.append("")
-        lines.append("By file:")
+        lines.extend(("", "By file:"))
         for file_key, file_matches in sorted(by_file.items()):
             lines.append(f"  {file_key}:")
             for fm in file_matches:
@@ -502,7 +501,7 @@ class RedactionScanner:
                 "by_severity": _count_by_severity(summary.matches),
                 "by_type": _count_by_type(summary.matches),
             },
-            "findings_by_file": dict(by_file),
+            "findings_by_file": dict(by_file),  # noqa: FURB123  # converts defaultdict to plain dict for JSON-serialised output.
         }
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -541,8 +540,7 @@ class RedactionScanner:
         # Severity breakdown.
         by_sev = _count_by_severity(summary.matches)
         if by_sev:
-            lines.append("### By Severity")
-            lines.append("")
+            lines.extend(("### By Severity", ""))
             for sev in ("critical", "high", "medium", "low"):
                 if sev in by_sev:
                     lines.append(f"- **{sev}**: {by_sev[sev]}")
@@ -553,18 +551,21 @@ class RedactionScanner:
         for match in summary.matches:
             by_file[str(match.file_path)].append(match)
 
-        lines.append("## Findings by File")
-        lines.append("")
+        lines.extend(("## Findings by File", ""))
 
         for file_key in sorted(by_file):
             file_matches = sorted(
                 by_file[file_key],
                 key=lambda m: _severity_rank(_get_severity(m.match_type)),
             )
-            lines.append(f"### `{file_key}`")
-            lines.append("")
-            lines.append("| Line | Type | Severity |")
-            lines.append("|------|------|----------|")
+            lines.extend(
+                (
+                    f"### `{file_key}`",
+                    "",
+                    "| Line | Type | Severity |",
+                    "|------|------|----------|",
+                )
+            )
             for fm in file_matches:
                 sev = _get_severity(fm.match_type)
                 lines.append(f"| {fm.line_number} | {fm.match_type} | {sev} |")
@@ -609,30 +610,36 @@ class RedactionScanner:
                 by_file[file_key],
                 key=lambda m: m.line_number,
             )
-            lines.append(f"## `{file_key}`")
-            lines.append("")
+            lines.extend((f"## `{file_key}`", ""))
 
             for fm in file_matches:
                 finding_num += 1
                 severity = _get_severity(fm.match_type)
                 context = self.extract_context(fm.file_path, fm.line_number)
 
-                lines.append(f"### Finding {finding_num}")
-                lines.append("")
-                lines.append(f"- **Type**: {fm.match_type}")
-                lines.append(f"- **Severity**: {severity}")
-                lines.append(f"- **Line**: {fm.line_number}")
-                lines.append("")
+                lines.extend(
+                    (
+                        f"### Finding {finding_num}",
+                        "",
+                        f"- **Type**: {fm.match_type}",
+                        f"- **Severity**: {severity}",
+                        f"- **Line**: {fm.line_number}",
+                        "",
+                    )
+                )
 
                 if context:
                     lines.append("```")
                     lines.extend(context)
-                    lines.append("```")
-                    lines.append("")
+                    lines.extend(("```", ""))
 
-                lines.append(f"- [ ] Confirmed sensitive (finding {finding_num})")
-                lines.append(f"- [ ] False positive (finding {finding_num})")
-                lines.append("")
+                lines.extend(
+                    (
+                        f"- [ ] Confirmed sensitive (finding {finding_num})",
+                        f"- [ ] False positive (finding {finding_num})",
+                        "",
+                    )
+                )
 
         return "\n".join(lines)
 

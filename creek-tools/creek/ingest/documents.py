@@ -420,10 +420,11 @@ class DocumentIngestor(Ingestor):
         Returns:
             A list of RawDocument objects for each document file found.
         """
-        docs: list[RawDocument] = []
-        for file_path in sorted(dir_path.rglob("*")):
-            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                docs.append(self._read_file(file_path))
+        docs: list[RawDocument] = [
+            self._read_file(file_path)
+            for file_path in sorted(dir_path.rglob("*"))
+            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
         return docs
 
     def _read_file(self, file_path: Path) -> RawDocument:
