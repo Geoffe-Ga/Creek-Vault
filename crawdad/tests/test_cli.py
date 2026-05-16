@@ -307,11 +307,11 @@ async def test_loop_runner_truncates_long_replies(
 ) -> None:
     """Replies over Discord's 2000-char limit are truncated with an ellipsis.
 
-    Regression for PR #237 review: ``interaction.followup.send`` raises
-    ``HTTPException`` past Discord's body cap, and that error fires
-    *after* ``_runner`` returns so the soft-error wrapper can't catch
-    it. Truncating inside ``_runner`` keeps every slash command's
-    payload below the wire limit.
+    ``interaction.followup.send`` raises ``HTTPException`` past
+    Discord's body cap, and that error fires *after* the runner's
+    soft-error wrapper exits — so truncation must happen inside the
+    runner. Truncating there keeps every slash command's payload below
+    the wire limit.
     """
     from crawdad.loop import LoopOutcome
     from crawdad.mcp_client import ToolDetails
@@ -354,9 +354,10 @@ async def test_loop_runner_returns_soft_error_on_exception(
 ) -> None:
     """A crash inside ``run_one_turn`` yields the documented soft reply.
 
-    Regression for review feedback on PR #237: previously an exception
-    propagated through Discord's interaction handler and the user saw
-    "This interaction failed" with no context.
+    Without the runner's catch-all, an unhandled exception would
+    propagate through Discord's interaction handler and the user would
+    see "This interaction failed" with no context. The runner surfaces
+    a friendly soft error instead.
     """
     from crawdad.mcp_client import ToolDetails
     from crawdad.skill_loader import VoiceSkillStack

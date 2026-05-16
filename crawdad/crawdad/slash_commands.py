@@ -63,6 +63,17 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "workflow": "List or run named workflows (v1.0 stub — full DSL in v1.1).",
 }
 
+# Module-level invariant: every command name must have a description and
+# vice versa. Checked at import time so a typo when adding a new command
+# fails fast instead of surfacing as a Discord registration error.
+if set(CRAWDAD_COMMANDS) != set(_COMMAND_DESCRIPTIONS):  # pragma: no cover
+    _diff = set(CRAWDAD_COMMANDS) ^ set(_COMMAND_DESCRIPTIONS)
+    _msg = (
+        "CRAWDAD_COMMANDS and _COMMAND_DESCRIPTIONS must list the same names; "
+        f"diff: {_diff}"
+    )
+    raise RuntimeError(_msg)
+
 _REFLECT_PROMPT = (
     "Reflect with me. No specific tool request — open the loop in conversational "
     "mode and surface whatever is most alive in my current wavelength."
