@@ -10,8 +10,8 @@
 # Pinned transitive bumps to address pip-audit findings (DEP-003).
 # These are dev/build-time tools whose vulnerable older versions can leak
 # in via pip's resolver. See ./scripts/security.sh for documented ignores.
-cryptography>=46.0.6
-pip>=26.1
-pyjwt>=2.12.0
+cryptography>=48.0.0
+pip>=26.1.1
+pyjwt>=2.12.1
 setuptools>=78.1.1
-wheel>=0.46.2
+wheel>=0.47.0
