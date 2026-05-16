@@ -25,6 +25,7 @@ from crawdad.config import (
 )
 from crawdad.history import ConversationHistory
 from crawdad.intents import ToolInfo
+from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
 from crawdad.skill_loader import load_skills_for_session
@@ -35,9 +36,23 @@ if TYPE_CHECKING:
 
     from crawdad.config import CrawDadConfig
     from crawdad.mcp_client import ToolDetails
+    from crawdad.skill_loader import VoiceSkillStack
+    from crawdad.slash_commands import LoopRunner
     from crawdad.state import SessionState
 
 _LOGGER = logging.getLogger("crawdad.cli")
+
+# Discord's regular message + slash-follow-up text body is capped at 2000
+# characters. Truncate well below the wire limit so the truncation marker
+# always fits and we leave headroom for accidental whitespace.
+_DISCORD_REPLY_LIMIT = 1900
+
+
+def _truncate_for_discord(text: str) -> str:
+    """Cap *text* at Discord's soft limit with an ellipsis marker if needed."""
+    if len(text) <= _DISCORD_REPLY_LIMIT:
+        return text
+    return text[: _DISCORD_REPLY_LIMIT - 3] + "..."
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -84,6 +99,11 @@ def run_bot(config: CrawDadConfig) -> None:
     tool_details = asyncio.run(_startup_probe(config))
     skills = load_skills_for_session(vault_path=config.vault_path, state=session_state)
     components = _build_agent_components(config=config, tool_details=tool_details)
+    loop_runner = _build_loop_runner(
+        components=components,
+        session_state=session_state,
+        skills=skills,
+    )
     client = CrawDadClient(
         config=config,
         session_state=session_state,
@@ -93,8 +113,63 @@ def run_bot(config: CrawDadConfig) -> None:
         known_tools=components.known_tools,
         history=components.history,
         skills=skills,
+        loop_runner=loop_runner,
     )
     client.run(config.discord_bot_token)
+
+
+def _build_loop_runner(
+    *,
+    components: _AgentComponents,
+    session_state: SessionState | None,
+    skills: VoiceSkillStack,
+) -> LoopRunner | None:
+    """Return a closure that runs one loop turn end-to-end.
+
+    The returned callable is what :mod:`crawdad.slash_commands` invokes
+    when a Discord user types `/crawdad <command>`. ``None`` when the
+    agent loop isn't wired (no router → no slash commands).
+    """
+    if components.router is None or components.composer is None:
+        return None
+    router = components.router
+    composer = components.composer
+    mcp_client = components.mcp_client
+    known_tools = components.known_tools
+    history = components.history
+
+    async def _runner(message: str) -> str:
+        """Drive one loop turn and return the user-facing reply text.
+
+        Catches unexpected exceptions so a misbehaving SDK call (network
+        timeout, panic in the loop) doesn't leave Discord showing
+        "interaction failed" with no user-visible reason. The catch is
+        an additional safety net — the loop's structured outcomes
+        already cover every documented failure mode. Replies are also
+        truncated to Discord's soft cap so a long composer output
+        cannot raise ``HTTPException`` past the safety net at
+        ``interaction.followup.send`` time.
+        """
+        try:
+            outcome = await run_one_turn(
+                message=message,
+                router=router,
+                composer=composer,
+                mcp_client=mcp_client,
+                known_tools=known_tools,
+                history=history,
+                session_state=session_state,
+                skills=skills,
+            )
+            return _truncate_for_discord(outcome.reply)
+        except Exception:
+            _LOGGER.exception("agent loop crashed for slash command turn")
+            return _truncate_for_discord(
+                "something went wrong on my end — creek-tools may be "
+                "unreachable. Try again in a moment."
+            )
+
+    return _runner
 
 
 class _AgentComponents:
