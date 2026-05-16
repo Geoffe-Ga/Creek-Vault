@@ -301,6 +301,46 @@ def test_build_loop_runner_returns_callable_when_loop_wired(
     assert callable(runner)
 
 
+async def test_loop_runner_returns_soft_error_on_exception(
+    patched_config: CrawDadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash inside ``run_one_turn`` yields the documented soft reply.
+
+    Regression for review feedback on PR #237: previously an exception
+    propagated through Discord's interaction handler and the user saw
+    "This interaction failed" with no context.
+    """
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.skill_loader import VoiceSkillStack
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+
+    async def _boom(**_kwargs: Any) -> Any:
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(cli, "run_one_turn", _boom)
+
+    runner = cli._build_loop_runner(
+        components=components,
+        session_state=None,
+        skills=VoiceSkillStack(skills=()),
+    )
+
+    assert runner is not None
+    reply = await runner("anything")
+    assert "creek-tools" in reply.lower() or "wrong" in reply.lower()
+
+
 def test_run_bot_passes_loop_runner_when_loop_wired(
     patched_config: CrawDadConfig,
     monkeypatch: pytest.MonkeyPatch,

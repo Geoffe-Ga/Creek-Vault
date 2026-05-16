@@ -127,18 +127,32 @@ def _build_loop_runner(
     history = components.history
 
     async def _runner(message: str) -> str:
-        """Drive one loop turn and return the user-facing reply text."""
-        outcome = await run_one_turn(
-            message=message,
-            router=router,
-            composer=composer,
-            mcp_client=mcp_client,
-            known_tools=known_tools,
-            history=history,
-            session_state=session_state,
-            skills=skills,
-        )
-        return outcome.reply
+        """Drive one loop turn and return the user-facing reply text.
+
+        Catches unexpected exceptions so a misbehaving SDK call (network
+        timeout, panic in the loop) doesn't leave Discord showing
+        "interaction failed" with no user-visible reason. The catch is
+        an additional safety net — the loop's structured outcomes
+        already cover every documented failure mode.
+        """
+        try:
+            outcome = await run_one_turn(
+                message=message,
+                router=router,
+                composer=composer,
+                mcp_client=mcp_client,
+                known_tools=known_tools,
+                history=history,
+                session_state=session_state,
+                skills=skills,
+            )
+            return outcome.reply
+        except Exception:
+            _LOGGER.exception("agent loop crashed for slash command turn")
+            return (
+                "something went wrong on my end — creek-tools may be "
+                "unreachable. Try again in a moment."
+            )
 
     return _runner
 

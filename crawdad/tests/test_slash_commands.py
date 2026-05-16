@@ -249,3 +249,89 @@ async def test_registered_callback_routes_to_handler(
 
     assert len(interaction.followup.sent) == 1
     assert "composer received:" in interaction.followup.sent[0]
+
+
+class _FakeFollowup:
+    """Followup-send fake — records the content passed to discord."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, content: str) -> None:
+        """Record the content the registered callback tried to post."""
+        self.sent.append(content)
+
+
+class _FakeResponse:
+    """Interaction-response fake — counts ``defer`` calls."""
+
+    def __init__(self) -> None:
+        self.deferred = 0
+
+    async def defer(self) -> None:
+        """Increment the defer counter."""
+        self.deferred += 1
+
+
+class _FakeInteraction:
+    """``discord.Interaction``-shaped fake with the minimal surface we use."""
+
+    def __init__(self) -> None:
+        self.response = _FakeResponse()
+        self.followup = _FakeFollowup()
+
+
+@pytest.mark.parametrize(
+    ("command_name", "callback_kwargs"),
+    [
+        ("reflect", {}),
+        ("checkin", {}),
+        ("surface", {}),
+        ("draft", {"topic": "phase transitions"}),
+        ("save", {"content": "a fragment to file"}),
+    ],
+)
+async def test_every_loop_routed_callback_defers_and_replies(
+    command_name: str, callback_kwargs: dict[str, Any]
+) -> None:
+    """Each loop-routed callback ``defer()``s the interaction and replies.
+
+    Closes the FEAT-016 review's #1 blocker — pre-existing tests only
+    covered ``checkin``. The five remaining ``_callback`` closures were
+    unreached so per-file coverage on slash_commands.py sat at 89.80%.
+    """
+    tree = _FakeTree()
+    register(tree, loop_runner=_fake_loop_runner)
+    interaction = _FakeInteraction()
+
+    await tree.registered[command_name]["callback"](interaction, **callback_kwargs)
+
+    assert interaction.response.deferred == 1
+    assert len(interaction.followup.sent) == 1
+    # Every routed callback yields the loop's reply text.
+    assert "composer received:" in interaction.followup.sent[0]
+
+
+async def test_workflow_callback_skips_loop_and_returns_stub() -> None:
+    """The workflow callback ``defer()``s but does NOT call the loop runner.
+
+    The workflow stub is the only registered callback that bypasses
+    the agent loop entirely (v1.0 ships only the `list` subaction).
+    """
+    runner_called = False
+
+    async def _spy_runner(_msg: str) -> str:
+        nonlocal runner_called
+        runner_called = True
+        return "should not be reached"
+
+    tree = _FakeTree()
+    register(tree, loop_runner=_spy_runner)
+    interaction = _FakeInteraction()
+
+    await tree.registered["workflow"]["callback"](interaction)
+
+    assert interaction.response.deferred == 1
+    assert len(interaction.followup.sent) == 1
+    assert "v1.1" in interaction.followup.sent[0]
+    assert runner_called is False

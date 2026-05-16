@@ -233,8 +233,14 @@ def _register_draft(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
     """Wire the ``/crawdad draft`` Discord callback onto *tree*."""
 
     @tree.command(name="draft", description=_COMMAND_DESCRIPTIONS["draft"])
-    async def _callback(interaction: Any, topic: str = "") -> None:
-        """Discord callback for ``/crawdad draft <topic>`` (deferred)."""
+    async def _callback(interaction: Any, topic: str) -> None:
+        """Discord callback for ``/crawdad draft <topic>`` (deferred).
+
+        ``topic`` has no default value so Discord's autocomplete UI
+        marks the parameter as required and disables submit until the
+        user fills it in. The runtime empty-string guard in
+        :func:`handle_draft` stays as defense-in-depth.
+        """
         await interaction.response.defer()
         await handle_draft(
             interaction.followup.send, topic=topic, loop_runner=loop_runner
@@ -245,8 +251,13 @@ def _register_save(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
     """Wire the ``/crawdad save`` Discord callback onto *tree*."""
 
     @tree.command(name="save", description=_COMMAND_DESCRIPTIONS["save"])
-    async def _callback(interaction: Any, content: str = "") -> None:
-        """Discord callback for ``/crawdad save <content>`` (deferred)."""
+    async def _callback(interaction: Any, content: str) -> None:
+        """Discord callback for ``/crawdad save <content>`` (deferred).
+
+        ``content`` has no default; Discord marks the parameter as
+        required in the slash-command UI. Runtime guard in
+        :func:`handle_save` stays as defense-in-depth.
+        """
         await interaction.response.defer()
         await handle_save(
             interaction.followup.send, content=content, loop_runner=loop_runner
