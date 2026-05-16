@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger("crawdad.composer")
 
-_PARADOX_KEYWORDS = ("paradox", "paradoxes")
+PARADOX_KEYWORDS = ("paradox", "paradoxes")
 _PARADOX_RULE = (
     "Paradox rule: if any tool result names a paradox, NAME the paradox "
     "in your reply but do NOT propose resolution. Paradoxes are evidence "
@@ -136,12 +136,22 @@ def _results_block(tool_results: list[ToolResult]) -> str:
 
 
 def _mentions_paradox(results: list[ToolResult]) -> bool:
-    """Return True when any tool result body or intent mentions a paradox."""
+    """Return True when any tool result body or intent mentions a paradox.
+
+    Exported (without leading underscore via the module-level
+    :data:`PARADOX_KEYWORDS`) so :mod:`crawdad.loop` can reuse the same
+    detection rule for paradox routing. Keeping the implementation
+    here — the composer is the conceptual owner of paradox-tolerance.
+    """
     for result in results:
         haystack = f"{result.intent_type} {result.body}".lower()
-        if any(kw in haystack for kw in _PARADOX_KEYWORDS):
+        if any(kw in haystack for kw in PARADOX_KEYWORDS):
             return True
     return False
+
+
+# Public re-export for sibling modules that need the same detection rule.
+mentions_paradox = _mentions_paradox
 
 
 class SonnetComposer:

@@ -421,6 +421,90 @@ async def test_run_one_turn_returns_loop_outcome(
     assert outcome.kind == "composed"
 
 
+async def test_loop_paradox_save_mcp_failure_short_circuits(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """An MCPUnavailableError during the paradox save returns the soft reply.
+
+    The auto-injected ``creek.save`` runs *after* the regular dispatch
+    loop terminates. If the MCP subprocess dies between the surfacing
+    call and the save, the loop must downgrade to the documented
+    unreachable-reply outcome rather than crashing.
+    """
+    router = _ScriptedRouter(
+        [
+            RouterResponse(intents=[Intent(type="creek.lint")]),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+    session = _ScriptedSession(
+        replies={"creek.lint": "paradox detected"},
+        errors={"creek.save": MCPUnavailableError("subprocess died between calls")},
+    )
+    composer = _ScriptedComposer("(unused — should not be reached)")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.lint", "creek.save"),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+    )
+
+    outcome = await loop.run("hi")
+
+    assert outcome.kind == "mcp_unavailable"
+    assert composer.calls == []
+
+
+async def test_loop_paradox_save_inherits_max_ceiling(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """The auto-injected paradox save uses the highest ceiling from results.
+
+    Regression for review feedback: a fixed OPEN ceiling would refuse
+    saves on personal- or intimate-tier source content. The save must
+    inherit at least the highest ceiling the surfacing call used.
+    """
+    from crawdad.intents import PrivacyTierCeiling
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type="creek.lint",
+                        privacy_tier_ceiling=PrivacyTierCeiling.INTIMATE,
+                    )
+                ]
+            ),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+    session = _ScriptedSession(
+        replies={
+            "creek.lint": "paradox detected in 03-Eddies/eddy-x",
+            "creek.save": "saved",
+        }
+    )
+    composer = _ScriptedComposer("done")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.lint", "creek.save"),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+    )
+
+    await loop.run("anything surfacing?")
+
+    save_call = next((args for name, args in session.calls if name == "creek.save"))
+    assert save_call["privacy_tier_ceiling"] == "intimate"
+
+
 async def test_loop_records_user_and_assistant_turns(
     state: SessionState, skills: VoiceSkillStack
 ) -> None:

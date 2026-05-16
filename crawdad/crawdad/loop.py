@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from crawdad.composer import ComposerFailureError
+from crawdad.composer import ComposerFailureError, mentions_paradox
 from crawdad.config import MAX_LOOP_ROUNDS
 from crawdad.dispatcher import (
     IntentDispatcher,
@@ -81,7 +81,6 @@ _COMPOSER_FAILURE_REPLY = (
     "I'm having trouble composing right now — try again in a moment."
 )
 
-_PARADOX_KEYWORDS = ("paradox", "paradoxes")
 _SAVE_TOOL_NAME = "creek.save"
 
 
@@ -204,11 +203,17 @@ class AgentLoop:
     async def _maybe_route_paradox(self, results: list[ToolResult]) -> list[ToolResult]:
         """If results mention a paradox, ensure a save call to liminal land.
 
+        The auto-injected ``creek.save`` inherits the highest
+        ``privacy_tier_ceiling`` seen across the surfacing results so
+        the save call is authorised for whatever tier the source content
+        sat at. Using a fixed OPEN ceiling would silently fail when a
+        paradox surfaced inside personal- or intimate-tier content.
+
         Returns the (possibly augmented) results list. Idempotent — if
         a ``creek.save`` was already dispatched in this turn, no extra
         call is made.
         """
-        if not _mentions_paradox(results):
+        if not mentions_paradox(results):
             return results
         if _SAVE_TOOL_NAME not in self._known_tools:
             _LOGGER.debug(
@@ -222,7 +227,7 @@ class AgentLoop:
 
         save_intent = Intent(
             type=_SAVE_TOOL_NAME,
-            privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
+            privacy_tier_ceiling=_max_ceiling_from(results),
             args={"target": "paradox"},
         )
         save_response = RouterResponse(intents=[save_intent], compose=False)
@@ -235,13 +240,25 @@ class AgentLoop:
         return [*results, *saved]
 
 
-def _mentions_paradox(results: list[ToolResult]) -> bool:
-    """Return True when any result body or intent name mentions a paradox."""
+def _max_ceiling_from(results: list[ToolResult]) -> PrivacyTierCeiling:
+    """Return the most permissive ceiling observed across *results*.
+
+    Ordered low→high by the underlying enum value strings: ``all`` is
+    treated as the most permissive (it's literally the "no ceiling"
+    sentinel), then ``intimate`` → ``personal`` → ``open``. Defaults
+    to OPEN when no results carry a ceiling.
+    """
+    rank = {
+        PrivacyTierCeiling.OPEN: 0,
+        PrivacyTierCeiling.PERSONAL: 1,
+        PrivacyTierCeiling.INTIMATE: 2,
+        PrivacyTierCeiling.ALL: 3,
+    }
+    best = PrivacyTierCeiling.OPEN
     for result in results:
-        haystack = f"{result.intent_type} {result.body}".lower()
-        if any(kw in haystack for kw in _PARADOX_KEYWORDS):
-            return True
-    return False
+        if rank[result.privacy_tier_ceiling] > rank[best]:
+            best = result.privacy_tier_ceiling
+    return best
 
 
 async def run_one_turn(
