@@ -9,7 +9,7 @@ Help command. Lists every `/creek` subcommand with a one-line description, or â€
 
 ## What I will do
 
-1. Without an argument: list all 10 subcommands (`state`, `lint`, `mine`, `draft`, `save`, `phase`, `wavelength`, `skills`, `ingest`) with descriptions pulled from each file's frontmatter.
+1. Without an argument: list all 10 subcommands (`state`, `lint`, `mine`, `draft`, `save`, `explain`, `phase`, `wavelength`, `skills`, `ingest`) with descriptions pulled from each file's frontmatter.
 2. With an argument: render the matching command file's body.
 3. Unknown subcommand: list the valid ones (no stack trace, no MCP call).
 

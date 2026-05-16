@@ -172,7 +172,17 @@ async def handle_workflow(replier: Replier, *, subaction: str | None) -> None:
 
 
 async def handle_help(replier: Replier) -> None:
-    """``/crawdad help`` — list every command with a one-line description."""
+    """Compose a help summary listing every ``/crawdad`` command.
+
+    Not registered as a Discord slash command — Discord's autocomplete
+    UI already surfaces the six registered commands and their
+    descriptions. ``handle_help`` is kept as a public helper so:
+
+    * Tests can drive the help-text format directly.
+    * Future surfaces (a v1.1 ``/crawdad help`` variant, an operator
+      REPL, a Discord rich-embed expansion) can reuse the canonical
+      help string without duplicating the command list.
+    """
     lines = ["**`/crawdad` commands**"]
     for name in CRAWDAD_COMMANDS:
         lines.append(f"- `/crawdad {name}` — {_COMMAND_DESCRIPTIONS[name]}")
@@ -187,15 +197,17 @@ async def handle_help(replier: Replier) -> None:
 
 
 def register(tree: _TreeLike, *, loop_runner: LoopRunner) -> int:
-    """Register every `/crawdad` slash command on the supplied tree.
+    """Register every ``/crawdad`` slash command on the supplied tree.
 
     Each callback ``defer()``s the Discord interaction so the loop has
     its full :data:`crawdad.config.MAX_LOOP_ROUNDS` budget before the
     SDK times out at 3 seconds. The actual reply lands via
     ``interaction.followup.send``.
 
-    Returns the number of registered commands so callers can sanity-check
-    the wiring.
+    Returns the count of advertised commands (always
+    ``len(CRAWDAD_COMMANDS)`` since the registration helpers don't
+    fail). The return value is a sanity-check signal callers can pin
+    in tests to catch silent additions or removals.
     """
     _register_reflect(tree, loop_runner=loop_runner)
     _register_checkin(tree, loop_runner=loop_runner)
