@@ -2,21 +2,23 @@
 
 CrawDad is the Discord-side interface to a Creek vault. It consumes
 the creek-tools MCP surface (see `creek-tools/creek_mcp`) and answers
-Discord messages in your voice.
+Discord messages in your voice using the FEAT-015 agent loop (Haiku
+router → MCP dispatcher → Sonnet composer with voice-skill activation).
 
-This is the **FEAT-013 wiring scaffold** — the agent loop (FEAT-014:
-Haiku router + dispatcher; FEAT-015: Sonnet composer + 5-round loop)
-is not yet implemented. What ships in this PR:
+CrawDad v1.0 ships:
 
 - A `discord.py` client that connects to Discord and forwards messages
   to a pure-logic handler.
+- The two-LLM agent loop (FEAT-014 + FEAT-015) — Haiku for intent
+  extraction, Sonnet for voice-faithful composition, capped at 5
+  rounds with paradox routing to `10-Liminal/Paradoxes/`.
 - An async MCP stdio client wrapping the Anthropic `mcp` SDK.
-- A `latest.md` parser that loads the audit-report snapshot once at
-  session start.
+- Voice-skill activation per session from `<vault>/creek-skills/`.
+- The six `/crawdad` slash commands (FEAT-016): `reflect`, `checkin`,
+  `surface`, `draft`, `save`, `workflow`.
 - A user + channel allowlist; non-allowlisted callers get no response.
 - A graceful "creek-tools is unreachable" reply when the MCP
-  subprocess dies. FEAT-014 will add the exponential-backoff restart
-  loop on top.
+  subprocess dies.
 
 ## Quick start
 
@@ -44,6 +46,25 @@ allowed_channel_ids:
   - 234567890123456789   # the channel the bot will respond in
 ```
 
+## Slash commands (FEAT-016)
+
+The `/crawdad` family registers automatically with Discord on startup.
+Each routes through the FEAT-015 agent loop with a pre-baked user
+message, so the Sonnet composer wraps the tool results in your voice.
+
+| Command | Purpose |
+|---|---|
+| `/crawdad reflect` | Open reflective conversation mode — the loop with no preselected intent. Same as bare `/crawdad`. |
+| `/crawdad checkin` | Wavelength check-in via `creek.state.read`. |
+| `/crawdad surface` | Surface paradoxes / liminal content via `creek.lint`. |
+| `/crawdad draft <topic>` | Mine + draft on the supplied topic (`creek.mine` → `creek.draft`). |
+| `/crawdad save <content>` | File the supplied content back to the vault (`creek.save`). |
+| `/crawdad workflow [list]` | v1.0 stub — full workflow DSL ships in v1.1. |
+
+Full grammar reference (including the developer-side `/creek` surface
+for Claude Code) is in
+[`creek-tools/docs/slash-commands.md`](../creek-tools/docs/slash-commands.md).
+
 ## Development
 
 ```bash
@@ -60,22 +81,34 @@ cyclomatic complexity ≤ 10.
 ## Architecture
 
 ```
-Discord message
+Discord message  /  /crawdad slash command
   ▼
-CrawDadClient.on_message  (crawdad/bot.py)
+CrawDadClient.{on_message, /crawdad <cmd>}  (crawdad/bot.py + slash_commands.py)
   ▼
-handle_message            (pure logic, allowlist + state dispatch)
+handle_message  /  loop_runner closure
   ▼
-session_state             (loaded once at start from latest.md)
+loop.run_one_turn   (FEAT-015 agent loop, capped at 5 rounds)
+  ▼  ┌──────────────────────────────────────────────────────────┐
+     │ Haiku router (FEAT-014)   →   JSON intents               │
+     │ MCP dispatcher            →   creek.state / lint / ...   │
+     │ Paradox auto-save         →   creek.save → 10-Liminal/   │
+     │ Sonnet composer (FEAT-015)→   voice-faithful reply       │
+     └──────────────────────────────────────────────────────────┘
   ▼
-[FEAT-014 dispatcher]     ── MCP subprocess (creek-tools-mcp)
-  ▼
-[FEAT-015 composer]
+Discord reply
 ```
+
+The voice-skill stack (`<vault>/creek-skills/voice-core/`, plus phase-
+and register-specific files) is loaded once at session start. See
+`crawdad/CLAUDE.md` §5.1 for the trust boundary on `crawdad.yaml`.
 
 ## See also
 
 - `creek-tools/CLAUDE.md` — quality standards we mirror.
 - `creek-tools/docs/mcp.md` — the MCP surface CrawDad consumes.
-- `plans/git-issues/FEAT-013-crawdad-discord-bot-skeleton-mcp-client.md`
-  — the issue this package implements.
+- `creek-tools/docs/slash-commands.md` — full `/creek` + `/crawdad` grammar.
+- `plans/git-issues/FEAT-013-crawdad-discord-bot-skeleton-mcp-client.md`,
+  `plans/git-issues/FEAT-014-crawdad-haiku-router-dispatcher.md`,
+  `plans/git-issues/FEAT-015-crawdad-sonnet-composer-loop.md`,
+  `plans/git-issues/FEAT-016-slash-command-grammar.md` — the
+  implementation plan.

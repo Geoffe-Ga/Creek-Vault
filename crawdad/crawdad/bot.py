@@ -16,12 +16,14 @@ fallback, and posting the loop's reply.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import discord
+from discord import app_commands
 
 from crawdad.history import ConversationHistory
 from crawdad.loop import run_one_turn
+from crawdad.slash_commands import register as register_slash_commands
 
 if TYPE_CHECKING:
     from crawdad.composer import SonnetComposer
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
     from crawdad.mcp_client import MCPClient, MCPUnavailableError
     from crawdad.router import IntentRouter
     from crawdad.skill_loader import VoiceSkillStack
+    from crawdad.slash_commands import LoopRunner
     from crawdad.state import SessionState, StateUnavailableError
 
 _LOGGER = logging.getLogger("crawdad.bot")
@@ -177,9 +180,15 @@ class CrawDadClient(discord.Client):
         known_tools: tuple[str, ...] = (),
         history: ConversationHistory | None = None,
         skills: VoiceSkillStack | None = None,
+        loop_runner: LoopRunner | None = None,
         intents: discord.Intents | None = None,
     ) -> None:
-        """Store config + agent-loop components; init the parent ``Client``."""
+        """Store config + agent-loop components; init the parent ``Client``.
+
+        ``loop_runner`` (FEAT-016) is the closure the slash command
+        callbacks invoke to enter the FEAT-015 loop with a pre-baked
+        user message. When ``None``, slash commands are not registered.
+        """
         super().__init__(intents=intents or self._default_intents())
         self._config = config
         self._session_state = session_state
@@ -189,6 +198,14 @@ class CrawDadClient(discord.Client):
         self._known_tools = known_tools
         self._history = history
         self._skills = skills
+        self._loop_runner = loop_runner
+        self.tree = app_commands.CommandTree(self)
+        if loop_runner is not None:
+            # discord.py's ``CommandTree.command`` signature is wider than
+            # the ``_TreeLike`` Protocol the registration function uses,
+            # so cast to Any at the boundary. Verified by the structural
+            # ``test_register_wires_every_command_onto_tree`` test.
+            register_slash_commands(cast("Any", self.tree), loop_runner=loop_runner)
 
     @staticmethod
     def _default_intents() -> discord.Intents:
@@ -196,6 +213,17 @@ class CrawDadClient(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         return intents
+
+    async def setup_hook(self) -> None:
+        """Sync slash commands with Discord once the client is ready.
+
+        ``setup_hook`` runs after login but before the gateway is
+        ready, which is the documented home for ``CommandTree.sync()``.
+        Skipped when the loop runner wasn't provided (test wiring).
+        """
+        if self._loop_runner is not None:
+            await self.tree.sync()
+            _LOGGER.info("synced /crawdad slash commands with Discord")
 
     async def on_ready(self) -> None:
         """Log connection details. Real session-start work happens in CLI."""

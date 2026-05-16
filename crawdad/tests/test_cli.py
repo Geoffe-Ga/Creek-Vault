@@ -254,3 +254,84 @@ def test_build_agent_components_wires_router_and_composer(
     assert components.router is not None
     assert components.composer is not None
     assert components.known_tools == ("creek.state.read",)
+
+
+def test_build_loop_runner_returns_none_when_loop_not_wired(
+    patched_config: CrawDadConfig,
+) -> None:
+    """No router/composer → no loop runner → slash commands stay unregistered."""
+    from crawdad.skill_loader import VoiceSkillStack
+
+    components = cli._build_agent_components(config=patched_config, tool_details=())
+
+    runner = cli._build_loop_runner(
+        components=components,
+        session_state=None,
+        skills=VoiceSkillStack(skills=()),
+    )
+
+    assert runner is None
+
+
+def test_build_loop_runner_returns_callable_when_loop_wired(
+    patched_config: CrawDadConfig,
+) -> None:
+    """A wired loop produces a callable suitable for slash-command dispatch."""
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.skill_loader import VoiceSkillStack
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+
+    runner = cli._build_loop_runner(
+        components=components,
+        session_state=None,
+        skills=VoiceSkillStack(skills=()),
+    )
+
+    assert runner is not None
+    assert callable(runner)
+
+
+def test_run_bot_passes_loop_runner_when_loop_wired(
+    patched_config: CrawDadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    vault_with_state: Path,
+) -> None:
+    """``run_bot`` constructs and forwards a ``loop_runner`` to the client."""
+    from crawdad.mcp_client import ToolDetails
+
+    config = patched_config.model_copy(update={"vault_path": vault_with_state})
+    captured: dict[str, Any] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["init_kwargs"] = kwargs
+
+        def run(self, _token: str) -> None:
+            captured["ran"] = True
+
+    async def _ok_probe(_c: CrawDadConfig) -> tuple[ToolDetails, ...]:
+        return (
+            ToolDetails(
+                name="creek.state.read",
+                description="Read latest.md",
+                input_schema={"type": "object"},
+            ),
+        )
+
+    monkeypatch.setattr(cli, "CrawDadClient", _FakeClient)
+    monkeypatch.setattr(cli, "_startup_probe", _ok_probe)
+
+    cli.run_bot(config)
+
+    assert captured["init_kwargs"]["loop_runner"] is not None
+    assert callable(captured["init_kwargs"]["loop_runner"])

@@ -339,6 +339,17 @@ Significant architectural decisions live in
 files. Skill guidance for *how* to write a decision record lives at
 the repository-level `.claude/skills/architectural-decisions/SKILL.md`.
 
+### 5.4 Slash commands (FEAT-016)
+
+`creek-tools/.claude/commands/` hosts the `/creek` slash-command surface
+that Claude Code reads when the user types `/creek <subcommand>`. Each
+file is a markdown skill with YAML frontmatter (`description`,
+`argument-hint`) and a body that names the MCP tool the command
+invokes (`creek.state.read`, `creek.lint`, `creek.mine`, etc.). The
+companion `/crawdad` surface lives in `crawdad/crawdad/slash_commands.py`
+and routes through the FEAT-015 agent loop. End-user documentation is
+in [`docs/slash-commands.md`](docs/slash-commands.md).
+
 ---
 
 ## 6. Quality Standards

@@ -105,10 +105,12 @@ def build_composer_prompt(
 
 
 def _skills_block(skills: VoiceSkillStack) -> str:
+    """Return the voice-skill stack prompt context, or an empty-state marker."""
     return skills.as_prompt_context() or "(no voice-skill stack loaded)"
 
 
 def _wavelength_block(state: SessionState | None) -> str:
+    """Return the wavelength prompt block — snapshot text or empty marker."""
     wavelength = (
         state.wavelength_snapshot if state and state.wavelength_snapshot else None
     )
@@ -118,6 +120,7 @@ def _wavelength_block(state: SessionState | None) -> str:
 
 
 def _history_block(history: ConversationHistory) -> str:
+    """Return the recent-history prompt block — bulleted turns or empty marker."""
     lines = [f"  - {entry.role}: {entry.content}" for entry in history.as_list()]
     if not lines:
         return "Recent conversation history: (empty)"
@@ -125,6 +128,7 @@ def _history_block(history: ConversationHistory) -> str:
 
 
 def _results_block(tool_results: list[ToolResult]) -> str:
+    """Return the tool-results prompt block — one section per result, or empty."""
     if not tool_results:
         return "Tool results: (none — answer from state + skills)"
     lines: list[str] = []

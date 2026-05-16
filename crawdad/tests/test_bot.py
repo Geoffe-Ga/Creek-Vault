@@ -591,3 +591,88 @@ async def test_handle_message_without_loop_components_uses_stub_reply(
 
     assert len(channel.sent) == 1
     assert "scaffold" in channel.sent[0].lower()
+
+
+def test_crawdad_client_registers_slash_commands_when_loop_runner_provided(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """FEAT-016: providing a ``loop_runner`` registers the six /crawdad commands."""
+    from crawdad.bot import CrawDadClient
+    from crawdad.slash_commands import CRAWDAD_COMMANDS
+
+    async def _runner(_message: str) -> str:
+        return "noop"
+
+    client = CrawDadClient(
+        config=config,
+        session_state=session_state,
+        loop_runner=_runner,
+    )
+
+    # The CommandTree exposes ``get_commands`` returning registered Commands.
+    names = {cmd.name for cmd in client.tree.get_commands()}
+    assert set(CRAWDAD_COMMANDS).issubset(names)
+
+
+def test_crawdad_client_without_loop_runner_registers_no_commands(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """No loop runner → no slash commands (test wiring stays uncoupled)."""
+    from crawdad.bot import CrawDadClient
+
+    client = CrawDadClient(config=config, session_state=session_state)
+
+    assert list(client.tree.get_commands()) == []
+
+
+async def test_setup_hook_skips_sync_when_no_loop_runner(
+    config: CrawDadConfig,
+    session_state: SessionState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``setup_hook`` is a no-op when slash commands weren't registered."""
+    from crawdad.bot import CrawDadClient
+
+    client = CrawDadClient(config=config, session_state=session_state)
+    sync_calls = 0
+
+    async def _spy() -> list[Any]:
+        nonlocal sync_calls
+        sync_calls += 1
+        return []
+
+    monkeypatch.setattr(client.tree, "sync", _spy)
+
+    await client.setup_hook()
+
+    assert sync_calls == 0
+
+
+async def test_setup_hook_syncs_when_loop_runner_provided(
+    config: CrawDadConfig,
+    session_state: SessionState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``setup_hook`` triggers a CommandTree sync after slash registration."""
+    from crawdad.bot import CrawDadClient
+
+    async def _runner(_message: str) -> str:
+        return "noop"
+
+    client = CrawDadClient(
+        config=config,
+        session_state=session_state,
+        loop_runner=_runner,
+    )
+    sync_calls = 0
+
+    async def _spy() -> list[Any]:
+        nonlocal sync_calls
+        sync_calls += 1
+        return []
+
+    monkeypatch.setattr(client.tree, "sync", _spy)
+
+    await client.setup_hook()
+
+    assert sync_calls == 1

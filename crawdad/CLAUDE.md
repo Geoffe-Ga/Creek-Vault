@@ -25,17 +25,21 @@ These mirror `creek-tools/CLAUDE.md` at a smaller scale:
 
 ## 2. Project overview
 
-CrawDad is a Discord bot:
+CrawDad is the Discord-side interface to a Creek vault. v1.0 is
+complete and ships:
 
-- Connects to `creek-tools-mcp` (FEAT-010) over stdio.
-- Reads `<vault>/00-Creek-Meta/State/latest.md` once at session start
-  (Graphify-style PreToolUse pattern).
-- Enforces a hard-coded user/channel allowlist — non-allowlisted users
-  get *no* response (silent ignore, per FEAT-013's personal-use
-  scoping).
-- Posts a stub reply for the wiring scaffold. FEAT-014 will swap the
-  stub for the Haiku-router + dispatcher; FEAT-015 will add the Sonnet
-  composer and 5-round loop.
+- Connection to `creek-tools-mcp` (FEAT-010/011/012) over stdio.
+- The two-LLM agent loop: Haiku router (FEAT-014) → MCP dispatcher →
+  Sonnet composer (FEAT-015), capped at 5 rounds with paradox auto-
+  routing to `10-Liminal/Paradoxes/`.
+- Voice-skill activation per session from `<vault>/creek-skills/`
+  (voice-core + phase + register).
+- Six `/crawdad` Discord slash commands (FEAT-016): `reflect`,
+  `checkin`, `surface`, `draft`, `save`, `workflow`.
+- A user + channel allowlist; non-allowlisted users get *no* response
+  (silent ignore, per FEAT-013's personal-use scoping).
+- Session-state load from `<vault>/00-Creek-Meta/State/latest.md` at
+  startup.
 
 ## 3. Layout
 
@@ -44,27 +48,20 @@ crawdad/
 ├── crawdad/                # Source package
 │   ├── __init__.py
 │   ├── bot.py              # discord.Client subclass + pure-logic handler
-│   ├── cli.py              # `crawdad run` entry point
+│   ├── cli.py              # `crawdad run` entry point + agent components
+│   ├── composer.py         # Sonnet composer (FEAT-015)
 │   ├── config.py           # Pydantic config (env secrets + YAML file)
+│   ├── dispatcher.py       # Intent → MCP tool dispatcher (FEAT-014)
+│   ├── history.py          # Conversation history with bounded truncation
+│   ├── intents.py          # Pydantic intent schema + builder
+│   ├── loop.py             # 5-round agent loop (FEAT-015)
 │   ├── mcp_client.py       # async MCP stdio wrapper
+│   ├── router.py           # Haiku intent router (FEAT-014)
+│   ├── skill_loader.py     # Voice-skill stack loader (FEAT-015)
+│   ├── slash_commands.py   # /crawdad Discord slash commands (FEAT-016)
 │   └── state.py            # load_session_state — latest.md parser
-├── tests/
-│   ├── conftest.py
-│   ├── fixtures/
-│   │   └── fake_mcp_server.py   # stdio MCP server used by client tests
-│   ├── test_bot.py
-│   ├── test_cli.py
-│   ├── test_config.py
-│   ├── test_mcp_client.py
-│   └── test_state.py
-├── scripts/
-│   ├── check-all.sh        # Run every quality gate
-│   ├── coverage.sh
-│   ├── format.sh
-│   ├── lint.sh
-│   ├── security.sh
-│   ├── test.sh
-│   └── typecheck.sh
+├── tests/                  # One test file per source module
+├── scripts/                # check-all, lint, test, etc.
 ├── docs/
 ├── CLAUDE.md
 ├── README.md

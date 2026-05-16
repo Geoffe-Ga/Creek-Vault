@@ -126,6 +126,7 @@ ignore = []
 "tests/**/*" = [
     "S101",   # assert is the point of tests
     "TC001",  # type-only imports in tests stay top-level for pytest discovery
+    "TC002",  # same — pytest.MonkeyPatch annotation, used only at type-check time
     "TC003",  # same — Path / Any used in fixture annotations
 ]
 
