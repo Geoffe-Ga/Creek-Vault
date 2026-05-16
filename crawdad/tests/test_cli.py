@@ -301,6 +301,53 @@ def test_build_loop_runner_returns_callable_when_loop_wired(
     assert callable(runner)
 
 
+async def test_loop_runner_truncates_long_replies(
+    patched_config: CrawDadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replies over Discord's 2000-char limit are truncated with an ellipsis.
+
+    Regression for PR #237 review: ``interaction.followup.send`` raises
+    ``HTTPException`` past Discord's body cap, and that error fires
+    *after* ``_runner`` returns so the soft-error wrapper can't catch
+    it. Truncating inside ``_runner`` keeps every slash command's
+    payload below the wire limit.
+    """
+    from crawdad.loop import LoopOutcome
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.skill_loader import VoiceSkillStack
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+
+    long_reply = "x" * 5000
+
+    async def _huge_outcome(**_kwargs: Any) -> LoopOutcome:
+        return LoopOutcome(kind="composed", reply=long_reply)
+
+    monkeypatch.setattr(cli, "run_one_turn", _huge_outcome)
+
+    runner = cli._build_loop_runner(
+        components=components,
+        session_state=None,
+        skills=VoiceSkillStack(skills=()),
+    )
+
+    assert runner is not None
+    reply = await runner("anything")
+    assert len(reply) < len(long_reply)
+    assert len(reply) <= cli._DISCORD_REPLY_LIMIT
+    assert reply.endswith("...")
+
+
 async def test_loop_runner_returns_soft_error_on_exception(
     patched_config: CrawDadConfig,
     monkeypatch: pytest.MonkeyPatch,

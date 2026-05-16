@@ -168,7 +168,7 @@ async def test_handle_help_lists_every_command() -> None:
         assert name in body
 
 
-async def test_handle_reflect_workflow_skips_loop() -> None:
+async def test_handle_workflow_skips_loop() -> None:
     """Workflow handler does NOT call the loop runner — it's a pure stub."""
     runner_calls = 0
 
@@ -216,39 +216,6 @@ def test_register_returns_command_count() -> None:
     count = register(tree, loop_runner=_fake_loop_runner)
 
     assert count == len(CRAWDAD_COMMANDS)
-
-
-async def test_registered_callback_routes_to_handler(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A registered slash callback ends up calling the matching handler."""
-    tree = _FakeTree()
-    register(tree, loop_runner=_fake_loop_runner)
-
-    # Each registered callback accepts a discord.Interaction. We provide
-    # a fake interaction with the minimal shape: a response object whose
-    # ``defer`` is a no-op and a ``followup.send`` that records calls.
-    class _FakeFollowup:
-        def __init__(self) -> None:
-            self.sent: list[str] = []
-
-        async def send(self, content: str) -> None:
-            self.sent.append(content)
-
-    class _FakeResponse:
-        async def defer(self) -> None:
-            return None
-
-    class _FakeInteraction:
-        def __init__(self) -> None:
-            self.response = _FakeResponse()
-            self.followup = _FakeFollowup()
-
-    interaction = _FakeInteraction()
-    await tree.registered["checkin"]["callback"](interaction)
-
-    assert len(interaction.followup.sent) == 1
-    assert "composer received:" in interaction.followup.sent[0]
 
 
 class _FakeFollowup:

@@ -16,6 +16,13 @@ and ``followup.send()``s the reply.
 ``/crawdad workflow`` is a v1.0 stub. Full workflow DSL ships with the
 next FEAT; see ``plans/2026-05-05_comparative-analysis/candidates/
 ADAPT-003-*.md``.
+
+Trust boundary: the user-supplied ``topic`` and ``content`` arguments
+are interpolated directly into LLM prompts. The personal-use allowlist
+(FEAT-013) is the primary gate; this surface does NOT sanitize input
+because doing so would interfere with the user's ability to ask the
+loop to act on raw text. Revisit this if the allowlist ever expands
+beyond a single trusted user.
 """
 
 from __future__ import annotations

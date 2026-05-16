@@ -42,6 +42,18 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger("crawdad.cli")
 
+# Discord's regular message + slash-follow-up text body is capped at 2000
+# characters. Truncate well below the wire limit so the truncation marker
+# always fits and we leave headroom for accidental whitespace.
+_DISCORD_REPLY_LIMIT = 1900
+
+
+def _truncate_for_discord(text: str) -> str:
+    """Cap *text* at Discord's soft limit with an ellipsis marker if needed."""
+    if len(text) <= _DISCORD_REPLY_LIMIT:
+        return text
+    return text[: _DISCORD_REPLY_LIMIT - 3] + "..."
+
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Parse *argv*, resolve config, and start the runtime."""
@@ -133,7 +145,10 @@ def _build_loop_runner(
         timeout, panic in the loop) doesn't leave Discord showing
         "interaction failed" with no user-visible reason. The catch is
         an additional safety net — the loop's structured outcomes
-        already cover every documented failure mode.
+        already cover every documented failure mode. Replies are also
+        truncated to Discord's soft cap so a long composer output
+        cannot raise ``HTTPException`` past the safety net at
+        ``interaction.followup.send`` time.
         """
         try:
             outcome = await run_one_turn(
@@ -146,10 +161,10 @@ def _build_loop_runner(
                 session_state=session_state,
                 skills=skills,
             )
-            return outcome.reply
+            return _truncate_for_discord(outcome.reply)
         except Exception:
             _LOGGER.exception("agent loop crashed for slash command turn")
-            return (
+            return _truncate_for_discord(
                 "something went wrong on my end — creek-tools may be "
                 "unreachable. Try again in a moment."
             )
