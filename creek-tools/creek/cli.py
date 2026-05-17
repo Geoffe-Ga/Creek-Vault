@@ -83,9 +83,14 @@ skills_app = typer.Typer(
     name="skills",
     help="Voice Skill Tree generation and schema-skill template sync.",
 )
+compost_app = typer.Typer(
+    name="compost",
+    help="Compost detection utilities (FEAT-018: embedding gate + verifier).",
+)
 app.add_typer(clean_app, name="clean")
 app.add_typer(purge_app, name="purge")
 app.add_typer(skills_app, name="skills")
+app.add_typer(compost_app, name="compost")
 console = Console()
 
 
@@ -2437,3 +2442,64 @@ def _resolve_purge_phrase(
     if typed.strip() != expected:
         return None
     return VAULT_PURGE_CONFIRMATION
+
+
+@compost_app.command("calibrate")
+def compost_calibrate(
+    fixture: Path | None = typer.Option(
+        None,
+        "--fixture",
+        help=(
+            "Path to a YAML calibration set of `{text, expected: bool}` "
+            "entries. When omitted, the command reports the packaged "
+            "exemplar set and explains how to author a fixture."
+        ),
+    ),
+    exemplars: Path | None = typer.Option(
+        None,
+        "--exemplars",
+        help=(
+            "Path to a custom exemplars YAML. Defaults to the packaged "
+            "`creek/generate/exemplars/compost.yaml`."
+        ),
+    ),
+) -> None:
+    """Report exemplar coverage and (when supplied) fixture recall (FEAT-018).
+
+    With ``--fixture`` omitted, prints the loaded exemplar count by
+    texture so operators can audit the curated set. With a fixture
+    supplied, scores recall + precision against the labelled set so
+    the operator can tune ``compost.embedding_threshold`` against
+    their corpus. The full calibration loop lands once a real fixture
+    is collected from the user's vault; today this command exists so
+    the workflow is discoverable.
+    """
+    from creek.generate.compost_embedding import load_exemplars
+
+    try:
+        loaded = load_exemplars(exemplars)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Failed to load exemplars: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    by_texture: dict[str, int] = {}
+    for exemplar in loaded:
+        by_texture[exemplar.texture] = by_texture.get(exemplar.texture, 0) + 1
+    console.print(f"[bold green]Loaded {len(loaded)} compost exemplars.[/bold green]")
+    for texture, count in sorted(by_texture.items()):
+        console.print(f"  {texture:<20} {count}")
+
+    if fixture is None:
+        console.print(
+            "\nNo --fixture supplied. To score recall/precision, author a "
+            "YAML list of `{text, expected: bool}` entries from real vault "
+            "fragments and re-run with `--fixture path/to/fixture.yaml`.",
+        )
+        return
+
+    console.print(
+        f"\n[yellow]Fixture-driven scoring against {fixture} is not yet "
+        "implemented (FEAT-018 stub). The fixture format and recall/"
+        "precision report land in a follow-up once a real labelled set "
+        "is collected.[/yellow]",
+    )

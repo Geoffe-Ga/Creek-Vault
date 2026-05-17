@@ -67,19 +67,34 @@ Output: `10-Liminal/Synchronicities/<id>.md` linking the pair, the cosine score,
 
 ## §10.4 — Compost Tracking
 
-`CompostTracker` surfaces threads and projects that have died or been abandoned and writes a compost note that **preserves** rather than deletes. Triggers:
+`CompostTracker` surfaces threads, fragments, and projects that have died or been abandoned and writes a compost note that **preserves** rather than deletes. Three detection paths:
 
-- A `Thread.status` transitions to `resolved`.
-- Fragments reference abandoned projects (heuristic: fragments tagged `abandoned`, `let-go`, or referencing dormant threads).
+1. **Thread dormancy** — a `Thread.status` is `resolved`, or `last_seen` is older than `dormancy_days` (180 by default).
+2. **Fragment abandonment (FEAT-018)** — an embedding-similarity gate against curated exemplars (`creek/generate/exemplars/compost.yaml`) followed by an optional LLM verifier. Replaces the legacy five-phrase `_ABANDONMENT_KEYWORDS` regex with a semantic surface diverse enough to recognize abandonment in the operator's own voice. The verifier returns `yes` / `no` / `ambiguous`; ambiguous verdicts route to `10-Liminal/Compost/Review/` for manual triage rather than the canonical compost folder.
+3. **Project silence** — a tag appears in at least `project_min_fragments` fragments but has not been mentioned for more than `project_gap_days`.
+
+Privacy: intimate-tier fragments are skipped by default (never sent to the embedding gate or the verifier), respecting the same policy as `creek.classify.privacy_filter`. Paradox-tagged fragments are skipped too — paradoxes are contradiction-holding notes by design, not compost candidates.
+
+Configuration lives under `compost:` in `creek_config.yaml`:
+
+```yaml
+compost:
+  embedding_threshold: 0.6       # cosine floor for verifier handoff
+  llm_verification: true         # set false for embedding-only acceptance
+  review_queue_relpath: "10-Liminal/Compost/Review"
+  skip_paradox: true
+  exemplars_relpath: null        # null → packaged default
+```
 
 The compost note records:
 
 - **What the idea was** — title plus one-paragraph summary.
-- **Why it was abandoned** — extracted from referencing fragments when explicit; left as a prompt otherwise.
+- **Why it composted** — the verifier's one-sentence reasoning (or the embedding similarity, when the verifier is disabled).
 - **What energy / insight it contained that may still be alive** — unresolved questions, active frequencies.
 - **Links to referencing fragments** — wiki-links so the compost stays reachable.
+- **Verifier metadata** — `embedding_similarity` and `verifier_reasoning` round-trip into frontmatter so the operator can audit decisions later.
 
-Output: `10-Liminal/Compost/<id>.md`. CLI: `creek report --type compost`.
+Output: `10-Liminal/Compost/<id>.md` (canonical) or `10-Liminal/Compost/Review/<id>.md` (ambiguous, awaiting triage). CLI: `creek report --type compost`. Calibration: `creek compost calibrate [--fixture FIXTURE.yaml]` (FEAT-018; full fixture-driven scoring lands once a real labelled set is collected).
 
 ---
 
