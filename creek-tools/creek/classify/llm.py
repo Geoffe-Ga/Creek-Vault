@@ -857,6 +857,10 @@ class LLMClassifier:
                 if attempt < self.MAX_RETRIES - 1:
                     time.sleep(self.RETRY_DELAY)
             else:
+                # _apply_classification is a pure transform (no network I/O)
+                # and lives in the else block intentionally: a failure here
+                # is a programmer error, not a transient LLM/network glitch,
+                # so it should propagate instead of triggering a retry.
                 return LLMClassificationResult(
                     fragment=self._apply_classification(fragment, data),
                     reasoning=reasoning,
