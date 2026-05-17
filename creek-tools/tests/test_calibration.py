@@ -343,6 +343,37 @@ class TestFixtureLoad:
             labels = {e.expected.get(dim) for e in entries if e.expected.get(dim)}
             assert labels, f"no fixture entry exercises {dim}"
 
+    # Per-value floors documented in the fixture header. A failure here means
+    # the fixture has lost coverage on a specific value — fix by adding entries
+    # that target the deficient value, not by lowering the floor.
+    @pytest.mark.parametrize(
+        ("dimension", "floor"),
+        [
+            ("frequency", 3),
+            ("phase", 4),
+            ("mode", 6),
+            ("orientation", 4),
+            ("dosage", 6),
+            ("voice_register", 4),
+        ],
+    )
+    def test_every_value_meets_per_dimension_floor(
+        self,
+        dimension: str,
+        floor: int,
+    ) -> None:
+        """Every value present in *dimension* appears in at least *floor* entries."""
+        import collections
+
+        entries = load_fixture(_FIXTURE_PATH)
+        counts = collections.Counter(
+            e.expected.get(dimension)
+            for e in entries
+            if e.expected.get(dimension) is not None
+        )
+        below = {value: n for value, n in counts.items() if n < floor}
+        assert not below, f"{dimension} values below floor of {floor}: {below}"
+
 
 class TestFixtureLoadErrors:
     """`load_fixture` rejects malformed input rather than papering over it."""
