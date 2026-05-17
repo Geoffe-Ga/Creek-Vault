@@ -23,7 +23,7 @@ The pipeline runs in five stages:
 
 ## Repository topology
 
-This repository is the **toolchain** plus the **canonical reference material**. Your personal vault — fragments, threads, journal, voice exemplars — lives *elsewhere on disk* and is never checked in. See FEAT-019 for the sovereignty rationale.
+This repository is the **toolchain** plus the **canonical reference material**. Your personal vault — fragments, threads, journal, voice exemplars — lives *elsewhere on disk* and is never checked in.
 
 ```
 Creek-Vault/                            # This repo (toolchain + canonical material)
@@ -34,7 +34,6 @@ Creek-Vault/                            # This repo (toolchain + canonical mater
 │       └── AGENTS.md                   # Canonical agent contract template
 ├── crawdad/                            # Discord bot — chat-side interface to the vault (consumes creek-tools-mcp)
 ├── docs/Ontology/                      # Canonical ontology specification
-├── plans/                              # Planning + comparative-analysis docs
 ├── CLAUDE.md                           # Repo guidance for Claude Code
 └── README.md                           # You are here
 ```

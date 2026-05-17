@@ -390,9 +390,9 @@ All code must meet these standards before merging to main:
 - **pip-audit**: zero vulnerabilities except documented unfixable
   CVEs in `scripts/security.sh` and `.github/workflows/ci.yml`
   (DEP-003).
-- **Refurb / Tryceratops / Vulture**: pre-commit-only today; tracked
-  under STYLE-001 to be added to `lint-extended.sh` once the existing
-  violation backlog is cleared.
+- **Refurb / Tryceratops / Vulture**: pre-commit-only today; will be
+  added to `lint-extended.sh` once the existing violation backlog is
+  cleared.
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs
