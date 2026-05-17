@@ -5,10 +5,17 @@ surfaces threads, fragments, and projects that have fallen dormant or been
 explicitly abandoned, writes ``10-Liminal/Compost/`` notes preserving what
 each idea was, why it faded, and what energy may still be alive, and
 generates an overview report cross-referencing active threads.
+
+FEAT-018 replaced the five-phrase ``ABANDONMENT_KEYWORDS`` regex with a
+two-stage detection: an embedding-similarity gate against curated
+exemplars (:mod:`creek.generate.compost_embedding`) followed by an
+optional LLM verifier (:mod:`creek.generate.compost_verifier`) whose
+``ambiguous`` verdicts route to a vault-relative review queue.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -17,25 +24,23 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
     Confidence,
     Fragment,
     PraxisPotential,
+    PrivacyTier,
     Thread,
     ThreadStatus,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
-ABANDONMENT_KEYWORDS: tuple[str, ...] = (
-    "gave up on",
-    "abandoned",
-    "never finished",
-    "put aside",
-    "shelved",
-)
-"""Case-insensitive phrases flagging a fragment as describing abandonment."""
+    from creek.generate.compost_verifier import SupportsVerifyCompost
+
+logger = logging.getLogger(__name__)
 
 _DORMANCY_DAYS: int = 180
 """Threads without new fragments for this many days become compost."""
@@ -71,10 +76,19 @@ class CompostCandidate:
         energy_fragment_ids: IDs of fragments whose confidence or
             ``praxis_potential`` marks them as crystallised thinking worth
             preserving ("what energy remains").
-        matched_keywords: Abandonment keywords matched against the source.
-            Empty for thread and project candidates.
         energy_excerpts: Optional short excerpts describing the surviving
             energy; rendered as bullet points under "What energy remains".
+        similarity: Embedding-gate cosine similarity to the closest
+            exemplar. ``None`` for thread and project candidates and
+            for fragment candidates produced before FEAT-018.
+        verifier_reasoning: One-sentence reason returned by the LLM
+            verifier (:mod:`creek.generate.compost_verifier`).
+            ``None`` when the verifier was skipped or the candidate
+            originated from a thread/project source.
+        for_review: When ``True`` the candidate routes to the operator
+            review queue (``CompostConfig.review_queue_relpath``)
+            rather than the canonical compost folder. Set for
+            ``ambiguous`` verifier verdicts.
     """
 
     source_type: str
@@ -83,8 +97,10 @@ class CompostCandidate:
     reason: str
     fragment_ids: list[str] = field(default_factory=list)
     energy_fragment_ids: list[str] = field(default_factory=list)
-    matched_keywords: list[str] = field(default_factory=list)
     energy_excerpts: list[str] = field(default_factory=list)
+    similarity: float | None = None
+    verifier_reasoning: str | None = None
+    for_review: bool = False
 
 
 # ---- Helpers ----
@@ -111,10 +127,14 @@ def _fragment_thread_titles(fragment: Fragment) -> list[str]:
     return titles
 
 
-def _matched_abandonment_keywords(title: str) -> list[str]:
-    """Return abandonment keywords present in *title* (case-insensitive)."""
-    lowered = title.lower()
-    return [kw for kw in ABANDONMENT_KEYWORDS if kw in lowered]
+def _is_paradox(fragment: Fragment) -> bool:
+    """Return whether *fragment* is a paradox note (skipped by compost detection)."""
+    return "paradox" in fragment.tags
+
+
+def _is_intimate(fragment: Fragment) -> bool:
+    """Return whether *fragment* carries the intimate privacy tier."""
+    return fragment.privacy_tier == PrivacyTier.INTIMATE
 
 
 def _sanitize_filename(title: str) -> str:
@@ -140,6 +160,11 @@ class CompostTracker:
         project_gap_days: int = _PROJECT_GAP_DAYS,
         project_min_fragments: int = _PROJECT_MIN_FRAGMENTS,
         now: datetime | None = None,
+        similarity_fn: Callable[[str], float] | None = None,
+        verifier: SupportsVerifyCompost | None = None,
+        embedding_threshold: float = 0.6,
+        skip_paradox: bool = True,
+        skip_intimate: bool = True,
     ) -> None:
         """Initialise the tracker.
 
@@ -154,11 +179,39 @@ class CompostTracker:
             now: Reference "now" for age calculations. Defaults to
                 :func:`datetime.now` (timezone-naive). Useful for
                 deterministic tests.
+            similarity_fn: Closure mapping a text string to its maximum
+                cosine similarity against the compost exemplar set
+                (see :mod:`creek.generate.compost_embedding`). When
+                ``None``, fragment-level compost detection is skipped
+                — thread-level dormancy and project-silence detection
+                still run.
+            verifier: Optional LLM verifier. When supplied, every
+                fragment that clears *embedding_threshold* is sent
+                through ``verifier.verify(...)``; ``yes`` → canonical
+                compost, ``ambiguous`` → review queue
+                (``for_review=True``), ``no`` → skipped. When ``None``,
+                clearing the embedding threshold alone accepts the
+                fragment as canonical compost.
+            embedding_threshold: Minimum cosine similarity (against the
+                exemplars) required for a fragment to advance to the
+                verifier. Defaults to 0.6 — deliberately wide-net.
+            skip_paradox: When ``True``, fragments tagged ``paradox``
+                are excluded from compost detection. Defaults to
+                ``True``.
+            skip_intimate: When ``True``, fragments with
+                ``privacy_tier == intimate`` are excluded from compost
+                detection. Defaults to ``True`` (matching the default
+                policy in :mod:`creek.classify.privacy_filter`).
         """
         self.dormancy_days = dormancy_days
         self.project_gap_days = project_gap_days
         self.project_min_fragments = project_min_fragments
         self._now = now or datetime.now(tz=UTC).replace(tzinfo=None)
+        self._similarity_fn = similarity_fn
+        self._verifier = verifier
+        self._embedding_threshold = embedding_threshold
+        self._skip_paradox = skip_paradox
+        self._skip_intimate = skip_intimate
 
     # ---- Detection ----
 
@@ -166,6 +219,8 @@ class CompostTracker:
         self,
         threads: list[Thread],
         fragments: list[Fragment],
+        *,
+        fragment_bodies: Mapping[str, str] | None = None,
     ) -> list[CompostCandidate]:
         """Scan *threads* and *fragments* for compost candidates.
 
@@ -173,21 +228,32 @@ class CompostTracker:
 
         1. Threads with ``status == resolved`` or whose ``last_seen`` is
            older than :attr:`dormancy_days`.
-        2. Fragments whose title contains an abandonment keyword.
+        2. Fragments whose embedding similarity to the curated compost
+           exemplar set exceeds :attr:`_embedding_threshold` (FEAT-018).
+           Optionally verified by an LLM before acceptance.
         3. Tagged projects that appear in early fragments but have not
            been mentioned for more than :attr:`project_gap_days`.
 
+        Paradox-tagged and intimate-tier fragments are skipped per
+        ``skip_paradox`` / ``skip_intimate`` on the constructor.
+
         Args:
             threads: Threads to scan.
-            fragments: Fragments to scan (used for keyword detection,
+            fragments: Fragments to scan (used for embedding detection,
                 project tracking, and energy extraction).
+            fragment_bodies: Optional mapping of fragment ID to body
+                text. When supplied, the embedding gate uses
+                ``title + body``; when omitted, title-only.
 
         Returns:
             A list of :class:`CompostCandidate` models, ordered
             thread-candidates → fragment-candidates → project-candidates.
         """
         thread_candidates = self._detect_threads(threads, fragments)
-        fragment_candidates = self._detect_keyword_fragments(fragments)
+        fragment_candidates = self._detect_abandonment_fragments(
+            fragments,
+            fragment_bodies or {},
+        )
         project_candidates = self._detect_disappeared_projects(fragments)
         return [*thread_candidates, *fragment_candidates, *project_candidates]
 
@@ -234,33 +300,81 @@ class CompostTracker:
             return f"Dormant for {days_since} days"
         return None
 
-    def _detect_keyword_fragments(
+    def _detect_abandonment_fragments(
         self,
         fragments: list[Fragment],
+        bodies: Mapping[str, str],
     ) -> list[CompostCandidate]:
-        """Detect fragments whose title signals abandonment."""
+        """Detect fragments that semantically describe abandonment (FEAT-018).
+
+        Two-stage pipeline: embedding-similarity gate → optional LLM
+        verifier. Paradox-tagged and intimate-tier fragments are
+        skipped here so neither the embedding nor the verifier sees
+        them — important because the verifier may call out to a cloud
+        LLM and intimate content must never leave the device.
+        """
+        if self._similarity_fn is None:
+            return []
         candidates: list[CompostCandidate] = []
         for fragment in fragments:
-            matched = _matched_abandonment_keywords(fragment.title)
-            if not matched:
+            if self._skip_paradox and _is_paradox(fragment):
                 continue
-            candidates.append(
-                CompostCandidate(
-                    source_type="fragment",
-                    source_id=fragment.id,
-                    title=fragment.title,
-                    reason=f"Abandonment keyword: {matched[0]}",
-                    fragment_ids=[fragment.id],
-                    energy_fragment_ids=(
-                        [fragment.id] if _fragment_is_energetic(fragment) else []
-                    ),
-                    matched_keywords=matched,
-                    energy_excerpts=(
-                        [fragment.title] if _fragment_is_energetic(fragment) else []
-                    ),
-                ),
-            )
+            if self._skip_intimate and _is_intimate(fragment):
+                continue
+            body = bodies.get(fragment.id, "")
+            text = f"{fragment.title}\n{body}".strip() if body else fragment.title
+            similarity = self._similarity_fn(text)
+            if similarity < self._embedding_threshold:
+                continue
+            candidate = self._verify_fragment_candidate(fragment, body, similarity)
+            if candidate is not None:
+                candidates.append(candidate)
         return candidates
+
+    def _verify_fragment_candidate(
+        self,
+        fragment: Fragment,
+        body: str,
+        similarity: float,
+    ) -> CompostCandidate | None:
+        """Stage 2: route an above-threshold fragment through the verifier.
+
+        When ``self._verifier`` is ``None`` the embedding gate alone
+        accepts the candidate. Otherwise:
+
+        * ``yes`` → canonical compost candidate;
+        * ``ambiguous`` → review-queue candidate (``for_review=True``);
+        * ``no`` → returns ``None`` (skip).
+        """
+        verdict: CompostVerdict
+        reasoning: str | None
+        if self._verifier is None:
+            verdict = CompostVerdict.YES
+            reasoning = None
+        else:
+            result = self._verifier.verify(title=fragment.title, body=body)
+            verdict = result.verdict
+            reasoning = result.reasoning
+            if verdict == CompostVerdict.NO:
+                return None
+        is_energetic = _fragment_is_energetic(fragment)
+        reason = (
+            f"Embedding-similarity {similarity:.2f}"
+            if reasoning is None
+            else f"{reasoning} (similarity {similarity:.2f})"
+        )
+        return CompostCandidate(
+            source_type="fragment",
+            source_id=fragment.id,
+            title=fragment.title,
+            reason=reason,
+            fragment_ids=[fragment.id],
+            energy_fragment_ids=[fragment.id] if is_energetic else [],
+            energy_excerpts=[fragment.title] if is_energetic else [],
+            similarity=similarity,
+            verifier_reasoning=reasoning,
+            for_review=verdict == CompostVerdict.AMBIGUOUS,
+        )
 
     def _detect_disappeared_projects(
         self,
@@ -317,24 +431,38 @@ class CompostTracker:
         self,
         candidate: CompostCandidate,
         vault_path: Path,
+        *,
+        review_queue_relpath: str = "10-Liminal/Compost/Review",
     ) -> Path:
         """Write a compost note for *candidate* into the vault.
 
-        The note lives at ``10-Liminal/Compost/<date>-<sanitised-title>.md``.
-        Frontmatter captures the source reference, composted date, reason,
-        tags, and fragment links. The body carries the three required
-        sections ("What it was", "Why it composted", "What energy
-        remains") plus a trailing list of all related fragments.
+        Canonical compost notes live at
+        ``10-Liminal/Compost/<date>-<sanitised-title>.md``. Candidates
+        whose verifier returned ``ambiguous`` (``candidate.for_review``
+        is ``True``) instead route to *review_queue_relpath* so the
+        operator can triage them before they are filed canonically.
+
+        Frontmatter captures the source reference, composted date,
+        reason, tags, and fragment links. The body carries the three
+        required sections ("What it was", "Why it composted", "What
+        energy remains") plus a trailing list of all related fragments.
 
         Args:
             candidate: The compost candidate to record.
             vault_path: Path to the root of the Obsidian vault.
+            review_queue_relpath: Vault-relative path for ambiguous
+                verifier verdicts. Defaults to
+                ``"10-Liminal/Compost/Review"``; callers wiring config
+                pass ``config.compost.review_queue_relpath``.
 
         Returns:
             Path to the written note.
         """
-        compost_dir = vault_path / "10-Liminal" / "Compost"
-        compost_dir.mkdir(parents=True, exist_ok=True)
+        if candidate.for_review:
+            target_dir = vault_path / review_queue_relpath
+        else:
+            target_dir = vault_path / "10-Liminal" / "Compost"
+        target_dir.mkdir(parents=True, exist_ok=True)
 
         today = self._now.date()
         metadata = self._build_metadata(candidate, today)
@@ -342,7 +470,7 @@ class CompostTracker:
         post = frontmatter.Post(content=body, **metadata)
 
         filename = f"{today.isoformat()}-{_sanitize_filename(candidate.title)}.md"
-        note_path = compost_dir / filename
+        note_path = target_dir / filename
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
 
@@ -352,13 +480,16 @@ class CompostTracker:
         today: date,
     ) -> dict[str, object]:
         """Build the frontmatter metadata dict for *candidate*."""
+        tags = ["compost"]
+        if candidate.for_review:
+            tags.append("compost-review")
         metadata: dict[str, object] = {
             "type": "compost",
             "title": candidate.title,
             "composted_date": today.isoformat(),
             "reason": candidate.reason,
             "fragments": [f"[[{fid}]]" for fid in candidate.fragment_ids],
-            "tags": ["compost"],
+            "tags": tags,
         }
         if candidate.source_type == "thread":
             metadata["original_thread"] = f"[[{candidate.source_id}]]"
@@ -366,8 +497,10 @@ class CompostTracker:
             metadata["original_fragment"] = f"[[{candidate.source_id}]]"
         else:
             metadata["original_project"] = candidate.source_id
-        if candidate.matched_keywords:
-            metadata["matched_keywords"] = list(candidate.matched_keywords)
+        if candidate.similarity is not None:
+            metadata["embedding_similarity"] = round(candidate.similarity, 4)
+        if candidate.verifier_reasoning is not None:
+            metadata["verifier_reasoning"] = candidate.verifier_reasoning
         return metadata
 
     @staticmethod

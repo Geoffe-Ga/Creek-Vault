@@ -1,0 +1,141 @@
+# Compost exemplars for FEAT-018 embedding-similarity detection.
+#
+# These exemplars seed the embedding gate in
+# creek/generate/compost.py. A fragment whose *body* exceeds
+# CompostConfig.embedding_threshold against the max-similarity of any
+# entry below is routed to the LLM verifier (stage 2). Entries should
+# capture the texture of idea-abandonment, not the literal phrasing
+# of the old `_ABANDONMENT_KEYWORDS` regex.
+#
+# Each entry:
+#   title:     human-readable label (not used for matching)
+#   body:      the matched text. 2-6 sentences. Match against fragment body.
+#   texture:   one of: circling, releasing, drifting, exhaustion,
+#              identity-drift, displacement, deflation, postponement,
+#              quiet-walk-away
+#   rationale: one-sentence explanation of why this is compost
+#
+# Curate this list as the user's actual abandonment voice. The regex
+# era used five literal phrases; this list should be diverse enough
+# that an embedding model can recognize abandonment phrased in the
+# user's own register (F6-F9, reflective, embodied, recursive).
+---
+- title: Circling without landing
+  body: I keep coming back to this question and never finishing the thought.
+    Every time I sit down with it the same circle opens, the same circle closes,
+    and I walk away with nothing new. The thread itself is the work,
+    apparently, and the work refuses to crystallize.
+  texture: circling
+  rationale: Repeated approach with no settling — the canonical "this isn't
+    going anywhere" pattern that has no literal abandonment keyword.
+
+- title: Quiet release
+  body: I'm letting this one go. Not with any drama, not as a failure,
+    just — it's not mine anymore. It belonged to a version of me that's
+    no longer the one holding the pen.
+  texture: releasing
+  rationale: Conscious release without struggle; the abandonment is
+    framed as completion, not defeat.
+
+- title: Drifted out of the room
+  body: Looking at the notes I made three months ago I barely recognize
+    the person who was urgent about this. Whatever pulled me toward it
+    pulled past it. I'm not interested anymore and I can't honestly say why.
+  texture: drifting
+  rationale: Loss of interest by drift rather than decision; "I'm not
+    interested anymore" without literal "abandoned".
+
+- title: I no longer recognize this thread
+  body: The thread went somewhere I no longer recognize. The premise I
+    started with isn't a premise I'd write today. I could keep pulling
+    on it out of momentum but I'd be performing continuity, not actually
+    continuing anything.
+  texture: identity-drift
+  rationale: The work has drifted from the author rather than the author
+    from the work; either way it's compost.
+
+- title: Too tired to keep this alive
+  body: I don't have the energy to keep tending this. It needed weekly
+    attention to stay warm and I gave it three weeks of cold and now
+    when I open the file the room feels empty. Maybe later. Probably not.
+  texture: exhaustion
+  rationale: Energy depletion as the abandonment mechanism; the "probably
+    not" undercuts the surface "maybe later".
+
+- title: Displaced by what came next
+  body: The project that ate this one has been alive for six months.
+    There's no room left for the older question, and honestly the new
+    one is better. Filing this under things that pointed somewhere.
+  texture: displacement
+  rationale: Replacement by a stronger pull; abandonment by displacement
+    rather than failure.
+
+- title: The air went out of it
+  body: I was excited about this for about a week and then the air went
+    out of it. I keep waiting for the energy to come back. It hasn't.
+    I'm starting to think the energy wasn't about this in the first place.
+  texture: deflation
+  rationale: Deflation pattern; the initial charge was misattributed
+    and the work itself was never the source.
+
+- title: Indefinitely postponed
+  body: I keep telling myself I'll come back to this when I have time
+    and the truthful version of that sentence is "when I have time" is
+    a euphemism for "never". I'm allowed to just say I'm not doing this.
+  texture: postponement
+  rationale: Indefinite postponement reframed as abandonment; the
+    self-honesty signal ("the truthful version") is diagnostic.
+
+- title: Walked away without noticing
+  body: At some point I stopped working on this and I can't point to
+    when. There was no decision, no moment, just the gap between the
+    last entry and now. The walking-away happened in the spaces between
+    the notes.
+  texture: quiet-walk-away
+  rationale: Absence-by-default; the abandonment is visible only in the
+    silence between entries, not in any explicit statement.
+
+- title: The question dissolved
+  body: I went looking for the original question and I couldn't find it.
+    Not because I lost the notes — they're right here — but because the
+    question doesn't feel urgent anymore. Whatever shape it had has
+    dissolved into the surrounding life.
+  texture: drifting
+  rationale: The question itself loses coherence; abandonment by
+    dissolution rather than decision.
+
+- title: I keep promising I'll get back to it
+  body: Three times this month I've told someone I'll get back to this
+    project. Each time I meant it less. I'm not going to. The promise
+    was performance, and the performance is the only part of this still
+    alive.
+  texture: postponement
+  rationale: Honest naming of the avoidance pattern; the promise itself
+    is recognized as the residue.
+
+- title: It belonged to a self I'm not anymore
+  body: Re-reading the early notes feels like reading someone else.
+    The voice is recognizable but the urgency is alien. I'm not going
+    to finish what that version started. They can have the credit;
+    I have other work.
+  texture: identity-drift
+  rationale: Authorial drift over time; the past self is named as
+    distinct, and the present self releases the work to them.
+
+- title: Started something else mid-sentence
+  body: I'm three paragraphs into an essay about this and I just opened
+    a new document for something completely unrelated. That tells me
+    where my actual attention is. The essay can stay where it is.
+  texture: displacement
+  rationale: In-the-moment displacement; the act of switching documents
+    is itself the abandonment signal.
+
+- title: I'm done pretending this is alive
+  body: I've been treating this like a live project for months when it
+    clearly isn't. Every time I update the status I'm performing for
+    no one. Calling it — this is compost. There's something in here worth
+    keeping but it isn't a project anymore.
+  texture: releasing
+  rationale: Explicit reframing from "active" to "compost"; names the
+    performance and the release in the same breath. Closest to an
+    intentional compost-tagging by the user.
