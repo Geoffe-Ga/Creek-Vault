@@ -408,10 +408,10 @@
     dosage: medicine
     voice_register: analytical
 - id: cal-035
-  title: Three folders and a clearing time
-  body: Three folders, one clearing time, no email after seven. Run it for six
-    months and re-evaluate. The system either still fits or it does not, and
-    either answer is allowed.
+  title: Stand at nine
+  body: Stand at nine, three questions, fifteen minutes. We agreed to this format
+    eighteen months ago and we have not changed it since. I have been listening
+    through the same answers for three weeks and I have not said anything.
   expected:
     frequency: F4
     phase: diminishing
