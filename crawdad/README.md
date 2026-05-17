@@ -107,8 +107,3 @@ and register-specific files) is loaded once at session start. See
 - `creek-tools/CLAUDE.md` — quality standards we mirror.
 - `creek-tools/docs/mcp.md` — the MCP surface CrawDad consumes.
 - `creek-tools/docs/slash-commands.md` — full `/creek` + `/crawdad` grammar.
-- `plans/git-issues/FEAT-013-crawdad-discord-bot-skeleton-mcp-client.md`,
-  `plans/git-issues/FEAT-014-crawdad-haiku-router-dispatcher.md`,
-  `plans/git-issues/FEAT-015-crawdad-sonnet-composer-loop.md`,
-  `plans/git-issues/FEAT-016-slash-command-grammar.md` — the
-  implementation plan.
