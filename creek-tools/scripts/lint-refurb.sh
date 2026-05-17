@@ -4,7 +4,7 @@
 # STYLE-001 closed the backlog (148 → 0); this gate keeps it at zero.
 # Any new violation will block CI. The `# noqa: FURB…` escape hatch is
 # available for the documented carve-outs (see creek-tools/CLAUDE.md
-# §6.2 for the policy).
+# §6.1 for the STYLE-001 status + carve-out list).
 
 set -euo pipefail
 

@@ -49,6 +49,8 @@ Always invoke tools through `./scripts/*` instead of directly.
 | Run tests | `pytest` | `./scripts/test.sh` |
 | Type check | `mypy .` | `./scripts/lint.sh` (includes mypy) |
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
+| Modernisation hints | `refurb creek/` | `./scripts/lint-refurb.sh` |
+| Exception hygiene | `tryceratops creek/` | `./scripts/lint-tryceratops.sh` |
 | All checks | *(run each tool)* | `./scripts/check-all.sh` |
 | Security scan | `bandit -r src/` | `./scripts/security.sh` |
 
