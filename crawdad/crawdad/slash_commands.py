@@ -13,9 +13,7 @@ discord.py. ``register()`` wraps each handler in a discord.py
 calls exceed Discord's 3-second response window), runs the handler,
 and ``followup.send()``s the reply.
 
-``/crawdad workflow`` is a v1.0 stub. Full workflow DSL ships with the
-next FEAT; see ``plans/2026-05-05_comparative-analysis/candidates/
-ADAPT-003-*.md``.
+``/crawdad workflow`` is a v1.0 stub. Full workflow DSL ships in v1.1.
 
 Trust boundary: the user-supplied ``topic`` and ``content`` arguments
 are interpolated directly into LLM prompts. The personal-use allowlist

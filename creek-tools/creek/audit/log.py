@@ -105,8 +105,6 @@ class AuditChainBrokenError(Exception):
     """Raised when :meth:`AuditLog.verify` detects tampering."""
 
 
-# Backward-compatible alias mirroring the spec example in
-# plans/prompts/2026-04-28/batch-C-audit-and-privacy-substrate.md.
 AuditChainBroken = AuditChainBrokenError
 
 
