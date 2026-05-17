@@ -18,9 +18,13 @@
 #     dosage:           medicine | toxic | ambiguous
 #     voice_register:   confessional | analytical | playful | prophetic | instructional | raw | conversational
 #
-# Coverage targets: every frequency at least once; every phase at least once;
-# every mode, dosage, register, and orientation appears in ≥3 entries so the
-# agreement metric has signal on every value.
+# Coverage targets: every frequency ≥3 entries; every phase ≥4 entries;
+# every mode ≥6 entries; every register and orientation ≥4 entries;
+# every dosage ≥6 entries (medicine naturally dominates introspective
+# fragments, so its ratio is looser than other dimensions). When adding
+# new entries, prefer the rarest cell in each dimension so the rarest
+# value stays within ~3× the most common — that keeps the agreement
+# metric well-conditioned across every value.
 - id: cal-001
   title: Lockout
   body: My keys are gone and I cannot get into the apartment tonight. Stomach is in
@@ -373,3 +377,127 @@
     orientation: do_feel
     dosage: medicine
     voice_register: confessional
+# Coverage-fill entries (cal-033..cal-042) added to lift the rarest values
+# in each dimension to the floors named in the header. Each entry targets
+# a previously underrepresented cell across frequency, phase, mode, dosage,
+# register, and orientation.
+- id: cal-033
+  title: Nothing has weight
+  body: Nothing has weight tonight. Not the book, not the food, not the worry I
+    came in with. I do not know if this is peace or numbness and I cannot tell
+    which would be worse.
+  expected:
+    frequency: F10
+    phase: bottoming_out
+    mode: inhabit
+    orientation: feel
+    dosage: ambiguous
+    voice_register: raw
+- id: cal-034
+  title: Stepping back from the chair
+  body: I have been the one calling the shots for two years and the cost is
+    showing. Stepping back from the chair is the only honest move, and I can
+    see the next person taking it better than I would now.
+  expected:
+    frequency: F3
+    phase: diminishing
+    mode: integrate
+    orientation: do_feel
+    dosage: medicine
+    voice_register: analytical
+- id: cal-035
+  title: Three folders and a clearing time
+  body: Three folders, one clearing time, no email after seven. Run it for six
+    months and re-evaluate. The system either still fits or it does not, and
+    either answer is allowed.
+  expected:
+    frequency: F4
+    phase: diminishing
+    mode: absorb
+    orientation: do_feel
+    dosage: ambiguous
+    voice_register: instructional
+- id: cal-036
+  title: Walking the watershed again
+  body: We walked the watershed trail again. The frogs are back this spring
+    after two years quiet. We will keep walking it once a month and write down
+    what we see, because nobody else is.
+  expected:
+    frequency: F8
+    phase: restoration
+    mode: integrate
+    orientation: do_feel
+    dosage: medicine
+    voice_register: prophetic
+- id: cal-037
+  title: The kettle whistled
+  body: The kettle whistled and I noticed I had been gone. Not gone-gone. Just
+    absent of myself, in the good way. The tea is excellent and I am right
+    here.
+  expected:
+    frequency: F10
+    phase: restoration
+    mode: absorb
+    orientation: feel
+    dosage: medicine
+    voice_register: playful
+- id: cal-038
+  title: Three sentences for stepping down
+  body: Three sentences for stepping down well. I am leaving the role. I am not
+    leaving the team. I am happy to help you find a replacement. Say them out
+    loud before the meeting.
+  expected:
+    frequency: F3
+    phase: restoration
+    mode: express
+    orientation: do
+    dosage: medicine
+    voice_register: instructional
+- id: cal-039
+  title: The rules we are not living
+  body: We agreed on the household rules two years ago and we are not living
+    them. Nobody wants to be the one to bring it up. We keep sleeping past the
+    agreed wake time and resenting each other quietly.
+  expected:
+    frequency: F4
+    phase: bottoming_out
+    mode: collaborate
+    orientation: do_feel
+    dosage: toxic
+    voice_register: conversational
+- id: cal-040
+  title: Reading the brief at midnight
+  body: The maples on this block lost their colour two weeks early again. I have
+    been reading the climate brief at midnight every night this week. Tomorrow
+    I will know more things and feel exactly the same way.
+  expected:
+    frequency: F8
+    phase: diminishing
+    mode: absorb
+    orientation: do_feel
+    dosage: toxic
+    voice_register: raw
+- id: cal-041
+  title: The question I used to lose sleep over
+  body: Used to be that this question would keep me up all night. Now it is just
+    a question. I am not sure if I have outgrown it or buried it. Either way
+    the kettle is on.
+  expected:
+    frequency: F10
+    phase: diminishing
+    mode: inhabit
+    orientation: feel
+    dosage: ambiguous
+    voice_register: playful
+- id: cal-042
+  title: Group text gone quiet
+  body: Group text has been quiet for a week and I am the only one who feels it.
+    Probably they are fine. Probably I have made it into a thing it is not. The
+    not knowing is the worst part.
+  expected:
+    frequency: F2
+    phase: bottoming_out
+    mode: inhabit
+    orientation: feel
+    dosage: toxic
+    voice_register: raw
