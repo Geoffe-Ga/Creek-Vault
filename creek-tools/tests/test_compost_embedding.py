@@ -57,6 +57,39 @@ class TestLoadExemplars:
         assert PACKAGED_EXEMPLARS_PATH.exists()
         assert PACKAGED_EXEMPLARS_PATH.name == "compost.yaml"
 
+    def test_packaged_textures_match_declared_vocabulary(self) -> None:
+        """Every exemplar's texture must come from the documented vocabulary.
+
+        The YAML header comment in ``compost.yaml`` pins the allowed
+        textures. Drift between the header and the entries would
+        silently corrupt downstream texture-aware tooling (e.g.
+        ``creek compost calibrate``). This test fails closed.
+        """
+        allowed = {
+            "circling",
+            "releasing",
+            "drifting",
+            "identity-drift",
+            "exhaustion",
+            "displacement",
+            "deflation",
+            "postponement",
+            "quiet-walk-away",
+        }
+        exemplars = load_exemplars()
+        violations = [
+            (e.title, e.texture) for e in exemplars if e.texture not in allowed
+        ]
+        assert violations == [], (
+            f"Exemplars carry textures outside the declared vocabulary: {violations}"
+        )
+
+    def test_packaged_titles_are_unique(self) -> None:
+        """Duplicate titles would mask curation bugs; titles must be distinct."""
+        exemplars = load_exemplars()
+        titles = [e.title for e in exemplars]
+        assert len(titles) == len(set(titles)), "Duplicate exemplar titles detected."
+
     def test_custom_path_loads(self, tmp_path: Path) -> None:
         """A user-provided YAML file is parsed and validated."""
         target = tmp_path / "custom.yaml"
