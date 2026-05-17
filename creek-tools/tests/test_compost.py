@@ -14,12 +14,16 @@ import frontmatter
 import pytest
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 from creek.generate.compost import (
-    ABANDONMENT_KEYWORDS,
     CompostCandidate,
     CompostTracker,
+)
+from creek.generate.compost_verifier import (
+    CompostVerdict,
+    CompostVerifierResult,
 )
 from creek.models import (
     Confidence,
@@ -28,11 +32,60 @@ from creek.models import (
     Frequency,
     FrequencyClassification,
     PraxisPotential,
+    PrivacyTier,
     SourcePlatform,
     Thread,
     ThreadStatus,
     VoiceClassification,
 )
+
+
+class _StubVerifier:
+    """Deterministic :class:`SupportsVerifyCompost` for tests.
+
+    Maps fragment titles to a fixed verdict via the ``responses``
+    mapping. Unmapped titles default to ``yes`` so tests that only
+    care about the embedding gate need not enumerate them.
+    """
+
+    def __init__(
+        self,
+        responses: dict[str, CompostVerifierResult] | None = None,
+        default: CompostVerdict = CompostVerdict.YES,
+    ) -> None:
+        self.responses = responses or {}
+        self.default = default
+        self.calls: list[tuple[str, str]] = []
+
+    def verify(self, *, title: str, body: str) -> CompostVerifierResult:
+        """Record the call and return the configured verdict."""
+        self.calls.append((title, body))
+        if title in self.responses:
+            return self.responses[title]
+        return CompostVerifierResult(verdict=self.default, reasoning="stub")
+
+
+def _high_similarity(_text: str) -> float:
+    """Similarity stub that always clears the default 0.6 threshold."""
+    return 0.95
+
+
+def _low_similarity(_text: str) -> float:
+    """Similarity stub that always falls below the default threshold."""
+    return 0.1
+
+
+def _similarity_by_title(scores: dict[str, float]) -> Callable[[str], float]:
+    """Return a similarity fn that maps title substrings to scores."""
+
+    def _fn(text: str) -> float:
+        for token, value in scores.items():
+            if token in text:
+                return value
+        return 0.0
+
+    return _fn
+
 
 # ---- Fixtures ----
 
@@ -71,6 +124,7 @@ def _fragment(
     praxis_potential: PraxisPotential = PraxisPotential.NONE,
     threads: list[str] | None = None,
     tags: list[str] | None = None,
+    privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED,
 ) -> Fragment:
     """Build a minimal fragment for testing."""
     return Fragment(
@@ -83,6 +137,7 @@ def _fragment(
         praxis_potential=praxis_potential,
         threads=threads or [],
         tags=tags or [],
+        privacy_tier=privacy_tier,
     )
 
 
@@ -131,35 +186,6 @@ def active_thread() -> Thread:
     )
 
 
-# ---- ABANDONMENT_KEYWORDS ----
-
-
-class TestAbandonmentKeywords:
-    """Ensure the canonical keyword list meets issue spec."""
-
-    def test_keywords_is_nonempty_tuple(self) -> None:
-        """ABANDONMENT_KEYWORDS should be a non-empty tuple of strings."""
-        assert isinstance(ABANDONMENT_KEYWORDS, tuple)
-        assert len(ABANDONMENT_KEYWORDS) > 0
-
-    def test_keywords_are_lowercase(self) -> None:
-        """All keywords must be lowercase (we match case-insensitively)."""
-        for keyword in ABANDONMENT_KEYWORDS:
-            assert keyword == keyword.lower()
-
-    def test_required_keywords_present(self) -> None:
-        """The keywords listed in the issue spec must be present."""
-        required = (
-            "gave up on",
-            "abandoned",
-            "never finished",
-            "put aside",
-            "shelved",
-        )
-        for keyword in required:
-            assert keyword in ABANDONMENT_KEYWORDS
-
-
 # ---- CompostTracker.detect_compost_candidates ----
 
 
@@ -195,33 +221,170 @@ class TestDetectCompostCandidates:
         thread_ids = {c.source_id for c in candidates}
         assert active_thread.id not in thread_ids
 
-    def test_keyword_fragment_detected(
+    def test_default_tracker_skips_fragment_detection(
         self,
         tracker: CompostTracker,
     ) -> None:
-        """Fragments whose title contains an abandonment keyword surface."""
+        """A tracker built without ``similarity_fn`` runs thread + project only."""
         frag = _fragment(
             frag_id="frag-abandon1",
-            title="I finally gave up on the novel",
+            title="I finally let go of the novel",
             created=datetime(2025, 6, 1, 8, 0, 0),
         )
         candidates = tracker.detect_compost_candidates([], [frag])
-        keyword_hits = [c for c in candidates if c.source_type == "fragment"]
-        assert any(c.source_id == frag.id for c in keyword_hits)
-        assert "gave up on" in keyword_hits[0].matched_keywords
+        assert [c for c in candidates if c.source_type == "fragment"] == []
 
-    def test_fragment_without_keyword_ignored(
+    def test_embedding_gate_accepts_above_threshold(
         self,
-        tracker: CompostTracker,
+        reference_now: datetime,
     ) -> None:
-        """Fragments without abandonment keywords should not surface."""
+        """Fragments clearing the embedding floor become compost candidates."""
+        tracker = CompostTracker(now=reference_now, similarity_fn=_high_similarity)
+        frag = _fragment(
+            frag_id="frag-let-go",
+            title="Letting this thread go",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+        )
+        candidates = tracker.detect_compost_candidates([], [frag])
+        fragment_hits = [c for c in candidates if c.source_type == "fragment"]
+        assert any(c.source_id == frag.id for c in fragment_hits)
+        assert fragment_hits[0].similarity == pytest.approx(0.95)
+
+    def test_embedding_gate_rejects_below_threshold(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """Fragments below the embedding floor are filtered out."""
+        tracker = CompostTracker(now=reference_now, similarity_fn=_low_similarity)
         frag = _fragment(
             frag_id="frag-neutral1",
             title="Notes on a productive morning",
             created=datetime(2025, 6, 1, 8, 0, 0),
         )
         candidates = tracker.detect_compost_candidates([], [frag])
-        assert [c for c in candidates if c.source_id == frag.id] == []
+        assert [c for c in candidates if c.source_type == "fragment"] == []
+
+    def test_verifier_no_verdict_drops_candidate(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """A ``no`` verifier verdict suppresses an above-threshold candidate."""
+        verifier = _StubVerifier(default=CompostVerdict.NO)
+        tracker = CompostTracker(
+            now=reference_now,
+            similarity_fn=_high_similarity,
+            verifier=verifier,
+        )
+        frag = _fragment(
+            frag_id="frag-false-positive",
+            title="This passage borrows the language of release",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+        )
+        candidates = tracker.detect_compost_candidates([], [frag])
+        assert [c for c in candidates if c.source_type == "fragment"] == []
+        assert verifier.calls == [(frag.title, "")]
+
+    def test_verifier_ambiguous_routes_to_review(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """An ``ambiguous`` verifier verdict sets ``for_review``."""
+        ambiguous = CompostVerifierResult(
+            verdict=CompostVerdict.AMBIGUOUS,
+            reasoning="Reader could plausibly call this a pause, not abandonment.",
+        )
+        verifier = _StubVerifier(
+            responses={"Pausing or composting?": ambiguous},
+        )
+        tracker = CompostTracker(
+            now=reference_now,
+            similarity_fn=_high_similarity,
+            verifier=verifier,
+        )
+        frag = _fragment(
+            frag_id="frag-pause",
+            title="Pausing or composting?",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+        )
+        candidates = tracker.detect_compost_candidates([], [frag])
+        fragment_hits = [c for c in candidates if c.source_type == "fragment"]
+        assert len(fragment_hits) == 1
+        assert fragment_hits[0].for_review is True
+        assert fragment_hits[0].verifier_reasoning == ambiguous.reasoning
+
+    def test_paradox_fragment_skipped(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """Paradox-tagged fragments never reach the embedding gate."""
+        called: list[str] = []
+
+        def _record(text: str) -> float:
+            called.append(text)
+            return 0.95
+
+        tracker = CompostTracker(now=reference_now, similarity_fn=_record)
+        frag = _fragment(
+            frag_id="frag-paradox",
+            title="The thread holds two truths",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+            tags=["paradox"],
+        )
+        candidates = tracker.detect_compost_candidates([], [frag])
+        assert candidates == []
+        assert called == []
+
+    def test_intimate_fragment_skipped(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """Intimate fragments never reach the embedding gate (or the LLM)."""
+        verifier = _StubVerifier()
+        tracker = CompostTracker(
+            now=reference_now,
+            similarity_fn=_high_similarity,
+            verifier=verifier,
+        )
+        frag = _fragment(
+            frag_id="frag-intimate",
+            title="A private letting-go",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+            privacy_tier=PrivacyTier.INTIMATE,
+        )
+        candidates = tracker.detect_compost_candidates([], [frag])
+        assert candidates == []
+        assert verifier.calls == []
+
+    def test_fragment_body_passed_to_similarity_and_verifier(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """When bodies are supplied they reach both stages of the pipeline."""
+        seen: list[str] = []
+
+        def _sim(text: str) -> float:
+            seen.append(text)
+            return 0.9
+
+        verifier = _StubVerifier()
+        tracker = CompostTracker(
+            now=reference_now,
+            similarity_fn=_sim,
+            verifier=verifier,
+        )
+        frag = _fragment(
+            frag_id="frag-with-body",
+            title="The air went out of it",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+        )
+        body = "Three weeks of cold and the room feels empty."
+        tracker.detect_compost_candidates(
+            [],
+            [frag],
+            fragment_bodies={frag.id: body},
+        )
+        assert seen == [f"{frag.title}\n{body}"]
+        assert verifier.calls == [(frag.title, body)]
 
     def test_disappeared_project_detected(
         self,
@@ -352,7 +515,6 @@ class TestCreateCompostNote:
             reason="Dormant for 244 days",
             fragment_ids=["frag-1", "frag-2"],
             energy_fragment_ids=["frag-1"],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         assert path.parent == vault_path / "10-Liminal" / "Compost"
@@ -372,7 +534,6 @@ class TestCreateCompostNote:
             reason="Dormant for 244 days",
             fragment_ids=["frag-1", "frag-2"],
             energy_fragment_ids=["frag-1"],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         post = frontmatter.load(str(path))
@@ -395,7 +556,6 @@ class TestCreateCompostNote:
             reason="Dormant for 244 days",
             fragment_ids=["frag-1"],
             energy_fragment_ids=["frag-1"],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         body = frontmatter.load(str(path)).content
@@ -416,7 +576,6 @@ class TestCreateCompostNote:
             reason="Dormant",
             fragment_ids=["frag-1", "frag-2"],
             energy_fragment_ids=["frag-1"],
-            matched_keywords=[],
             energy_excerpts=["Key insight about fermentation"],
         )
         path = tracker.create_compost_note(candidate, vault_path)
@@ -437,7 +596,6 @@ class TestCreateCompostNote:
             reason="Resolved",
             fragment_ids=[],
             energy_fragment_ids=[],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         post = frontmatter.load(str(path))
@@ -457,7 +615,6 @@ class TestCreateCompostNote:
             reason="",
             fragment_ids=["frag-a"],
             energy_fragment_ids=[],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         body = frontmatter.load(str(path)).content
@@ -472,16 +629,19 @@ class TestCreateCompostNote:
         candidate = CompostCandidate(
             source_type="fragment",
             source_id="frag-abandon",
-            title="I finally gave up on the novel",
-            reason="Abandonment keyword: gave up on",
+            title="I finally let go of the novel",
+            reason="Embedding-similarity 0.91 + verifier yes",
             fragment_ids=["frag-abandon"],
             energy_fragment_ids=[],
-            matched_keywords=["gave up on"],
+            similarity=0.91,
+            verifier_reasoning="Self-honest naming of a release.",
         )
         path = tracker.create_compost_note(candidate, vault_path)
         post = frontmatter.load(str(path))
         assert "original_thread" not in post.metadata
         assert post["original_fragment"] == "[[frag-abandon]]"
+        assert post["embedding_similarity"] == pytest.approx(0.91)
+        assert post["verifier_reasoning"] == "Self-honest naming of a release."
 
 
 # ---- CompostTracker.generate_compost_report ----
@@ -638,7 +798,6 @@ class TestProjectCandidateNote:
             reason="Project silent for 400 days",
             fragment_ids=["frag-a", "frag-b"],
             energy_fragment_ids=[],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         post = frontmatter.load(str(path))
@@ -659,30 +818,54 @@ class TestProjectCandidateNote:
             reason="Resolved",
             fragment_ids=[],
             energy_fragment_ids=[],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         body = frontmatter.load(str(path)).content
         assert "_No related fragments were recorded._" in body
 
-    def test_matched_keywords_persist_in_frontmatter(
+    def test_similarity_and_reasoning_persist_in_frontmatter(
         self,
         tracker: CompostTracker,
         vault_path: Path,
     ) -> None:
-        """matched_keywords on a candidate must round-trip into frontmatter."""
+        """Embedding similarity + verifier reasoning round-trip via frontmatter."""
         candidate = CompostCandidate(
             source_type="fragment",
-            source_id="frag-keyword",
-            title="abandoned plans",
-            reason="Abandonment keyword: abandoned",
-            fragment_ids=["frag-keyword"],
+            source_id="frag-released",
+            title="Releasing the project quietly",
+            reason="Verifier: clear release statement (similarity 0.82)",
+            fragment_ids=["frag-released"],
             energy_fragment_ids=[],
-            matched_keywords=["abandoned"],
+            similarity=0.82,
+            verifier_reasoning="Clear release statement.",
         )
         path = tracker.create_compost_note(candidate, vault_path)
         post = frontmatter.load(str(path))
-        assert post["matched_keywords"] == ["abandoned"]
+        assert post["embedding_similarity"] == pytest.approx(0.82)
+        assert post["verifier_reasoning"] == "Clear release statement."
+
+    def test_ambiguous_candidate_routes_to_review_queue(
+        self,
+        tracker: CompostTracker,
+        vault_path: Path,
+    ) -> None:
+        """``for_review`` candidates land in the review subdirectory."""
+        candidate = CompostCandidate(
+            source_type="fragment",
+            source_id="frag-maybe",
+            title="Pausing or composting?",
+            reason="Verifier ambiguous (similarity 0.71)",
+            fragment_ids=["frag-maybe"],
+            energy_fragment_ids=[],
+            similarity=0.71,
+            verifier_reasoning="Could be a pause, could be a release.",
+            for_review=True,
+        )
+        path = tracker.create_compost_note(candidate, vault_path)
+        assert path.parent == vault_path / "10-Liminal" / "Compost" / "Review"
+        post = frontmatter.load(str(path))
+        tags = post.get("tags") or []
+        assert "compost-review" in tags
 
     def test_title_with_special_chars_sanitized(
         self,
@@ -697,7 +880,6 @@ class TestProjectCandidateNote:
             reason="Resolved",
             fragment_ids=[],
             energy_fragment_ids=[],
-            matched_keywords=[],
         )
         path = tracker.create_compost_note(candidate, vault_path)
         assert path.exists()

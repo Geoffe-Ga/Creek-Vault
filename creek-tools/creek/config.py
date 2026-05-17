@@ -450,6 +450,49 @@ class CleaningConfig(BaseModel):
     """Data hygiene settings."""
 
 
+class CompostConfig(BaseModel):
+    """Compost detection configuration (FEAT-018).
+
+    Replaces the legacy five-phrase abandonment keyword regex with a
+    two-stage pipeline: an embedding-similarity gate against curated
+    exemplars (``creek/generate/exemplars/compost.yaml``), followed by
+    an optional LLM verifier that returns ``yes`` / ``no`` /
+    ``ambiguous``. Ambiguous verdicts route to a review queue rather
+    than the canonical compost folder.
+    """
+
+    embedding_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Cosine-similarity floor above which a fragment is sent to the
+    verifier. Deliberately wide-net (0.6) — the verifier owns precision.
+    Tighten once a calibration set exists for your real corpus.
+    """
+
+    llm_verification: bool = True
+    """When ``True``, candidates that pass the embedding gate are sent
+    to the LLM verifier. When ``False``, the embedding gate alone
+    decides acceptance (faster + offline, but more false positives).
+    """
+
+    review_queue_relpath: str = "10-Liminal/Compost/Review"
+    """Vault-relative path under which ``ambiguous`` verdicts are filed.
+    Operators triage this queue manually and either promote to canonical
+    compost or delete.
+    """
+
+    skip_paradox: bool = True
+    """When ``True``, fragments tagged ``paradox`` or living under
+    ``10-Liminal/Paradoxes/`` are skipped — paradoxes are contradiction-
+    holding notes by design, not compost candidates.
+    """
+
+    exemplars_relpath: str | None = None
+    """Vault-relative path to a custom exemplars YAML. When ``None``,
+    the packaged default (``creek/generate/exemplars/compost.yaml``)
+    is used. Override only after running ``creek compost calibrate``
+    against your corpus has shown the defaults under-recall.
+    """
+
+
 class SourcePaths(BaseModel):
     """Source data paths (relative to ``source_drive``)."""
 
@@ -529,6 +572,9 @@ class CreekConfig(BaseSettings):
 
     cleaning: CleaningConfig = Field(default_factory=CleaningConfig)
     """Data cleaning pipeline settings."""
+
+    compost: CompostConfig = Field(default_factory=CompostConfig)
+    """Compost detection settings (FEAT-018: embedding gate + verifier)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""

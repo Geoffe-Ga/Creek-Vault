@@ -1,9 +1,20 @@
 """Creek generate package — index and note generation for the Creek vault."""
 
 from creek.generate.compost import (
-    ABANDONMENT_KEYWORDS,
     CompostCandidate,
     CompostTracker,
+)
+from creek.generate.compost_embedding import (
+    PACKAGED_EXEMPLARS_PATH,
+    CompostExemplar,
+    load_exemplars,
+    make_similarity_fn,
+)
+from creek.generate.compost_verifier import (
+    CompostVerdict,
+    CompostVerifierResult,
+    LLMCompostVerifier,
+    SupportsVerifyCompost,
 )
 from creek.generate.decisions import (
     DECISION_KEYWORDS,
@@ -102,7 +113,6 @@ from creek.generate.wavelength import (
 )
 
 __all__ = [
-    "ABANDONMENT_KEYWORDS",
     "CONTRADICTION_KEYWORDS",
     "DECISION_KEYWORDS",
     "DEFAULT_MAX_EXEMPLARS",
@@ -130,6 +140,7 @@ __all__ = [
     "METAPHOR_DOMAINS",
     "MODE_ORIENTATION_KEYS",
     "MODE_ORIENTATION_STANCES",
+    "PACKAGED_EXEMPLARS_PATH",
     "PHASE_KEYS",
     "PHASE_VOICE_RHYTHMS",
     "PRACTICE_MAP",
@@ -143,7 +154,10 @@ __all__ = [
     "BorrowedTermEntry",
     "CoinedTermEntry",
     "CompostCandidate",
+    "CompostExemplar",
     "CompostTracker",
+    "CompostVerdict",
+    "CompostVerifierResult",
     "DecisionContext",
     "DecisionContextGatherer",
     "DecisionDetector",
@@ -155,6 +169,7 @@ __all__ = [
     "IdeaMiner",
     "IdeaSeed",
     "IndexGenerator",
+    "LLMCompostVerifier",
     "Lexicon",
     "LexiconContext",
     "LexiconGenerator",
@@ -172,6 +187,7 @@ __all__ = [
     "SkillExemplar",
     "SkillTreeGenerator",
     "StateReportGenerator",
+    "SupportsVerifyCompost",
     "SynchronicityDetector",
     "TagGardenGenerator",
     "TagScanResult",
@@ -183,4 +199,6 @@ __all__ = [
     "WavelengthSnapshot",
     "WavelengthTracker",
     "decision_from_note",
+    "load_exemplars",
+    "make_similarity_fn",
 ]
