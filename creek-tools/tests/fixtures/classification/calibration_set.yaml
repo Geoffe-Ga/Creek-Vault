@@ -21,10 +21,12 @@
 # Coverage targets: every frequency ≥3 entries; every phase ≥4 entries;
 # every mode ≥6 entries; every register and orientation ≥4 entries;
 # every dosage ≥6 entries (medicine naturally dominates introspective
-# fragments, so its ratio is looser than other dimensions). When adding
-# new entries, prefer the rarest cell in each dimension so the rarest
-# value stays within ~3× the most common — that keeps the agreement
-# metric well-conditioned across every value.
+# fragments, so its ratio is looser than other dimensions: currently
+# ~4.67× the rarest dosage value, tolerate up to ~5× before adding
+# more toxic/ambiguous entries). When adding new entries, prefer the
+# rarest cell in each dimension so the rarest value stays within ~3×
+# the most common on every non-dosage dimension — that keeps the
+# agreement metric well-conditioned across every value.
 - id: cal-001
   title: Lockout
   body: My keys are gone and I cannot get into the apartment tonight. Stomach is in
