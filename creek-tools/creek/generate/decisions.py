@@ -979,7 +979,7 @@ def decision_from_note(note_path: Path) -> Decision:
         frontmatter. Missing fields fall back to the model defaults.
     """
     post = frontmatter.load(str(note_path))
-    metadata = dict(post.metadata)
+    metadata = post.metadata.copy()
     metadata["title"] = metadata.get("title") or note_path.stem
     metadata["id"] = metadata.get("id") or _generate_decision_id()
     valid_freqs = {freq.value for freq in Frequency}

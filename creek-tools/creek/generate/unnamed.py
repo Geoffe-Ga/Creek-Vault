@@ -499,7 +499,7 @@ def _excerpt_from_file(fragment_path: Path | None) -> str:
     if fragment_path is None or not fragment_path.exists():
         return ""
     post = frontmatter.load(str(fragment_path))
-    body = (post.content or "").strip().replace("\n", " ")
+    body = post.content.strip().replace("\n", " ")
     if not body:
         return ""
     if len(body) <= _EXCERPT_MAX_CHARS:

@@ -228,7 +228,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
 
 def _validate_fragment(post: frontmatter.Post, path: Path) -> Fragment | None:
     """Validate a fragment post and log invalid records."""
-    metadata = dict(post.metadata)
+    metadata = post.metadata.copy()
     if metadata.get("type") != "fragment":
         return None
     try:
