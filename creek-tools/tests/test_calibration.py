@@ -13,6 +13,7 @@ Three layers of coverage:
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -363,10 +364,8 @@ class TestFixtureLoad:
         floor: int,
     ) -> None:
         """Every value present in *dimension* appears in at least *floor* entries."""
-        import collections
-
         entries = load_fixture(_FIXTURE_PATH)
-        counts = collections.Counter(
+        counts = Counter(
             e.expected.get(dimension)
             for e in entries
             if e.expected.get(dimension) is not None
