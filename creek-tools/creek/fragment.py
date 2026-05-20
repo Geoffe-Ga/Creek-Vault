@@ -293,7 +293,7 @@ class FragmentationEngine:
         )
         children: list[ParsedFragment] = []
         for section in sections:
-            child_meta = dict(parent.metadata)
+            child_meta = parent.metadata.copy()
             child_meta["parent_id"] = parent_id
             children.append(
                 ParsedFragment(

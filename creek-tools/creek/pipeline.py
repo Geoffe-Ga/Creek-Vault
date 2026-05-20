@@ -590,6 +590,5 @@ class Pipeline:
         Returns:
             Number of index files generated.
         """
-        index_gen = IndexGenerator(vault_path=vault_path)
-        generated = index_gen.generate_all()
+        generated = IndexGenerator(vault_path=vault_path).generate_all()
         return len(generated)

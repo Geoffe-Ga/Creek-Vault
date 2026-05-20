@@ -202,10 +202,10 @@ class DecisionDetector:
             type="decision",
             id=decision_id,
             title=candidate.fragment_title,
-            status=str(DecisionStatus.SENSING),
+            status=str(DecisionStatus.SENSING),  # noqa: FURB123  # yaml.safe_dump cannot serialise StrEnum directly; convert to plain str.
             opened=today.isoformat(),
             wavelength_phase_at_opening=candidate.wavelength_phase_at_detection,
-            frequency_context=list(candidate.frequency_context),
+            frequency_context=candidate.frequency_context.copy(),
             detection_method=candidate.detection_method,
             confidence_score=candidate.confidence_score,
         )
@@ -312,8 +312,7 @@ class DecisionDetector:
             return False
 
         all_freqs: set[str] = {str(fragment.frequency.primary)}
-        for sec in fragment.frequency.secondary:
-            all_freqs.add(str(sec))
+        all_freqs.update(str(sec) for sec in fragment.frequency.secondary)
 
         return any(
             f1 in all_freqs and f2 in all_freqs for f1, f2 in _DECISION_FREQUENCY_PAIRS
@@ -911,16 +910,17 @@ class DecisionContextGatherer:
         """Render the ``### Current Wavelength`` section and advisory."""
         lines = ["### Current Wavelength", ""]
         if not phase:
-            lines.append("_Current wavelength phase is unknown._")
-            lines.append("")
+            lines.extend(("_Current wavelength phase is unknown._", ""))
             return lines
         lines.append(f"You are currently in the **{phase}** phase.")
         if past_decision_count >= _MIN_HISTORY_FOR_ADVISORY:
-            lines.append("")
-            lines.append(
-                f"Historically, decisions made during {phase} have had "
-                "a pattern worth noticing; review the related past "
-                "decisions above.",
+            lines.extend(
+                (
+                    "",
+                    f"Historically, decisions made during {phase} have had "
+                    "a pattern worth noticing; review the related past "
+                    "decisions above.",
+                )
             )
         lines.append("")
         return lines
@@ -931,10 +931,12 @@ class DecisionContextGatherer:
         if not interventions:
             return []
         lines = ["### Interventions Surfaced", ""]
-        lines.append(
-            "Practices that have been mapped as useful in this territory:",
+        lines.extend(
+            (
+                "Practices that have been mapped as useful in this territory:",
+                "",
+            )
         )
-        lines.append("")
         lines.extend(f"- {practice}" for practice in interventions)
         lines.append("")
         return lines

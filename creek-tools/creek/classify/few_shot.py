@@ -236,9 +236,13 @@ def render_block(samples: dict[str, tuple[FewShotExample, ...]]) -> str:
                 if len(ex.body) <= _BODY_CAP_CHARS
                 else ex.body[:_BODY_CAP_CHARS] + "…"
             )
-            lines.append(f"- title: {ex.title}")
-            lines.append(f"  label: {ex.label}")
-            lines.append(f"  rationale: {ex.rationale}")
-            lines.append(f"  body: {body}")
+            lines.extend(
+                (
+                    f"- title: {ex.title}",
+                    f"  label: {ex.label}",
+                    f"  rationale: {ex.rationale}",
+                    f"  body: {body}",
+                )
+            )
         lines.append("")
     return "\n".join(lines).rstrip()

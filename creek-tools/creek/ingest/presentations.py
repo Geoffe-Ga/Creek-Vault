@@ -136,9 +136,10 @@ class PythonPptxBackend:
             raise PythonPptxUnavailableError(msg) from exc
 
         prs = Presentation(str(path))
-        slides: list[SlideData] = []
-        for index, slide in enumerate(prs.slides, start=1):
-            slides.append(_slide_to_data(slide, index))
+        slides: list[SlideData] = [
+            _slide_to_data(slide, index)
+            for index, slide in enumerate(prs.slides, start=1)
+        ]
         title = self._extract_title(prs)
         return PresentationData(title=title, slides=tuple(slides))
 
@@ -277,18 +278,13 @@ class PresentationIngestor(Ingestor):
             heading = f"## Slide {slide['index']}"
             if slide.get("title"):
                 heading = f"{heading}: {slide['title']}"
-            lines.append(heading)
-            lines.append("")
+            lines.extend((heading, ""))
             body = str(slide.get("body", ""))
             if body:
-                lines.append(body)
-                lines.append("")
+                lines.extend((body, ""))
             notes = str(slide.get("notes", ""))
             if notes:
-                lines.append("**Speaker notes:**")
-                lines.append("")
-                lines.append(notes)
-                lines.append("")
+                lines.extend(("**Speaker notes:**", "", notes, ""))
         return "\n".join(lines).rstrip() + "\n"
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:

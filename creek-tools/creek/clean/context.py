@@ -137,7 +137,7 @@ class ContextExtractor:
                     # Self-authored: attach any pending context
                     updated = frag.model_copy(deep=True)
                     if pending_context:
-                        updated.context = list(pending_context)
+                        updated.context = pending_context.copy()
                         context_entries += len(pending_context)
                         pending_context.clear()
                     kept.append(updated)

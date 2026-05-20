@@ -11,6 +11,7 @@ for temporal growth tracking across scans.
 from __future__ import annotations
 
 import json
+import operator
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -69,11 +70,8 @@ def _build_note(front: dict[str, str], body: str) -> str:
         Complete markdown string with ``---`` delimited frontmatter.
     """
     lines = ["---"]
-    for key, value in front.items():
-        lines.append(f"{key}: {value}")
-    lines.append("---")
-    lines.append("")
-    lines.append(body)
+    lines.extend(f"{key}: {value}" for key, value in front.items())
+    lines.extend(("---", "", body))
     return "\n".join(lines)
 
 
@@ -135,8 +133,8 @@ class TagGardenGenerator:
                     tag_fragments[tag].append(ft.fragment_id)
 
         return TagScanResult(
-            tag_counts=dict(tag_counts),
-            tag_fragments=dict(tag_fragments),
+            tag_counts=dict(tag_counts),  # noqa: FURB123  # converts defaultdict to plain dict so downstream cannot accidentally insert.
+            tag_fragments=dict(tag_fragments),  # noqa: FURB123  # converts defaultdict to plain dict so downstream cannot accidentally insert.
         )
 
     def detect_growth(
@@ -204,16 +202,15 @@ class TagGardenGenerator:
                 for tag_b in sorted_tags[i + 1 :]:
                     co_occur[(tag_a, tag_b)] += 1
 
-        clusters: list[dict[str, object]] = []
-        for (tag_a, tag_b), count in sorted(
-            co_occur.items(),
-            key=lambda x: x[1],
-            reverse=True,
-        ):
-            if count >= _CO_OCCURRENCE_MIN:
-                clusters.append(
-                    {"tags": [tag_a, tag_b], "count": count},
-                )
+        clusters: list[dict[str, object]] = [
+            {"tags": [tag_a, tag_b], "count": count}
+            for (tag_a, tag_b), count in sorted(
+                co_occur.items(),
+                key=operator.itemgetter(1),
+                reverse=True,
+            )
+            if count >= _CO_OCCURRENCE_MIN
+        ]
 
         return clusters
 
@@ -367,11 +364,15 @@ class TagGardenGenerator:
         else:
             sorted_tags = sorted(
                 scan.tag_counts.items(),
-                key=lambda x: x[1],
+                key=operator.itemgetter(1),
                 reverse=True,
             )
-            lines.append("| Tag | Count | Fragments |")
-            lines.append("|-----|-------|-----------|")
+            lines.extend(
+                (
+                    "| Tag | Count | Fragments |",
+                    "|-----|-------|-----------|",
+                )
+            )
             for tag, count in sorted_tags:
                 frag_links = ", ".join(
                     f"[[{fid}]]" for fid in scan.tag_fragments.get(tag, [])[:5]
@@ -407,9 +408,13 @@ class TagGardenGenerator:
                 lines.append("")
 
             if growing_tags:
-                lines.append("### Rapidly Growing\n")
-                lines.append("| Tag | Previous | Current | Growth |")
-                lines.append("|-----|----------|---------|--------|")
+                lines.extend(
+                    (
+                        "### Rapidly Growing\n",
+                        "| Tag | Previous | Current | Growth |",
+                        "|-----|----------|---------|--------|",
+                    )
+                )
                 for tag, info in sorted(growing_tags.items()):
                     prev = info["previous"]
                     curr = info["current"]
@@ -433,8 +438,12 @@ class TagGardenGenerator:
         if not clusters:
             lines.append("*No significant tag clusters detected.*\n")
         else:
-            lines.append("| Tag A | Tag B | Co-occurrences |")
-            lines.append("|-------|-------|----------------|")
+            lines.extend(
+                (
+                    "| Tag A | Tag B | Co-occurrences |",
+                    "|-------|-------|----------------|",
+                )
+            )
             for cluster in clusters:
                 tags: list[str] = cluster["tags"]  # type: ignore[assignment]
                 count = cluster["count"]

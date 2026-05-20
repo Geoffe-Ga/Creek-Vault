@@ -95,8 +95,7 @@ class EmbeddingLinker:
         """
         import numpy as np  # lazy: numpy lives in the [embeddings] extra
 
-        model = self.load_model()
-        raw = model.encode(text)
+        raw = self.load_model().encode(text)
         embedding = np.asarray(raw, dtype=np.float32)
         return [float(x) for x in embedding]
 

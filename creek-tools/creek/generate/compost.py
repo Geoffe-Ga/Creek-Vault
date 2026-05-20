@@ -507,19 +507,20 @@ class CompostTracker:
     def _render_body(candidate: CompostCandidate) -> str:
         """Render the markdown body for *candidate*."""
         lines: list[str] = []
-        lines.append("## What it was")
-        lines.append("")
-        lines.append(
-            f"A {candidate.source_type} titled **{candidate.title}** that "
-            "has since composted back into the vault.",
+        lines.extend(("## What it was", ""))
+        lines.extend(
+            (
+                f"A {candidate.source_type} titled **{candidate.title}** that "
+                "has since composted back into the vault.",
+                "",
+                "## Why it composted",
+                "",
+                candidate.reason or _UNKNOWN_REASON,
+                "",
+                "## What energy remains",
+                "",
+            )
         )
-        lines.append("")
-        lines.append("## Why it composted")
-        lines.append("")
-        lines.append(candidate.reason or _UNKNOWN_REASON)
-        lines.append("")
-        lines.append("## What energy remains")
-        lines.append("")
         if candidate.energy_fragment_ids:
             for fid in candidate.energy_fragment_ids:
                 lines.append(f"- [[{fid}]]")
@@ -529,9 +530,7 @@ class CompostTracker:
                     lines.append(f"> {excerpt}")
         else:
             lines.append("_No crystallised insights were flagged for preservation._")
-        lines.append("")
-        lines.append("## Related Fragments")
-        lines.append("")
+        lines.extend(("", "## Related Fragments", ""))
         if candidate.fragment_ids:
             for fid in candidate.fragment_ids:
                 lines.append(f"- [[{fid}]]")
@@ -643,10 +642,12 @@ class CompostTracker:
         else:
             lines.append("_No compost notes recorded yet._")
         lines.extend(["", "## Active Threads", ""])
-        lines.append(
-            "Use this list to notice when composted ideas feed new growth:",
+        lines.extend(
+            (
+                "Use this list to notice when composted ideas feed new growth:",
+                "",
+            )
         )
-        lines.append("")
         if active_threads:
             for title, thread_id in active_threads:
                 lines.append(f"- [[{thread_id}|{title}]]")

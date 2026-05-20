@@ -129,10 +129,11 @@ def _build_source_summary(source_path: Path, exclusions: list[str]) -> SourceSum
     Returns:
         A ``SourceSummary`` with aggregate statistics.
     """
-    files: list[Path] = []
-    for path in sorted(source_path.rglob("*")):
-        if path.is_file() and not _matches_any_glob(path, exclusions):
-            files.append(path)
+    files: list[Path] = [
+        path
+        for path in sorted(source_path.rglob("*"))
+        if path.is_file() and not _matches_any_glob(path, exclusions)
+    ]
 
     total_size = sum(f.stat().st_size for f in files)
 

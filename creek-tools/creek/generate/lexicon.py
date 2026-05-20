@@ -262,7 +262,7 @@ def _tokenize_words(text: str) -> list[str]:
 
 def _fragment_id(fragment: Fragment) -> str:
     """Return a fragment's identifier as a plain string."""
-    return str(fragment.id)
+    return fragment.id
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +378,14 @@ def _render_coined_terms(entries: tuple[CoinedTermEntry, ...]) -> list[str]:
         lines.extend(("_No coined terms detected._", ""))
         return lines
     for entry in entries:
-        lines.append(f"### {entry.term}")
-        lines.append("")
-        lines.append(f"- **Usage count:** {entry.count}")
-        lines.append("- **Contexts:**")
+        lines.extend(
+            (
+                f"### {entry.term}",
+                "",
+                f"- **Usage count:** {entry.count}",
+                "- **Contexts:**",
+            )
+        )
         lines.extend(f"  {_render_context_line(c)}" for c in entry.contexts)
         lines.append("")
     return lines
@@ -394,10 +398,14 @@ def _render_metaphors(inventories: tuple[MetaphorInventory, ...]) -> list[str]:
         lines.extend(("_No metaphor families detected._", ""))
         return lines
     for inv in inventories:
-        lines.append(f"### {inv.domain.title()}")
-        lines.append("")
-        lines.append(f"- **Keywords:** {', '.join(inv.keywords)}")
-        lines.append("- **Usages:**")
+        lines.extend(
+            (
+                f"### {inv.domain.title()}",
+                "",
+                f"- **Keywords:** {', '.join(inv.keywords)}",
+                "- **Usages:**",
+            )
+        )
         lines.extend(f"  {_render_context_line(u)}" for u in inv.usages)
         lines.append("")
     return lines
@@ -421,11 +429,15 @@ def _render_borrowed_terms(entries: tuple[BorrowedTermEntry, ...]) -> list[str]:
         lines.extend(("_No borrowed terms detected._", ""))
         return lines
     for entry in entries:
-        lines.append(f"### {entry.term} ({entry.tradition})")
-        lines.append("")
-        lines.append(f"- **Tradition:** {entry.tradition}")
-        lines.append(f"- **Usage count:** {entry.count}")
-        lines.append("- **Contexts:**")
+        lines.extend(
+            (
+                f"### {entry.term} ({entry.tradition})",
+                "",
+                f"- **Tradition:** {entry.tradition}",
+                f"- **Usage count:** {entry.count}",
+                "- **Contexts:**",
+            )
+        )
         lines.extend(f"  {_render_context_line(c)}" for c in entry.contexts)
         lines.append("")
     return lines

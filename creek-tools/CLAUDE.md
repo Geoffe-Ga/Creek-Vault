@@ -49,6 +49,8 @@ Always invoke tools through `./scripts/*` instead of directly.
 | Run tests | `pytest` | `./scripts/test.sh` |
 | Type check | `mypy .` | `./scripts/lint.sh` (includes mypy) |
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
+| Modernisation hints | `refurb creek/` | `./scripts/lint-refurb.sh` |
+| Exception hygiene | `tryceratops creek/` | `./scripts/lint-tryceratops.sh` |
 | All checks | *(run each tool)* | `./scripts/check-all.sh` |
 | Security scan | `bandit -r src/` | `./scripts/security.sh` |
 
@@ -390,9 +392,19 @@ All code must meet these standards before merging to main:
 - **pip-audit**: zero vulnerabilities except documented unfixable
   CVEs in `scripts/security.sh` and `.github/workflows/ci.yml`
   (DEP-003).
-- **Refurb / Tryceratops / Vulture**: pre-commit-only today; will be
-  added to `lint-extended.sh` once the existing violation backlog is
-  cleared.
+- **Refurb (modernisation hints)**: zero violations. STYLE-001 closed
+  the backlog (148 → 0). Gated by `scripts/lint-refurb.sh` in both
+  `check-all.sh` and CI. New `FURB…` findings block the build; the
+  `# noqa: FURB…  # <one-line justification>` escape hatch is reserved
+  for documented carve-outs (defaultdict→dict conversions for
+  JSON/YAML serialisation, StrEnum→str round-trips, etc.).
+- **Tryceratops (exception-handling hygiene)**: zero violations.
+  STYLE-001 closed the backlog (21 → 0). Gated by
+  `scripts/lint-tryceratops.sh`. The `# noqa: TRY…  # <one-liner>`
+  escape hatch is reserved for intentional separation of failure modes
+  and documented `ValueError` schema contracts.
+- **Vulture**: pre-commit-only today; tracked under a follow-up to
+  STYLE-001 to be gated once the dead-code surface is groomed.
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs

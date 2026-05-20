@@ -86,8 +86,7 @@ def _normalize_content(content: str) -> str:
     text = unicodedata.normalize("NFC", content)
     text = text.lower()
     text = _strip_punctuation(text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _strip_punctuation(text: str) -> str:
@@ -265,8 +264,8 @@ class Deduplicator:
 
         data = {
             "version": _MANIFEST_VERSION,
-            "exact_index": dict(self._exact_index),
-            "normalized_index": dict(self._normalized_index),
+            "exact_index": self._exact_index.copy(),
+            "normalized_index": self._normalized_index.copy(),
         }
         manifest_path.write_text(
             json.dumps(data, indent=2),

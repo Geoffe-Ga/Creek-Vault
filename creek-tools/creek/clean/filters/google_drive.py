@@ -440,7 +440,7 @@ class GoogleDriveFilter:
             final.append(
                 GoogleDriveFilterResult(
                     action=action,
-                    reasons=list(reasons),
+                    reasons=reasons.copy(),
                     duplicate_of=str(dup_of) if dup_of else None,
                 )
             )
@@ -582,7 +582,7 @@ class GoogleDriveFilter:
             skip_indices: Set updated in-place with skipped indices.
         """
         groups = self._build_version_groups(files, skip_indices)
-        for _base, indices in groups.items():
+        for indices in groups.values():
             if len(indices) < 2:
                 continue
             _keep_newest_skip_rest(
@@ -645,7 +645,7 @@ class GoogleDriveFilter:
             files,
             skip_indices,
         )
-        for _h, indices in hash_groups.items():
+        for indices in hash_groups.values():
             if not _is_cross_format_group(indices, files):
                 continue
             _keep_newest_skip_rest(

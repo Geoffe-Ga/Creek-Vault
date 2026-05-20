@@ -52,10 +52,11 @@ def _extract_text(content: str | list[dict[str, Any]]) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(str(part.get("text", "")))
+        parts: list[str] = [
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
         return "\n".join(parts)
     return str(content)
 
@@ -129,7 +130,7 @@ def _normalize_messages(
     """
     normalized: list[dict[str, Any]] = []
     for msg in messages:
-        m: dict[str, Any] = dict(msg)
+        m: dict[str, Any] = msg.copy()
         if "created_at" not in m and "timestamp" in m:
             m["created_at"] = m["timestamp"]
         normalized.append(m)
@@ -186,7 +187,7 @@ def _resolve_timestamp(msg: dict[str, Any], fallback: str) -> str:
     ts = msg.get("created_at")
     if ts:
         return str(ts)
-    return fallback if fallback else "2000-01-01T00:00:00Z"
+    return fallback or "2000-01-01T00:00:00Z"
 
 
 # ---- Claude Ingestor ----

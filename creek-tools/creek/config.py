@@ -533,10 +533,10 @@ class CreekConfig(BaseSettings):
         env_prefix="CREEK_",
     )
 
-    vault_path: Path = Path(".")
+    vault_path: Path = Path()
     """Path to the Obsidian vault root."""
 
-    source_drive: Path = Path(".")
+    source_drive: Path = Path()
     """Path to the mounted source drive containing raw exports."""
 
     timezone: str = "America/Los_Angeles"
@@ -655,7 +655,6 @@ def generate_default_config(output_path: Path) -> None:
     Args:
         output_path: Destination file path for the generated YAML.
     """
-    config = CreekConfig()
-    data: dict[str, object] = config.model_dump(mode="json")
+    data: dict[str, object] = CreekConfig().model_dump(mode="json")
     with output_path.open("w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

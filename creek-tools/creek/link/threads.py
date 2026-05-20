@@ -283,7 +283,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
     vb = np.asarray(b, dtype=np.float32)
     na = float(np.linalg.norm(va))
     nb = float(np.linalg.norm(vb))
-    if na == 0.0 or nb == 0.0:
+    if 0.0 in (na, nb):
         return 0.0
     return float(np.dot(va, vb) / (na * nb))
 
@@ -349,7 +349,7 @@ class ThreadDetector:
         Returns:
             A copy of the internal mapping. Empty until detection runs.
         """
-        return dict(self._thread_members)
+        return self._thread_members.copy()
 
     def detect_threads(
         self,
@@ -619,7 +619,7 @@ class ThreadDetector:
             if not new_links:
                 updated.append(frag)
                 continue
-            merged = list(frag.threads)
+            merged = frag.threads.copy()
             for link in new_links:
                 if link not in merged:
                     merged.append(link)

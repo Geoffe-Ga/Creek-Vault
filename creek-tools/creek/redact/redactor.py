@@ -55,7 +55,7 @@ class Redactor:
         Returns:
             Combined dictionary of pattern name to compiled regex.
         """
-        patterns: dict[str, re.Pattern[str]] = dict(REDACTION_PATTERNS)
+        patterns: dict[str, re.Pattern[str]] = REDACTION_PATTERNS.copy()
         for name, raw in self.config.custom_patterns.items():
             patterns[name] = re.compile(raw)
         return patterns

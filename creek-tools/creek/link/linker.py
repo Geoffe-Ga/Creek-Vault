@@ -88,8 +88,7 @@ class LinkingPipeline:
         resonances = embedding_linker.find_resonances(embeddings)
 
         # Stage 2: Temporal proximity
-        temporal_linker = TemporalLinker()
-        temporal_links = temporal_linker.find_temporal_links(
+        temporal_links = TemporalLinker().find_temporal_links(
             fragments,
             window_hours=self.linking_config.temporal_window_hours,
         )
@@ -143,7 +142,7 @@ class LinkingPipeline:
             A new ``Fragment`` with the links added to its threads list.
         """
         existing = set(fragment.threads)
-        new_threads = list(fragment.threads)
+        new_threads = fragment.threads.copy()
         for link in links:
             if link not in existing:
                 new_threads.append(link)
