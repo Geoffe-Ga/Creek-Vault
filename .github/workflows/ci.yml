@@ -48,18 +48,21 @@ jobs:
             ${{ runner.os }}-uv-
 
       - name: Install uv
-        run: python -m pip install uv
+        # Pin uv so a uv release cannot change resolution or CLI
+        # behaviour out from under CI; bump deliberately with uv.lock.
+        run: python -m pip install 'uv==0.8.17'
 
       - name: Install dependencies (locked)
-        # uv.lock is the canonical, fully-pinned resolution shared by
-        # local dev and CI, so a clean runner installs exactly the
-        # versions a developer tested against. --locked fails the build
-        # if uv.lock has drifted from pyproject.toml. Putting .venv on
-        # PATH lets the existing ./scripts/*.sh steps run unchanged.
+        # Install the fully-pinned uv.lock straight into the runner's
+        # Python — no virtualenv, no PATH indirection — so every quality
+        # step below resolves its tools exactly as it did under the
+        # previous pip flow. `uv export --locked` fails the build if
+        # uv.lock has drifted from pyproject.toml.
         run: |
-          uv sync --all-extras --locked --python ${{ matrix.python-version }}
-          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o /tmp/locked-requirements.txt
+          uv pip install --system -r /tmp/locked-requirements.txt
+          uv pip install --system --no-deps -e .
 
       - name: Create necessary directories
         run: |

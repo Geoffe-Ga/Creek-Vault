@@ -25,8 +25,8 @@ pre-commit install
 `uv.lock` is the canonical, fully-pinned environment — local dev and CI
 install from it so they never drift. After changing dependencies in
 `pyproject.toml`, regenerate with `uv lock` and commit the result; CI
-runs `uv sync --locked` and fails on a stale lock. Plain `pip install -r
-requirements-dev.txt` still works as an unpinned fallback.
+installs from the lock and fails the build on a stale lock. Plain `pip
+install -r requirements-dev.txt` still works as an unpinned fallback.
 
 ### Key Commands (always use scripts, never run tools directly)
 ```bash
