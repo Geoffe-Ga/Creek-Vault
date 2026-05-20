@@ -271,7 +271,7 @@ def _assert_no_escaping_symlinks(
                 resolved = candidate.resolve(strict=False)
                 resolved.relative_to(resolved_root)
             except (OSError, RuntimeError, ValueError):
-                logger.error(
+                logger.exception(
                     "Refusing to follow symlink that escapes the %s root: %s",
                     label,
                     candidate,

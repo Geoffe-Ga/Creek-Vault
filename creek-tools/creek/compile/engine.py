@@ -267,9 +267,13 @@ def _build_prompt(
     ]
     for fragment, body in pairs:
         excerpt = _fragment_excerpt_for_prompt(fragment, body)
-        sections.append(f"- id: {fragment.id}")
-        sections.append(f"  title: {fragment.title}")
-        sections.append(f"  body: {excerpt}")
+        sections.extend(
+            (
+                f"- id: {fragment.id}",
+                f"  title: {fragment.title}",
+                f"  body: {excerpt}",
+            )
+        )
     return "\n".join(sections)
 
 
@@ -282,12 +286,12 @@ def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
         raise ValueError(msg) from exc
     if not isinstance(decoded, dict):
         msg = "Compile LLM payload must be a JSON object."
-        raise ValueError(msg)
+        raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
     claims = decoded.get("claims") or []
     paradoxes = decoded.get("paradoxes") or []
     if not isinstance(claims, list) or not isinstance(paradoxes, list):
         msg = "Compile LLM payload claims/paradoxes must be arrays."
-        raise ValueError(msg)
+        raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
     return {"claims": list(claims), "paradoxes": list(paradoxes)}
 
 
@@ -299,8 +303,7 @@ def _render_body(title: str, claims: list[dict[str, object]]) -> str:
         claim_id = str(claim.get("id", ""))
         if not text:
             continue
-        lines.append(f"{text} [^{claim_id}]")
-        lines.append("")
+        lines.extend((f"{text} [^{claim_id}]", ""))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -309,7 +312,7 @@ def _load_fragments_for_compile(
     fragment_ids: list[str],
 ) -> list[tuple[Fragment, str]]:
     """Load the requested fragments from the vault and preserve order."""
-    requested = list(fragment_ids)
+    requested = fragment_ids.copy()
     by_id: dict[str, tuple[Fragment, str]] = {}
     for _path, fragment, body, _raw in iter_vault_fragments(
         vault_path / "01-Fragments",

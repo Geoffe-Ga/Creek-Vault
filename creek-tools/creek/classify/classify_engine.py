@@ -263,7 +263,7 @@ def _process_file(
         method=write_method,
         trace_log_path=trace_log_path,
     )
-    try:
+    try:  # noqa: TRY101  # ARG: clear failure-mode separation (read vs. write)
         _write_fragment(
             md_file=md_file,
             fragment=new_fragment,
@@ -464,7 +464,7 @@ def _write_fragment(
             already truncated / tier-routed by :func:`_route_reasoning`.
             Empty string clears the field on disk.
     """
-    new_metadata = dict(raw)
+    new_metadata = raw.copy()
     new_metadata.update(fragment.model_dump(mode="json"))
     new_metadata[CLASSIFICATION_METHOD_KEY] = method
     # BUG-002: route through the shared LA helper rather than calling

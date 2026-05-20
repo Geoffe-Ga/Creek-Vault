@@ -129,8 +129,7 @@ class ReviewQueueGenerator:
             lines.append("No fragments require review.")
             return lines
 
-        lines.append("---")
-        lines.append("")
+        lines.extend(("---", ""))
 
         for frag in fragments:
             lines.extend(self._format_fragment_entry(frag))

@@ -188,7 +188,7 @@ def _merge_frontmatter(
     Returns:
         A merged dict where existing fields override Creek defaults.
     """
-    merged = dict(creek_defaults)
+    merged = creek_defaults.copy()
     merged.update(existing)
     return merged
 
@@ -350,10 +350,11 @@ class MarkdownIngestor(Ingestor):
         """
         try:
             post = frontmatter.loads(text)
-            return dict(post.metadata), post.content
         except Exception:
             logger.warning("Failed to parse frontmatter, treating as plain content")
             return {}, text
+        else:
+            return dict(post.metadata), post.content
 
     def _resolve_timestamp(self, fm_data: dict[str, Any], file_path: Path) -> datetime:
         """Resolve a timestamp from frontmatter or filesystem metadata.

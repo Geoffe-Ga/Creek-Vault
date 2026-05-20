@@ -258,7 +258,7 @@ def _override_frequency(
         update={
             "frequency": FrequencyClassification(
                 primary=primary,
-                secondary=list(entry.fragment.frequency.secondary),
+                secondary=entry.fragment.frequency.secondary.copy(),
             ),
         },
     )
@@ -271,7 +271,7 @@ def _persist_manual(entry: ReviewEntry, fragment: Fragment) -> None:
         entry: Original entry (used for path and body).
         fragment: Updated fragment metadata to persist.
     """
-    metadata = dict(entry.raw_metadata)
+    metadata = entry.raw_metadata.copy()
     metadata.update(fragment.model_dump(mode="json"))
     metadata[CLASSIFICATION_METHOD_KEY] = MANUAL_METHOD
     metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()

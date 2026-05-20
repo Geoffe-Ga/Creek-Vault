@@ -370,13 +370,14 @@ class DiscordIngestor(Ingestor):
         if channel_file.is_file():
             try:
                 data = json.loads(channel_file.read_bytes())
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Failed to parse channel.json in %s", channel_dir)
+            else:
                 return {
                     "channel_id": str(data.get("id", channel_dir.name)),
                     "channel_name": str(data.get("name", channel_dir.name)),
                     "channel_type": str(data.get("type", "text")),
                 }
-            except (json.JSONDecodeError, OSError):
-                logger.warning("Failed to parse channel.json in %s", channel_dir)
 
         return {
             "channel_id": channel_dir.name,
@@ -524,8 +525,8 @@ class DiscordIngestor(Ingestor):
         # Add reply context if this is a reply
         ref_id = _get_reference_id(msg)
         if ref_id is not None and ref_id in msg_index:
-            parts.append(_format_reply_context(msg_index[ref_id]))
-            parts.append("")  # blank line after quote
+            # blank line after quote
+            parts.extend((_format_reply_context(msg_index[ref_id]), ""))
 
         author = _safe_author_name(msg)
         content = _format_discord_content(msg.get("content", ""))

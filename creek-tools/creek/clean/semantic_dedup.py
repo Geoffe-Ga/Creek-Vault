@@ -204,7 +204,7 @@ def _faiss_pair_indices(
     n, dim = matrix.shape
     index = faiss.IndexFlatIP(dim)
     index.add(matrix)
-    lims, distances, neighbours = index.range_search(matrix, float(threshold))
+    lims, distances, neighbours = index.range_search(matrix, threshold)
     rows_list: list[np.ndarray] = [
         np.full(lims[i + 1] - lims[i], i, dtype=np.int64) for i in range(n)
     ]

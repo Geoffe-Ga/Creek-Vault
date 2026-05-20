@@ -441,7 +441,7 @@ class AnthropicProvider:
         Returns:
             The resolved model identifier.
         """
-        model = (self.config.model or "").strip()
+        model = self.config.model.strip()
         if not model or model == self._OLLAMA_DEFAULT_MODEL:
             return self.DEFAULT_MODEL
         return model
@@ -673,7 +673,7 @@ class LLMClassifier:
             The formatted prompt string.
         """
         safe_title = _sanitise_for_prompt(fragment.title)
-        body = content if content else "(no content provided)"
+        body = content or "(no content provided)"
         safe_content = _sanitise_for_prompt(body)
         samples = few_shot.sample_examples(fragment.id)
         examples_block = few_shot.render_block(samples) or "(no examples bundled)"
@@ -739,7 +739,7 @@ class LLMClassifier:
         parsed: object = docs[0] if docs else None
         if not isinstance(parsed, dict):
             msg = f"Expected YAML dict, got {type(parsed).__name__}"
-            raise ValueError(msg)
+            raise ValueError(msg)  # noqa: TRY004  # ValueError matches the documented schema-validation contract; callers catch ValueError.
         keys = {str(k) for k in parsed}
         extras = keys - _ALLOWED_TOP_LEVEL_KEYS
         if extras:
@@ -834,10 +834,6 @@ class LLMClassifier:
                 raw = self._invoke_llm(prompt)
                 reasoning, yaml_text = _split_reasoning_and_yaml(raw)
                 data = self.validate_response(yaml_text)
-                return LLMClassificationResult(
-                    fragment=self._apply_classification(fragment, data),
-                    reasoning=reasoning,
-                )
             except (
                 httpx.HTTPError,
                 RuntimeError,
@@ -860,6 +856,15 @@ class LLMClassifier:
                 )
                 if attempt < self.MAX_RETRIES - 1:
                     time.sleep(self.RETRY_DELAY)
+            else:
+                # _apply_classification is a pure transform (no network I/O)
+                # and lives in the else block intentionally: a failure here
+                # is a programmer error, not a transient LLM/network glitch,
+                # so it should propagate instead of triggering a retry.
+                return LLMClassificationResult(
+                    fragment=self._apply_classification(fragment, data),
+                    reasoning=reasoning,
+                )
 
         logger.error(
             "[fragment=%s path=%s provider=%s] "
@@ -899,10 +904,10 @@ class LLMClassifier:
                 "LLM provider unavailable — returning %d fragments unchanged",
                 len(fragments),
             )
-            return list(fragments)
+            return fragments.copy()
 
         stats = BatchStats(total=len(fragments))
-        ordered: list[Fragment] = list(fragments)
+        ordered: list[Fragment] = fragments.copy()
 
         with ThreadPoolExecutor(
             max_workers=self.config.max_concurrent,

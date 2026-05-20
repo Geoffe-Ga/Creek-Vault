@@ -351,10 +351,11 @@ def _get_commit_messages(repo_path: Path) -> str:
             text=True,
             timeout=10,
         )
-        return result.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         logger.warning("Could not retrieve git log for %s", repo_path)
         return ""
+    else:
+        return result.stdout.strip()
 
 
 def _get_file_timestamp(path: Path) -> datetime:

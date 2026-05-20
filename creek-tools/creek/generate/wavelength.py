@@ -525,7 +525,7 @@ class WavelengthTracker:
             if not freq or freq == Frequency.UNCLASSIFIED.value:
                 continue
             grouped[freq].append(fragment)
-        return dict(grouped)
+        return dict(grouped)  # noqa: FURB123  # converts defaultdict to plain dict so callers cannot accidentally insert.
 
     @staticmethod
     def _weekly_toxic_ratios(
@@ -643,7 +643,7 @@ class WavelengthTracker:
             period=period,
             generated_on=stamp.isoformat(),
             window_days=self.window_days,
-            flagged_frequencies=list(trend.flagged_frequencies),
+            flagged_frequencies=trend.flagged_frequencies.copy(),
             tags=["wavelength", f"wavelength-{period}"],
         )
 
@@ -886,21 +886,20 @@ def _render_current_phase(snapshots: list[WavelengthSnapshot]) -> list[str]:
     """Render the ``Current Phase`` section describing the latest snapshot."""
     lines = ["## Current Phase", ""]
     if not snapshots:
-        lines.append("_No fragments available for this period._")
-        lines.append("")
+        lines.extend(("_No fragments available for this period._", ""))
         return lines
     current = snapshots[-1]
-    lines.append(
-        f"- Dominant phase: **{current.dominant_phase}** "
-        f"(confidence {current.confidence:.2f})",
+    lines.extend(
+        (
+            f"- Dominant phase: **{current.dominant_phase}** "
+            f"(confidence {current.confidence:.2f})",
+            f"- Dominant mode: **{current.dominant_mode}**",
+            f"- Fragment count: {current.fragment_count}",
+            f"- Medicine share: {current.medicine_percent:.2f} | "
+            f"Toxic share: {current.toxic_percent:.2f}",
+            "",
+        )
     )
-    lines.append(f"- Dominant mode: **{current.dominant_mode}**")
-    lines.append(f"- Fragment count: {current.fragment_count}")
-    lines.append(
-        f"- Medicine share: {current.medicine_percent:.2f} | "
-        f"Toxic share: {current.toxic_percent:.2f}",
-    )
-    lines.append("")
     return lines
 
 
@@ -908,8 +907,7 @@ def _render_phase_history(snapshots: list[WavelengthSnapshot]) -> list[str]:
     """Render one bullet per snapshot as a chronological history."""
     lines = ["## Phase History", ""]
     if not snapshots:
-        lines.append("_No snapshots recorded._")
-        lines.append("")
+        lines.extend(("_No snapshots recorded._", ""))
         return lines
     for snap in snapshots:
         lines.append(
@@ -924,8 +922,7 @@ def _render_dosage_trends(trend: DosageTrend) -> list[str]:
     """Render the Dosage Trends section, listing flagged frequencies neutrally."""
     lines = ["## Dosage Trends", ""]
     if not trend.frequency_trends:
-        lines.append("_No classified frequencies recorded._")
-        lines.append("")
+        lines.extend(("_No classified frequencies recorded._", ""))
         return lines
     for freq in sorted(trend.frequency_trends):
         series = trend.frequency_trends[freq]
@@ -937,8 +934,12 @@ def _render_dosage_trends(trend: DosageTrend) -> list[str]:
             f"{latest_ratio:.2f} (week of {latest_week.isoformat()})",
         )
     if trend.flagged_frequencies:
-        lines.append("")
-        lines.append("Frequencies trending toward overdose (descriptive signal):")
+        lines.extend(
+            (
+                "",
+                "Frequencies trending toward overdose (descriptive signal):",
+            )
+        )
         for freq in sorted(trend.flagged_frequencies):
             lines.append(f"- {freq}")
     lines.append("")
@@ -949,8 +950,7 @@ def _render_transition_log(transitions: list[PhaseTransition]) -> list[str]:
     """Render one bullet per detected phase transition."""
     lines = ["## Transition Log", ""]
     if not transitions:
-        lines.append("_No phase transitions detected in this period._")
-        lines.append("")
+        lines.extend(("_No phase transitions detected in this period._", ""))
         return lines
     for trans in transitions:
         lines.append(
@@ -969,8 +969,7 @@ def _render_texture_cloud(snapshots: list[WavelengthSnapshot]) -> list[str]:
         for tag, count in snap.emotional_texture_cloud:
             merged[tag] += count
     if not merged:
-        lines.append("_No emotional texture tags recorded._")
-        lines.append("")
+        lines.extend(("_No emotional texture tags recorded._", ""))
         return lines
     for tag, count in merged.most_common():
         lines.append(f"- `{tag}` x{count}")
@@ -1018,8 +1017,7 @@ def _render_domain_mappings(snapshot: WavelengthSnapshot) -> list[str]:
     lines = ["## Domain Mappings", ""]
     mapping = PHASE_DOMAIN_MAPPINGS.get(snapshot.dominant_phase)
     if mapping is None:
-        lines.append("_No mapping available — dominant phase is unclassified._")
-        lines.append("")
+        lines.extend(("_No mapping available — dominant phase is unclassified._", ""))
         return lines
     for key, label in _DOMAIN_LABELS:
         lines.append(f"- **{label}**: {mapping[key]}")
@@ -1036,8 +1034,7 @@ def _render_mode_distribution(fragments: list[Fragment]) -> list[str]:
         if str(f.wavelength.mode) and str(f.wavelength.mode) != Mode.UNCLASSIFIED.value
     )
     if not counts:
-        lines.append("_No classified modes in this period._")
-        lines.append("")
+        lines.extend(("_No classified modes in this period._", ""))
         return lines
     for mode, count in counts.most_common():
         lines.append(f"- `{mode}`: {count}")
@@ -1066,12 +1063,10 @@ def _render_emotional_texture_cloud(
         for tag, count in snap.emotional_texture_cloud:
             merged[tag] += count
     if not merged:
-        lines.append("_No emotional texture tags recorded._")
-        lines.append("")
+        lines.extend(("_No emotional texture tags recorded._", ""))
         return lines
     cloud = " ".join(f"{tag}({count})" for tag, count in merged.most_common())
-    lines.append(cloud)
-    lines.append("")
+    lines.extend((cloud, ""))
     return lines
 
 
@@ -1079,8 +1074,7 @@ def _render_notable_fragments(fragments: list[Fragment]) -> list[str]:
     """Render up to ``_NOTABLE_FRAGMENT_LIMIT`` highest-confidence fragments."""
     lines = ["## Notable Fragments", ""]
     if not fragments:
-        lines.append("_No fragments observed in this period._")
-        lines.append("")
+        lines.extend(("_No fragments observed in this period._", ""))
         return lines
     ranked = sorted(
         fragments,
@@ -1135,8 +1129,7 @@ def _render_week_by_week_chart(snapshots: list[WavelengthSnapshot]) -> list[str]
     """
     lines = ["## Week-by-Week Progression", ""]
     if not snapshots:
-        lines.append("_No weekly snapshots in this month._")
-        lines.append("")
+        lines.extend(("_No weekly snapshots in this month._", ""))
         return lines
     for index, snap in enumerate(snapshots, start=1):
         if snap.fragment_count == 0:
@@ -1159,27 +1152,22 @@ def _render_month_over_month(
     """Render the ``Month-over-Month`` comparison block."""
     lines = ["## Month-over-Month", ""]
     if previous.fragment_count == 0:
-        lines.append(
-            "_No prior month data to compare against._",
-        )
-        lines.append("")
+        lines.extend(("_No prior month data to compare against._", ""))
         return lines
     delta = current.fragment_count - previous.fragment_count
     direction = (
         "more" if delta > 0 else ("fewer" if delta < 0 else "the same number of")
     )
-    lines.append(
-        f"- Previous month dominant phase: `{previous.dominant_phase}` "
-        f"({previous.fragment_count} fragments)",
+    lines.extend(
+        (
+            f"- Previous month dominant phase: `{previous.dominant_phase}` "
+            f"({previous.fragment_count} fragments)",
+            f"- This month dominant phase: `{current.dominant_phase}` "
+            f"({current.fragment_count} fragments)",
+            f"- Volume change: {direction} fragments ({delta:+d}).",
+            "",
+        )
     )
-    lines.append(
-        f"- This month dominant phase: `{current.dominant_phase}` "
-        f"({current.fragment_count} fragments)",
-    )
-    lines.append(
-        f"- Volume change: {direction} fragments ({delta:+d}).",
-    )
-    lines.append("")
     return lines
 
 

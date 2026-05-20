@@ -335,7 +335,7 @@ class GoogleApiDriveClient:
         # modified_time so the file is re-downloaded on the next run
         # rather than silently treated as up-to-date.
         tmp_path = destination.with_name(destination.name + ".download.tmp")
-        try:
+        try:  # noqa: TRY101  # Separate failure modes: optional-import check vs the actual download stream.
             with tmp_path.open("wb") as handle:
                 downloader = MediaIoBaseDownload(
                     handle,
@@ -598,7 +598,7 @@ def _secure_erase(path: Path) -> bool:
             path,
             exc,
         )
-    try:
+    try:  # noqa: TRY101  # Separate failure modes: secure-overwrite vs the directory-entry unlink each have distinct fallbacks.
         path.unlink()
     except OSError as exc:
         logger.warning("Could not unlink %s: %s", path, exc)

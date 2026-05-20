@@ -24,6 +24,7 @@ import re
 import tempfile
 import threading
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -37,7 +38,6 @@ from creek.models import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from pydantic import BaseModel
 
@@ -166,7 +166,7 @@ def _read_legacy_provenance_entries(
         return [], "read_failed"
     if not raw.strip():
         return [], "ok"
-    try:
+    try:  # noqa: TRY101  # Separate failure modes: file IO vs JSON parsing each return distinct status strings.
         data = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning(
@@ -364,9 +364,10 @@ def _atomic_write_text(path: Path, content: str) -> None:
             fp.write(content)
         os.replace(tmp_name, path)
     finally:
-        if os.path.exists(tmp_name):
+        tmp_path = Path(tmp_name)
+        if tmp_path.exists():
             with contextlib.suppress(OSError):
-                os.unlink(tmp_name)
+                tmp_path.unlink()
 
 
 class VaultWriter:

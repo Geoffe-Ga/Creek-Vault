@@ -231,7 +231,7 @@ class SynchronicityDetector:
             similarity=round(sync.similarity, 4),
             time_gap_days=sync.time_gap_days,
             sources=[str(sync.source_a), str(sync.source_b)],
-            tags=list(sync.tags),
+            tags=sync.tags.copy(),
         )
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path

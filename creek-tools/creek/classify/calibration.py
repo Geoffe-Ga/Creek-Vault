@@ -18,6 +18,7 @@ code itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import starmap
 from typing import TYPE_CHECKING, Final, Protocol
 
 import yaml
@@ -210,8 +211,8 @@ def load_fixture(path: Path) -> tuple[CalibrationEntry, ...]:
             "calibration fixture must be a YAML list at top level, "
             f"got {type(parsed).__name__}"
         )
-        raise ValueError(msg)
-    return tuple(_coerce_entry(idx, item) for idx, item in enumerate(parsed))
+        raise ValueError(msg)  # noqa: TRY004  # public API contract: tests assert ValueError
+    return tuple(starmap(_coerce_entry, enumerate(parsed)))
 
 
 def _coerce_entry(index: int, item: object) -> CalibrationEntry:
@@ -231,7 +232,7 @@ def _coerce_entry(index: int, item: object) -> CalibrationEntry:
     """
     if not isinstance(item, dict):
         msg = f"calibration entry #{index} is not a dict: got {type(item).__name__}"
-        raise ValueError(msg)
+        raise ValueError(msg)  # noqa: TRY004  # public API contract: tests assert ValueError
     missing = _REQUIRED_ENTRY_KEYS - {str(k) for k in item}
     if missing:
         msg = f"calibration entry #{index} missing keys: {sorted(missing)}"
@@ -239,7 +240,7 @@ def _coerce_entry(index: int, item: object) -> CalibrationEntry:
     expected = item["expected"]
     if not isinstance(expected, dict):
         msg = f"calibration entry #{index} has non-dict 'expected' block"
-        raise ValueError(msg)
+        raise ValueError(msg)  # noqa: TRY004  # public API contract: tests assert ValueError
     return CalibrationEntry(
         id=str(item["id"]),
         title=str(item["title"]),

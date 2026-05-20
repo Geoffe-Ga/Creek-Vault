@@ -686,8 +686,8 @@ class PurgeEngine:
         fragments_deleted = result.fragments_affected if deletes_files else 0
         entry = PurgeAuditEntry(
             operation=result.operation,
-            criteria=dict(result.criteria),
-            affected_fragments=list(result.affected_fragment_ids),
+            criteria=result.criteria.copy(),
+            affected_fragments=result.affected_fragment_ids.copy(),
             fragments_deleted=fragments_deleted,
             references_scrubbed=result.wikilinks_removed,
             embeddings_removed=fragments_deleted,

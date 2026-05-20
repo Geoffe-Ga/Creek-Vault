@@ -15,6 +15,7 @@ Exports:
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -87,28 +88,21 @@ def _try_decode(raw_bytes: bytes) -> str | None:
 
     # Try UTF-16 first if BOM is present (contains null bytes so check before binary)
     if raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        try:
+        with suppress(UnicodeDecodeError, ValueError):
             return raw_bytes.decode("utf-16")
-        except (UnicodeDecodeError, ValueError):
-            pass
 
     if _is_binary_content(raw_bytes):
         return None
 
     # Try UTF-8 first (most common encoding)
-    try:
+    with suppress(UnicodeDecodeError, ValueError):
         return raw_bytes.decode("utf-8")
-    except (UnicodeDecodeError, ValueError):
-        pass
 
     # Try chardet detection before falling back to Latin-1
-    detection = chardet.detect(raw_bytes)
-    detected_encoding = detection.get("encoding")
+    detected_encoding = chardet.detect(raw_bytes).get("encoding")
     if detected_encoding:
-        try:
+        with suppress(UnicodeDecodeError, ValueError, LookupError):
             return raw_bytes.decode(detected_encoding)
-        except (UnicodeDecodeError, ValueError, LookupError):
-            pass
 
     # Latin-1 as final fallback (can decode any byte sequence)
     return raw_bytes.decode("latin-1")
