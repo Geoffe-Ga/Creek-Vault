@@ -605,7 +605,7 @@ class PurgeEngine:
             if post is None or post.get("id") not in id_set:
                 continue
             raw_count = post.get("fragment_count", 0)
-            current = int(raw_count) if isinstance(raw_count, (int, str)) else 0
+            current = int(raw_count) if isinstance(raw_count, (int, float, str)) else 0
             post["fragment_count"] = max(0, current - 1)
             updated += 1
             if not self.dry_run:

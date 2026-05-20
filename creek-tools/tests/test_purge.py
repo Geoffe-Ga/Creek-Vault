@@ -18,7 +18,7 @@ from typer.testing import CliRunner
 
 from creek.cli import app
 from creek.purge import PurgeAuditEntry, PurgeAuditLog, PurgeEngine, PurgeResult
-from creek.purge.engine import VAULT_PURGE_CONFIRMATION
+from creek.purge.engine import VAULT_PURGE_CONFIRMATION, _str_list
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -246,6 +246,46 @@ def test_fragment_purge_decrements_eddy_counts(tmp_path: Path) -> None:
     assert result.eddies_updated == 1
     eddy_post = frontmatter.load(str(vault / "03-Eddies/Whirl.md"))
     assert eddy_post["fragment_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (["thread-1", "thread-2"], ["thread-1", "thread-2"]),
+        ([1, 2], ["1", "2"]),
+        (None, []),
+        ("thread-1", []),
+        (7, []),
+        ({"thread": "x"}, []),
+    ],
+)
+def test_str_list_coerces_only_lists(value: object, expected: list[str]) -> None:
+    """`_str_list` stringifies list members and yields [] for non-lists."""
+    assert _str_list(value) == expected
+
+
+def test_fragment_purge_zeroes_non_numeric_fragment_count(tmp_path: Path) -> None:
+    """A thread whose fragment_count is non-numeric decrements to 0, not a crash."""
+    vault = _make_vault(tmp_path)
+    thread = vault / "02-Threads" / "Active" / "Weird.md"
+    thread.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="",
+                id="thread-1",
+                title="Weird",
+                type="thread",
+                fragment_count=["not", "numeric"],
+            ),
+        ),
+        encoding="utf-8",
+    )
+    _write_fragment(vault, "frag-A", "Alpha", threads=["thread-1"])
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    thread_post = frontmatter.load(str(thread))
+    assert thread_post["fragment_count"] == 0
 
 
 def test_fragment_purge_dry_run_preserves_everything(tmp_path: Path) -> None:
