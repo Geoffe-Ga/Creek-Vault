@@ -8,9 +8,12 @@
 -e .[all,dev]
 
 # Pinned transitive bumps to address pip-audit findings (DEP-003).
-# These are dev/build-time tools whose vulnerable older versions can leak
-# in via pip's resolver. See ./scripts/security.sh for documented ignores.
+# These are transitive dependencies whose vulnerable older versions can
+# leak in via pip's resolver. See ./scripts/security.sh for documented
+# ignores.
+#   - idna<3.15: CVE-2026-45409.
 cryptography>=48.0.0
+idna>=3.15
 pip>=26.1.1
 pyjwt>=2.12.1
 setuptools>=78.1.1

@@ -992,4 +992,4 @@ def decision_from_note(note_path: Path) -> Decision:
         metadata["opened"] = opened
     else:
         metadata.pop("opened", None)
-    return Decision(**metadata)
+    return Decision.model_validate(metadata)

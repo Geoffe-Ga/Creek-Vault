@@ -593,7 +593,12 @@ class DuplicateScanner:
         if not content:
             return None, "", datetime.now(tz=UTC)
 
-        source = str(post.get("source", {}).get("original_file", str(frag_file)))
+        source_meta = post.get("source", {})
+        source = (
+            str(source_meta.get("original_file", str(frag_file)))
+            if isinstance(source_meta, dict)
+            else str(frag_file)
+        )
         created = post.get("created", datetime.now(tz=UTC))
         if not isinstance(created, datetime):
             created = datetime.now(tz=UTC)

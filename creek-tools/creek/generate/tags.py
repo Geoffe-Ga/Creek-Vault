@@ -308,7 +308,8 @@ class TagGardenGenerator:
             _FragmentTags with the file's ID and tag list.
         """
         post = frontmatter.load(str(md_file))
-        frag_id: str = post.get("id", md_file.stem)
+        raw_id = post.get("id", md_file.stem)
+        frag_id: str = raw_id if isinstance(raw_id, str) else md_file.stem
         tags_raw = post.get("tags", [])
         tags: list[str] = list(tags_raw) if isinstance(tags_raw, list) else []
         return _FragmentTags(fragment_id=frag_id, tags=tags)

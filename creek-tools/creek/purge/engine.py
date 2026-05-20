@@ -69,6 +69,20 @@ must be classified explicitly here — defaulting unknown operations to
 """
 
 
+def _str_list(value: object) -> list[str]:
+    """Coerce a frontmatter list value into a list of strings.
+
+    Args:
+        value: Raw value from a :class:`frontmatter.Post` field.
+
+    Returns:
+        A list of strings; empty when *value* is not a list.
+    """
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
+
+
 class PurgeResult(BaseModel):
     """Outcome of a single purge operation.
 
@@ -153,8 +167,8 @@ class PurgeEngine:
             return result
 
         title = str(post.get("title", frag_file.stem))
-        thread_ids = [str(t) for t in post.get("threads", []) or []]
-        eddy_ids = [str(e) for e in post.get("eddies", []) or []]
+        thread_ids = _str_list(post.get("threads"))
+        eddy_ids = _str_list(post.get("eddies"))
 
         result.deleted_files.append(str(frag_file))
         result.affected_fragment_ids.append(fragment_id)
@@ -398,8 +412,8 @@ class PurgeEngine:
             result: Result object being accumulated.
         """
         title = str(post.get("title", frag_file.stem))
-        thread_ids = [str(t) for t in post.get("threads", []) or []]
-        eddy_ids = [str(e) for e in post.get("eddies", []) or []]
+        thread_ids = _str_list(post.get("threads"))
+        eddy_ids = _str_list(post.get("eddies"))
 
         result.deleted_files.append(str(frag_file))
         frag_id = post.get("id")
@@ -590,7 +604,8 @@ class PurgeEngine:
             post = self._load_frontmatter(md_file)
             if post is None or post.get("id") not in id_set:
                 continue
-            current = int(post.get("fragment_count", 0) or 0)
+            raw_count = post.get("fragment_count", 0)
+            current = int(raw_count) if isinstance(raw_count, (int, str)) else 0
             post["fragment_count"] = max(0, current - 1)
             updated += 1
             if not self.dry_run:

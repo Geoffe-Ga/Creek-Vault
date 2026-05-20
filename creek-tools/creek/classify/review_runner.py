@@ -276,7 +276,8 @@ def _persist_manual(entry: ReviewEntry, fragment: Fragment) -> None:
     metadata[CLASSIFICATION_METHOD_KEY] = MANUAL_METHOD
     metadata[CLASSIFIED_AT_KEY] = datetime.now(tz=LA_TZ).isoformat()
 
-    post = frontmatter.Post(content=entry.body, **metadata)
+    post = frontmatter.Post(content=entry.body)
+    post.metadata.update(metadata)
     entry.path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 

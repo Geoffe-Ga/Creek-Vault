@@ -467,7 +467,8 @@ class CompostTracker:
         today = self._now.date()
         metadata = self._build_metadata(candidate, today)
         body = self._render_body(candidate)
-        post = frontmatter.Post(content=body, **metadata)
+        post = frontmatter.Post(content=body)
+        post.metadata.update(metadata)
 
         filename = f"{today.isoformat()}-{_sanitize_filename(candidate.title)}.md"
         note_path = target_dir / filename
