@@ -49,8 +49,13 @@ jobs:
 
       - name: Install uv
         # Pin uv so a uv release cannot change resolution or CLI
-        # behaviour out from under CI; bump deliberately with uv.lock.
-        run: python -m pip install 'uv==0.8.17'
+        # behaviour out from under CI. uv is installed into the runner
+        # Python and therefore audited by the pip-audit step below, so
+        # this pin must stay on a release with no open advisories
+        # (0.11.16 clears GHSA-w476-p2h3-79g9 / CVE-2025-13327 /
+        # GHSA-pjjw-68hj-v9mw); bump it deliberately when pip-audit flags
+        # a newer one.
+        run: python -m pip install 'uv==0.11.16'
 
       - name: Install dependencies (locked)
         # Install the fully-pinned uv.lock straight into the runner's
