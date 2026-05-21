@@ -136,6 +136,20 @@ jobs:
         #   - CVE-2026-24049: wheel — RECORD parsing edge case; wheel is
         #     build-tooling only and never reaches the production runtime.
         #     https://nvd.nist.gov/vuln/detail/CVE-2026-24049
+        #   - PYSEC-2025-189..197, PYSEC-2025-210, PYSEC-2026-139 (torch)
+        #     and PYSEC-2025-211..218 (transformers): transitive via the
+        #     `embeddings` extra. No patched release exists — torch
+        #     2.12.0 and transformers 5.9.0 (the latest, as of
+        #     2026-05-21) still carry every advisory. torch's are
+        #     local-access memory-corruption/DoS bugs; transformers' are
+        #     RCE via malicious checkpoints. creek-tools embeds vault
+        #     fragments with a pinned, known sentence-transformers model
+        #     (FEAT-018) and never loads untrusted checkpoints, so none
+        #     are reachable. Re-audit by 2026-06-20; see scripts/security.sh.
+        #   - PYSEC-2024-277 (joblib) and PYSEC-2025-183 (pyjwt): both at
+        #     their latest release and both formally disputed by the
+        #     supplier (joblib path needs trusted-content caching; pyjwt
+        #     key length is the caller's choice). Not reachable here.
         # A single `pip-audit --format=json --output=…` call writes the
         # JSON artifact AND gates on findings (pip-audit exits non-zero
         # if any non-ignored vulnerability is reported, regardless of the
@@ -146,7 +160,28 @@ jobs:
             --ignore-vuln CVE-2025-8869 \
             --ignore-vuln CVE-2026-1703 \
             --ignore-vuln CVE-2026-3219 \
-            --ignore-vuln CVE-2026-24049
+            --ignore-vuln CVE-2026-24049 \
+            --ignore-vuln PYSEC-2025-189 \
+            --ignore-vuln PYSEC-2025-190 \
+            --ignore-vuln PYSEC-2025-191 \
+            --ignore-vuln PYSEC-2025-192 \
+            --ignore-vuln PYSEC-2025-193 \
+            --ignore-vuln PYSEC-2025-194 \
+            --ignore-vuln PYSEC-2025-195 \
+            --ignore-vuln PYSEC-2025-196 \
+            --ignore-vuln PYSEC-2025-197 \
+            --ignore-vuln PYSEC-2025-210 \
+            --ignore-vuln PYSEC-2026-139 \
+            --ignore-vuln PYSEC-2025-211 \
+            --ignore-vuln PYSEC-2025-212 \
+            --ignore-vuln PYSEC-2025-213 \
+            --ignore-vuln PYSEC-2025-214 \
+            --ignore-vuln PYSEC-2025-215 \
+            --ignore-vuln PYSEC-2025-216 \
+            --ignore-vuln PYSEC-2025-217 \
+            --ignore-vuln PYSEC-2025-218 \
+            --ignore-vuln PYSEC-2024-277 \
+            --ignore-vuln PYSEC-2025-183
 
       - name: Run tests with coverage (CI-003 — mirrors local default)
         # ./scripts/test.sh excludes integration/e2e by default so local
