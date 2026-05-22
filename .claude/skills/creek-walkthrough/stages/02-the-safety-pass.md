@@ -16,8 +16,8 @@ voice, why:
 
 1. Quietly run `creek redact --help` to confirm flags.
 2. Ask the user where their source material is — the folder of exports
-   they want to bring in. If they don't have anything yet, say so is
-   fine; offer to continue the walkthrough with a small sample so they
+   they want to bring in. If they don't have anything yet, that's fine;
+   offer to continue the walkthrough with a small sample so they
    can see the shape of it, and pick up real ingestion later.
 3. Run the **scan only** first — never the destructive apply yet:
    `creek redact --scan --source <their path> --report`. Scan looks and

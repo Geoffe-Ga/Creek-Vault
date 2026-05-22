@@ -17,7 +17,11 @@ helps, offer this one, lightly:
 
 - **When new water arrives** — a fresh export, a season of notes — bring
   it in: the safety pass, then ingest, then let the naming and weaving
-  run. You've watched all of it; it's the same creek, deeper.
+  run. You've watched all of it; it's the same creek, deeper. You don't
+  have to run those steps one at a time, either — `creek process` chains
+  the whole pipeline (redaction, ingestion, classification, linking) in a
+  single command. The stage-by-stage walk was so you'd understand what
+  flows; day to day, `creek process` does the flowing for you.
 - **Now and then** — a week, a month, whatever's natural — ask for the
   whole creek at once (`creek state`) and walk the banks (`creek lint`).
   Read what gathered. Tend the few housekeeping things. Leave the liminal

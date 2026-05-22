@@ -37,7 +37,9 @@ same creek:
 - **A direct ask — slash commands.** When they know what they want:
   `/crawdad surface` (what's stirring this week), `/crawdad checkin` (a
   wavelength reflection), `/crawdad draft` (a piece), `/crawdad save`
-  (keep this exchange in the vault). Small, named, deliberate.
+  (keep this exchange in the vault). These names are examples — confirm
+  the live set against `crawdad --help` before you state them as exact.
+  Small, named, deliberate.
 - **A larger request — workflows.** Composite asks like "draft my next
   essay on phase transitions" — several steps the user names once and
   CrawDad walks through.

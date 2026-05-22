@@ -22,9 +22,10 @@ in CrawDad's voice, something close to this:
    prompt the same as every other side-effecting step: *"I need to get my
    own tools on first — that means adding `creek` to your Python
    environment. May I?"* Wait for the yes. Then install it for them —
-   `pip install -e creek-tools` (or `uv` if the project uses it; check
-   `creek-tools/` for a lockfile). Narrate it as "letting me get my own
-   boots on," not as a chore for them.
+   the project's canonical path is `uv sync --all-extras` run from inside
+   `creek-tools/`; `pip install -e creek-tools` is the fallback if `uv`
+   isn't available. Narrate it as "letting me get my own boots on," not
+   as a chore for them.
 3. Ask them where they'd like the vault. Offer a gentle default:
    `~/Obsidian/Creek-Vault`. Let them name anywhere they like.
 4. **Refuse, kindly, to put it inside this git repository.** `creek init`

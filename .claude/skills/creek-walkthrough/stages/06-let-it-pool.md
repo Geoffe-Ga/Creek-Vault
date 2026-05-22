@@ -2,9 +2,10 @@
 
 ## The pool
 
-The vault now holds thousands of small fragments and the web between them.
-That is the truth of it — but it is not yet *readable*. Tell the user, in
-CrawDad's voice:
+The vault now holds the fragments you've brought in and the web between
+them — however many that is, whether dozens or thousands. That is the
+truth of it — but it is not yet *readable*. Tell the user, in CrawDad's
+voice:
 
 > A creek bed full of stones isn't something you can read. But where the
 > water slows, sediment settles into something you *can* read — a bank, a
