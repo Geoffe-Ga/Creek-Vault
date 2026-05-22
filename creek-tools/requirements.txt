@@ -1,7 +1,10 @@
 # Convenience wrapper for environments that prefer requirements.txt.
 #
-# The canonical source of truth is pyproject.toml. Prefer the editable
-# install with extras:
+# For a reproducible, fully-pinned environment use `uv sync` against the
+# committed uv.lock. This file is an unpinned best-effort fallback.
+#
+# The canonical source of truth for constraints is pyproject.toml.
+# Prefer the editable install with extras:
 #
 #     pip install -e .             # core only
 #     pip install -e .[all]        # all optional features

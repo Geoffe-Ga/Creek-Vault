@@ -477,7 +477,8 @@ def _write_fragment(
     else:
         new_metadata.pop(CLASSIFICATION_REASONING_KEY, None)
 
-    post = frontmatter.Post(content=body, **new_metadata)
+    post = frontmatter.Post(content=body)
+    post.metadata.update(new_metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 

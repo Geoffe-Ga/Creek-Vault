@@ -593,7 +593,12 @@ class DuplicateScanner:
         if not content:
             return None, "", datetime.now(tz=UTC)
 
-        source = str(post.get("source", {}).get("original_file", str(frag_file)))
+        source_meta = post.get("source", {})
+        source = (
+            str(source_meta.get("original_file", str(frag_file)))
+            if isinstance(source_meta, dict)
+            else str(frag_file)
+        )
         created = post.get("created", datetime.now(tz=UTC))
         if not isinstance(created, datetime):
             created = datetime.now(tz=UTC)
@@ -703,7 +708,7 @@ class HygieneReporter:
             logger.debug("Failed to read content from %s", frag_file)
             return ""
         else:
-            return post.content or ""
+            return post.content
 
     def _format_report(self, report: HygieneReport) -> list[str]:
         """Format a hygiene report as markdown lines.

@@ -328,8 +328,9 @@ creek-tools/
 │       └── conftest.py
 ├── .pre-commit-config.yaml           # Pre-commit hooks
 ├── pyproject.toml                    # Project configuration
-├── requirements.txt                  # Production dependencies
-├── requirements-dev.txt              # Development dependencies
+├── uv.lock                           # Canonical pinned lockfile (uv sync)
+├── requirements.txt                  # Unpinned pip fallback (production)
+├── requirements-dev.txt              # Unpinned pip fallback (development)
 ├── README.md                         # Project overview
 └── CLAUDE.md                         # This file
 ```

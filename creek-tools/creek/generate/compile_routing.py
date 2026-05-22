@@ -130,7 +130,7 @@ def _load_pages(root: Path, target_kind: str) -> dict[str, CompiledPage]:
         except (OSError, ValueError, yaml.YAMLError):
             logger.debug("Skipping unreadable compiled page: %s", md_file)
             continue
-        metadata = dict(post.metadata)
+        metadata = post.metadata.copy()
         if metadata.get("type") != "compiled_page":
             continue
         if metadata.get("target_kind") != target_kind:

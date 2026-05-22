@@ -399,6 +399,23 @@ class TestDuplicateScanner:
         result = scanner.scan(vault)
         assert len(result.candidates) == 0
 
+    def test_non_dict_source_falls_back_to_file_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A fragment whose `source` is a scalar reports the file path."""
+        vault = _make_vault(tmp_path)
+        frag = vault / "01-Fragments" / "Conversations" / "scalar-source.md"
+        frag.parent.mkdir(parents=True, exist_ok=True)
+        frag.write_text(
+            "---\nid: frag-x\ntitle: X\ntype: fragment\n"
+            'source: "legacy.txt"\n---\n\nBody content here.\n',
+            encoding="utf-8",
+        )
+        content, source, _ = DuplicateScanner()._read_fragment(frag)
+        assert content == "Body content here."
+        assert source == str(frag)
+
 
 # ---------------------------------------------------------------------------
 # HygieneReporter tests

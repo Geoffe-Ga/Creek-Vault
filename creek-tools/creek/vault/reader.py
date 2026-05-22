@@ -63,7 +63,7 @@ def try_load_fragment(
         yaml.YAMLError: When the YAML parser rejects the document.
     """
     post = frontmatter.load(str(md_file))
-    metadata = dict(post.metadata)
+    metadata = post.metadata.copy()
     if metadata.get("type") != "fragment":
         return None
     try:
@@ -71,7 +71,7 @@ def try_load_fragment(
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
         return None
-    return fragment, str(post.content), metadata
+    return fragment, post.content, metadata
 
 
 def iter_vault_fragments(

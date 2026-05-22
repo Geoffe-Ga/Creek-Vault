@@ -210,6 +210,31 @@ Content without tags.
         result = generator.scan_tags()
         assert result.tag_counts == {}
 
+    def test_non_string_id_falls_back_to_filename(
+        self,
+        generator: TagGardenGenerator,
+        vault: Path,
+    ) -> None:
+        """A fragment whose `id` is not a string is recorded by filename."""
+        weird = """---
+type: fragment
+id:
+  - not
+  - a-string
+title: "Weird ID"
+tags:
+  - python
+---
+
+Body.
+"""
+        (vault / "01-Fragments" / "weird-id.md").write_text(
+            weird,
+            encoding="utf-8",
+        )
+        result = generator.scan_tags()
+        assert result.tag_fragments["python"] == ["weird-id"]
+
 
 # ---- detect_growth Tests ----
 

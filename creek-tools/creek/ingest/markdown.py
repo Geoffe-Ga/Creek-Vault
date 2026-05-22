@@ -354,7 +354,7 @@ class MarkdownIngestor(Ingestor):
             logger.warning("Failed to parse frontmatter, treating as plain content")
             return {}, text
         else:
-            return dict(post.metadata), post.content
+            return post.metadata.copy(), post.content
 
     def _resolve_timestamp(self, fm_data: dict[str, Any], file_path: Path) -> datetime:
         """Resolve a timestamp from frontmatter or filesystem metadata.

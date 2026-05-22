@@ -24,6 +24,9 @@ dependencies = [
     # Security: pin urllib3 above CVE-2026-44431 / CVE-2026-44432
     # (transitive via requests/conan). Both are fixed in 2.7.0.
     "urllib3>=2.7.0",
+    # Security: pin idna above CVE-2026-45409 (transitive via httpx /
+    # requests). Fixed in 3.15.
+    "idna>=3.15",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -97,6 +100,23 @@ dev = [
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv]
+# uv.lock is the canonical, fully-pinned resolution for local + CI
+# installs (`uv sync --all-extras`). Regenerate with `uv lock` after any
+# dependency change; CI runs `uv sync --locked` and fails on a stale lock.
+#
+# constraint-dependencies floor transitive packages that pip-audit
+# flagged (DEP-003). A constraint tightens resolution *if* the package is
+# in the graph without adding it as a direct dependency, so a future
+# `uv lock` cannot silently regress onto a vulnerable build/dev version.
+constraint-dependencies = [
+    "cryptography>=48.0.0",
+    "pyjwt>=2.12.1",
+    "pip>=26.1.1",
+    "setuptools>=78.1.1",
+    "wheel>=0.47.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["creek", "creek.*", "creek_mcp", "creek_mcp.*"]
