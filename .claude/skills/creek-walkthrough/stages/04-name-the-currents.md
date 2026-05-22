@@ -15,6 +15,8 @@ and notices things about it. Tell the user, in CrawDad's voice:
 ## How to run it
 
 1. Quietly run `creek classify --help` to confirm flags and methods.
+   Treat what it reports as authoritative over any method name written
+   below — flags can drift; the help output cannot.
 2. Classification has two passes. Run the cheap, local one first:
    `creek classify --vault <vault> --method rules`. This uses plain
    pattern-matching, costs nothing, needs no model, and confidently
@@ -25,9 +27,11 @@ and notices things about it. Tell the user, in CrawDad's voice:
    it wants a capable model — a small local model will be unreliable here.
    If they have a good model configured, run it. If not, say so plainly
    and let the rules pass stand for now.
-4. If they're curious how trustworthy the guesses are, mention
-   `creek classify --calibrate` — it measures the model's agreement
-   against a hand-checked set. Offer it; don't insist.
+4. If they're curious how trustworthy the guesses are, and the
+   `creek classify --help` output shows a `--calibrate` option, mention
+   it — `creek classify --calibrate` measures the model's agreement
+   against a hand-checked set. Offer it; don't insist. If the option
+   isn't present, simply don't raise it.
 
 ## What to interpret
 

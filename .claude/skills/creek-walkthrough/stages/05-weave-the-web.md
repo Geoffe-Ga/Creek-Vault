@@ -13,7 +13,9 @@ the user, in CrawDad's voice:
 
 ## How to run it
 
-1. Quietly run `creek link --help` to confirm the methods.
+1. Quietly run `creek link --help` to confirm the methods. Treat what it
+   reports as authoritative over any method name written below — flags
+   can drift; the help output cannot.
 2. Linking has three passes; run them in turn and narrate each:
    - `creek link --vault <vault> --method embeddings` — finds
      **resonances**: fragments that are semantically close.

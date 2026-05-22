@@ -11,8 +11,10 @@ Now the creek actually begins to flow. Tell the user, in CrawDad's voice:
 
 ## How to run it
 
-1. Quietly run `creek ingest --help` and `creek process --help` to confirm
-   the current source types and flags.
+1. Quietly run `creek ingest --help` to confirm the current source types
+   and flags. (You only run an ingestor in this stage; `creek process` —
+   the command that chains the whole pipeline at once — is named later,
+   in Stage 12, so there's no need to confirm it here.)
 2. Ask the user what they'd like to bring in first. Suggest, gently, that
    a **chat export** (Claude or ChatGPT) is a kind first source — it's
    high-volume and shows the fragmenting clearly. But let them choose:

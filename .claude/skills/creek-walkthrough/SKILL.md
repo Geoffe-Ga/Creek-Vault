@@ -102,7 +102,7 @@ actually standing in.
 | 6 | `stages/06-let-it-pool.md` | Compile the fragments into readable pages. |
 | 7 | `stages/07-see-the-whole-creek.md` | Read the vault's state, all at once. |
 | 8 | `stages/08-tend-the-banks.md` | Lint — tend paradox, compost, the unnamed. |
-| 9 | `stages/09-listen.md` | Mine for what wants to be written. |
+| 9 | `stages/09-listen.md` | Listen — mine for what wants to be written. |
 | 10 | `stages/10-let-it-speak.md` | Draft an essay in the user's own voice. |
 | 11 | `stages/11-meet-crawdad.md` | Move to Discord — the conversational layer. |
 | 12 | `stages/12-the-rhythm.md` | The ongoing cadence; how to live with it. |
