@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
     from creek.models import FragmentLevel
 
+__all__ = ["AggregateLevel", "AggregationConfig", "aggregate"]
+
 AggregateLevel = Literal["exchange", "burst", "session"]
 """Target levels supported by :func:`aggregate`.
 

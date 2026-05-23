@@ -100,7 +100,7 @@ class LinkingConfig(BaseModel):
     eddy_min_fragments: int = 5
     """Minimum fragments required to form an Eddy."""
 
-    exchange_max_gap_minutes: int = 30
+    exchange_max_gap_minutes: int = Field(default=30, ge=1)
     """Maximum minute-gap between consecutive messages still grouped into
     the same ``exchange`` by the FEAT-022 aggregator. Inclusive boundary.
     """
@@ -111,7 +111,7 @@ class LinkingConfig(BaseModel):
     Inclusive boundary.
     """
 
-    session_max_gap_minutes: int = 360
+    session_max_gap_minutes: int = Field(default=360, ge=1)
     """Maximum minute-gap between consecutive bursts still grouped into the
     same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
     """

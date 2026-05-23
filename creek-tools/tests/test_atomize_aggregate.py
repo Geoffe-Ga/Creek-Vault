@@ -315,10 +315,6 @@ class TestBurstTransition:
 
     def test_similarity_equal_to_threshold_stays_in_burst(self) -> None:
         """Boundary: similarity exactly at threshold keeps the burst joined."""
-        cfg = AggregationConfig(
-            burst_similarity_threshold=0.5,
-            embedder=_fake_embedder({"a": [1.0, 0.0], "b": [0.5, 0.5**0.5 * 1.0]}),
-        )
         # cosine([1,0], [0.5, 0.866]) ≈ 0.5 — equality boundary.
         exchanges = [
             _frag(id_="e1", title="a", minute=0, level="exchange"),
