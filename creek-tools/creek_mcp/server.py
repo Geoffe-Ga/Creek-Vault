@@ -32,6 +32,7 @@ from creek_mcp.tools import (
     purge_fragment_tool,
     purge_source_tool,
     purge_vault_tool,
+    redact_scan_tool,
     report_tool,
     save_tool,
     skills_refresh_tool,
@@ -225,6 +226,19 @@ def build_server(
         return ingest_tool(
             vault_path=vault,
             source_type=source_type,
+            input_path=input_path,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.redact.scan")
+    def _redact_scan(
+        input_path: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Read-only PII / secret scan over a vault-relative directory (FEAT-027)."""
+        return redact_scan_tool(
+            vault_path=vault,
             input_path=input_path,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,

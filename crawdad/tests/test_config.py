@@ -128,3 +128,47 @@ def test_is_allowed_user(tmp_path: Path) -> None:
     assert config.is_allowed(user_id=111, channel_id=999) is True
     assert config.is_allowed(user_id=222, channel_id=999) is False
     assert config.is_allowed(user_id=111, channel_id=888) is False
+
+
+def test_config_attachments_defaults_to_25_mib_and_inbound(tmp_path: Path) -> None:
+    """FEAT-027: the default attachment config matches the documented limits."""
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[1],
+        allowed_channel_ids=[2],
+    )
+    assert config.attachments.max_size_bytes == 25 * 1024 * 1024
+    assert config.attachments.staging_subpath == Path("00-Creek-Meta") / "Inbound"
+    assert ".md" in config.attachments.allowed_extensions
+    assert ".exe" in config.attachments.denied_extensions
+
+
+def test_load_config_parses_attachment_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FEAT-027: ``attachments:`` block in YAML overrides each field."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n"
+        "attachments:\n"
+        "  max_size_bytes: 10485760\n"
+        "  allowed_extensions: ['.md', '.txt']\n"
+        "  denied_extensions: ['.exe', '.sh']\n"
+        "  channel_privacy_tiers:\n"
+        "    222: intimate\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+    assert config.attachments.max_size_bytes == 10 * 1024 * 1024
+    assert config.attachments.allowed_extensions == frozenset({".md", ".txt"})
+    assert config.attachments.denied_extensions == frozenset({".exe", ".sh"})
+    assert config.attachments.channel_privacy_tiers[222] == "intimate"

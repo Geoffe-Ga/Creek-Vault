@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,8 @@ class _FakeMessage:
     author: _FakeAuthor
     channel: _FakeChannel
     content: str
+    id: int = 1
+    attachments: list[Any] = field(default_factory=list)
 
 
 @pytest.fixture
@@ -676,3 +678,340 @@ async def test_setup_hook_syncs_when_loop_runner_provided(
     await client.setup_hook()
 
     assert sync_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# FEAT-027 — Discord attachment handling
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeAttachment:
+    """Stand-in for ``discord.Attachment`` used by handler tests."""
+
+    filename: str
+    size: int
+    payload: bytes = b""
+    url: str = "https://cdn.example/file"
+
+    async def read(self) -> bytes:
+        return self.payload
+
+
+async def test_attachment_path_downloads_scans_and_prompts_consent(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Attachment messages: download → MCP scan → reply with consent prompt."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(
+        filename="journal.md",
+        size=4,
+        payload=b"safe",
+    )
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="here's my journal",
+        id=42,
+        attachments=[attachment],
+    )
+
+    scan_calls: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            scan_calls.append({"name": name, "args": arguments})
+            return "Scan summary: no findings"
+
+    client = _StubMCPClient(_Session())  # type: ignore[arg-type]
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=client,  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    # File landed at deterministic path.
+    staged = (
+        config.vault_path / "00-Creek-Meta" / "Inbound" / "999" / "42" / "journal.md"
+    )
+    assert staged.read_bytes() == b"safe"
+
+    # The scan tool was invoked with the staging dir relative to the vault.
+    assert len(scan_calls) == 1
+    assert scan_calls[0]["name"] == "creek.redact.scan"
+    assert scan_calls[0]["args"]["input_path"] == "00-Creek-Meta/Inbound/999/42"
+
+    # Reply mentions staging, scan results, and the consent prompt.
+    assert len(channel.sent) == 1
+    reply = channel.sent[0]
+    assert "00-Creek-Meta/Inbound/999/42" in reply
+    assert "Safety scan" in reply
+    assert "ingest" in reply.lower()
+
+
+async def test_attachment_path_replies_when_redact_tool_missing(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Downloads succeed, but the soft-error fires when the tool isn't advertised."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=99,
+        attachments=[attachment],
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),  # no creek.redact.scan here
+    )
+
+    assert len(channel.sent) == 1
+    assert "creek.redact.scan" in channel.sent[0]
+    assert "Run `creek redact --scan" in channel.sent[0]
+
+
+async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """If creek.redact.scan dies mid-call, the user sees the soft MCP error."""
+    from crawdad.mcp_client import MCPUnavailableError
+
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=7,
+        attachments=[attachment],
+    )
+
+    session = _StubSession(
+        errors={"creek.redact.scan": MCPUnavailableError("subprocess died")}
+    )
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert len(channel.sent) == 1
+    assert "unreachable" in channel.sent[0].lower()
+
+
+async def test_attachment_path_short_circuits_when_all_already_present(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A re-upload of identical bytes replies 'already staged' without scanning."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+
+    def _build_message() -> Any:
+        return _FakeMessage(
+            author=_FakeAuthor(id=111),
+            channel=channel,
+            content="",
+            id=100,
+            attachments=[attachment],
+        )
+
+    scan_call_count = 0
+
+    class _Session:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            nonlocal scan_call_count
+            scan_call_count += 1
+            return "Scan summary: no findings"
+
+    client = _StubMCPClient(_Session())  # type: ignore[arg-type]
+
+    # First upload — bytes are new; scan runs.
+    await handle_message(
+        _build_message(),
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=client,  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert scan_call_count == 1
+
+    # Second upload of identical bytes — already staged; no scan call.
+    channel.sent.clear()
+    await handle_message(
+        _build_message(),
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=client,  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert scan_call_count == 1
+    assert "already staged" in channel.sent[0].lower()
+
+
+async def test_attachment_path_replies_with_rejection_summary_when_all_rejected(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """All-rejected uploads reply with the rejection summary and never call MCP."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(
+        filename="badness.exe",
+        size=10,
+        payload=b"MZ\x00\x00",
+    )
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=55,
+        attachments=[attachment],
+    )
+
+    class _BoomSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            raise AssertionError("MCP should not be invoked when nothing was accepted")
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_BoomSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert len(channel.sent) == 1
+    assert "extension not allowed" in channel.sent[0]
+    # No consent prompt when nothing landed.
+    assert "ingest" not in channel.sent[0].lower()
+
+
+async def test_attachment_path_oversized_file_is_rejected_in_reply(
+    tmp_path: Path, session_state: SessionState
+) -> None:
+    """An oversized attachment is rejected without consuming the body."""
+    from crawdad.config import AttachmentConfig
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        attachments=AttachmentConfig(max_size_bytes=8),
+    )
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="big.md", size=1024, payload=b"x" * 1024)
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=15,
+        attachments=[attachment],
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert len(channel.sent) == 1
+    assert "exceeds max" in channel.sent[0]
+
+
+async def test_attachment_path_uses_channel_tier_override_when_configured(
+    tmp_path: Path, session_state: SessionState
+) -> None:
+    """FEAT-027: per-channel privacy tier override is forwarded to creek.redact.scan."""
+    from crawdad.config import AttachmentConfig
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        attachments=AttachmentConfig(channel_privacy_tiers={999: "intimate"}),
+    )
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="x.md", size=4, payload=b"text")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=11,
+        attachments=[attachment],
+    )
+
+    captured: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, _name: str, args: dict[str, Any] | None = None
+        ) -> str:
+            captured.append(args or {})
+            return "Scan complete"
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert captured[0]["privacy_tier_ceiling"] == "intimate"
+
+
+async def test_attachment_path_short_circuits_before_agent_loop(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Attachment messages do NOT run the agent loop — consent is required first."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="x.md", size=4, payload=b"text")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="please ingest these",
+        id=8,
+        attachments=[attachment],
+    )
+
+    class _ExplodingRouter:
+        async def extract_intents(self, **_kwargs: Any) -> Any:
+            raise AssertionError("router must not run on the same turn as attachments")
+
+    composer = _StubComposer("(unused)")
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=_ExplodingRouter(),  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+    assert composer.calls == []
