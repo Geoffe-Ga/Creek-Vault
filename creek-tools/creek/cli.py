@@ -979,7 +979,7 @@ def compile_(
     side-channel log under ``00-Creek-Meta/Processing-Log/`` rather
     than flattened into the synthesis page.
     """
-    from creek.compile.engine import TARGET_KINDS, _default_llm, compile_to_vault
+    from creek.compile.engine import TARGET_KINDS, compile_to_vault, default_llm
 
     if target_kind not in TARGET_KINDS:
         console.print(
@@ -997,7 +997,7 @@ def compile_(
         target_kind=kind,
         target_id=target_id,
         target_title=target_title,
-        llm=_default_llm(config.llm),
+        llm=default_llm(config.llm),
     )
     console.print(
         f"[bold green]Compiled {fragment_id} -> {written}[/bold green]",

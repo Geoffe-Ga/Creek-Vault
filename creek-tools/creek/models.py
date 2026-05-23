@@ -713,7 +713,12 @@ class CompiledPage(BaseModel):
 
     model_config = ConfigDict(use_enum_values=True)
 
-    type: str = "compiled_page"
+    type: Literal["compiled_page"] = "compiled_page"
+    """Discriminator field. Reserved for future ``Annotated[Union[...],
+    Field(discriminator="type")]`` dispatch when the compiled layer
+    grows beyond ``CompiledPage`` — pinning the literal here means
+    mypy will narrow correctly once the union exists.
+    """
     target_kind: CompileTargetKind
     target_id: str
     title: str
