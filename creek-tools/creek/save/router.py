@@ -10,10 +10,19 @@ the CLI, and tests all share the same source of truth.
 from __future__ import annotations
 
 from enum import StrEnum
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-INTIMATE_STUB_RELPATH = Path("10-Liminal/Compost/intimate-stubs")
-"""Where intimate-tier bodies land — gitignored at the repo level."""
+from creek.save._constants import INTIMATE_STUB_RELPATH
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+__all__ = [
+    "INTIMATE_STUB_RELPATH",
+    "TARGET_SUBDIRS",
+    "SaveTarget",
+    "target_directory",
+]
 
 
 class SaveTarget(StrEnum):
