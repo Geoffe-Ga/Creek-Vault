@@ -28,7 +28,7 @@ from crawdad.intents import ToolInfo
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
-from crawdad.skill_loader import load_skills_for_session
+from crawdad.skill_loader import SkillStackRegistry, load_skills_for_session
 from crawdad.state import StateUnavailableError, load_session_state
 
 if TYPE_CHECKING:
@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
     from crawdad.config import CrawDadConfig
     from crawdad.mcp_client import ToolDetails
-    from crawdad.skill_loader import VoiceSkillStack
     from crawdad.slash_commands import LoopRunner
     from crawdad.state import SessionState
 
@@ -91,18 +90,25 @@ def run_bot(config: CrawDadConfig) -> None:
 
     FEAT-015 adds the composer + voice-skill stack to the wiring. The
     skill stack is loaded once at session start from
-    ``<vault>/creek-skills/`` per the FEAT-015 plan; FEAT-016 will
-    introduce dynamic register switching.
+    ``<vault>/creek-skills/`` per the FEAT-015 plan; FEAT-029 introduced
+    the :class:`SkillStackRegistry` so the active register can be
+    swapped mid-session via natural language or
+    ``/crawdad register <name>`` without restarting the bot.
     """
     logging.basicConfig(level=logging.INFO)
     session_state = _safe_load_state(config.vault_path)
     tool_details = asyncio.run(_startup_probe(config))
-    skills = load_skills_for_session(vault_path=config.vault_path, state=session_state)
+    initial_skills = load_skills_for_session(
+        vault_path=config.vault_path, state=session_state
+    )
+    skill_registry = SkillStackRegistry(
+        stack=initial_skills, vault_path=config.vault_path, state=session_state
+    )
     components = _build_agent_components(config=config, tool_details=tool_details)
     loop_runner = _build_loop_runner(
         components=components,
         session_state=session_state,
-        skills=skills,
+        skill_registry=skill_registry,
     )
     client = CrawDadClient(
         config=config,
@@ -112,8 +118,10 @@ def run_bot(config: CrawDadConfig) -> None:
         mcp_client=components.mcp_client,
         known_tools=components.known_tools,
         history=components.history,
-        skills=skills,
+        skills=skill_registry.stack,
+        skill_registry=skill_registry,
         loop_runner=loop_runner,
+        register_switcher=skill_registry.activate_register,
     )
     client.run(config.discord_bot_token)
 
@@ -122,13 +130,16 @@ def _build_loop_runner(
     *,
     components: _AgentComponents,
     session_state: SessionState | None,
-    skills: VoiceSkillStack,
+    skill_registry: SkillStackRegistry,
 ) -> LoopRunner | None:
     """Return a closure that runs one loop turn end-to-end.
 
     The returned callable is what :mod:`crawdad.slash_commands` invokes
     when a Discord user types `/crawdad <command>`. ``None`` when the
     agent loop isn't wired (no router → no slash commands).
+
+    The closure captures the :class:`SkillStackRegistry` so FEAT-029
+    register switches persist across turns within the same bot session.
     """
     if components.router is None or components.composer is None:
         return None
@@ -159,7 +170,8 @@ def _build_loop_runner(
                 known_tools=known_tools,
                 history=history,
                 session_state=session_state,
-                skills=skills,
+                skills=skill_registry.stack,
+                skill_registry=skill_registry,
             )
             return _truncate_for_discord(outcome.reply)
         except Exception:

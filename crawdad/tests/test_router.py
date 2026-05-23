@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from crawdad.history import ConversationHistory
-from crawdad.intents import PrivacyTierCeiling, ToolInfo
+from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE, PrivacyTierCeiling, ToolInfo
 from crawdad.router import (
     IntentRouter,
     RouterParseError,
@@ -261,6 +261,68 @@ async def test_router_translates_anthropic_api_error_to_parse_error(
             history=ConversationHistory(),
             state=session_state,
         )
+
+
+def test_build_router_prompt_mentions_register_switch_intent(
+    tools: list[ToolInfo], session_state: SessionState
+) -> None:
+    """FEAT-029: the prompt explains how to emit the activate_register intent.
+
+    Without the instruction, Haiku will try to satisfy "switch to the
+    analytic register" by hallucinating an MCP tool name. The prompt
+    must name the client-side intent type explicitly.
+    """
+    prompt = build_router_prompt(
+        message="switch to the analytic register",
+        history=ConversationHistory(),
+        state=session_state,
+        tools=tools,
+    )
+
+    assert ACTIVATE_REGISTER_INTENT_TYPE in prompt
+    assert "register" in prompt.lower()
+    assert "switch" in prompt.lower() or "activate" in prompt.lower()
+
+
+async def test_router_emits_activate_register_for_natural_language_phrase(
+    tools: list[ToolInfo], session_state: SessionState
+) -> None:
+    """A switch phrase yields an activate_register intent.
+
+    With the prompt updated to teach Haiku about the intent type, a
+    well-behaved Haiku reply emits ``crawdad.activate_register`` with
+    the requested register name. We stub the model so the test pins
+    the parsing path, not the model's behavior.
+    """
+    fake_haiku = _FakeAnthropic(
+        json.dumps(
+            {
+                "intents": [
+                    {
+                        "type": ACTIVATE_REGISTER_INTENT_TYPE,
+                        "args": {"register": "analytic"},
+                    }
+                ],
+                "compose": True,
+            }
+        )
+    )
+    router = IntentRouter(
+        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        model="claude-haiku-test",
+        tools=tools,
+    )
+
+    response = await router.extract_intents(
+        message="switch to the analytic voice",
+        history=ConversationHistory(),
+        state=session_state,
+    )
+
+    assert len(response.intents) == 1
+    assert response.intents[0].type == ACTIVATE_REGISTER_INTENT_TYPE
+    assert response.intents[0].args == {"register": "analytic"}
+    assert response.compose is True
 
 
 async def test_router_extracts_fenced_json_blocks(

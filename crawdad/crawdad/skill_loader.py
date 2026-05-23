@@ -15,9 +15,10 @@ error):
 The session-state wavelength snapshot supplies the phase. The default
 register is :data:`crawdad.config.DEFAULT_REGISTER` ("confessional",
 the long-term-memory reflective register from the ontology). Callers
-can ask for extra registers via ``extra_registers=...`` — FEAT-016's
-slash commands will use this to switch into ``praxis`` for actionable
-turns.
+can ask for extra registers via ``extra_registers=...``. FEAT-029 adds
+the :class:`SkillStackRegistry` so the active register can be swapped
+mid-session by the dispatcher's ``crawdad.activate_register`` branch or
+the ``/crawdad register`` slash command.
 
 The loader is forgiving: a vault without a fleshed-out voice tree
 still produces a :class:`VoiceSkillStack`, just an empty one, and the
@@ -140,6 +141,79 @@ def load_skills_for_session(
         _append_if_present(collected, register_path, name=f"register:{register}")
 
     return VoiceSkillStack(skills=tuple(collected))
+
+
+class SkillStackRegistry:
+    """Mutable holder for the active :class:`VoiceSkillStack` (FEAT-029).
+
+    The default stack is built at session start by
+    :func:`load_skills_for_session`. The dispatcher's
+    ``crawdad.activate_register`` branch (and the ``/crawdad register``
+    slash command) call :meth:`activate_register` to swap the stack in
+    place; the same registry instance lives in the loop runner closure
+    so the switch persists across turns within a single bot session.
+
+    The registry validates register names with the same regex the loader
+    uses for ``extra_registers`` and checks file existence before
+    reloading, so unknown / unsafe names soft-fail rather than mutate.
+    """
+
+    def __init__(
+        self,
+        *,
+        stack: VoiceSkillStack,
+        vault_path: Path,
+        state: SessionState | None,
+    ) -> None:
+        """Cache the initial stack and the inputs needed to reload it.
+
+        Args:
+            stack: The stack produced by :func:`load_skills_for_session`
+                at session start.
+            vault_path: Root of the user's Obsidian vault — passed
+                verbatim into subsequent reload calls.
+            state: Session-state snapshot for phase resolution. Pinned
+                at construction so a register switch keeps the same
+                phase skill even if the wavelength evolves later.
+        """
+        self._stack = stack
+        self._vault_path = vault_path
+        self._state = state
+
+    @property
+    def stack(self) -> VoiceSkillStack:
+        """Return the currently active skill stack."""
+        return self._stack
+
+    def activate_register(self, name: str) -> bool:
+        """Reload the stack with *name* as an additional active register.
+
+        Returns ``True`` when the swap succeeded (the stack now reflects
+        the requested register) and ``False`` when the name is unsafe
+        or the corresponding ``registers/<name>.SKILL.md`` file is
+        missing. On failure the previous stack is preserved untouched —
+        the caller is free to surface a user-facing soft error.
+        """
+        if not _SAFE_NAME_RE.match(name):
+            _LOGGER.warning("refusing register %r: must match [a-z][a-z-]*", name)
+            return False
+        register_path = (
+            self._vault_path / CREEK_SKILLS_DIRNAME / "registers" / f"{name}.SKILL.md"
+        )
+        if not register_path.is_file():
+            _LOGGER.info(
+                "register %r not found at %s; soft-failing the switch",
+                name,
+                register_path,
+            )
+            return False
+        self._stack = load_skills_for_session(
+            vault_path=self._vault_path,
+            state=self._state,
+            extra_registers=(name,),
+        )
+        _LOGGER.info("activated voice register %r", name)
+        return True
 
 
 def _append_if_present(target: list[VoiceSkill], path: Path, *, name: str) -> None:

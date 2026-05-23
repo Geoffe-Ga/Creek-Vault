@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     from crawdad.config import CrawDadConfig
     from crawdad.mcp_client import MCPClient, MCPUnavailableError
     from crawdad.router import IntentRouter
-    from crawdad.skill_loader import VoiceSkillStack
-    from crawdad.slash_commands import LoopRunner
+    from crawdad.skill_loader import SkillStackRegistry, VoiceSkillStack
+    from crawdad.slash_commands import LoopRunner, RegisterSwitcher
     from crawdad.state import SessionState, StateUnavailableError
 
 _LOGGER = logging.getLogger("crawdad.bot")
@@ -87,6 +87,7 @@ async def handle_message(
     known_tools: tuple[str, ...] = (),
     history: ConversationHistory | None = None,
     skills: VoiceSkillStack | None = None,
+    skill_registry: SkillStackRegistry | None = None,
 ) -> None:
     """Process one Discord message.
 
@@ -102,6 +103,10 @@ async def handle_message(
         known_tools: MCP tool names snapshotted at session start.
         history: Conversation transcript appended in place.
         skills: Voice-skill stack loaded at session start.
+        skill_registry: FEAT-029 mutable registry. When provided it
+            takes precedence over ``skills`` and routes
+            ``crawdad.activate_register`` intents through to a live
+            stack swap.
 
     When ``router``, ``composer``, or ``mcp_client`` is ``None``, the
     handler falls back to the FEAT-013 stub reply — useful for tests
@@ -126,7 +131,8 @@ async def handle_message(
         known_tools=known_tools,
         history=history or ConversationHistory(),
         session_state=session_state,
-        skills=skills or _empty_skills(),
+        skills=_resolve_skills(skill_registry, skills),
+        skill_registry=skill_registry,
     )
     _LOGGER.info("loop outcome: %s", outcome.kind)
     await message.channel.send(_truncate_for_discord(outcome.reply))
@@ -137,6 +143,19 @@ def _empty_skills() -> VoiceSkillStack:
     from crawdad.skill_loader import VoiceSkillStack
 
     return VoiceSkillStack(skills=())
+
+
+def _resolve_skills(
+    registry: SkillStackRegistry | None, fallback: VoiceSkillStack | None
+) -> VoiceSkillStack:
+    """Return the active skill stack, preferring the registry when wired.
+
+    Extracted out of :func:`handle_message` so the message-handling
+    branch stays under the project's cyclomatic-complexity cap.
+    """
+    if registry is not None:
+        return registry.stack
+    return fallback or _empty_skills()
 
 
 def _truncate_for_discord(text: str) -> str:
@@ -180,7 +199,9 @@ class CrawDadClient(discord.Client):
         known_tools: tuple[str, ...] = (),
         history: ConversationHistory | None = None,
         skills: VoiceSkillStack | None = None,
+        skill_registry: SkillStackRegistry | None = None,
         loop_runner: LoopRunner | None = None,
+        register_switcher: RegisterSwitcher | None = None,
         intents: discord.Intents | None = None,
     ) -> None:
         """Store config + agent-loop components; init the parent ``Client``.
@@ -188,6 +209,12 @@ class CrawDadClient(discord.Client):
         ``loop_runner`` (FEAT-016) is the closure the slash command
         callbacks invoke to enter the FEAT-015 loop with a pre-baked
         user message. When ``None``, slash commands are not registered.
+
+        ``skill_registry`` and ``register_switcher`` (FEAT-029) thread
+        the mutable voice-register state through the free-text handler
+        and the ``/crawdad register`` slash command respectively, so
+        register switches survive across turns within the bot's
+        lifetime.
         """
         super().__init__(intents=intents or self._default_intents())
         self._config = config
@@ -198,6 +225,7 @@ class CrawDadClient(discord.Client):
         self._known_tools = known_tools
         self._history = history
         self._skills = skills
+        self._skill_registry = skill_registry
         self._loop_runner = loop_runner
         self.tree = app_commands.CommandTree(self)
         if loop_runner is not None:
@@ -205,7 +233,11 @@ class CrawDadClient(discord.Client):
             # the ``_TreeLike`` Protocol the registration function uses,
             # so cast to Any at the boundary. Verified by the structural
             # ``test_register_wires_every_command_onto_tree`` test.
-            register_slash_commands(cast("Any", self.tree), loop_runner=loop_runner)
+            register_slash_commands(
+                cast("Any", self.tree),
+                loop_runner=loop_runner,
+                register_switcher=register_switcher,
+            )
 
     @staticmethod
     def _default_intents() -> discord.Intents:
@@ -245,4 +277,5 @@ class CrawDadClient(discord.Client):
             known_tools=self._known_tools,
             history=self._history,
             skills=self._skills,
+            skill_registry=self._skill_registry,
         )

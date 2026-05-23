@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -503,6 +504,119 @@ async def test_loop_paradox_save_inherits_max_ceiling(
 
     save_call = next((args for name, args in session.calls if name == "creek.save"))
     assert save_call["privacy_tier_ceiling"] == "intimate"
+
+
+async def test_loop_activate_register_intent_swaps_composer_skills(
+    state: SessionState, tmp_path: Path
+) -> None:
+    """FEAT-029: a ``crawdad.activate_register`` intent re-wires the composer.
+
+    Before the switch the composer sees the initial (empty) stack; after
+    the dispatch the registry holds the new stack and the composer call
+    receives the loaded register file.
+    """
+    from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE
+    from crawdad.skill_loader import (
+        SkillStackRegistry,
+        VoiceSkillStack,
+        load_skills_for_session,
+    )
+
+    skills_dir = tmp_path / "creek-skills"
+    (skills_dir / "voice-core").mkdir(parents=True)
+    (skills_dir / "voice-core" / "SKILL.md").write_text(
+        "voice core body", encoding="utf-8"
+    )
+    (skills_dir / "registers").mkdir()
+    (skills_dir / "registers" / "analytic.SKILL.md").write_text(
+        "# Analytic register\nPrecise, taxonomy-leaning.",
+        encoding="utf-8",
+    )
+
+    initial = load_skills_for_session(vault_path=tmp_path, state=None)
+    registry = SkillStackRegistry(stack=initial, vault_path=tmp_path, state=None)
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=ACTIVATE_REGISTER_INTENT_TYPE,
+                        args={"register": "analytic"},
+                    )
+                ]
+            ),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+    session_obj = _ScriptedSession()
+    composer = _ScriptedComposer("switched")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(session_obj),  # type: ignore[arg-type]
+        known_tools=(),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=VoiceSkillStack(skills=()),
+        skill_registry=registry,
+    )
+
+    outcome = await loop.run("use the analytic voice")
+
+    assert outcome.kind == "composed"
+    assert composer.calls, "composer must be called after register switch"
+    composer_skills = composer.calls[0]["skills"]
+    bodies = composer_skills.bodies()
+    assert any("Analytic" in body for body in bodies)
+    # The registry's stack now matches what the composer saw.
+    assert registry.stack is composer_skills
+
+
+async def test_loop_activate_register_unknown_register_soft_errors(
+    state: SessionState, tmp_path: Path
+) -> None:
+    """An unknown register yields a soft-error dispatch result, no crash.
+
+    The composer still runs and the original skill stack is preserved.
+    """
+    from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE
+    from crawdad.skill_loader import SkillStackRegistry, VoiceSkillStack
+
+    # Empty vault — no registers/ tree, so any register name will miss.
+    initial = VoiceSkillStack(skills=())
+    registry = SkillStackRegistry(stack=initial, vault_path=tmp_path, state=None)
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=ACTIVATE_REGISTER_INTENT_TYPE,
+                        args={"register": "nonexistent"},
+                    )
+                ]
+            ),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+    composer = _ScriptedComposer("did not crash")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(_ScriptedSession()),  # type: ignore[arg-type]
+        known_tools=(),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=initial,
+        skill_registry=registry,
+    )
+
+    outcome = await loop.run("switch to a register that doesn't exist")
+
+    assert outcome.kind == "composed"
+    # Registry untouched on soft failure.
+    assert registry.stack is initial
 
 
 async def test_loop_records_user_and_assistant_turns(
