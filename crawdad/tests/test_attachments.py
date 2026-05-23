@@ -407,6 +407,16 @@ def test_config_refuses_absolute_staging_subpath() -> None:
         AttachmentConfig(staging_subpath=Path("/etc"))
 
 
+def test_config_refuses_parent_traversal_in_staging_subpath() -> None:
+    """``..`` segments are refused — defense in depth against vault escape.
+
+    Reviewer-flagged: ``Path("../../tmp").is_absolute()`` is ``False``,
+    so the absolute-path check alone is not enough.
+    """
+    with pytest.raises(ValueError, match=r"\.\."):
+        AttachmentConfig(staging_subpath=Path("../../tmp"))
+
+
 async def test_empty_allowed_extensions_passes_anything_not_denied(
     tmp_path: Path,
 ) -> None:
@@ -445,8 +455,7 @@ async def test_process_attachments_with_no_attachments_returns_empty(
 def test_format_attachment_summary_with_only_rejections(
     tmp_path: Path,
 ) -> None:
-    """A run with only rejections still produces a readable summary."""
-
+    """A run with only rejections uses a neutral header — nothing was staged."""
     processed = ProcessedAttachments(
         staging_dir=tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2",
         accepted=(),
@@ -455,6 +464,11 @@ def test_format_attachment_summary_with_only_rejections(
     summary = format_attachment_summary(processed, vault_path=tmp_path)
     assert "Rejected" in summary
     assert "Accepted" not in summary
+    # Header must NOT claim "staged at" when nothing landed on disk.
+    assert "staged at" not in summary
+    assert "would stage to" in summary
+    # The staging path is still shown for operator reference.
+    assert "00-Creek-Meta/Inbound/1/2" in summary
 
 
 def test_format_attachment_summary_outside_vault_renders_absolute(

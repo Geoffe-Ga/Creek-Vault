@@ -10,6 +10,7 @@ import pytest
 
 from crawdad.bot import handle_message, render_state_unavailable_reply
 from crawdad.config import CrawDadConfig
+from crawdad.mcp_client import MCPUnavailableError
 from crawdad.state import SessionState, StateUnavailableError
 
 
@@ -179,7 +180,6 @@ async def test_handle_subprocess_unavailable_replies_gracefully(
 ) -> None:
     """A simulated MCP subprocess failure produces the documented soft error."""
     from crawdad.bot import render_mcp_unavailable_reply
-    from crawdad.mcp_client import MCPUnavailableError
 
     reply = render_mcp_unavailable_reply(MCPUnavailableError("subprocess died"))
 
@@ -510,7 +510,6 @@ async def test_handle_message_mcp_unavailable_uses_soft_reply(
 ) -> None:
     """MCP subprocess death → loop returns the "unreachable" outcome."""
     from crawdad.intents import Intent, RouterResponse
-    from crawdad.mcp_client import MCPUnavailableError
 
     router = _StubRouter(RouterResponse(intents=[Intent(type="creek.state.read")]))
     composer = _StubComposer("(unused)")
@@ -787,7 +786,6 @@ async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
     """If creek.redact.scan dies mid-call, the user sees the soft MCP error."""
-    from crawdad.mcp_client import MCPUnavailableError
 
     channel = _FakeChannel(id=999, sent=[])
     attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")

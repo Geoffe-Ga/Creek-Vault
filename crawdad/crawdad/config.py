@@ -130,10 +130,12 @@ class AttachmentConfig(BaseModel):
             channel / per-message subdirectories are created. Default
             ``00-Creek-Meta/Inbound``.
         channel_privacy_tiers: Optional per-channel privacy tier
-            override (``open`` / ``personal`` / ``intimate``). When a
-            channel id is absent, attachments inherit the bot's default
-            personal tier — ingest writes are personal by default per
-            FEAT-011, so a missing entry never silently downgrades.
+            override (``open`` / ``personal`` / ``intimate`` / ``all``).
+            When a channel id is absent, attachments inherit the bot's
+            default ``personal`` tier — ingest writes are personal by
+            default per FEAT-011, so a missing entry never silently
+            downgrades. Tier strings are validated at config-parse time;
+            unknown values raise ``ValueError``.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -168,11 +170,23 @@ class AttachmentConfig(BaseModel):
     @field_validator("staging_subpath")
     @classmethod
     def _refuse_absolute_subpath(cls, value: Path) -> Path:
-        """Refuse absolute paths — staging must stay inside the vault."""
+        """Refuse absolute and ``..``-traversing paths — must stay in the vault.
+
+        ``Path.is_absolute()`` catches obvious ``/etc/foo`` cases; the
+        ``..`` check closes the defence-in-depth gap where a relative
+        path like ``../../tmp`` would still resolve outside the vault
+        root when joined against ``vault_path``.
+        """
         if value.is_absolute():
             msg = (
                 f"staging_subpath {value!r} must be vault-relative; "
                 "absolute paths could escape the vault root."
+            )
+            raise ValueError(msg)
+        if ".." in value.parts:
+            msg = (
+                f"staging_subpath {value!r} must not contain '..'; "
+                "parent-directory segments could escape the vault root."
             )
             raise ValueError(msg)
         return value

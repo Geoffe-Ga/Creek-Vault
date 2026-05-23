@@ -422,9 +422,15 @@ def format_attachment_summary(
     except ValueError:
         rel_staging = processed.staging_dir
 
-    lines: list[str] = [
-        f"**Attachments staged at** `{rel_staging}/`",
-    ]
+    # When every attachment was rejected nothing landed on disk, so the
+    # "staged at" header would be factually wrong. Use a neutral header
+    # that still includes the staging path for reference.
+    header = (
+        f"**Attachments staged at** `{rel_staging}/`"
+        if processed.accepted
+        else f"**Attachments** (would stage to `{rel_staging}/`)"
+    )
+    lines: list[str] = [header]
     if processed.accepted:
         lines.append("")
         lines.append("**Accepted:**")
