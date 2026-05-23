@@ -22,15 +22,16 @@ _EXPECTED_INGESTOR_NAMES: frozenset[str] = frozenset(
         "markdown",
         "presentation",
         "spreadsheet",
+        "substack",
     },
 )
 
 
 def test_ingestor_registry_size_matches_readme() -> None:
-    """Pin the registry size to the README's "10 source ingestors" claim."""
+    """Pin the registry size to the README's "11 source ingestors" claim."""
     # Update both this assertion and the README paragraph in
     # ``creek-tools/README.md`` ("Source platforms") together.
-    assert len(INGESTOR_REGISTRY) == 10
+    assert len(INGESTOR_REGISTRY) == 11
 
 
 def test_ingestor_registry_names_match_readme() -> None:

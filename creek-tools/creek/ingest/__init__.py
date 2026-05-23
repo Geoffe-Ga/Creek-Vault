@@ -48,6 +48,7 @@ from creek.ingest.images import ImageIngestor
 from creek.ingest.markdown import MarkdownIngestor
 from creek.ingest.presentations import PresentationIngestor
 from creek.ingest.spreadsheets import SpreadsheetIngestor
+from creek.ingest.substack import SubstackIngestor
 
 # Registry mapping ingestor names to their concrete classes.
 # To add a new ingestor, import its class above and add an entry here.
@@ -62,6 +63,7 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
     "markdown": MarkdownIngestor,
     "presentation": PresentationIngestor,
     "spreadsheet": SpreadsheetIngestor,
+    "substack": SubstackIngestor,
 }
 
 __all__ = [
@@ -86,6 +88,7 @@ __all__ = [
     "PresentationIngestor",
     "RawDocument",
     "SpreadsheetIngestor",
+    "SubstackIngestor",
     "assemble_ingested_fragment",
     "route_to_ingestor",
 ]

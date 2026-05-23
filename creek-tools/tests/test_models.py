@@ -27,6 +27,7 @@ from creek.models import (
     PraxisStatus,
     PraxisType,
     ReviewInterval,
+    SourceKind,
     SourcePlatform,
     Thread,
     ThreadStatus,
@@ -255,6 +256,7 @@ class TestSourcePlatformEnum:
             "image_ocr",
             "spreadsheet",
             "presentation",
+            "substack",
             "other",
         ]
         actual = [s.value for s in SourcePlatform]
@@ -298,6 +300,21 @@ class TestFragmentSource:
         dump = source.model_dump()
         assert isinstance(dump["platform"], str)
         assert dump["platform"] == "journal"
+
+    def test_kind_defaults_to_unclassified(self) -> None:
+        """FragmentSource.kind defaults to UNCLASSIFIED."""
+        source = FragmentSource(platform=SourcePlatform.JOURNAL)
+        assert source.kind == SourceKind.UNCLASSIFIED.value
+
+    def test_kind_writing_roundtrips(self) -> None:
+        """``kind = WRITING`` is preserved through model_dump."""
+        source = FragmentSource(
+            platform=SourcePlatform.SUBSTACK,
+            kind=SourceKind.WRITING,
+        )
+        dump = source.model_dump()
+        assert dump["kind"] == "writing"
+        assert dump["platform"] == "substack"
 
 
 class TestFrequencyClassification:
@@ -441,6 +458,38 @@ class TestFragment:
         assert frag.wavelength.phase == "peaking"
         assert frag.voice.voice_register == "analytical"
         assert frag.praxis_potential == "explicit"
+
+    def test_authored_at_defaults_to_none(self) -> None:
+        """Fragment.authored_at is ``None`` by default.
+
+        ``None`` is the honest answer when no source date was extracted
+        — fragments should never guess an authored date.
+        """
+        frag = Fragment(
+            id="frag-000000000016",
+            title="No date",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        )
+        assert frag.authored_at is None
+
+    def test_authored_at_round_trips_through_dump(self) -> None:
+        """``authored_at`` survives model_dump → model_validate."""
+        from datetime import UTC, datetime
+
+        when = datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+        frag = Fragment(
+            id="frag-000000000017",
+            title="Old essay",
+            source=FragmentSource(
+                platform=SourcePlatform.SUBSTACK,
+                kind=SourceKind.WRITING,
+            ),
+            authored_at=when,
+        )
+        dump = frag.model_dump(mode="json")
+        assert dump["authored_at"].startswith("2024-03-15")
+        roundtrip = Fragment.model_validate(dump)
+        assert roundtrip.authored_at == when
 
     def test_synthetic_id_is_unique(self) -> None:
         """synthetic_fragment_id() returns distinct, frag-prefixed values."""

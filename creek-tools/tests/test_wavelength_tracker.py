@@ -1038,3 +1038,58 @@ class TestDataclasses:
         trend = DosageTrend()
         assert trend.frequency_trends == {}
         assert trend.flagged_frequencies == []
+
+
+# ---- authored_at fallback ----
+
+
+class TestAuthoredAtBucketing:
+    """``authored_at`` takes precedence over ``created`` for time bucketing.
+
+    Without this, a Substack export ingested today would show up in
+    *this week's* wavelength snapshot even when every essay was
+    published years ago.
+    """
+
+    def test_fragment_with_authored_at_is_bucketed_by_authored_date(
+        self,
+        tracker: WavelengthTracker,
+    ) -> None:
+        """A 2024-authored fragment ingested today must miss the current window."""
+        from datetime import UTC, timedelta
+
+        from creek.generate.wavelength import _fragment_effective_date
+
+        ingested_today = datetime.now(tz=UTC)
+        old_authored = datetime(2024, 3, 15, tzinfo=UTC)
+        frag = _make_fragment(
+            frag_id="frag-old",
+            created=ingested_today,
+            phase=Phase.RISING,
+            dosage=Dosage.MEDICINE,
+            frequency=Frequency.F1,
+        )
+        frag = frag.model_copy(update={"authored_at": old_authored})
+        assert _fragment_effective_date(frag) == old_authored.date()
+
+        # A current-week window should NOT contain the 2024-authored fragment.
+        snapshot = tracker.analyze_period(
+            [frag],
+            ingested_today.date() - timedelta(days=6),
+            ingested_today.date(),
+        )
+        assert snapshot.fragment_count == 0
+
+    def test_fragment_without_authored_at_falls_back_to_created(self) -> None:
+        """When ``authored_at`` is ``None`` the bucket date is ``created``."""
+        from datetime import UTC
+
+        from creek.generate.wavelength import _fragment_effective_date
+
+        frag = _make_fragment(
+            frag_id="frag-fresh",
+            created=datetime(2026, 5, 23, tzinfo=UTC),
+        )
+        # No authored_at set → falls back to created.
+        assert frag.authored_at is None
+        assert _fragment_effective_date(frag) == frag.created.date()

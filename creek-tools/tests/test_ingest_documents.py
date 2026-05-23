@@ -271,6 +271,23 @@ class TestParseHtmlToMarkdown:
         result = _parse_html_to_markdown(html)
         assert "Click here" in result
 
+    def test_missing_markdownify_raises_helpful_error(self) -> None:
+        """When the optional ``markdownify`` extra is absent, raise a clear ImportError.
+
+        Users who installed ``creek-tools`` without the ``[documents]``
+        extra should see a one-liner pointing at the install command,
+        not an opaque ``ModuleNotFoundError``.
+        """
+        import sys
+
+        from creek.ingest.html import parse_html_to_markdown
+
+        with (
+            patch.dict(sys.modules, {"markdownify": None}),
+            pytest.raises(ImportError, match=r"creek-tools\[documents\]"),
+        ):
+            parse_html_to_markdown("<p>x</p>")
+
 
 # ---- TXT Parsing Tests ----
 
