@@ -59,11 +59,13 @@ from crawdad.mcp_client import MCPUnavailableError
 from crawdad.router import RouterParseError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from crawdad.composer import SonnetComposer
     from crawdad.history import ConversationHistory
     from crawdad.mcp_client import MCPClient
     from crawdad.router import IntentRouter
-    from crawdad.skill_loader import VoiceSkillStack
+    from crawdad.skill_loader import SkillStackRegistry, VoiceSkillStack
     from crawdad.state import SessionState
 
 _LOGGER = logging.getLogger("crawdad.loop")
@@ -121,9 +123,18 @@ class AgentLoop:
         history: ConversationHistory,
         session_state: SessionState | None,
         skills: VoiceSkillStack,
+        skill_registry: SkillStackRegistry | None = None,
         max_rounds: int = MAX_LOOP_ROUNDS,
     ) -> None:
-        """Cache injected components for the per-turn :meth:`run` call."""
+        """Cache injected components for the per-turn :meth:`run` call.
+
+        ``skill_registry`` (FEAT-029) is the mutable holder backing
+        ``crawdad.activate_register`` intents. When supplied, the loop
+        reads the current stack from the registry on each compose and
+        hands its ``activate_register`` method to the dispatcher so
+        register switches persist across turns. Without it the loop
+        falls back to the static ``skills`` argument.
+        """
         self._router = router
         self._composer = composer
         self._mcp_client = mcp_client
@@ -131,6 +142,7 @@ class AgentLoop:
         self._history = history
         self._session_state = session_state
         self._skills = skills
+        self._skill_registry = skill_registry
         self._max_rounds = max_rounds
 
     async def run(self, message: str) -> LoopOutcome:
@@ -183,7 +195,7 @@ class AgentLoop:
                 tool_results=aggregated,
                 history=self._history,
                 state=self._session_state,
-                skills=self._skills,
+                skills=self._current_skills(),
             )
         except ComposerFailureError as exc:
             _LOGGER.warning("composer failed: %s", exc)
@@ -196,9 +208,23 @@ class AgentLoop:
         """Open one MCP session, dispatch this round's intents, return results."""
         async with self._mcp_client.connect() as session:
             dispatcher = IntentDispatcher(
-                session=session, known_tools=self._known_tools
+                session=session,
+                known_tools=self._known_tools,
+                register_switcher=self._register_switcher(),
             )
             return await dispatcher.dispatch(response)
+
+    def _current_skills(self) -> VoiceSkillStack:
+        """Return the active skill stack, preferring the registry when wired."""
+        if self._skill_registry is not None:
+            return self._skill_registry.stack
+        return self._skills
+
+    def _register_switcher(self) -> Callable[[str], bool] | None:
+        """Return the dispatcher's register-switch callback or ``None``."""
+        if self._skill_registry is None:
+            return None
+        return self._skill_registry.activate_register
 
     async def _maybe_route_paradox(self, results: list[ToolResult]) -> list[ToolResult]:
         """If results mention a paradox, ensure a save call to liminal land.
@@ -271,12 +297,18 @@ async def run_one_turn(
     history: ConversationHistory,
     session_state: SessionState | None,
     skills: VoiceSkillStack,
+    skill_registry: SkillStackRegistry | None = None,
 ) -> LoopOutcome:
     """Convenience wrapper the bot handler calls.
 
     Constructs an :class:`AgentLoop` from the per-session components and
     runs it for one user turn. Returns the structured :class:`LoopOutcome`
     so callers can branch on ``kind`` for logging / metrics.
+
+    ``skill_registry`` (FEAT-029) — when supplied, the loop reads the
+    active skill stack from the registry and routes
+    ``crawdad.activate_register`` intents through it so the register
+    switch persists across turns.
     """
     loop = AgentLoop(
         router=router,
@@ -286,5 +318,6 @@ async def run_one_turn(
         history=history,
         session_state=session_state,
         skills=skills,
+        skill_registry=skill_registry,
     )
     return await loop.run(message)

@@ -18,13 +18,20 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
-from crawdad.intents import PrivacyTierCeiling
+from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE, PrivacyTierCeiling
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from crawdad.intents import Intent, RouterResponse
     from crawdad.mcp_client import MCPSession
+
+    # FEAT-029: synchronous callable that swaps the active voice-skill
+    # register. Returns True on success (register file present, stack
+    # reloaded), False on unknown / unsafe register names. The loop owns
+    # the underlying :class:`SkillStackRegistry` and passes its
+    # ``activate_register`` method down to the dispatcher.
+    RegisterSwitcher = Callable[[str], bool]
 
 _LOGGER = logging.getLogger("crawdad.dispatcher")
 
@@ -61,6 +68,7 @@ class IntentDispatcher:
         *,
         session: MCPSession,
         known_tools: Iterable[str],
+        register_switcher: RegisterSwitcher | None = None,
     ) -> None:
         """Cache the advertised tools so unknown intents fail fast.
 
@@ -70,9 +78,15 @@ class IntentDispatcher:
             known_tools: The MCP tool names snapshotted at session
                 start. Intent types outside this set raise
                 :class:`UnknownIntentError`.
+            register_switcher: FEAT-029 callback that swaps the loop's
+                active voice register. ``None`` causes
+                ``crawdad.activate_register`` intents to soft-error
+                rather than mutate the skill stack — useful in tests
+                and when the registry isn't wired (no vault layout).
         """
         self._session = session
         self._known_tools = frozenset(known_tools)
+        self._register_switcher = register_switcher
 
     async def dispatch(self, response: RouterResponse) -> list[ToolResult]:
         """Invoke each intent in order; collect the textual tool results.
@@ -91,6 +105,9 @@ class IntentDispatcher:
         """
         results: list[ToolResult] = []
         for intent in response.intents:
+            if intent.type == ACTIVATE_REGISTER_INTENT_TYPE:
+                results.append(self._handle_activate_register(intent))
+                continue
             if intent.type not in self._known_tools:
                 msg = (
                     f"router emitted intent type {intent.type!r} which is not "
@@ -107,6 +124,38 @@ class IntentDispatcher:
                 )
             )
         return results
+
+    def _handle_activate_register(self, intent: Intent) -> ToolResult:
+        """Run the FEAT-029 register switch for ``crawdad.activate_register``.
+
+        The result body is a short status line the composer can quote
+        verbatim (or summarise) for the user. The privacy ceiling on the
+        result mirrors the intent's declared ceiling so downstream
+        consumers see a faithful echo of the router's authorisation.
+        """
+        register = intent.args.get("register")
+        if not isinstance(register, str) or not register:
+            _LOGGER.info("activate_register intent missing 'register' arg")
+            body = "could not switch voice register: no register name was provided"
+        elif self._register_switcher is None:
+            _LOGGER.info(
+                "activate_register intent for %r but no switcher is wired", register
+            )
+            body = (
+                f"voice register switching is unavailable in this session; "
+                f"ignoring request to activate {register!r}"
+            )
+        elif self._register_switcher(register):
+            _LOGGER.info("voice register switched to %r", register)
+            body = f"voice register switched to {register!r}"
+        else:
+            _LOGGER.info("voice register switch refused for %r", register)
+            body = f"unknown voice register {register!r}; keeping the current register"
+        return ToolResult(
+            intent_type=intent.type,
+            body=body,
+            privacy_tier_ceiling=intent.privacy_tier_ceiling,
+        )
 
 
 def _build_arguments(intent: Intent) -> dict[str, object]:

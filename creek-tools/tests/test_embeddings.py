@@ -9,18 +9,26 @@ conftest.py to avoid model downloads.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pytest
 
 from creek.config import EmbeddingsConfig
-from creek.link.embeddings import EmbeddingLinker
+from creek.link.embeddings import (
+    CachedEmbedding,
+    EmbeddingLinker,
+    content_hash_for_text,
+    embeddings_cache_path,
+    fragment_embedding_text,
+)
 from creek.models import Fragment, FragmentSource, SourcePlatform
 
 if TYPE_CHECKING:
     from pathlib import Path
     from unittest.mock import MagicMock
+
+    import pytest
 
 _DIMS = 384  # all-MiniLM-L6-v2 output dimensions
 
@@ -208,46 +216,138 @@ class TestIncrementalMode:
         assert len(result) == 2
 
 
-# ---- Save / Load ----
+# ---- Cache Save / Load ----
 
 
-class TestSaveLoadEmbeddings:
-    """Tests for save_embeddings and load_embeddings disk persistence."""
+def _entry(
+    fragment_id: str,
+    *,
+    vector: list[float],
+    content_hash: str = "abc",
+    model_name: str = "all-MiniLM-L6-v2",
+    computed_at: datetime | None = None,
+) -> CachedEmbedding:
+    """Construct a CachedEmbedding with sensible defaults."""
+    return CachedEmbedding(
+        fragment_id=fragment_id,
+        content_hash=content_hash,
+        model_name=model_name,
+        vector=vector,
+        computed_at=computed_at or datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+class TestSaveLoadCache:
+    """Tests for ``save_cache`` / ``load_cache`` parquet persistence (INC-006)."""
 
     def test_roundtrip(self, tmp_path: Path) -> None:
-        """Saved embeddings should be loadable and identical."""
+        """Cache entries should survive a parquet round-trip unchanged."""
         linker = EmbeddingLinker(config=EmbeddingsConfig())
         original = {
-            "frag-001": [0.1, 0.2, 0.3],
-            "frag-002": [0.4, 0.5, 0.6],
+            "frag-001": _entry("frag-001", vector=[0.1, 0.2, 0.3]),
+            "frag-002": _entry("frag-002", vector=[0.4, 0.5, 0.6]),
         }
-        save_path = tmp_path / "embeddings.npz"
-        linker.save_embeddings(original, save_path)
-        loaded = linker.load_embeddings(save_path)
+        save_path = tmp_path / "embeddings.parquet"
+        linker.save_cache(original, save_path)
+        loaded = linker.load_cache(save_path)
         assert set(loaded.keys()) == set(original.keys())
-        for key in original:
-            np.testing.assert_allclose(loaded[key], original[key], rtol=1e-5)
+        for key, entry in original.items():
+            assert loaded[key].fragment_id == entry.fragment_id
+            assert loaded[key].content_hash == entry.content_hash
+            assert loaded[key].model_name == entry.model_name
+            np.testing.assert_allclose(loaded[key].vector, entry.vector, rtol=1e-5)
 
     def test_save_creates_file(self, tmp_path: Path) -> None:
-        """save_embeddings should create the .npz file."""
+        """save_cache should create the parquet file."""
         linker = EmbeddingLinker(config=EmbeddingsConfig())
-        save_path = tmp_path / "test.npz"
-        linker.save_embeddings({"a": [1.0]}, save_path)
+        save_path = tmp_path / "embeddings.parquet"
+        linker.save_cache({"a": _entry("a", vector=[1.0])}, save_path)
         assert save_path.exists()
 
-    def test_load_missing_file_raises(self, tmp_path: Path) -> None:
-        """load_embeddings should raise FileNotFoundError for missing file."""
-        linker = EmbeddingLinker(config=EmbeddingsConfig())
-        with pytest.raises(FileNotFoundError):
-            linker.load_embeddings(tmp_path / "nonexistent.npz")
+    def test_load_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        """load_cache should return an empty dict for a missing file.
 
-    def test_empty_embeddings_roundtrip(self, tmp_path: Path) -> None:
-        """Saving and loading empty embeddings should work."""
+        Treating a missing file as a cache miss lets callers fall
+        through to a full recompute without special-casing FileNotFound.
+        """
         linker = EmbeddingLinker(config=EmbeddingsConfig())
-        save_path = tmp_path / "empty.npz"
-        linker.save_embeddings({}, save_path)
-        loaded = linker.load_embeddings(save_path)
+        assert linker.load_cache(tmp_path / "nonexistent.parquet") == {}
+
+    def test_empty_cache_roundtrip(self, tmp_path: Path) -> None:
+        """Saving and loading an empty cache should work."""
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        save_path = tmp_path / "empty.parquet"
+        linker.save_cache({}, save_path)
+        loaded = linker.load_cache(save_path)
         assert loaded == {}
+
+    def test_load_drops_entries_from_other_models(self, tmp_path: Path) -> None:
+        """Cache entries for a non-active model must be invalidated on load."""
+        save_path = tmp_path / "embeddings.parquet"
+        writer = EmbeddingLinker(config=EmbeddingsConfig(model="old-model"))
+        writer.save_cache(
+            {
+                "frag-001": _entry(
+                    "frag-001",
+                    vector=[0.1, 0.2],
+                    model_name="old-model",
+                ),
+                "frag-002": _entry(
+                    "frag-002",
+                    vector=[0.3, 0.4],
+                    model_name="new-model",
+                ),
+            },
+            save_path,
+        )
+        reader = EmbeddingLinker(config=EmbeddingsConfig(model="new-model"))
+        loaded = reader.load_cache(save_path)
+        assert "frag-002" in loaded
+        assert "frag-001" not in loaded
+
+
+class TestContentHash:
+    """Tests for the content_hash_for_text helper."""
+
+    def test_stable_across_calls(self) -> None:
+        """Hashing the same text twice yields identical digests."""
+        assert content_hash_for_text("hello") == content_hash_for_text("hello")
+
+    def test_different_text_different_hash(self) -> None:
+        """Changing the source text changes the hash."""
+        assert content_hash_for_text("hello") != content_hash_for_text("HELLO")
+
+    def test_hex_digest_length(self) -> None:
+        """SHA-256 hex digests are 64 characters."""
+        assert len(content_hash_for_text("anything")) == 64
+
+
+class TestBuildCacheEntries:
+    """Tests for ``EmbeddingLinker.build_cache_entries``."""
+
+    def test_entry_records_fragment_text_hash(self) -> None:
+        """The content_hash should match the fragment's embedding text."""
+        linker = EmbeddingLinker(config=EmbeddingsConfig(model="m1"))
+        frag = _make_fragment("Alpha")
+        entries = linker.build_cache_entries(
+            [frag],
+            {frag.id: [0.1, 0.2, 0.3]},
+        )
+        expected_hash = content_hash_for_text(fragment_embedding_text(frag))
+        assert entries[frag.id].content_hash == expected_hash
+        assert entries[frag.id].model_name == "m1"
+        assert entries[frag.id].vector == [0.1, 0.2, 0.3]
+
+
+class TestEmbeddingsCachePath:
+    """Tests for the embeddings_cache_path helper."""
+
+    def test_returns_canonical_parquet_path(self, tmp_path: Path) -> None:
+        """The cache path lives in 00-Creek-Meta as a parquet file."""
+        assert (
+            embeddings_cache_path(tmp_path)
+            == tmp_path / "00-Creek-Meta" / "embeddings.parquet"
+        )
 
 
 # ---- Find Resonances ----

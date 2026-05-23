@@ -175,6 +175,23 @@ See [10. Common Pitfalls & Troubleshooting](#10-common-pitfalls--troubleshooting
 - Full type safety with mypy strict mode
 - Extensive documentation
 
+### 2.1 Setup (CI-equivalent dev environment)
+
+From `creek-tools/`:
+
+```bash
+./scripts/dev-setup.sh          # uv sync --all-extras + pre-commit install
+```
+
+The setup script installs the fully-pinned `uv.lock` so a fresh checkout runs `./scripts/check-all.sh` to the same result CI does on the same commit. Plain-pip fallback:
+
+```bash
+pip install -e '.[dev]'         # [dev] depends on [all]; this is self-contained
+pre-commit install
+```
+
+`[dev]` deliberately pulls in `[all]` (anthropic, embeddings, ocr, documents, spreadsheets, presentations, gdrive) because `tests/conftest.py` imports numpy, `tests/test_classify.py` mocks the anthropic SDK, and `tests/test_ingest_documents.py` parses DOCX/PDF/HTML — so the optional code paths are not optional at test-collection time (issue #206). The mypy floor in `[dev]` is pinned to the same major.minor as `uv.lock` and `.pre-commit-config.yaml` so the three install paths agree.
+
 ---
 
 ## 3. The Maximum Quality Engineering Mindset
@@ -305,6 +322,7 @@ creek-tools/
 │   └── architecture/
 │       └── ADR/                      # Architecture Decision Records
 ├── scripts/
+│   ├── dev-setup.sh                  # One-shot CI-equivalent dev environment (issue #206)
 │   ├── check-all.sh                  # Run every quality gate (single source of truth)
 │   ├── test.sh                       # Run test suite (--unit / --integration / --e2e / --all)
 │   ├── lint.sh                       # Ruff lint

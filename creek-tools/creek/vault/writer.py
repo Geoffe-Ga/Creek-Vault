@@ -60,6 +60,7 @@ _PLATFORM_SUBFOLDER: dict[str, str] = {
     SourcePlatform.DISCORD: "Messages",
     SourcePlatform.EMAIL: "Messages",
     SourcePlatform.ESSAY: "Writing",
+    SourcePlatform.SUBSTACK: "Writing/Substack",
     SourcePlatform.JOURNAL: "Journal",
     SourcePlatform.CODE: "Technical",
     SourcePlatform.MARKDOWN: "Notes",

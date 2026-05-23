@@ -12,6 +12,7 @@ from crawdad.slash_commands import (
     handle_draft,
     handle_help,
     handle_reflect,
+    handle_register,
     handle_save,
     handle_surface,
     handle_workflow,
@@ -34,14 +35,15 @@ async def _fake_loop_runner(message: str) -> str:
     return f"composer received: {message}"
 
 
-def test_crawdad_commands_lists_the_six_documented_names() -> None:
-    """The exported registry matches the FEAT-016 §pre-decided choice list."""
+def test_crawdad_commands_lists_the_documented_names() -> None:
+    """The exported registry matches the FEAT-016 + FEAT-029 set."""
     assert set(CRAWDAD_COMMANDS) == {
         "reflect",
         "checkin",
         "surface",
         "draft",
         "save",
+        "register",
         "workflow",
     }
 
@@ -125,6 +127,64 @@ async def test_handle_save_refuses_empty_content() -> None:
 
     assert len(replier.sent) == 1
     assert "content" in replier.sent[0].lower() or "what" in replier.sent[0].lower()
+
+
+async def test_handle_register_invokes_switcher_with_cleaned_name() -> None:
+    """``/crawdad register <name>`` calls the switcher with a normalised name."""
+    seen: list[str] = []
+
+    def _switcher(name: str) -> bool:
+        seen.append(name)
+        return True
+
+    replier = _FakeReplier()
+    await handle_register(replier, name="  Analytic  ", register_switcher=_switcher)
+
+    assert seen == ["analytic"]
+    assert len(replier.sent) == 1
+    assert "analytic" in replier.sent[0].lower()
+    assert "switched" in replier.sent[0].lower()
+
+
+async def test_handle_register_soft_errors_on_unknown_register() -> None:
+    """A switcher returning ``False`` produces a soft-error reply (no crash)."""
+
+    def _switcher(_name: str) -> bool:
+        return False
+
+    replier = _FakeReplier()
+    await handle_register(replier, name="nonexistent", register_switcher=_switcher)
+
+    assert len(replier.sent) == 1
+    body = replier.sent[0].lower()
+    assert "unknown" in body
+    assert "nonexistent" in replier.sent[0]
+
+
+async def test_handle_register_refuses_empty_name() -> None:
+    """An empty register name returns a help reply, not a switcher call."""
+    calls: list[str] = []
+
+    def _switcher(name: str) -> bool:
+        calls.append(name)
+        return True
+
+    replier = _FakeReplier()
+    await handle_register(replier, name="   ", register_switcher=_switcher)
+
+    assert calls == []
+    assert len(replier.sent) == 1
+    assert "register" in replier.sent[0].lower()
+
+
+async def test_handle_register_without_switcher_returns_soft_error() -> None:
+    """A missing switcher (no registry wired) yields the unavailable reply."""
+    replier = _FakeReplier()
+    await handle_register(replier, name="analytic", register_switcher=None)
+
+    assert len(replier.sent) == 1
+    body = replier.sent[0].lower()
+    assert "unavailable" in body or "wired" in body
 
 
 async def test_handle_workflow_list_returns_v11_placeholder() -> None:
@@ -277,6 +337,40 @@ async def test_every_loop_routed_callback_defers_and_replies(
     assert len(interaction.followup.sent) == 1
     # Every routed callback yields the loop's reply text.
     assert "composer received:" in interaction.followup.sent[0]
+
+
+async def test_register_callback_defers_and_invokes_switcher() -> None:
+    """``/crawdad register <name>`` defers the interaction and calls the switcher."""
+    switched: list[str] = []
+
+    def _switcher(name: str) -> bool:
+        switched.append(name)
+        return True
+
+    tree = _FakeTree()
+    register(tree, loop_runner=_fake_loop_runner, register_switcher=_switcher)
+    interaction = _FakeInteraction()
+
+    await tree.registered["register"]["callback"](interaction, name="praxis")
+
+    assert interaction.response.deferred == 1
+    assert switched == ["praxis"]
+    assert len(interaction.followup.sent) == 1
+    assert "praxis" in interaction.followup.sent[0].lower()
+
+
+async def test_register_callback_without_switcher_replies_softly() -> None:
+    """When no switcher is wired the callback still replies — does not crash."""
+    tree = _FakeTree()
+    register(tree, loop_runner=_fake_loop_runner)
+    interaction = _FakeInteraction()
+
+    await tree.registered["register"]["callback"](interaction, name="praxis")
+
+    assert interaction.response.deferred == 1
+    assert len(interaction.followup.sent) == 1
+    body = interaction.followup.sent[0].lower()
+    assert "unavailable" in body or "wired" in body
 
 
 async def test_workflow_callback_skips_loop_and_returns_stub() -> None:

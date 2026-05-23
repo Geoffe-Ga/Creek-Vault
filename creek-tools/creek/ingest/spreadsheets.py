@@ -104,8 +104,24 @@ class SpreadsheetBackend(Protocol):
     def is_available(self) -> bool:
         """Return ``True`` when the backend can perform reads right now."""
 
-    def read_workbook(self, path: Path) -> WorkbookData:
-        """Read *path* and return its decomposed :class:`WorkbookData`."""
+    def read_workbook(
+        self,
+        path: Path,
+        *,
+        has_header: bool | None = None,
+    ) -> WorkbookData:
+        """Read *path* and return its decomposed :class:`WorkbookData`.
+
+        ``has_header`` lets callers override the per-sheet header
+        auto-detection heuristic (#165):
+
+        * ``None`` (default) — auto-detect: a row qualifies as headers
+          only when every cell is a non-empty string.
+        * ``True`` — always treat the first row of every sheet as a
+          header row, regardless of content.
+        * ``False`` — never treat the first row as a header; render
+          ``col1..colN`` placeholders instead.
+        """
 
 
 class OpenpyxlUnavailableError(RuntimeError):
@@ -133,11 +149,20 @@ class OpenpyxlBackend:
             return False
         return True
 
-    def read_workbook(self, path: Path) -> WorkbookData:
+    def read_workbook(
+        self,
+        path: Path,
+        *,
+        has_header: bool | None = None,
+    ) -> WorkbookData:
         """Read *path* and return a :class:`WorkbookData`.
 
         Args:
             path: Filesystem path to a ``.xlsx`` or ``.csv`` file.
+            has_header: Per-call override for header auto-detection
+                (#165). ``None`` keeps the heuristic, ``True`` forces
+                the first row to be a header, ``False`` forces it to
+                be data.
 
         Returns:
             A :class:`WorkbookData` with one or more
@@ -149,11 +174,11 @@ class OpenpyxlBackend:
         """
         suffix = path.suffix.lower()
         if suffix == ".csv":
-            return _read_csv(path)
-        return self._read_xlsx(path)
+            return _read_csv(path, has_header=has_header)
+        return self._read_xlsx(path, has_header=has_header)
 
     @staticmethod
-    def _read_xlsx(path: Path) -> WorkbookData:
+    def _read_xlsx(path: Path, *, has_header: bool | None = None) -> WorkbookData:
         """Read an XLSX file via ``openpyxl``."""
         try:
             import openpyxl
@@ -172,7 +197,7 @@ class OpenpyxlBackend:
                 tuple(_cell_to_str(cell) for cell in row)
                 for row in worksheet.iter_rows(values_only=True)
             ]
-            sheets.append(_split_header(name, raw_rows))
+            sheets.append(_split_header(name, raw_rows, has_header=has_header))
         workbook.close()
         return WorkbookData(sheets=tuple(sheets))
 
@@ -194,7 +219,7 @@ user knows the result may be mojibake.
 """
 
 
-def _read_csv(path: Path) -> WorkbookData:
+def _read_csv(path: Path, *, has_header: bool | None = None) -> WorkbookData:
     """Read a CSV file as a single-sheet workbook.
 
     Probe order:
@@ -207,6 +232,9 @@ def _read_csv(path: Path) -> WorkbookData:
        sequence. Emits a ``WARNING`` log including the file path so
        the user has a chance to spot mojibake before it lands in the
        vault (BUG-010).
+
+    ``has_header`` is threaded into :func:`_split_header` so callers
+    can override per-call header auto-detection (#165).
     """
     raw = path.read_bytes()
     try:
@@ -214,7 +242,7 @@ def _read_csv(path: Path) -> WorkbookData:
     except UnicodeDecodeError:
         pass
     else:
-        return _csv_text_to_workbook(path, text)
+        return _csv_text_to_workbook(path, text, has_header=has_header)
 
     detection = chardet.detect(raw)
     detected = detection.get("encoding")
@@ -229,7 +257,7 @@ def _read_csv(path: Path) -> WorkbookData:
         except (UnicodeDecodeError, LookupError):
             pass
         else:
-            return _csv_text_to_workbook(path, text)
+            return _csv_text_to_workbook(path, text, has_header=has_header)
 
     text = raw.decode("cp1252")
     logger.warning(
@@ -239,28 +267,47 @@ def _read_csv(path: Path) -> WorkbookData:
         detected or "unknown",
         confidence,
     )
-    return _csv_text_to_workbook(path, text)
+    return _csv_text_to_workbook(path, text, has_header=has_header)
 
 
-def _csv_text_to_workbook(path: Path, text: str) -> WorkbookData:
+def _csv_text_to_workbook(
+    path: Path,
+    text: str,
+    *,
+    has_header: bool | None = None,
+) -> WorkbookData:
     """Parse decoded CSV ``text`` into a single-sheet :class:`WorkbookData`."""
     rows = [tuple(row) for row in csv.reader(text.splitlines())]
-    return WorkbookData(sheets=(_split_header(path.stem, rows),))
+    return WorkbookData(
+        sheets=(_split_header(path.stem, rows, has_header=has_header),),
+    )
 
 
 def _split_header(
     name: str,
     rows: list[tuple[str, ...]],
+    *,
+    has_header: bool | None = None,
 ) -> SheetData:
     """Split *rows* into ``(headers, data_rows)``.
 
-    Auto-detects a header row: the first row qualifies when every
-    cell is a non-empty string. Otherwise the first row is treated
-    as data and ``headers`` is ``None``.
+    Header-row selection follows ``has_header`` (#165):
+
+    * ``None`` (default) auto-detects via the heuristic — the first
+      row qualifies when every cell is a non-empty string.
+    * ``True`` always treats the first row as headers, regardless of
+      content. An empty sheet (``rows == []``) still yields no
+      headers since there is no first row to promote.
+    * ``False`` never treats the first row as headers; the rendered
+      table will use auto-generated ``colN`` placeholders.
     """
     if not rows:
         return SheetData(name=name, headers=None, rows=())
     first = rows[0]
+    if has_header is False:
+        return SheetData(name=name, headers=None, rows=tuple(rows))
+    if has_header is True:
+        return SheetData(name=name, headers=first, rows=tuple(rows[1:]))
     if first and all(cell.strip() for cell in first):
         return SheetData(
             name=name,
@@ -312,9 +359,21 @@ class SpreadsheetIngestor(Ingestor):
             for path in paths
         ]
 
-    def parse(self, raw: RawDocument) -> list[ParsedFragment]:
-        """Read the workbook and emit one fragment per non-empty sheet."""
-        workbook = self.backend.read_workbook(raw.path)
+    def parse(
+        self,
+        raw: RawDocument,
+        *,
+        has_header: bool | None = None,
+    ) -> list[ParsedFragment]:
+        """Read the workbook and emit one fragment per non-empty sheet.
+
+        ``has_header`` lets callers override per-document header
+        auto-detection (#165). The default ``None`` preserves the
+        heuristic; ``True`` / ``False`` force the first row to be
+        treated as headers / data respectively, in every sheet of the
+        workbook.
+        """
+        workbook = self.backend.read_workbook(raw.path, has_header=has_header)
         timestamp = file_modified_time(raw.path)
         fragments: list[ParsedFragment] = []
         for sheet in workbook.sheets:

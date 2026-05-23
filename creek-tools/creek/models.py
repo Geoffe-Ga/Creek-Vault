@@ -280,7 +280,24 @@ class SourcePlatform(StrEnum):
     IMAGE_OCR = "image_ocr"
     SPREADSHEET = "spreadsheet"
     PRESENTATION = "presentation"
+    SUBSTACK = "substack"
     OTHER = "other"
+
+
+class SourceKind(StrEnum):
+    """Coarse semantic category for a fragment's source.
+
+    Where :class:`SourcePlatform` answers *where the bytes came from*
+    (Substack, ChatGPT, Discord, …), ``SourceKind`` answers *what kind
+    of material it is* — a published essay versus a private journal
+    entry, a chat message versus a code file. Downstream surfaces use
+    the kind to make policy decisions (public-by-design vs.
+    private-by-default redaction, voice-proxy register selection,
+    folder routing) independently of which platform produced it.
+    """
+
+    WRITING = "writing"
+    UNCLASSIFIED = "unclassified"
 
 
 class Authorship(StrEnum):
@@ -407,6 +424,7 @@ class FragmentSource(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
     platform: SourcePlatform
+    kind: SourceKind = SourceKind.UNCLASSIFIED
     original_file: str | None = None
     original_encoding: str | None = None
     conversation_id: str | None = None
@@ -464,6 +482,10 @@ class Fragment(BaseModel):
     source: FragmentSource
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
+    # Timestamp the source itself records (a Substack post's publish
+    # date, a Discord message's ``timestamp``, …); ``None`` is the
+    # honest answer when no source date is extractable — never guess.
+    authored_at: datetime | None = None
     frequency: FrequencyClassification = Field(
         default_factory=FrequencyClassification,
     )
@@ -691,7 +713,12 @@ class CompiledPage(BaseModel):
 
     model_config = ConfigDict(use_enum_values=True)
 
-    type: str = "compiled_page"
+    type: Literal["compiled_page"] = "compiled_page"
+    """Discriminator field. Reserved for future ``Annotated[Union[...],
+    Field(discriminator="type")]`` dispatch when the compiled layer
+    grows beyond ``CompiledPage`` — pinning the literal here means
+    mypy will narrow correctly once the union exists.
+    """
     target_kind: CompileTargetKind
     target_id: str
     title: str

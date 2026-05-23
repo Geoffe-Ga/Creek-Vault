@@ -467,7 +467,7 @@ def test_cli_compile_writes_thread_with_provenance(
     def fake_llm(_prompt: str) -> str:
         return response
 
-    monkeypatch.setattr("creek.compile.engine._default_llm", lambda _config: fake_llm)
+    monkeypatch.setattr("creek.compile.engine.default_llm", lambda _config: fake_llm)
     runner = CliRunner()
     result = runner.invoke(
         app,
@@ -780,6 +780,11 @@ def test_compile_fragments_skips_empty_claim_text() -> None:
     )
     assert "claim-001" not in result.page.body
     assert "claim-002" in result.page.body
+    # The engine filters empty-text claims out of the rendered body but
+    # keeps them in provenance (the filter key is ``id``, not ``text``);
+    # pin both halves of that contract so a future reorder is caught.
+    assert any(p.claim_id == "claim-001" for p in result.page.provenance)
+    assert any(p.claim_id == "claim-002" for p in result.page.provenance)
 
 
 def test_compile_to_vault_skips_extra_fragments_in_directory(vault: Path) -> None:
@@ -803,6 +808,42 @@ def test_compile_to_vault_skips_extra_fragments_in_directory(vault: Path) -> Non
         llm=llm,
     )
     assert "extra body" not in prompts[0]
+
+
+def test_resolve_target_path_rejects_escaping_target_id(vault: Path) -> None:
+    """``target_id`` that resolves outside the compiled-layer dir is rejected.
+
+    The CLI passes ``target_id`` straight through from operator input;
+    a value like ``"../escape"`` would land the synthesis page outside
+    the intended ``02-Threads/Active/`` directory. The guard fires
+    before any write touches disk.
+    """
+    from creek.compile import engine as engine_module
+
+    with pytest.raises(ValueError, match="escapes the compiled-layer directory"):
+        engine_module._resolve_target_path(vault, "thread", "../escape")
+    # No file should have been written under the target directory.
+    assert not (vault / "02-Threads" / "Active" / "..escape.md").exists()
+    assert not (vault / "02-Threads" / "escape.md").exists()
+
+
+def test_compile_to_vault_rejects_escaping_target_id(vault: Path) -> None:
+    """The high-level entry point surfaces the escape guard's ValueError."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    _write_fragment_to_vault(vault, frag, "body")
+    response = _llm_response(
+        claims=[{"id": "claim-001", "text": "X", "fragment_ids": ["frag-aaa"]}],
+    )
+    llm, _ = _make_llm([response])
+    with pytest.raises(ValueError, match="escapes the compiled-layer directory"):
+        compile_to_vault(
+            fragment_ids=["frag-aaa"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="../escape",
+            target_title="X",
+            llm=llm,
+        )
 
 
 def test_load_existing_provenance_handles_unreadable_page(
@@ -886,7 +927,7 @@ def test_default_llm_returns_callable(monkeypatch: pytest.MonkeyPatch) -> None:
         _StubProvider,
     )
     sentinel = object()
-    llm = engine_module._default_llm(sentinel)
+    llm = engine_module.default_llm(sentinel)
     assert callable(llm)
     assert llm("hi") == "echo:hi"
     assert captured["config"] is sentinel

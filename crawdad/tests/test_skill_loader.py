@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from crawdad.skill_loader import (
+    SkillStackRegistry,
     VoiceSkillStack,
     load_skills_for_session,
 )
@@ -152,6 +153,91 @@ def test_load_skills_refuses_unsafe_register_name(
     assert "register:../../etc/passwd" not in names
     assert "register:Praxis" not in names
     assert any("must match" in record.message for record in caplog.records)
+
+
+def test_skill_stack_registry_exposes_initial_stack(
+    vault_with_voice_tree: Path,
+) -> None:
+    """A fresh registry surfaces whatever stack the caller initialised it with."""
+    state = _make_state("rising")
+    initial = load_skills_for_session(vault_path=vault_with_voice_tree, state=state)
+
+    registry = SkillStackRegistry(
+        stack=initial, vault_path=vault_with_voice_tree, state=state
+    )
+
+    assert registry.stack is initial
+
+
+def test_skill_stack_registry_activate_register_reloads_with_new_register(
+    vault_with_voice_tree: Path,
+) -> None:
+    """``activate_register('praxis')`` swaps the stack to include that file."""
+    state = _make_state("rising")
+    initial = load_skills_for_session(vault_path=vault_with_voice_tree, state=state)
+    registry = SkillStackRegistry(
+        stack=initial, vault_path=vault_with_voice_tree, state=state
+    )
+    assert not any("Praxis" in body for body in registry.stack.bodies())
+
+    activated = registry.activate_register("praxis")
+
+    assert activated is True
+    assert any("Praxis" in body for body in registry.stack.bodies())
+
+
+def test_skill_stack_registry_activate_unknown_register_returns_false(
+    vault_with_voice_tree: Path,
+) -> None:
+    """A register file that does not exist soft-fails — no exception, no mutation."""
+    state = _make_state("rising")
+    initial = load_skills_for_session(vault_path=vault_with_voice_tree, state=state)
+    registry = SkillStackRegistry(
+        stack=initial, vault_path=vault_with_voice_tree, state=state
+    )
+
+    activated = registry.activate_register("nonexistent-register")
+
+    assert activated is False
+    # Original stack still in place.
+    assert registry.stack is initial
+
+
+def test_skill_stack_registry_activate_unsafe_name_returns_false(
+    vault_with_voice_tree: Path,
+) -> None:
+    """Path-traversal / unsafe register names are refused without crashing.
+
+    Mirrors the guard inside :func:`load_skills_for_session` so the
+    same protection applies to slash-command-driven switches.
+    """
+    state = _make_state("rising")
+    initial = load_skills_for_session(vault_path=vault_with_voice_tree, state=state)
+    registry = SkillStackRegistry(
+        stack=initial, vault_path=vault_with_voice_tree, state=state
+    )
+
+    activated = registry.activate_register("../../etc/passwd")
+
+    assert activated is False
+    assert registry.stack is initial
+
+
+def test_skill_stack_registry_activate_default_register_is_idempotent(
+    vault_with_voice_tree: Path,
+) -> None:
+    """Activating the default register (``confessional``) succeeds quietly."""
+    state = _make_state("rising")
+    initial = load_skills_for_session(vault_path=vault_with_voice_tree, state=state)
+    registry = SkillStackRegistry(
+        stack=initial, vault_path=vault_with_voice_tree, state=state
+    )
+
+    activated = registry.activate_register("confessional")
+
+    assert activated is True
+    # Stack still contains the confessional register.
+    assert any("Confessional" in body for body in registry.stack.bodies())
 
 
 def test_voice_skill_stack_as_prompt_context(vault_with_voice_tree: Path) -> None:
