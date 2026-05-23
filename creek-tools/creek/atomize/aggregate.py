@@ -103,6 +103,9 @@ def aggregate(
     Returns:
         A new list containing aggregated parents followed by any
         pass-through fragments (in their original relative order).
+        Parents within the same source key are time-ordered, but two
+        source keys are emitted in dict-insertion order — not
+        interleaved chronologically.
     """
     if not fragments:
         return []
@@ -281,7 +284,7 @@ def _inherit_source(children: list[Fragment]) -> FragmentSource:
 
 
 def _parent_tags(
-    level: FragmentLevel,
+    level: AggregateLevel,
     earliest: datetime,
     latest: datetime,
     speakers: set[str],
@@ -307,7 +310,7 @@ def _source_key(source: FragmentSource) -> str:
 
 def _aggregate_id(
     source_key: str,
-    level: FragmentLevel,
+    level: AggregateLevel,
     child_ids: list[str],
 ) -> str:
     """Compute the deterministic parent ID that anchors FEAT-022 idempotency.
