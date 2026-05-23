@@ -39,7 +39,10 @@ repos:
     - --fix
   - id: ruff-format
 - repo: https://github.com/pre-commit/mirrors-mypy
-  rev: v1.8.0
+  # Kept in sync with uv.lock (mypy 2.1.0) and pyproject.toml's
+  # [project.optional-dependencies].dev pin so all three install paths
+  # run the same mypy version (issue #206).
+  rev: v2.1.0
   hooks:
   - id: mypy
     # The packages listed here all ship py.typed (or are type stubs).
