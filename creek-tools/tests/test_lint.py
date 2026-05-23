@@ -145,6 +145,55 @@ def _write_skill(vault: Path, *, stem: str, lines: int) -> Path:
     return target
 
 
+def _write_paradox_pair_cross_level(vault: Path) -> None:
+    """Write two fragments that share a thread but sit at different levels.
+
+    The pair has the same dosage-rule trigger (medicine vs. toxic on a
+    shared primary frequency) so the detector would emit a paradox if
+    the cross-level guard were off. FEAT-025: with the default policy,
+    the pair is skipped.
+    """
+    when = datetime(2026, 5, 1, tzinfo=UTC)
+    common: dict[str, object] = {
+        "type": "fragment",
+        "created": when.isoformat(),
+        "ingested": when.isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "threads": ["shared-thread"],
+        "tags": [],
+    }
+    section = {
+        **common,
+        "id": "frag-section",
+        "title": "Section-level take",
+        "wavelength": {
+            "phase": "rising",
+            "mode": "express",
+            "dosage": "medicine",
+        },
+        "level": "section",
+    }
+    sentence = {
+        **common,
+        "id": "frag-sentence",
+        "title": "Sentence-level take",
+        "wavelength": {
+            "phase": "rising",
+            "mode": "express",
+            "dosage": "toxic",
+        },
+        "level": "sentence",
+        "parent_id": "frag-section",
+    }
+    for record in (section, sentence):
+        target = vault / "01-Fragments" / "Notes" / f"{record['id']}.md"
+        target.write_text(
+            frontmatter.dumps(frontmatter.Post(content="body", **record)),
+            encoding="utf-8",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Module-level invariants
 # ---------------------------------------------------------------------------
@@ -360,6 +409,32 @@ class TestSemanticWrappers:
         )
         result = paradox_check.run(tmp_path)
         assert result.findings == []
+
+    def test_paradox_skips_cross_level_pairs_by_default(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """FEAT-025: cross-level paradox candidates are filtered by default."""
+        _seed_vault(tmp_path)
+        _write_paradox_pair_cross_level(tmp_path)
+        result = paradox_check.run(tmp_path)
+        # The pair is at different levels, so no paradox is recorded.
+        assert result.findings == []
+
+    def test_paradox_includes_cross_level_pairs_when_configured(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """FEAT-025: ``lint.paradox_cross_level: true`` opts the pair back in."""
+        _seed_vault(tmp_path)
+        _write_paradox_pair_cross_level(tmp_path)
+        config_path = tmp_path / "00-Creek-Meta" / "creek_config.yaml"
+        config_path.write_text(
+            "lint:\n  paradox_cross_level: true\n",
+            encoding="utf-8",
+        )
+        result = paradox_check.run(tmp_path)
+        assert len(result.findings) == 1
 
     def test_unnamed_reports_zero_when_folder_missing(self, tmp_path: Path) -> None:
         """Vault without an Unnamed folder reports zero, not an error."""

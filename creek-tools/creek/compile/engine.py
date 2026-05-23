@@ -31,6 +31,12 @@ import frontmatter
 
 from creek.audit import AuditLog
 from creek.compile.provenance import ProvenanceEntry, merge_provenance
+from creek.hierarchy import (
+    LevelPolicy,
+    select_by_policy,
+    source_levels,
+    structural_path_context,
+)
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
 from creek.vault.reader import iter_vault_fragments
 
@@ -91,6 +97,7 @@ def compile_fragments(
     target_title: str,
     existing_provenance: list[ProvenanceEntry] | None = None,
     compiled_at: datetime | None = None,
+    level_policy: LevelPolicy = "leaves",
 ) -> CompileResult:
     """Run one compile pass and return the compiled page plus any paradoxes.
 
@@ -106,6 +113,11 @@ def compile_fragments(
         existing_provenance: Provenance already on the target page, used
             to enforce idempotent re-runs.
         compiled_at: Override the run timestamp; defaults to ``now(UTC)``.
+        level_policy: FEAT-025 level policy applied to the input pairs.
+            ``"leaves"`` (default) keeps the most-atomic representation
+            and surfaces parents as ``structural_path`` context. ``"all"``
+            reproduces the pre-FEAT-025 path. ``"documents"`` keeps only
+            document- and session-level rows.
 
     Returns:
         A :class:`CompileResult` carrying the synthesised
@@ -116,6 +128,46 @@ def compile_fragments(
         ValueError: If *target_kind* is not one of the supported
             compiled-page surfaces.
     """
+    _validate_target_kind(target_kind)
+    pairs = list(fragments_with_bodies)
+    by_id: dict[str, Fragment] = {fragment.id: fragment for fragment, _ in pairs}
+    selected_fragments, selected_pairs = _apply_level_policy(pairs, level_policy)
+
+    timestamp = compiled_at or datetime.now(tz=UTC)
+    prompt = _build_prompt(
+        selected_pairs,
+        target_kind=target_kind,
+        target_title=target_title,
+        by_id=by_id,
+    )
+    payload = _parse_llm_payload(llm(prompt))
+    valid_claims = _filter_valid_claims(payload["claims"])
+    provenance = merge_provenance(
+        existing_provenance or [],
+        _claims_to_provenance(valid_claims, timestamp),
+    )
+    page = CompiledPage(
+        target_kind=target_kind,
+        target_id=target_id,
+        title=target_title,
+        body=_render_body(target_title, valid_claims),
+        provenance=provenance,
+        compiled_at=timestamp,
+        compile_method="llm",
+        level_policy=level_policy,
+        source_levels=source_levels(selected_fragments),
+    )
+    paradoxes = _payload_to_paradox_entries(
+        payload["paradoxes"],
+        target_kind=target_kind,
+        target_id=target_id,
+        timestamp=timestamp,
+    )
+    return CompileResult(page=page, paradoxes=paradoxes)
+
+
+def _validate_target_kind(target_kind: str) -> None:
+    """Reject any *target_kind* outside the published surface list."""
     if target_kind not in TARGET_KINDS:
         msg = (
             f"Unknown target_kind {target_kind!r}; "
@@ -123,16 +175,41 @@ def compile_fragments(
         )
         raise ValueError(msg)
 
-    pairs = list(fragments_with_bodies)
-    timestamp = compiled_at or datetime.now(tz=UTC)
-    prompt = _build_prompt(pairs, target_kind=target_kind, target_title=target_title)
-    raw = llm(prompt)
-    payload = _parse_llm_payload(raw)
 
-    # Drop malformed claims (missing/empty id) before they reach the page body;
-    # otherwise `_render_body` would emit a broken Markdown footnote `[^]`.
-    valid_claims = [c for c in payload["claims"] if str(c.get("id", "")).strip()]
-    new_provenance = [
+def _apply_level_policy(
+    pairs: list[tuple[Fragment, str]],
+    policy: LevelPolicy,
+) -> tuple[list[Fragment], list[tuple[Fragment, str]]]:
+    """Filter (fragment, body) pairs by *policy* and return the surviving subset.
+
+    Returns the selected fragments (for ``source_levels`` recording)
+    alongside the matching (fragment, body) pairs so the prompt builder
+    keeps body parity with the policy's choice of leaves.
+    """
+    fragments_only = [fragment for fragment, _ in pairs]
+    selected_fragments = select_by_policy(fragments_only, policy)
+    selected_ids = {fragment.id for fragment in selected_fragments}
+    selected_pairs = [pair for pair in pairs if pair[0].id in selected_ids]
+    return selected_fragments, selected_pairs
+
+
+def _filter_valid_claims(
+    claims: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Drop malformed claims (missing/empty id) before they reach the page body.
+
+    Otherwise ``_render_body`` would emit a broken Markdown footnote
+    ``[^]`` that downstream readers can't resolve.
+    """
+    return [c for c in claims if str(c.get("id", "")).strip()]
+
+
+def _claims_to_provenance(
+    claims: list[dict[str, object]],
+    timestamp: datetime,
+) -> list[ProvenanceEntry]:
+    """Build per-claim provenance entries for an LLM compile run."""
+    return [
         ProvenanceEntry(
             claim_id=str(claim["id"]),
             claim_excerpt=_excerpt(str(claim.get("text", ""))),
@@ -140,21 +217,19 @@ def compile_fragments(
             compiled_at=timestamp,
             compile_method="llm",
         )
-        for claim in valid_claims
+        for claim in claims
     ]
-    provenance = merge_provenance(existing_provenance or [], new_provenance)
-    body = _render_body(target_title, valid_claims)
 
-    page = CompiledPage(
-        target_kind=target_kind,
-        target_id=target_id,
-        title=target_title,
-        body=body,
-        provenance=provenance,
-        compiled_at=timestamp,
-        compile_method="llm",
-    )
-    paradoxes = [
+
+def _payload_to_paradox_entries(
+    items: list[dict[str, object]],
+    *,
+    target_kind: str,
+    target_id: str,
+    timestamp: datetime,
+) -> list[ParadoxLogEntry]:
+    """Map LLM-reported paradox dicts into structured log entries."""
+    return [
         ParadoxLogEntry(
             timestamp=timestamp,
             target_kind=target_kind,
@@ -162,9 +237,8 @@ def compile_fragments(
             description=str(item.get("description", "")),
             fragment_ids=_str_list(item.get("fragment_ids")),
         )
-        for item in payload["paradoxes"]
+        for item in items
     ]
-    return CompileResult(page=page, paradoxes=paradoxes)
 
 
 def compile_to_vault(
@@ -175,6 +249,7 @@ def compile_to_vault(
     target_id: str,
     target_title: str,
     llm: CompileLLM,
+    level_policy: LevelPolicy = "leaves",
 ) -> Path:
     """Compile *fragment_ids* into a compiled-layer page on disk.
 
@@ -190,6 +265,9 @@ def compile_to_vault(
         target_id: Stable ID of the synthesis target.
         target_title: Human-readable title for the page.
         llm: Compile LLM callable returning JSON.
+        level_policy: FEAT-025 level policy applied to the input
+            fragments. Passed through to :func:`compile_fragments`;
+            defaults to ``"leaves"``.
 
     Returns:
         The path of the written compiled-layer page.
@@ -207,6 +285,7 @@ def compile_to_vault(
         target_id=target_id,
         target_title=target_title,
         existing_provenance=existing,
+        level_policy=level_policy,
     )
     _write_compiled_page(target_path, result.page)
     if result.paradoxes:
@@ -256,8 +335,15 @@ def _build_prompt(
     *,
     target_kind: str,
     target_title: str,
+    by_id: dict[str, Fragment] | None = None,
 ) -> str:
-    """Assemble the compile prompt for the LLM."""
+    """Assemble the compile prompt for the LLM.
+
+    Surfaces each fragment's ``structural_path`` breadcrumb (FEAT-025)
+    as a separate field so the LLM treats parent context as orientation
+    rather than duplicate claim material.
+    """
+    lookup: dict[str, Fragment] = by_id or {f.id: f for f, _ in pairs}
     sections: list[str] = [
         f"You are compiling a {target_kind} note titled {target_title!r}.",
         "Return JSON with two arrays: 'claims' (each having 'id', 'text', "
@@ -269,13 +355,16 @@ def _build_prompt(
     ]
     for fragment, body in pairs:
         excerpt = _fragment_excerpt_for_prompt(fragment, body)
+        breadcrumb = structural_path_context(fragment, lookup)
         sections.extend(
             (
                 f"- id: {fragment.id}",
                 f"  title: {fragment.title}",
-                f"  body: {excerpt}",
             )
         )
+        if breadcrumb:
+            sections.append(f"  structural_path: {' > '.join(breadcrumb)}")
+        sections.append(f"  body: {excerpt}")
     return "\n".join(sections)
 
 

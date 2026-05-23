@@ -912,3 +912,243 @@ def test_cli_compile_unknown_target_kind_exits_2(vault: Path) -> None:
     )
     assert result.exit_code == 2
     assert "target-kind" in result.stdout.lower() or "kind" in result.stdout.lower()
+
+
+# ---- FEAT-025: hierarchy-aware compile -----------------------------------
+
+
+def _make_child_fragment(
+    *,
+    frag_id: str,
+    parent_id: str,
+    level: str = "paragraph",
+    title: str = "A child fragment",
+) -> Fragment:
+    """Build a child fragment that references a parent via parent_id."""
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        created=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        ingested=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        level=level,  # type: ignore[arg-type]
+        parent_id=parent_id,
+    )
+
+
+def test_compile_records_level_policy_and_source_levels_in_frontmatter() -> None:
+    """The CompiledPage records the level_policy + source_levels used."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    response = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "A claim.",
+                "fragment_ids": ["frag-aaa"],
+            },
+        ],
+    )
+    llm, _ = _make_llm([response])
+
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="thread-l",
+        target_title="L",
+    )
+
+    assert result.page.level_policy == "leaves"
+    assert result.page.source_levels == ["document"]
+
+
+def test_compile_filters_to_leaves_by_default() -> None:
+    """Parents whose children are also in the set drop out of the synthesis."""
+    parent = Fragment(
+        id="frag-parent",
+        title="Whole document",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        created=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        ingested=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        level="document",
+        child_ids=["frag-child-1", "frag-child-2"],
+    )
+    child1 = _make_child_fragment(frag_id="frag-child-1", parent_id="frag-parent")
+    child2 = _make_child_fragment(
+        frag_id="frag-child-2",
+        parent_id="frag-parent",
+        title="A second child",
+    )
+    response = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "Synthesised from leaves.",
+                "fragment_ids": ["frag-child-1", "frag-child-2"],
+            },
+        ],
+    )
+    llm, prompts = _make_llm([response])
+
+    result = compile_fragments(
+        [
+            (parent, "the entire parent body that must not be duplicated"),
+            (child1, "child one body"),
+            (child2, "child two body"),
+        ],
+        llm=llm,
+        target_kind="thread",
+        target_id="thread-h",
+        target_title="H",
+    )
+
+    prompt = prompts[0]
+    # Parent body must NOT appear — it was rolled up via leaves.
+    assert "the entire parent body that must not be duplicated" not in prompt
+    # Both leaf bodies do appear.
+    assert "child one body" in prompt
+    assert "child two body" in prompt
+    # source_levels reflect what was actually used.
+    assert result.page.source_levels == ["paragraph"]
+
+
+def test_compile_surfaces_parent_as_structural_path_context() -> None:
+    """Parents appear in the prompt as structural-path context, not as bodies."""
+    parent = Fragment(
+        id="frag-parent",
+        title="The Capricorn Moon",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        created=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        ingested=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        level="document",
+        child_ids=["frag-child"],
+    )
+    child = _make_child_fragment(
+        frag_id="frag-child",
+        parent_id="frag-parent",
+        title="On grief",
+    )
+    response = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "A claim from the leaf.",
+                "fragment_ids": ["frag-child"],
+            },
+        ],
+    )
+    llm, prompts = _make_llm([response])
+
+    compile_fragments(
+        [(parent, "parent body"), (child, "child body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="thread-c",
+        target_title="C",
+    )
+
+    prompt = prompts[0]
+    # The leaf body flows; the parent's title surfaces as breadcrumb context.
+    assert "child body" in prompt
+    assert "The Capricorn Moon" in prompt
+    assert "parent body" not in prompt
+
+
+def test_compile_level_policy_all_keeps_pre_feat025_behaviour() -> None:
+    """An explicit ``all`` policy mirrors the flat-vault path."""
+    parent = Fragment(
+        id="frag-parent",
+        title="A document",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        created=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        ingested=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        level="document",
+        child_ids=["frag-child"],
+    )
+    child = _make_child_fragment(frag_id="frag-child", parent_id="frag-parent")
+    response = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "A claim.",
+                "fragment_ids": ["frag-parent", "frag-child"],
+            },
+        ],
+    )
+    llm, prompts = _make_llm([response])
+
+    result = compile_fragments(
+        [(parent, "parent body"), (child, "child body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="thread-a",
+        target_title="A",
+        level_policy="all",
+    )
+
+    prompt = prompts[0]
+    assert "parent body" in prompt
+    assert "child body" in prompt
+    assert result.page.level_policy == "all"
+    assert set(result.page.source_levels) == {"document", "paragraph"}
+
+
+def test_compile_to_vault_persists_level_policy_in_frontmatter(vault: Path) -> None:
+    """Frontmatter on disk carries the level_policy + source_levels fields."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    _write_fragment_to_vault(vault, frag, body="body")
+    response = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "A claim.",
+                "fragment_ids": ["frag-aaa"],
+            },
+        ],
+    )
+    llm, _ = _make_llm([response])
+
+    written = compile_to_vault(
+        fragment_ids=["frag-aaa"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-d",
+        target_title="D",
+        llm=llm,
+    )
+
+    post = frontmatter.load(str(written))
+    assert post.metadata["level_policy"] == "leaves"
+    assert post.metadata["source_levels"] == ["document"]
+
+
+def test_compile_flat_vault_regression(vault: Path) -> None:
+    """A flat-fragment vault produces the same provenance as before FEAT-025."""
+    frag_a = _make_fragment(frag_id="frag-aaa")
+    frag_b = _make_fragment(frag_id="frag-bbb")
+    _write_fragment_to_vault(vault, frag_a, body="body A")
+    _write_fragment_to_vault(vault, frag_b, body="body B")
+    response = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "Shared claim.",
+                "fragment_ids": ["frag-aaa", "frag-bbb"],
+            },
+        ],
+    )
+    llm, _ = _make_llm([response])
+
+    written = compile_to_vault(
+        fragment_ids=["frag-aaa", "frag-bbb"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-flat",
+        target_title="Flat",
+        llm=llm,
+    )
+
+    post = frontmatter.load(str(written))
+    provenance = post.metadata["provenance"]
+    assert len(provenance) == 1
+    assert provenance[0]["fragment_ids"] == ["frag-aaa", "frag-bbb"]

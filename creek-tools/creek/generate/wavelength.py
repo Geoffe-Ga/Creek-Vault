@@ -23,6 +23,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.hierarchy import LevelPolicy, select_by_policy
 from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 
 if TYPE_CHECKING:
@@ -1273,6 +1274,7 @@ def current_phase_summary(
     *,
     today: date | None = None,
     window_days: int = DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
+    level_policy: LevelPolicy = "all",
 ) -> CurrentPhaseSummary:
     """Return a :class:`CurrentPhaseSummary` for the trailing *window_days*.
 
@@ -1291,6 +1293,10 @@ def current_phase_summary(
             day near midnight UTC on a non-UTC host.
         window_days: Lookback (inclusive). Defaults to 28 days — long
             enough that one quiet week does not flip the dominant phase.
+        level_policy: FEAT-025 level filter applied before aggregation.
+            ``"all"`` (default) reproduces the pre-FEAT-025 behaviour.
+            ``creek state`` passes ``"documents"`` so the snapshot is
+            read at whole-source granularity.
 
     Returns:
         A :class:`CurrentPhaseSummary`.
@@ -1298,6 +1304,7 @@ def current_phase_summary(
     anchor = today or datetime.now(tz=UTC).date()
     start = anchor - timedelta(days=window_days - 1)
     fragments = _load_fragments_from_vault(vault_path)
+    fragments = select_by_policy(fragments, level_policy)
     tracker = WavelengthTracker()
     snapshot = tracker.analyze_period(fragments, start, anchor)
     weekly = tracker.weekly_snapshots(fragments, start, anchor)

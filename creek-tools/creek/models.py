@@ -709,6 +709,14 @@ class CompiledPage(BaseModel):
         compiled_at: UTC timestamp of the most recent compile run.
         compile_method: How the page's claims were produced — one of
             ``"rules"``, ``"llm"``, or ``"manual"``.
+        level_policy: FEAT-025 level policy used to filter source
+            fragments. ``"leaves"`` is the default — parents serve as
+            ``structural_path`` context rather than duplicate content.
+            ``"all"`` reproduces the pre-FEAT-025 behaviour and is
+            recorded explicitly for re-compile audits.
+        source_levels: Sorted distinct ``Fragment.level`` values of the
+            fragments that actually fed the synthesis after the policy
+            filter ran. Empty on pre-FEAT-025 pages.
     """
 
     model_config = ConfigDict(use_enum_values=True)
@@ -721,3 +729,5 @@ class CompiledPage(BaseModel):
     provenance: list[ProvenanceEntry] = Field(default_factory=list)
     compiled_at: datetime = Field(default_factory=_utc_now)
     compile_method: CompileMethod = "llm"
+    level_policy: str = "leaves"
+    source_levels: list[str] = Field(default_factory=list)

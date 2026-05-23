@@ -548,6 +548,28 @@ class CompostConfig(BaseModel):
     """
 
 
+class LintConfig(BaseModel):
+    """Configuration for ``creek lint`` checks (FEAT-008, FEAT-025).
+
+    Today only the paradox check carries a knob; this class exists so
+    additional check-level toggles can land without expanding the
+    top-level :class:`CreekConfig` surface.
+    """
+
+    paradox_cross_level: bool = False
+    """FEAT-025 opt-in for cross-level paradox detection.
+
+    ``False`` (default): the paradox check skips pairs whose
+    :attr:`creek.models.Fragment.level` values differ — a paragraph
+    contradicting the section it lives inside is rhetorical structure,
+    not the contradiction `10-Liminal/Paradoxes/` is for.
+
+    ``True``: restore the pre-FEAT-025 behaviour. Useful when the
+    operator wants the cross-level pairs surfaced (e.g. to audit a
+    re-atomized vault for splitter mistakes).
+    """
+
+
 class SourcePaths(BaseModel):
     """Source data paths (relative to ``source_drive``)."""
 
@@ -630,6 +652,9 @@ class CreekConfig(BaseSettings):
 
     compost: CompostConfig = Field(default_factory=CompostConfig)
     """Compost detection settings (FEAT-018: embedding gate + verifier)."""
+
+    lint: LintConfig = Field(default_factory=LintConfig)
+    """Lint check toggles (FEAT-008 / FEAT-025)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
