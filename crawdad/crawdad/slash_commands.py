@@ -1,10 +1,12 @@
-"""Discord slash commands for CrawDad (FEAT-016).
+"""Discord slash commands for CrawDad (FEAT-016 + FEAT-029).
 
-Six commands form the `/crawdad` family — `reflect`, `checkin`,
-`surface`, `draft`, `save`, `workflow`. Each routes through the
-FEAT-015 agent loop by constructing a pre-baked user message and
-running it through an injected ``loop_runner`` callable. The Sonnet
-composer wraps the tool results in the user's voice.
+The `/crawdad` family bundles `reflect`, `checkin`, `surface`, `draft`,
+`save`, `register`, and `workflow`. Most routes through the FEAT-015
+agent loop by constructing a pre-baked user message and running it
+through an injected ``loop_runner`` callable; the Sonnet composer
+wraps the tool results in the user's voice. ``register`` (FEAT-029)
+bypasses the loop and invokes the synchronous ``register_switcher``
+directly so voice-register changes are deterministic.
 
 The handlers are free functions that take a tiny ``Replier`` callable
 (``async def (str) -> None``) so they can be unit-tested without
@@ -37,6 +39,12 @@ _LOGGER = logging.getLogger("crawdad.slash_commands")
 # components — see :func:`crawdad.cli._build_loop_runner`.
 LoopRunner = Callable[[str], Awaitable[str]]
 
+# FEAT-029: synchronous callable that swaps the active voice register.
+# The slash-command handler invokes it directly so the user gets a
+# deterministic switch (no LLM round-trip). Returns True on success,
+# False on unknown / unsafe register names.
+RegisterSwitcher = Callable[[str], bool]
+
 # Async callable that posts a message back to the Discord user.
 # Wraps ``discord.Interaction.followup.send`` in production; tests
 # substitute a list-appending fake.
@@ -49,6 +57,7 @@ CRAWDAD_COMMANDS: tuple[str, ...] = (
     "surface",
     "draft",
     "save",
+    "register",
     "workflow",
 )
 
@@ -58,6 +67,7 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "surface": "Surface paradoxes, liminal content, or emerging themes.",
     "draft": "Draft an essay on a topic (routes through creek.mine + creek.draft).",
     "save": "File the supplied content back to the vault via creek.save.",
+    "register": "Switch the active voice register (FEAT-029).",
     "workflow": "List or run named workflows (v1.0 stub — full DSL in v1.1).",
 }
 
@@ -165,6 +175,38 @@ async def handle_save(
     await replier(reply)
 
 
+async def handle_register(
+    replier: Replier, *, name: str, register_switcher: RegisterSwitcher | None
+) -> None:
+    """``/crawdad register <name>`` — swap the active voice register.
+
+    Bypasses the agent loop and calls ``register_switcher`` directly so
+    the user gets a deterministic, single-step switch with a clear
+    success / soft-error reply.
+    """
+    cleaned = name.strip().lower()
+    if not cleaned:
+        await replier(
+            "What register should I activate? Try `/crawdad register <name>` — "
+            "for example, `/crawdad register analytic`."
+        )
+        return
+    if register_switcher is None:
+        _LOGGER.info("register switcher unavailable; ignoring %r", cleaned)
+        await replier(
+            "Voice register switching is unavailable in this session. "
+            "(The vault's `creek-skills/` tree wasn't wired up.)"
+        )
+        return
+    if register_switcher(cleaned):
+        await replier(f"Voice register switched to `{cleaned}`.")
+        return
+    await replier(
+        f"Unknown voice register `{cleaned}` — check that "
+        f"`creek-skills/registers/{cleaned}.SKILL.md` exists in your vault."
+    )
+
+
 async def handle_workflow(replier: Replier, *, subaction: str | None) -> None:
     """``/crawdad workflow [list]`` — v1.0 stub.
 
@@ -205,13 +247,23 @@ async def handle_help(replier: Replier) -> None:
 # -----------------------------------------------------------------------------
 
 
-def register(tree: _TreeLike, *, loop_runner: LoopRunner) -> int:
+def register(
+    tree: _TreeLike,
+    *,
+    loop_runner: LoopRunner,
+    register_switcher: RegisterSwitcher | None = None,
+) -> int:
     """Register every ``/crawdad`` slash command on the supplied tree.
 
     Each callback ``defer()``s the Discord interaction so the loop has
     its full :data:`crawdad.config.MAX_LOOP_ROUNDS` budget before the
     SDK times out at 3 seconds. The actual reply lands via
     ``interaction.followup.send``.
+
+    ``register_switcher`` (FEAT-029) is the synchronous callback the
+    ``/crawdad register`` command invokes to swap the active voice
+    register. ``None`` keeps the command wired but the handler short-
+    circuits to a soft-error reply explaining the feature is unwired.
 
     Returns the count of advertised commands (always
     ``len(CRAWDAD_COMMANDS)`` since the registration helpers don't
@@ -223,6 +275,7 @@ def register(tree: _TreeLike, *, loop_runner: LoopRunner) -> int:
     _register_surface(tree, loop_runner=loop_runner)
     _register_draft(tree, loop_runner=loop_runner)
     _register_save(tree, loop_runner=loop_runner)
+    _register_register(tree, register_switcher=register_switcher)
     _register_workflow(tree)
     return len(CRAWDAD_COMMANDS)
 
@@ -289,6 +342,22 @@ def _register_save(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
         await interaction.response.defer()
         await handle_save(
             interaction.followup.send, content=content, loop_runner=loop_runner
+        )
+
+
+def _register_register(
+    tree: _TreeLike, *, register_switcher: RegisterSwitcher | None
+) -> None:
+    """Wire the ``/crawdad register`` Discord callback onto *tree* (FEAT-029)."""
+
+    @tree.command(name="register", description=_COMMAND_DESCRIPTIONS["register"])
+    async def _callback(interaction: Any, name: str) -> None:
+        """Discord callback for ``/crawdad register <name>`` (deferred)."""
+        await interaction.response.defer()
+        await handle_register(
+            interaction.followup.send,
+            name=name,
+            register_switcher=register_switcher,
         )
 
 

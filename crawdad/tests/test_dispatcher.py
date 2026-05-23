@@ -11,7 +11,7 @@ from crawdad.dispatcher import (
     ToolResult,
     UnknownIntentError,
 )
-from crawdad.intents import Intent, RouterResponse
+from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE, Intent, RouterResponse
 from crawdad.mcp_client import MCPUnavailableError
 
 
@@ -118,6 +118,125 @@ async def test_dispatcher_preserves_privacy_tier_ceiling() -> None:
     )
 
     assert session.calls[0][1]["privacy_tier_ceiling"] == "personal"
+
+
+async def test_dispatcher_routes_activate_register_to_switcher() -> None:
+    """FEAT-029: ``activate_register`` intents bypass MCP and call the switcher.
+
+    The dispatcher hands the requested register name to the injected
+    ``register_switcher`` callable and emits a :class:`ToolResult`
+    describing the outcome. No MCP call is made.
+    """
+    switched: list[str] = []
+
+    def _switcher(name: str) -> bool:
+        switched.append(name)
+        return True
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=("creek.state.read",),
+        register_switcher=_switcher,
+    )
+
+    results = await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=ACTIVATE_REGISTER_INTENT_TYPE,
+                    args={"register": "analytic"},
+                )
+            ]
+        )
+    )
+
+    assert switched == ["analytic"]
+    assert session.calls == []
+    assert len(results) == 1
+    assert results[0].intent_type == ACTIVATE_REGISTER_INTENT_TYPE
+    assert "analytic" in results[0].body
+
+
+async def test_dispatcher_activate_register_soft_errors_on_unknown_name() -> None:
+    """Switcher returning ``False`` produces a soft-error result (no crash)."""
+
+    def _switcher(_name: str) -> bool:
+        return False
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        register_switcher=_switcher,
+    )
+
+    results = await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=ACTIVATE_REGISTER_INTENT_TYPE,
+                    args={"register": "nonexistent"},
+                )
+            ]
+        )
+    )
+
+    assert len(results) == 1
+    body = results[0].body.lower()
+    assert "nonexistent" in results[0].body
+    assert "unknown" in body or "not" in body or "could not" in body
+
+
+async def test_dispatcher_activate_register_without_switcher_soft_errors() -> None:
+    """If no switcher is wired the dispatcher still produces a soft result.
+
+    Without the soft-fail path an ``activate_register`` intent emitted
+    by Haiku in a test or misconfigured runtime would crash the loop.
+    """
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(session=session, known_tools=())
+
+    results = await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=ACTIVATE_REGISTER_INTENT_TYPE,
+                    args={"register": "praxis"},
+                )
+            ]
+        )
+    )
+
+    assert len(results) == 1
+    assert "praxis" in results[0].body or "register" in results[0].body.lower()
+    assert session.calls == []
+
+
+async def test_dispatcher_activate_register_missing_register_arg_soft_errors() -> None:
+    """A malformed activate_register intent (no ``register`` arg) soft-errors.
+
+    Defensive: Haiku could emit the intent type without filling the
+    expected ``args["register"]`` slot. The dispatcher must not raise.
+    """
+
+    def _switcher(_name: str) -> bool:
+        return True
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        register_switcher=_switcher,
+    )
+
+    results = await dispatcher.dispatch(
+        RouterResponse(intents=[Intent(type=ACTIVATE_REGISTER_INTENT_TYPE)])
+    )
+
+    assert len(results) == 1
+    body = results[0].body.lower()
+    assert "register" in body
 
 
 async def test_dispatcher_intent_ceiling_overrides_conflicting_args() -> None:

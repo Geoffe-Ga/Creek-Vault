@@ -21,6 +21,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# FEAT-029: client-side intent for dynamic voice-register switching. The
+# dispatcher recognises this type *before* the MCP known-tools check and
+# routes it to the loop's :class:`SkillStackRegistry` instead of an MCP
+# tool call. The ``crawdad.`` namespace prefix keeps it visually distinct
+# from MCP ``creek.*`` tools and immune to a future MCP-side collision.
+ACTIVATE_REGISTER_INTENT_TYPE: str = "crawdad.activate_register"
+
 
 class PrivacyTierCeiling(StrEnum):
     """Per-intent privacy tier ceiling.
@@ -84,6 +91,7 @@ def build_intents_schema(tools: list[ToolInfo]) -> dict[str, Any]:
         verbatim and that a downstream JSON parser can validate against.
     """
     tool_names = [tool.name for tool in tools]
+    allowed_types = [*tool_names, ACTIVATE_REGISTER_INTENT_TYPE]
     return {
         "type": "object",
         "properties": {
@@ -94,10 +102,11 @@ def build_intents_schema(tools: list[ToolInfo]) -> dict[str, Any]:
                     "properties": {
                         "type": {
                             "type": "string",
-                            "enum": tool_names,
+                            "enum": allowed_types,
                             "description": (
-                                "MCP tool name to invoke; must match one "
-                                "of the advertised tools."
+                                "MCP tool name to invoke, or the client-side "
+                                f"intent {ACTIVATE_REGISTER_INTENT_TYPE!r} to "
+                                "switch the active voice register mid-session."
                             ),
                         },
                         "privacy_tier_ceiling": {

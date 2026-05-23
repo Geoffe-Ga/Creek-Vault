@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING, Any
 import anthropic
 from pydantic import ValidationError
 
-from crawdad.intents import RouterResponse, ToolInfo, build_intents_schema
+from crawdad.intents import (
+    ACTIVATE_REGISTER_INTENT_TYPE,
+    RouterResponse,
+    ToolInfo,
+    build_intents_schema,
+)
 
 if TYPE_CHECKING:
     from crawdad.history import ConversationHistory
@@ -111,6 +116,16 @@ def build_router_prompt(
         "include a paradox surfacing, include a `creek.save` intent "
         "(target=paradox) BEFORE setting `compose: true` so paradoxes are "
         "routed to `10-Liminal/Paradoxes/`. Never propose paradox resolution.\n\n"
+        "Register-switch detection (FEAT-029): when the user asks you to "
+        "switch voice register, change voice, or activate a different "
+        'voice — phrases like "switch to the analytic register", "use '
+        'confessional voice", "speak in praxis mode", "can you talk like '
+        'the X register now" — emit a single intent with '
+        f'type "{ACTIVATE_REGISTER_INTENT_TYPE}" and '
+        '`args: {"register": "<name>"}` BEFORE setting `compose: true`. '
+        "Use the lowercase, hyphenated register name (e.g. "
+        "`confessional`, `praxis`, `analytic`). Do NOT call any MCP tool "
+        "for register switches — the dispatcher handles them locally.\n\n"
         f"{phase_hint}\n\n"
         f"{wavelength_block}\n\n"
         f"{history_block}\n\n"
