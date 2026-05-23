@@ -18,6 +18,7 @@ from creek.config import EmbeddingsConfig
 from creek.link.embeddings import (
     CachedEmbedding,
     EmbeddingLinker,
+    Resonance,
     content_hash_for_text,
     embeddings_cache_path,
     fragment_embedding_text,
@@ -367,9 +368,9 @@ class TestFindResonances:
         }
         result = linker.find_resonances(embeddings)
         assert len(result) == 1
-        assert result[0][0] == "a"
-        assert result[0][1] == "b"
-        assert abs(result[0][2] - 1.0) < 1e-6
+        assert result[0].fragment_a_id == "a"
+        assert result[0].fragment_b_id == "b"
+        assert abs(result[0].similarity - 1.0) < 1e-6
 
     def test_orthogonal_vectors_no_resonance(self) -> None:
         """Orthogonal vectors should not produce resonances."""
@@ -395,7 +396,7 @@ class TestFindResonances:
         }
         result = linker.find_resonances(embeddings)
         # a-b should be close to threshold, a-c and b-c should be below
-        pair_ids = {(r[0], r[1]) for r in result}
+        pair_ids = {(r.fragment_a_id, r.fragment_b_id) for r in result}
         assert ("a", "c") not in pair_ids
 
     def test_empty_embeddings_returns_empty(self) -> None:
@@ -410,8 +411,8 @@ class TestFindResonances:
         result = linker.find_resonances({"a": [1.0, 0.0]})
         assert result == []
 
-    def test_result_tuple_structure(self) -> None:
-        """Each resonance should be a (id_a, id_b, similarity) tuple."""
+    def test_result_record_structure(self) -> None:
+        """Each resonance should be a Resonance with id/sim/level fields."""
         linker = EmbeddingLinker(
             config=EmbeddingsConfig(similarity_threshold=0.0),
         )
@@ -421,11 +422,14 @@ class TestFindResonances:
         }
         result = linker.find_resonances(embeddings)
         assert len(result) >= 1
-        frag_a, frag_b, sim = result[0]
-        assert isinstance(frag_a, str)
-        assert isinstance(frag_b, str)
-        assert isinstance(sim, float)
-        assert 0.0 <= sim <= 1.0
+        edge = result[0]
+        assert isinstance(edge.fragment_a_id, str)
+        assert isinstance(edge.fragment_b_id, str)
+        assert isinstance(edge.similarity, float)
+        assert 0.0 <= edge.similarity <= 1.0
+        # Without a fragments map, both endpoints default to "document".
+        assert edge.from_level == "document"
+        assert edge.to_level == "document"
 
     def test_no_duplicate_pairs(self) -> None:
         """Each pair should appear only once (no (b,a) if (a,b) exists)."""
@@ -438,7 +442,7 @@ class TestFindResonances:
             "c": [0.8, 0.2],
         }
         result = linker.find_resonances(embeddings)
-        pairs = [(r[0], r[1]) for r in result]
+        pairs = [(r.fragment_a_id, r.fragment_b_id) for r in result]
         # Check no reverse duplicates
         for id_a, id_b in pairs:
             assert (id_b, id_a) not in pairs
@@ -466,3 +470,255 @@ class TestEmbeddingLinkerLogging:
         with caplog.at_level(logging.INFO, logger="creek.link.embeddings"):
             linker.find_resonances({"a": [1.0], "b": [0.0]})
         assert any("2" in r.message for r in caplog.records)
+
+
+# ---- FEAT-024 Hierarchy-aware Filtering ----
+
+
+def _hier_fragment(
+    fid: str,
+    *,
+    parent_id: str | None = None,
+    child_ids: list[str] | None = None,
+    level: str = "document",
+) -> Fragment:
+    """Build a Fragment with explicit hierarchy fields for FEAT-024 tests."""
+    return Fragment(
+        id=fid,
+        title=fid,
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        parent_id=parent_id,
+        child_ids=child_ids or [],
+        level=level,  # type: ignore[arg-type]
+    )
+
+
+class TestHierarchyAwareFiltering:
+    """Tests for FEAT-024 hierarchy-aware resonance suppression."""
+
+    def test_ancestor_descendant_pair_suppressed(self) -> None:
+        """Parent/child pairs never produce a resonance, even at sim=1.0."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p": _hier_fragment(
+                "p",
+                child_ids=["c1"],
+                level="document",
+            ),
+            "c1": _hier_fragment("c1", parent_id="p", level="paragraph"),
+        }
+        embeddings = {"p": [1.0, 0.0], "c1": [1.0, 0.0]}
+        result = linker.find_resonances(embeddings, fragments)
+        assert not result
+
+    def test_deep_ancestor_descendant_suppressed(self) -> None:
+        """Suppression follows the parent_id chain past a single hop."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "root": _hier_fragment(
+                "root",
+                child_ids=["mid"],
+                level="document",
+            ),
+            "mid": _hier_fragment(
+                "mid",
+                parent_id="root",
+                child_ids=["leaf"],
+                level="paragraph",
+            ),
+            "leaf": _hier_fragment("leaf", parent_id="mid", level="sentence"),
+        }
+        embeddings = {"root": [1.0, 0.0], "mid": [1.0, 0.0], "leaf": [1.0, 0.0]}
+        result = linker.find_resonances(embeddings, fragments)
+        # No surviving pair — root-mid, mid-leaf, root-leaf are all ancestor edges.
+        assert not result
+
+    def test_adjacent_siblings_within_default_window_suppressed(self) -> None:
+        """Siblings within K=2 positions of each other are suppressed."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p": _hier_fragment(
+                "p",
+                child_ids=["s0", "s1", "s2"],
+                level="document",
+            ),
+            "s0": _hier_fragment("s0", parent_id="p", level="sentence"),
+            "s1": _hier_fragment("s1", parent_id="p", level="sentence"),
+            "s2": _hier_fragment("s2", parent_id="p", level="sentence"),
+        }
+        embeddings = {
+            "s0": [1.0, 0.0],
+            "s1": [1.0, 0.0],
+            "s2": [1.0, 0.0],
+        }
+        result = linker.find_resonances(embeddings, fragments)
+        # All three sentence-siblings sit within window=2 of each other.
+        pair_ids = {(r.fragment_a_id, r.fragment_b_id) for r in result}
+        assert ("s0", "s1") not in pair_ids
+        assert ("s1", "s2") not in pair_ids
+        assert ("s0", "s2") not in pair_ids
+
+    def test_non_adjacent_siblings_kept(self) -> None:
+        """Siblings beyond the skip window keep their resonance edge."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p": _hier_fragment(
+                "p",
+                child_ids=["c0", "c1", "c2", "c3"],
+                level="document",
+            ),
+            "c0": _hier_fragment("c0", parent_id="p", level="sentence"),
+            "c1": _hier_fragment("c1", parent_id="p", level="sentence"),
+            "c2": _hier_fragment("c2", parent_id="p", level="sentence"),
+            "c3": _hier_fragment("c3", parent_id="p", level="sentence"),
+        }
+        # Make only the (c0, c3) pair similar enough to survive.
+        embeddings = {
+            "c0": [1.0, 0.0],
+            "c1": [0.0, 1.0],
+            "c2": [0.0, 1.0],
+            "c3": [1.0, 0.0],
+        }
+        result = linker.find_resonances(embeddings, fragments)
+        pair_ids = {(r.fragment_a_id, r.fragment_b_id) for r in result}
+        # c0 and c3 are 3 positions apart — outside the default window of 2.
+        assert ("c0", "c3") in pair_ids
+
+    def test_cross_tree_pair_kept(self) -> None:
+        """Fragments under different parents are never suppressed."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p1": _hier_fragment("p1", child_ids=["a"], level="document"),
+            "p2": _hier_fragment("p2", child_ids=["b"], level="document"),
+            "a": _hier_fragment("a", parent_id="p1", level="paragraph"),
+            "b": _hier_fragment("b", parent_id="p2", level="paragraph"),
+        }
+        embeddings = {"a": [1.0, 0.0], "b": [1.0, 0.0]}
+        result = linker.find_resonances(embeddings, fragments)
+        pair_ids = {(r.fragment_a_id, r.fragment_b_id) for r in result}
+        assert ("a", "b") in pair_ids
+
+    def test_resonance_records_endpoint_levels(self) -> None:
+        """Returned Resonance carries from_level / to_level from fragments."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p1": _hier_fragment("p1", child_ids=["a"], level="exchange"),
+            "p2": _hier_fragment("p2", child_ids=["b"], level="document"),
+            "a": _hier_fragment("a", parent_id="p1", level="sentence"),
+            "b": _hier_fragment("b", parent_id="p2", level="paragraph"),
+        }
+        embeddings = {"a": [1.0, 0.0], "b": [1.0, 0.0]}
+        result = linker.find_resonances(embeddings, fragments)
+        assert len(result) == 1
+        edge = result[0]
+        assert edge.from_level == "sentence"
+        assert edge.to_level == "paragraph"
+
+    def test_flat_fragment_regression(self) -> None:
+        """No-hierarchy vaults produce the same edges as pre-FEAT-024.
+
+        Acceptance criterion: existing flat-fragment behaviour is
+        unchanged when no parent/child fields are populated.
+        """
+        baseline = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        embeddings = {
+            "a": [1.0, 0.0],
+            "b": [0.95, 0.05],
+            "c": [0.0, 1.0],
+        }
+        without_fragments = baseline.find_resonances(embeddings)
+        flat_fragments = {
+            "a": _hier_fragment("a"),
+            "b": _hier_fragment("b"),
+            "c": _hier_fragment("c"),
+        }
+        with_fragments = baseline.find_resonances(embeddings, flat_fragments)
+        # Same pair set, in the same order.
+        pairs_a = [(r.fragment_a_id, r.fragment_b_id) for r in without_fragments]
+        pairs_b = [(r.fragment_a_id, r.fragment_b_id) for r in with_fragments]
+        assert pairs_a == pairs_b
+        # Levels default to "document" in both cases.
+        for edge in with_fragments:
+            assert edge.from_level == "document"
+            assert edge.to_level == "document"
+
+    def test_skip_window_zero_disables_sibling_suppression(self) -> None:
+        """A skip window of 0 leaves siblings in the graph."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p": _hier_fragment(
+                "p",
+                child_ids=["s0", "s1"],
+                level="document",
+            ),
+            "s0": _hier_fragment("s0", parent_id="p", level="sentence"),
+            "s1": _hier_fragment("s1", parent_id="p", level="sentence"),
+        }
+        embeddings = {"s0": [1.0, 0.0], "s1": [1.0, 0.0]}
+        result = linker.find_resonances(
+            embeddings,
+            fragments,
+            sibling_skip_window=0,
+        )
+        pair_ids = {(r.fragment_a_id, r.fragment_b_id) for r in result}
+        assert ("s0", "s1") in pair_ids
+
+    def test_skip_window_zero_still_suppresses_ancestors(self) -> None:
+        """Skip window 0 does NOT relax the ancestor suppression."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        fragments = {
+            "p": _hier_fragment("p", child_ids=["c"], level="document"),
+            "c": _hier_fragment("c", parent_id="p", level="paragraph"),
+        }
+        embeddings = {"p": [1.0, 0.0], "c": [1.0, 0.0]}
+        result = linker.find_resonances(
+            embeddings,
+            fragments,
+            sibling_skip_window=0,
+        )
+        assert not result
+
+    def test_cycle_in_parent_chain_is_tolerated(self) -> None:
+        """A malformed cyclic parent_id chain must not loop forever."""
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.5),
+        )
+        # Hand-crafted cycle: a -> b -> a. The linker should fall through
+        # without hanging, even though the data is broken.
+        fragments = {
+            "a": _hier_fragment("a", parent_id="b", level="paragraph"),
+            "b": _hier_fragment("b", parent_id="a", level="paragraph"),
+        }
+        embeddings = {"a": [1.0, 0.0], "b": [1.0, 0.0]}
+        # Each side sees the other in its ancestor set, so the pair is
+        # still suppressed — what matters is that we don't hang.
+        result = linker.find_resonances(embeddings, fragments)
+        assert not result
+
+    def test_resonance_model_default_levels(self) -> None:
+        """Constructing a Resonance with no level kwargs yields 'document'."""
+        edge = Resonance(
+            fragment_a_id="x",
+            fragment_b_id="y",
+            similarity=0.91,
+        )
+        assert edge.from_level == "document"
+        assert edge.to_level == "document"

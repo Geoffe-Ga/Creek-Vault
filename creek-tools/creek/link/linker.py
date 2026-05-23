@@ -85,7 +85,15 @@ class LinkingPipeline:
         # Stage 1: Embeddings and resonances
         embedding_linker = EmbeddingLinker(config=self.config)
         embeddings = embedding_linker.generate_embeddings(fragments)
-        resonances = embedding_linker.find_resonances(embeddings)
+        # FEAT-024: thread the fragment map and configured sibling window
+        # through so hierarchy-trivial pairs (parent/child, adjacent
+        # siblings) are dropped from the resonance graph.
+        fragments_by_id = {f.id: f for f in fragments}
+        resonances = embedding_linker.find_resonances(
+            embeddings,
+            fragments_by_id,
+            sibling_skip_window=self.linking_config.hierarchy_sibling_skip_window,
+        )
 
         # Stage 2: Temporal proximity
         temporal_links = TemporalLinker().find_temporal_links(

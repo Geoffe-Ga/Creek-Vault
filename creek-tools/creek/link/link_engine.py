@@ -138,7 +138,14 @@ def _run_embeddings(
         cache_path=cache_path,
     )
 
-    resonances = EmbeddingLinker(config=config.embeddings).find_resonances(embeddings)
+    # FEAT-024: hierarchy-aware filtering needs both the fragment map
+    # (parent/child relations) and the configured sibling skip window.
+    fragments_by_id = {f.id: f for f in fragments}
+    resonances = EmbeddingLinker(config=config.embeddings).find_resonances(
+        embeddings,
+        fragments_by_id,
+        sibling_skip_window=config.linking.hierarchy_sibling_skip_window,
+    )
     return len(resonances)
 
 

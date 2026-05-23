@@ -23,12 +23,13 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.link.embeddings import Resonance
 from creek.models import Synchronicity
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from creek.models import Fragment
+    from creek.models import Fragment, FragmentLevel
 
 DEFAULT_SIMILARITY_THRESHOLD: float = 0.9
 """Cosine similarity must exceed this value to qualify as a synchronicity."""
@@ -80,6 +81,45 @@ def _share_project(title_a: str, title_b: str) -> bool:
     return bool(_extract_proper_nouns(title_a) & _extract_proper_nouns(title_b))
 
 
+_LEGACY_TUPLE_ARITY: int = 3
+"""Pre-FEAT-024 resonance tuple shape: (id_a, id_b, similarity)."""
+
+
+def _normalise_resonance(
+    resonance: Resonance | tuple[str, str, float] | object,
+) -> tuple[str, str, float, FragmentLevel, FragmentLevel] | None:
+    """Unpack either resonance flavour into a uniform 5-tuple.
+
+    Accepting both the canonical :class:`Resonance` model and the
+    pre-FEAT-024 ``(id_a, id_b, similarity)`` tuple keeps existing
+    callers (and historical fixtures in test suites) working through
+    the transition. Any other shape is returned as ``None`` so the
+    detection loop can skip it without raising.
+
+    Args:
+        resonance: A :class:`Resonance`, a legacy 3-tuple, or some
+            other object.
+
+    Returns:
+        ``(fragment_a_id, fragment_b_id, similarity, from_level,
+        to_level)`` for recognised shapes; ``None`` otherwise.
+    """
+    if isinstance(resonance, Resonance):
+        # ``model_config`` is set to ``use_enum_values=False`` by default,
+        # so the level fields are already plain ``FragmentLevel`` strings.
+        return (
+            resonance.fragment_a_id,
+            resonance.fragment_b_id,
+            resonance.similarity,
+            resonance.from_level,
+            resonance.to_level,
+        )
+    if isinstance(resonance, tuple) and len(resonance) == _LEGACY_TUPLE_ARITY:
+        frag_a_id, frag_b_id, similarity = resonance
+        return (frag_a_id, frag_b_id, similarity, "document", "document")
+    return None
+
+
 class SynchronicityDetector:
     """Filter resonances down to meaningful cross-source synchronicities.
 
@@ -107,33 +147,57 @@ class SynchronicityDetector:
 
     def detect_synchronicities(
         self,
-        resonances: list[tuple[str, str, float]],
+        resonances: list[Resonance] | list[tuple[str, str, float]],
         fragments: dict[str, Fragment],
     ) -> list[Synchronicity]:
         """Filter *resonances* into :class:`Synchronicity` records.
 
+        FEAT-024 ranks cross-level pairs (``level_a != level_b``) ahead
+        of same-level pairs in the returned list — when a sentence-level
+        child resonates with an exchange-level fragment from a different
+        source, that asymmetry is itself a signal worth surfacing
+        deliberately rather than burying among same-level matches.
+
         Args:
-            resonances: Tuples of ``(fragment_id_a, fragment_id_b,
-                similarity)`` as emitted by
-                :class:`~creek.link.embeddings.EmbeddingLinker`.
+            resonances: :class:`Resonance` records (canonical) or the
+                legacy ``(fragment_id_a, fragment_id_b, similarity)``
+                tuple form, both emitted by
+                :class:`~creek.link.embeddings.EmbeddingLinker` across
+                FEAT-024's transition. Tuples carry no level metadata,
+                so synchronicities derived from them keep the default
+                ``"document"`` levels.
             fragments: Mapping of fragment ID to :class:`Fragment` used
                 to inspect metadata.  Resonances referencing unknown IDs
                 are silently skipped.
 
         Returns:
             A list of :class:`Synchronicity` objects, one per qualifying
-            resonance, with the earlier fragment stored in
-            ``fragment_a_id``.
+            resonance, sorted with cross-level pairs first (highest
+            similarity within each group).
         """
         results: list[Synchronicity] = []
-        for frag_a_id, frag_b_id, similarity in resonances:
+        for resonance in resonances:
+            normalised = _normalise_resonance(resonance)
+            if normalised is None:
+                continue
+            frag_a_id, frag_b_id, similarity, from_level, to_level = normalised
             frag_a = fragments.get(frag_a_id)
             frag_b = fragments.get(frag_b_id)
             if frag_a is None or frag_b is None:
                 continue
-            sync = self._evaluate_pair(frag_a, frag_b, similarity)
+            sync = self._evaluate_pair(
+                frag_a,
+                frag_b,
+                similarity,
+                from_level=from_level,
+                to_level=to_level,
+            )
             if sync is not None:
                 results.append(sync)
+        # Cross-level pairs (level_a != level_b) sort first; within each
+        # group, highest similarity wins. The boolean sort key works
+        # because Python sorts ``False`` before ``True``.
+        results.sort(key=lambda s: (s.level_a == s.level_b, -s.similarity))
         return results
 
     def _evaluate_pair(
@@ -141,6 +205,9 @@ class SynchronicityDetector:
         frag_a: Fragment,
         frag_b: Fragment,
         similarity: float,
+        *,
+        from_level: FragmentLevel,
+        to_level: FragmentLevel,
     ) -> Synchronicity | None:
         """Return a :class:`Synchronicity` if the pair passes every criterion.
 
@@ -148,6 +215,10 @@ class SynchronicityDetector:
             frag_a: First fragment in the resonance pair.
             frag_b: Second fragment in the resonance pair.
             similarity: Cosine similarity score for the pair.
+            from_level: Structural level recorded on the resonance for
+                ``frag_a`` (defaults to ``"document"`` for legacy tuples).
+            to_level: Structural level recorded on the resonance for
+                ``frag_b``.
 
         Returns:
             A :class:`Synchronicity` record, or ``None`` if any criterion
@@ -158,7 +229,12 @@ class SynchronicityDetector:
         if frag_a.source.platform == frag_b.source.platform:
             return None
 
-        earlier, later = self._chronological_pair(frag_a, frag_b)
+        earlier, later, level_earlier, level_later = self._chronological_pair(
+            frag_a,
+            frag_b,
+            from_level=from_level,
+            to_level=to_level,
+        )
         gap_days = (later.created - earlier.created).days
         if gap_days <= self.min_time_gap_days:
             return None
@@ -177,17 +253,37 @@ class SynchronicityDetector:
             time_gap_days=gap_days,
             source_a=earlier.source.platform,
             source_b=later.source.platform,
+            level_a=level_earlier,
+            level_b=level_later,
         )
 
     @staticmethod
     def _chronological_pair(
         frag_a: Fragment,
         frag_b: Fragment,
-    ) -> tuple[Fragment, Fragment]:
-        """Return the pair ordered ``(earlier, later)`` by creation time."""
+        *,
+        from_level: FragmentLevel,
+        to_level: FragmentLevel,
+    ) -> tuple[Fragment, Fragment, FragmentLevel, FragmentLevel]:
+        """Return the pair ordered ``(earlier, later, lvl_earlier, lvl_later)``.
+
+        Ordering by creation time matches what the synchronicity record
+        promises (``fragment_a_id`` is always the earlier of the two);
+        the levels follow the same flip so callers can attribute each
+        level to the right endpoint without re-checking timestamps.
+
+        Args:
+            frag_a: First fragment in the resonance pair.
+            frag_b: Second fragment in the resonance pair.
+            from_level: Resonance-recorded level of ``frag_a``.
+            to_level: Resonance-recorded level of ``frag_b``.
+
+        Returns:
+            ``(earlier, later, level_earlier, level_later)``.
+        """
         if frag_a.created <= frag_b.created:
-            return frag_a, frag_b
-        return frag_b, frag_a
+            return frag_a, frag_b, from_level, to_level
+        return frag_b, frag_a, to_level, from_level
 
     def create_synchronicity_note(
         self,

@@ -117,6 +117,20 @@ class LinkingConfig(BaseModel):
     same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
     """
 
+    hierarchy_sibling_skip_window: int = Field(default=2, ge=0)
+    """FEAT-024 sibling-suppression window for hierarchy-aware linking.
+
+    With re-atomization (FEAT-020..023) every parent fragment shares the
+    vault with its own children, and adjacent children of one parent are
+    usually topically continuous — so naive cosine similarity emits noise
+    instead of meaningful resonances. The embedding linker drops pairs
+    that are ancestor/descendant unconditionally, and pairs that share a
+    parent and sit within this many positions of each other in the
+    parent's ``child_ids`` list. ``0`` disables sibling suppression
+    entirely (ancestor suppression still applies); the default of ``2``
+    skips immediate and one-removed neighbours on either side.
+    """
+
 
 class ClassificationConfig(BaseModel):
     """Classification pipeline configuration."""
