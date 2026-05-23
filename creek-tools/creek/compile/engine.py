@@ -403,11 +403,36 @@ def _resolve_target_path(
     target_kind: CompileTargetKind,
     target_id: str,
 ) -> Path:
-    """Resolve the on-disk path for a compiled-layer target."""
+    """Resolve the on-disk path for a compiled-layer target.
+
+    Raises:
+        ValueError: If *target_id* resolves to a path outside the
+            compiled-layer subdirectory (e.g. ``"../escape"``). The
+            CLI passes ``target_id`` straight through from operator
+            input, so a one-line guard here prevents accidental
+            traversal regardless of upstream validation.
+    """
     subdir = _TARGET_DIRS[target_kind]
     target_dir = vault_path / subdir
     target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"{target_id}.md"
+    candidate = (target_dir / f"{target_id}.md").resolve()
+    if candidate.parent != target_dir.resolve():
+        msg = f"target_id {target_id!r} escapes the compiled-layer directory"
+        raise ValueError(msg)
+    return candidate
+
+
+def default_llm(config: LLMConfig) -> CompileLLM:
+    """Return the default cloud LLM client for the CLI entry point.
+
+    Tests monkeypatch this hook to inject a deterministic stub. The
+    production path constructs an Anthropic client lazily so the import
+    cost (and the API-key check) stays out of the unit-test surface.
+    """
+    from creek.classify.llm import AnthropicProvider
+
+    provider = AnthropicProvider(config)
+    return provider.call
 
 
 def _load_existing_provenance(target_path: Path) -> list[ProvenanceEntry]:
@@ -442,16 +467,3 @@ def _append_paradox_log(vault_path: Path, entries: list[ParadoxLogEntry]) -> Non
         record = asdict(entry)
         record["timestamp"] = entry.timestamp.isoformat()
         log.append(record)
-
-
-def _default_llm(config: LLMConfig) -> CompileLLM:
-    """Return the default cloud LLM client for the CLI entry point.
-
-    Tests monkeypatch this hook to inject a deterministic stub. The
-    production path constructs an Anthropic client lazily so the import
-    cost (and the API-key check) stays out of the unit-test surface.
-    """
-    from creek.classify.llm import AnthropicProvider
-
-    provider = AnthropicProvider(config)
-    return provider.call
