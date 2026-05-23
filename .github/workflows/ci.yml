@@ -121,72 +121,35 @@ jobs:
           bandit -r creek/ -ll
 
       - name: Run pip-audit dependency check
-        # Documented CVEs in build/install tooling. Each excluded with a
+        # Documented CVE in build/install tooling. Excluded with a
         # justification + advisory link, kept in sync with
         # scripts/security.sh. Audit this list at every release.
-        #   - PYSEC-2022-42969: ReDoS in py.path.svnwc; py is a transitive
-        #     dev dep (pulled in by pytest plugins); the affected code path
-        #     is unused.
+        #
+        # Re-audit 2026-05-23 (issue #249): all 23 advisories
+        # previously suppressed for torch, transformers, joblib,
+        # pyjwt, pip, and wheel are no longer reported by pip-audit's
+        # PyPI service against the locked versions (torch 2.12.0,
+        # transformers 5.8.1, joblib 1.5.3, pyjwt 2.12.1, pip 26.1.1,
+        # wheel 0.47.0). Suppressions dropped per the cve-remediation
+        # "no suppression without an active finding" rule.
+        #
+        #   - PYSEC-2022-42969: ReDoS in py.path.svnwc. ``py`` is a
+        #     transitive dep pulled in by ``interrogate 1.7.0`` (also
+        #     the latest release); ``py`` itself is abandoned at 1.11.0
+        #     with no forthcoming fix. creek-tools never invokes
+        #     ``py.path.svnwc``-backed code paths, so this advisory is
+        #     not reachable.
         #     https://github.com/advisories/GHSA-w596-4wvx-j9j6
-        #   - CVE-2025-8869: pip — symlink TOCTOU during sdist install; the
-        #     installer never runs against untrusted sdists in CI.
-        #     https://nvd.nist.gov/vuln/detail/CVE-2025-8869
-        #   - CVE-2026-1703: pip — index-URL parsing; CI installs from
-        #     declared requirements only, so untrusted indexes are not in
-        #     scope.
-        #     https://nvd.nist.gov/vuln/detail/CVE-2026-1703
-        #   - CVE-2026-3219: pip — no fix published yet; same scope as
-        #     above.
-        #     https://nvd.nist.gov/vuln/detail/CVE-2026-3219
-        #   - CVE-2026-24049: wheel — RECORD parsing edge case; wheel is
-        #     build-tooling only and never reaches the production runtime.
-        #     https://nvd.nist.gov/vuln/detail/CVE-2026-24049
-        #   - PYSEC-2025-189..197, PYSEC-2025-210, PYSEC-2026-139 (torch)
-        #     and PYSEC-2025-211..218 (transformers): transitive via the
-        #     `embeddings` extra. No patched release exists — torch
-        #     2.12.0 and transformers 5.9.0 (the latest, as of
-        #     2026-05-21) still carry every advisory. torch's are
-        #     local-access memory-corruption/DoS bugs; transformers' are
-        #     RCE via malicious checkpoints. creek-tools embeds vault
-        #     fragments with a pinned, known sentence-transformers model
-        #     (FEAT-018) and never loads untrusted checkpoints, so none
-        #     are reachable. Re-audit by 2026-06-20; see scripts/security.sh.
-        #   - PYSEC-2024-277 (joblib) and PYSEC-2025-183 (pyjwt): both at
-        #     their latest release and both formally disputed by the
-        #     supplier (joblib path needs trusted-content caching; pyjwt
-        #     key length is the caller's choice). Not reachable here.
+        #     Re-audit by 2026-11-23, or sooner if ``interrogate``
+        #     drops its ``py`` dependency.
+        #
         # A single `pip-audit --format=json --output=…` call writes the
         # JSON artifact AND gates on findings (pip-audit exits non-zero
         # if any non-ignored vulnerability is reported, regardless of the
         # output flag). No `|| true`, no second invocation needed.
         run: |
           pip-audit --format=json --output=reports/pip-audit-report.json \
-            --ignore-vuln PYSEC-2022-42969 \
-            --ignore-vuln CVE-2025-8869 \
-            --ignore-vuln CVE-2026-1703 \
-            --ignore-vuln CVE-2026-3219 \
-            --ignore-vuln CVE-2026-24049 \
-            --ignore-vuln PYSEC-2025-189 \
-            --ignore-vuln PYSEC-2025-190 \
-            --ignore-vuln PYSEC-2025-191 \
-            --ignore-vuln PYSEC-2025-192 \
-            --ignore-vuln PYSEC-2025-193 \
-            --ignore-vuln PYSEC-2025-194 \
-            --ignore-vuln PYSEC-2025-195 \
-            --ignore-vuln PYSEC-2025-196 \
-            --ignore-vuln PYSEC-2025-197 \
-            --ignore-vuln PYSEC-2025-210 \
-            --ignore-vuln PYSEC-2026-139 \
-            --ignore-vuln PYSEC-2025-211 \
-            --ignore-vuln PYSEC-2025-212 \
-            --ignore-vuln PYSEC-2025-213 \
-            --ignore-vuln PYSEC-2025-214 \
-            --ignore-vuln PYSEC-2025-215 \
-            --ignore-vuln PYSEC-2025-216 \
-            --ignore-vuln PYSEC-2025-217 \
-            --ignore-vuln PYSEC-2025-218 \
-            --ignore-vuln PYSEC-2024-277 \
-            --ignore-vuln PYSEC-2025-183
+            --ignore-vuln PYSEC-2022-42969
 
       - name: Run tests with coverage (CI-003 — mirrors local default)
         # ./scripts/test.sh excludes integration/e2e by default so local
