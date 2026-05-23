@@ -1,4 +1,4 @@
-"""Substack-aware ingestor for the Creek ingest pipeline (FEAT-024).
+"""Substack-aware ingestor for the Creek ingest pipeline.
 
 A Substack export bundles a ``posts.csv`` metadata sidecar alongside per-post
 ``<post_id>.<slug>.html`` files. The generic :class:`DocumentIngestor` treats
@@ -31,10 +31,14 @@ from __future__ import annotations
 
 import csv
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from creek.ingest._detection import (
+    POSTS_CSV_FILENAME,
+    extract_post_id,
+    is_substack_export,
+)
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -43,7 +47,7 @@ from creek.ingest.base import (
     normalize_encoding,
     normalize_timestamp,
 )
-from creek.ingest.documents import _parse_html_to_markdown
+from creek.ingest.html import parse_html_to_markdown
 from creek.models import SourceKind, SourcePlatform
 
 if TYPE_CHECKING:
@@ -52,10 +56,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ---- Constants ----
+# ---- Public re-exports ----
 
-POSTS_CSV_FILENAME = "posts.csv"
-"""The canonical Substack-export metadata sidecar."""
+# Detection helpers live in ``creek.ingest._detection`` so
+# ``creek.ingest.documents`` can import them without forming a cycle
+# with this module. They are re-exported here for the existing
+# substack-facing test surface and for downstream callers that want a
+# single "all things Substack" import location.
+__all__ = [
+    "POSTS_CSV_FILENAME",
+    "SUBSCRIBER_CSV_SUFFIXES",
+    "SUBSCRIBER_LIST_PREFIX",
+    "SubstackIngestor",
+    "is_substack_export",
+]
+
+
+# ---- Constants ----
 
 SUBSCRIBER_CSV_SUFFIXES: frozenset[str] = frozenset(
     {".delivers.csv", ".opens.csv"},
@@ -70,9 +87,6 @@ because Substack names them ``<post_id>.<slug>.delivers.csv`` /
 
 SUBSCRIBER_LIST_PREFIX = "email_list"
 """Filename prefix for the top-level subscriber list CSV (also PII)."""
-
-_LEADING_DIGITS = re.compile(r"^(\d+)")
-"""Capture the leading numeric component of a Substack HTML filename."""
 
 # Columns ``_parse_posts_csv`` will surface verbatim. Anything else in
 # the CSV is ignored — Substack's export schema has drifted over the
@@ -95,38 +109,41 @@ _KNOWN_POSTS_COLUMNS: frozenset[str] = frozenset(
 # ---- Helper functions ----
 
 
-def is_substack_export(path: Path) -> bool:
-    """Return whether *path* looks like a Substack export directory.
+# Backwards-compatible alias for the test surface that imports
+# ``_extract_post_id`` from this module by name.
+_extract_post_id = extract_post_id
 
-    A Substack export root holds a ``posts.csv`` sidecar plus at least
-    one ``<post_id>.<slug>.html`` post file (Substack drops the HTML
-    files either next to ``posts.csv`` or one level down inside a
-    ``posts/`` subdirectory). Files and missing paths short-circuit to
-    ``False`` so the check is safe to call against arbitrary CLI input.
+
+# Optional ``posts.csv`` columns whose values are surfaced verbatim
+# into the fragment frontmatter when present. Driving the assignment
+# from a table keeps :meth:`SubstackIngestor.generate_frontmatter`
+# below the project's cyclomatic-complexity ceiling and makes adding
+# a new column a one-line change.
+_OPTIONAL_FRONTMATTER_FIELDS: tuple[str, ...] = (
+    "subtitle",
+    "audience",
+    "podcast_url",
+)
+
+
+def _merge_optional_fields(
+    frontmatter_dict: dict[str, Any],
+    row: dict[str, str],
+    post_id: object,
+) -> None:
+    """Copy non-empty optional Substack columns into *frontmatter_dict*.
+
+    Empty / whitespace-only values are skipped so the frontmatter does
+    not carry blank keys that downstream consumers would have to
+    null-check. ``post_id`` is treated separately because its source
+    is the parsed-fragment metadata, not the CSV row.
     """
-    if not path.exists() or not path.is_dir():
-        return False
-    if not (path / POSTS_CSV_FILENAME).is_file():
-        return False
-    return any(
-        _extract_post_id(p.name) is not None
-        for p in path.rglob("*.html")
-        if p.is_file()
-    )
-
-
-def _extract_post_id(filename: str) -> str | None:
-    """Return the leading numeric component of a Substack HTML filename.
-
-    Substack names post files ``<post_id>.<slug>.html``. We split on the
-    leading digit run rather than ``"."`` because some slugs themselves
-    contain ``.``, and a regex anchored at the start is the simplest
-    way to read past those without misclassifying.
-    """
-    match = _LEADING_DIGITS.match(filename)
-    if match is None:
-        return None
-    return match.group(1)
+    for key in _OPTIONAL_FRONTMATTER_FIELDS:
+        value = (row.get(key) or "").strip()
+        if value:
+            frontmatter_dict[key] = value
+    if post_id:
+        frontmatter_dict["substack_post_id"] = post_id
 
 
 def _parse_posts_csv(csv_path: Path) -> dict[str, dict[str, str]]:
@@ -203,7 +220,7 @@ def _resolve_authored_at(
 
 
 class SubstackIngestor(Ingestor):
-    """Ingestor for Substack newsletter exports (FEAT-024).
+    """Ingestor for Substack newsletter exports.
 
     Discovers ``posts.csv`` once at the export root, recursively walks
     the directory for per-post ``<post_id>.<slug>.html`` files, and
@@ -231,7 +248,14 @@ class SubstackIngestor(Ingestor):
         ingestor refuses to emit anything (auto-detection failed and
         the caller likely meant ``--type document``). Subscriber-PII
         CSVs are filtered here so the parse stage cannot see them.
+
+        ``_posts_metadata`` is reset unconditionally on every call so a
+        reused ingestor instance cannot leak the previous export's
+        rows into a later parse — defensive against the (rare) caller
+        that runs the same ingestor against several sources in sequence.
         """
+        self._posts_metadata = {}
+
         if not source_path.exists() or not source_path.is_dir():
             return []
 
@@ -250,7 +274,7 @@ class SubstackIngestor(Ingestor):
             # PII guard at the discover boundary regardless.
             if _is_subscriber_csv(html_file):
                 continue
-            post_id = _extract_post_id(html_file.name)
+            post_id = extract_post_id(html_file.name)
             if post_id is None:
                 logger.debug(
                     "Substack HTML %s has no leading post_id; skipping",
@@ -279,14 +303,14 @@ class SubstackIngestor(Ingestor):
 
         The fragment's ``timestamp`` is the publication date when
         available so the base class's deterministic fragment-ID hash is
-        stable across re-ingests (FEAT-024 idempotency requirement).
+        stable across re-ingests — the idempotency contract.
         """
         post_id = str(raw.metadata.get("post_id", ""))
         row = self._posts_metadata.get(post_id)
         authored_at, timestamp = _resolve_authored_at(row, raw.path)
 
         text, encoding = normalize_encoding(raw.content)
-        markdown_body = _parse_html_to_markdown(text)
+        markdown_body = parse_html_to_markdown(text)
 
         return [
             ParsedFragment(
@@ -318,17 +342,15 @@ class SubstackIngestor(Ingestor):
         row = fragment.metadata.get("post_row") or {}
         title = (row.get("title") or "").strip() or Path(fragment.source_path).stem
 
-        source: dict[str, Any] = {
-            "platform": SourcePlatform.SUBSTACK,
-            "kind": SourceKind.WRITING,
-            "original_file": fragment.source_path,
-            "original_encoding": fragment.metadata.get("source_encoding", "utf-8"),
-        }
-
         frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "title": title,
-            "source": source,
+            "source": {
+                "platform": SourcePlatform.SUBSTACK,
+                "kind": SourceKind.WRITING,
+                "original_file": fragment.source_path,
+                "original_encoding": fragment.metadata.get("source_encoding", "utf-8"),
+            },
             "created": fragment.timestamp.isoformat(),
         }
 
@@ -336,14 +358,5 @@ class SubstackIngestor(Ingestor):
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()
 
-        subtitle = (row.get("subtitle") or "").strip()
-        if subtitle:
-            frontmatter_dict["subtitle"] = subtitle
-        audience = (row.get("audience") or "").strip()
-        if audience:
-            frontmatter_dict["audience"] = audience
-        post_id = fragment.metadata.get("post_id")
-        if post_id:
-            frontmatter_dict["substack_post_id"] = post_id
-
+        _merge_optional_fields(frontmatter_dict, row, fragment.metadata.get("post_id"))
         return frontmatter_dict

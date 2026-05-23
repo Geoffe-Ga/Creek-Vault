@@ -292,10 +292,10 @@ def _week_start(day: date) -> date:
 def _fragment_effective_date(fragment: Fragment) -> date:
     """Return the date this fragment should be bucketed under.
 
-    Prefers :attr:`Fragment.authored_at` (FEAT-024 / FEAT-025) — when an
-    ingestor extracts the source's own timestamp (a Substack post's
-    publish date, a Discord message's ``timestamp``), that date is what
-    every time-bucket surface should see so a 2024 essay does not get
+    Prefers :attr:`Fragment.authored_at` — when an ingestor extracts
+    the source's own timestamp (a Substack post's publish date, a
+    Discord message's ``timestamp``), that date is what every
+    time-bucket surface should see so a 2024 essay does not get
     counted as part of *this week's* wavelength. Falls back to
     :attr:`Fragment.created` when no authored date was extracted.
     """
@@ -308,7 +308,7 @@ def _fragment_in_window(fragment: Fragment, start: date, end: date) -> bool:
     """Return whether *fragment* falls within ``[start, end]`` inclusive.
 
     Bucketing uses :func:`_fragment_effective_date` so a historical
-    Substack export does not register as current-week activity (FEAT-024).
+    export does not register as current-week activity.
     """
     frag_date = _fragment_effective_date(fragment)
     return start <= frag_date <= end

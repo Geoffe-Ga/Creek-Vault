@@ -1,4 +1,4 @@
-"""Tests for creek.ingest.substack — Substack-aware ingestor (FEAT-024).
+"""Tests for creek.ingest.substack — Substack-aware ingestor.
 
 Covers Substack-export detection, ``posts.csv`` metadata extraction,
 publication-date preservation via ``authored_at``, source taxonomy
@@ -225,6 +225,35 @@ class TestSubstackIngestion:
             assemble_ingested_fragment(p).fragment.title for p in result.fragments
         )
         assert titles == ["Hello World", "Latest", "Second Essay"]
+
+    def test_optional_metadata_columns_surface_in_frontmatter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``subtitle``, ``audience``, and ``podcast_url`` round-trip into frontmatter.
+
+        These are the optional ``posts.csv`` columns the ingestor
+        promises in its docstring; if any silently disappeared,
+        downstream surfaces (privacy gates, voice-proxy training) would
+        lose useful context.
+        """
+        (tmp_path / "posts.csv").write_text(
+            "post_id,post_date,title,subtitle,audience,podcast_url\n"
+            "111,2024-03-15T08:30:00.000Z,Hello,A subtitle,only_paid,"
+            "https://example.com/p/111.mp3\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "111.hello.html").write_text(
+            "<html><body><p>hi</p></body></html>",
+            encoding="utf-8",
+        )
+        result = SubstackIngestor().ingest(tmp_path)
+        assert len(result.fragments) == 1
+        frontmatter = result.fragments[0].metadata["frontmatter"]
+        assert frontmatter["subtitle"] == "A subtitle"
+        assert frontmatter["audience"] == "only_paid"
+        assert frontmatter["podcast_url"] == "https://example.com/p/111.mp3"
+        assert frontmatter["substack_post_id"] == "111"
 
     def test_html_body_converted_to_markdown(self, tmp_path: Path) -> None:
         _write_substack_export(tmp_path)

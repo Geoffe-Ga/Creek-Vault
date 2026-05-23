@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from creek.ingest._detection import is_substack_export
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -35,6 +36,7 @@ from creek.ingest.base import (
     normalize_encoding,
     normalize_timestamp,
 )
+from creek.ingest.html import parse_html_to_markdown
 from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
@@ -57,30 +59,16 @@ _DOCUMENT_PLATFORM_EXTENSIONS: frozenset[str] = frozenset({".docx", ".pdf", ".rt
 
 
 def _parse_html_to_markdown(html: str) -> str:
-    """Convert an HTML string to clean ATX-style markdown.
+    """Re-export of :func:`creek.ingest.html.parse_html_to_markdown`.
 
-    Uses ``markdownify`` with ATX heading style for consistent output.
-
-    Args:
-        html: The HTML content to convert.
-
-    Returns:
-        A markdown-formatted string.
-
-    Raises:
-        ImportError: If ``markdownify`` is not installed. Install with
-            ``pip install creek-tools[documents]``.
+    The implementation moved to :mod:`creek.ingest.html` so
+    :mod:`creek.ingest.substack` can use it without reaching into a
+    private symbol of this module. This thin shim keeps existing
+    tests and downstream callers that import the underscore-prefixed
+    name working; new code should import the public
+    :func:`creek.ingest.html.parse_html_to_markdown` directly.
     """
-    try:
-        import markdownify
-    except ImportError as exc:
-        msg = (
-            "markdownify is required for HTML ingestion. "
-            "Install with: pip install creek-tools[documents]"
-        )
-        raise ImportError(msg) from exc
-    result: str = markdownify.markdownify(html, heading_style="ATX")
-    return result
+    return parse_html_to_markdown(html)
 
 
 def _wrap_txt_with_structure(text: str) -> str:
@@ -383,13 +371,12 @@ class DocumentIngestor(Ingestor):
         for files with supported extensions. Returns empty list for
         nonexistent paths.
 
-        FEAT-024: Substack export directories (``posts.csv`` + per-post
-        ``<id>.<slug>.html``) are claimed by :class:`SubstackIngestor`;
-        ``DocumentIngestor`` defers to that ingestor rather than
-        double-emitting every post as an opaque HTML document. This keeps
-        the auto-detect path of ``creek process`` (which fans every
-        registered ingestor at the source) from producing two fragments
-        per Substack essay.
+        Substack export directories (``posts.csv`` + per-post
+        ``<id>.<slug>.html``) are claimed by ``SubstackIngestor``;
+        ``DocumentIngestor`` defers to it rather than double-emitting
+        every post as an opaque HTML document, so the auto-detect path
+        of ``creek process`` (which fans every registered ingestor at
+        the source) produces one fragment per essay, not two.
 
         Args:
             source_path: A file or directory path to search.
@@ -402,9 +389,6 @@ class DocumentIngestor(Ingestor):
 
         if source_path.is_file():
             return self._discover_single_file(source_path)
-
-        # Defer Substack exports to SubstackIngestor (FEAT-024).
-        from creek.ingest.substack import is_substack_export
 
         if is_substack_export(source_path):
             return []
@@ -506,7 +490,7 @@ class DocumentIngestor(Ingestor):
         if file_type == ".pdf":
             return self._extract_pdf_content(raw_bytes)
         if file_type in {".html", ".htm"}:
-            return _parse_html_to_markdown(text)
+            return parse_html_to_markdown(text)
         if file_type == ".txt":
             return _wrap_txt_with_structure(text)
         # RTF and other formats: return raw text

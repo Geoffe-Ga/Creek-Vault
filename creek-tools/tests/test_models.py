@@ -302,12 +302,12 @@ class TestFragmentSource:
         assert dump["platform"] == "journal"
 
     def test_kind_defaults_to_unclassified(self) -> None:
-        """FragmentSource.kind defaults to UNCLASSIFIED (FEAT-024)."""
+        """FragmentSource.kind defaults to UNCLASSIFIED."""
         source = FragmentSource(platform=SourcePlatform.JOURNAL)
         assert source.kind == SourceKind.UNCLASSIFIED.value
 
     def test_kind_writing_roundtrips(self) -> None:
-        """``kind = WRITING`` is preserved through model_dump (FEAT-024)."""
+        """``kind = WRITING`` is preserved through model_dump."""
         source = FragmentSource(
             platform=SourcePlatform.SUBSTACK,
             kind=SourceKind.WRITING,
@@ -460,7 +460,7 @@ class TestFragment:
         assert frag.praxis_potential == "explicit"
 
     def test_authored_at_defaults_to_none(self) -> None:
-        """Fragment.authored_at is ``None`` by default (FEAT-024).
+        """Fragment.authored_at is ``None`` by default.
 
         ``None`` is the honest answer when no source date was extracted
         — fragments should never guess an authored date.
@@ -473,7 +473,7 @@ class TestFragment:
         assert frag.authored_at is None
 
     def test_authored_at_round_trips_through_dump(self) -> None:
-        """``authored_at`` survives model_dump → model_validate (FEAT-024)."""
+        """``authored_at`` survives model_dump → model_validate."""
         from datetime import UTC, datetime
 
         when = datetime(2024, 3, 15, 8, 30, tzinfo=UTC)

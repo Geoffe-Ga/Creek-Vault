@@ -285,7 +285,7 @@ class SourcePlatform(StrEnum):
 
 
 class SourceKind(StrEnum):
-    """Coarse semantic category for a fragment's source (FEAT-024).
+    """Coarse semantic category for a fragment's source.
 
     Where :class:`SourcePlatform` answers *where the bytes came from*
     (Substack, ChatGPT, Discord, …), ``SourceKind`` answers *what kind
@@ -294,9 +294,6 @@ class SourceKind(StrEnum):
     the kind to make policy decisions (public-by-design vs.
     private-by-default redaction, voice-proxy register selection,
     folder routing) independently of which platform produced it.
-
-    Only the values FEAT-024 actually consumes are defined; the enum
-    is expected to grow as other ingestors adopt the contract.
     """
 
     WRITING = "writing"
@@ -485,11 +482,9 @@ class Fragment(BaseModel):
     source: FragmentSource
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
-    # FEAT-024: timestamp the source *itself* records (a Substack post's
-    # publish date, a Discord message's ``timestamp``, …) as opposed to
-    # when the file was scanned (``created``) or ingested into the vault
-    # (``ingested``). ``None`` is the honest answer when no source date
-    # is extractable; FEAT-025 will roll this out across every ingestor.
+    # Timestamp the source itself records (a Substack post's publish
+    # date, a Discord message's ``timestamp``, …); ``None`` is the
+    # honest answer when no source date is extractable — never guess.
     authored_at: datetime | None = None
     frequency: FrequencyClassification = Field(
         default_factory=FrequencyClassification,

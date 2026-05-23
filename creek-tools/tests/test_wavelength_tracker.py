@@ -1040,7 +1040,7 @@ class TestDataclasses:
         assert trend.flagged_frequencies == []
 
 
-# ---- FEAT-024 authored_at fallback ----
+# ---- authored_at fallback ----
 
 
 class TestAuthoredAtBucketing:
