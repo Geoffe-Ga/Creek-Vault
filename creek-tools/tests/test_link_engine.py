@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from creek.config import CreekConfig
+from creek.config import CreekConfig, EmbeddingsConfig
+from creek.link.embeddings import (
+    EmbeddingLinker,
+    content_hash_for_text,
+    embeddings_cache_path,
+    fragment_embedding_text,
+)
 from creek.link.link_engine import run_link
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from tests.helpers import write_fragment_file as _write_fragment
@@ -26,11 +32,10 @@ def test_run_link_zero_for_empty_vault(tmp_path: Path) -> None:
 
 
 def test_run_link_rebuild_clears_cache(tmp_path: Path) -> None:
-    """``rebuild=True`` removes any pre-existing embeddings archive."""
+    """``rebuild=True`` removes any pre-existing embeddings parquet."""
     vault = tmp_path / "vault"
-    cache_dir = vault / "00-Creek-Meta"
-    cache_dir.mkdir(parents=True)
-    cache_path = cache_dir / "embeddings.npz"
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True)
     cache_path.write_bytes(b"stale-cache")
     (vault / "01-Fragments").mkdir(parents=True)
 
@@ -52,9 +57,8 @@ def test_run_link_rebuild_is_noop_for_temporal(tmp_path: Path) -> None:
     here.
     """
     vault = tmp_path / "vault"
-    cache_dir = vault / "00-Creek-Meta"
-    cache_dir.mkdir(parents=True)
-    cache_path = cache_dir / "embeddings.npz"
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True)
     sentinel = b"keep-me"
     cache_path.write_bytes(sentinel)
     (vault / "01-Fragments").mkdir(parents=True)
@@ -70,7 +74,7 @@ def test_run_link_rebuild_is_noop_for_temporal(tmp_path: Path) -> None:
 
 
 def test_run_link_embeddings_writes_cache(tmp_path: Path) -> None:
-    """Embeddings are persisted to the on-disk cache after a run."""
+    """Embeddings are persisted to the on-disk parquet cache after a run."""
     vault = tmp_path / "vault"
     fragment = Fragment(
         id="frag-cache0000000",
@@ -86,7 +90,7 @@ def test_run_link_embeddings_writes_cache(tmp_path: Path) -> None:
         rebuild=False,
     )
     assert summary.fragment_count == 1
-    cache_path = vault / "00-Creek-Meta" / "embeddings.npz"
+    cache_path = embeddings_cache_path(vault)
     assert cache_path.exists()
 
 
@@ -105,7 +109,7 @@ def test_run_link_embeddings_save_oserror_does_not_crash(
     _write_fragment(vault=vault, fragment=fragment, body="body")
 
     with patch(
-        "creek.link.embeddings.EmbeddingLinker.save_embeddings",
+        "creek.link.embeddings.EmbeddingLinker.save_cache",
         side_effect=OSError("disk full"),
     ):
         summary = run_link(
@@ -168,13 +172,11 @@ def test_run_link_eddies_returns_cluster_count(tmp_path: Path) -> None:
     assert summary.link_count >= 0
 
 
-def test_run_link_uses_existing_cache(tmp_path: Path) -> None:
-    """A second run reuses the cached embeddings archive without re-encoding.
+def test_run_link_unchanged_fragments_skip_recompute(tmp_path: Path) -> None:
+    """Re-running link must short-circuit fragments whose hash is unchanged.
 
-    The mtime check on its own is a tautology (mtime can only grow). The
-    real invariant is that the embedding model is *not* re-invoked when
-    the cache covers every fragment ID — patching ``encode`` and
-    asserting it is never called proves the cache hit.
+    The acceptance test for INC-006: with a fully fresh cache, the
+    sentence-transformer is never invoked on the second run.
     """
     from unittest.mock import patch
 
@@ -192,14 +194,9 @@ def test_run_link_uses_existing_cache(tmp_path: Path) -> None:
         method="embeddings",
         rebuild=False,
     )
-    cache_path = vault / "00-Creek-Meta" / "embeddings.npz"
-    assert cache_path.exists()
-    cached_bytes = cache_path.read_bytes()
 
-    with patch(
-        "creek.link.embeddings.EmbeddingLinker.generate_embeddings",
-        wraps=lambda *_args, **_kw: {},
-    ) as mock_generate:
+    with patch.object(EmbeddingLinker, "generate_embeddings") as mock_generate:
+        mock_generate.return_value = {}
         run_link(
             vault_path=vault,
             config=CreekConfig(),
@@ -207,11 +204,143 @@ def test_run_link_uses_existing_cache(tmp_path: Path) -> None:
             rebuild=False,
         )
 
-    # The second run still calls ``generate_embeddings`` (so unseen
-    # fragments would be picked up), but it must short-circuit because
-    # ``existing_ids`` covers every fragment we just embedded.
     mock_generate.assert_called_once()
     _, called_kwargs = mock_generate.call_args
     assert fragment.id in called_kwargs["existing_ids"]
-    # And the cache content must be preserved across the round-trip.
-    assert cache_path.read_bytes() == cached_bytes
+
+
+def test_run_link_changed_title_triggers_recompute(tmp_path: Path) -> None:
+    """A fragment whose title changes must be re-embedded on the next run."""
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    fragment_old = Fragment(
+        id="frag-changetitle0",
+        title="Original title",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment_old, body="body")
+    run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="embeddings",
+        rebuild=False,
+    )
+
+    # Rewrite the same fragment with a different title.
+    import shutil
+
+    shutil.rmtree(vault / "01-Fragments")
+    fragment_new = Fragment(
+        id="frag-changetitle0",
+        title="Updated title",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment_new, body="body")
+
+    with patch.object(EmbeddingLinker, "generate_embeddings") as mock_generate:
+        mock_generate.return_value = {fragment_new.id: [0.0] * 384}
+        run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="embeddings",
+            rebuild=False,
+        )
+
+    mock_generate.assert_called_once()
+    _, called_kwargs = mock_generate.call_args
+    # The stale fragment is NOT in existing_ids, so it gets recomputed.
+    assert fragment_new.id not in called_kwargs["existing_ids"]
+
+
+def test_run_link_model_change_invalidates_entire_cache(tmp_path: Path) -> None:
+    """Switching ``embeddings.model`` recomputes every fragment.
+
+    Acceptance test for INC-006: cache invalidation by model name.
+    """
+    from unittest.mock import patch
+
+    from creek.config import EmbeddingsConfig
+
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-modelswap00",
+        title="Stable title",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    first_config = CreekConfig(embeddings=EmbeddingsConfig(model="model-a"))
+    run_link(
+        vault_path=vault,
+        config=first_config,
+        method="embeddings",
+        rebuild=False,
+    )
+
+    second_config = CreekConfig(embeddings=EmbeddingsConfig(model="model-b"))
+    with patch.object(EmbeddingLinker, "generate_embeddings") as mock_generate:
+        mock_generate.return_value = {fragment.id: [0.0] * 384}
+        run_link(
+            vault_path=vault,
+            config=second_config,
+            method="embeddings",
+            rebuild=False,
+        )
+
+    mock_generate.assert_called_once()
+    _, called_kwargs = mock_generate.call_args
+    # Model swap invalidates the cache entry, so the fragment is NOT in existing_ids.
+    assert fragment.id not in called_kwargs["existing_ids"]
+
+
+def test_run_link_persists_content_hash_and_model(tmp_path: Path) -> None:
+    """The persisted parquet records the content hash and active model."""
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-persist0000",
+        title="Persisted fragment",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    config = CreekConfig(embeddings=EmbeddingsConfig(model="checkmodel"))
+    run_link(
+        vault_path=vault,
+        config=config,
+        method="embeddings",
+        rebuild=False,
+    )
+
+    cache_path = embeddings_cache_path(vault)
+    loaded = EmbeddingLinker(config=config.embeddings).load_cache(cache_path)
+    assert fragment.id in loaded
+    expected_hash = content_hash_for_text(fragment_embedding_text(fragment))
+    assert loaded[fragment.id].content_hash == expected_hash
+    assert loaded[fragment.id].model_name == "checkmodel"
+
+
+def test_run_link_unreadable_cache_recomputes(tmp_path: Path) -> None:
+    """A corrupted cache file must not crash the run; it triggers recompute."""
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-corruptdat0",
+        title="Corrupted cache test",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"not a parquet file")
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="embeddings",
+        rebuild=False,
+    )
+    assert summary.fragment_count == 1
+    # Cache was rewritten as a valid parquet.
+    loaded = EmbeddingLinker(config=CreekConfig().embeddings).load_cache(cache_path)
+    assert fragment.id in loaded

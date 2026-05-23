@@ -3,19 +3,24 @@
 Provides the ``EmbeddingLinker`` class which generates vector embeddings
 for fragments and finds semantic resonances between them using cosine
 similarity.  Uses locally-run sentence-transformers with disk-based
-persistence via numpy compressed archives.
+persistence via parquet so per-fragment freshness can be tracked across
+runs (INC-006).
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import logging
 import sys
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Final, cast
 
 from tqdm import tqdm
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from sentence_transformers import SentenceTransformer as SentenceTransformerType
@@ -24,6 +29,74 @@ if TYPE_CHECKING:
     from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
+
+EMBEDDINGS_CACHE_FILENAME: Final[str] = "embeddings.parquet"
+"""Canonical name for the per-vault embeddings cache (INC-006)."""
+
+EMBEDDINGS_CACHE_DIR: Final[str] = "00-Creek-Meta"
+"""Vault subdirectory that holds the embeddings cache."""
+
+
+@dataclass(frozen=True)
+class CachedEmbedding:
+    """A persisted embedding row with the metadata needed to revalidate it.
+
+    Attributes:
+        fragment_id: Stable ID of the embedded fragment.
+        content_hash: SHA-256 of the text that was embedded; a mismatch
+            against the current fragment text triggers a recompute.
+        model_name: Sentence-transformer model identifier the vector was
+            produced with. Entries for other models are invalidated on
+            load so a model swap forces a full recompute.
+        vector: The embedding vector itself.
+        computed_at: UTC timestamp at which the vector was produced.
+    """
+
+    fragment_id: str
+    content_hash: str
+    model_name: str
+    vector: list[float]
+    computed_at: datetime
+
+
+def content_hash_for_text(text: str) -> str:
+    """Return a stable SHA-256 hex digest of the embedding source text.
+
+    Args:
+        text: The exact string the embedding will (or did) consume.
+
+    Returns:
+        Lowercase 64-character hex digest used as the freshness key.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def fragment_embedding_text(fragment: Fragment) -> str:
+    """Return the canonical text encoded by the embedding model.
+
+    Centralising this keeps the freshness hash and the embedding input
+    in lockstep — if the embedding text ever expands beyond the title,
+    the hash automatically follows.
+
+    Args:
+        fragment: The fragment whose embedding text is requested.
+
+    Returns:
+        The exact string passed to the sentence-transformer.
+    """
+    return fragment.title
+
+
+def embeddings_cache_path(vault_path: Path) -> Path:
+    """Return the canonical embeddings parquet path inside a vault.
+
+    Args:
+        vault_path: Vault root directory.
+
+    Returns:
+        ``<vault>/00-Creek-Meta/embeddings.parquet``.
+    """
+    return vault_path / EMBEDDINGS_CACHE_DIR / EMBEDDINGS_CACHE_FILENAME
 
 
 def _load_sentence_transformer(
@@ -137,7 +210,7 @@ class EmbeddingLinker:
         import numpy as np  # lazy: numpy lives in the [embeddings] extra
 
         model = self.load_model()
-        texts = [f.title for f in to_embed]
+        texts = [fragment_embedding_text(f) for f in to_embed]
         show_progress = logger.isEnabledFor(logging.INFO)
         raw = model.encode(
             texts,
@@ -150,47 +223,131 @@ class EmbeddingLinker:
             frag.id: [float(x) for x in vectors[i]] for i, frag in enumerate(to_embed)
         }
 
-    def save_embeddings(
+    def save_cache(
         self,
-        embeddings: dict[str, list[float]],
+        entries: Mapping[str, CachedEmbedding],
         path: Path,
     ) -> None:
-        """Persist embeddings to disk as a compressed numpy archive.
+        """Persist freshness-aware cache entries as a parquet file.
+
+        Each entry carries the fragment ID, content hash, model name,
+        embedding vector, and computation timestamp so a subsequent load
+        can revalidate per fragment rather than treating the file as
+        opaque.
 
         Args:
-            embeddings: Mapping of fragment IDs to embedding vectors.
-            path: Destination file path (typically ``*.npz``).
+            entries: Mapping of fragment ID to :class:`CachedEmbedding`.
+            path: Destination parquet path; parent dirs must already exist.
         """
-        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+        import pyarrow as pa  # lazy: pyarrow lives in the [embeddings] extra
+        import pyarrow.parquet as pq
 
-        arrays = {k: np.array(v, dtype=np.float32) for k, v in embeddings.items()}
-        # ``allow_pickle`` is passed explicitly so mypy can narrow the kwargs
-        # type for ``**arrays`` to ``ArrayLike`` instead of matching ``bool``.
-        np.savez_compressed(path, allow_pickle=True, **arrays)
-        logger.info("Saved %d embedding(s) to %s", len(embeddings), path)
+        rows = list(entries.values())
+        table = pa.table(
+            {
+                "fragment_id": pa.array(
+                    [row.fragment_id for row in rows],
+                    type=pa.string(),
+                ),
+                "content_hash": pa.array(
+                    [row.content_hash for row in rows],
+                    type=pa.string(),
+                ),
+                "model_name": pa.array(
+                    [row.model_name for row in rows],
+                    type=pa.string(),
+                ),
+                "embedding": pa.array(
+                    [row.vector for row in rows],
+                    type=pa.list_(pa.float32()),
+                ),
+                "computed_at": pa.array(
+                    [row.computed_at for row in rows],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+            },
+        )
+        pq.write_table(table, path, compression="snappy")
+        logger.info("Saved %d embedding cache row(s) to %s", len(rows), path)
 
-    def load_embeddings(self, path: Path) -> dict[str, list[float]]:
-        """Load embeddings from a compressed numpy archive.
+    def load_cache(self, path: Path) -> dict[str, CachedEmbedding]:
+        """Load freshness-aware cache entries from a parquet file.
+
+        Entries whose ``model_name`` does not match the current
+        ``config.model`` are dropped — a model swap fully invalidates
+        the cache so the next run recomputes from scratch.
 
         Args:
-            path: Path to the ``.npz`` file.
+            path: Parquet file produced by :meth:`save_cache`.
 
         Returns:
-            A mapping of fragment IDs to their embedding vectors.
-
-        Raises:
-            FileNotFoundError: If *path* does not exist.
+            Mapping of fragment ID to :class:`CachedEmbedding`. Empty if
+            the file does not exist (treated as a cache miss so the
+            engine can fall through to a full recompute without raising).
         """
-        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+        import pyarrow.parquet as pq  # lazy: pyarrow lives in [embeddings]
 
         if not path.exists():
-            msg = f"Embeddings file not found: {path}"
-            raise FileNotFoundError(msg)
+            return {}
 
-        with np.load(path) as data:
-            result = {key: data[key].tolist() for key in data.files}
-        logger.info("Loaded %d embedding(s) from %s", len(result), path)
+        data = pq.read_table(path).to_pylist()
+        active_model = self.config.model
+        result: dict[str, CachedEmbedding] = {}
+        skipped = 0
+        for row in data:
+            if row["model_name"] != active_model:
+                skipped += 1
+                continue
+            computed_at = row["computed_at"]
+            if computed_at.tzinfo is None:
+                computed_at = computed_at.replace(tzinfo=UTC)
+            result[row["fragment_id"]] = CachedEmbedding(
+                fragment_id=row["fragment_id"],
+                content_hash=row["content_hash"],
+                model_name=row["model_name"],
+                vector=[float(x) for x in row["embedding"]],
+                computed_at=computed_at,
+            )
+        if skipped:
+            logger.info(
+                "Discarded %d cached embedding(s) from other model(s); "
+                "active model is '%s'",
+                skipped,
+                active_model,
+            )
+        logger.info("Loaded %d embedding cache row(s) from %s", len(result), path)
         return result
+
+    def build_cache_entries(
+        self,
+        fragments: list[Fragment],
+        vectors: Mapping[str, list[float]],
+    ) -> dict[str, CachedEmbedding]:
+        """Pair freshly-computed vectors with their freshness metadata.
+
+        Args:
+            fragments: Fragments whose embeddings were just computed.
+            vectors: Mapping of fragment ID to embedding vector for the
+                fragments that were actually re-encoded this run.
+
+        Returns:
+            Mapping of fragment ID to :class:`CachedEmbedding` covering
+            every fragment present in ``vectors``.
+        """
+        computed_at = datetime.now(tz=UTC)
+        by_id = {f.id: f for f in fragments}
+        return {
+            frag_id: CachedEmbedding(
+                fragment_id=frag_id,
+                content_hash=content_hash_for_text(
+                    fragment_embedding_text(by_id[frag_id]),
+                ),
+                model_name=self.config.model,
+                vector=vector.copy(),
+                computed_at=computed_at,
+            )
+            for frag_id, vector in vectors.items()
+        }
 
     def find_resonances(
         self,

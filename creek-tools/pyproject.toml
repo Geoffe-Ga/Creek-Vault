@@ -47,6 +47,7 @@ anthropic = ["anthropic>=0.40.0"]
 embeddings = [
     "sentence-transformers>=2.2.0",
     "numpy>=2.4.4",
+    "pyarrow>=17.0.0",
 ]
 ocr = [
     "pytesseract>=0.3",
