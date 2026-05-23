@@ -61,8 +61,10 @@ StopReason = Literal[
     "disabled",
     "no_decomposition",
     "aggregate_no_siblings",
+    "passthrough",
     "split",
     "aggregated",
+    "aggregated_weak",
 ]
 """Why the orchestrator stopped recursing on a given subtree.
 
@@ -76,12 +78,22 @@ Leaf reasons (``children`` is empty):
 ``no_decomposition``: the chosen operator returned no children.
 ``aggregate_no_siblings``: zoom-out chosen on a lone fragment with no
 siblings; see :func:`classify_reatomize_stream`.
+``passthrough``: a stream member the FEAT-022 aggregator declined to
+combine (wrong level for the target transition) AND that didn't
+clear the threshold on its own — distinct from ``accepted`` so
+downstream gates don't conflate "the orchestrator did nothing" with
+"the classifier was confident".
 
 Internal reasons (``children`` is non-empty):
 
 ``split``: parent was decomposed by the FEAT-021 zoom-in splitter.
 ``aggregated``: parent was assembled by the FEAT-022 zoom-out
-aggregator (only produced by :func:`classify_reatomize_stream`).
+aggregator AND cleared the threshold (only produced by
+:func:`classify_reatomize_stream`).
+``aggregated_weak``: parent was assembled by the aggregator but the
+re-classified parent still failed the threshold. Symmetric with
+``aggregated`` for downstream consumers that want to find the
+"aggregation happened but didn't resolve uncertainty" subset.
 """
 
 Classifier = Callable[[IngestedFragment], tuple[IngestedFragment, float]]
@@ -106,21 +118,6 @@ _CHAT_PLATFORMS: frozenset[SourcePlatform] = frozenset(
 Slack is named in the FEAT-023 spec but is not yet enumerated in
 :class:`SourcePlatform`; it will join this set once added.
 """
-
-_DOCUMENT_PLATFORMS: frozenset[SourcePlatform] = frozenset(
-    {
-        SourcePlatform.DOCUMENT,
-        SourcePlatform.MARKDOWN,
-        SourcePlatform.CODE,
-        SourcePlatform.ESSAY,
-        SourcePlatform.JOURNAL,
-        SourcePlatform.EMAIL,
-        SourcePlatform.SPREADSHEET,
-        SourcePlatform.PRESENTATION,
-        SourcePlatform.IMAGE_OCR,
-    },
-)
-"""Source platforms whose top-level units are long-form documents."""
 
 _TERMINAL_LEVELS: frozenset[FragmentLevel] = frozenset({"sentence", "session"})
 """Levels that resist further re-atomization in either direction."""
@@ -190,6 +187,11 @@ class ReatomizeConfig:
 
     enabled: bool = False
     threshold: float = 0.7
+    # Deliberately not validated with ge=1 (unlike
+    # ``ClassificationConfig.reatomize_max_depth``): the runtime knob
+    # accepts 0 so tests can short-circuit recursion at the root, and
+    # the CLI path projects from ``ClassificationConfig`` which already
+    # enforces the user-facing floor.
     max_depth: int = 4
     direction: DirectionOverride = "auto"
     sentence_tokenizer: SentenceTokenizer = field(
@@ -327,18 +329,14 @@ def choose_direction(
 
     Honours an explicit ``override`` first, then routes by
     ``source.platform`` and structural ``level`` per the FEAT-023
-    heuristic:
-
-    - Chat sources (``discord`` / ``claude`` / ``chatgpt``) at a chat-
-      level (``document`` = message, ``exchange``) zoom **out** to
-      stitch sparse context into the level where meaning lives.
-    - Document sources at top levels (``document`` / ``section``) zoom
-      **in**, slicing polyphonic content into focused children.
-    - Finer carved levels (``paragraph`` / ``subsection``) always zoom
-      in — they're already past any aggregation target.
-    - Anything else defaults to ``split``: aggregate without a clear
-      chat-stream signal risks combining unrelated material; ``split``
-      can at worst return no children and become an honest leaf.
+    heuristic: chat sources (``discord`` / ``claude`` / ``chatgpt``)
+    at a chat-level (``document`` = message, ``exchange``) zoom
+    **out** to stitch sparse context into the level where meaning
+    lives; every other combination — document sources at top levels,
+    finer carved levels at any source, the unknown-platform fallback —
+    zooms **in**. Aggregate without a clear chat-stream signal risks
+    combining unrelated material; ``split`` can at worst return no
+    children and become an honest leaf.
 
     Args:
         fragment: Fragment whose source + level drive the heuristic.
@@ -359,10 +357,11 @@ def choose_direction(
 
     if platform in _CHAT_PLATFORMS and level in {"document", "exchange"}:
         return "aggregate"
-    if platform in _DOCUMENT_PLATFORMS and level in {"document", "section"}:
-        return "split"
-    if level in {"paragraph", "subsection"}:
-        return "split"
+    # Document-source top levels, paragraph/subsection at any source, and
+    # the unknown-platform fallback all default to ``split``. Aggregate
+    # without a clear chat-stream signal risks combining unrelated
+    # material; ``split`` can at worst return no children and become an
+    # honest leaf.
     return "split"
 
 
@@ -406,6 +405,13 @@ def _route_stream(
     if not weak:
         return [_leaf(cl, conf, "accepted", 0) for cl, conf in classified_leaves]
 
+    # Pin the direction off the first weak fragment. The stream API
+    # assumes a homogeneous source (one Discord conversation, one
+    # document corpus) — the FEAT-022 aggregator itself groups by
+    # FragmentSource key, so mixed streams already split cleanly at
+    # that layer. A caller mixing chat + document sources in the same
+    # batch should either segment up-front or invoke
+    # :func:`classify_reatomize` per fragment.
     direction = choose_direction(weak[0][0].fragment, config.direction)
     if direction != "aggregate":
         return [
@@ -498,8 +504,18 @@ def _tree_for_parent(
 ) -> ClassificationTree:
     """Classify ``parent`` and wrap its leaves as a sub-tree."""
     if parent.level != target:
+        # Pass-through: FEAT-022 declined to aggregate this fragment
+        # (wrong source level for the target transition). Distinguish
+        # the "classifier was confident" case from "we did nothing
+        # further" so a downstream gate on ``stop_reason == "accepted"``
+        # doesn't pick up weak fragments by accident.
         cl, conf = leaf_lookup[parent.id]
-        return _leaf(cl, conf, "accepted", 0)
+        reason: StopReason = (
+            "accepted"
+            if _is_accepted(cl.fragment, conf, config.threshold)
+            else "passthrough"
+        )
+        return _leaf(cl, conf, reason, 0)
 
     body = config.aggregation_config.joiner.join(
         leaf_lookup[c_id][0].body for c_id in parent.child_ids
@@ -515,10 +531,13 @@ def _tree_for_parent(
         )
         for c_id in parent.child_ids
     )
+    # Children are non-empty here, so ``no_decomposition`` (defined as
+    # "operator returned no children") would be a lie. Use the dedicated
+    # ``aggregated_weak`` for the unconfident-parent case instead.
     stop: StopReason = (
         "aggregated"
         if _is_accepted(classified_parent.fragment, parent_conf, config.threshold)
-        else "no_decomposition"
+        else "aggregated_weak"
     )
     return ClassificationTree(
         fragment=classified_parent,

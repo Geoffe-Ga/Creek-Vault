@@ -550,13 +550,14 @@ class TestZoomOutIntegration:
         assert len(trees) == 1
         assert trees[0].stop_reason == "split"
 
-    def test_stream_aggregator_passthrough_keeps_classified_leaf(self) -> None:
-        """A pass-through fragment from FEAT-022 stays as a single-node leaf.
+    def test_stream_passthrough_weak_fragment_marked_passthrough(self) -> None:
+        """A weak pass-through fragment is labeled ``passthrough``, not ``accepted``.
 
         Mixing a ``document``-level message with a ``burst``-level fragment
         forces the aggregator's eligibility partition to emit the burst as
-        pass-through. The orchestrator must recognise that and return its
-        original classification rather than re-classify it as a new parent.
+        pass-through. When that pass-through fragment failed the threshold
+        on its own, ``stop_reason`` must NOT be ``accepted`` — downstream
+        consumers gate dashboards and export queues on that field.
         """
 
         def _mixed_classifier(
@@ -604,7 +605,109 @@ class TestZoomOutIntegration:
         # The aggregator emits one exchange parent and one burst pass-through.
         stops = {t.stop_reason for t in trees}
         assert "aggregated" in stops
-        assert "accepted" in stops  # the pass-through leaf
+        # The weak burst pass-through must be flagged honestly, NOT "accepted":
+        # confidence was 0.2 against a threshold of 0.7.
+        assert "passthrough" in stops
+        assert "accepted" not in stops
+
+    def test_stream_passthrough_strong_fragment_marked_accepted(self) -> None:
+        """A pass-through fragment that *does* pass the threshold stays ``accepted``."""
+
+        def _strong_passthrough_classifier(
+            ig: IngestedFragment,
+        ) -> tuple[IngestedFragment, float]:
+            if ig.fragment.level == "exchange":
+                return (
+                    IngestedFragment(
+                        fragment=_classified(
+                            ig.fragment,
+                            frequency=Frequency.F2,
+                            phase=Phase.RISING,
+                        ),
+                        body=ig.body,
+                    ),
+                    0.9,
+                )
+            if ig.fragment.level == "burst":
+                # Confident pass-through — must keep its "accepted" label.
+                return (
+                    IngestedFragment(
+                        fragment=_classified(
+                            ig.fragment,
+                            frequency=Frequency.F5,
+                            phase=Phase.PEAKING,
+                        ),
+                        body=ig.body,
+                    ),
+                    0.95,
+                )
+            # The document-level message stays weak so aggregation fires.
+            return ig, 0.2
+
+        mixed = [
+            _make_ingested(
+                frag_id="frag-msg00000002",
+                body="hi",
+                level="document",
+                platform=SourcePlatform.DISCORD,
+                minute=0,
+            ),
+            _make_ingested(
+                frag_id="frag-burst00002",
+                body="burst body",
+                level="burst",
+                platform=SourcePlatform.DISCORD,
+                minute=5,
+            ),
+        ]
+        trees = classify_reatomize_stream(
+            mixed,
+            _strong_passthrough_classifier,
+            config=ReatomizeConfig(
+                enabled=True,
+                threshold=0.7,
+                direction="aggregate",
+            ),
+        )
+        stops = {t.stop_reason for t in trees}
+        assert "aggregated" in stops
+        assert "accepted" in stops  # confident pass-through keeps "accepted"
+        assert "passthrough" not in stops  # confident burst is NOT a weak passthrough
+
+    def test_stream_aggregated_weak_parent_marked_aggregated_weak(self) -> None:
+        """An aggregated parent that still fails the threshold gets ``aggregated_weak``.
+
+        ``no_decomposition`` is reserved for "operator returned no children";
+        a parent with non-empty children must not borrow that label.
+        """
+
+        def _weak_parent_classifier(
+            _ig: IngestedFragment,
+        ) -> tuple[IngestedFragment, float]:
+            # Every fragment — leaf or aggregated parent — scores below threshold.
+            return _ig, 0.2
+
+        messages = [
+            _make_ingested(
+                frag_id=f"frag-weak{idx:08}",
+                body=body,
+                title=body,
+                level="document",
+                platform=SourcePlatform.DISCORD,
+                minute=idx,
+            )
+            for idx, body in enumerate(["a", "b", "c"])
+        ]
+        trees = classify_reatomize_stream(
+            messages,
+            _weak_parent_classifier,
+            config=ReatomizeConfig(enabled=True, threshold=0.7),
+        )
+        assert len(trees) == 1
+        parent = trees[0]
+        # Children were produced, so "no_decomposition" would be a lie.
+        assert parent.children
+        assert parent.stop_reason == "aggregated_weak"
 
     def test_stream_returns_terminal_when_base_level_is_session(self) -> None:
         """A stream already at the terminal level can't aggregate further."""
