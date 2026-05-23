@@ -22,6 +22,7 @@ import pytest
 
 from crawdad.attachments import (
     AcceptedAttachment,
+    ProcessedAttachments,
     RejectedAttachment,
     format_attachment_summary,
     infer_ingestor_type,
@@ -223,6 +224,37 @@ async def test_reupload_with_different_bytes_overwrites(
     assert second.accepted[0].staged_path.read_bytes() == second_payload
 
 
+async def test_post_download_size_check_rejects_underreported_size(
+    tmp_path: Path,
+) -> None:
+    """Reviewer-flagged: the post-download size gate catches a lying size field.
+
+    A malicious gateway could report a small ``size`` (passing the
+    cheap pre-filter) and then return an unbounded body from
+    ``read()``. The second size check on the downloaded bytes is the
+    authoritative gate.
+    """
+    config = AttachmentConfig(max_size_bytes=8)
+    attachment = _FakeAttachment(
+        filename="liar.md",
+        size=4,  # under-reported
+        payload=b"x" * 4096,  # actually huge
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=config,
+    )
+    assert result.accepted == ()
+    assert len(result.rejected) == 1
+    assert "downloaded size" in result.rejected[0].reason
+    # And no file landed on disk.
+    staged = tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2" / "liar.md"
+    assert not staged.exists()
+
+
 async def test_download_failure_is_rejected_cleanly(
     tmp_path: Path, attachment_config: AttachmentConfig
 ) -> None:
@@ -315,7 +347,6 @@ def test_format_attachment_summary_renders_relative_paths(
     rejected = RejectedAttachment(
         filename="big.exe", size=999, reason="extension not allowed"
     )
-    from crawdad.attachments import ProcessedAttachments
 
     processed = ProcessedAttachments(
         staging_dir=staging,
@@ -336,7 +367,6 @@ def test_format_attachment_summary_size_formats_kib_and_mib(
     tmp_path: Path,
 ) -> None:
     """Sizes render as B / KiB / MiB across the three brackets."""
-    from crawdad.attachments import ProcessedAttachments
 
     def _accepted(size: int) -> AcceptedAttachment:
         return AcceptedAttachment(
@@ -377,7 +407,7 @@ def test_config_refuses_absolute_staging_subpath() -> None:
         AttachmentConfig(staging_subpath=Path("/etc"))
 
 
-def test_empty_allowed_extensions_passes_anything_not_denied(
+async def test_empty_allowed_extensions_passes_anything_not_denied(
     tmp_path: Path,
 ) -> None:
     """An empty allow list means 'allow all not denied'."""
@@ -385,23 +415,15 @@ def test_empty_allowed_extensions_passes_anything_not_denied(
         allowed_extensions=frozenset(),
         denied_extensions=frozenset({".exe"}),
     )
-
-    async def _run() -> None:
-        result = await process_attachments(
-            attachments=[
-                _FakeAttachment(filename="weird.xyz", size=4, payload=b"abcd")
-            ],
-            vault_path=tmp_path,
-            channel_id=1,
-            message_id=2,
-            config=config,
-        )
-        assert len(result.accepted) == 1
-        assert result.accepted[0].inferred_type is None
-
-    import asyncio
-
-    asyncio.run(_run())
+    result = await process_attachments(
+        attachments=[_FakeAttachment(filename="weird.xyz", size=4, payload=b"abcd")],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=config,
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].inferred_type is None
 
 
 async def test_process_attachments_with_no_attachments_returns_empty(
@@ -424,7 +446,6 @@ def test_format_attachment_summary_with_only_rejections(
     tmp_path: Path,
 ) -> None:
     """A run with only rejections still produces a readable summary."""
-    from crawdad.attachments import ProcessedAttachments
 
     processed = ProcessedAttachments(
         staging_dir=tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2",
@@ -440,7 +461,6 @@ def test_format_attachment_summary_outside_vault_renders_absolute(
     tmp_path: Path,
 ) -> None:
     """When staging_dir is outside vault_path the summary falls back to absolute."""
-    from crawdad.attachments import ProcessedAttachments
 
     elsewhere = Path("/var/spool/staged")
     processed = ProcessedAttachments(staging_dir=elsewhere, accepted=(), rejected=())

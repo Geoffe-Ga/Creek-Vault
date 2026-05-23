@@ -16,6 +16,7 @@ attachments through the safety pass before any ingest.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -64,6 +65,11 @@ _REDACT_TOOL_MISSING_REPLY = (
     "terminal before ingesting."
 )
 
+# FEAT-027 ships the safety-pass + staging half of the consent flow.
+# The conversational "Reply with `ingest`" follow-up that drives the
+# router into ``creek.ingest`` automatically is tracked in FEAT-028
+# (issue #281). Until then the CLI escape hatch in the prompt below is
+# the supported path.
 _INGEST_CONSENT_PROMPT = (
     "I did **not** ingest anything. Reply with `ingest` (or run "
     "`creek ingest --type <type> --input <staging path>`) to proceed."
@@ -146,13 +152,14 @@ async def handle_message(
     When ``router``, ``composer``, or ``mcp_client`` is ``None``, the
     handler falls back to the FEAT-013 stub reply — useful for tests
     that don't exercise the full loop.
+
+    Gate ordering note (FEAT-027): attachments are handled *before* the
+    session-state check so a user dropping a file during a degraded
+    session-state condition still gets their file staged with a clear
+    safety report, instead of a misleading "session unavailable" reply.
+    The attachment path does not need ``session_state``.
     """
-    if not await _passes_preflight(
-        message=message,
-        config=config,
-        session_state=session_state,
-        bot_user_id=bot_user_id,
-    ):
+    if not _passes_allowlist(message, config=config, bot_user_id=bot_user_id):
         return
     if message.attachments:
         await _handle_attachments(
@@ -162,12 +169,13 @@ async def handle_message(
             known_tools=known_tools,
         )
         return
+    if session_state is None:
+        await message.channel.send(_STATE_UNAVAILABLE_REPLY)
+        return
     if router is None or composer is None or mcp_client is None:
         await message.channel.send(_stub_reply())
         return
 
-    # session_state is non-None — _passes_preflight enforces that.
-    assert session_state is not None
     outcome = await run_one_turn(
         message=message.content,
         router=router,
@@ -182,27 +190,21 @@ async def handle_message(
     await message.channel.send(_truncate_for_discord(outcome.reply))
 
 
-async def _passes_preflight(
-    *,
+def _passes_allowlist(
     message: _MessageLike,
+    *,
     config: CrawDadConfig,
-    session_state: SessionState | None,
     bot_user_id: int,
 ) -> bool:
-    """Run the self-suppression, allowlist, and state gates.
+    """Pure (non-side-effecting) self-suppression + allowlist gate.
 
-    Returns ``True`` when the caller should continue processing the
-    message, ``False`` when the gate already replied (or silently
-    dropped the message per FEAT-013).
+    Returns ``True`` when the caller should keep processing the
+    message, ``False`` when the message should be silently dropped
+    (per FEAT-013 §non-allowlisted callers get no response).
     """
     if message.author.id == bot_user_id or message.author.bot:
         return False
-    if not config.is_allowed(user_id=message.author.id, channel_id=message.channel.id):
-        return False
-    if session_state is None:
-        await message.channel.send(_STATE_UNAVAILABLE_REPLY)
-        return False
-    return True
+    return config.is_allowed(user_id=message.author.id, channel_id=message.channel.id)
 
 
 def _empty_skills() -> VoiceSkillStack:
@@ -237,12 +239,14 @@ async def _handle_attachments(
     4. Reply with the combined download summary, the scan report, and a
        consent prompt. The bot **never** auto-ingests; the user must
        respond explicitly (per FEAT-027 §Ingestion only proceeds on
-       explicit user consent).
+       explicit user consent — see FEAT-028 / issue #281 for the
+       conversational consent follow-up).
     """
+    channel_id = message.channel.id
     processed = await process_attachments(
         attachments=message.attachments,
         vault_path=config.vault_path,
-        channel_id=message.channel.id,
+        channel_id=channel_id,
         message_id=message.id,
         config=config.attachments,
     )
@@ -265,6 +269,7 @@ async def _handle_attachments(
         config=config,
         mcp_client=mcp_client,
         known_tools=known_tools,
+        channel_id=channel_id,
     )
 
     reply = "\n\n".join((summary, scan_section, _INGEST_CONSENT_PROMPT))
@@ -277,12 +282,15 @@ async def _run_safety_scan(
     config: CrawDadConfig,
     mcp_client: MCPClient | None,
     known_tools: tuple[str, ...],
+    channel_id: int,
 ) -> str:
     """Invoke ``creek.redact.scan`` on the staging dir, return Discord-safe text.
 
     Returns a soft-error message instead of raising when MCP is
-    unavailable or the tool is not advertised — the user still gets
-    the download summary and a clear next step.
+    unavailable, the tool is not advertised, or any other unexpected
+    exception occurs during the call. The user always gets the
+    download summary and a clear next step — the bot never goes silent
+    on attachment turns.
     """
     if mcp_client is None or _REDACT_SCAN_TOOL not in known_tools:
         return _REDACT_TOOL_MISSING_REPLY
@@ -299,31 +307,53 @@ async def _run_safety_scan(
                 {
                     "input_path": str(rel_staging),
                     "privacy_tier_ceiling": _channel_tier(
-                        channel_id=processed.staging_dir.parent.name,
-                        config=config,
+                        channel_id=channel_id, config=config
                     ),
                 },
             )
     except MCPUnavailableError as exc:
         _LOGGER.warning("creek.redact.scan failed: %s", exc)
         return _MCP_UNAVAILABLE_REPLY
+    except Exception:
+        # Any other failure (timeout, protocol error, bad JSON, etc.)
+        # must not bubble up — the bot would go silent on the user's
+        # attachment turn. Log a full traceback for the operator and
+        # surface the same soft error.
+        _LOGGER.exception("unexpected error during creek.redact.scan call")
+        return _MCP_UNAVAILABLE_REPLY
 
+    return _format_scan_section(body)
+
+
+def _format_scan_section(body: str) -> str:
+    """Wrap the MCP scan tool's text response into a Discord-safe section.
+
+    The MCP transport already concatenates the tool's text content into
+    a single string; ``creek.redact.scan`` puts a Markdown summary in
+    that text. If the body looks like a raw JSON dict (e.g. because a
+    future tool revision returns structured content directly), pull the
+    ``report_markdown`` field out so users do not see a JSON blob.
+    """
+    stripped = body.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("report_markdown"), str):
+            return f"**Safety scan**\n\n{parsed['report_markdown']}"
     return f"**Safety scan**\n```\n{body}\n```"
 
 
-def _channel_tier(*, channel_id: str, config: CrawDadConfig) -> str:
-    """Return the privacy tier ceiling for the staging-dir's channel id.
+def _channel_tier(*, channel_id: int, config: CrawDadConfig) -> str:
+    """Return the privacy tier ceiling for *channel_id*.
 
     Falls back to ``personal`` when the channel is absent from
     :attr:`AttachmentConfig.channel_privacy_tiers` — ingest writes
     default to personal per FEAT-011, so a missing entry never
     silently relaxes the ceiling.
     """
-    try:
-        cid = int(channel_id)
-    except ValueError:
-        return "personal"
-    return config.attachments.channel_privacy_tiers.get(cid, "personal")
+    return config.attachments.channel_privacy_tiers.get(channel_id, "personal")
 
 
 def _truncate_for_discord(text: str) -> str:

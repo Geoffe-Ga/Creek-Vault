@@ -177,6 +177,29 @@ class AttachmentConfig(BaseModel):
             raise ValueError(msg)
         return value
 
+    @field_validator("channel_privacy_tiers")
+    @classmethod
+    def _validate_channel_tiers(cls, value: dict[int, str]) -> dict[int, str]:
+        """Refuse unknown privacy tier strings at config-parse time.
+
+        The MCP server validates the ``privacy_tier_ceiling`` argument
+        downstream, but a bogus override in ``crawdad.yaml`` would
+        surface as a confusing MCP error at runtime instead of a clear
+        config error at startup. Restrict the value set to the four
+        ``TierCeiling`` values (mirrored from
+        :class:`creek_mcp.tier_ceiling.TierCeiling` without importing it
+        — crawdad has no Python dependency on creek-tools).
+        """
+        allowed: frozenset[str] = frozenset({"open", "personal", "intimate", "all"})
+        for channel_id, tier in value.items():
+            if tier not in allowed:
+                msg = (
+                    f"channel_privacy_tiers[{channel_id}] = {tier!r} is not a valid "
+                    f"tier ceiling; expected one of {sorted(allowed)}."
+                )
+                raise ValueError(msg)
+        return value
+
 
 class CrawDadConfig(BaseModel):
     """Immutable runtime configuration for the bot.

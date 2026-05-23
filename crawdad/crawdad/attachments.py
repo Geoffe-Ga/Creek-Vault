@@ -148,7 +148,7 @@ class ProcessedAttachments:
     """
 
     staging_dir: Path
-    accepted: tuple[AcceptedAttachment, ...]
+    accepted: tuple[AcceptedAttachment, ...] = field(default_factory=tuple)
     rejected: tuple[RejectedAttachment, ...] = field(default_factory=tuple)
 
     @property
@@ -346,6 +346,26 @@ async def _process_one(
             filename=attachment.filename,
             size=attachment.size,
             reason=f"download failed: {exc}",
+        )
+
+    # Re-check the size against the actual downloaded body, not the
+    # Discord-reported metadata. The metadata-based check above is the
+    # cheap pre-filter; this second gate makes the invariant hold even
+    # if a malicious gateway under-reported the size.
+    if len(data) > config.max_size_bytes:
+        _LOGGER.info(
+            "rejecting attachment %r post-download: %d bytes exceeds max %d",
+            attachment.filename,
+            len(data),
+            config.max_size_bytes,
+        )
+        return RejectedAttachment(
+            filename=attachment.filename,
+            size=len(data),
+            reason=(
+                f"downloaded size {len(data)} bytes exceeds max "
+                f"{config.max_size_bytes} bytes"
+            ),
         )
 
     safe_name = sanitize_filename(attachment.filename)

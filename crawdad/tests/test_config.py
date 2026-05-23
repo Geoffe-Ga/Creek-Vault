@@ -145,6 +145,34 @@ def test_config_attachments_defaults_to_25_mib_and_inbound(tmp_path: Path) -> No
     assert ".exe" in config.attachments.denied_extensions
 
 
+def test_attachment_config_rejects_unknown_privacy_tier() -> None:
+    """FEAT-027: bogus tier strings in ``channel_privacy_tiers`` are refused.
+
+    Without this validator a typo in ``crawdad.yaml`` would surface
+    as a confusing MCP error at runtime instead of a clear config
+    error at startup.
+    """
+    from crawdad.config import AttachmentConfig
+
+    with pytest.raises(ValidationError, match="valid tier ceiling"):
+        AttachmentConfig(channel_privacy_tiers={999: "superopen"})
+
+
+def test_attachment_config_accepts_all_four_tier_values() -> None:
+    """All four ``TierCeiling`` values pass validation."""
+    from crawdad.config import AttachmentConfig
+
+    config = AttachmentConfig(
+        channel_privacy_tiers={
+            1: "open",
+            2: "personal",
+            3: "intimate",
+            4: "all",
+        },
+    )
+    assert config.channel_privacy_tiers[2] == "personal"
+
+
 def test_load_config_parses_attachment_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

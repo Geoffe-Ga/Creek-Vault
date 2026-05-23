@@ -1015,3 +1015,208 @@ async def test_attachment_path_short_circuits_before_agent_loop(
         known_tools=("creek.redact.scan",),
     )
     assert composer.calls == []
+
+
+async def test_attachment_path_runs_when_session_state_is_none(
+    config: CrawDadConfig,
+) -> None:
+    """FEAT-027 regression: a degraded session must NOT block file staging.
+
+    Reviewer-flagged blocker: previously the ``session_state is None``
+    gate fired before the attachment branch, so a user dropping a file
+    during a degraded state received "session unavailable" instead of
+    a staged file + safety report.
+    """
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=314,
+        attachments=[attachment],
+    )
+
+    class _Session:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return "Scan summary: no findings"
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=None,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    # File was staged.
+    staged = config.vault_path / "00-Creek-Meta" / "Inbound" / "999" / "314" / "note.md"
+    assert staged.read_bytes() == b"safe"
+    # Reply mentions the safety scan, not "session unavailable".
+    assert len(channel.sent) == 1
+    assert "creek state" not in channel.sent[0]
+    assert "Safety scan" in channel.sent[0]
+
+
+async def test_run_safety_scan_swallows_unexpected_exceptions(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Reviewer-flagged blocker: non-``MCPUnavailableError`` exceptions
+    must not crash the handler. The bot still replies with the soft
+    error so the user is not left in silence.
+    """
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=271,
+        attachments=[attachment],
+    )
+
+    class _BrokenSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            raise TimeoutError("upstream timed out")
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_BrokenSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    assert len(channel.sent) == 1
+    assert "unreachable" in channel.sent[0].lower()
+
+
+async def test_run_safety_scan_extracts_report_markdown_from_dict_response(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Reviewer-flagged: when MCP returns a JSON dict, extract ``report_markdown``.
+
+    A future revision of ``creek.redact.scan`` may return its full
+    structured response (statistics + findings + report) instead of
+    just the markdown summary. The handler must show the markdown,
+    not a JSON blob, to the user.
+    """
+    import json as _json
+
+    structured = {
+        "status": "empty",
+        "tool": "creek.redact.scan",
+        "report_markdown": "# Redaction Scan Summary\n\nNo findings.\n",
+        "statistics": {"files_scanned": 1, "total_findings": 0},
+        "findings": [],
+    }
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=161,
+        attachments=[attachment],
+    )
+
+    class _StructuredSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return _json.dumps(structured)
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_StructuredSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    assert len(channel.sent) == 1
+    reply = channel.sent[0]
+    assert "Redaction Scan Summary" in reply
+    # Raw JSON should not leak into the reply when report_markdown is present.
+    assert '"findings"' not in reply
+    assert '"statistics"' not in reply
+
+
+async def test_run_safety_scan_falls_back_for_unparseable_dict_response(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """When the response looks like a dict but isn't valid JSON, fall back to raw."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=162,
+        attachments=[attachment],
+    )
+
+    # Brace-bracketed but not valid JSON — handler must not crash, and
+    # the raw text falls through to the code-fenced section.
+    bad_body = "{not really json}"
+
+    class _BadJsonSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return bad_body
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_BadJsonSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    assert len(channel.sent) == 1
+    assert bad_body in channel.sent[0]
+    assert "Safety scan" in channel.sent[0]
+
+
+async def test_channel_tier_default_falls_back_to_personal(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """No override in ``channel_privacy_tiers`` → ceiling defaults to ``personal``."""
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=10,
+        attachments=[attachment],
+    )
+
+    captured: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, _name: str, args: dict[str, Any] | None = None
+        ) -> str:
+            captured.append(args or {})
+            return "Scan summary"
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    assert captured[0]["privacy_tier_ceiling"] == "personal"
