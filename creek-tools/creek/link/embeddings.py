@@ -17,7 +17,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
 
+from pydantic import BaseModel
 from tqdm import tqdm
+
+# FragmentLevel is a Literal alias that Pydantic resolves at class-creation
+# time when building ``Resonance``'s field schema; moving it under
+# TYPE_CHECKING would leave the symbol undefined and crash the import.
+from creek.models import (
+    FragmentLevel,  # noqa: TC001  # Issue #255: Pydantic runtime resolution
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -28,6 +36,15 @@ if TYPE_CHECKING:
     from creek.config import EmbeddingsConfig
     from creek.models import Fragment
 
+_DEFAULT_LEVEL: Final[FragmentLevel] = "document"
+"""Fallback level for fragments not present in the supplied lookup map.
+
+When :meth:`EmbeddingLinker.find_resonances` is called without a
+``fragments`` argument (the flat-fragment / pre-FEAT-020 contract), every
+resonance reports both endpoints at ``"document"`` level — which matches
+``Fragment.level``'s own default and keeps the regression test honest.
+"""
+
 logger = logging.getLogger(__name__)
 
 EMBEDDINGS_CACHE_FILENAME: Final[str] = "embeddings.parquet"
@@ -35,6 +52,31 @@ EMBEDDINGS_CACHE_FILENAME: Final[str] = "embeddings.parquet"
 
 EMBEDDINGS_CACHE_DIR: Final[str] = "00-Creek-Meta"
 """Vault subdirectory that holds the embeddings cache."""
+
+
+class Resonance(BaseModel):
+    """A semantic resonance edge between two fragments (FEAT-024).
+
+    Replaces the old ``(fragment_a_id, fragment_b_id, similarity)`` tuple
+    so downstream surfaces (synchronicity detection, mining) can read
+    the structural level of each endpoint without re-joining against the
+    fragment table. The two ``*_level`` fields default to ``"document"``
+    so flat-fragment vaults — where no hierarchy has been carved —
+    report a stable, predictable value rather than ``None``.
+
+    Attributes:
+        fragment_a_id: ID of the first fragment in the resonance.
+        fragment_b_id: ID of the second fragment in the resonance.
+        similarity: Cosine similarity between the two embedding vectors.
+        from_level: Structural level of ``fragment_a_id``'s fragment.
+        to_level: Structural level of ``fragment_b_id``'s fragment.
+    """
+
+    fragment_a_id: str
+    fragment_b_id: str
+    similarity: float
+    from_level: FragmentLevel = _DEFAULT_LEVEL
+    to_level: FragmentLevel = _DEFAULT_LEVEL
 
 
 @dataclass(frozen=True)
@@ -120,6 +162,128 @@ def _load_sentence_transformer(
         "SentenceTransformerType",
         SentenceTransformer(model_name, cache_folder=cache_folder),
     )
+
+
+def _hierarchy_index(
+    fragments: Mapping[str, Fragment] | None,
+) -> tuple[dict[str, frozenset[str]], dict[str, tuple[str, int]]]:
+    """Precompute ancestor sets and sibling positions for hierarchy filtering.
+
+    Two derived structures keep the per-pair check in
+    :meth:`EmbeddingLinker.find_resonances` O(1) amortised:
+
+    - ``ancestors[fid]`` is the frozen set of every fragment ID reachable
+      by walking ``parent_id`` upward from *fid*. Used by the
+      ancestor/descendant pair check.
+    - ``sibling_positions[child_id] = (parent_id, index)`` records each
+      child's slot in its parent's ``child_ids`` list. Built from the
+      *parent's* declaration so the index is anchored in the canonical
+      sibling order (which the FEAT-021 splitter and FEAT-022 aggregator
+      both emit deterministically).
+
+    Args:
+        fragments: Mapping of fragment ID to :class:`Fragment`, or
+            ``None`` when no hierarchy data is available.
+
+    Returns:
+        A tuple ``(ancestors, sibling_positions)``. Both maps are empty
+        when *fragments* is ``None`` or empty — suppression then becomes
+        a no-op without special-casing in the caller.
+    """
+    if not fragments:
+        return {}, {}
+
+    sibling_positions: dict[str, tuple[str, int]] = {}
+    for parent_id, parent in fragments.items():
+        for index, child_id in enumerate(parent.child_ids):
+            sibling_positions[child_id] = (parent_id, index)
+
+    ancestors: dict[str, frozenset[str]] = {}
+    for fid, frag in fragments.items():
+        chain: set[str] = set()
+        current = frag.parent_id
+        # Cycle guard: ``current in chain`` catches a self-referential or
+        # circular parent_id link without raising. The vault writer never
+        # produces these, but a hand-edited fragment could.
+        while current and current not in chain:
+            chain.add(current)
+            next_frag = fragments.get(current)
+            current = next_frag.parent_id if next_frag is not None else None
+        ancestors[fid] = frozenset(chain)
+    return ancestors, sibling_positions
+
+
+def _level_lookup(
+    ids: list[str],
+    fragments: Mapping[str, Fragment] | None,
+) -> dict[str, FragmentLevel]:
+    """Return a level lookup for every embedded fragment ID.
+
+    Missing or absent entries fall back to ``"document"`` so the
+    resulting :class:`Resonance` records carry a meaningful value even
+    when the caller has not threaded a fragment map through.
+
+    Args:
+        ids: Fragment IDs that appeared in the embedding map.
+        fragments: Optional mapping of fragment ID to :class:`Fragment`.
+
+    Returns:
+        A mapping of fragment ID to its declared level.
+    """
+    if not fragments:
+        return dict.fromkeys(ids, _DEFAULT_LEVEL)
+    return {fid: _level_for(fid, fragments) for fid in ids}
+
+
+def _level_for(fid: str, fragments: Mapping[str, Fragment]) -> FragmentLevel:
+    """Return the level of *fid* in *fragments*, falling back to ``"document"``."""
+    frag = fragments.get(fid)
+    if frag is None:
+        return _DEFAULT_LEVEL
+    return frag.level
+
+
+def _is_hierarchy_suppressed(
+    a_id: str,
+    b_id: str,
+    *,
+    ancestors: dict[str, frozenset[str]],
+    sibling_positions: dict[str, tuple[str, int]],
+    sibling_skip_window: int,
+) -> bool:
+    """Return whether the pair ``(a_id, b_id)`` is hierarchy-trivial.
+
+    Suppression triggers when *either* fragment is an ancestor of the
+    other (via ``parent_id`` chain), *or* both fragments share a parent
+    and their indices in that parent's ``child_ids`` differ by at most
+    *sibling_skip_window*. A non-positive window disables the sibling
+    check; ancestor suppression always applies.
+
+    Args:
+        a_id: First fragment ID.
+        b_id: Second fragment ID.
+        ancestors: Precomputed ancestor sets (see :func:`_hierarchy_index`).
+        sibling_positions: Precomputed sibling positions (idem).
+        sibling_skip_window: Adjacent-sibling suppression radius (``>= 0``).
+
+    Returns:
+        ``True`` if the pair should be dropped from the resonance graph.
+    """
+    if b_id in ancestors.get(a_id, frozenset()):
+        return True
+    if a_id in ancestors.get(b_id, frozenset()):
+        return True
+    if sibling_skip_window <= 0:
+        return False
+    pos_a = sibling_positions.get(a_id)
+    pos_b = sibling_positions.get(b_id)
+    if pos_a is None or pos_b is None:
+        return False
+    parent_a, index_a = pos_a
+    parent_b, index_b = pos_b
+    if parent_a != parent_b:
+        return False
+    return abs(index_a - index_b) <= sibling_skip_window
 
 
 class EmbeddingLinker:
@@ -352,18 +516,38 @@ class EmbeddingLinker:
     def find_resonances(
         self,
         embeddings: dict[str, list[float]],
-    ) -> list[tuple[str, str, float]]:
+        fragments: Mapping[str, Fragment] | None = None,
+        *,
+        sibling_skip_window: int = 2,
+    ) -> list[Resonance]:
         """Find semantic resonances between fragments via cosine similarity.
 
         Computes pairwise cosine similarity for all embedding pairs and
-        returns those above the configured threshold.
+        returns those above the configured threshold. When *fragments*
+        is provided, FEAT-024 hierarchy-aware suppression applies:
+
+        - Pairs where one fragment is an ancestor of the other (via the
+          ``parent_id`` chain) are dropped — same text at two granularities
+          is not a resonance.
+        - Pairs sharing a ``parent_id`` whose positions in the parent's
+          ``child_ids`` differ by at most *sibling_skip_window* are
+          dropped as topically continuous neighbours.
+
+        With no *fragments* mapping (the flat-fragment contract) the
+        suppression is inert and behaviour is identical to pre-FEAT-024.
 
         Args:
             embeddings: Mapping of fragment IDs to their embedding vectors.
+            fragments: Optional mapping of fragment ID to :class:`Fragment`
+                used for hierarchy-aware suppression and level metadata.
+            sibling_skip_window: Adjacent-sibling suppression radius;
+                ``0`` disables sibling suppression (ancestor suppression
+                still applies).
 
         Returns:
-            A list of ``(fragment_id_a, fragment_id_b, similarity)`` tuples
-            for each resonance found.
+            A list of :class:`Resonance` records, one per qualifying pair,
+            in the deterministic insertion order of
+            :func:`itertools.combinations`.
         """
         ids = list(embeddings.keys())
         if len(ids) < 2:
@@ -383,7 +567,11 @@ class EmbeddingLinker:
         normalized = vectors / norms
         similarity_matrix = normalized @ normalized.T
 
-        resonances: list[tuple[str, str, float]] = []
+        ancestors, sibling_positions = _hierarchy_index(fragments)
+        levels = _level_lookup(ids, fragments)
+
+        resonances: list[Resonance] = []
+        suppressed = 0
         # OPS-004: pairwise loop is O(N²); on a 10k-fragment vault this
         # is ~50M iterations and runs for minutes. Show tqdm in TTYs and
         # stay silent in non-interactive runs (CI logs, pipes).
@@ -397,8 +585,33 @@ class EmbeddingLinker:
         )
         for i, j in pair_iter:
             sim = float(similarity_matrix[i, j])
-            if sim >= self.config.similarity_threshold:
-                resonances.append((ids[i], ids[j], sim))
+            if sim < self.config.similarity_threshold:
+                continue
+            if _is_hierarchy_suppressed(
+                ids[i],
+                ids[j],
+                ancestors=ancestors,
+                sibling_positions=sibling_positions,
+                sibling_skip_window=sibling_skip_window,
+            ):
+                suppressed += 1
+                continue
+            resonances.append(
+                Resonance(
+                    fragment_a_id=ids[i],
+                    fragment_b_id=ids[j],
+                    similarity=sim,
+                    from_level=levels[ids[i]],
+                    to_level=levels[ids[j]],
+                ),
+            )
 
+        if suppressed:
+            logger.info(
+                "Suppressed %d hierarchy-trivial resonance(s) "
+                "(ancestor/descendant or adjacent siblings within %d)",
+                suppressed,
+                sibling_skip_window,
+            )
         logger.info("Found %d resonance(s)", len(resonances))
         return resonances

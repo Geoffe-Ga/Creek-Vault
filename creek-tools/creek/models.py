@@ -671,6 +671,12 @@ class Synchronicity(BaseModel):
         source_a: Source platform of the first fragment.
         source_b: Source platform of the second fragment (must differ
             from ``source_a``).
+        level_a: Structural level of the earlier fragment (FEAT-024).
+            Defaults to ``"document"`` for flat-fragment vaults.
+        level_b: Structural level of the later fragment (FEAT-024).
+            When ``level_a != level_b`` the pair is *cross-level*, which
+            ranks above same-level pairs in
+            :class:`~creek.generate.synchronicity.SynchronicityDetector`.
         tags: Obsidian tags applied to the synchronicity note.
     """
 
@@ -684,6 +690,8 @@ class Synchronicity(BaseModel):
     time_gap_days: int
     source_a: SourcePlatform
     source_b: SourcePlatform
+    level_a: FragmentLevel = "document"
+    level_b: FragmentLevel = "document"
     tags: list[str] = Field(default_factory=lambda: ["synchronicity"])
 
 

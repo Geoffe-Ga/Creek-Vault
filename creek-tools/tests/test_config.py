@@ -95,6 +95,21 @@ class TestLinkingConfig:
         assert cfg.thread_min_fragments == 3
         assert cfg.eddy_min_fragments == 5
 
+    def test_hierarchy_sibling_skip_window_default_is_two(self) -> None:
+        """FEAT-024 sibling-skip window defaults to 2 positions either side."""
+        cfg = LinkingConfig()
+        assert cfg.hierarchy_sibling_skip_window == 2
+
+    def test_hierarchy_sibling_skip_window_accepts_zero(self) -> None:
+        """A skip window of 0 disables sibling suppression (still valid)."""
+        cfg = LinkingConfig(hierarchy_sibling_skip_window=0)
+        assert cfg.hierarchy_sibling_skip_window == 0
+
+    def test_hierarchy_sibling_skip_window_rejects_negative(self) -> None:
+        """Negative skip windows are nonsensical and rejected by validation."""
+        with pytest.raises(ValueError, match="greater than or equal to 0"):
+            LinkingConfig(hierarchy_sibling_skip_window=-1)
+
 
 class TestClassificationConfig:
     """Tests for ClassificationConfig model."""
