@@ -129,6 +129,21 @@ class TestSubsectionToParagraph:
     def test_subsection_with_single_sentence_returns_empty(self) -> None:
         assert split(_make(body="Indivisible content.", level="subsection")) == []
 
+    def test_single_paragraph_cascade_forwards_stripped_body(self) -> None:
+        """Custom tokenizers receive the stripped paragraph, not raw body."""
+        seen: list[str] = []
+
+        def recording_tokenizer(text: str) -> list[str]:
+            seen.append(text)
+            return text.split("|")
+
+        body = "  \n\nalpha|bravo|charlie  \n\n  "
+        split(
+            _make(body=body, level="subsection"),
+            sentence_tokenizer=recording_tokenizer,
+        )
+        assert seen == ["alpha|bravo|charlie"]
+
 
 # ---- Section → subsection ----
 
@@ -225,6 +240,11 @@ class TestDocumentToSection:
         ingested = _make(body=body, level="document")
         children = split(ingested)
         assert _levels(children) == ["sentence", "sentence"]
+
+    def test_document_with_empty_body_returns_empty(self) -> None:
+        """Cascade bottoms out cleanly when there's nothing to decompose."""
+        assert split(_make(body="", level="document")) == []
+        assert split(_make(body="   \n\t\n  ", level="document")) == []
 
     def test_document_preamble_before_first_heading_is_preserved(self) -> None:
         body = "Intro paragraph with no heading.\n\n# A heading\n\nBody under heading."

@@ -78,6 +78,11 @@ def default_sentence_tokenizer(text: str) -> list[str]:
     and a capital letter or opening bracket/quote. Empty input yields
     an empty list.
 
+    Known failure modes: abbreviations (``Dr. Smith``) and ellipses
+    (``... and then``) produce extra splits. Callers needing higher
+    fidelity (clinical text, formal prose, multi-language) should pass
+    their own tokenizer via :func:`split`'s ``sentence_tokenizer`` kwarg.
+
     Args:
         text: Raw text to tokenize.
 
@@ -89,6 +94,9 @@ def default_sentence_tokenizer(text: str) -> list[str]:
         return []
     parts = _SENTENCE_BOUNDARY.split(stripped)
     return [piece.strip() for piece in parts if piece.strip()]
+
+
+_LevelHandler = Callable[["Fragment", str, SentenceTokenizer], list[IngestedFragment]]
 
 
 def split(
@@ -113,20 +121,10 @@ def split(
         ``session``), or when no decomposition is possible.
     """
     parent = fragment.fragment
-    body = fragment.body
-    dispatch: dict[
-        FragmentLevel,
-        Callable[[Fragment, str, SentenceTokenizer], list[IngestedFragment]],
-    ] = {
-        "document": _split_document,
-        "section": _split_section,
-        "subsection": _paragraphs_or_sentences,
-        "paragraph": _split_paragraph,
-    }
-    handler = dispatch.get(parent.level)
+    handler = _DISPATCH.get(parent.level)
     if handler is None:
         return []
-    return handler(parent, body, sentence_tokenizer)
+    return handler(parent, fragment.body, sentence_tokenizer)
 
 
 # ---- Per-level handlers -----------------------------------------------------
@@ -169,7 +167,10 @@ def _paragraphs_or_sentences(
     if len(paragraphs) > 1:
         pieces: list[_Piece] = [(None, para) for para in paragraphs]
         return _build_children(parent, pieces, "paragraph")
-    return _split_paragraph(parent, body, tokenizer)
+    # Forward the stripped paragraph (not raw body) so a custom tokenizer that
+    # skips its own .strip() doesn't receive leading/trailing whitespace.
+    cascade_body = paragraphs[0] if paragraphs else body
+    return _split_paragraph(parent, cascade_body, tokenizer)
 
 
 def _split_paragraph(
@@ -183,6 +184,16 @@ def _split_paragraph(
         return []
     pieces: list[_Piece] = [(None, sentence) for sentence in sentences]
     return _build_children(parent, pieces, "sentence")
+
+
+_DISPATCH: dict[FragmentLevel, _LevelHandler] = {
+    "document": _split_document,
+    "section": _split_section,
+    "subsection": _paragraphs_or_sentences,
+    "paragraph": _split_paragraph,
+}
+"""Level → handler routing table for :func:`split`; hoisted so callers in a
+hot loop don't re-allocate it on every invocation."""
 
 
 # ---- Carving primitives -----------------------------------------------------
