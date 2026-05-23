@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -262,6 +263,7 @@ def _build_prompt(
         "Return JSON with two arrays: 'claims' (each having 'id', 'text', "
         "'fragment_ids') and 'paradoxes' (each having 'description', "
         "'fragment_ids'). Never flatten contradictions into a claim.",
+        "Respond with raw JSON only. No prose, no preamble, no Markdown code fences.",
         "",
         "Source fragments:",
     ]
@@ -277,13 +279,83 @@ def _build_prompt(
     return "\n".join(sections)
 
 
+_JSON_FENCE_RE = re.compile(
+    r"```(?:json|JSON)?[ \t]*\r?\n?(.*?)\r?\n?[ \t]*```",
+    re.DOTALL,
+)
+"""First fenced code block in a Markdown-ish response (group 1 = inner text).
+
+Tolerates an optional ``json`` language tag and surrounding whitespace.
+Non-greedy so it stops at the first closing fence even when the LLM
+emits multiple blocks.
+"""
+
+
+def _strip_fenced_block(raw: str) -> str | None:
+    """Return the first fenced code block's inner text, or ``None`` if absent."""
+    match = _JSON_FENCE_RE.search(raw)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _extract_first_json_object(raw: str) -> str | None:
+    """Return the substring of the first balanced JSON object in *raw*.
+
+    Uses :class:`json.JSONDecoder.raw_decode` from the first ``{``, so
+    nested braces and braces inside JSON strings don't confuse the
+    scan. Returns ``None`` if no opener is present or if the decoder
+    cannot consume a complete object from that point.
+    """
+    start = raw.find("{")
+    if start == -1:
+        return None
+    try:
+        _, end = json.JSONDecoder().raw_decode(raw, start)
+    except json.JSONDecodeError:
+        return None
+    return raw[start:end]
+
+
+def _json_candidates(raw: str) -> list[str]:
+    """Build an ordered list of JSON decoding candidates from *raw*.
+
+    The raw response comes first (the happy path: a well-behaved LLM
+    returned bare JSON), then a fenced-code-block strip, then a
+    first-balanced-object extraction. Duplicates are skipped so callers
+    don't pay for parsing the same string twice.
+    """
+    candidates = [raw]
+    fenced = _strip_fenced_block(raw)
+    if fenced is not None and fenced not in candidates:
+        candidates.append(fenced)
+    extracted = _extract_first_json_object(raw)
+    if extracted is not None and extracted not in candidates:
+        candidates.append(extracted)
+    return candidates
+
+
+def _decode_json_tolerant(raw: str) -> object:
+    """Decode JSON from an LLM response, tolerating fences and preambles.
+
+    Claude 4.x routinely wraps structured responses in ``` ```json … ```
+    `` ` fences or prefaces them with a short preamble (INC-007). The
+    strict :func:`json.loads` path rejects both; this helper retries
+    against successively more aggressive cleanups before giving up.
+    """
+    last_error: json.JSONDecodeError | None = None
+    for candidate in _json_candidates(raw):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+    msg = "Compile LLM returned non-JSON output."
+    raise ValueError(msg) from last_error
+
+
 def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
     """Parse the LLM response into the canonical ``{claims, paradoxes}`` dict."""
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        msg = "Compile LLM returned non-JSON output."
-        raise ValueError(msg) from exc
+    decoded = _decode_json_tolerant(raw)
     if not isinstance(decoded, dict):
         msg = "Compile LLM payload must be a JSON object."
         raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.

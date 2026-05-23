@@ -543,6 +543,160 @@ def test_compile_fragments_rejects_non_json_response() -> None:
         )
 
 
+def test_compile_fragments_tolerates_json_fenced_block() -> None:
+    """LLM responses wrapped in ``` ```json ... ``` `` ` parse successfully.
+
+    Claude 4.x routinely wraps structured responses in fenced code
+    blocks regardless of prompt wording (INC-007). The parser must
+    survive both ``` ```json `` ` and bare ``` ``` `` ` fences.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload = json.dumps(
+        {
+            "claims": [{"id": "c1", "text": "X.", "fragment_ids": ["frag-aaa"]}],
+            "paradoxes": [],
+        },
+    )
+    wrapped = f"```json\n{payload}\n```"
+    llm, _ = _make_llm([wrapped])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert [p.claim_id for p in result.page.provenance] == ["c1"]
+
+
+def test_compile_fragments_tolerates_plain_fenced_block() -> None:
+    """LLM responses wrapped in a plain ``` ``` `` ` fence (no language tag) parse."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload = json.dumps(
+        {
+            "claims": [{"id": "c1", "text": "X.", "fragment_ids": ["frag-aaa"]}],
+            "paradoxes": [],
+        },
+    )
+    wrapped = f"```\n{payload}\n```"
+    llm, _ = _make_llm([wrapped])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert [p.claim_id for p in result.page.provenance] == ["c1"]
+
+
+def test_compile_fragments_tolerates_leading_preamble() -> None:
+    """A short preamble before the JSON object is stripped before parsing."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload = json.dumps(
+        {
+            "claims": [{"id": "c1", "text": "X.", "fragment_ids": ["frag-aaa"]}],
+            "paradoxes": [],
+        },
+    )
+    wrapped = f"Here is the requested JSON:\n{payload}"
+    llm, _ = _make_llm([wrapped])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert [p.claim_id for p in result.page.provenance] == ["c1"]
+
+
+def test_compile_fragments_tolerates_trailing_text() -> None:
+    """A trailing sign-off after the JSON object is ignored."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload = json.dumps(
+        {
+            "claims": [{"id": "c1", "text": "X.", "fragment_ids": ["frag-aaa"]}],
+            "paradoxes": [],
+        },
+    )
+    wrapped = f"{payload}\n\nLet me know if you need anything else."
+    llm, _ = _make_llm([wrapped])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert [p.claim_id for p in result.page.provenance] == ["c1"]
+
+
+def test_compile_fragments_handles_nested_braces_in_payload() -> None:
+    """A wrapped payload with braces inside string values still parses."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload = json.dumps(
+        {
+            "claims": [
+                {
+                    "id": "c1",
+                    "text": "A claim with {curly} braces in the text {value}.",
+                    "fragment_ids": ["frag-aaa"],
+                },
+            ],
+            "paradoxes": [],
+        },
+    )
+    wrapped = f"```json\n{payload}\n```"
+    llm, _ = _make_llm([wrapped])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert [p.claim_id for p in result.page.provenance] == ["c1"]
+
+
+def test_compile_fragments_rejects_unterminated_object_in_fence() -> None:
+    """An unterminated JSON object — even inside a fence — still raises."""
+    frag = _make_fragment(frag_id="frag-aaa")
+    llm, _ = _make_llm(['```json\n{"claims": [{"id": "c1"\n```'])
+    with pytest.raises(ValueError, match="non-JSON"):
+        compile_fragments(
+            [(frag, "body")],
+            llm=llm,
+            target_kind="thread",
+            target_id="t",
+            target_title="T",
+        )
+
+
+def test_build_prompt_requests_raw_json() -> None:
+    """The compile prompt explicitly instructs the LLM to emit raw JSON only.
+
+    Tightening the prompt is one half of the INC-007 fix; the tolerant
+    parser is the other. Together they keep the system forgiving on
+    input and explicit on output.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    response = _llm_response(
+        claims=[{"id": "c1", "text": "x", "fragment_ids": ["frag-aaa"]}],
+    )
+    llm, prompts = _make_llm([response])
+    compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    lowered = prompts[0].lower()
+    assert "raw json" in lowered
+    assert "code fence" in lowered or "fenced" in lowered or "fences" in lowered
+
+
 def test_compile_fragments_rejects_non_object_payload() -> None:
     """A JSON array (rather than an object) at the top level is rejected."""
     frag = _make_fragment(frag_id="frag-aaa")
