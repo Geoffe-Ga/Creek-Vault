@@ -1478,7 +1478,7 @@ def _warn_bypass_compiled(verb: str) -> None:
     routing introduced in FEAT-004. Warning loudly is the contract:
     bypass should be a deliberate, visible choice, not silent.
     """
-    print(  # operator-facing CLI warning
+    print(
         f"[creek {verb}] WARNING: --bypass-compiled is set; "
         "the compiled-layer-first contract is being side-stepped.",
         file=sys.stderr,

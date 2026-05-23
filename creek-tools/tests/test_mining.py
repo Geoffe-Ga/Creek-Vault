@@ -42,6 +42,15 @@ from creek.models import (
     ThreadStatus,
     WavelengthClassification,
 )
+from tests.factories.compiled import (
+    write_compiled_eddy_page as _write_compiled_eddy_page,
+)
+from tests.factories.compiled import (
+    write_compiled_frequency_page as _write_compiled_frequency_page,
+)
+from tests.factories.compiled import (
+    write_compiled_thread_page as _write_compiled_thread_page,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -908,98 +917,6 @@ class TestMineAll:
 
 
 # ---- FEAT-004 compiled-layer routing -------------------------------------
-
-
-def _write_compiled_thread_page(
-    vault: Path,
-    *,
-    target_id: str,
-    title: str,
-    fragment_ids: tuple[str, ...],
-) -> Path:
-    """Persist a compiled-layer thread page under ``02-Threads/Active``."""
-    from creek.compile.provenance import ProvenanceEntry
-    from creek.models import CompiledPage
-
-    page = CompiledPage(
-        target_kind="thread",
-        target_id=target_id,
-        title=title,
-        body=f"# {title}\n",
-        provenance=[
-            ProvenanceEntry(
-                claim_id=f"claim-{i}",
-                claim_excerpt=f"excerpt {i}",
-                fragment_ids=[fid],
-                compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
-                compile_method="llm",
-            )
-            for i, fid in enumerate(fragment_ids, start=1)
-        ],
-    )
-    metadata = page.model_dump(mode="json", exclude={"body"})
-    # Use a distinct subfolder so the test fixture can coexist with the
-    # Thread-frontmatter note ``_write_thread`` places under Active/.
-    target = vault / "02-Threads" / "Compiled" / f"{target_id}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    post = frontmatter.Post(content=page.body, **metadata)
-    target.write_text(frontmatter.dumps(post), encoding="utf-8")
-    return target
-
-
-def _write_compiled_eddy_page(
-    vault: Path,
-    *,
-    target_id: str,
-    title: str,
-    body: str,
-) -> Path:
-    """Persist a compiled-layer eddy page under ``03-Eddies``."""
-    from creek.models import CompiledPage
-
-    page = CompiledPage(target_kind="eddy", target_id=target_id, title=title, body=body)
-    metadata = page.model_dump(mode="json", exclude={"body"})
-    # Distinct subfolder so the eddy frontmatter file at the canonical
-    # path coexists with the compiled page.
-    target = vault / "03-Eddies" / "Compiled" / f"{target_id}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    post = frontmatter.Post(content=body, **metadata)
-    target.write_text(frontmatter.dumps(post), encoding="utf-8")
-    return target
-
-
-def _write_compiled_frequency_page(
-    vault: Path,
-    *,
-    target_id: str,
-    fragment_ids: tuple[str, ...],
-) -> Path:
-    """Persist a compiled frequency-index page under ``06-Frequencies``."""
-    from creek.compile.provenance import ProvenanceEntry
-    from creek.models import CompiledPage
-
-    page = CompiledPage(
-        target_kind="frequency_index",
-        target_id=target_id,
-        title=f"{target_id} index",
-        body=f"# {target_id}\n",
-        provenance=[
-            ProvenanceEntry(
-                claim_id=f"claim-{i}",
-                claim_excerpt=f"excerpt {i}",
-                fragment_ids=[fid],
-                compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
-                compile_method="llm",
-            )
-            for i, fid in enumerate(fragment_ids, start=1)
-        ],
-    )
-    metadata = page.model_dump(mode="json", exclude={"body"})
-    target = vault / "06-Frequencies" / f"{target_id}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    post = frontmatter.Post(content=page.body, **metadata)
-    target.write_text(frontmatter.dumps(post), encoding="utf-8")
-    return target
 
 
 class TestCompileFirstThreadTerminus:
