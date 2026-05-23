@@ -383,6 +383,14 @@ class DocumentIngestor(Ingestor):
         for files with supported extensions. Returns empty list for
         nonexistent paths.
 
+        FEAT-024: Substack export directories (``posts.csv`` + per-post
+        ``<id>.<slug>.html``) are claimed by :class:`SubstackIngestor`;
+        ``DocumentIngestor`` defers to that ingestor rather than
+        double-emitting every post as an opaque HTML document. This keeps
+        the auto-detect path of ``creek process`` (which fans every
+        registered ingestor at the source) from producing two fragments
+        per Substack essay.
+
         Args:
             source_path: A file or directory path to search.
 
@@ -394,6 +402,12 @@ class DocumentIngestor(Ingestor):
 
         if source_path.is_file():
             return self._discover_single_file(source_path)
+
+        # Defer Substack exports to SubstackIngestor (FEAT-024).
+        from creek.ingest.substack import is_substack_export
+
+        if is_substack_export(source_path):
+            return []
 
         return self._discover_directory(source_path)
 

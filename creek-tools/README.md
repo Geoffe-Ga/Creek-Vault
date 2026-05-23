@@ -161,9 +161,9 @@ See [`docs/configuration.md`](docs/configuration.md) for the full schema with ex
 
 ## Source platforms
 
-The ingestion pipeline currently ships **10** registered `Ingestor`s plus a read-only Google Drive downloader that routes mirrored files back through the matching ingestor:
+The ingestion pipeline currently ships **11** registered `Ingestor`s plus a read-only Google Drive downloader that routes mirrored files back through the matching ingestor:
 
-`claude`, `chatgpt`, `discord`, `code`, `document` (.docx / .pdf), `markdown`, `spreadsheet` (.xlsx / .csv), `presentation` (.pptx), `image` (with OCR), and `generic` (fallback for unknown text).
+`claude`, `chatgpt`, `discord`, `code`, `document` (.docx / .pdf), `markdown`, `spreadsheet` (.xlsx / .csv), `presentation` (.pptx), `image` (with OCR), `substack` (newsletter exports), and `generic` (fallback for unknown text).
 
 `gdrive` is a downloader, not an ingestor — it stages files locally and dispatches each one to the appropriate ingestor by extension. The `other` enum value on `SourcePlatform` is reserved for downstream consumers (e.g. fragments synthesised from praxes) and has no parser.
 

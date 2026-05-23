@@ -280,7 +280,27 @@ class SourcePlatform(StrEnum):
     IMAGE_OCR = "image_ocr"
     SPREADSHEET = "spreadsheet"
     PRESENTATION = "presentation"
+    SUBSTACK = "substack"
     OTHER = "other"
+
+
+class SourceKind(StrEnum):
+    """Coarse semantic category for a fragment's source (FEAT-024).
+
+    Where :class:`SourcePlatform` answers *where the bytes came from*
+    (Substack, ChatGPT, Discord, …), ``SourceKind`` answers *what kind
+    of material it is* — a published essay versus a private journal
+    entry, a chat message versus a code file. Downstream surfaces use
+    the kind to make policy decisions (public-by-design vs.
+    private-by-default redaction, voice-proxy register selection,
+    folder routing) independently of which platform produced it.
+
+    Only the values FEAT-024 actually consumes are defined; the enum
+    is expected to grow as other ingestors adopt the contract.
+    """
+
+    WRITING = "writing"
+    UNCLASSIFIED = "unclassified"
 
 
 class Authorship(StrEnum):
@@ -407,6 +427,7 @@ class FragmentSource(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
     platform: SourcePlatform
+    kind: SourceKind = SourceKind.UNCLASSIFIED
     original_file: str | None = None
     original_encoding: str | None = None
     conversation_id: str | None = None
@@ -464,6 +485,12 @@ class Fragment(BaseModel):
     source: FragmentSource
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
+    # FEAT-024: timestamp the source *itself* records (a Substack post's
+    # publish date, a Discord message's ``timestamp``, …) as opposed to
+    # when the file was scanned (``created``) or ingested into the vault
+    # (``ingested``). ``None`` is the honest answer when no source date
+    # is extractable; FEAT-025 will roll this out across every ingestor.
+    authored_at: datetime | None = None
     frequency: FrequencyClassification = Field(
         default_factory=FrequencyClassification,
     )

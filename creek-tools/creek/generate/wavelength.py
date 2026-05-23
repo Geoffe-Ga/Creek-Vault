@@ -289,9 +289,28 @@ def _week_start(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
 
+def _fragment_effective_date(fragment: Fragment) -> date:
+    """Return the date this fragment should be bucketed under.
+
+    Prefers :attr:`Fragment.authored_at` (FEAT-024 / FEAT-025) — when an
+    ingestor extracts the source's own timestamp (a Substack post's
+    publish date, a Discord message's ``timestamp``), that date is what
+    every time-bucket surface should see so a 2024 essay does not get
+    counted as part of *this week's* wavelength. Falls back to
+    :attr:`Fragment.created` when no authored date was extracted.
+    """
+    if fragment.authored_at is not None:
+        return fragment.authored_at.date()
+    return fragment.created.date()
+
+
 def _fragment_in_window(fragment: Fragment, start: date, end: date) -> bool:
-    """Return whether *fragment* was created within ``[start, end]`` inclusive."""
-    frag_date = fragment.created.date()
+    """Return whether *fragment* falls within ``[start, end]`` inclusive.
+
+    Bucketing uses :func:`_fragment_effective_date` so a historical
+    Substack export does not register as current-week activity (FEAT-024).
+    """
+    frag_date = _fragment_effective_date(fragment)
     return start <= frag_date <= end
 
 
@@ -537,7 +556,7 @@ class WavelengthTracker:
             dosage = str(fragment.wavelength.dosage)
             if not dosage or dosage == Dosage.UNCLASSIFIED.value:
                 continue
-            week = _week_start(fragment.created.date())
+            week = _week_start(_fragment_effective_date(fragment))
             buckets[week].append(dosage)
         weekly: list[tuple[date, float]] = []
         for week in sorted(buckets):

@@ -24,6 +24,7 @@ _VAULT_DIRS = (
     "01-Fragments/Conversations",
     "01-Fragments/Messages",
     "01-Fragments/Writing",
+    "01-Fragments/Writing/Substack",
     "01-Fragments/Journal",
     "01-Fragments/Technical",
     "01-Fragments/Notes",
