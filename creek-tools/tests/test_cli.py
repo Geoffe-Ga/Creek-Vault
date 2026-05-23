@@ -293,6 +293,39 @@ def test_classify_rejects_unknown_method(tmp_path: Path) -> None:
     assert "Unknown method" in result.output
 
 
+def test_classify_rejects_unknown_reatomize_direction(tmp_path: Path) -> None:
+    """An unknown ``--reatomize-direction`` exits with code 2."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--vault",
+            str(vault),
+            "--reatomize",
+            "--reatomize-direction",
+            "sideways",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "reatomize-direction" in result.output
+
+
+def test_classify_reatomize_help_lists_flag() -> None:
+    """The classify help text advertises the FEAT-023 flags."""
+    result = runner.invoke(app, ["classify", "--help"])
+    assert result.exit_code == 0
+    # Typer's Rich-formatted help inserts ANSI colour escapes between
+    # consecutive characters in option names (so the literal substring
+    # ``--reatomize`` does not appear contiguously when the runner
+    # captures the styled stream — observed on Python 3.12/3.13 CI).
+    # Strip ANSI before asserting.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "--reatomize" in plain
+    assert "--reatomize-direction" in plain
+
+
 def test_classify_rules_writes_method_to_frontmatter(tmp_path: Path) -> None:
     """``creek classify --method rules`` stamps the method on each fragment."""
     import frontmatter

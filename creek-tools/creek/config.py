@@ -11,6 +11,7 @@ file — they must come from environment variables.
 
 import logging
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -132,6 +133,44 @@ class ClassificationConfig(BaseModel):
         default_factory=lambda: ["journal"],
     )
     """Sources that require human review after classification."""
+
+    reatomize: bool = False
+    """Opt-in switch for FEAT-023 confidence-driven re-atomization.
+
+    When ``False`` (default) the classify pipeline behaves exactly as
+    it did before FEAT-023: a single pass over each fragment, no
+    structural decomposition. When ``True``, low-confidence /
+    ``unclassified`` results trigger the zoom-in splitter (FEAT-021) or
+    zoom-out aggregator (FEAT-022), recursing until a leaf reaches the
+    confidence threshold, a terminal level (sentence / session), or
+    :attr:`reatomize_max_depth`.
+    """
+
+    reatomize_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Confidence floor that triggers re-atomization (FEAT-023).
+
+    ``None`` (default) means "use :attr:`confidence_threshold`" — the
+    same floor that already gates a paid LLM call. Set this lower than
+    the main threshold to keep the rules-vs-LLM gate at one place but
+    only fire re-atomization on truly hopeless fragments.
+    """
+
+    reatomize_max_depth: int = Field(default=4, ge=1)
+    """Hard ceiling on FEAT-023 recursion depth.
+
+    Caps unbounded zoom-in on a fractal document. Counted from the
+    root fragment (depth 0). Once reached, the orchestrator accepts
+    whatever classification it has, even if still ``unclassified``.
+    """
+
+    reatomize_direction: Literal["auto", "split", "aggregate"] = "auto"
+    """FEAT-023 direction-choice override.
+
+    ``"auto"`` (default) routes by ``source.platform`` and ``level``
+    per the heuristic in :mod:`creek.classify.reatomize`. ``"split"``
+    or ``"aggregate"`` force a single direction regardless of source
+    — useful for triage runs over a known-uniform corpus.
+    """
 
 
 class ContextConfig(BaseModel):
