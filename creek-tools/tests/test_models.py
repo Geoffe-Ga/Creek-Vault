@@ -2,6 +2,7 @@
 
 import json
 from datetime import date, datetime
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from creek.models import (
     Dosage,
     Eddy,
     Fragment,
+    FragmentLevel,
     FragmentSource,
     Frequency,
     FrequencyClassification,
@@ -540,8 +542,15 @@ class TestFragmentHierarchy:
         ]
 
     def test_all_documented_levels_accepted(self) -> None:
-        """Every value in the FEAT-020 ``FragmentLevel`` enumeration is valid."""
-        for level in (
+        """Every value in the FEAT-020 ``FragmentLevel`` Literal is valid.
+
+        Iterates the Literal's own ``get_args`` tuple so MyPy strict sees
+        each iteration variable as a genuine ``FragmentLevel`` — no
+        ``# type: ignore`` suppression. This proves the type contract,
+        not just runtime acceptance of string lookalikes.
+        """
+        levels = get_args(FragmentLevel)
+        assert set(levels) == {
             "sentence",
             "paragraph",
             "subsection",
@@ -550,12 +559,13 @@ class TestFragmentHierarchy:
             "exchange",
             "burst",
             "session",
-        ):
+        }
+        for level in levels:
             frag = Fragment(
                 id=f"frag-lvl-{level}",
                 title=f"Level {level}",
                 source=FragmentSource(platform=SourcePlatform.JOURNAL),
-                level=level,  # type: ignore[arg-type]
+                level=level,
             )
             assert frag.level == level
 

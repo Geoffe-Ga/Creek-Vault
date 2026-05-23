@@ -503,10 +503,10 @@ class TestGenerateChildFragmentId:
 
     def test_shape_matches_root_fragment_id(self) -> None:
         """Child IDs use the same ``frag-`` + 12-hex shape as root IDs."""
+        import re
+
         child_id = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 0)
-        assert child_id.startswith("frag-")
-        assert len(child_id) == 17
-        int(child_id[5:], 16)
+        assert re.fullmatch(r"frag-[0-9a-f]{12}", child_id), child_id
 
     def test_deterministic(self) -> None:
         """Same ``(parent_id, level, index)`` triple always returns the same ID."""

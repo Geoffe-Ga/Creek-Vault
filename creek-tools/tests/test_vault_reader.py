@@ -155,8 +155,10 @@ def test_try_load_fragment_round_trips_hierarchy_fields(tmp_path: Path) -> None:
     assert loaded_fragment.child_ids == ["frag-hier-kidaa", "frag-hier-kidbb"]
     assert loaded_fragment.level == "section"
     assert loaded_fragment.structural_path == ["Essay", "Part 2"]
-    # raw_metadata must surface the hierarchy keys too — classify/link
+    # raw_metadata must surface every hierarchy key — classify/link
     # engines pass raw forward when rewriting frontmatter, so dropping
-    # them here would silently nuke the hierarchy on the next write.
+    # any one would silently nuke that field on the next write.
     assert raw["parent_id"] == "frag-hier-parent"
+    assert raw["child_ids"] == ["frag-hier-kidaa", "frag-hier-kidbb"]
     assert raw["level"] == "section"
+    assert raw["structural_path"] == ["Essay", "Part 2"]

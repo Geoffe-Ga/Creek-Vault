@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 import chardet
 from pydantic import BaseModel, ConfigDict, Field
 
-from creek.models import Fragment
+from creek.models import Fragment, FragmentLevel
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +262,11 @@ def generate_fragment_id(source: str, timestamp: datetime, content: str) -> str:
     return f"frag-{digest}"
 
 
-def generate_child_fragment_id(parent_id: str, level: str, index: int) -> str:
+def generate_child_fragment_id(
+    parent_id: str,
+    level: FragmentLevel,
+    index: int,
+) -> str:
     """Generate a deterministic child fragment ID (FEAT-020).
 
     The output matches :func:`generate_fragment_id`'s shape — a
@@ -280,8 +284,10 @@ def generate_child_fragment_id(parent_id: str, level: str, index: int) -> str:
 
     Args:
         parent_id: ID of the parent fragment (root or otherwise).
-        level: Structural level of the child — one of
-            :data:`creek.models.FragmentLevel`'s values.
+        level: Structural level of the child. Typed as
+            :data:`creek.models.FragmentLevel` so MyPy strict catches
+            invalid level strings (e.g. ``"chapter"``) at call sites
+            instead of letting them silently flow through to the hash.
         index: Zero-based position of this child among its siblings.
 
     Returns:

@@ -478,13 +478,7 @@ class Fragment(BaseModel):
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED
     context: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
-    # FEAT-020 hierarchical fragment data model. Flat (pre-FEAT-020)
-    # fragments load as root documents: ``parent_id=None``,
-    # ``child_ids=[]``, ``level="document"``, ``structural_path=[]``.
-    # These four fields are direction-agnostic — a parent may be the
-    # level *above* its children whether the children were carved out
-    # by the FEAT-021 zoom-in splitter or stitched together by the
-    # FEAT-022 zoom-out aggregator.
+    # FEAT-020 hierarchy; defaults (None, [], "document", []) = root document.
     parent_id: str | None = None
     child_ids: list[str] = Field(default_factory=list)
     level: FragmentLevel = "document"
