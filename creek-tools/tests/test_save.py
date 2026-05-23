@@ -697,18 +697,60 @@ def test_slugify_filename_truncates_at_hyphen_without_breaking_idempotence() -> 
     assert not result.endswith("-")
 
 
-def test_slugify_filename_used_by_both_call_sites() -> None:
-    """Both ``_compose_base_name`` and ``_stub_relpath_for`` go through the helper.
+def test_slugify_filename_used_by_both_call_sites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both ``_compose_base_name`` and ``_stub_relpath_for`` route through the helper.
 
-    The shared helper is the single source of truth for stub and
-    vault-note filenames; if a future refactor reintroduces a local
-    regex in either call site, this test fails so the divergence is
-    caught.
+    Runtime check — wraps :func:`slugify_filename` with a spy and
+    confirms both call sites invoke it. A source-text grep was the
+    first cut (PR #287 review caught it) but would also pass with a
+    dead import or a comment, so the spy is the robust pin.
+
+    ``creek.save.writer`` imports ``slugify_filename`` at module load
+    time, so the spy must replace ``writer.slugify_filename`` to be
+    seen. ``creek.classify.privacy_filter`` imports it function-locally
+    on each call, so replacing the canonical attribute on
+    ``creek.save._slug`` is enough to redirect that path.
     """
     from creek.classify import privacy_filter as classify_module
+    from creek.save import _slug as slug_module
     from creek.save import writer as writer_module
 
-    classify_source = Path(classify_module.__file__).read_text(encoding="utf-8")
-    writer_source = Path(writer_module.__file__).read_text(encoding="utf-8")
-    assert "slugify_filename" in classify_source
-    assert "slugify_filename" in writer_source
+    calls: list[str] = []
+    real_slugify = slug_module.slugify_filename
+
+    def spy(text: str, *, max_length: int = 64) -> str:
+        calls.append(text)
+        return real_slugify(text, max_length=max_length)
+
+    monkeypatch.setattr(slug_module, "slugify_filename", spy)
+    monkeypatch.setattr(writer_module, "slugify_filename", spy)
+
+    writer_module._compose_base_name("Why this matters")
+    classify_module._stub_relpath_for("Intimate moment")
+
+    # At least one call came from each site — the helper is the
+    # single source of truth, not duplicated regex logic.
+    assert "Why this matters" in calls
+    # The privacy_filter lowercases before calling, so check the
+    # lowered form.
+    assert "intimate moment" in calls
+
+
+def test_stub_relpath_preserves_non_word_chars_as_hyphens() -> None:
+    """Stub path slugs replace ``!``, ``?``, ``:`` (etc.) with hyphens.
+
+    Regression for the PR #287 review concern: the pre-refactor
+    ``_stub_relpath_for`` replaced non-word/non-hyphen chars with a
+    hyphen; an early draft of the shared helper dropped them
+    silently, which would have orphaned the
+    ``intimate_body_pointer`` paths in any existing vault note whose
+    title contained one of those characters. Pin the canonical
+    semantics so the helper cannot regress that way again.
+    """
+    from creek.classify.privacy_filter import _stub_relpath_for
+
+    assert _stub_relpath_for("hello!world").name == "hello-world.md"
+    assert _stub_relpath_for("why this matters?").name == "why-this-matters.md"
+    assert _stub_relpath_for("multi!!!bang").name == "multi-bang.md"

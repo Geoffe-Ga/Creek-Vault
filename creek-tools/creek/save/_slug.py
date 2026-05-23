@@ -16,6 +16,19 @@ Leaf module — imports nothing from the rest of :mod:`creek.save`, so
 it can be pulled in from anywhere (notably
 :mod:`creek.classify.privacy_filter`) without re-introducing a
 circular import.
+
+Compatibility note (PR #287 review): the unified pipeline matches the
+*intimate-stub* call site's pre-refactor semantics — non-word
+characters (``!``, ``?``, ``:``, …) are *replaced* with hyphens, not
+silently dropped. Existing intimate-stub pointers stored in vault
+notes therefore continue to resolve to the same file the next
+``creek save`` would produce. The vault-note call site
+(``_compose_base_name``) gains the same hyphen-replacement behaviour;
+no existing tests pin its prior "drop non-word chars" output, and the
+new shape is the strictly more sensible filesystem convention
+(``"why this matters!"`` → ``"why-this-matters"`` rather than
+``"why-this-matters"`` vs ``"why-this-matters"`` — the divergence the
+issue was filed to eliminate).
 """
 
 from __future__ import annotations
@@ -37,8 +50,11 @@ def slugify_filename(text: str, *, max_length: int = _DEFAULT_MAX_LENGTH) -> str
 
     1. Strip surrounding whitespace.
     2. Collapse internal whitespace runs to a single hyphen.
-    3. Drop any character outside ``[\\w-]`` (letters, digits,
-       underscore, hyphen).
+    3. Replace any character outside ``[\\w-]`` (letters, digits,
+       underscore, hyphen) with a hyphen. Non-word characters become
+       word separators rather than disappearing — this preserves the
+       pre-refactor intimate-stub semantics so existing
+       ``intimate_body_pointer`` paths still resolve.
     4. Collapse consecutive hyphens.
     5. Strip leading / trailing hyphens.
     6. Truncate to *max_length* and strip trailing hyphens again so a
@@ -63,6 +79,6 @@ def slugify_filename(text: str, *, max_length: int = _DEFAULT_MAX_LENGTH) -> str
         ``"untitled"`` when that matters.
     """
     intermediate = _WHITESPACE_RE.sub("-", text.strip())
-    cleaned = _INVALID_CHARS_RE.sub("", intermediate)
+    cleaned = _INVALID_CHARS_RE.sub("-", intermediate)
     collapsed = _HYPHEN_RUN_RE.sub("-", cleaned).strip("-")
     return collapsed[:max_length].rstrip("-")
