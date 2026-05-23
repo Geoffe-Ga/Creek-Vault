@@ -11,7 +11,7 @@ fixtures miss.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 import frontmatter
 from hypothesis import HealthCheck, given, settings
@@ -20,6 +20,7 @@ from hypothesis import strategies as st
 from creek.models import (
     Authorship,
     Fragment,
+    FragmentLevel,
     FragmentSource,
     SourcePlatform,
 )
@@ -81,18 +82,10 @@ _TIMESTAMPS = st.datetimes(
 _PLATFORMS = st.sampled_from(list(SourcePlatform))
 
 
-_LEVELS = st.sampled_from(
-    [
-        "sentence",
-        "paragraph",
-        "subsection",
-        "section",
-        "document",
-        "exchange",
-        "burst",
-        "session",
-    ],
-)
+# Derived from ``FragmentLevel`` so a new level added in models.py is
+# automatically exercised by these property tests — no parallel list to
+# keep in sync (matches the ``_PLATFORMS`` pattern above).
+_LEVELS = st.sampled_from(list(get_args(FragmentLevel)))
 
 _FRAG_IDS = st.from_regex(r"frag-[0-9a-f]{12}", fullmatch=True)
 
