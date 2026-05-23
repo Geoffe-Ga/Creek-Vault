@@ -100,6 +100,22 @@ class LinkingConfig(BaseModel):
     eddy_min_fragments: int = 5
     """Minimum fragments required to form an Eddy."""
 
+    exchange_max_gap_minutes: int = 30
+    """Maximum minute-gap between consecutive messages still grouped into
+    the same ``exchange`` by the FEAT-022 aggregator. Inclusive boundary.
+    """
+
+    burst_similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    """Cosine-similarity floor below which two consecutive exchanges start
+    separate ``burst``-level parents in the FEAT-022 aggregator.
+    Inclusive boundary.
+    """
+
+    session_max_gap_minutes: int = 360
+    """Maximum minute-gap between consecutive bursts still grouped into the
+    same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
+    """
+
 
 class ClassificationConfig(BaseModel):
     """Classification pipeline configuration."""
