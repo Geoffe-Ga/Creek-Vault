@@ -9,7 +9,7 @@ and create_synchronicity_note (writing reflection notes to
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import frontmatter
 import pytest
@@ -22,6 +22,7 @@ from creek.generate.synchronicity import (
 from creek.link.embeddings import Resonance
 from creek.models import (
     Fragment,
+    FragmentLevel,
     FragmentSource,
     SourcePlatform,
     Synchronicity,
@@ -436,7 +437,7 @@ def _level_fragment(
     title: str,
     platform: SourcePlatform,
     created: datetime,
-    level: str,
+    level: FragmentLevel,
 ) -> Fragment:
     """Construct a test Fragment with an explicit structural level."""
     return Fragment(
@@ -444,7 +445,7 @@ def _level_fragment(
         title=title,
         source=FragmentSource(platform=platform),
         created=created,
-        level=level,  # type: ignore[arg-type]
+        level=level,
     )
 
 
@@ -671,6 +672,34 @@ def sample_sync_pair() -> tuple[Synchronicity, dict[str, Fragment]]:
         source_b=SourcePlatform.JOURNAL,
     )
     return sync, fragments
+
+
+class TestUnrecognisedResonanceShape:
+    """Tests for the unknown-shape fall-through in ``_normalise_resonance``."""
+
+    def test_alien_shape_is_skipped_with_warning(
+        self,
+        detector: SynchronicityDetector,
+        cross_source_pair: dict[str, Fragment],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A non-Resonance, non-3-tuple input is logged and dropped silently."""
+        # Exercise the runtime fall-through that the static signature
+        # rules out: a deliberate cast to the declared input type lets
+        # the runtime branch run without a bypass directive.
+        alien_items: list[object] = [
+            (42,),
+            "not a resonance",
+            ("a", "b", 0.9, "extra"),
+        ]
+        alien = cast("list[tuple[str, str, float]]", alien_items)
+        with caplog.at_level("WARNING", logger="creek.generate.synchronicity"):
+            result = detector.detect_synchronicities(alien, cross_source_pair)
+        assert not result
+        assert any(
+            "Unrecognised resonance shape" in record.message
+            for record in caplog.records
+        )
 
 
 class TestCreateSynchronicityNote:

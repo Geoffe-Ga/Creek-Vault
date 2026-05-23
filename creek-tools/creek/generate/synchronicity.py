@@ -18,6 +18,7 @@ The criteria are deliberately strict:
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.models import Fragment, FragmentLevel
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SIMILARITY_THRESHOLD: float = 0.9
 """Cosine similarity must exceed this value to qualify as a synchronicity."""
@@ -86,19 +89,18 @@ _LEGACY_TUPLE_ARITY: int = 3
 
 
 def _normalise_resonance(
-    resonance: Resonance | tuple[str, str, float] | object,
+    resonance: Resonance | tuple[str, str, float],
 ) -> tuple[str, str, float, FragmentLevel, FragmentLevel] | None:
     """Unpack either resonance flavour into a uniform 5-tuple.
 
     Accepting both the canonical :class:`Resonance` model and the
     pre-FEAT-024 ``(id_a, id_b, similarity)`` tuple keeps existing
     callers (and historical fixtures in test suites) working through
-    the transition. Any other shape is returned as ``None`` so the
-    detection loop can skip it without raising.
+    the transition. Any other shape is logged and returned as ``None``
+    so the detection loop can skip it without raising.
 
     Args:
-        resonance: A :class:`Resonance`, a legacy 3-tuple, or some
-            other object.
+        resonance: A :class:`Resonance` or a legacy 3-tuple.
 
     Returns:
         ``(fragment_a_id, fragment_b_id, similarity, from_level,
@@ -117,6 +119,11 @@ def _normalise_resonance(
     if isinstance(resonance, tuple) and len(resonance) == _LEGACY_TUPLE_ARITY:
         frag_a_id, frag_b_id, similarity = resonance
         return (frag_a_id, frag_b_id, similarity, "document", "document")
+    logger.warning(
+        "Unrecognised resonance shape %r; skipping. Pass a Resonance or "
+        "a (id_a, id_b, similarity) tuple.",
+        type(resonance).__name__,
+    )
     return None
 
 

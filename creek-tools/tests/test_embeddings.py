@@ -23,7 +23,7 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
-from creek.models import Fragment, FragmentSource, SourcePlatform
+from creek.models import Fragment, FragmentLevel, FragmentSource, SourcePlatform
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -480,7 +480,7 @@ def _hier_fragment(
     *,
     parent_id: str | None = None,
     child_ids: list[str] | None = None,
-    level: str = "document",
+    level: FragmentLevel = "document",
 ) -> Fragment:
     """Build a Fragment with explicit hierarchy fields for FEAT-024 tests."""
     return Fragment(
@@ -489,7 +489,7 @@ def _hier_fragment(
         source=FragmentSource(platform=SourcePlatform.CLAUDE),
         parent_id=parent_id,
         child_ids=child_ids or [],
-        level=level,  # type: ignore[arg-type]
+        level=level,
     )
 
 
