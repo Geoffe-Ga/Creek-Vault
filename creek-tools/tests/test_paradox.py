@@ -482,3 +482,86 @@ class TestCreateParadoxNote:
         assert first == second
         files = list((tmp_path / "10-Liminal" / "Paradoxes").glob("*.md"))
         assert len(files) == 1
+
+
+# ---- FEAT-025: cross-level paradox filter --------------------------------
+
+
+def _leveled_fragment(
+    fid: str,
+    *,
+    level: str,
+    phase: Phase = Phase.UNCLASSIFIED,
+    confidence: Confidence | None = None,
+    threads: list[str] | None = None,
+) -> Fragment:
+    """Build a fragment with an explicit structural level."""
+    return Fragment(
+        id=fid,
+        title=f"Title for {fid}",
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        frequency=FrequencyClassification(),
+        wavelength=WavelengthClassification(phase=phase),
+        voice=VoiceClassification(confidence=confidence),
+        threads=threads or [],
+        level=level,  # type: ignore[arg-type]
+    )
+
+
+class TestCrossLevelFilter:
+    """Cross-level pairs default to *not* a paradox — they're rhetorical."""
+
+    def test_cross_level_phase_pair_dropped_by_default(self) -> None:
+        """A sentence vs. paragraph contradiction is structure, not paradox."""
+        sentence = _leveled_fragment("frag-s", level="sentence", phase=Phase.RISING)
+        section = _leveled_fragment("frag-x", level="section", phase=Phase.DIMINISHING)
+        embeddings = {"frag-s": unit_embedding(0), "frag-x": unit_embedding(0)}
+
+        detector = ParadoxDetector()
+        paradoxes = detector.detect_paradoxes(
+            [sentence, section],
+            embeddings=embeddings,
+        )
+        assert paradoxes == []
+
+    def test_same_level_phase_pair_still_a_paradox(self) -> None:
+        """The default policy doesn't suppress same-level paradoxes."""
+        a = _leveled_fragment("frag-a", level="paragraph", phase=Phase.RISING)
+        b = _leveled_fragment("frag-b", level="paragraph", phase=Phase.DIMINISHING)
+        embeddings = {"frag-a": unit_embedding(0), "frag-b": unit_embedding(0)}
+
+        detector = ParadoxDetector()
+        paradoxes = detector.detect_paradoxes([a, b], embeddings=embeddings)
+        assert len(paradoxes) == 1
+
+    def test_cross_level_pair_surfaces_when_opt_in(self) -> None:
+        """``cross_level=True`` opts back into the pre-FEAT-025 behaviour."""
+        sentence = _leveled_fragment("frag-s", level="sentence", phase=Phase.RISING)
+        section = _leveled_fragment("frag-x", level="section", phase=Phase.DIMINISHING)
+        embeddings = {"frag-s": unit_embedding(0), "frag-x": unit_embedding(0)}
+
+        detector = ParadoxDetector()
+        paradoxes = detector.detect_paradoxes(
+            [sentence, section],
+            embeddings=embeddings,
+            cross_level=True,
+        )
+        assert len(paradoxes) == 1
+
+    def test_cross_level_filter_applies_to_confidence_rule(self) -> None:
+        """The cross-level guard applies to every detection rule, not just phase."""
+        a = _leveled_fragment(
+            "frag-a",
+            level="sentence",
+            confidence=Confidence.MUSING,
+            threads=["thread-trust"],
+        )
+        b = _leveled_fragment(
+            "frag-b",
+            level="paragraph",
+            confidence=Confidence.SETTLED,
+            threads=["thread-trust"],
+        )
+        detector = ParadoxDetector()
+        assert detector.detect_paradoxes([a, b]) == []
+        assert len(detector.detect_paradoxes([a, b], cross_level=True)) == 1

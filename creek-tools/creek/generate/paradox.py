@@ -247,6 +247,7 @@ class ParadoxDetector:
         fragments: list[Fragment],
         *,
         embeddings: dict[str, list[float]] | None = None,
+        cross_level: bool = False,
     ) -> list[Paradox]:
         """Scan fragments for contradictory pairs.
 
@@ -262,6 +263,12 @@ class ParadoxDetector:
                 vector. When provided, it is used to compute cosine
                 similarity for the topic-sharing rules. When absent,
                 only the thread- and frequency-based rules can match.
+            cross_level: FEAT-025 opt-in. When ``False`` (default),
+                pairs at different structural levels (e.g. a paragraph
+                vs. the section enclosing it) are skipped — that kind
+                of contradiction is rhetorical structure, not a paradox.
+                Set ``True`` to restore the pre-FEAT-025 behaviour and
+                emit cross-level pairs as paradoxes too.
 
         Returns:
             List of :class:`Paradox` instances, one per contradictory
@@ -273,6 +280,8 @@ class ParadoxDetector:
         embeddings = embeddings or {}
         paradoxes: list[Paradox] = []
         for a, b in itertools.combinations(fragments, 2):
+            if not cross_level and str(a.level) != str(b.level):
+                continue
             similarity = self._pair_similarity(a, b, embeddings)
             paradox = self._detect_pair(a, b, similarity)
             if paradox is not None:

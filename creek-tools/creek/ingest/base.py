@@ -65,19 +65,50 @@ class ParsedFragment(BaseModel):
 
     Represents one logical unit of content after parsing, with its
     source provenance and timestamp.
+
+    Ingestors with rich structured backend output (workbooks, slide
+    decks, etc.) should stash that output on :attr:`payload` as a
+    typed dataclass and use :attr:`metadata` only for the small set of
+    frontmatter-relevant scalars. See the class docstring of
+    :class:`Ingestor` for the migration story.
     """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     content: str
     """The extracted text content."""
 
     metadata: dict[str, Any]
-    """Arbitrary metadata from parsing (e.g., headers, tags)."""
+    """Frontmatter-relevant scalars from parsing.
+
+    Kept as an untyped dict so YAML serialisation in
+    :meth:`Ingestor.generate_frontmatter` stays trivial. Reach for
+    :attr:`payload` when you need to round-trip structured data
+    between :meth:`Ingestor.parse` and :meth:`Ingestor.convert_to_markdown`
+    without erasing types or duplicating the schema in two places.
+    """
 
     source_path: str
     """Path to the original source file."""
 
     timestamp: datetime
     """Timestamp associated with this fragment."""
+
+    payload: Any = None
+    """Optional typed intermediate from the ingestor backend.
+
+    Carry the backend's structured dataclass (``SheetData``,
+    ``PresentationData``, etc.) here instead of flattening it into
+    :attr:`metadata`. :meth:`Ingestor.convert_to_markdown` reads the
+    typed payload directly — no string-keyed dict access, no implicit
+    schema duplicated between the parse and convert sites, and mypy
+    catches a renamed field at the call site rather than letting it
+    silently flow through.
+
+    Defaults to ``None`` so the pre-FEAT-024 ingestors (chatgpt,
+    markdown, html, code, …) that don't need structured payloads are
+    not forced to set a slot they don't use.
+    """
 
 
 class ProvenanceEntry(BaseModel):

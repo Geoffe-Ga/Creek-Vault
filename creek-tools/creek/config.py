@@ -117,6 +117,20 @@ class LinkingConfig(BaseModel):
     same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
     """
 
+    hierarchy_sibling_skip_window: int = Field(default=2, ge=0)
+    """FEAT-024 sibling-suppression window for hierarchy-aware linking.
+
+    With re-atomization (FEAT-020..023) every parent fragment shares the
+    vault with its own children, and adjacent children of one parent are
+    usually topically continuous — so naive cosine similarity emits noise
+    instead of meaningful resonances. The embedding linker drops pairs
+    that are ancestor/descendant unconditionally, and pairs that share a
+    parent and sit within this many positions of each other in the
+    parent's ``child_ids`` list. ``0`` disables sibling suppression
+    entirely (ancestor suppression still applies); the default of ``2``
+    skips immediate and one-removed neighbours on either side.
+    """
+
     cross_source_aggregation: bool = False
     """When ``True``, the FEAT-027 aggregator drops the source-identity
     gate so a single exchange/burst/session may span multiple sources
@@ -558,6 +572,28 @@ class CompostConfig(BaseModel):
     """
 
 
+class LintConfig(BaseModel):
+    """Configuration for ``creek lint`` checks (FEAT-008, FEAT-025).
+
+    Today only the paradox check carries a knob; this class exists so
+    additional check-level toggles can land without expanding the
+    top-level :class:`CreekConfig` surface.
+    """
+
+    paradox_cross_level: bool = False
+    """FEAT-025 opt-in for cross-level paradox detection.
+
+    ``False`` (default): the paradox check skips pairs whose
+    :attr:`creek.models.Fragment.level` values differ — a paragraph
+    contradicting the section it lives inside is rhetorical structure,
+    not the contradiction `10-Liminal/Paradoxes/` is for.
+
+    ``True``: restore the pre-FEAT-025 behaviour. Useful when the
+    operator wants the cross-level pairs surfaced (e.g. to audit a
+    re-atomized vault for splitter mistakes).
+    """
+
+
 class SourcePaths(BaseModel):
     """Source data paths (relative to ``source_drive``)."""
 
@@ -640,6 +676,9 @@ class CreekConfig(BaseSettings):
 
     compost: CompostConfig = Field(default_factory=CompostConfig)
     """Compost detection settings (FEAT-018: embedding gate + verifier)."""
+
+    lint: LintConfig = Field(default_factory=LintConfig)
+    """Lint check toggles (FEAT-008 / FEAT-025)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""

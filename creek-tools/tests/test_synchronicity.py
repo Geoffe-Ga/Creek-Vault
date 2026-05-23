@@ -9,7 +9,7 @@ and create_synchronicity_note (writing reflection notes to
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import frontmatter
 import pytest
@@ -19,8 +19,10 @@ from creek.generate.synchronicity import (
     DEFAULT_SIMILARITY_THRESHOLD,
     SynchronicityDetector,
 )
+from creek.link.embeddings import Resonance
 from creek.models import (
     Fragment,
+    FragmentLevel,
     FragmentSource,
     SourcePlatform,
     Synchronicity,
@@ -426,6 +428,220 @@ class TestDetectSynchronicities:
         assert sync.source_b == SourcePlatform.JOURNAL
 
 
+# ---- FEAT-024 cross-level ranking ----
+
+
+def _level_fragment(
+    *,
+    frag_id: str,
+    title: str,
+    platform: SourcePlatform,
+    created: datetime,
+    level: FragmentLevel,
+) -> Fragment:
+    """Construct a test Fragment with an explicit structural level."""
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=platform),
+        created=created,
+        level=level,
+    )
+
+
+class TestCrossLevelRanking:
+    """Tests for FEAT-024 cross-level synchronicity ranking."""
+
+    def test_accepts_resonance_objects(
+        self,
+        detector: SynchronicityDetector,
+        cross_source_pair: dict[str, Fragment],
+    ) -> None:
+        """Detector accepts the new Resonance record (FEAT-024)."""
+        resonances = [
+            Resonance(
+                fragment_a_id="frag-a",
+                fragment_b_id="frag-b",
+                similarity=0.95,
+                from_level="sentence",
+                to_level="document",
+            ),
+        ]
+        result = detector.detect_synchronicities(resonances, cross_source_pair)
+        assert len(result) == 1
+        # Chronological order keeps frag-a first, so its level is level_a.
+        assert result[0].level_a == "sentence"
+        assert result[0].level_b == "document"
+
+    def test_tuple_input_defaults_to_document_levels(
+        self,
+        detector: SynchronicityDetector,
+        cross_source_pair: dict[str, Fragment],
+    ) -> None:
+        """Legacy 3-tuple input keeps the default 'document' levels."""
+        resonances = [("frag-a", "frag-b", 0.95)]
+        result = detector.detect_synchronicities(resonances, cross_source_pair)
+        assert len(result) == 1
+        assert result[0].level_a == "document"
+        assert result[0].level_b == "document"
+
+    def test_cross_level_ranks_before_same_level(
+        self,
+        detector: SynchronicityDetector,
+    ) -> None:
+        """Cross-level pairs surface ahead of same-level pairs."""
+        fragments = {
+            "same-a": _level_fragment(
+                frag_id="same-a",
+                title="the wind through the long grass",
+                platform=SourcePlatform.DISCORD,
+                created=datetime(2025, 1, 1, 10, 0, 0),
+                level="document",
+            ),
+            "same-b": _level_fragment(
+                frag_id="same-b",
+                title="the wind through the long grass",
+                platform=SourcePlatform.JOURNAL,
+                created=datetime(2025, 4, 1, 10, 0, 0),
+                level="document",
+            ),
+            "cross-a": _level_fragment(
+                frag_id="cross-a",
+                title="silence has a shape",
+                platform=SourcePlatform.EMAIL,
+                created=datetime(2025, 1, 2, 10, 0, 0),
+                level="sentence",
+            ),
+            "cross-b": _level_fragment(
+                frag_id="cross-b",
+                title="silence has a shape",
+                platform=SourcePlatform.ESSAY,
+                created=datetime(2025, 5, 1, 10, 0, 0),
+                level="exchange",
+            ),
+        }
+        # Give the same-level pair a *higher* raw similarity to prove the
+        # cross-level boost overrides naive similarity ordering.
+        resonances = [
+            Resonance(
+                fragment_a_id="same-a",
+                fragment_b_id="same-b",
+                similarity=0.99,
+                from_level="document",
+                to_level="document",
+            ),
+            Resonance(
+                fragment_a_id="cross-a",
+                fragment_b_id="cross-b",
+                similarity=0.92,
+                from_level="sentence",
+                to_level="exchange",
+            ),
+        ]
+        result = detector.detect_synchronicities(resonances, fragments)
+        assert len(result) == 2
+        # Cross-level should come first.
+        assert result[0].fragment_a_id == "cross-a"
+        assert result[1].fragment_a_id == "same-a"
+
+    def test_within_group_sorted_by_similarity_descending(
+        self,
+        detector: SynchronicityDetector,
+    ) -> None:
+        """Two cross-level pairs are ranked by similarity descending."""
+        fragments = {
+            "x1": _level_fragment(
+                frag_id="x1",
+                title="cedar smoke at dusk",
+                platform=SourcePlatform.DISCORD,
+                created=datetime(2025, 1, 1, 10, 0, 0),
+                level="sentence",
+            ),
+            "x2": _level_fragment(
+                frag_id="x2",
+                title="cedar smoke at dusk",
+                platform=SourcePlatform.JOURNAL,
+                created=datetime(2025, 4, 1, 10, 0, 0),
+                level="exchange",
+            ),
+            "y1": _level_fragment(
+                frag_id="y1",
+                title="folding the laundry slowly",
+                platform=SourcePlatform.EMAIL,
+                created=datetime(2025, 1, 2, 10, 0, 0),
+                level="paragraph",
+            ),
+            "y2": _level_fragment(
+                frag_id="y2",
+                title="folding the laundry slowly",
+                platform=SourcePlatform.ESSAY,
+                created=datetime(2025, 5, 1, 10, 0, 0),
+                level="session",
+            ),
+        }
+        resonances = [
+            Resonance(
+                fragment_a_id="x1",
+                fragment_b_id="x2",
+                similarity=0.91,
+                from_level="sentence",
+                to_level="exchange",
+            ),
+            Resonance(
+                fragment_a_id="y1",
+                fragment_b_id="y2",
+                similarity=0.97,
+                from_level="paragraph",
+                to_level="session",
+            ),
+        ]
+        result = detector.detect_synchronicities(resonances, fragments)
+        assert len(result) == 2
+        # Both are cross-level — higher similarity wins.
+        assert result[0].fragment_a_id == "y1"
+        assert result[1].fragment_a_id == "x1"
+
+    def test_level_swaps_with_chronological_order(
+        self,
+        detector: SynchronicityDetector,
+    ) -> None:
+        """When the later fragment is listed first, its level follows."""
+        fragments = {
+            "early": _level_fragment(
+                frag_id="early",
+                title="moss on the north side of the stone",
+                platform=SourcePlatform.DISCORD,
+                created=datetime(2025, 1, 1, 10, 0, 0),
+                level="paragraph",
+            ),
+            "late": _level_fragment(
+                frag_id="late",
+                title="moss on the north side of the stone",
+                platform=SourcePlatform.JOURNAL,
+                created=datetime(2025, 5, 1, 10, 0, 0),
+                level="sentence",
+            ),
+        }
+        # Resonance lists later -> earlier; level_a / level_b on the
+        # synchronicity must still reflect the chronological order.
+        resonances = [
+            Resonance(
+                fragment_a_id="late",
+                fragment_b_id="early",
+                similarity=0.95,
+                from_level="sentence",
+                to_level="paragraph",
+            ),
+        ]
+        result = detector.detect_synchronicities(resonances, fragments)
+        assert len(result) == 1
+        sync = result[0]
+        assert sync.fragment_a_id == "early"
+        assert sync.fragment_b_id == "late"
+        assert sync.level_a == "paragraph"
+        assert sync.level_b == "sentence"
+
+
 # ---- create_synchronicity_note ----
 
 
@@ -456,6 +672,34 @@ def sample_sync_pair() -> tuple[Synchronicity, dict[str, Fragment]]:
         source_b=SourcePlatform.JOURNAL,
     )
     return sync, fragments
+
+
+class TestUnrecognisedResonanceShape:
+    """Tests for the unknown-shape fall-through in ``_normalise_resonance``."""
+
+    def test_alien_shape_is_skipped_with_warning(
+        self,
+        detector: SynchronicityDetector,
+        cross_source_pair: dict[str, Fragment],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A non-Resonance, non-3-tuple input is logged and dropped silently."""
+        # Exercise the runtime fall-through that the static signature
+        # rules out: a deliberate cast to the declared input type lets
+        # the runtime branch run without a bypass directive.
+        alien_items: list[object] = [
+            (42,),
+            "not a resonance",
+            ("a", "b", 0.9, "extra"),
+        ]
+        alien = cast("list[tuple[str, str, float]]", alien_items)
+        with caplog.at_level("WARNING", logger="creek.generate.synchronicity"):
+            result = detector.detect_synchronicities(alien, cross_source_pair)
+        assert not result
+        assert any(
+            "Unrecognised resonance shape" in record.message
+            for record in caplog.records
+        )
 
 
 class TestCreateSynchronicityNote:

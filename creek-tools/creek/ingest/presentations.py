@@ -249,18 +249,10 @@ class PresentationIngestor(Ingestor):
                     "original_file": str(raw.path),
                     "title": data.title or raw.path.stem,
                     "slide_count": len(data.slides),
-                    "slides": [
-                        {
-                            "index": slide.index,
-                            "title": slide.title or "",
-                            "body": slide.body,
-                            "notes": slide.notes,
-                        }
-                        for slide in data.slides
-                    ],
                 },
                 source_path=str(raw.path),
                 timestamp=timestamp,
+                payload=data,
             ),
         ]
 
@@ -269,22 +261,25 @@ class PresentationIngestor(Ingestor):
 
         One ``## Slide N: Title`` block per slide with the body inlined
         and speaker notes (when present) under a ``**Speaker notes:**``
-        sub-section.
+        sub-section. Reads the typed :class:`PresentationData` off
+        :attr:`~creek.ingest.base.ParsedFragment.payload` rather than
+        re-parsing a dict mirror in ``metadata`` (issue #166).
         """
         title = str(fragment.metadata.get("title", "Presentation"))
-        slides: list[dict[str, Any]] = list(fragment.metadata.get("slides", []))
+        data = fragment.payload
+        slides: tuple[SlideData, ...] = (
+            data.slides if isinstance(data, PresentationData) else ()
+        )
         lines: list[str] = [f"# {title}", ""]
         for slide in slides:
-            heading = f"## Slide {slide['index']}"
-            if slide.get("title"):
-                heading = f"{heading}: {slide['title']}"
+            heading = f"## Slide {slide.index}"
+            if slide.title:
+                heading = f"{heading}: {slide.title}"
             lines.extend((heading, ""))
-            body = str(slide.get("body", ""))
-            if body:
-                lines.extend((body, ""))
-            notes = str(slide.get("notes", ""))
-            if notes:
-                lines.extend(("**Speaker notes:**", "", notes, ""))
+            if slide.body:
+                lines.extend((slide.body, ""))
+            if slide.notes:
+                lines.extend(("**Speaker notes:**", "", slide.notes, ""))
         return "\n".join(lines).rstrip() + "\n"
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:

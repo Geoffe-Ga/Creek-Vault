@@ -19,7 +19,6 @@ behaviour consistent.
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -28,6 +27,7 @@ import frontmatter
 
 from creek.classify.privacy_filter import pre_save_filter
 from creek.models import Eddy, Praxis, PrivacyTier, Thread
+from creek.save._slug import slugify_filename
 from creek.save.router import SaveTarget, target_directory
 
 if TYPE_CHECKING:
@@ -186,8 +186,7 @@ def _derive_title(body: str) -> str:
 def _compose_base_name(title: str) -> str:
     """Return ``YYYY-MM-DD-<slug>`` for the filename stem."""
     date_str = datetime.now(tz=UTC).strftime("%Y-%m-%d")
-    slug = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "-")
-    slug = slug[:_MAX_FILENAME_LENGTH] or "untitled"
+    slug = slugify_filename(title, max_length=_MAX_FILENAME_LENGTH) or "untitled"
     return f"{date_str}-{slug}"
 
 

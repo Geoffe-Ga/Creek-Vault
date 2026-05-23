@@ -281,6 +281,38 @@ class TestSpreadsheetParse:
         fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
         assert fragments == []
 
+    def test_parsed_fragment_carries_typed_sheetdata_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Sheet structure is carried as a typed :class:`SheetData`, not a dict.
+
+        Issue #166 — the pre-refactor code flattened the backend's
+        ``SheetData`` into ``metadata["headers"]`` /
+        ``metadata["row_data"]`` and ``convert_to_markdown`` re-read
+        them. The new contract puts the typed object on
+        :attr:`ParsedFragment.payload` so the schema lives in one
+        place and mypy can catch a rename at the call site.
+        """
+        path = tmp_path / "typed.xlsx"
+        _write_xlsx_placeholder(path)
+        original = SheetData(
+            name="Typed",
+            headers=("a", "b"),
+            rows=(("1", "2"),),
+        )
+        backend = StubSpreadsheetBackend(
+            workbooks={"typed.xlsx": WorkbookData(sheets=(original,))},
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        assert fragments[0].payload is original
+        # The structured fields are NOT mirrored back into the dict,
+        # so a refactor that drops the mirror later does not regress
+        # this test.
+        assert "headers" not in fragments[0].metadata
+        assert "row_data" not in fragments[0].metadata
+
 
 # ---- convert_to_markdown ----------------------------------------------
 
@@ -582,8 +614,10 @@ class TestHasHeaderOverride:
         ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
         fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
         # The heuristic promotes the first row, so "France" lands in headers.
-        assert fragments[0].metadata["headers"] == ["France", "Germany", "Spain"]
-        assert fragments[0].metadata["row_data"] == [
+        sheet = fragments[0].payload
+        assert isinstance(sheet, SheetData)
+        assert list(sheet.headers or ()) == ["France", "Germany", "Spain"]
+        assert [list(row) for row in sheet.rows] == [
             ["Italy", "Greece", "Portugal"],
         ]
 
@@ -604,8 +638,10 @@ class TestHasHeaderOverride:
         ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
         raws = ingestor.discover(tmp_path)
         fragments = ingestor.parse(raws[0], has_header=False)
-        assert fragments[0].metadata["headers"] == []
-        assert fragments[0].metadata["row_data"] == [
+        sheet = fragments[0].payload
+        assert isinstance(sheet, SheetData)
+        assert sheet.headers in (None, ())
+        assert [list(row) for row in sheet.rows] == [
             ["France", "Germany", "Spain"],
             ["Italy", "Greece", "Portugal"],
         ]
@@ -629,8 +665,10 @@ class TestHasHeaderOverride:
         ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
         raws = ingestor.discover(tmp_path)
         fragments = ingestor.parse(raws[0], has_header=True)
-        assert fragments[0].metadata["headers"] == ["name", "", "city"]
-        assert fragments[0].metadata["row_data"] == [["Alice", "30", "NYC"]]
+        sheet = fragments[0].payload
+        assert isinstance(sheet, SheetData)
+        assert list(sheet.headers or ()) == ["name", "", "city"]
+        assert [list(row) for row in sheet.rows] == [["Alice", "30", "NYC"]]
 
     def test_csv_has_header_none_matches_default_call(
         self,
@@ -643,8 +681,12 @@ class TestHasHeaderOverride:
         raws = ingestor.discover(tmp_path)
         default = ingestor.parse(raws[0])
         explicit_none = ingestor.parse(raws[0], has_header=None)
-        assert default[0].metadata["headers"] == explicit_none[0].metadata["headers"]
-        assert default[0].metadata["row_data"] == explicit_none[0].metadata["row_data"]
+        default_sheet = default[0].payload
+        explicit_sheet = explicit_none[0].payload
+        assert isinstance(default_sheet, SheetData)
+        assert isinstance(explicit_sheet, SheetData)
+        assert default_sheet.headers == explicit_sheet.headers
+        assert default_sheet.rows == explicit_sheet.rows
 
     def test_stub_backend_receives_has_header(self, tmp_path: Path) -> None:
         """``has_header`` propagates from ingestor.parse to backend.read_workbook.
@@ -717,8 +759,10 @@ class TestHasHeaderOverride:
         ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
         raws = ingestor.discover(tmp_path)
         fragments = ingestor.parse(raws[0], has_header=False)
-        assert fragments[0].metadata["headers"] == []
-        assert fragments[0].metadata["row_data"] == [
+        sheet = fragments[0].payload
+        assert isinstance(sheet, SheetData)
+        assert sheet.headers in (None, ())
+        assert [list(row) for row in sheet.rows] == [
             ["France", "Germany", "Spain"],
             ["Italy", "Greece", "Portugal"],
         ]
@@ -844,6 +888,28 @@ class TestPresentationParse:
         assert len(fragments) == 1
         assert fragments[0].metadata["slide_count"] == 2
         assert fragments[0].metadata["title"] == "My Talk"
+
+    def test_parsed_fragment_carries_typed_presentationdata_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Slide structure rides on a typed :class:`PresentationData` payload.
+
+        Issue #166 — the pre-refactor code dict-ified every slide into
+        ``metadata["slides"]`` and ``convert_to_markdown`` re-parsed
+        the list of dicts. The typed payload eliminates that round-trip.
+        """
+        path = tmp_path / "typed.pptx"
+        _write_pptx_placeholder(path)
+        original = PresentationData(
+            title="Typed Deck",
+            slides=(SlideData(index=1, title="A", body="B"),),
+        )
+        backend = StubPresentationBackend(presentations={"typed.pptx": original})
+        ingestor = PresentationIngestor(backend=backend)
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        assert fragments[0].payload is original
+        assert "slides" not in fragments[0].metadata
 
     def test_markdown_renders_one_section_per_slide(
         self,
