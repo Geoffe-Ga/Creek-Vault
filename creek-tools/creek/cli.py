@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import typer
 from rich.console import Console
@@ -690,6 +690,7 @@ def redact(
 
 _CLASSIFY_METHODS = ("rules", "llm")
 _LINK_METHODS = ("embeddings", "temporal", "eddies")
+_REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
 
 
 @app.command()
@@ -728,6 +729,24 @@ def classify(
             "loud on a regressed prompt or example set."
         ),
     ),
+    reatomize: bool = typer.Option(
+        False,
+        "--reatomize",
+        help=(
+            "Enable FEAT-023 confidence-driven re-atomization for this run "
+            "regardless of the YAML default. Below-threshold or unclassified "
+            "fragments are re-atomized (split or aggregated) and re-classified "
+            "until a leaf clears the threshold or a terminal level is reached."
+        ),
+    ),
+    reatomize_direction: str = typer.Option(
+        "auto",
+        "--reatomize-direction",
+        help=(
+            "Override the FEAT-023 direction heuristic. 'auto' routes by "
+            "source/level; 'split' forces zoom-in; 'aggregate' forces zoom-out."
+        ),
+    ),
 ) -> None:
     """Run classification on existing vault fragments.
 
@@ -760,8 +779,29 @@ def classify(
             f"Supported: {', '.join(_CLASSIFY_METHODS)}.[/red]",
         )
         raise typer.Exit(code=2)
+    if reatomize_direction not in _REATOMIZE_DIRECTIONS:
+        console.print(
+            f"[red]Unknown --reatomize-direction {reatomize_direction!r}. "
+            f"Supported: {', '.join(_REATOMIZE_DIRECTIONS)}.[/red]",
+        )
+        raise typer.Exit(code=2)
 
     config = load_config()
+    if reatomize:
+        # Late-bind the FEAT-023 CLI overrides into the loaded config so
+        # downstream call-sites only ever look at the config object, not
+        # at sticky locals. The `reatomize_direction` here is already
+        # validated against `_REATOMIZE_DIRECTIONS`, so the cast to the
+        # config's `Literal` is sound.
+        config.classification = config.classification.model_copy(
+            update={
+                "reatomize": True,
+                "reatomize_direction": cast(
+                    "Literal['auto', 'split', 'aggregate']",
+                    reatomize_direction,
+                ),
+            },
+        )
     vault_path = _resolve_vault(vault)
 
     from creek.classify.classify_engine import run_classify

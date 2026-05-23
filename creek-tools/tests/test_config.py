@@ -106,6 +106,34 @@ class TestClassificationConfig:
         assert cfg.auto_classify_sources == ["claude", "chatgpt", "discord"]
         assert cfg.human_review_sources == ["journal"]
 
+    def test_reatomize_defaults_match_feat_023_spec(self) -> None:
+        """FEAT-023 knobs default to disabled / inherit / 4 / auto."""
+        cfg = ClassificationConfig()
+        assert cfg.reatomize is False
+        assert cfg.reatomize_threshold is None
+        assert cfg.reatomize_max_depth == 4
+        assert cfg.reatomize_direction == "auto"
+
+    def test_reatomize_threshold_accepts_explicit_float(self) -> None:
+        """An explicit reatomize_threshold survives validation."""
+        cfg = ClassificationConfig(reatomize_threshold=0.5)
+        assert cfg.reatomize_threshold == 0.5
+
+    def test_reatomize_threshold_rejects_out_of_range(self) -> None:
+        """The reatomize_threshold guard rails are [0.0, 1.0]."""
+        with pytest.raises(ValueError, match="reatomize_threshold"):
+            ClassificationConfig(reatomize_threshold=1.5)
+
+    def test_reatomize_max_depth_must_be_positive(self) -> None:
+        """``reatomize_max_depth`` rejects zero/negative values."""
+        with pytest.raises(ValueError, match="reatomize_max_depth"):
+            ClassificationConfig(reatomize_max_depth=0)
+
+    def test_reatomize_direction_rejects_unknown_value(self) -> None:
+        """Only ``auto`` / ``split`` / ``aggregate`` are accepted."""
+        with pytest.raises(ValueError, match="reatomize_direction"):
+            ClassificationConfig(reatomize_direction="sideways")
+
 
 class TestRedactionConfig:
     """Tests for RedactionConfig model."""
