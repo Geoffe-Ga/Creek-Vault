@@ -124,7 +124,14 @@ class TestEmptyAndPassthrough:
         assert aggregate([], level="session", config=cfg) == []
 
     def test_session_level_input_returns_unchanged(self) -> None:
-        """Session-level fragments are terminal — passed through verbatim."""
+        """Session-level fragments are terminal.
+
+        Mechanism: ``_SOURCE_LEVELS["session"] == "burst"``, so a fragment
+        already at ``session`` fails the eligibility check and falls into
+        the passthrough partition. The "session is terminal" guarantee is
+        a consequence of that source-level mismatch, not a special-cased
+        branch in :func:`aggregate`.
+        """
         cfg = AggregationConfig()
         sessions = [
             _frag(id_="s1", title="session 1", minute=0, level="session"),

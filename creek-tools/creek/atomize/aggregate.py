@@ -227,7 +227,7 @@ def _group_to_sessions(
 
 def _build_parent(
     children: list[Fragment],
-    level: FragmentLevel,
+    level: AggregateLevel,
     config: AggregationConfig,
 ) -> Fragment:
     """Assemble an aggregated parent Fragment from an ordered child list.
