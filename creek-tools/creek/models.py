@@ -20,6 +20,27 @@ from creek.time import now_la, today_la
 CompileTargetKind = Literal["thread", "eddy", "frequency_index"]
 """The compiled-page surfaces ``creek compile`` may target (FEAT-003)."""
 
+FragmentLevel = Literal[
+    "sentence",
+    "paragraph",
+    "subsection",
+    "section",
+    "document",
+    "exchange",
+    "burst",
+    "session",
+]
+"""Structural level a :class:`Fragment` sits at within its source hierarchy.
+
+The first four values (``sentence`` … ``section``) describe levels carved
+*down* from a longer document by the FEAT-021 zoom-in splitter. The last
+three (``exchange``, ``burst``, ``session``) describe levels stitched
+*up* from short messages by the FEAT-022 zoom-out aggregator. ``document``
+is the default for any flat ingestion — a chat conversation, an essay, a
+note — and is therefore what every pre-FEAT-020 fragment is treated as
+when it loads without an explicit ``level`` field.
+"""
+
 
 def _utc_now() -> datetime:
     """Return the current time in UTC (used as a Pydantic default factory).
@@ -457,6 +478,17 @@ class Fragment(BaseModel):
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED
     context: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    # FEAT-020 hierarchical fragment data model. Flat (pre-FEAT-020)
+    # fragments load as root documents: ``parent_id=None``,
+    # ``child_ids=[]``, ``level="document"``, ``structural_path=[]``.
+    # These four fields are direction-agnostic — a parent may be the
+    # level *above* its children whether the children were carved out
+    # by the FEAT-021 zoom-in splitter or stitched together by the
+    # FEAT-022 zoom-out aggregator.
+    parent_id: str | None = None
+    child_ids: list[str] = Field(default_factory=list)
+    level: FragmentLevel = "document"
+    structural_path: list[str] = Field(default_factory=list)
 
     # BUG-009: the ``[prop-decorator]`` suppression below is a known
     # mypy / Pydantic-v2 limitation when stacking ``@computed_field``

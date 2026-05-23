@@ -262,6 +262,36 @@ def generate_fragment_id(source: str, timestamp: datetime, content: str) -> str:
     return f"frag-{digest}"
 
 
+def generate_child_fragment_id(parent_id: str, level: str, index: int) -> str:
+    """Generate a deterministic child fragment ID (FEAT-020).
+
+    The output matches :func:`generate_fragment_id`'s shape — a
+    ``frag-XXXXXXXXXXXX`` SHA-256 prefix — so child IDs are
+    indistinguishable from root IDs downstream and the same dedup,
+    indexing, and resonance code paths work for both.
+
+    Re-running the splitter (FEAT-021) or aggregator (FEAT-022) against
+    an unchanged parent must produce the same child IDs in the same
+    order so the second run is a no-op — that idempotency is why the
+    tuple is ``(parent_id, level, index)`` and not, say,
+    ``(parent_id, child_content)`` (content-keyed IDs would change
+    every time a trivial whitespace edit landed upstream and explode
+    the resonance graph).
+
+    Args:
+        parent_id: ID of the parent fragment (root or otherwise).
+        level: Structural level of the child — one of
+            :data:`creek.models.FragmentLevel`'s values.
+        index: Zero-based position of this child among its siblings.
+
+    Returns:
+        A deterministic ID string in the format ``frag-XXXXXXXXXXXX``.
+    """
+    hash_input = f"{parent_id}:{level}:{index}"
+    digest = hashlib.sha256(hash_input.encode()).hexdigest()[:12]
+    return f"frag-{digest}"
+
+
 def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
     """Combine a ``ParsedFragment`` with its frontmatter into an ``IngestedFragment``.
 

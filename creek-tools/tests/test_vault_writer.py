@@ -381,6 +381,60 @@ class TestWriteFragment:
         result = writer.write_fragment(frag)
         assert "01-Fragments/Notes" in str(result)
 
+    def test_write_fragment_persists_hierarchy_fields(
+        self,
+        writer: VaultWriter,
+    ) -> None:
+        """FEAT-020 hierarchy fields appear in frontmatter and re-validate.
+
+        Acceptance criterion: "``VaultWriter`` serialises hierarchy
+        fields to frontmatter; ``VaultReader`` parses them back."
+        """
+        import frontmatter as fm_mod
+
+        frag = Fragment(
+            id="frag-hier-write1",
+            title="Hierarchy Write",
+            source=FragmentSource(platform=SourcePlatform.ESSAY),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+            parent_id="frag-hier-root00",
+            child_ids=["frag-hier-childa", "frag-hier-childb"],
+            level="subsection",
+            structural_path=["The Capricorn Moon", "On grief"],
+        )
+        result = writer.write_fragment(frag)
+        text = result.read_text(encoding="utf-8")
+        assert "parent_id: frag-hier-root00" in text
+        assert "level: subsection" in text
+
+        post = fm_mod.load(str(result))
+        reloaded = Fragment.model_validate(dict(post.metadata))
+        assert reloaded.parent_id == "frag-hier-root00"
+        assert reloaded.child_ids == ["frag-hier-childa", "frag-hier-childb"]
+        assert reloaded.level == "subsection"
+        assert reloaded.structural_path == ["The Capricorn Moon", "On grief"]
+
+    def test_write_fragment_defaults_serialise_as_root_document(
+        self,
+        writer: VaultWriter,
+        sample_fragment: Fragment,
+    ) -> None:
+        """A flat fragment's frontmatter records the documented defaults.
+
+        Pre-FEAT-020 callers that never set the hierarchy fields must
+        produce vault files whose ``parent_id``/``child_ids``/``level``/
+        ``structural_path`` round-trip back to the documented defaults
+        — so downstream loads of those files re-create root documents.
+        """
+        import frontmatter as fm_mod
+
+        result = writer.write_fragment(sample_fragment)
+        post = fm_mod.load(str(result))
+        assert post["parent_id"] is None
+        assert post["child_ids"] == []
+        assert post["level"] == "document"
+        assert post["structural_path"] == []
+
     def test_platform_subfolder_mapping_is_total(self) -> None:
         """Every SourcePlatform must have an explicit subfolder mapping.
 

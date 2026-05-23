@@ -81,13 +81,40 @@ _TIMESTAMPS = st.datetimes(
 _PLATFORMS = st.sampled_from(list(SourcePlatform))
 
 
+_LEVELS = st.sampled_from(
+    [
+        "sentence",
+        "paragraph",
+        "subsection",
+        "section",
+        "document",
+        "exchange",
+        "burst",
+        "session",
+    ],
+)
+
+_FRAG_IDS = st.from_regex(r"frag-[0-9a-f]{12}", fullmatch=True)
+
+_STRUCTURAL_PATH = st.lists(
+    st.text(
+        alphabet=st.characters(
+            blacklist_categories=("Cs", "Cc"),
+            blacklist_characters="\x00",
+        ),
+        min_size=1,
+        max_size=40,
+    ).filter(lambda s: s.strip() != ""),
+    max_size=5,
+)
+
+
 @st.composite
 def fragments(draw: st.DrawFn) -> Fragment:
     """Build a Fragment instance from primitive strategies."""
+    parent_id = draw(st.one_of(st.none(), _FRAG_IDS))
     return Fragment(
-        id=draw(
-            st.from_regex(r"frag-[0-9a-f]{12}", fullmatch=True),
-        ),
+        id=draw(_FRAG_IDS),
         title=draw(_TITLES),
         source=FragmentSource(
             platform=draw(_PLATFORMS),
@@ -96,6 +123,10 @@ def fragments(draw: st.DrawFn) -> Fragment:
         created=draw(_TIMESTAMPS),
         ingested=draw(_TIMESTAMPS),
         tags=draw(_TAGS),
+        parent_id=parent_id,
+        child_ids=draw(st.lists(_FRAG_IDS, max_size=6, unique=True)),
+        level=draw(_LEVELS),
+        structural_path=draw(_STRUCTURAL_PATH),
     )
 
 
@@ -147,6 +178,36 @@ def test_fragment_id_survives_roundtrip(
     written_path = writer.write_fragment(fragment)
     post = frontmatter.load(str(written_path))
     assert post.metadata["id"] == fragment.id
+
+
+@_PROFILE
+@given(fragment=fragments())
+def test_fragment_hierarchy_write_read_write_bytes_identical(
+    fragment: Fragment, tmp_path_factory: TempPathFactory
+) -> None:
+    """FEAT-020 acceptance: write → read → write yields identical bytes.
+
+    The first write produces the canonical on-disk form. We load the
+    file back through the shared vault reader, re-write the loaded
+    fragment into a second vault, and assert the two files are
+    byte-for-byte equal. Any non-determinism in the YAML serialisation
+    (list ordering, scalar quoting, key drift) would break this
+    contract.
+    """
+    from creek.vault.reader import try_load_fragment
+
+    vault_a = _make_vault(tmp_path_factory.mktemp("vault_a"))
+    vault_b = _make_vault(tmp_path_factory.mktemp("vault_b"))
+    writer_a = VaultWriter(vault_path=vault_a)
+    writer_b = VaultWriter(vault_path=vault_b)
+
+    path_a = writer_a.write_fragment(fragment, body="round-trip body")
+    record = try_load_fragment(path_a)
+    assert record is not None
+    loaded_fragment, body, _raw = record
+    path_b = writer_b.write_fragment(loaded_fragment, body=body)
+
+    assert path_a.read_bytes() == path_b.read_bytes()
 
 
 def test_frontmatter_roundtrip_smoke(tmp_path: Path) -> None:
