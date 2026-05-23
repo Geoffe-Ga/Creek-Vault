@@ -45,6 +45,7 @@ from creek.generate.wavelength import (
     CurrentPhaseSummary,
     current_phase_summary,
 )
+from creek.hierarchy import select_by_policy
 from creek.models import Eddy, Fragment, Frequency, Praxis, Thread
 
 logger = logging.getLogger(__name__)
@@ -376,6 +377,17 @@ def _section(header: str, body_lines: list[str]) -> str:
     return header + "\n\n" + "\n".join(body_lines)
 
 
+def _level_annotation(level: str) -> str:
+    """FEAT-025: render the "level used" note that opens hierarchy-aware sections.
+
+    Italicised so it visually sits below the section header without
+    competing with body content; the trailing period keeps the line a
+    full sentence so downstream tools (state-budget, voice-proxy) don't
+    treat it as a heading.
+    """
+    return f"_Counted at: {level}._"
+
+
 def _seed_as_prompt(seed: IdeaSeed) -> str:
     """Format a phase-filtered :class:`IdeaSeed` as one bullet of prompt text.
 
@@ -431,6 +443,8 @@ class StateReportGenerator:
         self._state = _load_vault_state(vault_path)
         self._current_phase_override = current_phase
         self._wavelength_summary: CurrentPhaseSummary | None = None
+        self._leaf_fragments: list[Fragment] | None = None
+        self._leaf_ids: frozenset[str] | None = None
 
     # ---- Sections ---------------------------------------------------
 
@@ -442,6 +456,10 @@ class StateReportGenerator:
         adapted to Creek. The snapshot is descriptive only: no
         prescriptive ranking, no "should" language.
 
+        FEAT-025: the snapshot reads at ``documents`` granularity —
+        sentence- or paragraph-level wavelength readings would be noise
+        next to whole-source phase signal.
+
         Falls back to the empty-state placeholder when the vault has no
         classified fragments in the 28-day window.
         """
@@ -449,6 +467,8 @@ class StateReportGenerator:
         if summary.fragment_count == 0:
             return _section(_HEADER_WAVELENGTH, [])
         body = [
+            _level_annotation("documents"),
+            "",
             f"- Phase: **{summary.phase}** (confidence {summary.confidence:.2f})",
             f"- Mode: **{summary.mode}**",
             f"- Fragments observed: {summary.fragment_count} "
@@ -507,13 +527,42 @@ class StateReportGenerator:
         return _section(_HEADER_SUGGESTED_QUESTIONS, body)
 
     def _resolve_wavelength_summary(self) -> CurrentPhaseSummary:
-        """Compute the wavelength summary once per generator instance."""
+        """Compute the wavelength summary once per generator instance.
+
+        FEAT-025: reads at ``documents`` granularity so sentence- and
+        paragraph-level wavelength readings don't drown out the phase
+        signal a whole-source document carries.
+        """
         if self._wavelength_summary is None:
             self._wavelength_summary = current_phase_summary(
                 self.vault_path,
                 today=self.today,
+                level_policy="documents",
             )
         return self._wavelength_summary
+
+    def _leaves(self) -> list[Fragment]:
+        """Return the leaf-level slice of loaded fragments (memoised).
+
+        FEAT-025: a fragment is a "leaf" in the current vault when none
+        of its ``child_ids`` are present among the loaded fragments —
+        the same semantics used by :func:`creek.hierarchy.select_by_policy`.
+        """
+        if self._leaf_fragments is None:
+            self._leaf_fragments = select_by_policy(self._state.fragments, "leaves")
+            self._leaf_ids = frozenset(f.id for f in self._leaf_fragments)
+        return self._leaf_fragments
+
+    def _is_leaf(self, fragment_id: str) -> bool:
+        """Whether *fragment_id* is a leaf in the current vault load.
+
+        Returns ``False`` for IDs that aren't loaded — a fragment we
+        can't see can't be verified as a leaf, and conservatively
+        excluding it keeps cross-set rollups (synchronicities) honest.
+        """
+        self._leaves()
+        leaf_ids = self._leaf_ids or frozenset()
+        return fragment_id in leaf_ids
 
     def _resolve_current_phase(self) -> str:
         """Return the active phase value (override > derived > unclassified)."""
@@ -586,34 +635,74 @@ class StateReportGenerator:
         return _HEADER_PRE_LLM_YIELD + "\n\n" + "\n".join(body)
 
     def section_active_eddies(self) -> str:
-        """Render section 3: top eddies by ``fragment_count`` (capped at ten)."""
+        """Render section 3: top eddies by leaf-counted fragments (capped at ten).
+
+        FEAT-025: when any leaves are loaded, state recounts how many
+        link to each eddy via the fragment's ``eddies`` wikilinks — the
+        stored :attr:`creek.models.Eddy.fragment_count` is ignored. On
+        a vault with eddies but no loaded fragments at all, the stored
+        count is the only signal available and we fall back to it so
+        the placeholder behaviour of FEAT-006 is preserved.
+        """
+        leaf_counts = self._leaf_counts_by_link("eddies")
+        has_leaves = bool(self._leaves())
         eddies = sorted(
             self._state.eddies,
-            key=lambda e: (-e.fragment_count, e.title),
+            key=lambda e: (
+                -self._eddy_count(e, leaf_counts, has_leaves=has_leaves),
+                e.title,
+            ),
         )[:_TOP_N]
-        body = [
-            f"- {eddy.title} — {eddy.fragment_count} fragment(s)" for eddy in eddies
+        rows = [
+            f"- {eddy.title} — "
+            f"{self._eddy_count(eddy, leaf_counts, has_leaves=has_leaves)} "
+            "fragment(s)"
+            for eddy in eddies
         ]
-        return _section(_HEADER_ACTIVE_EDDIES, body)
+        return _section(
+            _HEADER_ACTIVE_EDDIES,
+            self._prepend_annotation(rows, "leaves"),
+        )
 
     def section_active_threads(self) -> str:
-        """Render section 4: most-recent threads by ``last_seen`` (capped at ten)."""
+        """Render section 4: most-recent threads by ``last_seen`` (capped at ten).
+
+        FEAT-025: the fragment count next to each thread is leaf-counted
+        the same way as :meth:`section_active_eddies`. The sort key
+        (``last_seen``) is unchanged — recency is independent of level.
+        """
+        leaf_counts = self._leaf_counts_by_link("threads")
+        has_leaves = bool(self._leaves())
         threads = sorted(
             self._state.threads,
             key=lambda t: (t.last_seen, t.title),
             reverse=True,
         )[:_TOP_N]
-        body = [
+        rows = [
             f"- {thread.title} — last seen {thread.last_seen.isoformat()} "
-            f"({thread.fragment_count} fragment(s))"
+            f"({self._thread_count(thread, leaf_counts, has_leaves=has_leaves)} "
+            "fragment(s))"
             for thread in threads
         ]
-        return _section(_HEADER_ACTIVE_THREADS, body)
+        return _section(
+            _HEADER_ACTIVE_THREADS,
+            self._prepend_annotation(rows, "leaves"),
+        )
 
     def section_synchronicities(self) -> str:
-        """Render section 5: surprising connections (synchronicities)."""
+        """Render section 5: surprising connections (synchronicities).
+
+        FEAT-025: synchronicities whose endpoints are not both leaves
+        are filtered out — a sync from a parent fragment is rhetorical
+        structure, not the surprising cross-source resonance the
+        section is meant to surface.
+        """
         rows = sorted(
-            self._state.synchronicities,
+            (
+                row
+                for row in self._state.synchronicities
+                if self._is_leaf(row.fragment_a_id) and self._is_leaf(row.fragment_b_id)
+            ),
             key=lambda r: (-r.similarity, r.sync_id),
         )[:_TOP_N]
         body = [
@@ -621,7 +710,69 @@ class StateReportGenerator:
             f"similarity {row.similarity:.2f}, gap {row.time_gap_days}d"
             for row in rows
         ]
-        return _section(_HEADER_SYNCHRONICITIES, body)
+        return _section(
+            _HEADER_SYNCHRONICITIES,
+            self._prepend_annotation(body, "leaves"),
+        )
+
+    @staticmethod
+    def _prepend_annotation(rows: list[str], level: str) -> list[str]:
+        """Insert the level annotation when *rows* has any content.
+
+        Keeps the FEAT-006 empty-state placeholder reachable: when the
+        section would otherwise be empty, ``_section`` renders
+        :data:`EMPTY_PLACEHOLDER` and the annotation is suppressed.
+        """
+        if not rows:
+            return rows
+        return [_level_annotation(level), "", *rows]
+
+    def _leaf_counts_by_link(self, attr: str) -> dict[str, int]:
+        """Count leaves grouped by their ``fragment.<attr>`` wiki-link targets.
+
+        Args:
+            attr: ``"eddies"`` or ``"threads"`` — the fragment attribute
+                holding the per-target wiki-link strings.
+
+        Returns:
+            ``{target_title: leaf_count}`` derived from the leaves slice.
+        """
+        counts: Counter[str] = Counter()
+        for frag in self._leaves():
+            for target in _wikilink_targets(getattr(frag, attr)):
+                counts[target] += 1
+        return dict(counts)
+
+    @staticmethod
+    def _eddy_count(
+        eddy: Eddy,
+        leaf_counts: dict[str, int],
+        *,
+        has_leaves: bool,
+    ) -> int:
+        """Resolve the displayed eddy count.
+
+        When the vault has any loaded leaf fragments, the leaf count
+        wins — including zero, which is the *honest* answer when no
+        leaves currently link to this eddy. When the vault has no
+        loaded fragments at all, the stored ``fragment_count`` is the
+        only signal we have and is used as a fallback.
+        """
+        if has_leaves:
+            return leaf_counts.get(eddy.title, 0)
+        return eddy.fragment_count
+
+    @staticmethod
+    def _thread_count(
+        thread: Thread,
+        leaf_counts: dict[str, int],
+        *,
+        has_leaves: bool,
+    ) -> int:
+        """Resolve the displayed thread count (see :meth:`_eddy_count`)."""
+        if has_leaves:
+            return leaf_counts.get(thread.title, 0)
+        return thread.fragment_count
 
     def section_hyperedges(self) -> str:
         """Render section 6: praxis whose source fragments span 2+ eddies.

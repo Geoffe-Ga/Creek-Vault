@@ -254,8 +254,19 @@ def populated_vault(tmp_path: Path) -> Path:
         frequency="F1",
         eddies=["[[Innovation Eddy]]"],
     )
-    _write_eddy(tmp_path, eddy_id="eddy-1", title="Receptivity Eddy", fragment_count=8)
-    _write_eddy(tmp_path, eddy_id="eddy-2", title="Innovation Eddy", fragment_count=5)
+    # frag-004 (FEAT-025) makes Receptivity outweigh Innovation in leaf counts —
+    # otherwise leaf-aware counting would tie and the sort would flip to
+    # alphabetical order.
+    _write_fragment(
+        tmp_path,
+        frag_id="frag-004",
+        title="D",
+        created=base + timedelta(days=6),
+        frequency="F1",
+        eddies=["[[Receptivity Eddy]]"],
+    )
+    _write_eddy(tmp_path, eddy_id="eddy-1", title="Receptivity Eddy", fragment_count=3)
+    _write_eddy(tmp_path, eddy_id="eddy-2", title="Innovation Eddy", fragment_count=2)
     _write_thread(
         tmp_path,
         thread_id="thread-old",
@@ -318,7 +329,7 @@ def test_section_vault_summary_includes_counts(populated_vault: Path) -> None:
     ).section_vault_summary()
 
     assert section.startswith("## Vault summary")
-    assert "Fragments: 3" in section
+    assert "Fragments: 4" in section
     assert "Eddies: 2" in section
     assert "Threads: 2" in section
 
@@ -344,8 +355,8 @@ def test_section_vault_summary_includes_frequency_distribution(
     ).section_vault_summary()
 
     assert "**Frequency distribution**" in section
-    # Two F1 fragments and one F2 fragment in the populated fixture.
-    assert "F1 (Agency/Survival): 2" in section
+    # Three F1 fragments and one F2 fragment in the populated fixture.
+    assert "F1 (Agency/Survival): 3" in section
     assert "F2 (Receptivity/Kinship): 1" in section
 
 
@@ -437,8 +448,8 @@ def test_section_active_eddies_sorts_by_fragment_count(populated_vault: Path) ->
     receptivity_idx = section.index("Receptivity Eddy")
     innovation_idx = section.index("Innovation Eddy")
     assert receptivity_idx < innovation_idx
-    assert "8" in section
-    assert "5" in section
+    assert "3 fragment(s)" in section
+    assert "2 fragment(s)" in section
 
 
 def test_section_active_eddies_caps_at_ten(empty_vault: Path) -> None:
@@ -1344,6 +1355,277 @@ def test_budget_result_largest_sections_is_immutable() -> None:
     result = BudgetResult(ok=True, tokens=0, largest_sections=(("## A", 1),))
     with pytest.raises(AttributeError):
         result.largest_sections.append(("## B", 2))  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# FEAT-025: hierarchy-aware state
+# ---------------------------------------------------------------------------
+
+
+def _write_hier_fragment(
+    vault: Path,
+    *,
+    frag_id: str,
+    level: str,
+    parent_id: str | None = None,
+    child_ids: list[str] | None = None,
+    eddies: list[str] | None = None,
+    threads: list[str] | None = None,
+    phase: str = "rising",
+    mode: str = "express",
+    dosage: str = "medicine",
+) -> Path:
+    """Write a fragment with explicit hierarchy fields for FEAT-025 tests."""
+    when = datetime(2026, 5, 1, tzinfo=UTC)
+    metadata = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": f"Title {frag_id}",
+        "created": when.isoformat(),
+        "ingested": when.isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "wavelength": {"phase": phase, "mode": mode, "dosage": dosage},
+        "eddies": list(eddies or []),
+        "threads": list(threads or []),
+        "level": level,
+        "parent_id": parent_id,
+        "child_ids": list(child_ids or []),
+    }
+    target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="body", **metadata)),
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_active_eddies_counts_leaves_not_parents(empty_vault: Path) -> None:
+    """A parent fragment with two children counts as 2 leaves, not 3."""
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-parent",
+        level="document",
+        child_ids=["frag-leaf-1", "frag-leaf-2"],
+        eddies=["[[Hierarchical Eddy]]"],
+    )
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-leaf-1",
+        level="paragraph",
+        parent_id="frag-parent",
+        eddies=["[[Hierarchical Eddy]]"],
+    )
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-leaf-2",
+        level="paragraph",
+        parent_id="frag-parent",
+        eddies=["[[Hierarchical Eddy]]"],
+    )
+    _write_eddy(
+        empty_vault,
+        eddy_id="eddy-h",
+        title="Hierarchical Eddy",
+        fragment_count=99,
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_active_eddies()
+
+    # 2 leaves link to the eddy. The stored fragment_count (99) is irrelevant
+    # — state recounts at leaf granularity.
+    assert "Hierarchical Eddy — 2 fragment(s)" in section
+
+
+def test_active_eddies_falls_back_to_stored_when_no_fragments(
+    empty_vault: Path,
+) -> None:
+    """When no fragments are loaded, stored fragment_count is the fallback."""
+    _write_eddy(empty_vault, eddy_id="eddy-x", title="Eddy X", fragment_count=7)
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_active_eddies()
+
+    assert "Eddy X — 7 fragment(s)" in section
+
+
+def test_active_eddies_shows_zero_when_leaves_present_but_unlinked(
+    empty_vault: Path,
+) -> None:
+    """An eddy with no leaves linking to it renders ``0``, not the stored count.
+
+    Regression: an earlier draft used ``leaf_counts.get(title) or stored`` which
+    conflated "zero leaves linked" with "no fragments loaded" and leaked a
+    stale stored count into the report.
+    """
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-other",
+        level="document",
+        eddies=["[[Some Other Eddy]]"],
+    )
+    _write_eddy(
+        empty_vault,
+        eddy_id="eddy-stale",
+        title="Stale Eddy",
+        fragment_count=42,
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_active_eddies()
+
+    assert "Stale Eddy — 0 fragment(s)" in section
+    assert "42" not in section
+
+
+def test_active_eddies_annotates_level(populated_vault: Path) -> None:
+    """Each list-style section opens with the level it counted from."""
+    section = StateReportGenerator(
+        vault_path=populated_vault,
+    ).section_active_eddies()
+    assert "_Counted at: leaves._" in section
+
+
+def test_active_threads_counts_leaves_not_parents(empty_vault: Path) -> None:
+    """Threads also recount by leaves when the hierarchy contains them."""
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-parent",
+        level="document",
+        child_ids=["frag-leaf"],
+        threads=["[[Thread X]]"],
+    )
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-leaf",
+        level="paragraph",
+        parent_id="frag-parent",
+        threads=["[[Thread X]]"],
+    )
+    _write_thread(
+        empty_vault,
+        thread_id="thread-x",
+        title="Thread X",
+        last_seen=date(2026, 5, 1),
+        fragment_count=99,
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_active_threads()
+
+    # 1 leaf links to Thread X (the parent is excluded).
+    assert "Thread X" in section
+    assert "(1 fragment(s))" in section
+    assert "_Counted at: leaves._" in section
+
+
+def test_synchronicities_drop_non_leaf_endpoints(empty_vault: Path) -> None:
+    """A sync between a parent and any other fragment is hidden in leaves view."""
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-parent",
+        level="document",
+        child_ids=["frag-leaf"],
+    )
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-leaf",
+        level="paragraph",
+        parent_id="frag-parent",
+    )
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-other",
+        level="document",
+    )
+    # Sync between the parent and an unrelated leaf — endpoint is non-leaf.
+    _write_synchronicity(
+        empty_vault,
+        sync_id="sync-bad",
+        frag_a="frag-parent",
+        frag_b="frag-other",
+    )
+    # Sync between two leaves — should survive.
+    _write_synchronicity(
+        empty_vault,
+        sync_id="sync-good",
+        frag_a="frag-leaf",
+        frag_b="frag-other",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_synchronicities()
+
+    assert "frag-leaf" in section
+    assert "frag-other" in section
+    # The non-leaf sync is filtered out.
+    assert "frag-parent" not in section
+    assert "_Counted at: leaves._" in section
+
+
+def test_wavelength_snapshot_reads_at_documents(empty_vault: Path) -> None:
+    """Wavelength snapshot uses document/session-level fragments only."""
+    # Three sentence-level fragments tagged ``peaking``; should be ignored.
+    for idx in range(3):
+        _write_hier_fragment(
+            empty_vault,
+            frag_id=f"frag-sentence-{idx}",
+            level="sentence",
+            phase="peaking",
+        )
+    # One document-level fragment tagged ``rising``; this should dominate.
+    _write_hier_fragment(
+        empty_vault,
+        frag_id="frag-doc",
+        level="document",
+        phase="rising",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+        today=date(2026, 5, 1),
+    ).section_wavelength_snapshot()
+
+    assert "_Counted at: documents._" in section
+    # Only one fragment passes the documents filter.
+    assert "Fragments observed: 1" in section
+    # The dominant phase reflects the single document, not the sentences.
+    assert "**rising**" in section
+
+
+def test_flat_vault_regression(empty_vault: Path) -> None:
+    """A vault with only flat ``document``-level fragments behaves as before."""
+    base = datetime(2026, 5, 1, tzinfo=UTC)
+    _write_fragment(
+        empty_vault,
+        frag_id="frag-flat-1",
+        title="Flat one",
+        created=base,
+        frequency="F1",
+        eddies=["[[Flat Eddy]]"],
+    )
+    _write_fragment(
+        empty_vault,
+        frag_id="frag-flat-2",
+        title="Flat two",
+        created=base + timedelta(days=1),
+        frequency="F2",
+        eddies=["[[Flat Eddy]]"],
+    )
+    _write_eddy(empty_vault, eddy_id="eddy-flat", title="Flat Eddy", fragment_count=2)
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_active_eddies()
+
+    # Counts and ordering are unchanged: all fragments are leaves.
+    assert "Flat Eddy — 2 fragment(s)" in section
 
 
 def test_cli_state_budget_fails_when_over_budget(populated_vault: Path) -> None:
