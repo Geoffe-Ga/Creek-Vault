@@ -24,6 +24,7 @@ from creek.ingest.base import (
     RawDocument,
     assemble_ingested_fragment,
     create_provenance_entry,
+    generate_child_fragment_id,
     generate_fragment_id,
     normalize_encoding,
     normalize_timestamp,
@@ -492,6 +493,56 @@ class TestGenerateFragmentId:
         expected_id = f"frag-{expected_hash}"
         actual_id = generate_fragment_id(source, ts, content)
         assert actual_id == expected_id
+
+
+# ---- generate_child_fragment_id Tests (FEAT-020) ----
+
+
+class TestGenerateChildFragmentId:
+    """Tests for the FEAT-020 stable child-fragment ID helper."""
+
+    def test_shape_matches_root_fragment_id(self) -> None:
+        """Child IDs use the same ``frag-`` + 12-hex shape as root IDs."""
+        import re
+
+        child_id = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 0)
+        assert re.fullmatch(r"frag-[0-9a-f]{12}", child_id), child_id
+
+    def test_deterministic(self) -> None:
+        """Same ``(parent_id, level, index)`` triple always returns the same ID."""
+        id1 = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 3)
+        id2 = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 3)
+        assert id1 == id2
+
+    def test_different_parent_produces_different_id(self) -> None:
+        """Distinct parents must produce distinct child IDs at the same slot."""
+        id1 = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 0)
+        id2 = generate_child_fragment_id("frag-aaaabbbbddddd", "paragraph", 0)
+        assert id1 != id2
+
+    def test_different_level_produces_different_id(self) -> None:
+        """Same parent and index at different structural levels differ."""
+        id1 = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 0)
+        id2 = generate_child_fragment_id("frag-aaaabbbbcccc", "section", 0)
+        assert id1 != id2
+
+    def test_different_index_produces_different_id(self) -> None:
+        """Sibling positions produce distinct IDs so the tree is unambiguous."""
+        id1 = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 0)
+        id2 = generate_child_fragment_id("frag-aaaabbbbcccc", "paragraph", 1)
+        assert id1 != id2
+
+    def test_uses_sha256(self) -> None:
+        """ID body is SHA-256 of ``{parent_id}:{level}:{index}`` (first 12 hex)."""
+        parent_id = "frag-aaaabbbbcccc"
+        level = "section"
+        index = 7
+        expected_hash = hashlib.sha256(
+            f"{parent_id}:{level}:{index}".encode(),
+        ).hexdigest()[:12]
+        assert generate_child_fragment_id(parent_id, level, index) == (
+            f"frag-{expected_hash}"
+        )
 
 
 # ---- create_provenance_entry Tests ----

@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 import chardet
 from pydantic import BaseModel, ConfigDict, Field
 
-from creek.models import Fragment
+from creek.models import Fragment, FragmentLevel
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +258,42 @@ def generate_fragment_id(source: str, timestamp: datetime, content: str) -> str:
         A deterministic ID string in the format ``frag-XXXXXXXXXXXX``.
     """
     hash_input = f"{source}:{timestamp.isoformat()}:{content}"
+    digest = hashlib.sha256(hash_input.encode()).hexdigest()[:12]
+    return f"frag-{digest}"
+
+
+def generate_child_fragment_id(
+    parent_id: str,
+    level: FragmentLevel,
+    index: int,
+) -> str:
+    """Generate a deterministic child fragment ID (FEAT-020).
+
+    The output matches :func:`generate_fragment_id`'s shape — a
+    ``frag-XXXXXXXXXXXX`` SHA-256 prefix — so child IDs are
+    indistinguishable from root IDs downstream and the same dedup,
+    indexing, and resonance code paths work for both.
+
+    Re-running the splitter (FEAT-021) or aggregator (FEAT-022) against
+    an unchanged parent must produce the same child IDs in the same
+    order so the second run is a no-op — that idempotency is why the
+    tuple is ``(parent_id, level, index)`` and not, say,
+    ``(parent_id, child_content)`` (content-keyed IDs would change
+    every time a trivial whitespace edit landed upstream and explode
+    the resonance graph).
+
+    Args:
+        parent_id: ID of the parent fragment (root or otherwise).
+        level: Structural level of the child. Typed as
+            :data:`creek.models.FragmentLevel` so MyPy strict catches
+            invalid level strings (e.g. ``"chapter"``) at call sites
+            instead of letting them silently flow through to the hash.
+        index: Zero-based position of this child among its siblings.
+
+    Returns:
+        A deterministic ID string in the format ``frag-XXXXXXXXXXXX``.
+    """
+    hash_input = f"{parent_id}:{level}:{index}"
     digest = hashlib.sha256(hash_input.encode()).hexdigest()[:12]
     return f"frag-{digest}"
 

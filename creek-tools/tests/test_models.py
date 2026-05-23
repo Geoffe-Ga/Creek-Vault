@@ -2,6 +2,7 @@
 
 import json
 from datetime import date, datetime
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from creek.models import (
     Dosage,
     Eddy,
     Fragment,
+    FragmentLevel,
     FragmentSource,
     Frequency,
     FrequencyClassification,
@@ -493,6 +495,134 @@ class TestFragment:
         assert restored.frequency.primary == original.frequency.primary
         assert restored.emotional_texture == original.emotional_texture
         assert restored.tags == original.tags
+
+
+class TestFragmentHierarchy:
+    """Tests for the FEAT-020 hierarchical fragment data model.
+
+    Covers the four new fields (``parent_id``, ``child_ids``, ``level``,
+    ``structural_path``), their documented defaults, and round-tripping
+    through ``model_dump`` / ``model_validate`` so the writer/reader
+    contracts inherit a known-good base.
+    """
+
+    def test_hierarchy_defaults_match_documented_root_document(self) -> None:
+        """A flat fragment defaults to ``(None, [], "document", [])``."""
+        frag = Fragment(
+            id="frag-hier00000001",
+            title="Flat",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        )
+        assert frag.parent_id is None
+        assert frag.child_ids == []
+        assert frag.level == "document"
+        assert frag.structural_path == []
+
+    def test_full_hierarchy_specified(self) -> None:
+        """Every hierarchy field accepts the values described in FEAT-020."""
+        frag = Fragment(
+            id="frag-hier00000002",
+            title="Para 3",
+            source=FragmentSource(platform=SourcePlatform.ESSAY),
+            parent_id="frag-hier00000001",
+            child_ids=["frag-hier00000003", "frag-hier00000004"],
+            level="paragraph",
+            structural_path=["The Capricorn Moon", "On grief", "para-3"],
+        )
+        assert frag.parent_id == "frag-hier00000001"
+        assert frag.child_ids == [
+            "frag-hier00000003",
+            "frag-hier00000004",
+        ]
+        assert frag.level == "paragraph"
+        assert frag.structural_path == [
+            "The Capricorn Moon",
+            "On grief",
+            "para-3",
+        ]
+
+    def test_all_documented_levels_accepted(self) -> None:
+        """Every value in the FEAT-020 ``FragmentLevel`` Literal is valid.
+
+        Iterates the Literal's own ``get_args`` tuple so MyPy strict sees
+        each iteration variable as a genuine ``FragmentLevel`` — no
+        ``# type: ignore`` suppression. This proves the type contract,
+        not just runtime acceptance of string lookalikes.
+        """
+        levels = get_args(FragmentLevel)
+        assert set(levels) == {
+            "sentence",
+            "paragraph",
+            "subsection",
+            "section",
+            "document",
+            "exchange",
+            "burst",
+            "session",
+        }
+        for level in levels:
+            frag = Fragment(
+                id=f"frag-lvl-{level}",
+                title=f"Level {level}",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                level=level,
+            )
+            assert frag.level == level
+
+    def test_unknown_level_rejected(self) -> None:
+        """An invalid ``level`` value fails Pydantic validation up front."""
+        with pytest.raises(ValidationError):
+            Fragment.model_validate(
+                {
+                    "id": "frag-hier00000005",
+                    "title": "Bad",
+                    "source": {"platform": "claude"},
+                    "level": "chapter",
+                },
+            )
+
+    def test_hierarchy_round_trips_through_model_dump(self) -> None:
+        """Hierarchy fields survive ``model_dump(mode="json")`` → re-validate."""
+        original = Fragment(
+            id="frag-hier00000006",
+            title="Round trip",
+            source=FragmentSource(platform=SourcePlatform.CHATGPT),
+            parent_id="frag-parent00000",
+            child_ids=["frag-childa00000", "frag-childb00000"],
+            level="exchange",
+            structural_path=["#general", "2026-04-22 evening", "exchange-12"],
+        )
+        dump = original.model_dump(mode="json")
+        restored = Fragment.model_validate(dump)
+        assert restored.parent_id == original.parent_id
+        assert restored.child_ids == original.child_ids
+        assert restored.level == original.level
+        assert restored.structural_path == original.structural_path
+
+    def test_legacy_fragment_without_hierarchy_keys_loads_with_defaults(
+        self,
+    ) -> None:
+        """Pre-FEAT-020 frontmatter (no hierarchy keys) loads as a root document.
+
+        Acceptance criterion: "Pre-existing fragments (no hierarchy
+        fields in frontmatter) load with the documented defaults — no
+        crash, no warning spam."
+        """
+        import warnings
+
+        legacy_metadata = {
+            "type": "fragment",
+            "id": "frag-legacy000001",
+            "title": "Old-school fragment",
+            "source": {"platform": "claude"},
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            frag = Fragment.model_validate(legacy_metadata)
+        assert frag.parent_id is None
+        assert frag.child_ids == []
+        assert frag.level == "document"
+        assert frag.structural_path == []
 
 
 class TestThread:
