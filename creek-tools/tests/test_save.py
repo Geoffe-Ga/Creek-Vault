@@ -237,21 +237,25 @@ def test_intimate_stub_relpath_constant_matches_gitignored_dir() -> None:
     assert Path("10-Liminal/Compost/intimate-stubs") == INTIMATE_STUB_RELPATH
 
 
-def test_intimate_stub_relpath_constants_do_not_drift() -> None:
-    """Drift guard: the private mirror in privacy_filter must match the
-    public constant in router.
+def test_pre_save_filter_intimate_ignores_full_body() -> None:
+    """``full_body=True`` must NOT widen an intimate-tier body into the vault.
 
-    ``creek/classify/privacy_filter.py`` keeps a private copy of the
-    stub-relpath constant to avoid a circular import back into
-    ``creek.save``. If the two ever drift, the vault note's
-    ``intimate_body_pointer`` field will point to a directory where
-    the stub didn't land — a silent data-integrity bug. The test
-    imports the private symbol explicitly so it fails noisily the
-    moment either side moves.
+    The :func:`pre_save_filter` docstring says ``full_body`` is
+    "Ignored for intimate". The intimate branch fires first in the
+    current implementation; pinning the invariant here means a future
+    reorder of the conditionals (e.g. checking ``full_body`` before
+    the tier) is caught before it can leak intimate content past the
+    redactor.
     """
-    from creek.classify.privacy_filter import _PRE_SAVE_INTIMATE_STUB_RELPATH
-
-    assert _PRE_SAVE_INTIMATE_STUB_RELPATH == INTIMATE_STUB_RELPATH
+    result = pre_save_filter(
+        "Confessional body.",
+        tier=PrivacyTier.INTIMATE,
+        title="Private",
+        full_body=True,
+    )
+    assert result.stub_body == "Confessional body."
+    assert "Confessional body." not in result.vault_body
+    assert result.stub_relpath is not None
 
 
 # ---- Intimate full-body never lands in the vault tree ----
@@ -620,3 +624,133 @@ def test_cli_save_unknown_target_exits_two(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "target" in result.output.lower()
+
+
+# ---- _atomic_create exhaustion path ----
+
+
+def test_atomic_create_raises_when_collision_retries_exhausted(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_atomic_create`` raises after ``_MAX_COLLISION_RETRIES`` collisions.
+
+    The defensive ``RuntimeError`` is uncoverable in normal operation
+    (it requires 1000 colliding files). Monkeypatching ``os.open`` to
+    always raise ``FileExistsError`` exercises the exhaustion branch
+    cheaply so the error message is locked down by a test.
+    """
+    from creek.save import writer as writer_module
+
+    def always_exists(*_args: object, **_kwargs: object) -> int:
+        raise FileExistsError
+
+    monkeypatch.setattr(writer_module.os, "open", always_exists)
+    with pytest.raises(RuntimeError) as excinfo:
+        writer_module._atomic_create(vault, "stuck", "content")
+    message = str(excinfo.value)
+    assert "stuck.md" in message
+    assert str(writer_module._MAX_COLLISION_RETRIES) in message
+
+
+# ---- Shared slugify helper ----
+
+
+def test_slugify_filename_is_idempotent() -> None:
+    """``slugify_filename(slugify_filename(x)) == slugify_filename(x)`` for any x.
+
+    The property test exercises the truncation-at-hyphen edge case
+    that a naive implementation would fail: when the cut lands on a
+    ``-`` the second pass must produce the same string, not a string
+    one character shorter.
+    """
+    from creek.save._slug import slugify_filename
+
+    samples = [
+        "",
+        "Why creeks compound",
+        "  leading and trailing  ",
+        "weird---hyphens",
+        "exclamation!points!and?question marks",
+        "unicode-naïve-test",
+        "a-b-c-d-e-f-g-h",  # may truncate at a hyphen with small max_length
+        "ALL CAPS TITLE",
+        "1234567890",
+        "a" * 200,  # very long
+    ]
+    for sample in samples:
+        once = slugify_filename(sample)
+        twice = slugify_filename(once)
+        assert once == twice, f"slugify_filename not idempotent for {sample!r}"
+
+
+def test_slugify_filename_truncates_at_hyphen_without_breaking_idempotence() -> None:
+    """A truncation that lands on a hyphen still round-trips cleanly."""
+    from creek.save._slug import slugify_filename
+
+    # "a-b-c-d-e" with max_length=4 would naively yield "a-b-" — and
+    # re-slugifying "a-b-" would strip the trailing "-" and return "a-b",
+    # breaking idempotence. The helper strips trailing hyphens after
+    # truncation to keep the round-trip closed.
+    result = slugify_filename("a-b-c-d-e", max_length=4)
+    assert result == slugify_filename(result, max_length=4)
+    assert not result.endswith("-")
+
+
+def test_slugify_filename_used_by_both_call_sites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both ``_compose_base_name`` and ``_stub_relpath_for`` route through the helper.
+
+    Runtime check — wraps :func:`slugify_filename` with a spy and
+    confirms both call sites invoke it. A source-text grep was the
+    first cut (PR #287 review caught it) but would also pass with a
+    dead import or a comment, so the spy is the robust pin.
+
+    ``creek.save.writer`` imports ``slugify_filename`` at module load
+    time, so the spy must replace ``writer.slugify_filename`` to be
+    seen. ``creek.classify.privacy_filter`` imports it function-locally
+    on each call, so replacing the canonical attribute on
+    ``creek.save._slug`` is enough to redirect that path.
+    """
+    from creek.classify import privacy_filter as classify_module
+    from creek.save import _slug as slug_module
+    from creek.save import writer as writer_module
+
+    calls: list[str] = []
+    real_slugify = slug_module.slugify_filename
+
+    def spy(text: str, *, max_length: int = 64) -> str:
+        calls.append(text)
+        return real_slugify(text, max_length=max_length)
+
+    monkeypatch.setattr(slug_module, "slugify_filename", spy)
+    monkeypatch.setattr(writer_module, "slugify_filename", spy)
+
+    writer_module._compose_base_name("Why this matters")
+    classify_module._stub_relpath_for("Intimate moment")
+
+    # At least one call came from each site — the helper is the
+    # single source of truth, not duplicated regex logic.
+    assert "Why this matters" in calls
+    # The privacy_filter lowercases before calling, so check the
+    # lowered form.
+    assert "intimate moment" in calls
+
+
+def test_stub_relpath_preserves_non_word_chars_as_hyphens() -> None:
+    """Stub path slugs replace ``!``, ``?``, ``:`` (etc.) with hyphens.
+
+    Regression for the PR #287 review concern: the pre-refactor
+    ``_stub_relpath_for`` replaced non-word/non-hyphen chars with a
+    hyphen; an early draft of the shared helper dropped them
+    silently, which would have orphaned the
+    ``intimate_body_pointer`` paths in any existing vault note whose
+    title contained one of those characters. Pin the canonical
+    semantics so the helper cannot regress that way again.
+    """
+    from creek.classify.privacy_filter import _stub_relpath_for
+
+    assert _stub_relpath_for("hello!world").name == "hello-world.md"
+    assert _stub_relpath_for("why this matters?").name == "why-this-matters.md"
+    assert _stub_relpath_for("multi!!!bang").name == "multi-bang.md"

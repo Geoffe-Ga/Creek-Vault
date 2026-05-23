@@ -17,7 +17,6 @@ writing an entry to the privacy audit log via
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -214,16 +213,6 @@ class PreSaveFilterResult:
     stub_relpath: Path | None
 
 
-_PRE_SAVE_INTIMATE_STUB_RELPATH = Path("10-Liminal/Compost/intimate-stubs")
-"""Mirror of :data:`creek.save.router.INTIMATE_STUB_RELPATH`.
-
-Duplicated here to keep ``privacy_filter`` free of a circular import
-back into the save module. The save module owns the canonical
-constant; this private mirror is only used to compose the stub
-relative path returned to callers.
-"""
-
-
 def _title_only_summary(title: str | None) -> str:
     """Return the body that gets written when only the title is safe."""
     safe_title = (title or "").strip() or "(untitled)"
@@ -232,9 +221,12 @@ def _title_only_summary(title: str | None) -> str:
 
 def _stub_relpath_for(title: str | None) -> Path:
     """Compose the gitignored stub path for an intimate body."""
+    from creek.save._constants import INTIMATE_STUB_RELPATH
+    from creek.save._slug import slugify_filename
+
     raw = (title or "intimate").strip().lower() or "intimate"
-    slug = re.sub(r"[^\w\-]+", "-", raw).strip("-") or "intimate"
-    return _PRE_SAVE_INTIMATE_STUB_RELPATH / f"{slug[:64]}.md"
+    slug = slugify_filename(raw) or "intimate"
+    return INTIMATE_STUB_RELPATH / f"{slug}.md"
 
 
 def pre_save_filter(
