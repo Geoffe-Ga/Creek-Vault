@@ -117,6 +117,16 @@ class LinkingConfig(BaseModel):
     same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
     """
 
+    cross_source_aggregation: bool = False
+    """When ``True``, the FEAT-027 aggregator drops the source-identity
+    gate so a single exchange/burst/session may span multiple sources
+    once the temporal/similarity thresholds permit. Each parent records
+    every contributing source key as a ``source/<key>`` tag while child
+    fragments retain their original :class:`~creek.models.FragmentSource`
+    pointers. ``False`` (default) preserves the single-source behaviour
+    introduced by FEAT-022.
+    """
+
 
 class ClassificationConfig(BaseModel):
     """Classification pipeline configuration."""

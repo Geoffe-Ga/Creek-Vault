@@ -95,6 +95,16 @@ class TestLinkingConfig:
         assert cfg.thread_min_fragments == 3
         assert cfg.eddy_min_fragments == 5
 
+    def test_cross_source_aggregation_default_is_false(self) -> None:
+        """FEAT-027: cross-source aggregation is opt-in (default False)."""
+        cfg = LinkingConfig()
+        assert cfg.cross_source_aggregation is False
+
+    def test_cross_source_aggregation_accepts_true(self) -> None:
+        """FEAT-027: operators can flip cross-source aggregation on."""
+        cfg = LinkingConfig(cross_source_aggregation=True)
+        assert cfg.cross_source_aggregation is True
+
 
 class TestClassificationConfig:
     """Tests for ClassificationConfig model."""
@@ -477,6 +487,15 @@ class TestLoadConfig:
         assert cfg.ocr.engine == "pytesseract"  # default preserved
         assert cfg.linking.temporal_window_hours == 48
         assert cfg.linking.thread_min_fragments == 3  # default preserved
+
+    def test_loads_cross_source_aggregation_flag(self, tmp_path: Path) -> None:
+        """YAML ``linking.cross_source_aggregation: true`` is honoured."""
+        config_file = tmp_path / "creek_config.yaml"
+        config_data = {"linking": {"cross_source_aggregation": True}}
+        config_file.write_text(yaml.dump(config_data))
+
+        cfg = load_config(config_file)
+        assert cfg.linking.cross_source_aggregation is True
 
     def test_loads_cleaning_section(self, tmp_path: Path) -> None:
         """load_config() should load cleaning section from YAML."""
