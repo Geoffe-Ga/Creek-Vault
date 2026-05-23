@@ -392,11 +392,10 @@ class SpreadsheetIngestor(Ingestor):
                         "sheet": sheet.name,
                         "rows": len(sheet.rows),
                         "columns": column_count,
-                        "headers": list(sheet.headers) if sheet.headers else [],
-                        "row_data": [list(row) for row in sheet.rows],
                     },
                     source_path=str(raw.path),
                     timestamp=timestamp,
+                    payload=sheet,
                 ),
             )
         return fragments
@@ -436,9 +435,18 @@ class SpreadsheetIngestor(Ingestor):
 def _extract_headers_and_rows(
     fragment: ParsedFragment,
 ) -> tuple[list[str], list[list[str]]]:
-    """Return ``(headers, rows)`` from a parsed fragment's metadata."""
-    headers: list[str] = list(fragment.metadata.get("headers", []))
-    rows: list[list[str]] = [list(row) for row in fragment.metadata.get("row_data", [])]
+    """Return ``(headers, rows)`` from a parsed fragment's typed payload.
+
+    Reads the typed :class:`SheetData` off
+    :attr:`~creek.ingest.base.ParsedFragment.payload` to avoid the
+    string-keyed metadata round-trip ``"headers"`` / ``"row_data"``
+    that the pre-refactor code paid (issue #166).
+    """
+    sheet = fragment.payload
+    if not isinstance(sheet, SheetData):
+        return [], []
+    headers: list[str] = list(sheet.headers) if sheet.headers else []
+    rows: list[list[str]] = [list(row) for row in sheet.rows]
     if not headers and rows:
         headers = [f"col{i + 1}" for i in range(len(rows[0]))]
     return headers, rows
