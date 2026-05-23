@@ -45,8 +45,19 @@ class StubSpreadsheetBackend:
         """Stubs are always available."""
         return True
 
-    def read_workbook(self, path: Path) -> WorkbookData:
-        """Return the canned workbook for *path*."""
+    def read_workbook(
+        self,
+        path: Path,
+        *,
+        has_header: bool | None = None,
+    ) -> WorkbookData:
+        """Return the canned workbook for *path*.
+
+        ``has_header`` is accepted for Protocol compatibility (#165)
+        but ignored — canned ``WorkbookData`` already has its
+        ``SheetData.headers`` baked in by each test.
+        """
+        del has_header
         self.calls.append(f"read_workbook:{path.name}")
         return self._workbooks[path.name]
 
@@ -533,6 +544,184 @@ class TestCsvFiles:
             "decoded as cp1252" in record.message and "ascii.csv" in record.message
             for record in caplog.records
         )
+
+
+# ---- has_header override (#165) ---------------------------------------
+
+
+class TestHasHeaderOverride:
+    """Caller-controllable header detection (#165).
+
+    The legacy heuristic — "first row qualifies as headers when every
+    cell is a non-empty string" — produces false positives on data
+    sheets whose first row happens to be all-strings (country names,
+    labels, etc.). Three modes:
+
+    * ``has_header=None`` (default) preserves the heuristic.
+    * ``has_header=True``  forces the first row to be headers.
+    * ``has_header=False`` forces the first row to be data and the
+      sheet's headers to be auto-generated ``colN`` placeholders at
+      render time.
+    """
+
+    def test_csv_heuristic_promotes_all_string_first_row(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Default ``has_header=None`` still auto-detects (heuristic intact).
+
+        This pins today's behaviour: a CSV whose first row is all
+        non-empty strings is treated as a header row. The next test
+        shows why this is sometimes wrong; together they describe the
+        bug the override fixes.
+        """
+        csv_path = tmp_path / "countries.csv"
+        _write_csv(
+            csv_path, [["France", "Germany", "Spain"], ["Italy", "Greece", "Portugal"]]
+        )
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        # The heuristic promotes the first row, so "France" lands in headers.
+        assert fragments[0].metadata["headers"] == ["France", "Germany", "Spain"]
+        assert fragments[0].metadata["row_data"] == [
+            ["Italy", "Greece", "Portugal"],
+        ]
+
+    def test_csv_has_header_false_keeps_first_row_as_data(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``has_header=False`` overrides the heuristic for the false-positive case.
+
+        Same all-string-first-row sheet as above, but now the caller
+        knows it's data — the first row stays in ``row_data`` and the
+        rendered table uses generated ``col1..colN`` headers.
+        """
+        csv_path = tmp_path / "countries.csv"
+        _write_csv(
+            csv_path, [["France", "Germany", "Spain"], ["Italy", "Greece", "Portugal"]]
+        )
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        raws = ingestor.discover(tmp_path)
+        fragments = ingestor.parse(raws[0], has_header=False)
+        assert fragments[0].metadata["headers"] == []
+        assert fragments[0].metadata["row_data"] == [
+            ["France", "Germany", "Spain"],
+            ["Italy", "Greece", "Portugal"],
+        ]
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        assert "| col1 | col2 | col3 |" in markdown
+        assert "| France | Germany | Spain |" in markdown
+
+    def test_csv_has_header_true_forces_first_row_as_header(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``has_header=True`` forces a header even when the heuristic would reject it.
+
+        Empty cells in the first row normally disqualify it; with the
+        override, it is still promoted to headers.
+        """
+        csv_path = tmp_path / "blank_cells.csv"
+        # First row has an empty cell — the heuristic would treat all
+        # rows as data. The override forces a header anyway.
+        _write_csv(csv_path, [["name", "", "city"], ["Alice", "30", "NYC"]])
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        raws = ingestor.discover(tmp_path)
+        fragments = ingestor.parse(raws[0], has_header=True)
+        assert fragments[0].metadata["headers"] == ["name", "", "city"]
+        assert fragments[0].metadata["row_data"] == [["Alice", "30", "NYC"]]
+
+    def test_csv_has_header_none_matches_default_call(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``has_header=None`` explicit is identical to omitting the kwarg."""
+        csv_path = tmp_path / "rows.csv"
+        _write_csv(csv_path, [["a", "b"], ["1", "2"]])
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        raws = ingestor.discover(tmp_path)
+        default = ingestor.parse(raws[0])
+        explicit_none = ingestor.parse(raws[0], has_header=None)
+        assert default[0].metadata["headers"] == explicit_none[0].metadata["headers"]
+        assert default[0].metadata["row_data"] == explicit_none[0].metadata["row_data"]
+
+    def test_stub_backend_receives_has_header(self, tmp_path: Path) -> None:
+        """``has_header`` propagates from ingestor.parse to backend.read_workbook.
+
+        The stub records every call's ``has_header`` value so we can
+        prove the override travels through the ingestor instead of
+        being silently dropped on the floor.
+        """
+
+        class RecordingBackend:
+            """Stub backend that records the has_header it was called with."""
+
+            def __init__(self) -> None:
+                """Initialise an empty call-log."""
+                self.received: list[bool | None] = []
+
+            def is_available(self) -> bool:
+                """Test backend is always available."""
+                return True
+
+            def read_workbook(
+                self,
+                path: Path,
+                *,
+                has_header: bool | None = None,
+            ) -> WorkbookData:
+                """Record ``has_header`` and return a canned workbook."""
+                self.received.append(has_header)
+                return WorkbookData(
+                    sheets=(
+                        SheetData(
+                            name=path.stem,
+                            headers=("h1", "h2") if has_header else None,
+                            rows=(("v1", "v2"),),
+                        ),
+                    ),
+                )
+
+        path = tmp_path / "data.xlsx"
+        _write_xlsx_placeholder(path)
+        backend = RecordingBackend()
+        ingestor = SpreadsheetIngestor(backend=backend)
+        raws = ingestor.discover(tmp_path)
+        ingestor.parse(raws[0], has_header=True)
+        ingestor.parse(raws[0], has_header=False)
+        ingestor.parse(raws[0])
+        assert backend.received == [True, False, None]
+
+    def test_xlsx_has_header_false_keeps_first_row_as_data(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``has_header=False`` flows through the XLSX path as well as CSV.
+
+        Real workbook (via openpyxl) so the override is exercised end
+        to end on both spreadsheet formats. Without the override, the
+        all-string first row would be promoted to headers by the
+        heuristic.
+        """
+        import openpyxl
+
+        path = tmp_path / "labels.xlsx"
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        assert worksheet is not None
+        worksheet.append(["France", "Germany", "Spain"])
+        worksheet.append(["Italy", "Greece", "Portugal"])
+        workbook.save(path)
+
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        raws = ingestor.discover(tmp_path)
+        fragments = ingestor.parse(raws[0], has_header=False)
+        assert fragments[0].metadata["headers"] == []
+        assert fragments[0].metadata["row_data"] == [
+            ["France", "Germany", "Spain"],
+            ["Italy", "Greece", "Portugal"],
+        ]
 
 
 # ---- OpenpyxlBackend lazy-import ---------------------------------------
