@@ -32,9 +32,17 @@ Optional dependencies are imported lazily, so you only need to install the ones 
 To install everything required for development plus the full quality toolchain:
 
 ```bash
-pip install -r requirements-dev.txt
+./scripts/dev-setup.sh          # uv sync --all-extras + pre-commit install
+```
+
+The setup script wraps the canonical install path (`uv sync --all-extras` against the pinned `uv.lock`) and installs the pre-commit hooks. If you prefer plain pip:
+
+```bash
+pip install -e '.[dev]'         # `[dev]` includes `[all]`, so this is self-contained
 pre-commit install
 ```
+
+Either path produces an environment whose `./scripts/check-all.sh` matches CI on the same commit.
 
 ---
 
