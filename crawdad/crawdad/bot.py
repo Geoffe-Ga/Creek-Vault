@@ -272,8 +272,15 @@ async def _handle_attachments(
         channel_id=channel_id,
     )
 
-    reply = "\n\n".join((summary, scan_section, _INGEST_CONSENT_PROMPT))
-    await message.channel.send(_truncate_for_discord(reply))
+    # Send the summary + scan section first (may be truncated for long
+    # scan bodies) and then the consent prompt as a separate message.
+    # The consent string is short and well under the Discord cap; sending
+    # it on its own guarantees the "I did **not** ingest anything" trust
+    # signal can never be silently dropped by truncation of the scan
+    # section, even for a multi-file batch with many findings.
+    body = "\n\n".join((summary, scan_section))
+    await message.channel.send(_truncate_for_discord(body))
+    await message.channel.send(_INGEST_CONSENT_PROMPT)
 
 
 async def _run_safety_scan(

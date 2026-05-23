@@ -747,11 +747,14 @@ async def test_attachment_path_downloads_scans_and_prompts_consent(
     assert scan_calls[0]["args"]["input_path"] == "00-Creek-Meta/Inbound/999/42"
 
     # Reply mentions staging, scan results, and the consent prompt.
-    assert len(channel.sent) == 1
-    reply = channel.sent[0]
-    assert "00-Creek-Meta/Inbound/999/42" in reply
-    assert "Safety scan" in reply
-    assert "ingest" in reply.lower()
+    # Consent goes out as its own message so a long scan body cannot
+    # truncate the "did not ingest" trust signal — see
+    # ``test_attachment_reply_consent_prompt_survives_long_scan_output``.
+    assert len(channel.sent) == 2
+    body, consent = channel.sent
+    assert "00-Creek-Meta/Inbound/999/42" in body
+    assert "Safety scan" in body
+    assert "ingest" in consent.lower()
 
 
 async def test_attachment_path_replies_when_redact_tool_missing(
@@ -777,9 +780,12 @@ async def test_attachment_path_replies_when_redact_tool_missing(
         known_tools=("creek.state.read",),  # no creek.redact.scan here
     )
 
-    assert len(channel.sent) == 1
-    assert "creek.redact.scan" in channel.sent[0]
-    assert "Run `creek redact --scan" in channel.sent[0]
+    # Two messages: body (with missing-tool soft error) + consent prompt.
+    assert len(channel.sent) == 2
+    body, consent = channel.sent
+    assert "creek.redact.scan" in body
+    assert "Run `creek redact --scan" in body
+    assert "ingest" in consent.lower()
 
 
 async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
@@ -808,8 +814,11 @@ async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
         mcp_client=_StubMCPClient(session),  # type: ignore[arg-type]
         known_tools=("creek.redact.scan",),
     )
-    assert len(channel.sent) == 1
-    assert "unreachable" in channel.sent[0].lower()
+    # Two messages: body (with unreachable soft error) + consent prompt.
+    assert len(channel.sent) == 2
+    body, consent = channel.sent
+    assert "unreachable" in body.lower()
+    assert "ingest" in consent.lower()
 
 
 async def test_attachment_path_short_circuits_when_all_already_present(
@@ -1053,10 +1062,13 @@ async def test_attachment_path_runs_when_session_state_is_none(
     # File was staged.
     staged = config.vault_path / "00-Creek-Meta" / "Inbound" / "999" / "314" / "note.md"
     assert staged.read_bytes() == b"safe"
-    # Reply mentions the safety scan, not "session unavailable".
-    assert len(channel.sent) == 1
-    assert "creek state" not in channel.sent[0]
-    assert "Safety scan" in channel.sent[0]
+    # Two messages: body (safety scan summary) + consent prompt.
+    # No "session unavailable" guidance anywhere in the reply.
+    assert len(channel.sent) == 2
+    joined = "\n".join(channel.sent)
+    assert "creek state" not in joined
+    assert "Safety scan" in joined
+    assert "ingest" in joined.lower()
 
 
 async def test_run_safety_scan_swallows_unexpected_exceptions(
@@ -1091,8 +1103,11 @@ async def test_run_safety_scan_swallows_unexpected_exceptions(
         known_tools=("creek.redact.scan",),
     )
 
-    assert len(channel.sent) == 1
-    assert "unreachable" in channel.sent[0].lower()
+    # Two messages: body (soft "unreachable" error) + consent prompt.
+    assert len(channel.sent) == 2
+    body, consent = channel.sent
+    assert "unreachable" in body.lower()
+    assert "ingest" in consent.lower()
 
 
 async def test_run_safety_scan_extracts_report_markdown_from_dict_response(
@@ -1139,12 +1154,14 @@ async def test_run_safety_scan_extracts_report_markdown_from_dict_response(
         known_tools=("creek.redact.scan",),
     )
 
-    assert len(channel.sent) == 1
-    reply = channel.sent[0]
-    assert "Redaction Scan Summary" in reply
+    # Two messages: body (with extracted markdown) + consent prompt.
+    assert len(channel.sent) == 2
+    body, consent = channel.sent
+    assert "Redaction Scan Summary" in body
     # Raw JSON should not leak into the reply when report_markdown is present.
-    assert '"findings"' not in reply
-    assert '"statistics"' not in reply
+    assert '"findings"' not in body
+    assert '"statistics"' not in body
+    assert "ingest" in consent.lower()
 
 
 async def test_run_safety_scan_falls_back_for_unparseable_dict_response(
@@ -1180,9 +1197,12 @@ async def test_run_safety_scan_falls_back_for_unparseable_dict_response(
         known_tools=("creek.redact.scan",),
     )
 
-    assert len(channel.sent) == 1
-    assert bad_body in channel.sent[0]
-    assert "Safety scan" in channel.sent[0]
+    # Two messages: body (raw bad-json passthrough) + consent prompt.
+    assert len(channel.sent) == 2
+    body, consent = channel.sent
+    assert bad_body in body
+    assert "Safety scan" in body
+    assert "ingest" in consent.lower()
 
 
 async def test_channel_tier_default_falls_back_to_personal(
@@ -1218,3 +1238,55 @@ async def test_channel_tier_default_falls_back_to_personal(
     )
 
     assert captured[0]["privacy_tier_ceiling"] == "personal"
+
+
+async def test_attachment_reply_consent_prompt_survives_long_scan_output(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Reviewer-flagged HIGH: a long scan body must not truncate the consent prompt.
+
+    When ``summary + scan_section`` exceeds the Discord cap, the
+    ``_truncate_for_discord`` step would silently drop the
+    "I did **not** ingest anything" prompt from the tail. The safety
+    invariant (no auto-ingest) still holds because the router never
+    fires on attachment turns, but the user trust signal would vanish.
+
+    Fix: send the consent prompt as a separate, guaranteed-untruncated
+    follow-up message.
+    """
+    channel = _FakeChannel(id=999, sent=[])
+    attachment = _FakeAttachment(filename="note.md", size=4, payload=b"safe")
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=4242,
+        attachments=[attachment],
+    )
+
+    # Force the MCP tool to return a body longer than the Discord cap.
+    long_body = "finding-line-" + ("x" * 3000)
+
+    class _BigSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return long_body
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_BigSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+    )
+
+    # The combined output exceeds the cap, so at least one message
+    # must carry the consent prompt verbatim — never truncated away.
+    consent_seen = any("did **not** ingest anything" in sent for sent in channel.sent)
+    assert consent_seen, channel.sent
+    # The scan content also reaches the user (in some message, possibly
+    # truncated). Find a chunk of the body in the joined output.
+    joined = "\n".join(channel.sent)
+    assert "finding-line-" in joined
