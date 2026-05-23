@@ -66,6 +66,7 @@ wavelength:
   mode: inhabit | express | collaborate | integrate | absorb
   orientation: do | feel | do_feel
   dosage: medicine | toxic
+  observed_phase: rising | peaking | withdrawal | diminishing | bottoming_out | restoration  # optional; written when source conversation contradicts inherited phase
 frequency:
   primary: F1 | F2 | F3 | F4 | F5 | F6 | F7 | F8 | F9 | F10 | unclassified
   secondary: []
