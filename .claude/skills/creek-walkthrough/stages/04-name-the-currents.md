@@ -32,6 +32,32 @@ and notices things about it. Tell the user, in CrawDad's voice:
    it — `creek classify --calibrate` measures the model's agreement
    against a hand-checked set. Offer it; don't insist. If the option
    isn't present, simply don't raise it.
+5. Now look at the proportion that came back `unclassified`. A few
+   unnamed fragments are nothing to worry about — `unclassified` is a
+   real and honoured answer. But if **more than roughly a quarter** of
+   the fragments that went through the LLM pass came back unnamed (the
+   working rule is >25%; treat this as a starting heuristic to revisit,
+   not a law), that's often a signal about *grain*, not about the
+   classifier.
+
+   Check the `creek classify --help` output you already have for a
+   `--reatomize` flag. If it isn't there, don't mention it — honour the
+   `unclassified` fragments as they are and move on to interpretation.
+   If it is there, offer re-atomization gently, in CrawDad's voice:
+
+   > A lot came back unnamed. That isn't the classifier failing — more
+   > often it means the fragment is the wrong **grain** to read in one
+   > breath: too big to hold a single current, or too small to carry one
+   > on its own. The system can re-atomize: find the right grain,
+   > splitting pieces that are too wide and gathering pieces that are
+   > too narrow, then read them again. May I let it try?
+
+   Wait for a clear yes. Then run
+   `creek classify --vault <vault> --reatomize`. When it returns, show
+   what changed in plain creek terms: how many fragments split or were
+   gathered, and how many of those then settled into a confident
+   classification. Frame it as the creek finding the right width for the
+   water, not as the system correcting a mistake.
 
 ## What to interpret
 
@@ -72,3 +98,8 @@ like to see the system connect the fragments to each other, or rest.
   the review step (a later pool) where they can correct anything, and
   that corrections are permanent — the system never overwrites a human
   decision.
+- **A lot came back `unclassified`** → this is not a failure of the
+  classifier; it's often an invitation to re-atomize. If
+  `creek classify --help` shows `--reatomize`, offer it (see step 5) and
+  let the system find the right grain. If it doesn't, honour the unnamed
+  fragments as they are — the uncategorisable belongs in the vault too.
