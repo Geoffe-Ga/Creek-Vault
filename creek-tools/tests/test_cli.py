@@ -635,12 +635,12 @@ def test_link_rejects_unknown_method(tmp_path: Path) -> None:
 
 
 def test_link_rebuild_clears_embeddings_cache(tmp_path: Path) -> None:
-    """``--rebuild`` deletes the cached embeddings archive before linking."""
+    """``--rebuild`` deletes the cached embeddings parquet before linking."""
     vault = tmp_path / "vault"
     (vault / "01-Fragments").mkdir(parents=True)
     cache_dir = vault / "00-Creek-Meta"
     cache_dir.mkdir(parents=True)
-    cache_path = cache_dir / "embeddings.npz"
+    cache_path = cache_dir / "embeddings.parquet"
     cache_path.write_bytes(b"stale-cache")
 
     result = runner.invoke(

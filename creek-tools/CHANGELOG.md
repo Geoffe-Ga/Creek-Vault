@@ -29,6 +29,15 @@ loose during pre-1.0 development; the headings below track FEAT IDs from
 - Canonical templates live under `creek-tools/creek/templates/{vault,
   skills,AGENTS.md}`. The ontology spec lives at repo-level
   `docs/Ontology/creek_ontology_agent_prompt.md`.
+- **Freshness-aware embeddings cache** (INC-006): `creek link --method
+  embeddings` now persists vectors to
+  `<vault>/00-Creek-Meta/embeddings.parquet` with `(fragment_id,
+  content_hash, model_name, embedding, computed_at)`. Re-runs reuse rows
+  whose `content_hash` matches the current fragment text and recompute
+  the rest, so a 1k-fragment vault re-links in seconds. Switching
+  `embeddings.model` invalidates the cache automatically; `--rebuild`
+  still forces a full recompute from scratch. Existing `embeddings.npz`
+  files are ignored and can be deleted.
 
 ### Removed
 
