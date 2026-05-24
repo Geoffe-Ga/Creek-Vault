@@ -70,6 +70,11 @@ def classify_tool(
         "total": summary.total,
         "classified": summary.classified,
         "preserved_manual": summary.preserved_manual,
+        # Issue #321: prior-LLM-preserved fragments used to roll into
+        # ``preserved_manual``, misattributing automated state to the
+        # operator. Surface them as a separate field so downstream
+        # consumers can present the two reasons distinctly.
+        "preserved_llm": summary.preserved_llm,
         "skipped_high_confidence": summary.skipped_high_confidence,
         "errors": list(summary.errors),
     }

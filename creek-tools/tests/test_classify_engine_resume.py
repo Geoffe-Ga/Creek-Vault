@@ -88,7 +88,12 @@ def test_already_llm_classified_fragment_is_skipped(tmp_path: Path) -> None:
         )
 
     mock_llm.assert_not_called()
-    assert summary.preserved_manual == 1
+    # Issue #321: a fragment stamped by a prior LLM run must NOT inflate
+    # the "manual preserved" counter — that field exists to report what
+    # a human curated. The OPS-001 resume path increments ``preserved_llm``
+    # instead so the CLI can label the two reasons honestly.
+    assert summary.preserved_manual == 0
+    assert summary.preserved_llm == 1
     assert summary.classified == 0
     reloaded = frontmatter.load(str(file))
     assert reloaded["classification_method"] == "llm"

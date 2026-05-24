@@ -867,10 +867,18 @@ def classify(
         method=method,
         force=force,
     )
+    # Issue #321: report manual-preserved and prior-LLM-preserved as
+    # distinct counts so the operator can tell genuine hand-curation
+    # ("a person tagged these") apart from the OPS-001 resume path
+    # ("we left them alone because a previous --method llm run already
+    # paid for them"). Collapsing both into "N manual preserved" was a
+    # bug: fragments touched only by a failed automated run were
+    # incorrectly attributed to a human.
     console.print(
         f"[bold green]Classified {summary.classified} of "
         f"{summary.total} fragment(s) "
         f"({summary.preserved_manual} manual preserved, "
+        f"{summary.preserved_llm} previously LLM-classified preserved, "
         f"{summary.skipped_high_confidence} skipped).[/bold green]",
     )
     if summary.errors:

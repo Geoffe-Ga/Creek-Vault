@@ -532,6 +532,55 @@ def test_classify_force_overrides_manual(tmp_path: Path) -> None:
     assert reloaded["classification_method"] == "rules"
 
 
+def test_classify_summary_distinguishes_manual_and_prior_llm(tmp_path: Path) -> None:
+    """Issue #321: the summary line labels manual vs prior-LLM preservation distinctly.
+
+    A vault with one ``classification_method: manual`` fragment and one
+    ``classification_method: llm`` fragment (left over from a prior
+    partial LLM run) must produce a summary that shows ``1 manual
+    preserved`` and ``1 previously LLM-classified preserved`` rather
+    than collapsing both into a single misleading "2 manual preserved"
+    count.
+    """
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    vault = tmp_path / "vault"
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+
+    for frag_id, method in (
+        ("frag-cli-manual0", "manual"),
+        ("frag-cli-llmold0", "llm"),
+    ):
+        fragment = Fragment(
+            id=frag_id,
+            title=f"prior {method}",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        )
+        metadata = fragment.model_dump(mode="json")
+        metadata["classification_method"] = method
+        file = fragments_dir / f"{frag_id}.md"
+        file.write_text(
+            frontmatter.dumps(frontmatter.Post(content="body", **metadata)),
+            encoding="utf-8",
+        )
+
+    result = runner.invoke(
+        app,
+        ["classify", "--vault", str(vault), "--method", "rules"],
+    )
+    assert result.exit_code == 0, result.output
+    # Rich/Typer may hard-wrap the summary at terminal width, so
+    # collapse whitespace before substring matching — otherwise the
+    # assertion would fail when Rich inserts a newline mid-phrase
+    # (e.g. ``LLM-classified\npreserved``).
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "1 manual preserved" in normalized
+    assert "1 previously LLM-classified preserved" in normalized
+
+
 # ---- FEAT-017b: --calibrate ----
 
 
