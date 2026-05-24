@@ -191,6 +191,7 @@ async def handle_message(
         session_state=session_state,
         skills=_resolve_skills(skill_registry, skills),
         skill_registry=skill_registry,
+        max_rounds=config.max_loop_rounds,
     )
     _LOGGER.info("loop outcome: %s", outcome.kind)
     await message.channel.send(_truncate_for_discord(outcome.reply))

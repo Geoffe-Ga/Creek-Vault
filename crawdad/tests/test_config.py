@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from crawdad.config import CrawDadConfig, load_config
+from crawdad.config import MAX_LOOP_ROUNDS, CrawDadConfig, load_config
 
 
 def test_config_requires_discord_token_and_anthropic_key(tmp_path: Path) -> None:
@@ -248,3 +248,75 @@ def test_load_config_reject_on_mime_mismatch_defaults_false_when_absent(
 
     config = load_config(yaml_path)
     assert config.attachments.reject_on_mime_mismatch is False
+
+
+def test_config_max_loop_rounds_defaults_to_module_constant() -> None:
+    """When absent, ``max_loop_rounds`` mirrors :data:`MAX_LOOP_ROUNDS` (FEAT-036)."""
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=Path("."),
+        allowed_user_ids=(1,),
+        allowed_channel_ids=(2,),
+    )
+    assert config.max_loop_rounds == MAX_LOOP_ROUNDS
+
+
+def test_config_accepts_max_loop_rounds_override() -> None:
+    """An explicit ``max_loop_rounds`` value is honoured (FEAT-036)."""
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=Path("."),
+        allowed_user_ids=(1,),
+        allowed_channel_ids=(2,),
+        max_loop_rounds=12,
+    )
+    assert config.max_loop_rounds == 12
+
+
+def test_config_rejects_max_loop_rounds_below_one() -> None:
+    """``max_loop_rounds`` < 1 fails validation (FEAT-036)."""
+    with pytest.raises(ValidationError):
+        CrawDadConfig(
+            discord_bot_token="t",
+            anthropic_api_key="k",
+            vault_path=Path("."),
+            allowed_user_ids=(1,),
+            allowed_channel_ids=(2,),
+            max_loop_rounds=0,
+        )
+
+
+def test_config_rejects_max_loop_rounds_above_fifty() -> None:
+    """``max_loop_rounds`` > 50 fails validation — runaway-loop guard (FEAT-036)."""
+    with pytest.raises(ValidationError):
+        CrawDadConfig(
+            discord_bot_token="t",
+            anthropic_api_key="k",
+            vault_path=Path("."),
+            allowed_user_ids=(1,),
+            allowed_channel_ids=(2,),
+            max_loop_rounds=51,
+        )
+
+
+def test_load_config_parses_max_loop_rounds_from_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YAML-supplied ``max_loop_rounds`` flows through ``load_config`` (FEAT-036)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n"
+        "max_loop_rounds: 15\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+    assert config.max_loop_rounds == 15

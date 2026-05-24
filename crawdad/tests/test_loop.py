@@ -679,3 +679,69 @@ async def test_loop_uses_known_intent_handling(
     name, args = session.calls[0]
     assert name == "creek.state.read"
     assert args["privacy_tier_ceiling"] == "personal"
+
+
+@pytest.mark.asyncio
+async def test_run_one_turn_honours_explicit_max_rounds(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """``run_one_turn`` threads ``max_rounds`` into the underlying loop (FEAT-036).
+
+    Scripts ``max_rounds + 1`` non-composing router passes; with the
+    explicit override the cap should fire at the configured round, well
+    before the default :data:`MAX_LOOP_ROUNDS`.
+    """
+    custom_cap = 2
+    scripted = [
+        RouterResponse(intents=[Intent(type="creek.state.read")])
+        for _ in range(custom_cap + 1)
+    ]
+    router = _ScriptedRouter(scripted)
+    composer = _ScriptedComposer("(unused — custom cap should fire first)")
+    session = _ScriptedSession(replies={"creek.state.read": "body"})
+    history = ConversationHistory()
+
+    outcome: LoopOutcome = await run_one_turn(
+        message="re-ingest everything",
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=history,
+        session_state=state,
+        skills=skills,
+        max_rounds=custom_cap,
+    )
+
+    assert outcome.kind == "too_deep"
+    # Router was called exactly ``custom_cap`` times — not ``MAX_LOOP_ROUNDS``.
+    assert len(router.calls) == custom_cap
+    assert composer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_one_turn_defaults_max_rounds_to_module_constant(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """Omitting ``max_rounds`` preserves the default :data:`MAX_LOOP_ROUNDS` cap."""
+    scripted = [
+        RouterResponse(intents=[Intent(type="creek.state.read")])
+        for _ in range(MAX_LOOP_ROUNDS + 1)
+    ]
+    router = _ScriptedRouter(scripted)
+    composer = _ScriptedComposer("(unused)")
+    session = _ScriptedSession(replies={"creek.state.read": "body"})
+
+    outcome = await run_one_turn(
+        message="loop",
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+    )
+
+    assert outcome.kind == "too_deep"
+    assert len(router.calls) == MAX_LOOP_ROUNDS

@@ -245,6 +245,15 @@ class CrawDadConfig(BaseModel):
     allowed_user_ids: tuple[int, ...]
     allowed_channel_ids: tuple[int, ...]
     attachments: AttachmentConfig = Field(default_factory=AttachmentConfig)
+    max_loop_rounds: int = Field(default=MAX_LOOP_ROUNDS, ge=1, le=50)
+    """Hard cap on the FEAT-015 agent loop (FEAT-036 / #312).
+
+    Raise this when legitimate multi-step requests trip the default
+    ceiling — re-ingesting a multi-source vault, large re-classification
+    asks, long workflows — and produce the ``too_deep`` fallback in
+    Discord. The upper bound of 50 prevents runaway loops and cost; the
+    lower bound of 1 keeps the engine sane.
+    """
 
     @field_validator("allowed_user_ids", "allowed_channel_ids")
     @classmethod

@@ -298,6 +298,7 @@ async def run_one_turn(
     session_state: SessionState | None,
     skills: VoiceSkillStack,
     skill_registry: SkillStackRegistry | None = None,
+    max_rounds: int = MAX_LOOP_ROUNDS,
 ) -> LoopOutcome:
     """Convenience wrapper the bot handler calls.
 
@@ -309,6 +310,9 @@ async def run_one_turn(
     active skill stack from the registry and routes
     ``crawdad.activate_register`` intents through it so the register
     switch persists across turns.
+
+    ``max_rounds`` (FEAT-036) — overrides the module default for callers
+    that surface the cap via :class:`~crawdad.config.CrawDadConfig`.
     """
     loop = AgentLoop(
         router=router,
@@ -319,5 +323,6 @@ async def run_one_turn(
         session_state=session_state,
         skills=skills,
         skill_registry=skill_registry,
+        max_rounds=max_rounds,
     )
     return await loop.run(message)
