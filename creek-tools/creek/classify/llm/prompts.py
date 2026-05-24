@@ -69,9 +69,7 @@ def _build_color_block() -> str:
         :class:`Color` value, suitable for embedding mid-sentence in
         :data:`CLASSIFICATION_PROMPT`.
     """
-    return ", ".join(
-        color.value for color in Color if color is not Color.UNCLASSIFIED
-    )
+    return ", ".join(color.value for color in Color if color is not Color.UNCLASSIFIED)
 
 
 _COLOR_BLOCK: str = _build_color_block()
@@ -101,7 +99,8 @@ _FREQUENCY_COLOR_BLOCK: str = _build_frequency_color_block()
 """Pre-rendered Frequency-to-Color mapping baked into the prompt template."""
 
 
-CLASSIFICATION_PROMPT: str = """\
+CLASSIFICATION_PROMPT: str = (
+    """\
 You are a classification assistant for the Creek knowledge organization system.
 
 Given a fragment of content, classify it along the following dimensions:
@@ -180,10 +179,13 @@ entry below {threshold:.2f} as ``unclassified``, so calibrate honestly.
 Fragment title: {title}
 Fragment content:
 {content}
-""".replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK).replace(
-    "__COLOR_BLOCK__",
-    _COLOR_BLOCK,
-).replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
+""".replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK)
+    .replace(
+        "__COLOR_BLOCK__",
+        _COLOR_BLOCK,
+    )
+    .replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
+)
 """Prompt template for two-step LLM-based fragment classification (FEAT-017).
 
 Placeholders:
