@@ -10,6 +10,7 @@ file — they must come from environment variables.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -712,26 +713,53 @@ def load_config(
 ) -> CreekConfig:
     """Load configuration from a YAML file with environment variable overrides.
 
-    If *config_path* does not exist, returns a ``CreekConfig`` populated
-    entirely from defaults and environment variables and (per ARCH-002)
-    emits a ``WARNING`` so the operator knows their data-handling
-    decisions are being made by the defaults rather than their own
-    config. Pass ``warn_on_missing=False`` to silence the warning when
-    the caller has already established that the missing file is
-    expected (e.g. ``creek init`` runs before any config exists).
+    Discovery order when *config_path* is ``None``:
+
+    1. ``CREEK_CONFIG`` environment variable (INC-008) — set by every
+       subprocess that inherits it, e.g. ``creek-tools-mcp`` launched
+       by CrawDad from a cwd other than the vault.
+    2. ``./creek_config.yaml`` in the current directory (legacy
+       fallback).
+
+    If *config_path* does not exist (after that resolution), returns a
+    ``CreekConfig`` populated entirely from defaults and environment
+    variables and (per ARCH-002) emits a ``WARNING`` so the operator
+    knows their data-handling decisions are being made by the defaults
+    rather than their own config. Pass ``warn_on_missing=False`` to
+    silence the warning when the caller has already established that
+    the missing file is expected (e.g. ``creek init`` runs before any
+    config exists).
 
     Args:
-        config_path: Path to a ``creek_config.yaml`` file.  Defaults to
-            ``creek_config.yaml`` in the current directory.
+        config_path: Path to a ``creek_config.yaml`` file. When ``None``
+            (default), ``CREEK_CONFIG`` is consulted before falling back
+            to ``creek_config.yaml`` in the current directory.
         warn_on_missing: When ``True`` (default), log a WARNING if the
             file does not exist. Suppress for CLI commands that
             legitimately operate in the no-config state.
 
     Returns:
         A fully-validated ``CreekConfig`` instance.
+
+    Raises:
+        FileNotFoundError: When ``CREEK_CONFIG`` is set to a path that
+            does not exist. A misconfigured env var must fail loudly so
+            the operator sees the typo instead of getting silent
+            built-in defaults.
     """
     if config_path is None:
-        config_path = Path("creek_config.yaml")
+        env_value = os.environ.get("CREEK_CONFIG")
+        if env_value:
+            env_path = Path(env_value)
+            if not env_path.exists():
+                msg = (
+                    f"CREEK_CONFIG points to {env_path}, which does not exist. "
+                    "Set CREEK_CONFIG to a path that exists or unset it."
+                )
+                raise FileNotFoundError(msg)
+            config_path = env_path
+        else:
+            config_path = Path("creek_config.yaml")
 
     if config_path.exists():
         with config_path.open() as f:
@@ -742,7 +770,8 @@ def load_config(
         logger.warning(
             "Config file %s not found; running with built-in defaults. "
             "Run `creek init --vault <vault>` to write a starter config, "
-            "or pass --config <path> to point at one explicitly. "
+            "pass --config <path> to point at one explicitly, "
+            "or set CREEK_CONFIG=<path> in the environment. "
             "Pipeline behaviour (privacy, redaction, cleaning) depends on "
             "this file — silent defaults are usually not what you want.",
             config_path,

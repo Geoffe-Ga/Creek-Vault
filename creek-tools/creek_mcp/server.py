@@ -13,6 +13,7 @@ point (``main``).
 
 from __future__ import annotations
 
+import argparse
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -396,8 +397,34 @@ def build_server(
     return server
 
 
-def main() -> None:
-    """Run the MCP server over stdio (entry point for ``creek-tools-mcp``)."""
+def main(argv: list[str] | None = None) -> None:
+    """Run the MCP server over stdio (entry point for ``creek-tools-mcp``).
+
+    Accepts ``--config <path>`` (INC-008). When provided, the path is
+    exported as ``CREEK_CONFIG`` in the process environment so every
+    later ``config.load_config()`` call inside the server — and every
+    subprocess the server spawns — discovers the vault's config
+    regardless of cwd.
+
+    Args:
+        argv: Command-line arguments (defaults to ``sys.argv[1:]``).
+    """
+    parser = argparse.ArgumentParser(
+        prog="creek-tools-mcp",
+        description="Run the creek-tools MCP server over stdio.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to creek_config.yaml. Overrides CREEK_CONFIG for this "
+            "process. Without this flag, CREEK_CONFIG and then "
+            "./creek_config.yaml are consulted in that order."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.config is not None:
+        os.environ["CREEK_CONFIG"] = args.config
     build_server().run(transport="stdio")
 
 

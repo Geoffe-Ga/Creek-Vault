@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -285,16 +286,71 @@ def test_build_draft_llm_returns_invoke_prompt_when_available(
     assert llm("hi") == "drafted body"
 
 
+class _RecordingStubServer:
+    """In-process stand-in for ``FastMCP`` used by ``main()`` tests."""
+
+    def __init__(self) -> None:
+        """Initialise the transport log."""
+        self.transports: list[str] = []
+
+    def run(self, transport: str) -> None:
+        """Record the requested transport instead of starting an MCP loop."""
+        self.transports.append(transport)
+
+
 def test_main_invokes_server_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """``main()`` calls ``FastMCP.run(transport='stdio')``."""
     from creek_mcp import server as server_module
 
-    runs: list[tuple[object, ...]] = []
+    stub = _RecordingStubServer()
+    monkeypatch.setattr(server_module, "build_server", lambda: stub)
+    server_module.main([])
+    assert stub.transports == ["stdio"]
 
-    class _StubServer:
-        def run(self, transport: str) -> None:
-            runs.append((transport,))
 
-    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
-    server_module.main()
-    assert runs == [("stdio",)]
+def test_main_config_flag_sets_creek_config_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--config <path>`` exports ``CREEK_CONFIG`` for later loads (INC-008)."""
+    from creek_mcp import server as server_module
+
+    config_file = tmp_path / "creek_config.yaml"
+    config_file.write_text("llm:\n  provider: anthropic\n", encoding="utf-8")
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    monkeypatch.setattr(server_module, "build_server", _RecordingStubServer)
+
+    server_module.main(["--config", str(config_file)])
+
+    assert os.environ.get("CREEK_CONFIG") == str(config_file)
+
+
+def test_main_without_config_flag_leaves_env_var_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``--config``, ``main()`` does not mutate ``CREEK_CONFIG`` (INC-008)."""
+    from creek_mcp import server as server_module
+
+    monkeypatch.setenv("CREEK_CONFIG", "/etc/preexisting.yaml")
+    monkeypatch.setattr(server_module, "build_server", _RecordingStubServer)
+
+    server_module.main([])
+
+    assert os.environ.get("CREEK_CONFIG") == "/etc/preexisting.yaml"
+
+
+def test_main_config_flag_overrides_existing_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both env var and ``--config`` are set, the CLI flag wins (INC-008)."""
+    from creek_mcp import server as server_module
+
+    config_file = tmp_path / "explicit.yaml"
+    config_file.write_text("llm:\n  provider: anthropic\n", encoding="utf-8")
+    monkeypatch.setenv("CREEK_CONFIG", "/etc/from-environment.yaml")
+    monkeypatch.setattr(server_module, "build_server", _RecordingStubServer)
+
+    server_module.main(["--config", str(config_file)])
+
+    assert os.environ.get("CREEK_CONFIG") == str(config_file)
