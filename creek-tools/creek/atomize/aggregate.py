@@ -80,6 +80,7 @@ def aggregate(
     *,
     level: AggregateLevel,
     config: AggregationConfig,
+    cross_source: bool = False,
 ) -> list[Fragment]:
     """Aggregate fragments upward to the requested ``level``.
 
@@ -89,9 +90,12 @@ def aggregate(
     and aggregated; pass-through fragments are returned unchanged.
 
     Idempotency: re-running on the same input produces parents with
-    identical IDs and identical concatenated text. Cross-source
-    grouping is out of scope in v1 — only fragments sharing a
-    ``(platform, channel, conversation_id)`` key combine.
+    identical IDs and identical concatenated text. Single-source
+    grouping is the default (v1, FEAT-022); pass ``cross_source=True``
+    to opt into FEAT-027 cross-source aggregation, where the
+    source-identity gate is dropped and the temporal/similarity
+    thresholds alone decide grouping. Cross-source parents record every
+    contributing source key as a ``source/<key>`` tag.
 
     Args:
         fragments: Fragments to aggregate. Mixed levels are allowed;
@@ -99,13 +103,17 @@ def aggregate(
         level: Target aggregation level (``exchange``, ``burst``, or
             ``session``).
         config: Aggregator knobs.
+        cross_source: When ``True`` (FEAT-027), eligible fragments are
+            chronologically interleaved across sources before grouping;
+            when ``False`` (default), fragments only combine within a
+            shared ``(platform, channel, conversation_id)`` key.
 
     Returns:
         A new list containing aggregated parents followed by any
         pass-through fragments (in their original relative order).
-        Parents within the same source key are time-ordered, but two
-        source keys are emitted in dict-insertion order — not
-        interleaved chronologically.
+        In single-source mode, parents within the same source key are
+        time-ordered but two source keys are emitted in dict-insertion
+        order. In cross-source mode, all parents are time-ordered.
     """
     if not fragments:
         return []
@@ -122,7 +130,7 @@ def aggregate(
     if not eligible:
         return fragments.copy()
 
-    parents = _aggregate_eligible(eligible, level, config)
+    parents = _aggregate_eligible(eligible, level, config, cross_source=cross_source)
     return parents + passthrough
 
 
@@ -130,8 +138,19 @@ def _aggregate_eligible(
     eligible: list[Fragment],
     level: AggregateLevel,
     config: AggregationConfig,
+    *,
+    cross_source: bool,
 ) -> list[Fragment]:
-    """Group eligible fragments by source key and dispatch the transition."""
+    """Group eligible fragments and dispatch the per-level transition.
+
+    In cross-source mode (FEAT-027) every eligible fragment lands in a
+    single chronologically-sorted bucket. Otherwise fragments are
+    partitioned by ``_source_key`` first (FEAT-022).
+    """
+    if cross_source:
+        sorted_frags = sorted(eligible, key=lambda f: (f.created, f.id))
+        return _group_by_level(sorted_frags, level, config, cross_source=True)
+
     by_source: dict[str, list[Fragment]] = {}
     for frag in eligible:
         key = _source_key(frag.source)
@@ -140,7 +159,9 @@ def _aggregate_eligible(
     parents: list[Fragment] = []
     for source_frags in by_source.values():
         sorted_frags = sorted(source_frags, key=lambda f: f.created)
-        parents.extend(_group_by_level(sorted_frags, level, config))
+        parents.extend(
+            _group_by_level(sorted_frags, level, config, cross_source=False),
+        )
     return parents
 
 
@@ -148,6 +169,8 @@ def _group_by_level(
     fragments: list[Fragment],
     level: AggregateLevel,
     config: AggregationConfig,
+    *,
+    cross_source: bool,
 ) -> list[Fragment]:
     """Dispatch grouping to the per-level transition and build parents."""
     if level == "exchange":
@@ -156,7 +179,7 @@ def _group_by_level(
         groups = _group_to_bursts(fragments, config)
     else:
         groups = _group_to_sessions(fragments, config)
-    return [_build_parent(g, level, config) for g in groups]
+    return [_build_parent(g, level, config, cross_source=cross_source) for g in groups]
 
 
 def _group_to_exchanges(
@@ -232,20 +255,29 @@ def _build_parent(
     children: list[Fragment],
     level: AggregateLevel,
     config: AggregationConfig,
+    *,
+    cross_source: bool,
 ) -> Fragment:
     """Assemble an aggregated parent Fragment from an ordered child list.
 
-    Carries a deterministic ID from ``(source_key, level, child_ids)``,
-    ``child_ids`` in input order, joiner-concatenated titles, inherited
-    source (with ``author`` promoted to ``COLLABORATIVE`` on multi-speaker
-    groups), and tags for the date-range and participants.
+    Carries a deterministic ID from ``(parent_source_key, level,
+    child_ids)``, ``child_ids`` in input order, joiner-concatenated
+    titles, inherited source (with ``author`` promoted to
+    ``COLLABORATIVE`` on multi-speaker groups), and tags for the
+    date-range, participants, and — under FEAT-027 cross-source mode —
+    every contributing source key.
     """
     child_ids = [c.id for c in children]
     source = _inherit_source(children)
-    parent_id = _aggregate_id(_source_key(source), level, child_ids)
+    parent_id = _aggregate_id(
+        _parent_source_key(children, cross_source=cross_source),
+        level,
+        child_ids,
+    )
     title = config.joiner.join(c.title for c in children)
     earliest = min(c.created for c in children)
     latest = max(c.created for c in children)
+    source_keys = _contributing_source_keys(children) if cross_source else None
     return Fragment(
         id=parent_id,
         title=title,
@@ -253,18 +285,28 @@ def _build_parent(
         created=earliest,
         child_ids=child_ids,
         level=level,
-        tags=_parent_tags(level, earliest, latest, _speakers(children)),
+        tags=_parent_tags(
+            level,
+            earliest,
+            latest,
+            _speakers(children),
+            source_keys=source_keys,
+        ),
     )
 
 
 def _inherit_source(children: list[Fragment]) -> FragmentSource:
     """Build the parent's :class:`FragmentSource` from its children.
 
-    Channel, platform, conversation_id, and original_file are inherited
-    from the first child (callers guarantee a shared source key).
-    ``author`` is promoted to ``COLLABORATIVE`` when ≥2 distinct authors
-    appear; ``interlocutor`` is the comma-joined sorted set of child
-    interlocutors.
+    In single-source mode (FEAT-022) every child shares a source key, so
+    channel, platform, conversation_id, and original_file are simply
+    inherited from the first child. In cross-source mode (FEAT-027) the
+    first child's values become a representative anchor — the full set
+    of contributing sources is captured separately as ``source/<key>``
+    tags on the parent, and each child still points at its origin via
+    its own :class:`FragmentSource`. ``author`` is promoted to
+    ``COLLABORATIVE`` when ≥2 distinct authors appear; ``interlocutor``
+    is the comma-joined sorted set of child interlocutors.
     """
     first = children[0].source
     authors = {c.source.author for c in children}
@@ -288,14 +330,45 @@ def _parent_tags(
     earliest: datetime,
     latest: datetime,
     speakers: set[str],
+    *,
+    source_keys: list[str] | None = None,
 ) -> list[str]:
-    """Build deterministic parent tags (level marker, date-range, speakers)."""
+    """Build deterministic parent tags (level, date-range, speakers, sources).
+
+    ``source_keys`` is ``None`` for single-source parents (the source is
+    already captured in :attr:`Fragment.source`) and a sorted list of
+    distinct contributing source keys for FEAT-027 cross-source parents.
+    """
     tags = [
         f"aggregated/{level}",
         f"daterange/{earliest.date().isoformat()}_{latest.date().isoformat()}",
     ]
     tags.extend(f"speaker/{s}" for s in sorted(speakers))
+    if source_keys is not None:
+        tags.extend(f"source/{key}" for key in source_keys)
     return tags
+
+
+def _contributing_source_keys(children: list[Fragment]) -> list[str]:
+    """Return the sorted distinct source keys contributing to a parent."""
+    return sorted({_source_key(c.source) for c in children})
+
+
+def _parent_source_key(
+    children: list[Fragment],
+    *,
+    cross_source: bool,
+) -> str:
+    """Resolve the source-key seed used to derive the parent's ID.
+
+    Single-source parents reuse :func:`_source_key` on the inherited
+    source. Cross-source parents combine every contributing key into a
+    deterministic ``cross-source:`` prefix so the parent ID remains
+    stable across re-runs and distinct from any single-source parent.
+    """
+    if not cross_source:
+        return _source_key(children[0].source)
+    return "cross-source:" + "|".join(_contributing_source_keys(children))
 
 
 def _speakers(fragments: list[Fragment]) -> set[str]:

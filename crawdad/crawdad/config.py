@@ -21,6 +21,53 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# Discord's free-tier upload limit is 25 MiB (Boost levels raise it).
+# Bot-side default mirrors that so users see a clear refusal rather
+# than a confusing partial download. Override in ``crawdad.yaml`` if
+# the channel is on a boosted server.
+_DEFAULT_MAX_ATTACHMENT_BYTES: int = 25 * 1024 * 1024
+
+_DEFAULT_ALLOWED_EXTENSIONS: tuple[str, ...] = (
+    ".md",
+    ".markdown",
+    ".txt",
+    ".html",
+    ".htm",
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".json",
+    ".csv",
+    ".xlsx",
+    ".xls",
+    ".pptx",
+    ".ppt",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+)
+
+# Hard deny for file types the system cannot safely or usefully ingest.
+# Override in ``crawdad.yaml`` to widen or tighten per deployment.
+_DEFAULT_DENIED_EXTENSIONS: tuple[str, ...] = (
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+    ".bat",
+    ".sh",
+    ".com",
+    ".cmd",
+    ".msi",
+    ".app",
+    ".jar",
+)
+
+_DEFAULT_STAGING_SUBPATH = Path("00-Creek-Meta") / "Inbound"
+
 _ENV_DISCORD_TOKEN = "DISCORD_BOT_TOKEN"
 _ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
 _ENV_ROUTER_MODEL = "CRAWDAD_ROUTER_MODEL"
@@ -62,6 +109,112 @@ CREEK_SKILLS_DIRNAME: str = "creek-skills"
 DEFAULT_REGISTER: str = "confessional"
 
 
+class AttachmentConfig(BaseModel):
+    """Per-attachment limits and staging-path config (FEAT-027).
+
+    Defaults match Discord's free-tier 25 MiB cap and the canonical
+    ``00-Creek-Meta/Inbound/`` staging subpath. Overrides live in
+    ``crawdad.yaml`` under the ``attachments`` key.
+
+    Attributes:
+        max_size_bytes: Per-attachment ceiling. Files larger than this
+            are refused before the download body is consumed (Discord
+            reports the size in the message metadata).
+        allowed_extensions: Inclusive allow list (lowercase, leading
+            dot). When empty, every extension passes the allow list —
+            but the deny list still applies.
+        denied_extensions: Hard deny list — present here always wins
+            over the allow list. Defaults to common executable types
+            the ingest pipeline cannot handle.
+        staging_subpath: Vault-relative directory under which per-
+            channel / per-message subdirectories are created. Default
+            ``00-Creek-Meta/Inbound``.
+        channel_privacy_tiers: Optional per-channel privacy tier
+            override (``open`` / ``personal`` / ``intimate`` / ``all``).
+            When a channel id is absent, attachments inherit the bot's
+            default ``personal`` tier — ingest writes are personal by
+            default per FEAT-011, so a missing entry never silently
+            downgrades. Tier strings are validated at config-parse time;
+            unknown values raise ``ValueError``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    max_size_bytes: int = Field(
+        default=_DEFAULT_MAX_ATTACHMENT_BYTES,
+        gt=0,
+    )
+    allowed_extensions: frozenset[str] = Field(
+        default_factory=lambda: frozenset(_DEFAULT_ALLOWED_EXTENSIONS),
+    )
+    denied_extensions: frozenset[str] = Field(
+        default_factory=lambda: frozenset(_DEFAULT_DENIED_EXTENSIONS),
+    )
+    staging_subpath: Path = Field(default=_DEFAULT_STAGING_SUBPATH)
+    channel_privacy_tiers: dict[int, str] = Field(default_factory=dict)
+
+    @field_validator("allowed_extensions", "denied_extensions")
+    @classmethod
+    def _normalise_extensions(cls, value: frozenset[str]) -> frozenset[str]:
+        """Lowercase every extension and ensure each starts with a single dot."""
+        normalised: set[str] = set()
+        for raw in value:
+            if not raw:
+                continue
+            cleaned = raw.lower().strip()
+            if not cleaned.startswith("."):
+                cleaned = "." + cleaned
+            normalised.add(cleaned)
+        return frozenset(normalised)
+
+    @field_validator("staging_subpath")
+    @classmethod
+    def _refuse_absolute_subpath(cls, value: Path) -> Path:
+        """Refuse absolute and ``..``-traversing paths — must stay in the vault.
+
+        ``Path.is_absolute()`` catches obvious ``/etc/foo`` cases; the
+        ``..`` check closes the defence-in-depth gap where a relative
+        path like ``../../tmp`` would still resolve outside the vault
+        root when joined against ``vault_path``.
+        """
+        if value.is_absolute():
+            msg = (
+                f"staging_subpath {value!r} must be vault-relative; "
+                "absolute paths could escape the vault root."
+            )
+            raise ValueError(msg)
+        if ".." in value.parts:
+            msg = (
+                f"staging_subpath {value!r} must not contain '..'; "
+                "parent-directory segments could escape the vault root."
+            )
+            raise ValueError(msg)
+        return value
+
+    @field_validator("channel_privacy_tiers")
+    @classmethod
+    def _validate_channel_tiers(cls, value: dict[int, str]) -> dict[int, str]:
+        """Refuse unknown privacy tier strings at config-parse time.
+
+        The MCP server validates the ``privacy_tier_ceiling`` argument
+        downstream, but a bogus override in ``crawdad.yaml`` would
+        surface as a confusing MCP error at runtime instead of a clear
+        config error at startup. Restrict the value set to the four
+        ``TierCeiling`` values (mirrored from
+        :class:`creek_mcp.tier_ceiling.TierCeiling` without importing it
+        — crawdad has no Python dependency on creek-tools).
+        """
+        allowed: frozenset[str] = frozenset({"open", "personal", "intimate", "all"})
+        for channel_id, tier in value.items():
+            if tier not in allowed:
+                msg = (
+                    f"channel_privacy_tiers[{channel_id}] = {tier!r} is not a valid "
+                    f"tier ceiling; expected one of {sorted(allowed)}."
+                )
+                raise ValueError(msg)
+        return value
+
+
 class CrawDadConfig(BaseModel):
     """Immutable runtime configuration for the bot.
 
@@ -77,6 +230,7 @@ class CrawDadConfig(BaseModel):
     mcp_server_command: tuple[str, ...] = _DEFAULT_MCP_COMMAND
     allowed_user_ids: tuple[int, ...]
     allowed_channel_ids: tuple[int, ...]
+    attachments: AttachmentConfig = Field(default_factory=AttachmentConfig)
 
     @field_validator("allowed_user_ids", "allowed_channel_ids")
     @classmethod

@@ -34,6 +34,12 @@ from creek.models import (
     VoiceRegister,
     WavelengthClassification,
 )
+from tests.factories.compiled import (
+    write_compiled_eddy_page as _write_compiled_eddy_page,
+)
+from tests.factories.compiled import (
+    write_compiled_thread_page as _write_compiled_thread_page,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -654,61 +660,6 @@ class TestSaveDraft:
 # ---- FEAT-004 compiled-layer routing ---------------------------------
 
 
-def _write_compiled_thread_page(
-    vault: Path,
-    *,
-    target_id: str,
-    title: str,
-    body: str,
-    fragment_ids: tuple[str, ...] = (),
-) -> Path:
-    """Persist a compiled-layer thread page in a non-colliding subfolder."""
-    from creek.compile.provenance import ProvenanceEntry
-    from creek.models import CompiledPage
-
-    page = CompiledPage(
-        target_kind="thread",
-        target_id=target_id,
-        title=title,
-        body=body,
-        provenance=[
-            ProvenanceEntry(
-                claim_id=f"claim-{i}",
-                claim_excerpt=f"excerpt {i}",
-                fragment_ids=[fid],
-                compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
-                compile_method="llm",
-            )
-            for i, fid in enumerate(fragment_ids, start=1)
-        ],
-    )
-    metadata = page.model_dump(mode="json", exclude={"body"})
-    target = vault / "02-Threads" / "Compiled" / f"{target_id}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    post = frontmatter.Post(content=body, **metadata)
-    target.write_text(frontmatter.dumps(post), encoding="utf-8")
-    return target
-
-
-def _write_compiled_eddy_page(
-    vault: Path,
-    *,
-    target_id: str,
-    title: str,
-    body: str,
-) -> Path:
-    """Persist a compiled-layer eddy page in a non-colliding subfolder."""
-    from creek.models import CompiledPage
-
-    page = CompiledPage(target_kind="eddy", target_id=target_id, title=title, body=body)
-    metadata = page.model_dump(mode="json", exclude={"body"})
-    target = vault / "03-Eddies" / "Compiled" / f"{target_id}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    post = frontmatter.Post(content=body, **metadata)
-    target.write_text(frontmatter.dumps(post), encoding="utf-8")
-    return target
-
-
 class TestGatherSourceMaterialCompileFirst:
     """``gather_source_material`` reads the compiled layer before fragments."""
 
@@ -835,6 +786,200 @@ class TestGatherSourceMaterialCompileFirst:
         assert "bypass should NOT see" not in block
         gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
         assert not gaps_log.exists()
+
+
+class TestRenderCompiledEntry:
+    """Pin the heading-strip heuristic in :func:`_render_compiled_entry`."""
+
+    def test_strips_matching_title_header(self) -> None:
+        """A leading ``# {title}`` line that matches ``page.title`` is stripped."""
+        from creek.generate.drafts import _render_compiled_entry
+        from creek.models import CompiledPage
+
+        page = CompiledPage(
+            target_kind="thread",
+            target_id="thread-A",
+            title="Listening practice",
+            body="# Listening practice\nThe body proper begins here.\n",
+        )
+
+        rendered = _render_compiled_entry("thread-A", page)
+
+        expected = "### thread-A: Listening practice\nThe body proper begins here."
+        assert rendered == expected
+
+    def test_preserves_non_matching_first_line(self) -> None:
+        """A non-title first line is kept verbatim."""
+        from creek.generate.drafts import _render_compiled_entry
+        from creek.models import CompiledPage
+
+        page = CompiledPage(
+            target_kind="eddy",
+            target_id="eddy-B",
+            title="Water as teacher",
+            body="A reflective lede paragraph.\nFollowed by more.\n",
+        )
+
+        rendered = _render_compiled_entry("eddy-B", page)
+
+        expected = (
+            "### eddy-B: Water as teacher\n"
+            "A reflective lede paragraph.\n"
+            "Followed by more."
+        )
+        assert rendered == expected
+
+    def test_empty_body_after_strip_uses_placeholder(self) -> None:
+        """When the body collapses to nothing, the fallback placeholder appears."""
+        from creek.generate.drafts import _render_compiled_entry
+        from creek.models import CompiledPage
+
+        page = CompiledPage(
+            target_kind="thread",
+            target_id="thread-empty",
+            title="Empty",
+            body="# Empty\n",
+        )
+
+        rendered = _render_compiled_entry("thread-empty", page)
+
+        assert rendered == "### thread-empty: Empty\n(compiled page has no body)"
+
+
+class TestComposeSectionLazyLoad:
+    """Full compiled-cache hits skip the frontmatter directory scan."""
+
+    def test_compose_thread_section_skips_load_when_all_hits(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fully-compiled vault never reads ``02-Threads`` frontmatter."""
+        from creek.generate import drafts as drafts_module
+
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-A",
+            title="Listening practice",
+            body="# Listening practice\nCompiled body.\n",
+        )
+
+        scans: list[Path] = []
+
+        def _spy(root: Path) -> dict[str, Thread]:
+            scans.append(root)
+            return {}
+
+        monkeypatch.setattr(drafts_module, "_load_threads_by_id", _spy)
+
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(threads=("thread-A",))
+
+        block = gen.gather_source_material(seed, vault_path=vault)
+
+        assert "Compiled body" in block
+        assert scans == []
+
+    def test_compose_thread_section_loads_on_first_miss(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A single missing ID triggers exactly one frontmatter scan, reused."""
+        from creek.generate import drafts as drafts_module
+
+        _write_compiled_thread_page(
+            vault,
+            target_id="thread-A",
+            title="Listening practice",
+            body="# Listening practice\nCompiled body.\n",
+        )
+
+        scans: list[Path] = []
+        original = drafts_module._load_threads_by_id
+
+        def _spy(root: Path) -> dict[str, Thread]:
+            scans.append(root)
+            return original(root)
+
+        monkeypatch.setattr(drafts_module, "_load_threads_by_id", _spy)
+
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(threads=("thread-A", "thread-missing-1", "thread-missing-2"))
+
+        gen.gather_source_material(seed, vault_path=vault)
+
+        assert len(scans) == 1
+
+    def test_compose_eddy_section_skips_load_when_all_hits(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fully-compiled vault never reads ``03-Eddies`` frontmatter."""
+        from creek.generate import drafts as drafts_module
+
+        _write_compiled_eddy_page(
+            vault,
+            target_id="eddy-A",
+            title="Water as teacher",
+            body="# Water as teacher\nWater is the teacher.\n",
+        )
+
+        scans: list[Path] = []
+
+        def _spy(root: Path) -> dict[str, Eddy]:
+            scans.append(root)
+            return {}
+
+        monkeypatch.setattr(drafts_module, "_load_eddies_by_id", _spy)
+
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(eddies=("eddy-A",))
+
+        block = gen.gather_source_material(seed, vault_path=vault)
+
+        assert "Water is the teacher" in block
+        assert scans == []
+
+    def test_compose_eddy_section_loads_on_first_miss(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A single missing eddy ID triggers exactly one frontmatter scan, reused."""
+        from creek.generate import drafts as drafts_module
+
+        _write_compiled_eddy_page(
+            vault,
+            target_id="eddy-A",
+            title="Water as teacher",
+            body="# Water as teacher\nWater is the teacher.\n",
+        )
+
+        scans: list[Path] = []
+        original = drafts_module._load_eddies_by_id
+
+        def _spy(root: Path) -> dict[str, Eddy]:
+            scans.append(root)
+            return original(root)
+
+        monkeypatch.setattr(drafts_module, "_load_eddies_by_id", _spy)
+
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        seed = _build_seed(eddies=("eddy-A", "eddy-missing-1", "eddy-missing-2"))
+
+        gen.gather_source_material(seed, vault_path=vault)
+
+        assert len(scans) == 1
 
 
 # ---- FEAT-032 manual seeding -----------------------------------------

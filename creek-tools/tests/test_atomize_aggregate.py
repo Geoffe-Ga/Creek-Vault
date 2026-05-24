@@ -21,7 +21,9 @@ import pytest
 from creek.atomize.aggregate import (
     AggregationConfig,
     _aggregate_id,
+    _contributing_source_keys,
     _cosine,
+    _parent_source_key,
     _source_key,
     aggregate,
 )
@@ -525,3 +527,315 @@ def _roll_up(docs: list[Fragment], cfg: AggregationConfig) -> Fragment:
     [burst] = aggregate([exchange], level="burst", config=cfg)
     [session] = aggregate([burst], level="session", config=cfg)
     return session
+
+
+# ---- Cross-source aggregation (FEAT-027) ----
+
+
+class TestCrossSourceDefault:
+    """``cross_source`` defaults to False and preserves FEAT-022 behaviour."""
+
+    def test_default_is_false_matches_single_source_behaviour(self) -> None:
+        """Omitting the flag keeps two-source inputs split into two parents."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        src_a = _src(channel="alpha")
+        src_b = _src(channel="beta")
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=src_a),
+            _frag(id_="d2", title="y", minute=10, source=src_b),
+        ]
+        parents = aggregate(docs, level="exchange", config=cfg)
+        assert len(parents) == 2
+
+    def test_explicit_false_matches_default(self) -> None:
+        """``cross_source=False`` yields the same parents as omitting it."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=_src(channel="alpha")),
+            _frag(id_="d2", title="y", minute=10, source=_src(channel="beta")),
+        ]
+        default = aggregate(docs, level="exchange", config=cfg)
+        explicit = aggregate(docs, level="exchange", config=cfg, cross_source=False)
+        assert [p.id for p in default] == [p.id for p in explicit]
+        assert [p.child_ids for p in default] == [p.child_ids for p in explicit]
+
+    def test_single_source_parents_omit_source_tag(self) -> None:
+        """Single-source parents must NOT carry ``source/<key>`` tags."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        docs = [
+            _frag(id_="d1", title="x", minute=0),
+            _frag(id_="d2", title="y", minute=10),
+        ]
+        [parent] = aggregate(docs, level="exchange", config=cfg)
+        assert not any(tag.startswith("source/") for tag in parent.tags)
+
+
+class TestCrossSourceExchange:
+    """``cross_source=True`` drops the source-identity gate at exchange level."""
+
+    def test_two_channels_merge_into_one_exchange(self) -> None:
+        """Two channels within gap form a single cross-source exchange."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        src_a = _src(channel="alpha", interlocutor="alice")
+        src_b = _src(channel="beta", interlocutor="alice")
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=src_a),
+            _frag(id_="d2", title="y", minute=10, source=src_b),
+        ]
+        [parent] = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert parent.child_ids == ["d1", "d2"]
+        assert parent.level == "exchange"
+
+    def test_two_platforms_merge_into_one_exchange(self) -> None:
+        """Different platforms within gap form a single cross-source exchange."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        src_d = _src(platform=SourcePlatform.DISCORD, channel="dev")
+        src_c = _src(platform=SourcePlatform.CLAUDE, channel="dev")
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=src_d),
+            _frag(id_="d2", title="y", minute=10, source=src_c),
+        ]
+        [parent] = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert parent.child_ids == ["d1", "d2"]
+
+    def test_parent_tags_record_every_contributing_source(self) -> None:
+        """Parent tags list every distinct source key under ``source/...``."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        src_d = _src(platform=SourcePlatform.DISCORD, channel="dev")
+        src_c = _src(platform=SourcePlatform.CLAUDE, channel="dev")
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=src_d),
+            _frag(id_="d2", title="y", minute=10, source=src_c),
+        ]
+        [parent] = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        source_tags = sorted(t for t in parent.tags if t.startswith("source/"))
+        assert source_tags == [
+            "source/claude|dev|conv-1",
+            "source/discord|dev|conv-1",
+        ]
+
+    def test_children_retain_their_original_sources(self) -> None:
+        """Provenance: child fragments are returned untouched (not mutated)."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        src_a = _src(channel="alpha")
+        src_b = _src(channel="beta")
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=src_a),
+            _frag(id_="d2", title="y", minute=10, source=src_b),
+        ]
+        aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert docs[0].source.channel == "alpha"
+        assert docs[1].source.channel == "beta"
+
+    def test_gap_still_breaks_cross_source_exchange(self) -> None:
+        """Cross-source mode still honours ``exchange_max_gap_minutes``."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=10)
+        src_a = _src(channel="alpha")
+        src_b = _src(channel="beta")
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=src_a),
+            _frag(id_="d2", title="y", minute=100, source=src_b),
+        ]
+        parents = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert [p.child_ids for p in parents] == [["d1"], ["d2"]]
+
+    def test_speaker_rule_still_applies_across_sources(self) -> None:
+        """≤2 speakers still holds even when sources are interleaved."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=120)
+        a = _src(channel="alpha", interlocutor="alice", author=Authorship.SELF)
+        b = _src(channel="beta", interlocutor="alice", author=Authorship.OTHER)
+        c = _src(channel="gamma", interlocutor="bob", author=Authorship.OTHER)
+        docs = [
+            _frag(id_="d1", title="me", minute=0, source=a),
+            _frag(id_="d2", title="alice", minute=5, source=b),
+            _frag(id_="d3", title="bob", minute=10, source=c),
+        ]
+        parents = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert [p.child_ids for p in parents] == [["d1", "d2"], ["d3"]]
+
+
+class TestCrossSourceSession:
+    """Session-level cross-source merging is purely time-gap based."""
+
+    def test_close_cross_source_bursts_merge_into_one_session(self) -> None:
+        """Bursts from two sources within the window collapse to one session."""
+        cfg = AggregationConfig(session_max_gap_minutes=120)
+        src_a = _src(channel="alpha")
+        src_b = _src(channel="beta")
+        bursts = [
+            _frag(id_="b1", title="a", minute=0, level="burst", source=src_a),
+            _frag(id_="b2", title="b", minute=60, level="burst", source=src_b),
+            _frag(id_="b3", title="c", minute=180, level="burst", source=src_a),
+        ]
+        [session] = aggregate(bursts, level="session", config=cfg, cross_source=True)
+        assert session.child_ids == ["b1", "b2", "b3"]
+        assert session.level == "session"
+
+
+class TestCrossSourceBurst:
+    """Burst-level cross-source merging still requires topical continuity."""
+
+    def test_high_similarity_collapses_cross_source_exchanges(self) -> None:
+        """Same-topic exchanges from two sources merge into one burst."""
+        cfg = AggregationConfig(
+            burst_similarity_threshold=0.7,
+            embedder=_fake_embedder(
+                {"a": [1.0, 0.0], "b": [0.99, 0.1]},
+            ),
+        )
+        src_a = _src(channel="alpha")
+        src_b = _src(channel="beta")
+        exchanges = [
+            _frag(id_="e1", title="a", minute=0, level="exchange", source=src_a),
+            _frag(id_="e2", title="b", minute=30, level="exchange", source=src_b),
+        ]
+        [burst] = aggregate(exchanges, level="burst", config=cfg, cross_source=True)
+        assert burst.child_ids == ["e1", "e2"]
+
+
+class TestCrossSourceIdempotency:
+    """FEAT-027 cross-source aggregation is deterministic across runs."""
+
+    def test_cross_source_ids_stable_across_runs(self) -> None:
+        """Re-running cross-source aggregation yields identical parent IDs."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        docs = [
+            _frag(id_="d1", title="x", minute=0, source=_src(channel="alpha")),
+            _frag(id_="d2", title="y", minute=10, source=_src(channel="beta")),
+        ]
+        first = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        second = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert [p.id for p in first] == [p.id for p in second]
+        assert [p.child_ids for p in first] == [p.child_ids for p in second]
+        assert [p.tags for p in first] == [p.tags for p in second]
+
+    def test_cross_source_id_differs_from_single_source(self) -> None:
+        """Same children grouped cross-source carry a different parent ID."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        docs = [
+            _frag(id_="d1", title="x", minute=0),
+            _frag(id_="d2", title="y", minute=10),
+        ]
+        [single] = aggregate(docs, level="exchange", config=cfg, cross_source=False)
+        [cross] = aggregate(docs, level="exchange", config=cfg, cross_source=True)
+        assert single.id != cross.id
+
+    def test_cross_source_orders_chronologically_regardless_of_input(self) -> None:
+        """Permuted input still produces a chronologically-ordered parent."""
+        cfg = AggregationConfig(exchange_max_gap_minutes=60)
+        d1 = _frag(id_="d1", title="x", minute=0, source=_src(channel="alpha"))
+        d2 = _frag(id_="d2", title="y", minute=10, source=_src(channel="beta"))
+        ordered = aggregate([d1, d2], level="exchange", config=cfg, cross_source=True)
+        reversed_ = aggregate([d2, d1], level="exchange", config=cfg, cross_source=True)
+        assert [p.id for p in ordered] == [p.id for p in reversed_]
+        assert [p.child_ids for p in ordered] == [p.child_ids for p in reversed_]
+
+
+class TestCrossSourceHelpers:
+    """Direct tests for the FEAT-027 helper functions."""
+
+    def test_contributing_source_keys_returns_sorted_unique(self) -> None:
+        """The helper deduplicates and sorts contributing source keys."""
+        src_a = _src(channel="alpha")
+        src_b = _src(channel="beta")
+        children = [
+            _frag(id_="d1", title="x", minute=0, source=src_a),
+            _frag(id_="d2", title="y", minute=5, source=src_b),
+            _frag(id_="d3", title="z", minute=10, source=src_a),
+        ]
+        keys = _contributing_source_keys(children)
+        assert keys == [
+            "discord|alpha|conv-1",
+            "discord|beta|conv-1",
+        ]
+
+    def test_parent_source_key_single_source_uses_source_key(self) -> None:
+        """Single-source mode reuses ``_source_key`` of the first child."""
+        children = [_frag(id_="d1", title="x", minute=0)]
+        key = _parent_source_key(children, cross_source=False)
+        assert key == _source_key(children[0].source)
+
+    def test_parent_source_key_cross_source_uses_canonical_prefix(self) -> None:
+        """Cross-source mode prefixes with ``cross-source:`` for stable IDs."""
+        children = [
+            _frag(id_="d1", title="x", minute=0, source=_src(channel="alpha")),
+            _frag(id_="d2", title="y", minute=10, source=_src(channel="beta")),
+        ]
+        key = _parent_source_key(children, cross_source=True)
+        assert key.startswith("cross-source:")
+        assert "discord|alpha|conv-1" in key
+        assert "discord|beta|conv-1" in key
+
+
+# ---- Property test (FEAT-027 acceptance criterion) ----
+
+
+class TestCrossSourceMergeInvariant:
+    """At session level the cross-source mode can only merge, never split.
+
+    Session grouping is purely time-gap based — no speaker rule, no
+    similarity gate — so dropping the source-identity boundary always
+    yields ≤ the number of single-source parents. This is the strongest
+    direction of the FEAT-027 invariant that holds independent of input
+    shape, and the acceptance-criterion property test relies on it.
+    """
+
+    @pytest.mark.parametrize(
+        ("layout", "session_max_gap_minutes"),
+        [
+            # Two sources, small gap → cross merges, single keeps split.
+            ([(0, "alpha"), (30, "beta")], 60),
+            # Three sources, all close → cross merges to 1, single keeps 3.
+            ([(0, "alpha"), (10, "beta"), (20, "gamma")], 60),
+            # Two sources, alternating timestamps → cross merges to 1.
+            (
+                [(0, "alpha"), (15, "beta"), (30, "alpha"), (45, "beta")],
+                60,
+            ),
+            # Wide gaps → both modes produce the same parents.
+            (
+                [(0, "alpha"), (500, "alpha"), (1000, "beta")],
+                60,
+            ),
+            # Single source → cross_source has no effect.
+            ([(0, "alpha"), (5, "alpha"), (10, "alpha")], 60),
+        ],
+    )
+    def test_cross_source_never_produces_more_session_parents(
+        self,
+        layout: list[tuple[int, str]],
+        session_max_gap_minutes: int,
+    ) -> None:
+        """Across diverse layouts, cross-source ≤ single-source parent count."""
+        cfg = AggregationConfig(session_max_gap_minutes=session_max_gap_minutes)
+        bursts = [
+            _frag(
+                id_=f"b{i}",
+                title=f"t{i}",
+                minute=minute,
+                level="burst",
+                source=_src(channel=channel),
+            )
+            for i, (minute, channel) in enumerate(layout)
+        ]
+        single = aggregate(bursts, level="session", config=cfg, cross_source=False)
+        cross = aggregate(bursts, level="session", config=cfg, cross_source=True)
+        assert len(cross) <= len(single)
+
+    def test_cross_source_idempotent_under_session_invariant(self) -> None:
+        """Re-running cross-source twice yields the same parent count."""
+        cfg = AggregationConfig(session_max_gap_minutes=60)
+        bursts = [
+            _frag(
+                id_=f"b{i}",
+                title=f"t{i}",
+                minute=i * 10,
+                level="burst",
+                source=_src(channel=("alpha" if i % 2 == 0 else "beta")),
+            )
+            for i in range(6)
+        ]
+        run1 = aggregate(bursts, level="session", config=cfg, cross_source=True)
+        run2 = aggregate(bursts, level="session", config=cfg, cross_source=True)
+        assert len(run1) == len(run2)
+        assert [p.id for p in run1] == [p.id for p in run2]

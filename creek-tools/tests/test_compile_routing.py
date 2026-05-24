@@ -17,6 +17,7 @@ from creek.generate.compile_routing import (
     log_compile_gap,
 )
 from creek.models import CompiledPage
+from tests.factories.compiled import build_compiled_page, write_compiled_page
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,28 +32,15 @@ def _write_compiled_page(
     fragment_ids: tuple[str, ...] = (),
     body: str = "# Body\n",
 ) -> None:
-    """Persist a compiled-layer page at *target*."""
-    provenance = [
-        ProvenanceEntry(
-            claim_id=f"claim-{i}",
-            claim_excerpt=f"excerpt-{i}",
-            fragment_ids=[fid],
-            compiled_at=datetime(2026, 4, 1, tzinfo=UTC),
-            compile_method="llm",
-        )
-        for i, fid in enumerate(fragment_ids, start=1)
-    ]
-    page = CompiledPage(
+    """Persist a compiled-layer page at *target* via the shared factory."""
+    page = build_compiled_page(
         target_kind=target_kind,
         target_id=target_id,
         title=title,
         body=body,
-        provenance=provenance,
+        fragment_ids=fragment_ids,
     )
-    metadata = page.model_dump(mode="json", exclude={"body"})
-    target.parent.mkdir(parents=True, exist_ok=True)
-    post = frontmatter.Post(content=body, **metadata)
-    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    write_compiled_page(page, target)
 
 
 class TestLoadCompiledPages:
@@ -101,6 +89,18 @@ class TestLoadCompiledPages:
         target.parent.mkdir(parents=True, exist_ok=True)
         post = frontmatter.Post(content="not a compiled page", title="Stray")
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+        index = load_compiled_pages(tmp_path)
+
+        assert index.threads == {}
+
+    def test_skips_malformed_yaml(self, tmp_path: Path) -> None:
+        """A page with broken YAML frontmatter is skipped silently."""
+        target = tmp_path / "02-Threads" / "bad.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Unbalanced ``[`` inside the YAML block triggers ``yaml.YAMLError``
+        # when ``frontmatter.load`` attempts to parse it.
+        target.write_text("---\nkey: [\n---\nbody\n", encoding="utf-8")
 
         index = load_compiled_pages(tmp_path)
 
