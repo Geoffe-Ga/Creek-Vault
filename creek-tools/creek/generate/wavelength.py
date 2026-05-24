@@ -293,16 +293,12 @@ def _week_start(day: date) -> date:
 def _fragment_effective_date(fragment: Fragment) -> date:
     """Return the date this fragment should be bucketed under.
 
-    Prefers :attr:`Fragment.authored_at` — when an ingestor extracts
-    the source's own timestamp (a Substack post's publish date, a
-    Discord message's ``timestamp``), that date is what every
-    time-bucket surface should see so a 2024 essay does not get
-    counted as part of *this week's* wavelength. Falls back to
-    :attr:`Fragment.created` when no authored date was extracted.
+    Thin wrapper around :attr:`Fragment.effective_at` that drops the
+    time component. Kept as a function so existing imports continue to
+    work; new call sites should use ``fragment.effective_at.date()``
+    directly.
     """
-    if fragment.authored_at is not None:
-        return fragment.authored_at.date()
-    return fragment.created.date()
+    return fragment.effective_at.date()
 
 
 def _fragment_in_window(fragment: Fragment, start: date, end: date) -> bool:
@@ -687,8 +683,8 @@ class WavelengthTracker:
         """
         if not fragments:
             return []
-        first = min(f.created.date() for f in fragments)
-        last = max(f.created.date() for f in fragments)
+        first = min(_fragment_effective_date(f) for f in fragments)
+        last = max(_fragment_effective_date(f) for f in fragments)
         start = _week_start(first)
         snapshots: list[WavelengthSnapshot] = []
         while start <= last:

@@ -242,7 +242,11 @@ class SynchronicityDetector:
             from_level=from_level,
             to_level=to_level,
         )
-        gap_days = (later.created - earlier.created).days
+        # FEAT-031 (#263): gap is computed on ``effective_at`` so a
+        # cross-source pair separated by *authored* years (not just
+        # ingest order) surfaces as the rare synchronicity it actually
+        # is.
+        gap_days = (later.effective_at - earlier.effective_at).days
         if gap_days <= self.min_time_gap_days:
             return None
 
@@ -288,7 +292,10 @@ class SynchronicityDetector:
         Returns:
             ``(earlier, later, level_earlier, level_later)``.
         """
-        if frag_a.created <= frag_b.created:
+        # FEAT-031 (#263): chronology follows authored-date precedence
+        # so the "earlier" half of a sync is whichever fragment was
+        # *authored* first, not ingested first.
+        if frag_a.effective_at <= frag_b.effective_at:
             return frag_a, frag_b, from_level, to_level
         return frag_b, frag_a, to_level, from_level
 
@@ -359,9 +366,11 @@ class SynchronicityDetector:
         lines = [
             "## Fragment excerpts",
             "",
-            f"- **{frag_a.source.platform}** ({frag_a.created.date().isoformat()}): "
+            f"- **{frag_a.source.platform}** "
+            f"({frag_a.effective_at.date().isoformat()}): "
             f"{frag_a.title}",
-            f"- **{frag_b.source.platform}** ({frag_b.created.date().isoformat()}): "
+            f"- **{frag_b.source.platform}** "
+            f"({frag_b.effective_at.date().isoformat()}): "
             f"{frag_b.title}",
             "",
             "## Details",

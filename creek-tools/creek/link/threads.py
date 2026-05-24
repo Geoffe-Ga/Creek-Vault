@@ -382,7 +382,10 @@ class ThreadDetector:
             self._thread_members = {}
             return []
 
-        sorted_frags = sorted(fragments, key=lambda f: f.created)
+        # FEAT-031 (#263): every time-window comparison uses
+        # ``effective_at`` so threads emerge across multi-year corpora
+        # that were ingested in a single batch.
+        sorted_frags = sorted(fragments, key=lambda f: f.effective_at)
         frag_by_id = {f.id: f for f in sorted_frags}
         uf = self._cluster(sorted_frags)
         threads = self._materialise_threads(uf, frag_by_id, min_fragments)
@@ -395,7 +398,7 @@ class ThreadDetector:
         """Walk the sliding window, unioning topic-consistent pairs.
 
         Args:
-            sorted_frags: Fragments pre-sorted by ``created`` ascending.
+            sorted_frags: Fragments pre-sorted by ``effective_at`` ascending.
 
         Returns:
             A populated :class:`_UnionFind` covering every fragment ID.
@@ -416,7 +419,7 @@ class ThreadDetector:
         )
         for i, frag_a in outer:
             for frag_b in sorted_frags[i + 1 :]:
-                if frag_b.created - frag_a.created > window:
+                if frag_b.effective_at - frag_a.effective_at > window:
                     break
                 if self._topic_consistent(frag_a, frag_b):
                     uf.union(frag_a.id, frag_b.id)
@@ -446,7 +449,7 @@ class ThreadDetector:
                 continue
             cluster = sorted(
                 (frag_by_id[fid] for fid in member_ids),
-                key=lambda f: f.created,
+                key=lambda f: f.effective_at,
             )
             thread = self._build_thread(cluster)
             threads.append(thread)
@@ -507,8 +510,8 @@ class ThreadDetector:
         Returns:
             A populated :class:`~creek.models.Thread`.
         """
-        first_seen = min(f.created for f in frags).date()
-        last_seen = max(f.created for f in frags).date()
+        first_seen = min(f.effective_at for f in frags).date()
+        last_seen = max(f.effective_at for f in frags).date()
         return Thread(
             title=self._generate_title(frags),
             status=self._compute_status(last_seen),

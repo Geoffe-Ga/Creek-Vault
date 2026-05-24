@@ -156,12 +156,16 @@ class TemporalLinker:
         if len(fragments) < min_pair_size:
             return []
 
-        sorted_frags = sorted(fragments, key=lambda f: f.created)
+        # FEAT-031 (#263): sort and gap-score on ``effective_at`` so a
+        # multi-year corpus surfaces real cross-time threads. Pre-FEAT-031
+        # the linker bucketed by ``created`` which made historical
+        # exports look contemporaneous from each other's perspective.
+        sorted_frags = sorted(fragments, key=lambda f: f.effective_at)
         links: list[TemporalLink] = []
 
         for i, frag_a in enumerate(sorted_frags):
             for frag_b in sorted_frags[i + 1 :]:
-                delta = frag_b.created - frag_a.created
+                delta = frag_b.effective_at - frag_a.effective_at
                 delta_hours = delta.total_seconds() / 3600.0
 
                 if delta_hours > window_hours:

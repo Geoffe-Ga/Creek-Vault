@@ -207,10 +207,15 @@ class UnnamedDigestGenerator:
             week_start: Monday of the target ISO week.
 
         Returns:
-            Fragments whose ``created`` date falls in the window.
+            Fragments whose ``effective_at`` date falls in the window.
         """
         week_end = week_start + timedelta(days=_WEEK_LENGTH_DAYS)
-        return [f for f in fragments if week_start <= f.created.date() < week_end]
+        # FEAT-031 (#263): bucket by authored date (with ``created``
+        # fallback via :attr:`Fragment.effective_at`) so a historical
+        # import doesn't get filed under the wrong week.
+        return [
+            f for f in fragments if week_start <= f.effective_at.date() < week_end
+        ]
 
     def detect_unnamed_clusters(
         self,
@@ -547,7 +552,7 @@ def _render_fragments_section(
         lines.append("No unnamed fragments recorded this week.\n")
         return "\n".join(lines) + "\n"
     for frag in fragments:
-        created = frag.created.date().isoformat()
+        created = frag.effective_at.date().isoformat()
         lines.extend(
             (
                 f"### {frag.title}\n",

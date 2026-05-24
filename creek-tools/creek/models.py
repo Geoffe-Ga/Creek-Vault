@@ -506,6 +506,28 @@ class Fragment(BaseModel):
     level: FragmentLevel = "document"
     structural_path: list[str] = Field(default_factory=list)
 
+    @property
+    def effective_at(self) -> datetime:
+        """The fragment's authored date, or ``created`` as the fallback.
+
+        FEAT-031 (#263) precedence for *every* time-bucket surface:
+
+        1. :attr:`authored_at` — the source's own date (a Substack
+           post's publication, a Discord message's ``timestamp``, an
+           EXIF ``DateTimeOriginal``). Always preferred.
+        2. :attr:`created` — the filesystem-derived timestamp from
+           pre-FEAT-031 ingests, or the fallback for sources with no
+           extractable in-band date.
+
+        Downstream surfaces (state report, temporal linker, thread /
+        eddy windowing, synchronicity gap math) **must** use this
+        property instead of reaching for :attr:`created` directly so a
+        historical export does not silently count as current-week
+        activity. New surfaces inherit the same precedence by routing
+        through this property.
+        """
+        return self.authored_at if self.authored_at is not None else self.created
+
     # BUG-009: the ``[prop-decorator]`` suppression below is a known
     # mypy / Pydantic-v2 limitation when stacking ``@computed_field``
     # over ``@property`` — see

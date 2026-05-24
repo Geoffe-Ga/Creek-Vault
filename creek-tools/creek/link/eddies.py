@@ -318,9 +318,11 @@ def _median_date(fragments: list[Fragment]) -> date:
     Returns:
         The median ``created`` date (lower-median for even counts).
     """
-    sorted_frags = sorted(fragments, key=lambda f: f.created)
+    # FEAT-031 (#263): median "formation" date uses authored precedence
+    # so an eddy formed of pre-2024 essays doesn't claim today's date.
+    sorted_frags = sorted(fragments, key=lambda f: f.effective_at)
     mid = len(sorted_frags) // 2
-    return sorted_frags[mid].created.date()
+    return sorted_frags[mid].effective_at.date()
 
 
 class EddyDetector:
@@ -554,7 +556,7 @@ class EddyDetector:
                 continue
             cluster_frags = sorted(
                 (frag_by_id[fid] for fid in members),
-                key=lambda f: f.created,
+                key=lambda f: f.effective_at,
             )
             if self._has_temporal_direction(cluster_frags):
                 continue

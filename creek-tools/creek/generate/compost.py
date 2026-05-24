@@ -410,7 +410,7 @@ class CompostTracker:
         """Return a project candidate for *tag*, or ``None`` if still active."""
         if len(frags) < self.project_min_fragments:
             return None
-        last_seen = max(frag.created for frag in frags)
+        last_seen = max(frag.effective_at for frag in frags)
         if last_seen >= cutoff:
             return None
         days = (self._now - last_seen).days
