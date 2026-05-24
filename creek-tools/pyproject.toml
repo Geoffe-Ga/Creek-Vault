@@ -21,6 +21,9 @@ dependencies = [
     "httpx>=0.27.0",
     "tqdm>=4.66.0",
     "mcp>=1.0.0,<2.0.0",
+    # defusedxml hardens stdlib XML parsing for the OOXML core-properties
+    # reader in creek.ingest._authored_at (B405/B314).
+    "defusedxml>=0.7",
     # Security: pin urllib3 above CVE-2026-44431 / CVE-2026-44432
     # (transitive via requests/conan). Both are fixed in 2.7.0.
     "urllib3>=2.7.0",
@@ -228,6 +231,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["openpyxl", "openpyxl.*", "pptx", "pptx.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["defusedxml", "defusedxml.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

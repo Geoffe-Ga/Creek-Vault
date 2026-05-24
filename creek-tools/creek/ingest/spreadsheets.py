@@ -442,7 +442,7 @@ class SpreadsheetIngestor(Ingestor):
         return fm
 
 
-def _resolve_spreadsheet_authored_at(path: Path) -> "datetime | None":
+def _resolve_spreadsheet_authored_at(path: Path) -> datetime | None:
     """SpreadsheetIngestor authored_at chain (FEAT-031 / #263).
 
     ``.xlsx`` carries Dublin Core date properties; ``.csv`` does not.

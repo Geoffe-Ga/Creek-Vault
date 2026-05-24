@@ -21,7 +21,8 @@ near-duplicate copies that drift apart.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date as date_cls, datetime
+from datetime import UTC, datetime
+from datetime import date as date_cls
 from typing import Any
 
 from creek.ingest.base import file_modified_time
@@ -84,6 +85,7 @@ def parse_authored_value(value: Any) -> datetime | None:
 
 def _parse_string_value(text: str) -> datetime | None:
     """Try ISO 8601 then the strict fallback patterns; anchor naive to UTC."""
+    parsed: datetime | None
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -99,7 +101,7 @@ def _try_fallback_formats(text: str) -> datetime | None:
     """Return the first :data:`_FALLBACK_DATETIME_FORMATS` match, or ``None``."""
     for fmt in _FALLBACK_DATETIME_FORMATS:
         try:
-            return datetime.strptime(text, fmt)  # noqa: DTZ007 — anchored by caller
+            return datetime.strptime(text, fmt)
         except ValueError:
             continue
     return None
@@ -162,14 +164,17 @@ def ooxml_authored_at(path: Any) -> datetime | None:
         A timezone-aware datetime, or ``None`` when nothing is
         extractable.
     """
-    import xml.etree.ElementTree as ET  # noqa: S405 — XML is opt-in via FEAT-031
     import zipfile
+
+    # defusedxml hardens stdlib XML parsing against XXE / billion-laughs
+    # attacks — required by ``./scripts/security.sh`` (B405/B314).
+    from defusedxml.ElementTree import parse as defused_parse
 
     try:
         with zipfile.ZipFile(path) as zf:
             try:
                 with zf.open(_OOXML_CORE_PROPERTIES_PATH) as fp:
-                    tree = ET.parse(fp)  # noqa: S314 — trusted user file
+                    tree = defused_parse(fp)
             except KeyError:
                 return None
     except (OSError, zipfile.BadZipFile):

@@ -23,13 +23,13 @@ Exports:
 from __future__ import annotations
 
 import io
+import json
 import logging
+import re
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import json
-import re
 
 from creek.ingest._authored_at import (
     parse_authored_value,
@@ -429,7 +429,7 @@ def _extract_html_json_ld_date(html: str) -> datetime | None:
     return None
 
 
-def _iter_json_ld_objects(payload: Any) -> "list[dict[str, Any]]":
+def _iter_json_ld_objects(payload: Any) -> list[dict[str, Any]]:
     """Yield every dict in a JSON-LD payload (top-level + ``@graph`` children).
 
     Real-world JSON-LD blocks are either a single object, a list of
@@ -497,10 +497,10 @@ def _parse_rtf_date_block(block: str) -> datetime | None:
     day = parts.get("dy")
     if year is None or month is None or day is None:
         return None
-    try:
-        from datetime import UTC
+    from datetime import UTC
 
-        return datetime(
+    try:
+        result = datetime(
             year=year,
             month=month,
             day=day,
@@ -511,6 +511,15 @@ def _parse_rtf_date_block(block: str) -> datetime | None:
         )
     except ValueError:
         return None
+    else:
+        return result
+
+
+DocumentAuthoredAtExtractor = Callable[
+    [bytes, str, dict[str, Any]],
+    "datetime | None",
+]
+"""Signature shared by every per-format document ``authored_at`` extractor."""
 
 
 def _resolve_document_authored_at(
@@ -576,28 +585,38 @@ def _parse_pdf_date(value: object) -> datetime | None:
     """
     if not isinstance(value, str):
         return None
-    text = value.strip()
-    if text.startswith("D:"):
-        text = text[2:]
-    if len(text) < 4:
-        return None
-    parts: list[str] = []
-    pieces = (text[0:4], text[4:6], text[6:8], text[8:10], text[10:12], text[12:14])
-    for idx, piece in enumerate(pieces):
-        if not piece or not piece.isdigit():
-            break
-        parts.append(piece if idx else piece)
+    parts = _pdf_date_parts(value)
     if len(parts) < 3:
         # Need at least YYYYMMDD; surface what parse_authored_value can
         # do with the raw string in case we got an already-ISO value.
         return parse_authored_value(value)
-    iso = (
-        f"{parts[0]}-{parts[1]}-{parts[2]}"
-        + (f"T{parts[3]}" if len(parts) > 3 else "")
-        + (f":{parts[4]}" if len(parts) > 4 else "")
-        + (f":{parts[5]}" if len(parts) > 5 else "")
-    )
-    return parse_authored_value(iso)
+    return parse_authored_value(_pdf_parts_to_iso(parts))
+
+
+def _pdf_date_parts(value: str) -> list[str]:
+    """Slice a PDF ``D:YYYYMMDDHHmmSS`` value into its component digit groups."""
+    text = value.strip().removeprefix("D:")
+    if len(text) < 4:
+        return []
+    pieces = (text[0:4], text[4:6], text[6:8], text[8:10], text[10:12], text[12:14])
+    parts: list[str] = []
+    for piece in pieces:
+        if not piece or not piece.isdigit():
+            break
+        parts.append(piece)
+    return parts
+
+
+def _pdf_parts_to_iso(parts: list[str]) -> str:
+    """Assemble a partial PDF date tuple into an ISO 8601 string."""
+    iso = f"{parts[0]}-{parts[1]}-{parts[2]}"
+    if len(parts) > 3:
+        iso += f"T{parts[3]}"
+    if len(parts) > 4:
+        iso += f":{parts[4]}"
+    if len(parts) > 5:
+        iso += f":{parts[5]}"
+    return iso
 
 
 def _docx_authored_at(
@@ -622,15 +641,20 @@ def _extract_docx_modified(docx_bytes: bytes) -> str | None:
         from docx import Document as DocxDocument
     except ImportError:
         return None
+    return _read_docx_modified(DocxDocument, docx_bytes)
+
+
+def _read_docx_modified(docx_document: Any, docx_bytes: bytes) -> str | None:
+    """Open *docx_bytes* and return the ``dcterms:modified`` ISO string."""
     try:
-        doc = DocxDocument(io.BytesIO(docx_bytes))
-    except Exception:  # noqa: BLE001 — python-docx surfaces a heterogeneous set
+        doc = docx_document(io.BytesIO(docx_bytes))
+    except Exception:
         logger.debug("Could not open DOCX for dcterms:modified extraction")
         return None
     modified = doc.core_properties.modified
     if modified is None:
         return None
-    return modified.isoformat()
+    return str(modified.isoformat())
 
 
 def _rtf_authored_at(
@@ -642,7 +666,7 @@ def _rtf_authored_at(
     return _extract_rtf_authored_at(text)
 
 
-_DOCUMENT_AUTHORED_AT_EXTRACTORS: dict[str, Any] = {
+_DOCUMENT_AUTHORED_AT_EXTRACTORS: dict[str, DocumentAuthoredAtExtractor] = {
     ".html": _html_authored_at,
     ".htm": _html_authored_at,
     ".pdf": _pdf_authored_at,

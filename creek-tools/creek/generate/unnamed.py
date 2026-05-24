@@ -213,9 +213,7 @@ class UnnamedDigestGenerator:
         # FEAT-031 (#263): bucket by authored date (with ``created``
         # fallback via :attr:`Fragment.effective_at`) so a historical
         # import doesn't get filed under the wrong week.
-        return [
-            f for f in fragments if week_start <= f.effective_at.date() < week_end
-        ]
+        return [f for f in fragments if week_start <= f.effective_at.date() < week_end]
 
     def detect_unnamed_clusters(
         self,

@@ -547,10 +547,23 @@ def _parse_exif_datetime(value: str) -> datetime | None:
     date/time and only adding the missing zone tag.
     """
     try:
-        parsed = datetime.strptime(value.strip(), _EXIF_DATETIME_FORMAT)  # noqa: DTZ007
+        parsed = datetime.strptime(value.strip(), _EXIF_DATETIME_FORMAT)
     except (TypeError, ValueError):
         return None
     return parsed.replace(tzinfo=UTC)
+
+
+def _read_exif_tags(
+    image_module: Any,
+    unidentified_error: type[Exception],
+    path: Path,
+) -> Any:
+    """Open *path* and return its EXIF dict, or ``None`` if unreadable."""
+    try:
+        with image_module.open(path) as img:
+            return img.getexif()
+    except (FileNotFoundError, OSError, unidentified_error):
+        return None
 
 
 def _extract_exif_authored_at(path: Path) -> datetime | None:
@@ -566,10 +579,8 @@ def _extract_exif_authored_at(path: Path) -> datetime | None:
         from PIL import Image, UnidentifiedImageError
     except ImportError:
         return None
-    try:
-        with Image.open(path) as img:
-            exif = img.getexif()
-    except (FileNotFoundError, OSError, UnidentifiedImageError):
+    exif = _read_exif_tags(Image, UnidentifiedImageError, path)
+    if exif is None:
         return None
     for tag in (_EXIF_DATETIME_ORIGINAL, _EXIF_DATETIME):
         raw = exif.get(tag)

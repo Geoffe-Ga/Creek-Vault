@@ -756,14 +756,14 @@ class TestDocumentAuthoredAt:
     """
 
     def test_html_meta_published_time_wins(
-        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
     ) -> None:
         path = tmp_path / "post.html"
         path.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body><p>Hi</p></body></html>',
+            "</head><body><p>Hi</p></body></html>",
             encoding="utf-8",
         )
         docs = doc_ingestor.discover(path)
@@ -773,14 +773,14 @@ class TestDocumentAuthoredAt:
         assert authored.date().isoformat() == "2024-03-15"
 
     def test_html_json_ld_date_published_used(
-        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
     ) -> None:
         path = tmp_path / "post.html"
         path.write_text(
-            '<html><head>'
+            "<html><head>"
             '<script type="application/ld+json">'
             '{"@type": "Article", "datePublished": "2023-06-09T12:00:00Z"}'
-            '</script></head><body><p>Hi</p></body></html>',
+            "</script></head><body><p>Hi</p></body></html>",
             encoding="utf-8",
         )
         docs = doc_ingestor.discover(path)
@@ -790,10 +790,10 @@ class TestDocumentAuthoredAt:
         assert authored.date().isoformat() == "2023-06-09"
 
     def test_html_falls_back_to_mtime(
-        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
     ) -> None:
-        from datetime import UTC
         import os
+        from datetime import UTC
 
         path = tmp_path / "post.html"
         path.write_text("<html><body><p>Hi</p></body></html>", encoding="utf-8")
@@ -805,10 +805,10 @@ class TestDocumentAuthoredAt:
         assert authored == expected
 
     def test_txt_falls_back_to_mtime_only(
-        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
     ) -> None:
-        from datetime import UTC
         import os
+        from datetime import UTC
 
         path = tmp_path / "note.txt"
         path.write_text("Meeting notes\n", encoding="utf-8")
@@ -820,7 +820,7 @@ class TestDocumentAuthoredAt:
         assert authored == expected
 
     def test_rtf_creatim_used(
-        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
     ) -> None:
         path = tmp_path / "doc.rtf"
         path.write_text(
@@ -838,14 +838,14 @@ class TestDocumentAuthoredAt:
         assert authored.date().isoformat() == "2024-03-15"
 
     def test_authored_at_emitted_in_frontmatter(
-        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
     ) -> None:
         path = tmp_path / "post.html"
         path.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body><p>Hi</p></body></html>',
+            "</head><body><p>Hi</p></body></html>",
             encoding="utf-8",
         )
         docs = doc_ingestor.discover(path)

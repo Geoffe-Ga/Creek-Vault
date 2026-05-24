@@ -525,6 +525,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "chardet" },
+    { name = "defusedxml" },
     { name = "httpx" },
     { name = "idna" },
     { name = "mcp" },
@@ -576,6 +577,7 @@ dev = [
     { name = "pillow" },
     { name = "pip-audit" },
     { name = "pre-commit" },
+    { name = "pyarrow" },
     { name = "pylint" },
     { name = "pytesseract" },
     { name = "pytest" },
@@ -631,6 +633,7 @@ requires-dist = [
     { name = "chardet", specifier = ">=7.4.3" },
     { name = "creek-tools", extras = ["all"], marker = "extra == 'dev'" },
     { name = "creek-tools", extras = ["anthropic", "embeddings", "ocr", "documents", "spreadsheets", "presentations", "gdrive"], marker = "extra == 'all'" },
+    { name = "defusedxml", specifier = ">=0.7" },
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.5.0" },
     { name = "google-api-python-client", marker = "extra == 'gdrive'", specifier = ">=2.0" },
     { name = "google-auth-oauthlib", marker = "extra == 'gdrive'", specifier = ">=1.0" },

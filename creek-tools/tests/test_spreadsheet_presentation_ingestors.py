@@ -1140,11 +1140,11 @@ class TestPresentationAuthoredAt:
     """
 
     def test_authored_at_falls_back_to_mtime_for_nonexistent_package(
-        self, tmp_path: "Path"
+        self, tmp_path: Path
     ) -> None:
         """A non-OOXML file (an empty stub) falls back to mtime."""
-        from datetime import UTC, datetime
         import os
+        from datetime import UTC, datetime
 
         path = tmp_path / "deck.pptx"
         path.write_bytes(b"")
@@ -1165,16 +1165,14 @@ class TestPresentationAuthoredAt:
         authored = fragments[0].metadata["authored_at"]
         assert authored == expected
 
-    def test_authored_at_from_real_pptx_core_properties(
-        self, tmp_path: "Path"
-    ) -> None:
+    def test_authored_at_from_real_pptx_core_properties(self, tmp_path: Path) -> None:
         """Build a minimal valid .pptx and verify dcterms:created is read."""
         import zipfile
 
         path = tmp_path / "deck.pptx"
         core_xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<cp:coreProperties '
+            "<cp:coreProperties "
             'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/'
             'core-properties" '
             'xmlns:dc="http://purl.org/dc/elements/1.1/" '
@@ -1202,7 +1200,7 @@ class TestPresentationAuthoredAt:
         assert authored is not None
         assert authored.date().isoformat() == "2024-03-15"
 
-    def test_authored_at_emitted_in_frontmatter(self, tmp_path: "Path") -> None:
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: Path) -> None:
         path = tmp_path / "deck.pptx"
         path.write_bytes(b"")
         backend = StubPresentationBackend(
@@ -1227,15 +1225,13 @@ class TestSpreadsheetAuthoredAt:
     files skip straight to mtime since they have no in-band date.
     """
 
-    def test_xlsx_authored_at_from_core_properties(
-        self, tmp_path: "Path"
-    ) -> None:
+    def test_xlsx_authored_at_from_core_properties(self, tmp_path: Path) -> None:
         import zipfile
 
         path = tmp_path / "book.xlsx"
         core_xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<cp:coreProperties '
+            "<cp:coreProperties "
             'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/'
             'core-properties" '
             'xmlns:dcterms="http://purl.org/dc/terms/">'
@@ -1266,9 +1262,9 @@ class TestSpreadsheetAuthoredAt:
         assert authored is not None
         assert authored.date().isoformat() == "2024-03-15"
 
-    def test_csv_authored_at_uses_mtime(self, tmp_path: "Path") -> None:
-        from datetime import UTC, datetime
+    def test_csv_authored_at_uses_mtime(self, tmp_path: Path) -> None:
         import os
+        from datetime import UTC, datetime
 
         path = tmp_path / "data.csv"
         path.write_text("col\nv\n", encoding="utf-8")
@@ -1294,7 +1290,7 @@ class TestSpreadsheetAuthoredAt:
         authored = fragments[0].metadata["authored_at"]
         assert authored == expected
 
-    def test_authored_at_emitted_in_frontmatter(self, tmp_path: "Path") -> None:
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: Path) -> None:
         path = tmp_path / "data.csv"
         path.write_text("col\nv\n", encoding="utf-8")
         backend = StubSpreadsheetBackend(

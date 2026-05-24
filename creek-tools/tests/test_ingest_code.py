@@ -971,26 +971,24 @@ class TestCodeAuthoredAt:
     the file lives inside a git repo, then filesystem mtime.
     """
 
-    def test_authored_at_uses_first_commit_author_date(
-        self, tmp_path: Path
-    ) -> None:
+    def test_authored_at_uses_first_commit_author_date(self, tmp_path: Path) -> None:
         """When a real git repo backs the file, the first-commit ``%aI`` wins."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)  # noqa: S607,S603
-        subprocess.run(  # noqa: S607,S603
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
             ["git", "config", "user.email", "test@example.com"],
             cwd=repo,
             check=True,
         )
-        subprocess.run(  # noqa: S607,S603
+        subprocess.run(
             ["git", "config", "user.name", "Test"],
             cwd=repo,
             check=True,
         )
         readme = repo / "README.md"
         readme.write_text("# Hi\n", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)  # noqa: S607,S603
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
         env = {
             "GIT_AUTHOR_DATE": "2024-03-15T12:00:00+00:00",
             "GIT_COMMITTER_DATE": "2024-03-15T12:00:00+00:00",
@@ -1000,7 +998,7 @@ class TestCodeAuthoredAt:
             "GIT_COMMITTER_EMAIL": "test@example.com",
             "PATH": __import__("os").environ.get("PATH", ""),
         }
-        subprocess.run(  # noqa: S607,S603
+        subprocess.run(
             ["git", "commit", "-q", "-m", "init"],
             cwd=repo,
             env=env,
@@ -1020,8 +1018,8 @@ class TestCodeAuthoredAt:
         self, tmp_path: Path
     ) -> None:
         """Files outside a git repo fall back to filesystem mtime."""
-        from datetime import UTC
         import os
+        from datetime import UTC
 
         path = tmp_path / "README.md"
         path.write_text("# Hi\n", encoding="utf-8")

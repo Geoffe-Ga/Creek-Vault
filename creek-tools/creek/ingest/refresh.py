@@ -31,8 +31,8 @@ correct fallback chain for each:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,7 +44,10 @@ from creek.models import Fragment, SourcePlatform
 from creek.vault.reader import try_load_fragment
 
 if TYPE_CHECKING:
-    pass
+    from datetime import datetime
+
+PlatformAuthoredAtExtractor = Callable[[Path], "datetime | None"]
+"""Signature shared by every per-platform ``authored_at`` extractor."""
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +148,7 @@ def _refresh_one(md_file: Path) -> RefreshOutcome | None:
         return None
     fragment, body, raw_metadata = loaded
     new_value = extract_authored_at_for_fragment(fragment)
-    if new_value is None and fragment.source.original_file is None:
+    if new_value is None is fragment.source.original_file:
         return RefreshOutcome(
             fragment_path=md_file,
             previous=fragment.authored_at,
@@ -203,11 +206,11 @@ def extract_authored_at_for_fragment(fragment: Fragment) -> datetime | None:
 
 def _document_extractor(path: Path) -> datetime | None:
     """Refresh extractor for HTML/PDF/DOCX/RTF/TXT files."""
+    from creek.ingest.base import normalize_encoding
     from creek.ingest.documents import (
         _extract_pdf_metadata,
         _resolve_document_authored_at,
     )
-    from creek.ingest.base import normalize_encoding
 
     raw = path.read_bytes()
     text, encoding = normalize_encoding(raw)
@@ -277,7 +280,7 @@ def _conversation_extractor(path: Path) -> datetime | None:
     return safe_file_modified_time(path)
 
 
-_PLATFORM_EXTRACTORS: dict[SourcePlatform, "object"] = {
+_PLATFORM_EXTRACTORS: dict[SourcePlatform, PlatformAuthoredAtExtractor] = {
     SourcePlatform.DOCUMENT: _document_extractor,
     SourcePlatform.MARKDOWN: _markdown_extractor,
     SourcePlatform.JOURNAL: _markdown_extractor,
@@ -302,19 +305,22 @@ def _rewrite_with_new_authored_at(
     raw_metadata: dict[str, object],
     new_value: datetime | None,
 ) -> None:
-    """Persist ``new_value`` into ``md_file``'s frontmatter; preserve body byte-for-byte.
+    """Persist ``new_value`` into ``md_file``'s frontmatter; preserve body.
 
     Reuses the raw metadata dict so non-Fragment keys (custom Obsidian
     fields, classification scratch space) survive the round-trip
     untouched. The body string we got from :func:`try_load_fragment`
     is fed straight back into :class:`frontmatter.Post`.
     """
-    updated = dict(raw_metadata)
+    updated = raw_metadata.copy()
     if new_value is None:
         updated.pop("authored_at", None)
     else:
         updated["authored_at"] = new_value.isoformat()
-    post = frontmatter.Post(content=body, **updated)
+    # frontmatter.Post's __init__ types ``**kwargs`` as ``BaseHandler``
+    # for legacy reasons even though dict-shaped metadata is what every
+    # caller actually passes; the runtime accepts the dict unchanged.
+    post = frontmatter.Post(content=body, **updated)  # type: ignore[arg-type]
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 

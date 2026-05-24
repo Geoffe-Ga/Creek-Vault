@@ -1112,9 +1112,7 @@ class TestDiscordAuthoredAt:
     timezone, so the value round-trips losslessly.
     """
 
-    def test_authored_at_matches_first_message_timestamp(
-        self, tmp_path: Path
-    ) -> None:
+    def test_authored_at_matches_first_message_timestamp(self, tmp_path: Path) -> None:
         ingestor = DiscordIngestor()
         msgs = [
             _make_msg(

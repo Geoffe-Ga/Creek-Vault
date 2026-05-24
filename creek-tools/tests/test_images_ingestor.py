@@ -747,7 +747,7 @@ class TestImageAuthoredAt:
 
     def _write_jpeg_with_exif(
         self,
-        path: "Path",
+        path: Path,
         *,
         date_time_original: str | None = None,
         date_time: str | None = None,
@@ -763,7 +763,7 @@ class TestImageAuthoredAt:
             exif[36867] = date_time_original  # ``DateTimeOriginal``
         img.save(path, "jpeg", exif=exif)
 
-    def test_date_time_original_takes_priority(self, tmp_path: "Path") -> None:
+    def test_date_time_original_takes_priority(self, tmp_path: Path) -> None:
         path = tmp_path / "photo.jpg"
         self._write_jpeg_with_exif(
             path,
@@ -779,7 +779,7 @@ class TestImageAuthoredAt:
         assert authored.date().isoformat() == "2024-03-15"
         assert authored.tzinfo is not None
 
-    def test_date_time_used_when_no_date_time_original(self, tmp_path: "Path") -> None:
+    def test_date_time_used_when_no_date_time_original(self, tmp_path: Path) -> None:
         path = tmp_path / "photo.jpg"
         self._write_jpeg_with_exif(path, date_time="2023:08:09 12:00:00")
         ingestor = ImageIngestor(engine=StubOcrEngine())
@@ -789,9 +789,10 @@ class TestImageAuthoredAt:
         assert authored is not None
         assert authored.date().isoformat() == "2023-08-09"
 
-    def test_falls_back_to_mtime_when_no_exif(self, tmp_path: "Path") -> None:
-        from PIL import Image
+    def test_falls_back_to_mtime_when_no_exif(self, tmp_path: Path) -> None:
         import os
+
+        from PIL import Image
 
         path = tmp_path / "photo.png"
         Image.new("RGB", (4, 4), color="white").save(path, "png")
@@ -804,7 +805,7 @@ class TestImageAuthoredAt:
         authored = fragments[0].metadata["authored_at"]
         assert authored == expected
 
-    def test_authored_at_emitted_in_frontmatter(self, tmp_path: "Path") -> None:
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: Path) -> None:
         path = tmp_path / "photo.jpg"
         self._write_jpeg_with_exif(
             path,

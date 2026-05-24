@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 — runtime use by pytest fixtures
 
 import frontmatter
 import pytest
@@ -25,7 +25,6 @@ from creek.models import (
     FragmentSource,
     SourcePlatform,
 )
-
 
 # ---- Fixtures ----
 
@@ -78,10 +77,10 @@ class TestRefreshVault:
     def test_html_source_authored_at_is_backfilled(self, vault: Path) -> None:
         html_source = vault / "post.html"
         html_source.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body>Hi</body></html>',
+            "</head><body>Hi</body></html>",
             encoding="utf-8",
         )
         frag_path = _write_fragment(
@@ -100,10 +99,10 @@ class TestRefreshVault:
         """A second pass against an unchanged source rewrites nothing."""
         html_source = vault / "post.html"
         html_source.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body>Hi</body></html>',
+            "</head><body>Hi</body></html>",
             encoding="utf-8",
         )
         _write_fragment(
@@ -123,10 +122,10 @@ class TestRefreshVault:
         """Refresh does not perturb the markdown body of the fragment."""
         html_source = vault / "post.html"
         html_source.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body>Hi</body></html>',
+            "</head><body>Hi</body></html>",
             encoding="utf-8",
         )
         original_body = "## Heading\n\nA paragraph with *emphasis* and a [link](x).\n"
@@ -146,10 +145,10 @@ class TestRefreshVault:
         """Custom frontmatter keys survive the rewrite untouched."""
         html_source = vault / "post.html"
         html_source.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body>Hi</body></html>',
+            "</head><body>Hi</body></html>",
             encoding="utf-8",
         )
         frag_path = _write_fragment(
@@ -258,6 +257,99 @@ class TestExtractorRouting:
         )
         assert extract_authored_at_for_fragment(fragment) is None
 
+    def test_image_platform_uses_mtime_for_png(self, tmp_path: Path) -> None:
+        from PIL import Image
+
+        path = tmp_path / "photo.png"
+        Image.new("RGB", (4, 4), color="white").save(path, "png")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        fragment = Fragment(
+            id="frag-png",
+            title="Test",
+            source=FragmentSource(
+                platform=SourcePlatform.IMAGE_OCR,
+                original_file=str(path),
+            ),
+        )
+        result = extract_authored_at_for_fragment(fragment)
+        assert result == expected
+
+    def test_code_platform_uses_mtime_when_not_git(self, tmp_path: Path) -> None:
+        path = tmp_path / "README.md"
+        path.write_text("# Hi\n", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        fragment = Fragment(
+            id="frag-code",
+            title="Test",
+            source=FragmentSource(
+                platform=SourcePlatform.CODE,
+                original_file=str(path),
+            ),
+        )
+        result = extract_authored_at_for_fragment(fragment)
+        assert result == expected
+
+    def test_presentation_platform_uses_mtime_for_stub(self, tmp_path: Path) -> None:
+        path = tmp_path / "deck.pptx"
+        path.write_bytes(b"")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        fragment = Fragment(
+            id="frag-pptx",
+            title="Test",
+            source=FragmentSource(
+                platform=SourcePlatform.PRESENTATION,
+                original_file=str(path),
+            ),
+        )
+        result = extract_authored_at_for_fragment(fragment)
+        assert result == expected
+
+    def test_spreadsheet_platform_uses_mtime_for_csv(self, tmp_path: Path) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("col\n", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        fragment = Fragment(
+            id="frag-csv",
+            title="Test",
+            source=FragmentSource(
+                platform=SourcePlatform.SPREADSHEET,
+                original_file=str(path),
+            ),
+        )
+        result = extract_authored_at_for_fragment(fragment)
+        assert result == expected
+
+    def test_chat_platform_uses_mtime_fallback(self, tmp_path: Path) -> None:
+        path = tmp_path / "export.json"
+        path.write_text('[{"a":1}]', encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        fragment = Fragment(
+            id="frag-chat",
+            title="Test",
+            source=FragmentSource(
+                platform=SourcePlatform.CHATGPT,
+                original_file=str(path),
+            ),
+        )
+        result = extract_authored_at_for_fragment(fragment)
+        assert result == expected
+
+    def test_nonexistent_source_path_returns_none(self) -> None:
+        fragment = Fragment(
+            id="frag-ghost",
+            title="Test",
+            source=FragmentSource(
+                platform=SourcePlatform.DOCUMENT,
+                original_file="/no/such/path.html",
+            ),
+        )
+        assert extract_authored_at_for_fragment(fragment) is None
+
 
 # ---- CLI integration ----
 
@@ -273,10 +365,10 @@ class TestRefreshDatesCli:
 
         html_source = vault / "post.html"
         html_source.write_text(
-            '<html><head>'
+            "<html><head>"
             '<meta property="article:published_time" '
             'content="2024-03-15T08:00:00Z">'
-            '</head><body>Hi</body></html>',
+            "</head><body>Hi</body></html>",
             encoding="utf-8",
         )
         frag_path = _write_fragment(

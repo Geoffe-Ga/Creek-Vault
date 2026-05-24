@@ -853,8 +853,8 @@ class TestMarkdownIngestorAuthoredAt:
         self, md_ingestor: MarkdownIngestor, tmp_path: Path
     ) -> None:
         """When no frontmatter date is present, filesystem mtime is used."""
-        from datetime import UTC
         import os
+        from datetime import UTC
 
         path = tmp_path / "post.md"
         path.write_text("# Hi\n", encoding="utf-8")
@@ -899,8 +899,8 @@ class TestMarkdownIngestorAuthoredAt:
         self, md_ingestor: MarkdownIngestor, tmp_path: Path
     ) -> None:
         """Garbage frontmatter date does not crash; mtime is used."""
-        from datetime import UTC
         import os
+        from datetime import UTC
 
         path = tmp_path / "post.md"
         path.write_text(
