@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from creek.generate.drafts import DraftLLM
+    from creek.generate.drafts import DraftLLM, SeedSpec
     from creek.ingest.base import Ingestor
-    from creek.models import CompileTargetKind, Phase
+    from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 
@@ -1600,6 +1600,144 @@ def _read_voice_core(path: Path | None) -> str:
         raise typer.Exit(code=2) from exc
 
 
+_APTITUDE_FREQUENCY_LABELS: dict[str, str] = {
+    "agency": "F1",
+    "survival": "F1",
+    "receptivity": "F2",
+    "kinship": "F2",
+    "self-love": "F3",
+    "self_love": "F3",
+    "selflove": "F3",
+    "power": "F3",
+    "community-love": "F4",
+    "community_love": "F4",
+    "conformity": "F4",
+    "achievism": "F5",
+    "innovation": "F5",
+    "pluralism": "F6",
+    "empathy": "F6",
+    "integration": "F7",
+    "systems": "F7",
+    "true-self": "F8",
+    "true_self": "F8",
+    "transcendence": "F8",
+    "unity": "F9",
+    "cosmic": "F9",
+    "emptiness": "F10",
+    "impermanence": "F10",
+}
+"""FEAT-032: APTITUDE labels accepted by ``--seed-frequency`` (case-insensitive).
+
+Mirrors :data:`creek.generate.indexes.FREQUENCY_NAMES` so the labels
+stay aligned with the canonical UI strings.
+"""
+
+
+def _parse_seed_frequency(value: str | None) -> tuple[Frequency, ...]:
+    """Parse ``--seed-frequency`` into a one-tuple of :class:`Frequency`.
+
+    Returns an empty tuple when *value* is ``None``. Accepts both the
+    ``F1``..``F10`` codes and the human-readable APTITUDE labels
+    (``agency``, ``receptivity``, ``self-love``, …); unknown values
+    exit with code 2 listing the valid options.
+    """
+    from creek.models import Frequency
+
+    if value is None:
+        return ()
+    normalised = value.strip().lower().replace(" ", "")
+    canonical = _APTITUDE_FREQUENCY_LABELS.get(normalised)
+    raw = canonical if canonical is not None else value.strip().upper()
+    try:
+        return (Frequency(raw),)
+    except ValueError as exc:
+        codes = ", ".join(f.value for f in Frequency if f != Frequency.UNCLASSIFIED)
+        labels = ", ".join(sorted(set(_APTITUDE_FREQUENCY_LABELS)))
+        console.print(
+            f"[red]Unknown --seed-frequency {value!r}. "
+            f"Valid codes: {codes}. "
+            f"Valid labels: {labels}.[/red]",
+        )
+        raise typer.Exit(code=2) from exc
+
+
+def _parse_seed_phase(value: str | None) -> tuple[Phase, ...]:
+    """Parse ``--seed-phase`` into a one-tuple of :class:`Phase`."""
+    if value is None:
+        return ()
+    return (_parse_phase(value),)
+
+
+def _parse_seed_mode(value: str | None) -> tuple[Mode, ...]:
+    """Parse ``--seed-mode`` into a one-tuple of :class:`Mode`.
+
+    Unknown modes exit with code 2 listing the valid stances.
+    """
+    from creek.models import Mode
+
+    if value is None:
+        return ()
+    try:
+        return (Mode(value.strip().lower()),)
+    except ValueError as exc:
+        valid = ", ".join(m.value for m in Mode if m != Mode.UNCLASSIFIED)
+        console.print(
+            f"[red]Unknown --seed-mode {value!r}. Valid stances: {valid}.[/red]",
+        )
+        raise typer.Exit(code=2) from exc
+
+
+def _build_seed_spec(
+    *,
+    seed_fragment: str | None,
+    seed_topic: str | None,
+    seed_frequency: str | None,
+    seed_phase: str | None,
+    seed_mode: str | None,
+) -> SeedSpec | None:
+    """Assemble a :class:`SeedSpec` from raw CLI args, or ``None`` if unused.
+
+    Enforces the FEAT-032 mutual-exclusion rule before constructing
+    the spec so the error message names CLI flags rather than dataclass
+    fields. Returns ``None`` when no seed flag was passed so the caller
+    can fall back to the default mining flow.
+    """
+    from creek.generate.drafts import SeedSpec
+
+    if seed_fragment is not None:
+        conflicts = [
+            name
+            for name, value in (
+                ("--seed-topic", seed_topic),
+                ("--seed-frequency", seed_frequency),
+                ("--seed-phase", seed_phase),
+                ("--seed-mode", seed_mode),
+            )
+            if value is not None
+        ]
+        if conflicts:
+            console.print(
+                f"[red]--seed-fragment is mutually exclusive with "
+                f"{', '.join(conflicts)}.[/red]",
+            )
+            raise typer.Exit(code=2)
+        return SeedSpec(fragment_id=seed_fragment.strip())
+
+    frequencies = _parse_seed_frequency(seed_frequency)
+    phases = _parse_seed_phase(seed_phase)
+    modes = _parse_seed_mode(seed_mode)
+    topic = seed_topic.strip() if seed_topic else None
+
+    if not (topic or frequencies or phases or modes):
+        return None
+    return SeedSpec(
+        topic=topic,
+        frequencies=frequencies,
+        phases=phases,
+        modes=modes,
+    )
+
+
 def _build_draft_llm() -> DraftLLM:
     """Construct a :data:`DraftLLM` callable from the configured LLM provider.
 
@@ -1660,6 +1798,47 @@ def draft(
             "Documented escape hatch — emits a stderr warning."
         ),
     ),
+    seed_fragment: str | None = typer.Option(
+        None,
+        "--seed-fragment",
+        help=(
+            "FEAT-032: draft a follow-up to one specific fragment ID. "
+            "Mutually exclusive with --seed-topic and the dimensional filters."
+        ),
+    ),
+    seed_topic: str | None = typer.Option(
+        None,
+        "--seed-topic",
+        help=(
+            "FEAT-032: free-form topic phrase. Combinable with dimensional "
+            "filters to narrow source material."
+        ),
+    ),
+    seed_frequency: str | None = typer.Option(
+        None,
+        "--seed-frequency",
+        help=(
+            "FEAT-032: restrict source material to fragments with the named "
+            "primary frequency. Accepts F1..F10 codes or APTITUDE labels "
+            "(agency, receptivity, self-love, ...)."
+        ),
+    ),
+    seed_phase: str | None = typer.Option(
+        None,
+        "--seed-phase",
+        help=(
+            "FEAT-032: restrict source material to the named wavelength phase "
+            "(rising, peaking, withdrawal, diminishing, bottoming_out, restoration)."
+        ),
+    ),
+    seed_mode: str | None = typer.Option(
+        None,
+        "--seed-mode",
+        help=(
+            "FEAT-032: restrict source material to the named stance "
+            "(inhabit, express, collaborate, integrate, absorb)."
+        ),
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -1667,8 +1846,17 @@ def draft(
     the frequency/phase/mode/register skill stack, gathers source
     material, asks the LLM to generate a draft, and saves it to
     ``07-Voice/Drafts/`` with full provenance.
+
+    FEAT-032 manual seeding: pass any of ``--seed-fragment``,
+    ``--seed-topic``, ``--seed-frequency``, ``--seed-phase``, or
+    ``--seed-mode`` to direct composition. ``--seed-fragment`` is
+    mutually exclusive with the others; topic and dimensional filters
+    combine freely. When any seed flag is supplied the idea miner is
+    bypassed and the draft is generated from the matching fragments,
+    with the seed flags recorded in the draft's frontmatter for
+    reproducibility.
     """
-    from creek.generate.drafts import DraftGenerator
+    from creek.generate.drafts import DraftGenerator, SeedResolutionError
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
@@ -1676,9 +1864,44 @@ def draft(
     current_phase = _parse_phase(phase)
     voice_text = _read_voice_core(voice_core)
     override = _parse_include_tier(include_tier)
+    seed_spec = _build_seed_spec(
+        seed_fragment=seed_fragment,
+        seed_topic=seed_topic,
+        seed_frequency=seed_frequency,
+        seed_phase=seed_phase,
+        seed_mode=seed_mode,
+    )
     llm = _build_draft_llm()
     if bypass_compiled:
         _warn_bypass_compiled("draft")
+
+    generator = DraftGenerator(
+        llm=llm,
+        skills_root=skills_dir,
+        voice_core=voice_text,
+        privacy_override=override,
+        bypass_compiled=bypass_compiled,
+    )
+
+    if seed_spec is not None:
+        try:
+            draft_obj = generator.generate_seeded_draft(
+                seed_spec,
+                vault_path=vault_path,
+                current_phase=current_phase,
+            )
+        except SeedResolutionError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        _audit_privacy_override_if_needed(
+            vault_path=vault_path,
+            command="draft",
+            override=override,
+            fragment_ids=list(draft_obj.source_fragments),
+        )
+        saved_path = generator.save_draft(draft_obj, vault_path)
+        console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+        return
 
     seeds = IdeaMiner(
         privacy_override=override,
@@ -1702,13 +1925,6 @@ def draft(
         command="draft",
         override=override,
         fragment_ids=list(idea.source_fragments),
-    )
-    generator = DraftGenerator(
-        llm=llm,
-        skills_root=skills_dir,
-        voice_core=voice_text,
-        privacy_override=override,
-        bypass_compiled=bypass_compiled,
     )
 
     console.print(generator.present_idea(idea))

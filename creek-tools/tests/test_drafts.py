@@ -12,6 +12,8 @@ from creek.generate.drafts import (
     DRAFTS_SUBDIR,
     Draft,
     DraftGenerator,
+    SeedResolutionError,
+    SeedSpec,
 )
 from creek.generate.mining import IdeaSeed, MiningStrategy
 from creek.models import (
@@ -46,6 +48,9 @@ def _build_fragment(
     mode: Mode = Mode.UNCLASSIFIED,
     orientation: Orientation = Orientation.UNCLASSIFIED,
     register: VoiceRegister | None = None,
+    phase: Phase = Phase.UNCLASSIFIED,
+    threads: tuple[str, ...] = (),
+    eddies: tuple[str, ...] = (),
 ) -> Fragment:
     """Return a deterministic Fragment for tests."""
     return Fragment(
@@ -58,12 +63,18 @@ def _build_fragment(
         created=datetime(2026, 3, 1, tzinfo=UTC),
         ingested=datetime(2026, 3, 1, tzinfo=UTC),
         frequency=FrequencyClassification(primary=primary),
-        wavelength=WavelengthClassification(mode=mode, orientation=orientation),
+        wavelength=WavelengthClassification(
+            mode=mode,
+            orientation=orientation,
+            phase=phase,
+        ),
         voice=VoiceClassification(
             voice_register=register,
             confidence=Confidence.SETTLED if register else None,
         ),
         praxis_potential=PraxisPotential.LATENT,
+        threads=list(threads),
+        eddies=list(eddies),
     )
 
 
@@ -824,3 +835,483 @@ class TestGatherSourceMaterialCompileFirst:
         assert "bypass should NOT see" not in block
         gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
         assert not gaps_log.exists()
+
+
+# ---- FEAT-032 manual seeding -----------------------------------------
+
+
+class TestSeedSpec:
+    """``SeedSpec`` enforces the FEAT-032 mutual-exclusion rule on construction."""
+
+    def test_empty_spec_reports_is_empty(self) -> None:
+        """A spec with no fields set is reported as empty."""
+        assert SeedSpec().is_empty is True
+
+    def test_populated_spec_reports_not_empty(self) -> None:
+        """Any populated field flips ``is_empty`` to ``False``."""
+        assert SeedSpec(topic="listening").is_empty is False
+        assert SeedSpec(frequencies=(Frequency.F1,)).is_empty is False
+        assert SeedSpec(fragment_id="frag-A").is_empty is False
+
+    def test_dimensional_filter_detection(self) -> None:
+        """Topic alone does NOT count as a dimensional filter."""
+        assert SeedSpec(topic="x").has_dimensional_filter is False
+        assert SeedSpec(frequencies=(Frequency.F1,)).has_dimensional_filter is True
+        assert SeedSpec(phases=(Phase.RISING,)).has_dimensional_filter is True
+        assert SeedSpec(modes=(Mode.INHABIT,)).has_dimensional_filter is True
+
+    def test_fragment_id_blocks_topic(self) -> None:
+        """``--seed-fragment`` cannot combine with ``--seed-topic``."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SeedSpec(fragment_id="frag-A", topic="x")
+
+    def test_fragment_id_blocks_dimensional_filters(self) -> None:
+        """``--seed-fragment`` cannot combine with frequency/phase/mode filters."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SeedSpec(fragment_id="frag-A", frequencies=(Frequency.F1,))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SeedSpec(fragment_id="frag-A", phases=(Phase.RISING,))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SeedSpec(fragment_id="frag-A", modes=(Mode.INHABIT,))
+
+
+class TestResolveSeedFragment:
+    """``resolve_seed`` with ``--seed-fragment`` yields a single-source IdeaSeed."""
+
+    def test_returns_seed_keyed_to_named_fragment(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """The synthetic seed carries the fragment's id, title, and frequency."""
+        fragment = _build_fragment(
+            frag_id="frag-keep",
+            title="Naming what orbits",
+            primary=Frequency.F6,
+            threads=("thread-A",),
+            eddies=("eddy-Z",),
+        )
+        _write_fragment(vault, fragment, "Body text.")
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+
+        idea = gen.resolve_seed(SeedSpec(fragment_id="frag-keep"), vault_path=vault)
+
+        assert idea.title == "Naming what orbits"
+        assert idea.source_fragments == ("frag-keep",)
+        assert idea.threads == ("thread-A",)
+        assert idea.eddies == ("eddy-Z",)
+        assert idea.frequency_affinity == (Frequency.F6,)
+
+    def test_unknown_fragment_id_raises(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """An ID not present in the vault is a hard error."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        with pytest.raises(SeedResolutionError, match="not found"):
+            gen.resolve_seed(SeedSpec(fragment_id="missing"), vault_path=vault)
+
+    def test_unclassified_frequency_yields_empty_affinity(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Following up on an unclassified fragment leaves frequency_affinity empty."""
+        fragment = _build_fragment(
+            frag_id="frag-unc",
+            primary=Frequency.UNCLASSIFIED,
+        )
+        _write_fragment(vault, fragment, "Body.")
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(SeedSpec(fragment_id="frag-unc"), vault_path=vault)
+        assert idea.frequency_affinity == ()
+
+
+class TestResolveSeedDimensional:
+    """``resolve_seed`` with dimensional filters selects matching fragments."""
+
+    def test_filters_by_frequency_only(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Only fragments whose primary frequency matches survive the filter."""
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", primary=Frequency.F1),
+            "agency body",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-B", primary=Frequency.F6),
+            "pluralism body",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(
+            SeedSpec(frequencies=(Frequency.F6,)),
+            vault_path=vault,
+        )
+        assert idea.source_fragments == ("frag-B",)
+        assert idea.frequency_affinity == (Frequency.F6,)
+
+    def test_filters_by_phase_and_mode_intersection(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Phase and mode AND together: only the intersection matches."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                phase=Phase.RISING,
+                mode=Mode.INHABIT,
+            ),
+            "body",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+            "body",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-C",
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+            ),
+            "body",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(
+            SeedSpec(phases=(Phase.RISING,), modes=(Mode.INHABIT,)),
+            vault_path=vault,
+        )
+        assert idea.source_fragments == ("frag-A",)
+
+    def test_zero_matches_raises_honest_error(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """No silent fallback when the dimensional intersection is empty."""
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", primary=Frequency.F1),
+            "body",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        with pytest.raises(SeedResolutionError, match="No source material matches"):
+            gen.resolve_seed(
+                SeedSpec(frequencies=(Frequency.F10,)),
+                vault_path=vault,
+            )
+
+    def test_empty_spec_raises(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """An empty spec is rejected — the caller must request *something*."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        with pytest.raises(SeedResolutionError, match="empty"):
+            gen.resolve_seed(SeedSpec(), vault_path=vault)
+
+    def test_topic_filter_combines_with_frequency(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """``--seed-topic`` plus ``--seed-frequency`` ANDs both filters."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                title="Belonging at the edge",
+                primary=Frequency.F2,
+            ),
+            "On belonging to a place.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                title="Solo travel",
+                primary=Frequency.F2,
+            ),
+            "On going alone.",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(
+            SeedSpec(topic="belonging", frequencies=(Frequency.F2,)),
+            vault_path=vault,
+        )
+        assert idea.source_fragments == ("frag-A",)
+        assert idea.title == "belonging"
+
+    def test_topic_alone_does_substring_match(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """``--seed-topic`` alone matches title or body substrings."""
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", title="A walk by the creek"),
+            "Body unrelated.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-B", title="Anything"),
+            "An essay on belonging in community.",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(SeedSpec(topic="belonging"), vault_path=vault)
+        assert idea.source_fragments == ("frag-B",)
+        assert idea.title == "belonging"
+
+    def test_dimensional_only_title_describes_corner(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Pure dimensional seeding produces an "From the X corner" title."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                primary=Frequency.F1,
+                phase=Phase.RISING,
+                mode=Mode.INTEGRATE,
+            ),
+            "body",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(
+            SeedSpec(
+                frequencies=(Frequency.F1,),
+                phases=(Phase.RISING,),
+                modes=(Mode.INTEGRATE,),
+            ),
+            vault_path=vault,
+        )
+        assert "From the" in idea.title
+        assert "F1" in idea.title
+        assert "rising" in idea.title
+        assert "integrate" in idea.title
+
+    def test_threads_and_eddies_unioned_across_matches(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Synthetic IdeaSeed gathers thread/eddy IDs from all matched fragments."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                primary=Frequency.F1,
+                threads=("thread-1",),
+                eddies=("eddy-1",),
+            ),
+            "body",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                primary=Frequency.F1,
+                threads=("thread-2", "thread-1"),
+                eddies=("eddy-2",),
+            ),
+            "body",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(
+            SeedSpec(frequencies=(Frequency.F1,)),
+            vault_path=vault,
+        )
+        assert set(idea.threads) == {"thread-1", "thread-2"}
+        assert set(idea.eddies) == {"eddy-1", "eddy-2"}
+
+
+class TestGenerateSeededDraft:
+    """``generate_seeded_draft`` runs the full pipeline from a SeedSpec."""
+
+    def test_returns_draft_with_seed_provenance(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The returned Draft carries the originating ``SeedSpec``."""
+        fragment = _build_fragment(frag_id="frag-A", primary=Frequency.F6)
+        _write_fragment(vault, fragment, "A note on listening to others.")
+        _seed_skill_tree(skills_root, "frequencies/F6.SKILL.md")
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "Generated body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        spec = SeedSpec(topic="listening", frequencies=(Frequency.F6,))
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        assert draft.seed_spec == spec
+        assert draft.source_fragments == ("frag-A",)
+        assert "frequencies/F6.SKILL.md" in draft.skill_stack
+        assert "listening" in draft.prompt.lower()
+
+    def test_seed_phase_drives_phase_skill_when_no_override(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """``--seed-phase`` selects the phase skill when no explicit phase is passed."""
+        fragment = _build_fragment(
+            frag_id="frag-A",
+            primary=Frequency.F1,
+            phase=Phase.RISING,
+        )
+        _write_fragment(vault, fragment, "Body.")
+        _seed_skill_tree(skills_root, "phases/rising.SKILL.md")
+
+        gen = DraftGenerator(llm=lambda _p: "Body.", skills_root=skills_root)
+        spec = SeedSpec(phases=(Phase.RISING,))
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        assert "phases/rising.SKILL.md" in draft.skill_stack
+
+    def test_explicit_current_phase_overrides_spec(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Caller-supplied ``current_phase`` wins over the spec's phase."""
+        fragment = _build_fragment(
+            frag_id="frag-A",
+            primary=Frequency.F1,
+            phase=Phase.RISING,
+        )
+        _write_fragment(vault, fragment, "Body.")
+        _seed_skill_tree(skills_root, "phases/peaking.SKILL.md")
+
+        gen = DraftGenerator(llm=lambda _p: "Body.", skills_root=skills_root)
+        spec = SeedSpec(phases=(Phase.RISING,))
+        draft = gen.generate_seeded_draft(
+            spec,
+            vault_path=vault,
+            current_phase=Phase.PEAKING,
+        )
+
+        assert "phases/peaking.SKILL.md" in draft.skill_stack
+
+    def test_zero_matches_propagates_resolution_error(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The error from ``resolve_seed`` is propagated to the caller."""
+        gen = DraftGenerator(llm=lambda _p: "Body.", skills_root=skills_root)
+        spec = SeedSpec(frequencies=(Frequency.F10,))
+        with pytest.raises(SeedResolutionError):
+            gen.generate_seeded_draft(spec, vault_path=vault)
+
+    def test_empty_llm_response_raises(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """An empty LLM body is rejected (parity with ``generate_draft``)."""
+        fragment = _build_fragment(frag_id="frag-A", primary=Frequency.F1)
+        _write_fragment(vault, fragment, "Body.")
+        gen = DraftGenerator(llm=lambda _p: "   ", skills_root=skills_root)
+        spec = SeedSpec(frequencies=(Frequency.F1,))
+        with pytest.raises(RuntimeError, match="empty draft body"):
+            gen.generate_seeded_draft(spec, vault_path=vault)
+
+
+class TestSaveDraftWithSeedSpec:
+    """``save_draft`` writes ``seed:`` provenance to frontmatter when present."""
+
+    def _make_draft(self, *, seed_spec: SeedSpec | None) -> Draft:
+        """Return a Draft instance for save_draft frontmatter tests."""
+        return Draft(
+            title="Seeded essay",
+            body="Body.",
+            idea_strategy=MiningStrategy.RESONANCE_CHAIN.value,
+            source_fragments=("frag-A",),
+            threads=(),
+            eddies=(),
+            skill_stack=(),
+            prompt="prompt",
+            generated_date=datetime(2026, 5, 1, tzinfo=UTC),
+            seed_spec=seed_spec,
+        )
+
+    def test_seed_field_omitted_for_mined_drafts(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """A Draft without ``seed_spec`` carries no ``seed:`` frontmatter."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        path = gen.save_draft(self._make_draft(seed_spec=None), vault)
+        post = frontmatter.load(str(path))
+        assert "seed" not in post.metadata
+
+    def test_seed_field_records_all_populated_flags(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """``seed:`` frontmatter mirrors every populated SeedSpec field."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        spec = SeedSpec(
+            topic="belonging",
+            frequencies=(Frequency.F2,),
+            phases=(Phase.RESTORATION,),
+            modes=(Mode.INHABIT,),
+        )
+        path = gen.save_draft(self._make_draft(seed_spec=spec), vault)
+        post = frontmatter.load(str(path))
+        seed_meta = post.metadata["seed"]
+        assert seed_meta == {
+            "topic": "belonging",
+            "frequencies": ["F2"],
+            "phases": ["restoration"],
+            "modes": ["inhabit"],
+        }
+
+    def test_seed_field_omits_unset_fields(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Only populated fields land in the ``seed:`` mapping."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        spec = SeedSpec(fragment_id="frag-keep")
+        path = gen.save_draft(self._make_draft(seed_spec=spec), vault)
+        post = frontmatter.load(str(path))
+        assert post.metadata["seed"] == {"fragment_id": "frag-keep"}
