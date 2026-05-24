@@ -8,7 +8,8 @@ decision lives here.
 FEAT-015 wires the full agent loop: the handler hands off to
 :func:`crawdad.loop.run_one_turn`, which orchestrates router →
 dispatcher → composer with a hard cap of
-:data:`crawdad.config.MAX_LOOP_ROUNDS`. The handler's other
+:attr:`CrawDadConfig.max_loop_rounds` (default
+:data:`crawdad.config.MAX_LOOP_ROUNDS`; FEAT-036). The handler's other
 responsibilities are the allowlist gate, the session-state fallback,
 posting the loop's reply, and (FEAT-027) processing Discord
 attachments through the safety pass before any ingest.
@@ -238,6 +239,7 @@ async def handle_message(
         session_state=session_state,
         skills=_resolve_skills(skill_registry, skills),
         skill_registry=skill_registry,
+        max_rounds=config.max_loop_rounds,
     )
     _LOGGER.info("loop outcome: %s", outcome.kind)
     await message.channel.send(_truncate_for_discord(outcome.reply))

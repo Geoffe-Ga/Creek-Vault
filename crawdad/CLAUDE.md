@@ -30,8 +30,10 @@ complete and ships:
 
 - Connection to `creek-tools-mcp` (FEAT-010/011/012) over stdio.
 - The two-LLM agent loop: Haiku router (FEAT-014) → MCP dispatcher →
-  Sonnet composer (FEAT-015), capped at 5 rounds with paradox auto-
-  routing to `10-Liminal/Paradoxes/`.
+  Sonnet composer (FEAT-015), capped at `MAX_LOOP_ROUNDS` (default 5;
+  operator-configurable via `crawdad.yaml::max_loop_rounds`, bounded
+  `[1, 50]` — FEAT-036) with paradox auto-routing to
+  `10-Liminal/Paradoxes/`.
 - Voice-skill activation per session from `<vault>/creek-skills/`
   (voice-core + phase + register).
 - Six `/crawdad` Discord slash commands (FEAT-016): `reflect`,
@@ -86,6 +88,8 @@ Four gates, each must pass before the next:
     `[creek-tools-mcp]`).
   - `allowed_user_ids` — Discord user ids that may message the bot.
   - `allowed_channel_ids` — channels the bot will respond in.
+  - `max_loop_rounds` — optional FEAT-036 override for the agent-loop
+    round cap (default `MAX_LOOP_ROUNDS = 5`, bounded `[1, 50]`).
 
 Both allowlists must be non-empty — an empty list is a configuration
 error, not "open to everyone".

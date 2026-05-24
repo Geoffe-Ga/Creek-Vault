@@ -275,6 +275,7 @@ def test_build_loop_runner_returns_none_when_loop_not_wired(
         components=components,
         session_state=None,
         skill_registry=_empty_registry(tmp_path),
+        max_rounds=5,
     )
 
     assert runner is None
@@ -301,6 +302,7 @@ def test_build_loop_runner_returns_callable_when_loop_wired(
         components=components,
         session_state=None,
         skill_registry=_empty_registry(tmp_path),
+        max_rounds=5,
     )
 
     assert runner is not None
@@ -345,6 +347,7 @@ async def test_loop_runner_truncates_long_replies(
         components=components,
         session_state=None,
         skill_registry=_empty_registry(tmp_path),
+        max_rounds=5,
     )
 
     assert runner is not None
@@ -388,11 +391,51 @@ async def test_loop_runner_returns_soft_error_on_exception(
         components=components,
         session_state=None,
         skill_registry=_empty_registry(tmp_path),
+        max_rounds=5,
     )
 
     assert runner is not None
     reply = await runner("anything")
     assert "creek-tools" in reply.lower() or "wrong" in reply.lower()
+
+
+async def test_loop_runner_forwards_max_rounds_into_run_one_turn(
+    patched_config: CrawDadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FEAT-036: ``_build_loop_runner``'s ``max_rounds`` reaches ``run_one_turn``."""
+    from crawdad.loop import LoopOutcome
+    from crawdad.mcp_client import ToolDetails
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+    captured: dict[str, Any] = {}
+
+    async def _capture(**kwargs: Any) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(kind="composed", reply="ok")
+
+    monkeypatch.setattr(cli, "run_one_turn", _capture)
+
+    runner = cli._build_loop_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        max_rounds=17,
+    )
+
+    assert runner is not None
+    await runner("anything")
+    assert captured["max_rounds"] == 17
 
 
 def test_run_bot_wires_skill_registry_and_register_switcher(

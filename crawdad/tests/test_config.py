@@ -354,3 +354,124 @@ def test_load_config_parses_consent_overrides(
     assert config.consent.consent_tokens == frozenset({"do it"})
     assert config.consent.abandon_tokens == frozenset({"hold off"})
     assert config.consent.pending_batch_ttl_seconds == 60.0
+
+
+# ---------------------------------------------------------------------------
+# FEAT-036 — max_loop_rounds knob
+# ---------------------------------------------------------------------------
+
+
+def test_config_max_loop_rounds_defaults_to_module_constant(tmp_path: Path) -> None:
+    """Absent ``max_loop_rounds`` preserves the pre-FEAT-036 cap (5)."""
+    from crawdad.config import MAX_LOOP_ROUNDS
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[1],
+        allowed_channel_ids=[2],
+    )
+
+    assert config.max_loop_rounds == MAX_LOOP_ROUNDS
+
+
+def test_config_accepts_max_loop_rounds_override(tmp_path: Path) -> None:
+    """An operator-supplied override survives the model boundary."""
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[1],
+        allowed_channel_ids=[2],
+        max_loop_rounds=12,
+    )
+
+    assert config.max_loop_rounds == 12
+
+
+def test_config_accepts_max_loop_rounds_boundary_values() -> None:
+    """``max_loop_rounds`` accepts the inclusive bounds 1 and 50 (FEAT-036)."""
+    for boundary in (1, 50):
+        config = CrawDadConfig(
+            discord_bot_token="t",
+            anthropic_api_key="k",
+            vault_path=Path("."),
+            allowed_user_ids=(1,),
+            allowed_channel_ids=(2,),
+            max_loop_rounds=boundary,
+        )
+        assert config.max_loop_rounds == boundary
+
+
+def test_config_rejects_max_loop_rounds_below_lower_bound(tmp_path: Path) -> None:
+    """Zero and negative values fail validation with a clear pydantic error."""
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError):
+            CrawDadConfig(
+                discord_bot_token="t",
+                anthropic_api_key="k",
+                vault_path=tmp_path,
+                allowed_user_ids=[1],
+                allowed_channel_ids=[2],
+                max_loop_rounds=invalid,
+            )
+
+
+def test_config_rejects_max_loop_rounds_above_upper_bound(tmp_path: Path) -> None:
+    """Values past the hard upper bound (50) fail validation."""
+    for invalid in (51, 1000):
+        with pytest.raises(ValidationError):
+            CrawDadConfig(
+                discord_bot_token="t",
+                anthropic_api_key="k",
+                vault_path=tmp_path,
+                allowed_user_ids=[1],
+                allowed_channel_ids=[2],
+                max_loop_rounds=invalid,
+            )
+
+
+def test_load_config_parses_max_loop_rounds_from_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YAML override for ``max_loop_rounds`` round-trips through ``load_config``."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n"
+        "max_loop_rounds: 12\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+
+    assert config.max_loop_rounds == 12
+
+
+def test_load_config_max_loop_rounds_defaults_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YAML without ``max_loop_rounds`` keeps the pre-FEAT-036 cap."""
+    from crawdad.config import MAX_LOOP_ROUNDS
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+
+    assert config.max_loop_rounds == MAX_LOOP_ROUNDS

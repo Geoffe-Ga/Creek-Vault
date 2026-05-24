@@ -570,6 +570,63 @@ async def test_handle_message_truncates_long_composer_output(
     assert len(channel.sent[0]) < 5000
 
 
+async def test_handle_message_respects_configured_max_loop_rounds(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """FEAT-036: a configured ``max_loop_rounds`` reaches the agent loop.
+
+    The router scripts three back-to-back tool-call rounds. With the
+    config-level cap pinned at 2, the loop must hit ``too_deep`` on the
+    third router pass rather than composing.
+    """
+    from crawdad.intents import Intent, RouterResponse
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        max_loop_rounds=2,
+    )
+
+    router_responses = iter(
+        [
+            RouterResponse(intents=[Intent(type="creek.state.read")]),
+            RouterResponse(intents=[Intent(type="creek.state.read")]),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+
+    class _SeqRouter:
+        async def extract_intents(self, **_kwargs: Any) -> Any:
+            return next(router_responses)
+
+    composer = _StubComposer("(unused - cap should fire first)")
+    mcp_client = _StubMCPClient(_StubSession(replies={"creek.state.read": "body"}))
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="loop forever",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=_SeqRouter(),  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=mcp_client,  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+    )
+
+    assert len(channel.sent) == 1
+    assert "back up" in channel.sent[0].lower() or "reframe" in channel.sent[0].lower()
+    assert composer.calls == []
+
+
 async def test_handle_message_without_loop_components_uses_stub_reply(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:

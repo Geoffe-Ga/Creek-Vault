@@ -328,6 +328,8 @@ class CrawDadConfig(BaseModel):
     allowed_channel_ids: tuple[int, ...]
     attachments: AttachmentConfig = Field(default_factory=AttachmentConfig)
     consent: ConsentConfig = Field(default_factory=ConsentConfig)
+    max_loop_rounds: int = Field(default=MAX_LOOP_ROUNDS, ge=1, le=50)
+    """Operator override for the FEAT-015 agent-loop round cap."""
 
     @field_validator("allowed_user_ids", "allowed_channel_ids")
     @classmethod
