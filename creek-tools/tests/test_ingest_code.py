@@ -958,3 +958,88 @@ class TestCodeIngestorRegistry:
         from creek.ingest import INGESTOR_REGISTRY
 
         assert INGESTOR_REGISTRY["code"] is CodeIngestor
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestCodeAuthoredAt:
+    """``CodeIngestor`` extracts ``authored_at`` from git first-commit date.
+
+    FEAT-031 (#263): the fallback chain is
+    ``git log --diff-filter=A --follow --format=%aI -- <file>`` when
+    the file lives inside a git repo, then filesystem mtime.
+    """
+
+    def test_authored_at_uses_first_commit_author_date(
+        self, tmp_path: Path
+    ) -> None:
+        """When a real git repo backs the file, the first-commit ``%aI`` wins."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)  # noqa: S607,S603
+        subprocess.run(  # noqa: S607,S603
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(  # noqa: S607,S603
+            ["git", "config", "user.name", "Test"],
+            cwd=repo,
+            check=True,
+        )
+        readme = repo / "README.md"
+        readme.write_text("# Hi\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)  # noqa: S607,S603
+        env = {
+            "GIT_AUTHOR_DATE": "2024-03-15T12:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2024-03-15T12:00:00+00:00",
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "PATH": __import__("os").environ.get("PATH", ""),
+        }
+        subprocess.run(  # noqa: S607,S603
+            ["git", "commit", "-q", "-m", "init"],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+
+        ingestor = CodeIngestor()
+        docs = ingestor.discover(readme)
+        fragments = ingestor.parse(docs[0])
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+        assert authored.tzinfo is not None
+
+    def test_authored_at_falls_back_to_mtime_when_not_in_git(
+        self, tmp_path: Path
+    ) -> None:
+        """Files outside a git repo fall back to filesystem mtime."""
+        from datetime import UTC
+        import os
+
+        path = tmp_path / "README.md"
+        path.write_text("# Hi\n", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        ingestor = CodeIngestor()
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: Path) -> None:
+        path = tmp_path / "README.md"
+        path.write_text("# Hi\n", encoding="utf-8")
+
+        ingestor = CodeIngestor()
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm

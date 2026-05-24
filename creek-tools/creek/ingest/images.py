@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from creek.ingest._authored_at import safe_file_modified_time
 from creek.ingest.base import Ingestor, ParsedFragment, RawDocument
 from creek.models import SourcePlatform
 
@@ -411,6 +412,7 @@ class ImageIngestor(Ingestor):
             "ocr_confidence": result.confidence,
             "image_type": result.image_type,
             "language": self.language,
+            "authored_at": _resolve_image_authored_at(raw.path),
         }
         self._tag_low_confidence(metadata, result.confidence)
         return [
@@ -470,6 +472,9 @@ class ImageIngestor(Ingestor):
             "language": fragment.metadata.get("language", self.language),
             "ingested": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter["authored_at"] = authored_at.isoformat()
         review_marker = fragment.metadata.get(_REVIEW_FRONTMATTER_KEY)
         if review_marker:
             frontmatter[_REVIEW_FRONTMATTER_KEY] = review_marker
@@ -521,6 +526,72 @@ class ImageIngestor(Ingestor):
 def _modified_time(path: Path) -> datetime:
     """Return the file's mtime as a timezone-aware UTC datetime."""
     return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+
+
+_EXIF_DATETIME_ORIGINAL: int = 36867
+"""EXIF tag ID for ``DateTimeOriginal`` — the time the photo was taken."""
+
+_EXIF_DATETIME: int = 306
+"""EXIF tag ID for ``DateTime`` — the file modification time inside EXIF."""
+
+_EXIF_DATETIME_FORMAT: str = "%Y:%m:%d %H:%M:%S"
+"""EXIF 2.32 §4.6.4: ``YYYY:MM:DD HH:MM:SS`` (note colons in date part)."""
+
+
+def _parse_exif_datetime(value: str) -> datetime | None:
+    """Parse an EXIF ``YYYY:MM:DD HH:MM:SS`` string into a UTC datetime.
+
+    EXIF dates are wall-clock with no timezone (the spec leaves
+    timezone implicit). Per FEAT-031 (#263) the never-naive rule, we
+    anchor the result to UTC — preserving the camera's calendar
+    date/time and only adding the missing zone tag.
+    """
+    try:
+        parsed = datetime.strptime(value.strip(), _EXIF_DATETIME_FORMAT)  # noqa: DTZ007
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=UTC)
+
+
+def _extract_exif_authored_at(path: Path) -> datetime | None:
+    """Return the image's EXIF authored date, or ``None`` (FEAT-031 / #263).
+
+    Walks the EXIF fallback chain ``DateTimeOriginal`` → ``DateTime``.
+    Returns ``None`` if Pillow is not installed, the file is not a
+    supported image, or neither tag is present/parseable — the caller
+    then falls back to filesystem mtime per the issue's documented
+    extraction chain.
+    """
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+    except (FileNotFoundError, OSError, UnidentifiedImageError):
+        return None
+    for tag in (_EXIF_DATETIME_ORIGINAL, _EXIF_DATETIME):
+        raw = exif.get(tag)
+        if not isinstance(raw, str):
+            continue
+        parsed = _parse_exif_datetime(raw)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _resolve_image_authored_at(path: Path) -> datetime | None:
+    """ImageIngestor fallback chain: EXIF dates, then filesystem mtime.
+
+    Mirrors FEAT-031 (#263). ``None`` only surfaces when both the EXIF
+    block and the filesystem mtime are unreadable — the contracted
+    "honest absence" answer.
+    """
+    exif = _extract_exif_authored_at(path)
+    if exif is not None:
+        return exif
+    return safe_file_modified_time(path)
 
 
 __all__ = [

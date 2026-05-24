@@ -23,6 +23,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from creek.ingest._authored_at import (
+    parse_authored_value,
+    safe_file_modified_time,
+)
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -373,6 +377,73 @@ def _get_file_timestamp(path: Path) -> datetime:
     return datetime.fromtimestamp(mtime, tz=LA_TZ)
 
 
+def _git_first_commit_author_date(path: Path) -> datetime | None:
+    """Return the file's first-commit author date, or ``None`` (FEAT-031 / #263).
+
+    Runs ``git log --diff-filter=A --follow --format=%aI -- <path>``
+    against the path's parent directory. The ``--follow`` flag tracks
+    renames so a file's authored date survives across a rename; ``%aI``
+    formats the author date as strict ISO 8601 which round-trips
+    losslessly through :func:`parse_authored_value`.
+
+    Returns ``None`` for any of the failure modes:
+
+    * git is not on ``PATH``,
+    * the path is not inside a git work tree,
+    * the file has never been committed (untracked / staged-only), or
+    * the subprocess exits non-zero or times out.
+
+    None is the contracted "honest absence" answer per the issue; the
+    caller falls back to filesystem mtime.
+    """
+    git_path = shutil.which("git")
+    if git_path is None:
+        return None
+    parent = path.parent if path.is_file() else path
+    try:
+        result = subprocess.run(  # nosec B603 — hardcoded args, path arg only
+            [
+                git_path,
+                "log",
+                "--diff-filter=A",
+                "--follow",
+                "--format=%aI",
+                "--",
+                path.name if path.is_file() else ".",
+            ],
+            cwd=str(parent),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    # ``%aI`` may emit one line per add-event for a file that has been
+    # deleted and re-added; the *earliest* (last line in git log
+    # reverse-chronological output) is the true creation date.
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return parse_authored_value(lines[-1])
+
+
+def _resolve_authored_at(path: Path) -> datetime | None:
+    """Apply the CodeIngestor fallback chain: git first-commit, then mtime.
+
+    Mirrors the per-ingestor extraction contract from FEAT-031 (#263):
+    the source's authored date is the file's first-commit author date
+    when it is in a git repo; otherwise the filesystem mtime. ``None``
+    surfaces only when both fail (e.g. a synthetic in-memory path).
+    """
+    git_date = _git_first_commit_author_date(path)
+    if git_date is not None:
+        return git_date
+    return safe_file_modified_time(path)
+
+
 def _is_adr_file(path: Path) -> bool:
     """Check if a file is an Architecture Decision Record.
 
@@ -615,15 +686,23 @@ class CodeIngestor(Ingestor):
         artifact_type = raw.metadata.get("artifact_type", "other")
         text, _encoding = normalize_encoding(raw.content)
         timestamp = _get_file_timestamp(raw.path)
+        # FEAT-031 (#263): the file's first-commit author date is the
+        # authored date for code artifacts; mtime is the fallback.
+        # For the synthetic ``commits`` document the path *is* the repo
+        # root, so the same call returns the repo's first commit — the
+        # most honest answer available.
+        authored_at = _resolve_authored_at(raw.path)
 
         if artifact_type in ("readme", "claude_md", "adr"):
-            return self._parse_markdown_artifact(raw, text, timestamp, artifact_type)
+            return self._parse_markdown_artifact(
+                raw, text, timestamp, artifact_type, authored_at
+            )
 
         if artifact_type == "python":
-            return self._parse_python_file(raw, text, timestamp)
+            return self._parse_python_file(raw, text, timestamp, authored_at)
 
         if artifact_type == "commits":
-            return self._parse_commits(raw, text, timestamp)
+            return self._parse_commits(raw, text, timestamp, authored_at)
 
         return []
 
@@ -633,6 +712,7 @@ class CodeIngestor(Ingestor):
         text: str,
         timestamp: datetime,
         artifact_type: str,
+        authored_at: datetime | None,
     ) -> list[ParsedFragment]:
         """Parse a markdown-based artifact (README, CLAUDE.md, ADR).
 
@@ -641,6 +721,7 @@ class CodeIngestor(Ingestor):
             text: Decoded text content.
             timestamp: File timestamp.
             artifact_type: The artifact type identifier.
+            authored_at: Source-derived authored date (FEAT-031).
 
         Returns:
             A single-element list containing the parsed fragment.
@@ -648,7 +729,10 @@ class CodeIngestor(Ingestor):
         return [
             ParsedFragment(
                 content=text,
-                metadata={"artifact_type": artifact_type},
+                metadata={
+                    "artifact_type": artifact_type,
+                    "authored_at": authored_at,
+                },
                 source_path=str(raw.path),
                 timestamp=timestamp,
             )
@@ -659,6 +743,7 @@ class CodeIngestor(Ingestor):
         raw: RawDocument,
         text: str,
         timestamp: datetime,
+        authored_at: datetime | None,
     ) -> list[ParsedFragment]:
         """Parse a Python file for docstrings and significant comments.
 
@@ -666,6 +751,7 @@ class CodeIngestor(Ingestor):
             raw: The raw document.
             text: Decoded Python source text.
             timestamp: File timestamp.
+            authored_at: Source-derived authored date (FEAT-031).
 
         Returns:
             A list of fragments for each docstring and significant comment.
@@ -683,6 +769,7 @@ class CodeIngestor(Ingestor):
                         "kind": doc_info["kind"],
                         "name": doc_info["name"],
                         "line": doc_info["line"],
+                        "authored_at": authored_at,
                     },
                     source_path=source_path,
                     timestamp=timestamp,
@@ -694,6 +781,7 @@ class CodeIngestor(Ingestor):
             metadata: dict[str, Any] = {
                 "artifact_type": "comment",
                 "line": comment_info["line"],
+                "authored_at": authored_at,
             }
             if "marker" in comment_info:
                 metadata["marker"] = comment_info["marker"]
@@ -713,6 +801,7 @@ class CodeIngestor(Ingestor):
         raw: RawDocument,
         text: str,
         timestamp: datetime,
+        authored_at: datetime | None,
     ) -> list[ParsedFragment]:
         """Parse commit messages into a single fragment.
 
@@ -720,6 +809,7 @@ class CodeIngestor(Ingestor):
             raw: The raw document.
             text: The git log output text.
             timestamp: Repository timestamp.
+            authored_at: Source-derived authored date (FEAT-031).
 
         Returns:
             A single-element list containing the commit log fragment.
@@ -730,7 +820,10 @@ class CodeIngestor(Ingestor):
         return [
             ParsedFragment(
                 content=text,
-                metadata={"artifact_type": "commits"},
+                metadata={
+                    "artifact_type": "commits",
+                    "authored_at": authored_at,
+                },
                 source_path=str(raw.path),
                 timestamp=timestamp,
             )
@@ -831,7 +924,7 @@ class CodeIngestor(Ingestor):
         title = _derive_title(fragment)
         artifact_type = fragment.metadata.get("artifact_type", "")
 
-        return {
+        fm: dict[str, Any] = {
             "type": "fragment",
             "title": title,
             "source": {
@@ -841,3 +934,7 @@ class CodeIngestor(Ingestor):
             "created": fragment.timestamp.isoformat(),
             "artifact_type": artifact_type,
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm

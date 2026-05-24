@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
+from creek.ingest._authored_at import parse_authored_value
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -490,6 +491,12 @@ class DiscordIngestor(Ingestor):
         content = "\n\n".join(content_parts)
         first_ts = _safe_timestamp(group[0])
         timestamp = self._resolve_timestamp(first_ts)
+        # FEAT-031 (#263): the group's earliest message timestamp is the
+        # authored date. Discord exports stamp every message with a
+        # tz-aware ISO 8601 string, so :func:`parse_authored_value`
+        # preserves the UTC instant intact — no LA shift that would
+        # silently move a 23:30 UTC message into the previous day.
+        authored_at = parse_authored_value(first_ts)
 
         return ParsedFragment(
             content=content,
@@ -499,6 +506,7 @@ class DiscordIngestor(Ingestor):
                 "authors": sorted(authors),
                 "message_count": len(group),
                 "message_ids": [str(m.get("id", "")) for m in group],
+                "authored_at": authored_at,
             },
             source_path=source_path,
             timestamp=timestamp,
@@ -643,7 +651,7 @@ class DiscordIngestor(Ingestor):
         Returns:
             A dict of frontmatter key-value pairs.
         """
-        return {
+        fm: dict[str, Any] = {
             "source": {
                 "platform": "discord",
                 "channel": fragment.metadata.get("channel_name", "unknown"),
@@ -653,3 +661,7 @@ class DiscordIngestor(Ingestor):
             "authors": fragment.metadata.get("authors", []),
             "message_count": fragment.metadata.get("message_count", 0),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm

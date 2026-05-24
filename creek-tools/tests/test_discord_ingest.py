@@ -1099,3 +1099,68 @@ class TestDiscordIngestorEdgeCases:
         ingestor = DiscordIngestor()
         fragments = ingestor.parse(raw)
         assert "Reactions:" not in fragments[0].content
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestDiscordAuthoredAt:
+    """``DiscordIngestor`` extracts ``authored_at`` from message ``timestamp``.
+
+    FEAT-031 (#263): the first (earliest) message of a grouped fragment
+    carries the authored date. Discord timestamps are ISO 8601 with
+    timezone, so the value round-trips losslessly.
+    """
+
+    def test_authored_at_matches_first_message_timestamp(
+        self, tmp_path: Path
+    ) -> None:
+        ingestor = DiscordIngestor()
+        msgs = [
+            _make_msg(
+                msg_id="m1",
+                author="Alice",
+                content="Hello there how is it going",
+                timestamp="2024-11-15T10:30:00+00:00",
+            ),
+        ]
+        _create_channel_dir(tmp_path, messages=msgs)
+        result = ingestor.ingest(tmp_path)
+        assert len(result.fragments) == 1
+        authored = result.fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-11-15"
+        assert authored.tzinfo is not None
+
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: Path) -> None:
+        ingestor = DiscordIngestor()
+        msgs = [
+            _make_msg(
+                msg_id="m1",
+                content="Hello there how is it going",
+                timestamp="2024-11-15T10:30:00+00:00",
+            ),
+        ]
+        _create_channel_dir(tmp_path, messages=msgs)
+        result = ingestor.ingest(tmp_path)
+        fm = result.fragments[0].metadata["frontmatter"]
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-11-15")
+
+    def test_authored_at_none_when_message_lacks_timestamp(self) -> None:
+        """Honest absence: a message with no parseable timestamp → None."""
+        ingestor = DiscordIngestor()
+        msg = _make_msg(
+            msg_id="m1",
+            content="Hello there how is it going",
+            timestamp="",
+        )
+        raw = RawDocument(
+            path=Path("/fake/messages.json"),
+            content=json.dumps([msg]).encode("utf-8"),
+            metadata={"channel_name": "general", "channel_id": "1"},
+            detected_encoding="utf-8",
+        )
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        assert fragments[0].metadata.get("authored_at") is None

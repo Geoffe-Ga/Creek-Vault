@@ -732,3 +732,87 @@ class TestOcrMinConfidence:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestImageAuthoredAt:
+    """``ImageIngestor`` extracts ``authored_at`` from EXIF date tags.
+
+    FEAT-031 (#263): the fallback chain is EXIF ``DateTimeOriginal``
+    (36867) → EXIF ``DateTime`` (306) → filesystem mtime. Naive EXIF
+    timestamps are anchored to UTC per the issue's never-naive rule.
+    """
+
+    def _write_jpeg_with_exif(
+        self,
+        path: "Path",
+        *,
+        date_time_original: str | None = None,
+        date_time: str | None = None,
+    ) -> None:
+        """Write a JPEG with the given EXIF date tags set."""
+        from PIL import Image
+
+        img = Image.new("RGB", (4, 4), color="white")
+        exif = img.getexif()
+        if date_time is not None:
+            exif[306] = date_time  # ``DateTime``
+        if date_time_original is not None:
+            exif[36867] = date_time_original  # ``DateTimeOriginal``
+        img.save(path, "jpeg", exif=exif)
+
+    def test_date_time_original_takes_priority(self, tmp_path: "Path") -> None:
+        path = tmp_path / "photo.jpg"
+        self._write_jpeg_with_exif(
+            path,
+            date_time_original="2024:03:15 10:30:00",
+            date_time="2023:01:01 00:00:00",
+        )
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+        assert authored.tzinfo is not None
+
+    def test_date_time_used_when_no_date_time_original(self, tmp_path: "Path") -> None:
+        path = tmp_path / "photo.jpg"
+        self._write_jpeg_with_exif(path, date_time="2023:08:09 12:00:00")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2023-08-09"
+
+    def test_falls_back_to_mtime_when_no_exif(self, tmp_path: "Path") -> None:
+        from PIL import Image
+        import os
+
+        path = tmp_path / "photo.png"
+        Image.new("RGB", (4, 4), color="white").save(path, "png")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: "Path") -> None:
+        path = tmp_path / "photo.jpg"
+        self._write_jpeg_with_exif(
+            path,
+            date_time_original="2024:03:15 10:30:00",
+        )
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
