@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from crawdad.consent import (
     DEFAULT_ABANDON_TOKENS,
@@ -289,6 +290,25 @@ class ConsentConfig(BaseModel):
             if cleaned:
                 normalised.add(cleaned)
         return frozenset(normalised)
+
+    @model_validator(mode="after")
+    def _refuse_token_overlap(self) -> Self:
+        """Refuse configurations where consent and abandon tokens overlap.
+
+        ``classify_followup_message`` checks the abandon set before the
+        consent set, so any token present in both would silently always
+        classify as abandon — a confusing semantic inversion the
+        operator did not intend. Surfacing this at config-parse time
+        keeps the misconfiguration loud instead of latent.
+        """
+        overlap = self.consent_tokens & self.abandon_tokens
+        if overlap:
+            msg = (
+                "consent_tokens and abandon_tokens must be disjoint; "
+                f"overlapping tokens: {sorted(overlap)}"
+            )
+            raise ValueError(msg)
+        return self
 
 
 class CrawDadConfig(BaseModel):

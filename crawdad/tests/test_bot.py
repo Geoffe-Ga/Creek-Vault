@@ -10,6 +10,7 @@ import pytest
 
 from crawdad.bot import handle_message, render_state_unavailable_reply
 from crawdad.config import CrawDadConfig
+from crawdad.consent import PendingBatchStore
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.state import SessionState, StateUnavailableError
 
@@ -1297,10 +1298,8 @@ async def test_attachment_reply_consent_prompt_survives_long_scan_output(
 # ---------------------------------------------------------------------------
 
 
-def _make_store(*, ttl: float = 60.0, clock_value: float = 0.0) -> Any:
+def _make_store(*, ttl: float = 60.0, clock_value: float = 0.0) -> PendingBatchStore:
     """Construct a fresh ``PendingBatchStore`` with a deterministic clock."""
-    from crawdad.consent import PendingBatchStore
-
     return PendingBatchStore(ttl_seconds=ttl, clock=lambda: clock_value)
 
 
@@ -1310,7 +1309,7 @@ async def _stage_attachment(
     session_state: SessionState,
     channel: _FakeChannel,
     attachment: _FakeAttachment,
-    pending_batches: Any,
+    pending_batches: PendingBatchStore,
     message_id: int = 100,
     known_tools: tuple[str, ...] = ("creek.redact.scan",),
     scan_body: str = "Scan summary: no findings",
@@ -2173,6 +2172,149 @@ async def test_consent_dispatch_with_staged_path_outside_vault(
 
     # The absolute path is forwarded verbatim because relative_to() raised.
     assert captured[0]["args"]["input_path"] == str(outside_path)
+
+
+async def test_consent_concurrent_followups_dispatch_only_once(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Two concurrent ``ingest`` messages on the same channel must not double-dispatch.
+
+    Reviewer-flagged HIGH: without per-channel locking, both coroutines
+    can read ``state == "awaiting_consent"`` before either completes
+    its dispatch, double-firing ``creek.ingest`` for the same file
+    (PR #308). The per-channel lock from
+    :meth:`PendingBatchStore.lock_for` serialises the critical
+    section; the second message sees ``state == "ingested"`` and
+    replies "already ingested".
+    """
+    import asyncio
+
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    barrier = asyncio.Event()
+    call_count = 0
+
+    class _SlowSession:
+        async def call_tool(
+            self, _name: str, _arguments: dict[str, Any] | None = None
+        ) -> str:
+            nonlocal call_count
+            call_count += 1
+            await barrier.wait()
+            return "ingested fragment-1"
+
+    mcp = _StubMCPClient(_SlowSession())
+
+    msg_a: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+        id=2001,
+    )
+    msg_b: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+        id=2002,
+    )
+
+    task_a = asyncio.create_task(
+        handle_message(
+            msg_a,
+            config=config,
+            session_state=session_state,
+            bot_user_id=42,
+            mcp_client=mcp,  # type: ignore[arg-type]
+            known_tools=("creek.ingest",),
+            pending_batches=store,
+        )
+    )
+    # Yield once so task A starts and grabs the lock before B is scheduled.
+    await asyncio.sleep(0)
+    task_b = asyncio.create_task(
+        handle_message(
+            msg_b,
+            config=config,
+            session_state=session_state,
+            bot_user_id=42,
+            mcp_client=mcp,  # type: ignore[arg-type]
+            known_tools=("creek.ingest",),
+            pending_batches=store,
+        )
+    )
+    # Let task B reach the lock-acquisition point.
+    await asyncio.sleep(0)
+    # Release task A's dispatch so the critical section can finish.
+    barrier.set()
+
+    await asyncio.gather(task_a, task_b)
+
+    # Only one ``creek.ingest`` dispatch happened across both messages.
+    assert call_count == 1
+    # The second message received the "already ingested" reply.
+    assert any("already ingested" in s.lower() for s in channel.sent)
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "ingested"
+
+
+async def test_run_ingest_dispatch_swallows_unexpected_exceptions(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Non-``MCPUnavailableError`` exceptions are caught — user is never left silent.
+
+    Reviewer-flagged LOW: a TimeoutError (or any other surprise) from
+    the MCP session would otherwise propagate out of
+    ``handle_message`` and the user would see no reply. Mirrors the
+    existing ``_run_safety_scan`` behaviour.
+    """
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    class _BrokenSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            raise TimeoutError("upstream timed out")
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_BrokenSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert len(channel.sent) == 1
+    assert "unreachable" in channel.sent[0].lower()
+    # The batch was not marked ingested — user can retry.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "awaiting_consent"
 
 
 async def test_already_present_batch_does_not_record_pending_state(

@@ -28,6 +28,7 @@ previously-unresolved file and completes ingestion.
 
 from __future__ import annotations
 
+import asyncio
 import string
 import time
 from dataclasses import dataclass, field, replace
@@ -216,6 +217,13 @@ class PendingBatchStore:
         self._batches: dict[int, PendingBatch] = {}
         self._ttl_seconds = ttl_seconds
         self._clock: Callable[[], float] = clock or time.monotonic
+        # Per-channel asyncio.Lock so concurrent ``ingest`` follow-ups on
+        # the same channel can't race past the read-classify-dispatch
+        # critical section and double-fire ``creek.ingest`` for the same
+        # batch (PR #308 review HIGH). Locks live for the bot's lifetime
+        # and are bounded by the channel count, which is itself bounded
+        # by the operator's allowlist.
+        self._locks: dict[int, asyncio.Lock] = {}
 
     @property
     def ttl_seconds(self) -> float:
@@ -252,6 +260,25 @@ class PendingBatchStore:
         """Drop any batch recorded for *channel_id*. No-op when absent."""
         self._batches.pop(channel_id, None)
 
+    def lock_for(self, channel_id: int) -> asyncio.Lock:
+        """Return the per-channel :class:`asyncio.Lock`, lazy-creating on first use.
+
+        Callers must hold this lock around the multi-step
+        read-classify-dispatch cycle to make the consent flow atomic
+        per channel — without it, two rapid ``ingest`` messages for the
+        same batch can suspend on different ``await`` points and both
+        observe ``state == "awaiting_consent"``, double-dispatching
+        ``creek.ingest``. Lazy creation is safe under :mod:`asyncio`'s
+        cooperative scheduling: the dict ``get``-then-set sequence
+        contains no awaits, so two coroutines cannot interleave and
+        produce different lock instances for the same channel.
+        """
+        lock = self._locks.get(channel_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[channel_id] = lock
+        return lock
+
 
 def classify_followup_message(
     content: str,
@@ -282,6 +309,13 @@ def classify_followup_message(
         A ``(kind, payload)`` tuple. ``payload`` carries the resolved
         ingest type when ``kind == "type"`` and is ``None`` otherwise.
     """
+    # Two strips on purpose: the first removes outer whitespace before
+    # the ``.lower()`` so the second strip can also clean up internal
+    # whitespace that ``.lower()`` would otherwise expose adjacent to
+    # punctuation (e.g. ``"  Ingest!  "`` → ``"ingest"``, ``"go ahead."``
+    # → ``"go ahead"``). Internal whitespace inside multi-word tokens
+    # like ``"go ahead"`` is preserved because only outer characters
+    # are stripped.
     norm = content.strip().lower().strip(string.punctuation + string.whitespace)
     if not norm:
         return "none", None

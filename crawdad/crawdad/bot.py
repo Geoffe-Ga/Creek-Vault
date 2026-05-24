@@ -328,12 +328,18 @@ async def _handle_attachments(
         channel_id=channel_id,
     )
 
-    _record_pending_batch(
-        pending_batches=pending_batches,
-        processed=processed,
-        channel_id=channel_id,
-        config=config,
-    )
+    # Hold the per-channel consent lock during the record so a racing
+    # ``ingest`` follow-up cannot observe a half-built batch. The lock
+    # is uncontended unless the consent flow is mid-dispatch — see the
+    # ``PendingBatchStore.lock_for`` docstring for the TOCTOU rationale.
+    if pending_batches is not None:
+        async with pending_batches.lock_for(channel_id):
+            _record_pending_batch(
+                pending_batches=pending_batches,
+                processed=processed,
+                channel_id=channel_id,
+                config=config,
+            )
 
     # Send the summary + scan section first (may be truncated for long
     # scan bodies) and then the consent prompt as a separate message.
@@ -393,43 +399,56 @@ async def _handle_consent_followup(
     Returns ``True`` when the message was consumed by the consent flow
     (a reply was sent and the regular agent loop should be skipped) and
     ``False`` when the caller should continue with normal processing.
+
+    Concurrency note: the entire read-classify-dispatch cycle runs
+    under the per-channel lock from :meth:`PendingBatchStore.lock_for`
+    so two rapid ``ingest`` messages on the same channel can't both
+    observe ``awaiting_consent`` and double-fire ``creek.ingest`` for
+    the same batch (PR #308 review HIGH).
+
+    Trust boundary: the batch is keyed by ``channel.id``, not by user
+    id, so any user the operator has allowlisted into a channel can
+    consent to that channel's pending batch. For the documented
+    personal-use deployment target this is acceptable — see FEAT-013
+    §5.1; broaden the consent key before adding multi-user channels.
     """
     if pending_batches is None:
         return False
-    batch = pending_batches.get(message.channel.id)
-    if batch is None:
-        return False
+    async with pending_batches.lock_for(message.channel.id):
+        batch = pending_batches.get(message.channel.id)
+        if batch is None:
+            return False
 
-    kind, payload = classify_followup_message(
-        message.content,
-        consent_tokens=config.consent.consent_tokens,
-        abandon_tokens=config.consent.abandon_tokens,
-    )
-    if kind == "none":
-        return False
-    if kind == "abandon":
-        pending_batches.clear(message.channel.id)
-        await message.channel.send(_BATCH_ABANDONED_REPLY)
-        return True
-    if kind == "type":
-        return await _apply_disambiguation_reply(
+        kind, payload = classify_followup_message(
+            message.content,
+            consent_tokens=config.consent.consent_tokens,
+            abandon_tokens=config.consent.abandon_tokens,
+        )
+        if kind == "none":
+            return False
+        if kind == "abandon":
+            pending_batches.clear(message.channel.id)
+            await message.channel.send(_BATCH_ABANDONED_REPLY)
+            return True
+        if kind == "type":
+            return await _apply_disambiguation_reply(
+                batch=batch,
+                ingest_type=payload or "",
+                message=message,
+                mcp_client=mcp_client,
+                known_tools=known_tools,
+                pending_batches=pending_batches,
+                config=config,
+            )
+        # kind == "consent"
+        return await _apply_consent_reply(
             batch=batch,
-            ingest_type=payload or "",
             message=message,
             mcp_client=mcp_client,
             known_tools=known_tools,
             pending_batches=pending_batches,
             config=config,
         )
-    # kind == "consent"
-    return await _apply_consent_reply(
-        batch=batch,
-        message=message,
-        mcp_client=mcp_client,
-        known_tools=known_tools,
-        pending_batches=pending_batches,
-        config=config,
-    )
 
 
 async def _apply_consent_reply(
@@ -554,7 +573,11 @@ async def _run_ingest_dispatch(
     Returns the user-facing reply text and the set of content hashes
     that landed successfully. A mid-batch
     :class:`MCPUnavailableError` short-circuits remaining files and
-    surfaces the documented soft error.
+    surfaces the documented soft error. Any other unexpected exception
+    (timeout, protocol error, malformed JSON, …) is also caught and
+    surfaced as the same soft error rather than left to bubble up into
+    the Discord ``on_message`` handler, where it would log a stack
+    trace and leave the user staring at silence.
     """
     lines: list[str] = ["**Ingest results**"]
     ingested: set[str] = set()
@@ -580,6 +603,13 @@ async def _run_ingest_dispatch(
                     lines.append(f"- `{file.filename}` ({ingest_type}): {body}")
     except MCPUnavailableError as exc:
         _LOGGER.warning("creek.ingest failed: %s", exc)
+        return _MCP_UNAVAILABLE_REPLY, frozenset(ingested)
+    except Exception:
+        # Match the safety-pass handler in ``_run_safety_scan``: log the
+        # full traceback for the operator, but surface a soft error to
+        # the user. Without this the exception would propagate out of
+        # ``handle_message`` and the user would be left in silence.
+        _LOGGER.exception("unexpected error during creek.ingest call")
         return _MCP_UNAVAILABLE_REPLY, frozenset(ingested)
     return "\n".join(lines), frozenset(ingested)
 

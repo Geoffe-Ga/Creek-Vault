@@ -294,6 +294,26 @@ def test_consent_config_rejects_non_positive_ttl(tmp_path: Path) -> None:
         ConsentConfig(pending_batch_ttl_seconds=-1.0)
 
 
+def test_consent_config_rejects_token_overlap() -> None:
+    """Tokens present in both consent and abandon sets surface as a clear config error.
+
+    Without the model validator, ``classify_followup_message`` would
+    silently classify the overlapping token as abandon (the abandon
+    branch executes before consent), which is almost never what the
+    operator meant.
+    """
+    from crawdad.config import ConsentConfig
+
+    with pytest.raises(ValidationError) as exc:
+        ConsentConfig(
+            consent_tokens=frozenset({"ingest", "yes"}),
+            abandon_tokens=frozenset({"yes", "drop"}),
+        )
+
+    assert "disjoint" in str(exc.value)
+    assert "yes" in str(exc.value)
+
+
 def test_crawdad_config_carries_consent_subconfig(tmp_path: Path) -> None:
     """``CrawDadConfig`` ships with a default ``ConsentConfig`` attached."""
     config = CrawDadConfig(

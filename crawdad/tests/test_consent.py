@@ -10,6 +10,7 @@ from crawdad.consent import (
     DEFAULT_ABANDON_TOKENS,
     DEFAULT_CONSENT_TOKENS,
     VALID_INGEST_TYPES,
+    BatchState,
     PendingBatch,
     PendingBatchStore,
     PendingFile,
@@ -40,7 +41,7 @@ def _batch(
     files: tuple[PendingFile, ...] = (),
     channel_id: int = 999,
     created_at: float = 0.0,
-    state: str = "awaiting_consent",
+    state: BatchState = "awaiting_consent",
     ingested_hashes: frozenset[str] = frozenset(),
 ) -> PendingBatch:
     """Return a :class:`PendingBatch` with sensible test defaults."""
@@ -50,7 +51,7 @@ def _batch(
         files=files or (_file(),),
         privacy_tier_ceiling="personal",
         created_at=created_at,
-        state=state,  # type: ignore[arg-type]
+        state=state,
         ingested_hashes=ingested_hashes,
     )
 
