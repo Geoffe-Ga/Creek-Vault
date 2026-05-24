@@ -8,21 +8,22 @@ description: >-
   ending in a `Verdict:` line (LGTM / CHANGES_REQUESTED / COMMENTS) — it is
   NOT a formal GitHub approval. This skill locates the most recent such
   comment via GitHub MCP, parses the verdict, triages blockers/problems/nits
-  into a TDD-driven local fix loop, replies and resolves threads, and merges
-  only when the latest verdict is `LGTM`, the comment was posted after the
-  current HEAD's push, and all required checks are green.
+  into a TDD-driven local fix loop, replies and resolves threads. On
+  `LGTM` for the current HEAD with green CI it squash-merges; on
+  `COMMENTS` it files each actionable item as a follow-up GitHub issue and
+  then squash-merges; on `CHANGES_REQUESTED` it loops until LGTM.
   Do NOT use for giving a review (use comprehensive-pr-review), debugging CI
   failures themselves (use ci-debugging), general TDD work outside review
   context (use stay-green), bug RCA (use bug-squashing-methodology), or
   issue/branch/PR creation (use git-workflow).
 metadata:
   author: Geoff
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # Address Feedback
 
-Close the loop on a Claude PR review: find the latest verdict comment, iterate locally with TDD, push once, and merge only when the verdict is `LGTM` for the current HEAD and CI is green.
+Close the loop on a Claude PR review: find the latest verdict comment, iterate locally with TDD, push once, and merge when the verdict for the current HEAD is `LGTM` (merge directly) or `COMMENTS` (file each actionable item as a follow-up issue, then squash-merge) with green CI.
 
 ## How the Claude Review Surfaces
 
@@ -71,9 +72,23 @@ Use the GitHub MCP tools — never `gh` CLI. The goal is to determine whether a 
 6. Classify and route:
    - `LGTM` → skip to Step 6 (merge gate).
    - `CHANGES_REQUESTED` → required fixes; continue to Step 2 with the **Security Concerns**, **Problems**, and any blocking items from the comment body.
-   - `COMMENTS` → optional improvements; user decides whether to address; if skipping, jump to Step 6.
+   - `COMMENTS` → reviewer has signed off but raised non-blocking ideas; file each actionable item as a follow-up GitHub issue (Step 1A), then jump to Step 6 for a squash merge. Do not enter the TDD loop.
    - **No qualifying comment** (none after the latest push) → wait for the next review run; do not merge. Optionally post `@claude please review` via `mcp__github__add_issue_comment` if the action did not run.
    - **Comment exists but no parseable Verdict line** → treat as malformed; ask the user before merging. Do not infer a verdict from prose.
+
+### Step 1A: COMMENTS Verdict — File Follow-up Issues, Then Squash Merge
+
+Reached only when the current verdict is `COMMENTS`. The reviewer has signed off on what's in the PR but raised non-blocking ideas worth tracking. Capture each one as a GitHub issue so the work isn't lost when the PR merges.
+
+1. Build the same triage table as Step 2 from the comment body (Strengths / Security Concerns / Problems / Code Quality / Requests sections) **and** any unresolved line-level threads via `mcp__github__pull_request_read` with `method: "get_review_comments"`.
+2. Drop rows that are factually wrong or already addressed — reply on the relevant thread/comment with a short justification instead of opening an issue.
+3. For every remaining row, file a follow-up issue via `mcp__github__issue_write` with `method: "create"`:
+   - **Title** — imperative summary derived from the reviewer's quote (e.g. "Extract magic numbers in `parser.py`").
+   - **Body** — include the reviewer's verbatim quote, the `file:line` citation, the requested change, the test idea from the triage table, and a back-link to the source PR (`Follow-up from #<N> — <comment URL>`).
+   - **Labels** — apply the repo's follow-up label if one exists (`follow-up`, `tech-debt`, etc.) plus the relevant area label.
+4. For each line-level thread that produced an issue, post a reply via `mcp__github__add_reply_to_pull_request_comment` linking the new issue number, then `mcp__github__resolve_review_thread`.
+5. Post a single summary reply on the top-level Claude comment via `mcp__github__add_issue_comment` listing every follow-up issue filed (e.g. `Follow-ups filed: #142, #143, #144`).
+6. Continue to Step 6. The merge gate accepts `COMMENTS` once every actionable item has a tracking issue.
 
 ### Step 2: Triage the Comment Body into a Fix Plan
 
@@ -120,28 +135,30 @@ When the helper wakes the session:
 
 - Verdict `LGTM` for the current HEAD → continue to Step 6.
 - Verdict `CHANGES_REQUESTED` → loop back to Step 2 with the new comment body.
-- Verdict `COMMENTS` → user decides; if skipping, Step 6.
+- Verdict `COMMENTS` → run Step 1A (file follow-up issues for every actionable item), then Step 6.
 - CI failure event for the current HEAD → if the failing job is the reviewer action, the helper retriggers it and stays subscribed; if it's other CI, hand off to `ci-debugging` and keep the subscription open. Either way, do not advance to merge.
 
 ### Step 6: Merge Gate — All Must Hold
 
 Merge only when **every** condition is true. If any fails, stop and explain which one.
 
-- Latest qualifying Claude review comment has `Verdict: LGTM`.
+- Latest qualifying Claude review comment has `Verdict: LGTM`, **or** `Verdict: COMMENTS` with every actionable item filed as a follow-up issue per Step 1A.
 - That comment's `created_at >= head commit's committer.date` (verdict is for the current HEAD, not a pre-push state).
 - All required check runs are `success`:
   - `mcp__github__pull_request_read` with `method: "get_status"` (combined commit status), and
   - `mcp__github__pull_request_read` with `method: "get_check_runs"` (per-job detail).
-- No unresolved line-level review threads (`mcp__github__pull_request_read` with `method: "get_review_comments"` — each thread has `isResolved`).
+- No unresolved line-level review threads (`mcp__github__pull_request_read` with `method: "get_review_comments"` — each thread has `isResolved`). For a `COMMENTS` verdict, threads are resolved by linking the follow-up issue (Step 1A.4), not by code change.
 - The PR is `mergeable` and not `draft` (from the `get` response).
 
-Then:
+Then squash-merge:
 
 ```
 mcp__github__merge_pull_request
   pull_number: <N>
-  merge_method: "squash"   # or whatever the repo standard is
+  merge_method: "squash"
 ```
+
+`squash` is required for the `COMMENTS` path so the follow-up issues are the only outstanding trail. For `LGTM`, use `squash` unless the repo standard says otherwise.
 
 Confirm the merge succeeded; do not delete the remote branch unless the user asks.
 
@@ -168,6 +185,17 @@ Confirm the merge succeeded; do not delete the remote branch unless the user ask
 3. For the two blockers: Red-Green-Refactor locally, then `pre-commit run --all-files` + full test suite + typecheck. All green.
 4. Single `git push`. Post a summary reply via `add_issue_comment` listing the addressed items and the SHA. Then post `@claude please re-review`.
 5. New Claude comment arrives with `Verdict: LGTM` after the new push timestamp → re-enter Step 6.
+
+### Example 4: `Verdict: COMMENTS` — File Follow-ups and Squash Merge
+
+1. `pull_request_read get` → `head.sha = def456`. `get_commit def456` → `committer.date = 2026-05-24T09:00:00Z`.
+2. Latest bot comment by `claude[bot]` at `2026-05-24T09:06:12Z` ends with `## Verdict: COMMENTS`. Body has three Code Quality items (two cite `parser.py:88` and `parser.py:142`, one cites `tests/test_parser.py:30`) and no Problems or Security Concerns.
+3. Step 1A — build the triage table. Reviewer was right on all three; nothing to push back on. File three issues via `mcp__github__issue_write create`:
+   - `#142 Extract magic numbers in parser.py` with body quoting the reviewer, `parser.py:88`, requested change, test idea, and `Follow-up from #137 — <comment URL>`. Labels: `follow-up`, `tech-debt`, `parser`.
+   - `#143 Tighten error message in parser.py:142`.
+   - `#144 Add boundary test for empty input`.
+4. Resolve the two line-level threads with replies linking `#142` and `#143`. Post a top-level summary reply on the Claude comment: `Follow-ups filed: #142, #143, #144`.
+5. Step 6 gate: `09:06:12Z >= 09:00:00Z` ✓, all checks `success` ✓, no unresolved threads ✓, `mergeable: true`, `draft: false`. Squash-merge `#137`.
 
 ## Troubleshooting
 
