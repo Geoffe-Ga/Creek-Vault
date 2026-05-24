@@ -10,6 +10,14 @@ compile-gaps.jsonl`` so ``creek lint`` can surface the gap later.
 This module is the single read-side surface for the compiled layer.
 Mining and drafting both consume it; the CLI's ``--bypass-compiled``
 escape hatch short-circuits the index load entirely.
+
+Trust assumption: the scanned directories ``02-Threads/``,
+``03-Eddies/``, and ``06-Frequencies/`` are treated as trusted output
+written by ``creek compile`` (FEAT-003). ``_load_pages`` uses
+``rglob("*.md")``, which follows symlinks; the ``type: compiled_page``
+sentinel plus Pydantic validation make planted non-pages a no-op in
+practice, but the routing layer should not be pointed at untrusted
+content.
 """
 
 from __future__ import annotations
@@ -77,13 +85,16 @@ class CompiledPageIndex:
         return self.frequency_indexes.get(target_id)
 
     def fragment_ids_for(self, page: CompiledPage) -> tuple[str, ...]:
-        """Return the unique fragment IDs traced by *page*'s provenance."""
-        seen: list[str] = []
-        for entry in page.provenance:
-            for fid in entry.fragment_ids:
-                if fid and fid not in seen:
-                    seen.append(fid)
-        return tuple(seen)
+        """Return the unique fragment IDs traced by *page*'s provenance.
+
+        Uses ``dict.fromkeys`` for O(n) deduplication; insertion order
+        is guaranteed by the Python 3.7+ language spec.
+        """
+        return tuple(
+            dict.fromkeys(
+                fid for entry in page.provenance for fid in entry.fragment_ids if fid
+            ),
+        )
 
 
 def empty_index(*, bypassed: bool = False) -> CompiledPageIndex:

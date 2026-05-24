@@ -462,10 +462,15 @@ class DraftGenerator:
         vault_path: Path,
         compiled: CompiledPageIndex,
     ) -> str:
-        """Render the ``## Threads`` block, compile-first."""
+        """Render the ``## Threads`` block, compile-first.
+
+        The frontmatter scan ``_load_threads_by_id`` is deferred until a
+        cache miss actually needs it, so fully-compiled vaults skip the
+        disk walk entirely.
+        """
         if not idea.threads:
             return ""
-        threads = _load_threads_by_id(vault_path / _THREADS_SUBDIR)
+        threads: dict[str, Thread] | None = None
         entries: list[str] = []
         for tid in idea.threads:
             page = compiled.thread(tid)
@@ -480,6 +485,8 @@ class DraftGenerator:
                     surfaced_by="draft",
                     reason="missing",
                 )
+            if threads is None:
+                threads = _load_threads_by_id(vault_path / _THREADS_SUBDIR)
             thread = threads.get(tid)
             if thread is not None:
                 desc = thread.description.strip() or "(no description)"
@@ -494,10 +501,15 @@ class DraftGenerator:
         vault_path: Path,
         compiled: CompiledPageIndex,
     ) -> str:
-        """Render the ``## Eddies`` block, compile-first."""
+        """Render the ``## Eddies`` block, compile-first.
+
+        The frontmatter scan ``_load_eddies_by_id`` is deferred until a
+        cache miss actually needs it, so fully-compiled vaults skip the
+        disk walk entirely.
+        """
         if not idea.eddies:
             return ""
-        eddies = _load_eddies_by_id(vault_path / _EDDIES_SUBDIR)
+        eddies: dict[str, Eddy] | None = None
         entries: list[str] = []
         for eid in idea.eddies:
             page = compiled.eddy(eid)
@@ -512,6 +524,8 @@ class DraftGenerator:
                     surfaced_by="draft",
                     reason="missing",
                 )
+            if eddies is None:
+                eddies = _load_eddies_by_id(vault_path / _EDDIES_SUBDIR)
             eddy = eddies.get(eid)
             if eddy is not None:
                 desc = eddy.description.strip() or "(no description)"
