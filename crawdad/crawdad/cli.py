@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import anthropic
 
@@ -31,6 +31,13 @@ from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
 from crawdad.skill_loader import SkillStackRegistry, load_skills_for_session
 from crawdad.state import StateUnavailableError, load_session_state
+from crawdad.workflows import (
+    WorkflowConstraintError,
+    WorkflowNotFoundError,
+    WorkflowRegistry,
+    bundled_workflows_dir,
+    dry_run_workflow,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -55,13 +62,23 @@ def _truncate_for_discord(text: str) -> str:
     return text[: _DISCORD_REPLY_LIMIT - 3] + "..."
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """Parse *argv*, resolve config, and start the runtime."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse *argv*, resolve config, and dispatch to the requested subcommand.
+
+    Returns:
+        Process exit code. ``0`` on success, non-zero when a subcommand
+        (e.g. ``workflows run``) declines to execute because a declared
+        constraint isn't satisfied.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.subcommand == "run":
         config = load_config(args.config)
         run_bot(config)
+        return 0
+    if args.subcommand == "workflows":
+        return _dispatch_workflows(args)
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -75,7 +92,84 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to crawdad.yaml (defaults to ./crawdad.yaml).",
     )
+    _add_workflows_parser(sub)
     return parser
+
+
+def _add_workflows_parser(sub: argparse._SubParsersAction[Any]) -> None:
+    """Wire the ``crawdad workflows {list,run}`` subcommands (ADAPT-003 Phase 1)."""
+    workflows = sub.add_parser(
+        "workflows",
+        help="List or dry-run Jig-style workflows (ADAPT-003 Phase 1).",
+    )
+    workflow_actions = workflows.add_subparsers(dest="workflow_action", required=True)
+    workflow_actions.add_parser("list", help="List the bundled workflows.")
+    run_action = workflow_actions.add_parser(
+        "run",
+        help="Dry-run a workflow by name (Phase 1: prints steps; no dispatch).",
+    )
+    run_action.add_argument("name", help="Workflow name (see `workflows list`).")
+    run_action.add_argument(
+        "--current-phase",
+        default=None,
+        help="Current Wavelength phase (required for phase_aware workflows).",
+    )
+    run_action.add_argument(
+        "--allow-intimate",
+        action="store_true",
+        help="Override the privacy_tier_floor=intimate constraint.",
+    )
+
+
+def _dispatch_workflows(args: argparse.Namespace) -> int:
+    """Dispatch the ``crawdad workflows ...`` subcommand to its handler."""
+    registry = WorkflowRegistry.from_directory(bundled_workflows_dir())
+    if args.workflow_action == "list":
+        return _workflows_list(registry)
+    return _workflows_run(
+        registry,
+        name=args.name,
+        current_phase=args.current_phase,
+        allow_intimate=args.allow_intimate,
+    )
+
+
+def _workflows_list(registry: WorkflowRegistry) -> int:
+    """Print every registered workflow as ``name — description``."""
+    workflows = registry.workflows()
+    if not workflows:
+        print("No workflows registered.")
+        return 0
+    for workflow in workflows:
+        print(f"{workflow.name} — {workflow.description}")
+    return 0
+
+
+def _workflows_run(
+    registry: WorkflowRegistry,
+    *,
+    name: str,
+    current_phase: str | None,
+    allow_intimate: bool,
+) -> int:
+    """Dry-run *name*; return ``0`` on success or ``1`` on constraint refusal."""
+    try:
+        workflow = registry.get(name)
+    except WorkflowNotFoundError as exc:
+        print(f"error: {exc}")
+        return 1
+    try:
+        lines = dry_run_workflow(
+            workflow,
+            current_phase=current_phase,
+            allow_intimate=allow_intimate,
+        )
+    except WorkflowConstraintError as exc:
+        print(f"refused: {exc}")
+        return 1
+    for line in lines:
+        print(line)
+    return 0
 
 
 def run_bot(config: CrawDadConfig) -> None:

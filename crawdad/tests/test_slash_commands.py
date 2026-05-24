@@ -187,34 +187,154 @@ async def test_handle_register_without_switcher_returns_soft_error() -> None:
     assert "unavailable" in body or "wired" in body
 
 
-async def test_handle_workflow_list_returns_v11_placeholder() -> None:
-    """``/crawdad workflow list`` returns the documented v1.1 stub."""
+async def test_handle_workflow_list_enumerates_bundled_workflows() -> None:
+    """``/crawdad workflow list`` enumerates the three bundled workflows."""
     replier = _FakeReplier()
 
     await handle_workflow(replier, subaction="list")
 
     assert len(replier.sent) == 1
-    assert "v1.1" in replier.sent[0] or "1.1" in replier.sent[0]
+    body = replier.sent[0]
+    assert "substack-draft-phase-transitions" in body
+    assert "wavelength-checkin" in body
+    assert "compost-surfacing" in body
 
 
 async def test_handle_workflow_unknown_subaction_returns_help() -> None:
-    """A workflow subaction other than ``list`` returns the help summary."""
+    """A workflow subaction other than ``list`` / ``run`` returns help."""
     replier = _FakeReplier()
 
-    await handle_workflow(replier, subaction="run")
+    await handle_workflow(replier, subaction="frobnicate")
 
     assert len(replier.sent) == 1
-    assert "list" in replier.sent[0].lower()
+    body = replier.sent[0].lower()
+    assert "list" in body
+    assert "run" in body
 
 
-async def test_handle_workflow_default_returns_list_stub() -> None:
-    """``/crawdad workflow`` with no subaction is the same as ``list``."""
+async def test_handle_workflow_default_returns_list() -> None:
+    """``/crawdad workflow`` with no subaction defaults to ``list``."""
     replier = _FakeReplier()
 
     await handle_workflow(replier, subaction=None)
 
     assert len(replier.sent) == 1
-    assert "v1.1" in replier.sent[0] or "1.1" in replier.sent[0]
+    assert "wavelength-checkin" in replier.sent[0]
+
+
+async def test_handle_workflow_run_dry_runs_open_workflow() -> None:
+    """``run wavelength-checkin`` dry-runs cleanly with no overrides."""
+    replier = _FakeReplier()
+
+    await handle_workflow(replier, subaction="run", name="wavelength-checkin")
+
+    assert len(replier.sent) == 1
+    body = replier.sent[0]
+    assert "Phase 1 dry-run" in body
+    assert "creek.state.read" in body
+
+
+async def test_handle_workflow_run_refuses_phase_aware_without_phase() -> None:
+    """The Substack workflow refuses without a current phase."""
+    replier = _FakeReplier()
+
+    await handle_workflow(
+        replier, subaction="run", name="substack-draft-phase-transitions"
+    )
+
+    assert len(replier.sent) == 1
+    body = replier.sent[0]
+    assert "refused" in body
+    assert "phase_aware" in body
+
+
+async def test_handle_workflow_run_accepts_current_phase() -> None:
+    """Supplying ``current_phase`` satisfies the phase-aware constraint."""
+    replier = _FakeReplier()
+
+    await handle_workflow(
+        replier,
+        subaction="run",
+        name="substack-draft-phase-transitions",
+        current_phase="Withdrawal",
+    )
+
+    assert len(replier.sent) == 1
+    assert "Withdrawal" in replier.sent[0]
+
+
+async def test_handle_workflow_run_unknown_name_returns_error() -> None:
+    """An unknown workflow name yields a clear error reply."""
+    replier = _FakeReplier()
+
+    await handle_workflow(replier, subaction="run", name="no-such-workflow")
+
+    assert len(replier.sent) == 1
+    assert "error" in replier.sent[0]
+    assert "no-such-workflow" in replier.sent[0]
+
+
+async def test_handle_workflow_run_requires_name() -> None:
+    """``run`` with an empty / missing name returns a help reply."""
+    replier = _FakeReplier()
+
+    await handle_workflow(replier, subaction="run", name="   ")
+
+    assert len(replier.sent) == 1
+    assert "workflow" in replier.sent[0].lower()
+
+
+async def test_handle_workflow_run_intimate_requires_override(
+    tmp_path: Any,
+) -> None:
+    """An intimate-floor workflow refuses without ``allow_intimate=True``."""
+    from crawdad.workflows import WorkflowRegistry
+
+    yaml_path = tmp_path / "secret.yaml"
+    yaml_path.write_text(
+        "name: secret\n"
+        "description: Private.\n"
+        "privacy_tier_floor: intimate\n"
+        "steps:\n"
+        "  - id: s\n"
+        "    tool: creek.state.read\n",
+        encoding="utf-8",
+    )
+
+    def _loader() -> WorkflowRegistry:
+        return WorkflowRegistry.from_directory(tmp_path)
+
+    replier = _FakeReplier()
+    await handle_workflow(
+        replier, subaction="run", name="secret", registry_loader=_loader
+    )
+    assert "intimate" in replier.sent[0]
+
+    replier2 = _FakeReplier()
+    await handle_workflow(
+        replier2,
+        subaction="run",
+        name="secret",
+        allow_intimate=True,
+        registry_loader=_loader,
+    )
+    assert "Phase 1 dry-run" in replier2.sent[0]
+
+
+async def test_handle_workflow_empty_registry_replies_friendly(
+    tmp_path: Any,
+) -> None:
+    """``list`` with no workflows returns a friendly empty message."""
+    from crawdad.workflows import WorkflowRegistry
+
+    def _loader() -> WorkflowRegistry:
+        return WorkflowRegistry.from_directory(tmp_path)
+
+    replier = _FakeReplier()
+    await handle_workflow(replier, subaction="list", registry_loader=_loader)
+
+    assert len(replier.sent) == 1
+    assert "No workflows" in replier.sent[0]
 
 
 async def test_handle_help_lists_every_command() -> None:
@@ -229,7 +349,7 @@ async def test_handle_help_lists_every_command() -> None:
 
 
 async def test_handle_workflow_skips_loop() -> None:
-    """Workflow handler does NOT call the loop runner — it's a pure stub."""
+    """Workflow handler does NOT call the loop runner — the registry is local."""
     runner_calls = 0
 
     async def _counting_runner(_message: str) -> str:
@@ -373,11 +493,11 @@ async def test_register_callback_without_switcher_replies_softly() -> None:
     assert "unavailable" in body or "wired" in body
 
 
-async def test_workflow_callback_skips_loop_and_returns_stub() -> None:
-    """The workflow callback ``defer()``s but does NOT call the loop runner.
+async def test_workflow_callback_skips_loop_and_lists_workflows() -> None:
+    """The workflow callback ``defer()``s, skips the loop, and lists workflows.
 
-    The workflow stub is the only registered callback that bypasses
-    the agent loop entirely (v1.0 ships only the `list` subaction).
+    The workflow callback bypasses the agent loop entirely — ADAPT-003
+    Phase 1 runs the registry + dry-run walker directly.
     """
     runner_called = False
 
@@ -394,5 +514,23 @@ async def test_workflow_callback_skips_loop_and_returns_stub() -> None:
 
     assert interaction.response.deferred == 1
     assert len(interaction.followup.sent) == 1
-    assert "v1.1" in interaction.followup.sent[0]
+    # The default subaction is ``list`` — bundled names appear in the body.
+    assert "wavelength-checkin" in interaction.followup.sent[0]
     assert runner_called is False
+
+
+async def test_workflow_callback_run_dispatches_dry_run() -> None:
+    """``workflow`` callback with ``run`` + ``name`` dry-runs the workflow."""
+    tree = _FakeTree()
+    register(tree, loop_runner=_fake_loop_runner)
+    interaction = _FakeInteraction()
+
+    await tree.registered["workflow"]["callback"](
+        interaction, subaction="run", name="wavelength-checkin"
+    )
+
+    assert interaction.response.deferred == 1
+    assert len(interaction.followup.sent) == 1
+    body = interaction.followup.sent[0]
+    assert "Phase 1 dry-run" in body
+    assert "creek.state.read" in body

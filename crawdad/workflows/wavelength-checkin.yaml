@@ -1,0 +1,19 @@
+# ADAPT-003 reference workflow — Weekly Wavelength check-in.
+#
+# Reads the current state, summarises the phase + dosage, and posts a
+# concise response. Open-tier — safe to run at any time, no overrides
+# required.
+name: wavelength-checkin
+description: Weekly Wavelength check-in — read the current phase and dosage state.
+trigger: "/checkin"
+phase_aware: false
+privacy_tier_floor: open
+steps:
+  - id: read-state
+    tool: creek.state.read
+    args:
+      period: weekly
+  - id: respond
+    tool: crawdad.respond
+    args:
+      message: wavelength check-in

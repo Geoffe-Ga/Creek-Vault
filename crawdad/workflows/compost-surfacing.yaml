@@ -1,0 +1,19 @@
+# ADAPT-003 reference workflow — Compost folder surfacing.
+#
+# Surfaces drift, paradoxes, and emerging items from the Compost folder
+# and responds with a digest. Personal-tier floor because Compost items
+# can lean diaristic.
+name: compost-surfacing
+description: Surface what is emerging in the Compost folder — drift, paradoxes, liminal items.
+trigger: "/surface compost"
+phase_aware: false
+privacy_tier_floor: personal
+steps:
+  - id: mine
+    tool: creek.mine
+    args:
+      strategy: compost
+  - id: respond
+    tool: crawdad.respond
+    args:
+      message: compost surfaced

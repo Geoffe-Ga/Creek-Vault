@@ -472,3 +472,131 @@ def test_run_bot_passes_loop_runner_when_loop_wired(
 
     assert captured["init_kwargs"]["loop_runner"] is not None
     assert callable(captured["init_kwargs"]["loop_runner"])
+
+
+# ---------------------------------------------------------------------------
+# ADAPT-003 Phase 1: ``crawdad workflows`` subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_workflows_list_prints_each_bundled_workflow(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``crawdad workflows list`` enumerates the three reference workflows."""
+    exit_code = cli.main(["workflows", "list"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "substack-draft-phase-transitions" in out
+    assert "wavelength-checkin" in out
+    assert "compost-surfacing" in out
+
+
+def test_workflows_list_empty_registry_prints_friendly_message(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Empty bundled directory yields a friendly empty-list message."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(cli, "bundled_workflows_dir", lambda: empty)
+
+    exit_code = cli.main(["workflows", "list"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "No workflows" in out
+
+
+def test_workflows_run_dry_runs_open_workflow(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-phase-aware, open workflow dry-runs cleanly with no overrides."""
+    exit_code = cli.main(["workflows", "run", "wavelength-checkin"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Phase 1 dry-run" in out
+    assert "creek.state.read" in out
+
+
+def test_workflows_run_refuses_phase_aware_without_current_phase(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The Substack workflow refuses without ``--current-phase``."""
+    exit_code = cli.main(["workflows", "run", "substack-draft-phase-transitions"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "refused" in out
+    assert "phase_aware" in out
+
+
+def test_workflows_run_accepts_phase_aware_with_current_phase(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Supplying ``--current-phase`` satisfies the constraint."""
+    exit_code = cli.main(
+        [
+            "workflows",
+            "run",
+            "substack-draft-phase-transitions",
+            "--current-phase",
+            "Withdrawal",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Withdrawal" in out
+    assert "creek.draft" in out
+
+
+def test_workflows_run_unknown_workflow_returns_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unknown workflow name yields a clear error and non-zero exit code."""
+    exit_code = cli.main(["workflows", "run", "no-such-workflow"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "error" in out
+    assert "no-such-workflow" in out
+
+
+def test_workflows_run_intimate_workflow_requires_override(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """An intimate-tier workflow refuses without ``--allow-intimate``."""
+    yaml_path = tmp_path / "secret.yaml"
+    yaml_path.write_text(
+        "name: secret\n"
+        "description: Private.\n"
+        "privacy_tier_floor: intimate\n"
+        "steps:\n"
+        "  - id: s\n"
+        "    tool: creek.state.read\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "bundled_workflows_dir", lambda: tmp_path)
+
+    exit_code = cli.main(["workflows", "run", "secret"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "intimate" in out
+
+    exit_code = cli.main(["workflows", "run", "secret", "--allow-intimate"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Phase 1 dry-run" in out
+
+
+def test_workflows_requires_subaction() -> None:
+    """``crawdad workflows`` with no action exits via argparse usage error."""
+    with pytest.raises(SystemExit):
+        cli.main(["workflows"])

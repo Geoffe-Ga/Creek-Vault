@@ -1,4 +1,4 @@
-"""Discord slash commands for CrawDad (FEAT-016 + FEAT-029).
+"""Discord slash commands for CrawDad (FEAT-016 + FEAT-029 + ADAPT-003).
 
 The `/crawdad` family bundles `reflect`, `checkin`, `surface`, `draft`,
 `save`, `register`, and `workflow`. Most routes through the FEAT-015
@@ -15,7 +15,10 @@ discord.py. ``register()`` wraps each handler in a discord.py
 calls exceed Discord's 3-second response window), runs the handler,
 and ``followup.send()``s the reply.
 
-``/crawdad workflow`` is a v1.0 stub. Full workflow DSL ships in v1.1.
+``/crawdad workflow`` (ADAPT-003 Phase 1) mirrors the ``crawdad
+workflows ...`` CLI surface: ``list`` enumerates the bundled
+workflows, ``run <name>`` dry-runs the named workflow's step list
+without dispatching MCP tools. Phase 2 wires the real walker in.
 
 Trust boundary: the user-supplied ``topic`` and ``content`` arguments
 are interpolated directly into LLM prompts. The personal-use allowlist
@@ -30,6 +33,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
+
+from crawdad.workflows import (
+    WorkflowConstraintError,
+    WorkflowNotFoundError,
+    WorkflowRegistry,
+    bundled_workflows_dir,
+    dry_run_workflow,
+)
 
 _LOGGER = logging.getLogger("crawdad.slash_commands")
 
@@ -68,7 +79,7 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "draft": "Draft an essay on a topic (routes through creek.mine + creek.draft).",
     "save": "File the supplied content back to the vault via creek.save.",
     "register": "Switch the active voice register (FEAT-029).",
-    "workflow": "List or run named workflows (v1.0 stub — full DSL in v1.1).",
+    "workflow": "List or dry-run named workflows (ADAPT-003 Phase 1).",
 }
 
 # Module-level invariant: every command name must have a description and
@@ -94,10 +105,9 @@ _SURFACE_PROMPT = (
     "Surface anything in my vault that's emerging — paradoxes, liminal items, or "
     "drift. Route paradoxes to 10-Liminal/Paradoxes/ via creek.save."
 )
-_WORKFLOW_STUB_REPLY = (
-    "no workflows yet — coming in v1.1.\n\n"
-    "The workflow DSL (ADAPT-003) will let you compose multi-step plans like "
-    "`/crawdad workflow run weekly-review`. v1.0 ships only this `list` stub."
+_WORKFLOW_RUN_MISSING_NAME_REPLY = (
+    "Which workflow should I run? Try `/crawdad workflow run <name>` — "
+    "see `/crawdad workflow list` for the bundled set."
 )
 
 
@@ -207,19 +217,92 @@ async def handle_register(
     )
 
 
-async def handle_workflow(replier: Replier, *, subaction: str | None) -> None:
-    """``/crawdad workflow [list]`` — v1.0 stub.
+async def handle_workflow(
+    replier: Replier,
+    *,
+    subaction: str | None,
+    name: str | None = None,
+    current_phase: str | None = None,
+    allow_intimate: bool = False,
+    registry_loader: Callable[[], WorkflowRegistry] | None = None,
+) -> None:
+    """``/crawdad workflow {list,run}`` — ADAPT-003 Phase 1 surface.
 
-    ``list`` (the default) returns the documented placeholder. Any
-    other subaction returns scoped help — no MCP call, no stack trace.
+    ``list`` (the default) enumerates the bundled workflows. ``run
+    <name>`` dry-runs the named workflow's step list, applying the
+    same constraint checks as the CLI surface. ``registry_loader`` is
+    injected so tests can substitute an in-memory registry; production
+    defaults to the bundled ``crawdad/workflows/`` directory.
     """
-    if subaction in (None, "list"):
-        await replier(_WORKFLOW_STUB_REPLY)
+    action = subaction or "list"
+    if action == "list":
+        await _workflow_list_reply(replier, registry_loader=registry_loader)
+        return
+    if action == "run":
+        await _workflow_run_reply(
+            replier,
+            name=name,
+            current_phase=current_phase,
+            allow_intimate=allow_intimate,
+            registry_loader=registry_loader,
+        )
         return
     await replier(
-        f"unknown workflow subcommand: {subaction!r}. "
-        "Only `/crawdad workflow list` is available in v1.0."
+        f"unknown workflow subcommand: {action!r}. "
+        "Try `/crawdad workflow list` or `/crawdad workflow run <name>`."
     )
+
+
+def _load_default_registry() -> WorkflowRegistry:
+    """Return the bundled-directory registry (separate fn for monkey-patching)."""
+    return WorkflowRegistry.from_directory(bundled_workflows_dir())
+
+
+async def _workflow_list_reply(
+    replier: Replier,
+    *,
+    registry_loader: Callable[[], WorkflowRegistry] | None,
+) -> None:
+    """Render ``/crawdad workflow list`` against *registry_loader*."""
+    registry = (registry_loader or _load_default_registry)()
+    workflows = registry.workflows()
+    if not workflows:
+        await replier("No workflows registered.")
+        return
+    lines = ["**Workflows**"]
+    lines.extend(f"- `{w.name}` — {w.description}" for w in workflows)
+    await replier("\n".join(lines))
+
+
+async def _workflow_run_reply(
+    replier: Replier,
+    *,
+    name: str | None,
+    current_phase: str | None,
+    allow_intimate: bool,
+    registry_loader: Callable[[], WorkflowRegistry] | None,
+) -> None:
+    """Render ``/crawdad workflow run <name>`` against *registry_loader*."""
+    cleaned = (name or "").strip()
+    if not cleaned:
+        await replier(_WORKFLOW_RUN_MISSING_NAME_REPLY)
+        return
+    registry = (registry_loader or _load_default_registry)()
+    try:
+        workflow = registry.get(cleaned)
+    except WorkflowNotFoundError as exc:
+        await replier(f"error: {exc}")
+        return
+    try:
+        lines = dry_run_workflow(
+            workflow,
+            current_phase=current_phase,
+            allow_intimate=allow_intimate,
+        )
+    except WorkflowConstraintError as exc:
+        await replier(f"refused: {exc}")
+        return
+    await replier("\n".join(lines))
 
 
 async def handle_help(replier: Replier) -> None:
@@ -365,7 +448,24 @@ def _register_workflow(tree: _TreeLike) -> None:
     """Wire the ``/crawdad workflow`` Discord callback onto *tree*."""
 
     @tree.command(name="workflow", description=_COMMAND_DESCRIPTIONS["workflow"])
-    async def _callback(interaction: Any, subaction: str = "list") -> None:
-        """Discord callback for ``/crawdad workflow [subaction]`` (deferred)."""
+    async def _callback(
+        interaction: Any,
+        subaction: str = "list",
+        name: str = "",
+        current_phase: str = "",
+        allow_intimate: bool = False,
+    ) -> None:
+        """Discord callback for ``/crawdad workflow [subaction]`` (deferred).
+
+        ``name``, ``current_phase`` default to empty strings rather than
+        ``None`` so discord.py treats them as optional parameters. The
+        handler interprets empty strings as "not supplied".
+        """
         await interaction.response.defer()
-        await handle_workflow(interaction.followup.send, subaction=subaction)
+        await handle_workflow(
+            interaction.followup.send,
+            subaction=subaction,
+            name=name or None,
+            current_phase=current_phase or None,
+            allow_intimate=allow_intimate,
+        )

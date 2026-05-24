@@ -1,0 +1,34 @@
+# ADAPT-003 reference workflow — Substack draft pipeline.
+#
+# Reads the current Wavelength state, mines for thread-terminus seeds,
+# picks the top idea, drafts an essay in the confessional register,
+# and posts a confirmation back to Discord.
+#
+# Phase 1 dispatches none of these tools — the dry-run walker only
+# prints them. Phase 2 wires the real MCP dispatcher in.
+name: substack-draft-phase-transitions
+description: Draft a Substack post about phase transitions, scoped to recent material.
+trigger: "/draft phase-transitions"
+phase_aware: true
+privacy_tier_floor: open
+steps:
+  - id: read-state
+    tool: creek.state.read
+    args:
+      period: weekly
+  - id: mine
+    tool: creek.mine
+    args:
+      strategy: thread-terminus
+  - id: select
+    tool: creek.mine.select
+    args:
+      index: 0
+  - id: draft
+    tool: creek.draft
+    args:
+      register: confessional
+  - id: respond
+    tool: crawdad.respond
+    args:
+      message: drafted essay filed
