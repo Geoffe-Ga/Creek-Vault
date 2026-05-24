@@ -53,6 +53,13 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["crawdad", "crawdad.*"]
 
+# ADAPT-003: ship the reference workflow YAML files alongside the
+# package so ``crawdad.workflows.BUILTIN_WORKFLOWS_DIR`` resolves to a
+# populated directory after ``pip install crawdad`` (not only in editable
+# / source installs).
+[tool.setuptools.package-data]
+crawdad = ["builtin_workflows/*.workflow.yaml"]
+
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = [

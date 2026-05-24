@@ -1,4 +1,4 @@
-"""Discord slash commands for CrawDad (FEAT-016 + FEAT-029).
+"""Discord slash commands for CrawDad (FEAT-016 + FEAT-029 + ADAPT-003).
 
 The `/crawdad` family bundles `reflect`, `checkin`, `surface`, `draft`,
 `save`, `register`, and `workflow`. Most routes through the FEAT-015
@@ -8,14 +8,17 @@ wraps the tool results in the user's voice. ``register`` (FEAT-029)
 bypasses the loop and invokes the synchronous ``register_switcher``
 directly so voice-register changes are deterministic.
 
+``workflow`` (ADAPT-003 / issue #268) bypasses the router and uses a
+deterministic step walker over an authored YAML file. The slash
+command's ``action`` parameter switches between ``list`` (enumerate
+available workflows) and ``run`` (execute one by name).
+
 The handlers are free functions that take a tiny ``Replier`` callable
 (``async def (str) -> None``) so they can be unit-tested without
 discord.py. ``register()`` wraps each handler in a discord.py
 ``app_commands`` callback that ``defer()``s the interaction (LLM
 calls exceed Discord's 3-second response window), runs the handler,
 and ``followup.send()``s the reply.
-
-``/crawdad workflow`` is a v1.0 stub. Full workflow DSL ships in v1.1.
 
 Trust boundary: the user-supplied ``topic`` and ``content`` arguments
 are interpolated directly into LLM prompts. The personal-use allowlist
@@ -45,6 +48,15 @@ LoopRunner = Callable[[str], Awaitable[str]]
 # False on unknown / unsafe register names.
 RegisterSwitcher = Callable[[str], bool]
 
+# ADAPT-003: async callable that runs a named workflow end-to-end and
+# returns the user-facing reply. The CLI builds one by closing over the
+# per-session registry, walker, composer, and MCP client — see
+# :func:`crawdad.cli._build_workflow_runner`. Workflow runners receive
+# a ``name`` plus an ``inputs`` dict (currently always empty until the
+# Discord slash command grows a free-text input parameter; the kwarg
+# keeps the signature future-proof for FEAT-015-style follow-ups).
+WorkflowRunner = Callable[[str, dict[str, str]], Awaitable[str]]
+
 # Async callable that posts a message back to the Discord user.
 # Wraps ``discord.Interaction.followup.send`` in production; tests
 # substitute a list-appending fake.
@@ -68,7 +80,7 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "draft": "Draft an essay on a topic (routes through creek.mine + creek.draft).",
     "save": "File the supplied content back to the vault via creek.save.",
     "register": "Switch the active voice register (FEAT-029).",
-    "workflow": "List or run named workflows (v1.0 stub — full DSL in v1.1).",
+    "workflow": "List or run named workflows (ADAPT-003).",
 }
 
 # Module-level invariant: every command name must have a description and
@@ -94,10 +106,16 @@ _SURFACE_PROMPT = (
     "Surface anything in my vault that's emerging — paradoxes, liminal items, or "
     "drift. Route paradoxes to 10-Liminal/Paradoxes/ via creek.save."
 )
-_WORKFLOW_STUB_REPLY = (
-    "no workflows yet — coming in v1.1.\n\n"
-    "The workflow DSL (ADAPT-003) will let you compose multi-step plans like "
-    "`/crawdad workflow run weekly-review`. v1.0 ships only this `list` stub."
+
+# ADAPT-003: workflow subaction names. Discord renders each command
+# parameter as a separate input field; ``action`` defaults to ``list``
+# so a bare ``/crawdad workflow`` enumerates the available workflows.
+WORKFLOW_ACTION_LIST = "list"
+WORKFLOW_ACTION_RUN = "run"
+_WORKFLOW_ACTIONS = (WORKFLOW_ACTION_LIST, WORKFLOW_ACTION_RUN)
+_WORKFLOW_RUNNER_MISSING_REPLY = (
+    "Workflows aren't wired up in this session — the MCP server probably "
+    "advertised no tools, so the workflow walker has nothing to call."
 )
 
 
@@ -207,27 +225,91 @@ async def handle_register(
     )
 
 
-async def handle_workflow(replier: Replier, *, subaction: str | None) -> None:
-    """``/crawdad workflow [list]`` — v1.0 stub.
+async def handle_workflow(
+    replier: Replier,
+    *,
+    action: str | None,
+    name: str,
+    workflow_lister: Callable[[], list[str]] | None,
+    workflow_runner: WorkflowRunner | None,
+) -> None:
+    """``/crawdad workflow [list|run] [name]`` — ADAPT-003 dispatcher.
 
-    ``list`` (the default) returns the documented placeholder. Any
-    other subaction returns scoped help — no MCP call, no stack trace.
+    Action semantics:
+
+    * ``list`` (default) — return the registered workflow names. No
+      MCP call. Always safe even when the agent loop is unwired.
+    * ``run <name>`` — execute the named workflow via the supplied
+      runner. ``name`` is required; the runner produces the final
+      composer reply or raises one of the workflow-module errors,
+      which this handler maps to a user-facing soft error.
+
+    Unknown actions return scoped help text.
     """
-    if subaction in (None, "list"):
-        await replier(_WORKFLOW_STUB_REPLY)
+    chosen = (action or WORKFLOW_ACTION_LIST).strip().lower()
+    if chosen == WORKFLOW_ACTION_LIST:
+        await _reply_workflow_list(replier, workflow_lister)
+        return
+    if chosen == WORKFLOW_ACTION_RUN:
+        await _reply_workflow_run(replier, name=name, workflow_runner=workflow_runner)
         return
     await replier(
-        f"unknown workflow subcommand: {subaction!r}. "
-        "Only `/crawdad workflow list` is available in v1.0."
+        f"unknown workflow action: {chosen!r}. "
+        f"Try one of: {', '.join(_WORKFLOW_ACTIONS)}."
     )
+
+
+async def _reply_workflow_list(
+    replier: Replier, workflow_lister: Callable[[], list[str]] | None
+) -> None:
+    """Format and send the workflow registry to the user."""
+    if workflow_lister is None:
+        await replier(_WORKFLOW_RUNNER_MISSING_REPLY)
+        return
+    names = workflow_lister()
+    if not names:
+        await replier(
+            "No workflows registered yet. Drop a `*.workflow.yaml` file under "
+            "`<vault>/00-Creek-Meta/Workflows/` to author one."
+        )
+        return
+    lines = ["**Workflows**"]
+    lines.extend(f"- `/crawdad workflow run {n}`" for n in names)
+    await replier("\n".join(lines))
+
+
+async def _reply_workflow_run(
+    replier: Replier,
+    *,
+    name: str,
+    workflow_runner: WorkflowRunner | None,
+) -> None:
+    """Drive a workflow run by name, mapping errors to soft replies."""
+    cleaned = name.strip()
+    if not cleaned:
+        await replier(
+            "I need a workflow name to run. Try "
+            "`/crawdad workflow list` to see the registered workflows."
+        )
+        return
+    if workflow_runner is None:
+        await replier(_WORKFLOW_RUNNER_MISSING_REPLY)
+        return
+    try:
+        reply = await workflow_runner(cleaned, {})
+    except Exception as exc:
+        _LOGGER.warning("workflow %r failed: %s", cleaned, exc)
+        await replier(f"workflow `{cleaned}` could not run: {exc}")
+        return
+    await replier(reply)
 
 
 async def handle_help(replier: Replier) -> None:
     """Compose a help summary listing every ``/crawdad`` command.
 
     Not registered as a Discord slash command — Discord's autocomplete
-    UI already surfaces the six registered commands and their
-    descriptions. ``handle_help`` is kept as a public helper so:
+    UI already surfaces the registered commands and their descriptions.
+    ``handle_help`` is kept as a public helper so:
 
     * Tests can drive the help-text format directly.
     * Future surfaces (a v1.1 ``/crawdad help`` variant, an operator
@@ -252,6 +334,8 @@ def register(
     *,
     loop_runner: LoopRunner,
     register_switcher: RegisterSwitcher | None = None,
+    workflow_lister: Callable[[], list[str]] | None = None,
+    workflow_runner: WorkflowRunner | None = None,
 ) -> int:
     """Register every ``/crawdad`` slash command on the supplied tree.
 
@@ -265,6 +349,11 @@ def register(
     register. ``None`` keeps the command wired but the handler short-
     circuits to a soft-error reply explaining the feature is unwired.
 
+    ``workflow_lister`` and ``workflow_runner`` (ADAPT-003) supply the
+    ``list`` and ``run`` subactions of ``/crawdad workflow``. Both
+    default to ``None`` (e.g. tests / no-tool-surface sessions); in
+    that case the workflow command soft-errors instead of crashing.
+
     Returns the count of advertised commands (always
     ``len(CRAWDAD_COMMANDS)`` since the registration helpers don't
     fail). The return value is a sanity-check signal callers can pin
@@ -276,7 +365,9 @@ def register(
     _register_draft(tree, loop_runner=loop_runner)
     _register_save(tree, loop_runner=loop_runner)
     _register_register(tree, register_switcher=register_switcher)
-    _register_workflow(tree)
+    _register_workflow(
+        tree, workflow_lister=workflow_lister, workflow_runner=workflow_runner
+    )
     return len(CRAWDAD_COMMANDS)
 
 
@@ -361,11 +452,22 @@ def _register_register(
         )
 
 
-def _register_workflow(tree: _TreeLike) -> None:
+def _register_workflow(
+    tree: _TreeLike,
+    *,
+    workflow_lister: Callable[[], list[str]] | None,
+    workflow_runner: WorkflowRunner | None,
+) -> None:
     """Wire the ``/crawdad workflow`` Discord callback onto *tree*."""
 
     @tree.command(name="workflow", description=_COMMAND_DESCRIPTIONS["workflow"])
-    async def _callback(interaction: Any, subaction: str = "list") -> None:
-        """Discord callback for ``/crawdad workflow [subaction]`` (deferred)."""
+    async def _callback(interaction: Any, action: str = "list", name: str = "") -> None:
+        """Discord callback for ``/crawdad workflow [action] [name]`` (deferred)."""
         await interaction.response.defer()
-        await handle_workflow(interaction.followup.send, subaction=subaction)
+        await handle_workflow(
+            interaction.followup.send,
+            action=action,
+            name=name,
+            workflow_lister=workflow_lister,
+            workflow_runner=workflow_runner,
+        )

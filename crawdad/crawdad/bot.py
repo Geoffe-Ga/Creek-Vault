@@ -42,7 +42,7 @@ from crawdad.mcp_client import MCPUnavailableError
 from crawdad.slash_commands import register as register_slash_commands
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from crawdad.attachments import _AttachmentLike
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from crawdad.mcp_client import MCPClient
     from crawdad.router import IntentRouter
     from crawdad.skill_loader import SkillStackRegistry, VoiceSkillStack
-    from crawdad.slash_commands import LoopRunner, RegisterSwitcher
+    from crawdad.slash_commands import LoopRunner, RegisterSwitcher, WorkflowRunner
     from crawdad.state import SessionState, StateUnavailableError
 
 _LOGGER = logging.getLogger("crawdad.bot")
@@ -760,6 +760,8 @@ class CrawDadClient(discord.Client):
         loop_runner: LoopRunner | None = None,
         register_switcher: RegisterSwitcher | None = None,
         pending_batches: PendingBatchStore | None = None,
+        workflow_lister: Callable[[], list[str]] | None = None,
+        workflow_runner: WorkflowRunner | None = None,
         intents: discord.Intents | None = None,
     ) -> None:
         """Store config + agent-loop components; init the parent ``Client``.
@@ -779,6 +781,12 @@ class CrawDadClient(discord.Client):
         writes on every successful attachment turn. When ``None``, the
         consent flow is disabled and the user must fall back to the
         ``creek ingest`` CLI path.
+
+        ``workflow_lister`` and ``workflow_runner`` (ADAPT-003) are the
+        closures the ``/crawdad workflow`` command invokes for its
+        ``list`` and ``run`` subactions. Both default to ``None`` —
+        sessions without an MCP tool surface still register the
+        command but the handler soft-errors instead of crashing.
         """
         super().__init__(intents=intents or self._default_intents())
         self._config = config
@@ -802,6 +810,8 @@ class CrawDadClient(discord.Client):
                 cast("Any", self.tree),
                 loop_runner=loop_runner,
                 register_switcher=register_switcher,
+                workflow_lister=workflow_lister,
+                workflow_runner=workflow_runner,
             )
 
     @staticmethod

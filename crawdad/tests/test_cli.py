@@ -472,3 +472,172 @@ def test_run_bot_passes_loop_runner_when_loop_wired(
 
     assert captured["init_kwargs"]["loop_runner"] is not None
     assert callable(captured["init_kwargs"]["loop_runner"])
+
+
+def test_run_bot_passes_workflow_runner_and_lister_when_loop_wired(
+    patched_config: CrawDadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    vault_with_state: Path,
+) -> None:
+    """``run_bot`` wires a workflow runner + lister alongside the loop runner."""
+    from crawdad.mcp_client import ToolDetails
+
+    config = patched_config.model_copy(update={"vault_path": vault_with_state})
+    captured: dict[str, Any] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["init_kwargs"] = kwargs
+
+        def run(self, _token: str) -> None:
+            captured["ran"] = True
+
+    async def _ok_probe(_c: CrawDadConfig) -> tuple[ToolDetails, ...]:
+        return (
+            ToolDetails(
+                name="creek.state.read",
+                description="Read latest.md",
+                input_schema={"type": "object"},
+            ),
+        )
+
+    monkeypatch.setattr(cli, "CrawDadClient", _FakeClient)
+    monkeypatch.setattr(cli, "_startup_probe", _ok_probe)
+
+    cli.run_bot(config)
+
+    assert callable(captured["init_kwargs"]["workflow_lister"])
+    listed = captured["init_kwargs"]["workflow_lister"]()
+    assert "wavelength-checkin" in listed
+    assert captured["init_kwargs"]["workflow_runner"] is not None
+    assert callable(captured["init_kwargs"]["workflow_runner"])
+
+
+def test_build_workflow_runner_returns_none_when_composer_unset(
+    patched_config: CrawDadConfig, tmp_path: Path
+) -> None:
+    """No composer → no workflow runner (slash command will soft-error)."""
+    from crawdad.workflows import WorkflowRegistry
+
+    components = cli._build_agent_components(config=patched_config, tool_details=())
+    registry = WorkflowRegistry(vault_path=tmp_path)
+
+    runner = cli._build_workflow_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        registry=registry,
+    )
+
+    assert runner is None
+
+
+async def test_build_workflow_runner_returns_string_on_unknown_workflow(
+    patched_config: CrawDadConfig, tmp_path: Path
+) -> None:
+    """An unknown workflow name lands as a Discord-safe error string."""
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.workflows import WorkflowRegistry
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+    registry = WorkflowRegistry(vault_path=tmp_path)
+
+    runner = cli._build_workflow_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        registry=registry,
+    )
+
+    assert runner is not None
+    reply = await runner("does-not-exist", {})
+    assert "does-not-exist" in reply
+    assert "could not find" in reply.lower()
+
+
+async def test_build_workflow_runner_returns_string_on_workflow_failure(
+    patched_config: CrawDadConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A walker / composer error lands as a Discord-safe error string."""
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.workflows import WorkflowRegistry
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+    registry = WorkflowRegistry(vault_path=tmp_path)
+
+    async def _boom(**_kwargs: Any) -> Any:
+        msg = "simulated boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(cli, "run_workflow_and_compose", _boom)
+
+    runner = cli._build_workflow_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        registry=registry,
+    )
+
+    assert runner is not None
+    reply = await runner("wavelength-checkin", {})
+    assert "wavelength-checkin" in reply
+    assert "failed" in reply.lower()
+
+
+async def test_build_workflow_runner_returns_composed_reply(
+    patched_config: CrawDadConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful run forwards the composer reply through truncation only."""
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.workflows import WorkflowRegistry
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+    registry = WorkflowRegistry(vault_path=tmp_path)
+
+    async def _ok(**_kwargs: Any) -> str:
+        return "x" * (cli._DISCORD_REPLY_LIMIT + 50)
+
+    monkeypatch.setattr(cli, "run_workflow_and_compose", _ok)
+
+    runner = cli._build_workflow_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        registry=registry,
+    )
+
+    assert runner is not None
+    reply = await runner("wavelength-checkin", {})
+    assert reply.endswith("...")
+    assert len(reply) <= cli._DISCORD_REPLY_LIMIT

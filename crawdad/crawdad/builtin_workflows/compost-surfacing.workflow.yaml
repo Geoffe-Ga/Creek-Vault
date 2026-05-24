@@ -1,0 +1,24 @@
+# Reference workflow: surface what's emerging across the vault for the
+# user's current phase. See ADAPT-003 (issue #268) for context.
+#
+# The "compost" framing in ADAPT-003's plan is a metaphor for the user's
+# liminal / unlinked material; the implementation uses ``creek.mine``'s
+# phase-scoped seed surface as the closest mechanical equivalent
+# available in v1.1's MCP tool set.
+name: compost-surfacing
+description: |
+  Surface ranked essay seeds — paradoxes, liminal fragments, and
+  thread terminals — for the user's current phase. The composer turns
+  the structured seed list into a short, voice-faithful summary.
+trigger: "/crawdad workflow run compost-surfacing"
+phase_aware: false
+privacy_tier_floor: personal
+steps:
+  - id: read
+    tool: creek.state.read
+    args: {}
+  - id: surface
+    tool: creek.mine
+    args:
+      phase: "{{state.phase}}"
+      limit: 10

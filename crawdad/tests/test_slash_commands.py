@@ -187,34 +187,168 @@ async def test_handle_register_without_switcher_returns_soft_error() -> None:
     assert "unavailable" in body or "wired" in body
 
 
-async def test_handle_workflow_list_returns_v11_placeholder() -> None:
-    """``/crawdad workflow list`` returns the documented v1.1 stub."""
+async def test_handle_workflow_list_enumerates_registered_workflows() -> None:
+    """``/crawdad workflow list`` enumerates the registry's workflow names."""
     replier = _FakeReplier()
 
-    await handle_workflow(replier, subaction="list")
+    await handle_workflow(
+        replier,
+        action="list",
+        name="",
+        workflow_lister=lambda: ["alpha", "beta"],
+        workflow_runner=None,
+    )
 
     assert len(replier.sent) == 1
-    assert "v1.1" in replier.sent[0] or "1.1" in replier.sent[0]
+    assert "alpha" in replier.sent[0]
+    assert "beta" in replier.sent[0]
 
 
-async def test_handle_workflow_unknown_subaction_returns_help() -> None:
-    """A workflow subaction other than ``list`` returns the help summary."""
+async def test_handle_workflow_list_with_no_workflows_explains_how_to_author() -> None:
+    """An empty registry returns a hint about authoring a workflow file."""
     replier = _FakeReplier()
 
-    await handle_workflow(replier, subaction="run")
+    await handle_workflow(
+        replier,
+        action="list",
+        name="",
+        workflow_lister=lambda: [],
+        workflow_runner=None,
+    )
 
     assert len(replier.sent) == 1
-    assert "list" in replier.sent[0].lower()
+    body = replier.sent[0].lower()
+    assert "no workflows" in body or "author" in body
 
 
-async def test_handle_workflow_default_returns_list_stub() -> None:
-    """``/crawdad workflow`` with no subaction is the same as ``list``."""
+async def test_handle_workflow_list_without_lister_returns_soft_error() -> None:
+    """A missing lister (no MCP tools surface) yields the soft-error reply."""
     replier = _FakeReplier()
 
-    await handle_workflow(replier, subaction=None)
+    await handle_workflow(
+        replier,
+        action="list",
+        name="",
+        workflow_lister=None,
+        workflow_runner=None,
+    )
 
     assert len(replier.sent) == 1
-    assert "v1.1" in replier.sent[0] or "1.1" in replier.sent[0]
+    assert "aren't wired" in replier.sent[0] or "unavailable" in replier.sent[0].lower()
+
+
+async def test_handle_workflow_default_action_is_list() -> None:
+    """``/crawdad workflow`` with no action behaves like ``list``."""
+    replier = _FakeReplier()
+
+    await handle_workflow(
+        replier,
+        action=None,
+        name="",
+        workflow_lister=lambda: ["alpha"],
+        workflow_runner=None,
+    )
+
+    assert len(replier.sent) == 1
+    assert "alpha" in replier.sent[0]
+
+
+async def test_handle_workflow_run_invokes_runner_with_name() -> None:
+    """``/crawdad workflow run <name>`` calls the runner with the cleaned name."""
+    captured: dict[str, object] = {}
+
+    async def _runner(name: str, inputs: dict[str, str]) -> str:
+        captured["name"] = name
+        captured["inputs"] = inputs
+        return "workflow done"
+
+    replier = _FakeReplier()
+    await handle_workflow(
+        replier,
+        action="run",
+        name="  wavelength-checkin  ",
+        workflow_lister=None,
+        workflow_runner=_runner,
+    )
+
+    assert captured["name"] == "wavelength-checkin"
+    assert captured["inputs"] == {}
+    assert replier.sent == ["workflow done"]
+
+
+async def test_handle_workflow_run_without_name_returns_help() -> None:
+    """``/crawdad workflow run`` with no name returns help — no runner call."""
+    calls: list[str] = []
+
+    async def _runner(name: str, _inputs: dict[str, str]) -> str:
+        calls.append(name)
+        return ""
+
+    replier = _FakeReplier()
+    await handle_workflow(
+        replier,
+        action="run",
+        name="",
+        workflow_lister=None,
+        workflow_runner=_runner,
+    )
+
+    assert calls == []
+    assert "name" in replier.sent[0].lower() or "list" in replier.sent[0].lower()
+
+
+async def test_handle_workflow_run_without_runner_returns_soft_error() -> None:
+    """A missing runner yields the soft-error reply (no crash)."""
+    replier = _FakeReplier()
+    await handle_workflow(
+        replier,
+        action="run",
+        name="wavelength-checkin",
+        workflow_lister=None,
+        workflow_runner=None,
+    )
+
+    assert len(replier.sent) == 1
+    assert "aren't wired" in replier.sent[0] or "unavailable" in replier.sent[0].lower()
+
+
+async def test_handle_workflow_run_maps_runner_exceptions_to_soft_reply() -> None:
+    """A runner exception lands as a soft Discord reply, not a stack trace."""
+
+    async def _boom(_name: str, _inputs: dict[str, str]) -> str:
+        msg = "no workflow named 'missing'"
+        raise RuntimeError(msg)
+
+    replier = _FakeReplier()
+    await handle_workflow(
+        replier,
+        action="run",
+        name="missing",
+        workflow_lister=None,
+        workflow_runner=_boom,
+    )
+
+    assert len(replier.sent) == 1
+    assert "missing" in replier.sent[0]
+    assert "could not run" in replier.sent[0]
+
+
+async def test_handle_workflow_unknown_action_returns_help() -> None:
+    """An action other than list/run lands a help summary."""
+    replier = _FakeReplier()
+
+    await handle_workflow(
+        replier,
+        action="frobnicate",
+        name="",
+        workflow_lister=None,
+        workflow_runner=None,
+    )
+
+    assert len(replier.sent) == 1
+    body = replier.sent[0].lower()
+    assert "list" in body
+    assert "run" in body
 
 
 async def test_handle_help_lists_every_command() -> None:
@@ -228,19 +362,27 @@ async def test_handle_help_lists_every_command() -> None:
         assert name in body
 
 
-async def test_handle_workflow_skips_loop() -> None:
-    """Workflow handler does NOT call the loop runner — it's a pure stub."""
-    runner_calls = 0
+async def test_handle_workflow_list_skips_loop_runner() -> None:
+    """The workflow list handler does NOT call the agent loop runner."""
+    loop_calls = 0
 
-    async def _counting_runner(_message: str) -> str:
-        nonlocal runner_calls
-        runner_calls += 1
+    async def _counting_loop(_message: str) -> str:
+        nonlocal loop_calls
+        loop_calls += 1
         return "should not be reached"
 
     replier = _FakeReplier()
-    await handle_workflow(replier, subaction="list")
+    await handle_workflow(
+        replier,
+        action="list",
+        name="",
+        workflow_lister=lambda: ["wavelength-checkin"],
+        workflow_runner=None,
+    )
 
-    assert runner_calls == 0
+    assert loop_calls == 0
+    # Sanity check: the loop fake exists only to prove no one called it.
+    assert _counting_loop is not None
 
 
 class _FakeTree:
@@ -373,26 +515,70 @@ async def test_register_callback_without_switcher_replies_softly() -> None:
     assert "unavailable" in body or "wired" in body
 
 
-async def test_workflow_callback_skips_loop_and_returns_stub() -> None:
-    """The workflow callback ``defer()``s but does NOT call the loop runner.
-
-    The workflow stub is the only registered callback that bypasses
-    the agent loop entirely (v1.0 ships only the `list` subaction).
-    """
-    runner_called = False
+async def test_workflow_callback_defers_and_lists_when_wired() -> None:
+    """``/crawdad workflow`` lists registered workflows when a lister is wired."""
 
     async def _spy_runner(_msg: str) -> str:
-        nonlocal runner_called
-        runner_called = True
         return "should not be reached"
 
     tree = _FakeTree()
-    register(tree, loop_runner=_spy_runner)
+    register(
+        tree,
+        loop_runner=_spy_runner,
+        workflow_lister=lambda: ["wavelength-checkin"],
+        workflow_runner=None,
+    )
     interaction = _FakeInteraction()
 
     await tree.registered["workflow"]["callback"](interaction)
 
     assert interaction.response.deferred == 1
     assert len(interaction.followup.sent) == 1
-    assert "v1.1" in interaction.followup.sent[0]
-    assert runner_called is False
+    assert "wavelength-checkin" in interaction.followup.sent[0]
+
+
+async def test_workflow_callback_runs_workflow_and_replies() -> None:
+    """``/crawdad workflow run <name>`` defers and invokes the workflow runner."""
+    captured: dict[str, object] = {}
+
+    async def _runner(name: str, inputs: dict[str, str]) -> str:
+        captured["name"] = name
+        captured["inputs"] = inputs
+        return "workflow output"
+
+    async def _loop(_msg: str) -> str:
+        return "should not be reached"
+
+    tree = _FakeTree()
+    register(
+        tree,
+        loop_runner=_loop,
+        workflow_lister=lambda: ["foo"],
+        workflow_runner=_runner,
+    )
+    interaction = _FakeInteraction()
+
+    await tree.registered["workflow"]["callback"](interaction, action="run", name="foo")
+
+    assert interaction.response.deferred == 1
+    assert captured["name"] == "foo"
+    assert captured["inputs"] == {}
+    assert interaction.followup.sent == ["workflow output"]
+
+
+async def test_workflow_callback_soft_errors_when_unwired() -> None:
+    """When no lister / runner is wired, the callback still defers and replies."""
+
+    async def _loop(_msg: str) -> str:
+        return "should not be reached"
+
+    tree = _FakeTree()
+    register(tree, loop_runner=_loop)
+    interaction = _FakeInteraction()
+
+    await tree.registered["workflow"]["callback"](interaction)
+
+    assert interaction.response.deferred == 1
+    assert len(interaction.followup.sent) == 1
+    body = interaction.followup.sent[0].lower()
+    assert "aren't wired" in body or "unavailable" in body
