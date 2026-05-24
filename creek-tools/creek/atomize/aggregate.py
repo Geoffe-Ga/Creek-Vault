@@ -298,11 +298,15 @@ def _build_parent(
 def _inherit_source(children: list[Fragment]) -> FragmentSource:
     """Build the parent's :class:`FragmentSource` from its children.
 
-    Channel, platform, conversation_id, and original_file are inherited
-    from the first child (callers guarantee a shared source key).
-    ``author`` is promoted to ``COLLABORATIVE`` when ≥2 distinct authors
-    appear; ``interlocutor`` is the comma-joined sorted set of child
-    interlocutors.
+    In single-source mode (FEAT-022) every child shares a source key, so
+    channel, platform, conversation_id, and original_file are simply
+    inherited from the first child. In cross-source mode (FEAT-027) the
+    first child's values become a representative anchor — the full set
+    of contributing sources is captured separately as ``source/<key>``
+    tags on the parent, and each child still points at its origin via
+    its own :class:`FragmentSource`. ``author`` is promoted to
+    ``COLLABORATIVE`` when ≥2 distinct authors appear; ``interlocutor``
+    is the comma-joined sorted set of child interlocutors.
     """
     first = children[0].source
     authors = {c.source.author for c in children}
