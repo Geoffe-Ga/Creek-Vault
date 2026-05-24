@@ -13,12 +13,14 @@ point (``main``).
 
 from __future__ import annotations
 
+import argparse
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
-from creek.config import load_config
+from creek.config import CONFIG_PATH_ENV_VAR, load_config
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import (
     classify_tool,
@@ -43,7 +45,6 @@ from creek_mcp.tools.draft import draft_tool
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 SERVER_NAME = "creek-tools-mcp"
 
@@ -396,8 +397,52 @@ def build_server(
     return server
 
 
-def main() -> None:
-    """Run the MCP server over stdio (entry point for ``creek-tools-mcp``)."""
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for the ``creek-tools-mcp`` entry point.
+
+    Exposed as a helper so tests can drive parsing without invoking the
+    stdio loop.
+
+    Returns:
+        A configured :class:`argparse.ArgumentParser` accepting an
+        optional ``--config <path>`` flag.
+    """
+    parser = argparse.ArgumentParser(
+        prog="creek-tools-mcp",
+        description=(
+            "Creek MCP server (stdio transport). Pass --config to "
+            "pin a config file regardless of the working directory "
+            "the server is launched from."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "Path to creek_config.yaml. When supplied, sets "
+            f"{CONFIG_PATH_ENV_VAR} in the process environment so every "
+            "tool handler picks it up regardless of cwd."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the MCP server over stdio (entry point for ``creek-tools-mcp``).
+
+    Args:
+        argv: Optional list of command-line arguments. When ``None``
+            (the default for the production entry point), the parser
+            reads :data:`sys.argv`. Tests supply an explicit list to
+            avoid mutating the process state.
+    """
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.config is not None:
+        if not args.config.exists():
+            parser.error(f"--config: file not found: {args.config}")
+        os.environ[CONFIG_PATH_ENV_VAR] = str(args.config.resolve())
     build_server().run(transport="stdio")
 
 

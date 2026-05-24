@@ -10,6 +10,7 @@ file — they must come from environment variables.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -19,6 +20,15 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+CONFIG_PATH_ENV_VAR = "CREEK_CONFIG"
+"""Environment variable that, when set, supplies the default config path.
+
+Honoured by :func:`load_config` when no explicit ``config_path``
+argument is given. Subprocess-friendly: any spawned process inherits
+the variable, so callers (e.g. CrawDad spawning ``creek-tools-mcp``)
+can keep the configured vault config discoverable regardless of cwd.
+"""
 
 
 class LLMConfig(BaseModel):
@@ -721,17 +731,36 @@ def load_config(
     expected (e.g. ``creek init`` runs before any config exists).
 
     Args:
-        config_path: Path to a ``creek_config.yaml`` file.  Defaults to
-            ``creek_config.yaml`` in the current directory.
+        config_path: Path to a ``creek_config.yaml`` file. When ``None``
+            (the default), :func:`load_config` consults the
+            ``CREEK_CONFIG`` environment variable; if that is unset or
+            empty, it falls back to ``creek_config.yaml`` in the
+            current directory.
         warn_on_missing: When ``True`` (default), log a WARNING if the
             file does not exist. Suppress for CLI commands that
             legitimately operate in the no-config state.
 
     Returns:
         A fully-validated ``CreekConfig`` instance.
+
+    Raises:
+        FileNotFoundError: When ``CREEK_CONFIG`` is set to a path that
+            does not exist. The explicit env var declares intent, so a
+            silent fallback to defaults would mask the misconfiguration.
     """
     if config_path is None:
-        config_path = Path("creek_config.yaml")
+        env_value = os.environ.get(CONFIG_PATH_ENV_VAR, "").strip()
+        if env_value:
+            config_path = Path(env_value)
+            if not config_path.exists():
+                msg = (
+                    f"{CONFIG_PATH_ENV_VAR} points to {config_path}, "
+                    "but no file exists there. Unset the environment "
+                    "variable or correct the path."
+                )
+                raise FileNotFoundError(msg)
+        else:
+            config_path = Path("creek_config.yaml")
 
     if config_path.exists():
         with config_path.open() as f:
@@ -742,10 +771,12 @@ def load_config(
         logger.warning(
             "Config file %s not found; running with built-in defaults. "
             "Run `creek init --vault <vault>` to write a starter config, "
-            "or pass --config <path> to point at one explicitly. "
-            "Pipeline behaviour (privacy, redaction, cleaning) depends on "
-            "this file — silent defaults are usually not what you want.",
+            "set %s to an absolute config path, or pass --config <path> "
+            "explicitly. Pipeline behaviour (privacy, redaction, "
+            "cleaning) depends on this file — silent defaults are "
+            "usually not what you want.",
             config_path,
+            CONFIG_PATH_ENV_VAR,
         )
     return CreekConfig()
 
