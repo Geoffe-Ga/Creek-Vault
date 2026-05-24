@@ -19,12 +19,15 @@ The factory exposes two layers:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path  # noqa: TC003  # runtime use in signatures
+from typing import TYPE_CHECKING
 
 import frontmatter
 
 from creek.compile.provenance import ProvenanceEntry
 from creek.models import CompiledPage
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _DEFAULT_COMPILED_AT = datetime(2026, 4, 1, tzinfo=UTC)
 _DEFAULT_COMPILED_SUBFOLDER = "Compiled"

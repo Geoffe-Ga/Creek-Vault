@@ -87,10 +87,8 @@ class CompiledPageIndex:
     def fragment_ids_for(self, page: CompiledPage) -> tuple[str, ...]:
         """Return the unique fragment IDs traced by *page*'s provenance.
 
-        ``dict.fromkeys`` preserves insertion order in O(n) total — the
-        previous list-based dedup paid an O(n) membership check per
-        insertion. The :class:`TestLoadCompiledPages` suite pins the
-        ordering invariant.
+        Uses ``dict.fromkeys`` for O(n) deduplication; insertion order
+        is guaranteed by the Python 3.7+ language spec.
         """
         return tuple(
             dict.fromkeys(
