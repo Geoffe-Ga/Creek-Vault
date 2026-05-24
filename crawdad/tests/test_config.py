@@ -200,3 +200,51 @@ def test_load_config_parses_attachment_overrides(
     assert config.attachments.allowed_extensions == frozenset({".md", ".txt"})
     assert config.attachments.denied_extensions == frozenset({".exe", ".sh"})
     assert config.attachments.channel_privacy_tiers[222] == "intimate"
+
+
+def test_load_config_parses_reject_on_mime_mismatch_from_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FEAT-035: ``attachments.reject_on_mime_mismatch: true`` round-trips.
+
+    Operators flip this knob in ``crawdad.yaml`` to harden the gate
+    from the documented soft-warning default. The field has to survive
+    the YAML → Pydantic boundary unchanged or the runtime behaviour
+    silently won't match the configured policy.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n"
+        "attachments:\n"
+        "  reject_on_mime_mismatch: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+    assert config.attachments.reject_on_mime_mismatch is True
+
+
+def test_load_config_reject_on_mime_mismatch_defaults_false_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YAML without the knob keeps the v1 soft-warning default."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+    assert config.attachments.reject_on_mime_mismatch is False

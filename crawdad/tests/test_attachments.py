@@ -526,10 +526,30 @@ def test_verify_mime_type_matched_png_signature_returns_match() -> None:
 
 
 def test_verify_mime_type_matched_text_sample_returns_match() -> None:
-    """Plain UTF-8 text under a ``.md`` extension passes the text sample check."""
+    """Plain UTF-8 text under a ``.md`` extension passes the text sample check.
+
+    The reported MIME is per-extension (``text/markdown`` for ``.md``,
+    ``application/json`` for ``.json``, etc.) so the user-facing summary
+    does not lie about format identity when a match surfaces.
+    """
     result = verify_mime_type("notes.md", b"# Hello\n\nSome notes.\n")
     assert result.status == "match"
-    assert result.detected_mime == "text/plain"
+    assert result.detected_mime == "text/markdown"
+
+
+def test_verify_mime_type_text_match_uses_per_extension_mime() -> None:
+    """``.json`` / ``.html`` / ``.csv`` matches report their specific MIMEs."""
+    json_result = verify_mime_type("config.json", b'{"key": "value"}\n')
+    assert json_result.status == "match"
+    assert json_result.detected_mime == "application/json"
+
+    html_result = verify_mime_type("page.html", b"<!doctype html><p>hi</p>\n")
+    assert html_result.status == "match"
+    assert html_result.detected_mime == "text/html"
+
+    csv_result = verify_mime_type("data.csv", b"a,b,c\n1,2,3\n")
+    assert csv_result.status == "match"
+    assert csv_result.detected_mime == "text/csv"
 
 
 def test_verify_mime_type_zip_disguised_as_pdf_is_mismatch() -> None:
@@ -551,7 +571,7 @@ def test_verify_mime_type_executable_disguised_as_markdown_is_mismatch() -> None
     result = verify_mime_type("evil.md", _PE_HEADER + b"\x00" * 100)
     assert result.status == "mismatch"
     assert result.detected_mime == "application/octet-stream"
-    assert result.expected_mime == "text/plain"
+    assert result.expected_mime == "text/markdown"
 
 
 def test_verify_mime_type_invalid_utf8_under_text_extension_is_mismatch() -> None:
@@ -560,6 +580,7 @@ def test_verify_mime_type_invalid_utf8_under_text_extension_is_mismatch() -> Non
     result = verify_mime_type("garbled.txt", invalid_utf8)
     assert result.status == "mismatch"
     assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
 
 
 def test_verify_mime_type_unknown_extension_returns_unknown_status() -> None:
@@ -702,10 +723,13 @@ async def test_process_attachment_unknown_extension_still_accepts(
     ``reject_on_mime_mismatch`` only fires on detected mismatches; an
     ``unknown`` verification status is treated as "no information" and
     must not trigger rejection (otherwise the knob would secretly
-    narrow the allow list).
+    narrow the allow list). The fixture explicitly allow-lists
+    ``.toml`` so the test pins the MIME-gate behaviour — not the
+    extension-gate behaviour (covered by
+    :func:`test_empty_allowed_extensions_passes_anything_not_denied`).
     """
     config = AttachmentConfig(
-        allowed_extensions=frozenset(),
+        allowed_extensions=frozenset({".toml"}),
         reject_on_mime_mismatch=True,
     )
     attachment = _FakeAttachment(
@@ -787,6 +811,24 @@ def test_attachment_config_reject_on_mime_mismatch_defaults_false() -> None:
     """The knob defaults to soft-warning mode so the v1 consent gate is unchanged."""
     config = AttachmentConfig()
     assert config.reject_on_mime_mismatch is False
+
+
+def test_extension_mime_specs_canonical_is_member_of_acceptable() -> None:
+    """Structural integrity: every spec's ``canonical`` MIME is also acceptable.
+
+    Guards against a future contributor adding an entry where the
+    user-facing ``canonical`` label drifts away from the membership
+    set used to decide ``match`` vs ``mismatch`` — a real file of the
+    right type would otherwise be flagged as a mismatch against its
+    own canonical name.
+    """
+    from crawdad.attachments import _EXTENSION_MIME_SPECS
+
+    for suffix, spec in _EXTENSION_MIME_SPECS.items():
+        assert spec.canonical in spec.acceptable, (
+            f"{suffix}: canonical {spec.canonical!r} missing from "
+            f"acceptable set {sorted(spec.acceptable)!r}"
+        )
 
 
 def test_attachment_config_default_allowed_extensions_omits_legacy_office() -> None:

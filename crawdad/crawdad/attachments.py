@@ -81,56 +81,69 @@ _EXTENSION_TO_INGESTOR_TYPE: dict[str, str] = {
     ".webp": "image",
 }
 
-# FEAT-035: extensions whose declared content type can be verified by
-# ``filetype.guess`` against the first kilobyte of the downloaded body.
-# Each entry lists every MIME string the library may legitimately return
-# for that extension — OOXML containers, for example, are zip files at
-# the byte level so ``filetype`` correctly reports ``application/zip``
-# unless the runtime libmagic version has dedicated OOXML detection.
-_EXTENSION_TO_ACCEPTABLE_MIMES: dict[str, frozenset[str]] = {
-    ".pdf": frozenset({"application/pdf"}),
-    ".png": frozenset({"image/png"}),
-    ".jpg": frozenset({"image/jpeg"}),
-    ".jpeg": frozenset({"image/jpeg"}),
-    ".gif": frozenset({"image/gif"}),
-    ".webp": frozenset({"image/webp"}),
-    ".docx": frozenset(
-        {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/zip",
-        }
-    ),
-    ".xlsx": frozenset(
-        {
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "application/zip",
-        }
-    ),
-    ".pptx": frozenset(
-        {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            "application/zip",
-        }
-    ),
-}
 
-# Canonical (first-choice) MIME per extension — used as the ``expected``
-# label in the verification report. Order does not matter for the
-# membership check; this lookup is purely cosmetic so the user-facing
-# summary names the format they probably recognise.
-_EXTENSION_TO_CANONICAL_MIME: dict[str, str] = {
-    ".pdf": "application/pdf",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".docx": (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+# FEAT-035: per-extension MIME contract for the binary-signature
+# verifier. ``canonical`` is the MIME string surfaced to the user as the
+# expected type; ``acceptable`` is the set of MIME strings any of which
+# ``filetype.guess`` may legitimately return for that extension — OOXML
+# containers, for example, are zip files at the byte level, so
+# ``filetype`` correctly reports ``application/zip`` unless the runtime
+# library has dedicated OOXML detection. Bundling both fields under one
+# key prevents the canonical/acceptable maps drifting out of sync (an
+# unchecked second lookup would raise ``KeyError`` at runtime today
+# rather than ``ImportError`` at module load).
+@dataclass(frozen=True)
+class _ExtensionMimeSpec:
+    """Per-extension MIME contract for the binary verifier."""
+
+    canonical: str
+    acceptable: frozenset[str]
+
+
+_OOXML_DOCX_MIME = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+_OOXML_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_OOXML_PPTX_MIME = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
+
+_EXTENSION_MIME_SPECS: dict[str, _ExtensionMimeSpec] = {
+    ".pdf": _ExtensionMimeSpec(
+        canonical="application/pdf",
+        acceptable=frozenset({"application/pdf"}),
     ),
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".pptx": (
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ".png": _ExtensionMimeSpec(
+        canonical="image/png",
+        acceptable=frozenset({"image/png"}),
+    ),
+    ".jpg": _ExtensionMimeSpec(
+        canonical="image/jpeg",
+        acceptable=frozenset({"image/jpeg"}),
+    ),
+    ".jpeg": _ExtensionMimeSpec(
+        canonical="image/jpeg",
+        acceptable=frozenset({"image/jpeg"}),
+    ),
+    ".gif": _ExtensionMimeSpec(
+        canonical="image/gif",
+        acceptable=frozenset({"image/gif"}),
+    ),
+    ".webp": _ExtensionMimeSpec(
+        canonical="image/webp",
+        acceptable=frozenset({"image/webp"}),
+    ),
+    ".docx": _ExtensionMimeSpec(
+        canonical=_OOXML_DOCX_MIME,
+        acceptable=frozenset({_OOXML_DOCX_MIME, "application/zip"}),
+    ),
+    ".xlsx": _ExtensionMimeSpec(
+        canonical=_OOXML_XLSX_MIME,
+        acceptable=frozenset({_OOXML_XLSX_MIME, "application/zip"}),
+    ),
+    ".pptx": _ExtensionMimeSpec(
+        canonical=_OOXML_PPTX_MIME,
+        acceptable=frozenset({_OOXML_PPTX_MIME, "application/zip"}),
     ),
 }
 
@@ -139,27 +152,32 @@ _EXTENSION_TO_CANONICAL_MIME: dict[str, str] = {
 # in this set are expected to be plain text, so a NUL byte or undecodable
 # bytes in the first ``_TEXT_SAMPLE_BYTES`` of the body are treated as
 # evidence that the file is actually a binary blob renamed to a text
-# extension (the polyglot case the issue calls out).
-_TEXT_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".md",
-        ".markdown",
-        ".txt",
-        ".html",
-        ".htm",
-        ".json",
-        ".csv",
-    }
-)
+# extension (the polyglot case the issue calls out). The dict carries
+# the canonical text MIME per extension so a successful match surfaces
+# the right label (``text/markdown`` for ``.md``, ``application/json``
+# for ``.json``, etc.) instead of a generic ``text/plain`` blanket.
+#
+# This path is heuristic — see ADR-0002 §"Negative" for the false-
+# negative surface and future hardening directions (tolerant HTML
+# parser, full JSON round-trip for ``.json``).
+_TEXT_EXTENSION_TO_MIME: dict[str, str] = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".json": "application/json",
+    ".csv": "text/csv",
+}
+_TEXT_EXTENSIONS: frozenset[str] = frozenset(_TEXT_EXTENSION_TO_MIME)
 
 # Sample size for the text-content heuristic. One kilobyte is enough to
 # catch every common binary header (PE / ELF / OLE / PDF / ZIP) without
 # materially extending the download path's CPU cost.
 _TEXT_SAMPLE_BYTES: int = 1024
 
-# Canonical MIME strings used by the text path so the Discord reply
-# names something meaningful when a sample fails the heuristic.
-_TEXT_CANONICAL_MIME: str = "text/plain"
+# Canonical MIME the text verifier uses when it has to label something
+# as binary (NUL bytes or invalid UTF-8 in the sample window).
 _BINARY_CANONICAL_MIME: str = "application/octet-stream"
 
 MimeStatus = Literal["match", "mismatch", "unknown"]
@@ -220,50 +238,51 @@ def verify_mime_type(filename: str, data: bytes) -> MimeVerification:
         to warn or skip the soft-error path.
     """
     suffix = Path(filename).suffix.lower()
-    if suffix in _TEXT_EXTENSIONS:
-        return _verify_text_sample(data)
-    if suffix in _EXTENSION_TO_ACCEPTABLE_MIMES:
+    if suffix in _TEXT_EXTENSION_TO_MIME:
+        return _verify_text_sample(suffix, data)
+    if suffix in _EXTENSION_MIME_SPECS:
         return _verify_binary_signature(suffix, data)
     return _UNKNOWN_VERIFICATION
 
 
 def _verify_binary_signature(suffix: str, data: bytes) -> MimeVerification:
     """Run ``filetype.guess`` against *data* and compare to *suffix*'s claim."""
+    spec = _EXTENSION_MIME_SPECS[suffix]
     guess = filetype.guess(data)
     detected = guess.mime if guess is not None else None
-    acceptable = _EXTENSION_TO_ACCEPTABLE_MIMES[suffix]
-    expected = _EXTENSION_TO_CANONICAL_MIME[suffix]
-    if detected is not None and detected in acceptable:
+    if detected is not None and detected in spec.acceptable:
         return MimeVerification(
-            status="match", detected_mime=detected, expected_mime=expected
+            status="match", detected_mime=detected, expected_mime=spec.canonical
         )
     return MimeVerification(
-        status="mismatch", detected_mime=detected, expected_mime=expected
+        status="mismatch", detected_mime=detected, expected_mime=spec.canonical
     )
 
 
-def _verify_text_sample(data: bytes) -> MimeVerification:
+def _verify_text_sample(suffix: str, data: bytes) -> MimeVerification:
     """Sample-check that *data* is plausibly UTF-8 text with no NUL bytes."""
+    expected = _TEXT_EXTENSION_TO_MIME[suffix]
     sample = data[:_TEXT_SAMPLE_BYTES]
-    if b"\x00" in sample:
+    if b"\x00" in sample or not _decodes_as_utf8(sample):
         return MimeVerification(
             status="mismatch",
             detected_mime=_BINARY_CANONICAL_MIME,
-            expected_mime=_TEXT_CANONICAL_MIME,
-        )
-    try:
-        sample.decode("utf-8")
-    except UnicodeDecodeError:
-        return MimeVerification(
-            status="mismatch",
-            detected_mime=_BINARY_CANONICAL_MIME,
-            expected_mime=_TEXT_CANONICAL_MIME,
+            expected_mime=expected,
         )
     return MimeVerification(
         status="match",
-        detected_mime=_TEXT_CANONICAL_MIME,
-        expected_mime=_TEXT_CANONICAL_MIME,
+        detected_mime=expected,
+        expected_mime=expected,
     )
+
+
+def _decodes_as_utf8(sample: bytes) -> bool:
+    """Return ``True`` when *sample* is fully decodable as UTF-8."""
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
 
 
 class _AttachmentLike(Protocol):
