@@ -6,6 +6,17 @@
 # creek.classify.calibration.DEFAULT_FLOORS; a drop below floor signals the
 # prompt/example set has regressed.
 #
+# Frequency naming convention (ONTOLOGY-001, 2026-05): labels are interpreted
+# against the canonical F-names in §6.1 of
+# ``docs/Ontology/creek_ontology_agent_prompt.md`` — F1 Agency, F2 Receptivity,
+# F3 Self-Love / Power, F4 Community Love / Conformity, F5 Achievism,
+# F6 Pluralism, F7 Integration, F8 True Self / Transcendence, F9 Unity,
+# F10 Emptiness. Pre-ONTOLOGY-001 entries that read more naturally under
+# drifted glosses (F2 "tribal-belonging", F8 "ecological holism") have been
+# rewritten so each entry's body is a defensible instance of its canonical
+# label. See ``docs/decisions/2026-05-23-frequency-naming.md`` for the
+# decision record.
+#
 # Format (per entry):
 #   id:              stable cal-NNN identifier
 #   title:           short headline (LLM sees this)
@@ -39,9 +50,10 @@
     dosage: ambiguous
     voice_register: raw
 - id: cal-002
-  title: Team retro
-  body: We circled the same complaint three times and never landed. People want to
-    belong to a competent group more than they want to be right.
+  title: Letting the meeting breathe
+  body: I noticed I had been pushing for an hour and stopped. I let the meeting
+    breathe and listened to what was underneath the words people were repeating.
+    The thing we needed was already in the room — I had been talking past it.
   expected:
     frequency: F2
     phase: withdrawal
@@ -215,9 +227,10 @@
     dosage: toxic
     voice_register: confessional
 - id: cal-018
-  title: Picking the fight again
-  body: I knew where it would go before I said the first sentence. I said it
-    anyway and we both lost the evening.
+  title: Reaching for closeness the wrong way
+  body: I tried to force the closeness I wanted by saying the hardest thing I could
+    think of. I knew it would not land before I said it. We both lost the evening,
+    and what I was actually asking for never made it into the room.
   expected:
     frequency: F2
     phase: peaking

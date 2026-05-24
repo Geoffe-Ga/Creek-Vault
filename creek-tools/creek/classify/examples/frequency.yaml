@@ -1,52 +1,74 @@
 # Few-shot examples for APTITUDE frequency classification (F1..F10).
 # Each entry: title (short), body (representative excerpt), label (one of F1..F10), rationale (why).
+#
+# Naming convention (ONTOLOGY-001, 2026-05): rationales use the canonical
+# F-names from §6.1 of ``docs/Ontology/creek_ontology_agent_prompt.md`` —
+# F1 Agency, F2 Receptivity, F3 Self-Love / Power, F4 Community Love /
+# Conformity, F5 Achievism, F6 Pluralism, F7 Integration, F8 True Self /
+# Transcendence, F9 Unity, F10 Emptiness. Earlier drafts of this file
+# used drifted glosses (F1 "survival", F2 "tribal-belonging", F8
+# "ecological holism"); those glosses were retired in favour of the
+# canonical names. See ``docs/decisions/2026-05-23-frequency-naming.md``.
 - title: Locked out again
   body: My keys are gone and I cannot get into the apartment tonight. Stomach is in
     a knot. I keep checking my pockets like that will change something.
   label: F1
-  rationale: Bodily safety and shelter rupture; survival texture, not strategy.
-- title: Team retro
-  body: We circled the same complaint three times and never landed. People want to
-    belong to a competent group more than they want to be right.
+  rationale: F1 Agency — the fragment lives in the bodily-safety / basic-needs
+    register that Agency picks up; the operator is reckoning with shelter and
+    initiative under stress, not strategising.
+- title: Letting the silence sit
+  body: She talked for a long time and I did not try to answer or fix anything. I
+    let the quiet be there afterwards. Something in me trusted that the right thing
+    would surface if I did not reach for it.
   label: F2
-  rationale: Tribal-belonging concern; whose group, whose loyalty.
+  rationale: F2 Receptivity — kinship, surrender, and trust in what arises rather
+    than asserting an answer; the gesture is receiving rather than producing.
 - title: Saying no to the contract
   body: I am the one with the authority to walk away. If I do not exercise it now,
     I never will.
   label: F3
-  rationale: Power and agency over a decision; F3 is about owning the choice.
+  rationale: F3 Self-Love / Power — owning the decision from a grounded sense of
+    one's authority; self-love as the foundation of healthy power.
 - title: Inbox triage rules
   body: I need three folders, a daily clearing time, and a hard rule about not
     checking after 7pm. Order will save me here.
   label: F4
-  rationale: Order and structure as the medicine for the problem.
+  rationale: F4 Community Love / Conformity — rules and structure as the medicine;
+    discipline and order as the path through.
 - title: Roadmap stake
   body: If the launch slips past Q3 the whole funding round shifts. I have to plan
     backwards from the demo date.
   label: F5
-  rationale: Achievement and strategy under a deadline; explicit goal framing.
+  rationale: F5 Achievism — strategy under a deadline; explicit goal framing,
+    material stakes, planning backwards from a target.
 - title: Sitting with grief
   body: She just needed someone to be in the room while she cried. I did not try
     to fix anything.
   label: F6
-  rationale: Community and empathy without a fix; presence as the gift.
+  rationale: F6 Pluralism — empathy and embodied presence without a fix; the
+    relational stance is what's offered.
 - title: Wiring two services
   body: The auth proxy and the billing API have to agree on the customer ID space.
     The whole system breaks otherwise.
   label: F7
-  rationale: Integration of multiple systems; thinking in interfaces.
+  rationale: F7 Integration — systems thinking, holding multiple components in one
+    interface; the unit of attention is the connection between parts.
 - title: Watershed walk
   body: The creek I grew up beside is gone. The aquifer it fed is the same one
     under the new development.
   label: F8
-  rationale: Ecological holism; the personal and the planetary as one body.
+  rationale: F8 True Self / Transcendence — pattern recognition from a transcendent
+    vantage; the personal memory and the planetary system are seen as one body,
+    which is the True-Self / higher-self way of holding scale.
 - title: Just watching
   body: I sat on the back step and the cat came over. I did not need anything
     to happen.
   label: F9
-  rationale: Witness mode, being rather than doing.
+  rationale: F9 Unity — source-connection texture; being rather than doing, the
+    quiet flow with what's already here.
 - title: One thing
   body: There is no separation between the dishwasher humming and the question
     I am sitting with.
   label: F10
-  rationale: Non-dual, unity texture; F10 collapses subject and object.
+  rationale: F10 Emptiness — no-self / non-dual collapse of subject and object;
+    the impermanence register where distinctions soften.
