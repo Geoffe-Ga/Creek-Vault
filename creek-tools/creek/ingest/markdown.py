@@ -22,6 +22,7 @@ from typing import Any
 
 import frontmatter
 
+from creek.ingest._authored_at import frontmatter_authored_at
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -211,6 +212,15 @@ def _extract_timestamp_from_frontmatter(fm_data: dict[str, Any]) -> str | None:
     return None
 
 
+_AUTHORED_AT_FRONTMATTER_KEYS: tuple[str, ...] = ("published", "date", "created")
+"""Frontmatter keys consulted (in order) for ``authored_at`` extraction.
+
+Per FEAT-031 (#263) the chain is ``published`` → ``date`` → ``created``,
+then the filesystem mtime via
+:func:`creek.ingest._authored_at.frontmatter_authored_at`.
+"""
+
+
 def _get_file_creation_timestamp(path: Path) -> datetime:
     """Get the file creation timestamp from filesystem metadata.
 
@@ -323,6 +333,12 @@ class MarkdownIngestor(Ingestor):
         fm_data, content = self._parse_frontmatter(text)
         document_type = _detect_document_type(content)
         timestamp = self._resolve_timestamp(fm_data, raw.path)
+        authored_at = frontmatter_authored_at(
+            fm_data,
+            _AUTHORED_AT_FRONTMATTER_KEYS,
+            raw.path,
+            source_label="MarkdownIngestor",
+        )
 
         return [
             ParsedFragment(
@@ -330,6 +346,7 @@ class MarkdownIngestor(Ingestor):
                 metadata={
                     "existing_frontmatter": fm_data,
                     "document_type": document_type,
+                    "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
                 timestamp=timestamp,
@@ -420,6 +437,9 @@ class MarkdownIngestor(Ingestor):
             },
             "created": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            creek_defaults["authored_at"] = authored_at.isoformat()
 
         return _merge_frontmatter(creek_defaults, existing_fm)
 

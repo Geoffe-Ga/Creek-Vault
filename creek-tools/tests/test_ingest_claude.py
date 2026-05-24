@@ -1003,3 +1003,71 @@ class TestEdgeCases:
         assert "Describe this image" in fragments[0].content
         # Non-text parts should be excluded
         assert "http://example.com" not in fragments[0].content
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestClaudeIngestorAuthoredAt:
+    """``ClaudeIngestor`` carries per-turn ``authored_at`` from human ``created_at``.
+
+    FEAT-031 (#263): per-message ``create_time`` is the message-level
+    fragment's authored date; the conversation's ``created_at`` is the
+    fallback only when the message itself has no timestamp.
+    """
+
+    def test_authored_at_matches_human_message_created_at(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        conv = _make_single_conversation(
+            uuid="conv-A",
+            created_at="2024-01-01T00:00:00Z",
+            messages=[
+                {
+                    "role": "human",
+                    "content": "Hi",
+                    "created_at": "2024-11-15T10:30:00Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "created_at": "2024-11-15T10:30:05Z",
+                },
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-11-15"
+        assert authored.tzinfo is not None
+
+    def test_authored_at_falls_back_to_conversation_created_at(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """Per-message create_time absent → use conversation created_at."""
+        conv = _make_single_conversation(
+            uuid="conv-B",
+            created_at="2023-05-04T12:00:00Z",
+            messages=[
+                {"role": "human", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2023-05-04"
+
+    def test_generate_frontmatter_emits_authored_at(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        conv = _make_single_conversation()
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-11-15")

@@ -19,6 +19,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+from creek.ingest._authored_at import parse_authored_value
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -28,6 +29,7 @@ from creek.ingest.base import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from pathlib import Path
 
     from creek.clean.filters.chatbot import ChatbotFilter
@@ -320,11 +322,15 @@ class ClaudeIngestor(Ingestor):
         if model is not None:
             source["model"] = model
 
-        return {
+        fm: dict[str, Any] = {
             "title": f"{conv_name} (turn {turn_idx})",
             "created": fragment.timestamp.isoformat(),
             "source": source,
         }
+        authored_at: datetime | None = meta.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm
 
     # ---- Private Helpers ----
 
@@ -449,6 +455,14 @@ class ClaudeIngestor(Ingestor):
 
         ts_string = _resolve_timestamp(human_msg, fallback_ts)
         timestamp = normalize_timestamp(ts_string, source_tz=None)
+        # FEAT-031 (#263): per-message ``create_time`` (Claude calls it
+        # ``created_at``) is the authored date. When absent we use the
+        # conversation's own ``created_at``; both are tz-aware ISO 8601
+        # values so :func:`parse_authored_value` preserves them
+        # without an LA shift that would drift the calendar date.
+        authored_at: datetime | None = parse_authored_value(
+            human_msg.get("created_at"),
+        ) or parse_authored_value(fallback_ts)
 
         content = f"{human_text}\n\n{assistant_text}"
 
@@ -458,6 +472,7 @@ class ClaudeIngestor(Ingestor):
             "turn_index": turn_index,
             "human_text": human_text,
             "assistant_text": assistant_text,
+            "authored_at": authored_at,
         }
         if model is not None:
             metadata["model"] = model

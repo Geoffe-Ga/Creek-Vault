@@ -21,6 +21,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from creek.ingest._authored_at import parse_authored_value
 from creek.ingest.base import (
     LA_TZ,
     Ingestor,
@@ -155,11 +156,15 @@ class ChatGPTIngestor(Ingestor):
         conv_id = fragment.metadata.get("conversation_id")
         if conv_id is not None:
             source["conversation_id"] = conv_id
-        return {
+        fm: dict[str, Any] = {
             "title": fragment.metadata.get("title", "Untitled Conversation"),
             "created": fragment.timestamp.isoformat(),
             "source": source,
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm
 
     # ---- Private helpers ----
 
@@ -203,7 +208,12 @@ class ChatGPTIngestor(Ingestor):
             )
 
         return _pair_messages_to_fragments(
-            ordered_messages, title, timestamp, source_path, conversation_id
+            ordered_messages,
+            title,
+            timestamp,
+            source_path,
+            conversation_id,
+            conversation_create_time=create_time,
         )
 
 
@@ -461,6 +471,8 @@ def _pair_messages_to_fragments(
     conversation_timestamp: datetime,
     source_path: str,
     conversation_id: str | None = None,
+    *,
+    conversation_create_time: float | None = None,
 ) -> list[ParsedFragment]:
     """Pair consecutive user+assistant messages into fragments.
 
@@ -475,6 +487,9 @@ def _pair_messages_to_fragments(
         conversation_timestamp: The conversation creation timestamp.
         source_path: The source file path.
         conversation_id: Optional ChatGPT conversation ID for metadata.
+        conversation_create_time: Raw Unix-epoch ``create_time`` from
+            the conversation, used as the ``authored_at`` fallback when
+            a per-message ``create_time`` is missing.
 
     Returns:
         A list of ``ParsedFragment`` objects, one per pair.
@@ -504,6 +519,16 @@ def _pair_messages_to_fragments(
                         if user_time
                         else conversation_timestamp
                     )
+                    # FEAT-031 (#263): per-message ``create_time``
+                    # (Unix epoch) is the user turn's authored date.
+                    # When absent we fall back to the conversation's
+                    # own ``create_time``. ``parse_authored_value``
+                    # keeps the source's UTC instant intact (no LA
+                    # shift) so a turn timestamped 23:30 UTC on
+                    # 2024-11-15 does not silently bucket into 2024-11-14.
+                    authored_at = parse_authored_value(
+                        user_time,
+                    ) or parse_authored_value(conversation_create_time)
                     content = (
                         f"**User**: {user_text}\n\n**Assistant**: {assistant_text}"
                     )
@@ -511,6 +536,7 @@ def _pair_messages_to_fragments(
                     meta: dict[str, Any] = {
                         "title": turn_title,
                         "platform": "chatgpt",
+                        "authored_at": authored_at,
                     }
                     if conversation_id is not None:
                         meta["conversation_id"] = conversation_id

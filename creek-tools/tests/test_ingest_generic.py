@@ -453,3 +453,77 @@ class TestGenericIngestorIngest:
         )
         markdown = ingestor.convert_to_markdown(fragment)
         assert markdown.startswith("```\n")
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestGenericIngestorAuthoredAt:
+    """``GenericIngestor`` authored_at falls back to filesystem mtime.
+
+    FEAT-031 (#263): the generic ingestor is the lowest-fidelity tier —
+    no in-band source date is available, so the file's mtime is the
+    only honest answer. ``authored_at`` is timezone-aware (UTC) and
+    flows through both the parsed metadata and the emitted frontmatter.
+    """
+
+    def test_parse_sets_authored_at_to_file_mtime(
+        self,
+        ingestor: GenericIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """``parse()`` stashes the file's mtime as authored_at on metadata."""
+        from datetime import UTC
+
+        path = tmp_path / "note.rst"
+        path.write_text("content", encoding="utf-8")
+        # Stamp a known mtime so the assertion does not depend on
+        # the wall-clock of the test machine.
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        import os
+
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        raw = RawDocument(
+            path=path,
+            content=path.read_bytes(),
+            metadata={"source_type": "generic"},
+            detected_encoding="utf-8",
+        )
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+        assert authored.tzinfo is not None
+
+    def test_generate_frontmatter_emits_authored_at(
+        self,
+        ingestor: GenericIngestor,
+    ) -> None:
+        """authored_at on metadata round-trips into the frontmatter dict."""
+        from datetime import UTC
+
+        ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=LA_TZ)
+        authored = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        fragment = ParsedFragment(
+            content="content",
+            metadata={"file_extension": ".txt", "authored_at": authored},
+            source_path="/fake/note.txt",
+            timestamp=ts,
+        )
+        fm = ingestor.generate_frontmatter(fragment)
+        assert fm["authored_at"] == authored.isoformat()
+
+    def test_generate_frontmatter_omits_authored_at_when_none(
+        self,
+        ingestor: GenericIngestor,
+    ) -> None:
+        """A ``None`` authored_at is omitted (never guessed) from frontmatter."""
+        fragment = ParsedFragment(
+            content="content",
+            metadata={"file_extension": ".txt", "authored_at": None},
+            source_path="/fake/note.txt",
+            timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=LA_TZ),
+        )
+        fm = ingestor.generate_frontmatter(fragment)
+        assert "authored_at" not in fm

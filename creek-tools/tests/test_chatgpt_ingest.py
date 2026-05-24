@@ -1284,3 +1284,53 @@ class TestCountDescendantsDeepTree:
 
         count = _count_descendants("node_0", mapping)
         assert count == depth
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestChatGPTAuthoredAt:
+    """``ChatGPTIngestor`` carries per-turn ``authored_at`` from user ``create_time``.
+
+    FEAT-031 (#263): per-message ``create_time`` is the message-level
+    fragment's authored date; the conversation's ``create_time`` is the
+    fallback when the user message itself has no timestamp.
+    """
+
+    def test_authored_at_matches_user_message_create_time(self) -> None:
+        # 2024-11-15T18:00:00Z → 1731693600.0 (Unix epoch in UTC)
+        ingestor = ChatGPTIngestor()
+        conv = _minimal_conversation(create_time=1700042400.0)
+        # Override the user message's create_time to a known epoch.
+        conv["mapping"]["u1"]["message"]["create_time"] = 1731693600.0
+        raw = _make_raw_doc([conv])
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-11-15"
+        assert authored.tzinfo is not None
+
+    def test_authored_at_falls_back_to_conversation_create_time(self) -> None:
+        """User message lacks create_time → conversation create_time is used."""
+        ingestor = ChatGPTIngestor()
+        # 2023-05-04T12:00:00Z = 1683201600.0
+        conv = _minimal_conversation(create_time=1683201600.0)
+        # Strip the user message's create_time entirely.
+        conv["mapping"]["u1"]["message"].pop("create_time", None)
+        raw = _make_raw_doc([conv])
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2023-05-04"
+
+    def test_generate_frontmatter_emits_authored_at(self) -> None:
+        ingestor = ChatGPTIngestor()
+        conv = _minimal_conversation(create_time=1700042400.0)
+        conv["mapping"]["u1"]["message"]["create_time"] = 1731693600.0
+        raw = _make_raw_doc([conv])
+        fragments = ingestor.parse(raw)
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-11-15")

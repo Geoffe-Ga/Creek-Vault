@@ -787,3 +787,130 @@ class TestMarkdownIngestorEdgeCases:
         # Should still get a valid timestamp (from filesystem)
         assert isinstance(fragments[0].timestamp, datetime)
         assert fragments[0].timestamp.tzinfo is not None
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestMarkdownIngestorAuthoredAt:
+    """``MarkdownIngestor`` extracts ``authored_at`` from frontmatter dates.
+
+    FEAT-031 (#263): the fallback chain is
+    ``published`` → ``date`` → ``created``, then filesystem mtime.
+    """
+
+    def test_published_key_takes_priority(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """``published`` wins over ``date`` and ``created``."""
+        path = tmp_path / "post.md"
+        path.write_text(
+            "---\n"
+            "published: 2024-03-15\n"
+            "date: 2023-01-01\n"
+            "created: 2022-06-01\n"
+            "---\n"
+            "# Hi\n",
+            encoding="utf-8",
+        )
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+
+    def test_date_used_when_no_published(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """``date`` is used when ``published`` is absent."""
+        path = tmp_path / "post.md"
+        path.write_text(
+            "---\ndate: 2023-08-09\ncreated: 2022-06-01\n---\n# Hi\n",
+            encoding="utf-8",
+        )
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2023-08-09"
+
+    def test_created_used_when_no_date_or_published(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """``created`` is used when neither ``published`` nor ``date`` exists."""
+        path = tmp_path / "post.md"
+        path.write_text(
+            "---\ncreated: 2022-06-01\n---\n# Hi\n",
+            encoding="utf-8",
+        )
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2022-06-01"
+
+    def test_falls_back_to_mtime_when_no_frontmatter_date(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """When no frontmatter date is present, filesystem mtime is used."""
+        from datetime import UTC
+        import os
+
+        path = tmp_path / "post.md"
+        path.write_text("# Hi\n", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_authored_at_emitted_in_frontmatter(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """``authored_at`` round-trips into the generated frontmatter."""
+        path = tmp_path / "post.md"
+        path.write_text(
+            "---\npublished: 2024-03-15\n---\n# Hi\n",
+            encoding="utf-8",
+        )
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        fm = md_ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
+
+    def test_authored_at_is_timezone_aware(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """Extracted ``authored_at`` is never naive."""
+        path = tmp_path / "post.md"
+        path.write_text(
+            "---\npublished: 2024-03-15\n---\n# Hi\n",
+            encoding="utf-8",
+        )
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored.tzinfo is not None
+
+    def test_unparseable_frontmatter_date_falls_back_to_mtime(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """Garbage frontmatter date does not crash; mtime is used."""
+        from datetime import UTC
+        import os
+
+        path = tmp_path / "post.md"
+        path.write_text(
+            "---\npublished: definitely-not-a-date\n---\n# Hi\n",
+            encoding="utf-8",
+        )
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        docs = md_ingestor.discover(tmp_path)
+        fragments = md_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected

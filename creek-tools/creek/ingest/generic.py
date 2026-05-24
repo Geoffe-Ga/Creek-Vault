@@ -22,6 +22,7 @@ from typing import Any
 
 import chardet
 
+from creek.ingest._authored_at import safe_file_modified_time
 from creek.ingest.base import (
     LA_TZ,
     Ingestor,
@@ -213,12 +214,18 @@ class GenericIngestor(Ingestor):
             return []
 
         now = datetime.now(tz=LA_TZ)
+        # FEAT-031 (#263): GenericIngestor is the lowest-fidelity tier —
+        # no in-band source date is available, so the file's mtime is
+        # the only honest answer. ``None`` when the path is unreadable
+        # (a synthetic ``RawDocument`` in tests, a vanished file mid-run).
+        authored_at = safe_file_modified_time(raw.path)
         return [
             ParsedFragment(
                 content=text,
                 metadata={
                     "file_extension": raw.path.suffix.lower(),
                     "source_type": "generic",
+                    "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
                 timestamp=now,
@@ -258,7 +265,7 @@ class GenericIngestor(Ingestor):
             A dict of frontmatter key-value pairs.
         """
         title = Path(fragment.source_path).stem
-        return {
+        fm: dict[str, Any] = {
             "type": "fragment",
             "title": title,
             "source": {
@@ -268,3 +275,7 @@ class GenericIngestor(Ingestor):
             "created": fragment.timestamp.isoformat(),
             "routing": "01-Fragments/Unsorted/",
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm
