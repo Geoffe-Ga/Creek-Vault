@@ -103,9 +103,10 @@ every other surface.
   the inline prompt header. This is the most operationally
   consequential drift because it goes directly into every classifier
   call, but updating it is a Python source change and so falls
-  outside ONTOLOGY-001's scope (which is data + docs only). File as a
-  follow-up if the calibration floor gate breaks after this change
-  lands.
+  outside ONTOLOGY-001's scope (which is data + docs only). Tracked
+  as **ONTOLOGY-002** (issue #298) so the prompt-header rename does
+  not slip; the issue carries the canonical names, the acceptance
+  criteria, and a regression-test requirement.
 - **Re-classifying already-labelled vault fragments.** The frequency
   IDs (`F1`..`F10`) are stable; only the human-readable interpretation
   changes. If the operator finds vault content that now reads
