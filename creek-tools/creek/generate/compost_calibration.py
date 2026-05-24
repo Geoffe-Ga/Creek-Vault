@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from itertools import starmap
-from pathlib import Path  # used at runtime as a parameter type
+from pathlib import Path  # runtime: parameter types and DEFAULT_FIXTURE_PATH
 from typing import TYPE_CHECKING
 
 import yaml
@@ -247,14 +247,20 @@ def load_fixture(path: Path) -> tuple[CompostCalibrationEntry, ...]:
 
     Raises:
         FileNotFoundError: When *path* does not exist.
-        ValueError: When the file is not a list of dicts, or when any
-            entry is missing a required key or has a non-boolean
-            ``expected`` value.
+        ValueError: When the file is not parseable YAML, is not a list
+            of dicts, or when any entry is missing a required key or
+            has a non-boolean ``expected`` value. ``yaml.YAMLError`` is
+            wrapped so callers can rely on a single exception type for
+            schema-and-syntax failures.
     """
     if not path.exists():
         msg = f"Compost calibration fixture not found: {path}"
         raise FileNotFoundError(msg)
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    except yaml.YAMLError as exc:
+        msg = f"compost-calibration fixture is not valid YAML: {exc}"
+        raise ValueError(msg) from exc
     if not isinstance(raw, list):
         msg = (
             "compost-calibration fixture must be a YAML list at top level, "

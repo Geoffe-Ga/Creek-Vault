@@ -30,6 +30,7 @@ from creek.generate.compost_verifier import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -74,7 +75,11 @@ def _entry(
     )
 
 
-def _similarity_table(table: dict[str, float], *, default: float = 0.0) -> object:
+def _similarity_table(
+    table: dict[str, float],
+    *,
+    default: float = 0.0,
+) -> Callable[[str], float]:
     """Return a similarity_fn closure that looks ids up by title substring."""
 
     def fn(text: str) -> float:
@@ -153,6 +158,21 @@ class TestLoadFixture:
         with pytest.raises(ValueError, match="must be a bool"):
             load_fixture(target)
 
+    def test_invalid_yaml_raises_value_error(self, tmp_path: Path) -> None:
+        """A syntactically-broken YAML surfaces as ``ValueError``.
+
+        The CLI handler catches ``ValueError``; without this wrapper a
+        malformed fixture would produce an uncaught traceback instead
+        of the operator-facing ``[red]Failed to load…[/red]`` line. The
+        wrapper also gives callers a single exception type to handle
+        for both schema and syntax failures.
+        """
+        target = tmp_path / "broken.yaml"
+        # Unclosed bracket — yaml.safe_load raises ``yaml.YAMLError``.
+        target.write_text("- id: x\n  body: [\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="not valid YAML"):
+            load_fixture(target)
+
 
 # ---- Scoring ------------------------------------------------------------
 
@@ -167,7 +187,7 @@ class TestScoreCompost:
 
         report = score_compost(
             entries,
-            similarity_fn=sim,  # type: ignore[arg-type]
+            similarity_fn=sim,
             verifier=None,
             embedding_threshold=0.5,
         )
@@ -186,7 +206,7 @@ class TestScoreCompost:
 
         report = score_compost(
             entries,
-            similarity_fn=sim,  # type: ignore[arg-type]
+            similarity_fn=sim,
             verifier=None,
             embedding_threshold=0.5,
         )
@@ -204,7 +224,7 @@ class TestScoreCompost:
 
         report = score_compost(
             entries,
-            similarity_fn=sim,  # type: ignore[arg-type]
+            similarity_fn=sim,
             verifier=verifier,
             embedding_threshold=0.6,
         )
@@ -224,7 +244,7 @@ class TestScoreCompost:
 
         report = score_compost(
             entries,
-            similarity_fn=sim,  # type: ignore[arg-type]
+            similarity_fn=sim,
             verifier=verifier,
             embedding_threshold=0.6,
         )
@@ -242,7 +262,7 @@ class TestScoreCompost:
 
         report = score_compost(
             entries,
-            similarity_fn=sim,  # type: ignore[arg-type]
+            similarity_fn=sim,
             verifier=verifier,
             embedding_threshold=0.6,
         )
@@ -277,7 +297,7 @@ class TestScoreCompost:
 
         report = score_compost(
             entries,
-            similarity_fn=sim,  # type: ignore[arg-type]
+            similarity_fn=sim,
             verifier=verifier,
             embedding_threshold=0.5,
         )
@@ -297,7 +317,7 @@ class TestScoreCompost:
         """No entries → no division by zero; metrics are 0.0."""
         report = score_compost(
             [],
-            similarity_fn=_similarity_table({}),  # type: ignore[arg-type]
+            similarity_fn=_similarity_table({}),
             verifier=None,
         )
         assert report.entries == 0
