@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from creek.config import CreekConfig
+    from creek.generate.compost_embedding import CompostExemplar
+    from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import DraftLLM
     from creek.ingest.base import Ingestor
     from creek.models import CompileTargetKind, Phase
@@ -2490,9 +2493,11 @@ def compost_calibrate(
         None,
         "--fixture",
         help=(
-            "Path to a YAML calibration set of `{text, expected: bool}` "
-            "entries. When omitted, the command reports the packaged "
-            "exemplar set and explains how to author a fixture."
+            "Path to a YAML calibration set of `{id, title, body, expected: "
+            "bool}` entries. Defaults to "
+            "`tests/fixtures/compost-calibration.yaml`. When omitted *and* "
+            "the default fixture is missing, the command falls back to "
+            "exemplar-coverage reporting only."
         ),
     ),
     exemplars: Path | None = typer.Option(
@@ -2503,16 +2508,55 @@ def compost_calibrate(
             "`creek/generate/exemplars/compost.yaml`."
         ),
     ),
+    json_path: Path | None = typer.Option(
+        None,
+        "--json",
+        help=(
+            "Write a machine-readable JSON sidecar with the confusion "
+            "matrix, metrics, per-stage hit rates, and per-entry breakdown."
+        ),
+    ),
+    embedding_threshold: float = typer.Option(
+        0.6,
+        "--embedding-threshold",
+        help=(
+            "Override the embedding-gate cosine floor (default 0.6 — matches "
+            "CompostConfig.embedding_threshold). Tighten when scoring shows "
+            "the default under-precises against your corpus."
+        ),
+    ),
+    no_verifier: bool = typer.Option(
+        False,
+        "--no-verifier",
+        help=(
+            "Skip the LLM verifier stage — score with the embedding gate "
+            "only. Useful for offline calibration runs and CI suites with "
+            "no API key."
+        ),
+    ),
+    floor_recall: float | None = typer.Option(
+        None,
+        "--floor-recall",
+        help=("CI gate: exit non-zero when recall falls below this value (0.0-1.0)."),
+    ),
+    floor_precision: float | None = typer.Option(
+        None,
+        "--floor-precision",
+        help=(
+            "CI gate: exit non-zero when precision falls below this value (0.0-1.0)."
+        ),
+    ),
 ) -> None:
-    """Report exemplar coverage and (when supplied) fixture recall (FEAT-018).
+    """Score the compost detector against a labelled fixture (FEAT-028).
 
-    With ``--fixture`` omitted, prints the loaded exemplar count by
-    texture so operators can audit the curated set. With a fixture
-    supplied, scores recall + precision against the labelled set so
-    the operator can tune ``compost.embedding_threshold`` against
-    their corpus. The full calibration loop lands once a real fixture
-    is collected from the user's vault; today this command exists so
-    the workflow is discoverable.
+    Runs every fixture entry through the embedding gate + (optional) LLM
+    verifier, then reports the confusion matrix, recall, precision, F1,
+    false-positive rate, and per-stage hit counts. Pair with
+    ``--floor-recall`` and ``--floor-precision`` in CI to fail the build
+    when the pipeline regresses against the labelled set.
+
+    With no fixture available, falls back to the exemplar-coverage
+    summary so the command still surfaces useful state on first run.
     """
     from creek.generate.compost_embedding import load_exemplars
 
@@ -2529,17 +2573,114 @@ def compost_calibrate(
     for texture, count in sorted(by_texture.items()):
         console.print(f"  {texture:<20} {count}")
 
-    if fixture is None:
-        console.print(
-            "\nNo --fixture supplied. To score recall/precision, author a "
-            "YAML list of `{text, expected: bool}` entries from real vault "
-            "fragments and re-run with `--fixture path/to/fixture.yaml`.",
-        )
-        return
-
-    console.print(
-        f"\n[yellow]Fixture-driven scoring against {fixture} is not yet "
-        "implemented (FEAT-018 stub). The fixture format and recall/"
-        "precision report land in a follow-up once a real labelled set "
-        "is collected.[/yellow]",
+    _run_compost_calibration(
+        fixture=fixture,
+        exemplars_loaded=loaded,
+        json_path=json_path,
+        embedding_threshold=embedding_threshold,
+        no_verifier=no_verifier,
+        floor_recall=floor_recall,
+        floor_precision=floor_precision,
     )
+
+
+def _run_compost_calibration(
+    *,
+    fixture: Path | None,
+    exemplars_loaded: tuple[CompostExemplar, ...],
+    json_path: Path | None,
+    embedding_threshold: float,
+    no_verifier: bool,
+    floor_recall: float | None,
+    floor_precision: float | None,
+) -> None:
+    """Drive ``creek compost calibrate --fixture`` end-to-end (FEAT-028).
+
+    Resolves the fixture path (falling back to the packaged default),
+    wires the embedding similarity closure + LLM verifier (or skips the
+    verifier under ``--no-verifier``), scores the fixture, and prints
+    the report. Optionally writes a JSON sidecar and enforces
+    recall/precision floors for CI gating.
+    """
+    from creek.generate.compost_calibration import (
+        DEFAULT_FIXTURE_PATH,
+        CompostFloorBreachError,
+        assert_floors,
+        load_fixture,
+        score_compost,
+        write_json_sidecar,
+    )
+    from creek.generate.compost_embedding import make_similarity_fn
+
+    resolved = fixture or DEFAULT_FIXTURE_PATH
+    if not resolved.exists():
+        if fixture is None:
+            console.print(
+                "\nNo --fixture supplied and the packaged default at "
+                f"{DEFAULT_FIXTURE_PATH} was not found (this happens under a "
+                "wheel install). Pass --fixture path/to/fixture.yaml to score "
+                "against your own labelled set.",
+            )
+            return
+        console.print(f"[red]Compost fixture not found: {resolved}[/red]")
+        raise typer.Exit(code=2)
+
+    try:
+        entries = load_fixture(resolved)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Failed to load compost fixture: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    config = load_config()
+    from creek.link.embeddings import EmbeddingLinker
+
+    linker = EmbeddingLinker(config=config.embeddings)
+    similarity_fn = make_similarity_fn(exemplars_loaded, linker)
+
+    verifier = None if no_verifier else _build_compost_verifier(config)
+
+    report = score_compost(
+        entries,
+        similarity_fn=similarity_fn,
+        verifier=verifier,
+        embedding_threshold=embedding_threshold,
+    )
+    console.print("")
+    console.print(report.render())
+
+    if json_path is not None:
+        write_json_sidecar(report, json_path)
+        console.print(f"\n[green]JSON sidecar written: {json_path}[/green]")
+
+    if floor_recall is not None or floor_precision is not None:
+        try:
+            assert_floors(
+                report,
+                floor_recall=floor_recall,
+                floor_precision=floor_precision,
+            )
+        except CompostFloorBreachError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from None
+
+
+def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None:
+    """Construct the production LLM verifier, or ``None`` if it can't be built.
+
+    ``creek compost calibrate`` runs in environments where the
+    Anthropic credentials may or may not be present; rather than fail
+    loud, fall back to embedding-only scoring with a console note so
+    the operator can re-run with the verifier once credentials are in
+    place.
+    """
+    from creek.classify.llm import AnthropicProvider
+    from creek.generate.compost_verifier import LLMCompostVerifier
+
+    try:
+        provider = AnthropicProvider(config=config.llm)
+    except RuntimeError as exc:
+        console.print(
+            f"[yellow]Skipping LLM verifier — provider unavailable: {exc}[/yellow]",
+        )
+        return None
+    return LLMCompostVerifier(provider=provider)

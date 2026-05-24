@@ -4,6 +4,25 @@ from creek.generate.compost import (
     CompostCandidate,
     CompostTracker,
 )
+from creek.generate.compost_calibration import (
+    DEFAULT_FIXTURE_PATH as COMPOST_CALIBRATION_FIXTURE_PATH,
+)
+from creek.generate.compost_calibration import (
+    CompostCalibrationEntry,
+    CompostCalibrationReport,
+    CompostEntryScore,
+    CompostFloorBreachError,
+    score_compost,
+)
+from creek.generate.compost_calibration import (
+    assert_floors as assert_compost_floors,
+)
+from creek.generate.compost_calibration import (
+    load_fixture as load_compost_fixture,
+)
+from creek.generate.compost_calibration import (
+    write_json_sidecar as write_compost_json_sidecar,
+)
 from creek.generate.compost_embedding import (
     PACKAGED_EXEMPLARS_PATH,
     CompostExemplar,
@@ -113,6 +132,7 @@ from creek.generate.wavelength import (
 )
 
 __all__ = [
+    "COMPOST_CALIBRATION_FIXTURE_PATH",
     "CONTRADICTION_KEYWORDS",
     "DECISION_KEYWORDS",
     "DEFAULT_MAX_EXEMPLARS",
@@ -153,8 +173,12 @@ __all__ = [
     "VOICE_REGISTERS",
     "BorrowedTermEntry",
     "CoinedTermEntry",
+    "CompostCalibrationEntry",
+    "CompostCalibrationReport",
     "CompostCandidate",
+    "CompostEntryScore",
     "CompostExemplar",
+    "CompostFloorBreachError",
     "CompostTracker",
     "CompostVerdict",
     "CompostVerifierResult",
@@ -198,7 +222,11 @@ __all__ = [
     "VoicePatterns",
     "WavelengthSnapshot",
     "WavelengthTracker",
+    "assert_compost_floors",
     "decision_from_note",
+    "load_compost_fixture",
     "load_exemplars",
     "make_similarity_fn",
+    "score_compost",
+    "write_compost_json_sidecar",
 ]

@@ -94,7 +94,9 @@ The compost note records:
 - **Links to referencing fragments** — wiki-links so the compost stays reachable.
 - **Verifier metadata** — `embedding_similarity` and `verifier_reasoning` round-trip into frontmatter so the operator can audit decisions later.
 
-Output: `10-Liminal/Compost/<id>.md` (canonical) or `10-Liminal/Compost/Review/<id>.md` (ambiguous, awaiting triage). CLI: `creek report --type compost`. Calibration: `creek compost calibrate [--fixture FIXTURE.yaml]` (FEAT-018; full fixture-driven scoring lands once a real labelled set is collected).
+Output: `10-Liminal/Compost/<id>.md` (canonical) or `10-Liminal/Compost/Review/<id>.md` (ambiguous, awaiting triage). CLI: `creek report --type compost`.
+
+Calibration (FEAT-028): `creek compost calibrate [--fixture FIXTURE.yaml] [--json PATH] [--floor-recall 0.8] [--floor-precision 0.85] [--no-verifier]`. Runs the two-stage detector against a hand-labelled fixture (default: `tests/fixtures/compost-calibration.yaml`, 20+ positives × 20+ false-positive-risk negatives) and reports recall, precision, F1, false-positive rate, and per-stage hit counts (embedding-passed / verifier-yes / verifier-no / routed-to-review). `--floor-recall` and `--floor-precision` exit non-zero on a regression so a CI job can gate on detector quality. `--no-verifier` runs embedding-only for offline calibration.
 
 ---
 

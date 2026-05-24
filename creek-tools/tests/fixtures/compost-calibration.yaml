@@ -1,0 +1,334 @@
+# Compost calibration fixture (FEAT-028).
+#
+# Hand-labelled fragments for ``creek compost calibrate --fixture``.
+# Each entry: { id, title, body, expected }.
+#
+# ``expected: true`` — genuine idea / project abandonment. The pipeline
+# (embedding gate + verifier) SHOULD flag this entry as compost.
+# ``expected: false`` — false-positive-risk content. Reads superficially
+# like compost (loss of momentum, hesitation, taking a break) but is
+# really paused / pivoted / completed / mid-flow / paradox-holding.
+# The pipeline SHOULD NOT flag this entry.
+#
+# Positives cover the nine canonical abandonment textures from
+# ``creek/generate/exemplars/compost.yaml`` plus a few cross-texture
+# blends so the fixture exercises the embedding gate's interior
+# rather than only the exemplar bodies themselves.
+#
+# Negatives target the four "is NOT abandonment" categories named in
+# ``compost_verifier._PROMPT_TEMPLATE``: temporary frustration mid-flow,
+# taking a break, completing the work, and expressing a paradox. Plus
+# a handful of adjacent risks (delegation, pivot to active alternative,
+# rescoping, evaluating a side question, etc.) so the verifier has to
+# discriminate against realistic noise.
+
+# ---- Positives (idea / project abandonment) ----
+
+- id: cc-001
+  title: Circling a question for the third week
+  body: I sit down with this and it goes the same place every time. The same
+    circle opens, the same circle closes, and I walk away with nothing new.
+    The thread is the work, apparently, and the work refuses to crystallize.
+  expected: true
+
+- id: cc-002
+  title: Quiet release of the synth project
+  body: I am letting this one go. Not with any drama, not as a failure — it is
+    not mine anymore. It belonged to a version of me that is no longer the one
+    holding the pen.
+  expected: true
+
+- id: cc-003
+  title: Drifted out of the room
+  body: Looking at the notes I made three months ago I barely recognize the
+    person who was urgent about this. Whatever pulled me toward it pulled
+    past it. I am not interested anymore and I cannot honestly say why.
+  expected: true
+
+- id: cc-004
+  title: I no longer recognize this thread
+  body: The thread went somewhere I no longer recognize. The premise I started
+    with is not a premise I would write today. I could keep pulling on it out
+    of momentum but I would be performing continuity, not actually continuing.
+  expected: true
+
+- id: cc-005
+  title: Too tired to keep this alive
+  body: I do not have the energy to keep tending this. It needed weekly
+    attention to stay warm and I gave it three weeks of cold and now when I
+    open the file the room feels empty. Maybe later. Probably not.
+  expected: true
+
+- id: cc-006
+  title: Displaced by what came next
+  body: The project that ate this one has been alive for six months. There is
+    no room left for the older question, and honestly the new one is better.
+    Filing this under things that pointed somewhere.
+  expected: true
+
+- id: cc-007
+  title: The air went out of it
+  body: I was excited about this for about a week and then the air went out
+    of it. I keep waiting for the energy to come back. It has not. I am
+    starting to think the energy was never about this in the first place.
+  expected: true
+
+- id: cc-008
+  title: Indefinitely postponed
+  body: I keep telling myself I will come back to this when I have time and
+    the truthful version of that sentence is "when I have time" is a
+    euphemism for "never". I am allowed to just say I am not doing this.
+  expected: true
+
+- id: cc-009
+  title: Walked away without noticing
+  body: At some point I stopped working on this and I cannot point to when.
+    There was no decision, no moment, just the gap between the last entry
+    and now. The walking-away happened in the spaces between the notes.
+  expected: true
+
+- id: cc-010
+  title: The question dissolved
+  body: I went looking for the original question and I could not find it. Not
+    because I lost the notes — they are right here — but because the question
+    does not feel urgent anymore. Whatever shape it had has dissolved.
+  expected: true
+
+- id: cc-011
+  title: I keep promising I will get back to it
+  body: Three times this month I have told someone I will get back to this
+    project. Each time I meant it less. I am not going to. The promise was
+    performance, and the performance is the only part of this still alive.
+  expected: true
+
+- id: cc-012
+  title: Belonged to a self I am not anymore
+  body: Re-reading the early notes feels like reading someone else. The
+    voice is recognizable but the urgency is alien. I am not going to
+    finish what that version started. They can have the credit.
+  expected: true
+
+- id: cc-013
+  title: Started something else mid-sentence
+  body: I am three paragraphs into an essay about this and I just opened a
+    new document for something completely unrelated. That tells me where my
+    actual attention is. The essay can stay where it is.
+  expected: true
+
+- id: cc-014
+  title: Done pretending this is alive
+  body: I have been treating this like a live project for months when it
+    clearly is not. Every time I update the status I am performing for no one.
+    Calling it — this is compost. There is something in here worth keeping.
+  expected: true
+
+- id: cc-015
+  title: Newsletter that never launched
+  body: I drafted three issues and then never sent the first one. Every time
+    I open the queue I find a new reason it is not ready. The not-ready is
+    the answer. I am not going to launch this.
+  expected: true
+
+- id: cc-016
+  title: The reading list I will never read
+  body: Sixty books, ten years, three real reads. I am going to delete the
+    list. The shame of looking at it is the only thing it still produces.
+    Whatever I needed from those books I have already gotten elsewhere.
+  expected: true
+
+- id: cc-017
+  title: Old notebook closing on its own
+  body: I have not opened this notebook in eight months. When I do open it the
+    pages feel sealed. I am going to put it on the shelf and stop pretending
+    I am the kind of person who is going to come back to those questions.
+  expected: true
+
+- id: cc-018
+  title: The startup idea was never mine
+  body: I have been talking about this idea for two years. I have built two
+    prototypes. I never wanted to actually run the company. The idea was
+    interesting; the life it implied was someone else's life.
+  expected: true
+
+- id: cc-019
+  title: We stopped doing the standup
+  body: We stopped doing the weekly standup six months ago and nobody said
+    anything. The thing we were checking in about is not a thing anymore.
+    Honoring that by formally retiring the meeting instead of letting it ghost.
+  expected: true
+
+- id: cc-020
+  title: My grand unified theory is fan-fiction
+  body: I have been refining this framework for a decade and what I actually
+    have is a vocabulary, not a theory. The framework predicts nothing it
+    did not already describe. I am letting the framework be a vocabulary
+    and stopping the pretense of theory-building.
+  expected: true
+
+- id: cc-021
+  title: PhD I am not going to finish
+  body: I have known this for a year. I have not told anyone yet. Saying it
+    here so the silence stops being the place where the decision actually
+    lives. The committee can read this as a withdrawal letter; I am done.
+  expected: true
+
+- id: cc-022
+  title: The book that wants to be three essays
+  body: It wanted to be a book and it kept trying to be three essays. I have
+    been forcing it to be a book for two years. Letting it be three essays
+    means the book-shaped thing dies, and that is the right move.
+  expected: true
+
+# ---- Negatives (false-positive risk: NOT abandonment) ----
+
+- id: cc-023
+  title: Stuck on this design today
+  body: Spent four hours on the auth flow and got nowhere useful. Frustrated.
+    Going to sleep on it and come back tomorrow with fresh eyes. The
+    problem is real; I am just not seeing it tonight.
+  expected: false
+
+- id: cc-024
+  title: Taking the long weekend off
+  body: I am going to step back from the project for the long weekend. The
+    work is in a good state. When I come back Tuesday I will know better
+    where the gaps are. This is not stopping; this is letting the soup settle.
+  expected: false
+
+- id: cc-025
+  title: Shipped the migration
+  body: Two months of work and the migration is live. Old code deleted, new
+    code monitored, no incidents in 48 hours. Calling this done and moving
+    to the next thing on the list.
+  expected: false
+
+- id: cc-026
+  title: Holding the paradox open
+  body: My instinct says push harder; my experience says wait. Both are
+    right. I am not resolving this. The contradiction is the actual data —
+    the thing I will keep noticing every time the project asks for a decision.
+  expected: false
+
+- id: cc-027
+  title: Pivoting to the new approach
+  body: The old architecture is not going to scale and we know it. Starting
+    the redesign tomorrow. The work is not over — the angle of attack is
+    just different. Keeping every learning from the old approach.
+  expected: false
+
+- id: cc-028
+  title: Handing this off to L
+  body: L has more context for the front-end side than I do. I am handing
+    the dashboard work over to them so I can focus on the API. The work
+    continues; the assignment changes.
+  expected: false
+
+- id: cc-029
+  title: End of phase 1
+  body: We have hit the end of phase 1 and the planned deliverables are in.
+    Brief pause to write the phase 1 retro, then straight into phase 2.
+    The thing is not over; the chapter is.
+  expected: false
+
+- id: cc-030
+  title: Explicitly NOT doing this in Q3
+  body: Adding this to the Q4 backlog. Q3 is full and adding more is how we
+    miss the launch. The work is real and important; the timing is not now.
+  expected: false
+
+- id: cc-031
+  title: Hard week but worth it
+  body: Every part of this week was harder than I expected. I am tired but
+    I am not less convinced. The work is producing the thing I wanted. The
+    difficulty is information about scope, not a reason to stop.
+  expected: false
+
+- id: cc-032
+  title: Rescoping the launch
+  body: We are shipping a smaller version of this in three weeks instead of
+    the full version in three months. The big version is not dead — the
+    smaller version is the way we learn what the big one should actually be.
+  expected: false
+
+- id: cc-033
+  title: On pause until the budget question
+  body: I am pausing this until the budget question lands next quarter.
+    "On pause" not "abandoned" — I have the file open and the plan written
+    and as soon as we know the number I am back on it.
+  expected: false
+
+- id: cc-034
+  title: Side question, not the main thread
+  body: This is a fun thing I noticed while doing the real work. Writing it
+    down so I do not forget but I am not going to chase it now. The main
+    project is on track and that is where the attention belongs.
+  expected: false
+
+- id: cc-035
+  title: Retro on the migration
+  body: Now that the migration is done, three things to remember next time —
+    write the rollback first, test on staging for a week, and have an
+    on-call rota in place before launch day. The project closed cleanly.
+  expected: false
+
+- id: cc-036
+  title: Archiving the old design docs
+  body: Moving the v1 design docs into the reference folder. They are not
+    active but they are the record of what we learned. Anyone working on
+    v3 should read them before they re-invent any of the same wheels.
+  expected: false
+
+- id: cc-037
+  title: Sprint debrief
+  body: Hit our targets, shipped the feature on schedule, no major regressions.
+    The team did good work this week. Writing the demo script for the
+    Friday review.
+  expected: false
+
+- id: cc-038
+  title: This contradicts what I wrote in March
+  body: In March I said the framework requires four phases. Today I think it
+    needs three. I am not retracting March; the March version is the version
+    that thinks four. Holding both as the actual state of my thinking.
+  expected: false
+
+- id: cc-039
+  title: First milestone landed
+  body: The first milestone of the FEAT-009 sequence is in. Next two are
+    queued. Pace feels sustainable. Writing the release notes tonight, then
+    starting the second milestone tomorrow morning.
+  expected: false
+
+- id: cc-040
+  title: Reviewing the proposal one more time
+  body: Sending the proposal out tomorrow. Spending tonight on one more pass
+    to clean up the assumptions section. The work is done; this is polish.
+  expected: false
+
+- id: cc-041
+  title: Will revisit after the user interviews
+  body: I cannot answer this question without more data. Pausing the spec
+    work until the next batch of user interviews lands next week. Plan is
+    intact; I just need the inputs the spec depends on.
+  expected: false
+
+- id: cc-042
+  title: Three concrete next steps
+  body: Three things to do this week — finalize the schema, get the migration
+    PR reviewed, draft the rollout doc. All blockers identified, all owners
+    assigned. The work is active and on schedule.
+  expected: false
+
+- id: cc-043
+  title: A wonderful collaborator
+  body: R and I finally got the proposal to a place we both like. Their edits
+    on section three were exactly the move it needed. Continuing to lean on
+    their judgment for the rest of the rollout.
+  expected: false
+
+- id: cc-044
+  title: Still in this
+  body: Six months in and the work is still teaching me things I did not
+    expect. Pace is steady, motivation is fine, the question still has
+    enough air in it to keep me curious. No exit plan; this is where I am.
+  expected: false
