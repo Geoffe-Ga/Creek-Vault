@@ -131,6 +131,60 @@ def safe_file_modified_time(path: Any) -> datetime | None:
         return None
 
 
+_OOXML_CORE_PROPERTIES_PATH: str = "docProps/core.xml"
+"""ZIP entry inside an OOXML package that holds the Dublin Core properties.
+
+OOXML (DOCX/XLSX/PPTX) wraps a ``docProps/core.xml`` file in the ZIP
+package, carrying ``dcterms:created`` and ``dcterms:modified`` plus
+the Dublin Core ``title`` / ``creator`` fields. Reading it through
+``zipfile`` + ``xml.etree`` avoids pulling python-pptx / openpyxl just
+for the date extraction.
+"""
+
+_DCTERMS_NAMESPACE_URI: str = "http://purl.org/dc/terms/"
+"""XML namespace URI for ``dcterms:`` elements in OOXML core properties."""
+
+
+def ooxml_authored_at(path: Any) -> datetime | None:
+    """Return ``dcterms:created`` / ``dcterms:modified`` from an OOXML file.
+
+    Tries ``dcterms:created`` first (the document creation time recorded
+    by Word / Excel / PowerPoint when the file was first saved), then
+    falls back to ``dcterms:modified``. Returns ``None`` when the file
+    is not a valid OOXML package, has no core-properties part, or both
+    fields are missing — the caller then falls back to the filesystem
+    mtime per the FEAT-031 (#263) fallback chain.
+
+    Args:
+        path: Path to a ``.docx`` / ``.xlsx`` / ``.pptx`` file.
+
+    Returns:
+        A timezone-aware datetime, or ``None`` when nothing is
+        extractable.
+    """
+    import xml.etree.ElementTree as ET  # noqa: S405 — XML is opt-in via FEAT-031
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            try:
+                with zf.open(_OOXML_CORE_PROPERTIES_PATH) as fp:
+                    tree = ET.parse(fp)  # noqa: S314 — trusted user file
+            except KeyError:
+                return None
+    except (OSError, zipfile.BadZipFile):
+        return None
+    root = tree.getroot()
+    for field in ("created", "modified"):
+        element = root.find(f"{{{_DCTERMS_NAMESPACE_URI}}}{field}")
+        if element is None or not element.text:
+            continue
+        parsed = parse_authored_value(element.text)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def frontmatter_authored_at(
     fm_data: dict[str, Any],
     keys: tuple[str, ...],

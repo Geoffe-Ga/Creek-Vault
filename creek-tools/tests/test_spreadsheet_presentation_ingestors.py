@@ -1128,3 +1128,190 @@ class TestModuleExports:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestPresentationAuthoredAt:
+    """``PresentationIngestor`` reads ``dcterms:created`` from the .pptx package.
+
+    FEAT-031 (#263): the chain is OOXML core properties → mtime.
+    """
+
+    def test_authored_at_falls_back_to_mtime_for_nonexistent_package(
+        self, tmp_path: "Path"
+    ) -> None:
+        """A non-OOXML file (an empty stub) falls back to mtime."""
+        from datetime import UTC, datetime
+        import os
+
+        path = tmp_path / "deck.pptx"
+        path.write_bytes(b"")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        backend = StubPresentationBackend(
+            presentations={
+                "deck.pptx": PresentationData(
+                    title="Title",
+                    slides=(SlideData(index=1, title="A", body="b"),),
+                ),
+            },
+        )
+        ingestor = PresentationIngestor(backend=backend)
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_authored_at_from_real_pptx_core_properties(
+        self, tmp_path: "Path"
+    ) -> None:
+        """Build a minimal valid .pptx and verify dcterms:created is read."""
+        import zipfile
+
+        path = tmp_path / "deck.pptx"
+        core_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<cp:coreProperties '
+            'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/'
+            'core-properties" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:dcterms="http://purl.org/dc/terms/">'
+            '<dcterms:created xsi:type="dcterms:W3CDTF" '
+            'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+            "2024-03-15T10:30:00Z</dcterms:created>"
+            "</cp:coreProperties>"
+        )
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("docProps/core.xml", core_xml)
+
+        backend = StubPresentationBackend(
+            presentations={
+                "deck.pptx": PresentationData(
+                    title="Title",
+                    slides=(SlideData(index=1, title="A", body="b"),),
+                ),
+            },
+        )
+        ingestor = PresentationIngestor(backend=backend)
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: "Path") -> None:
+        path = tmp_path / "deck.pptx"
+        path.write_bytes(b"")
+        backend = StubPresentationBackend(
+            presentations={
+                "deck.pptx": PresentationData(
+                    title="Title",
+                    slides=(SlideData(index=1, title="A", body="b"),),
+                ),
+            },
+        )
+        ingestor = PresentationIngestor(backend=backend)
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+
+
+class TestSpreadsheetAuthoredAt:
+    """``SpreadsheetIngestor`` reads ``dcterms:created`` from .xlsx packages.
+
+    FEAT-031 (#263): the chain is OOXML core properties → mtime; .csv
+    files skip straight to mtime since they have no in-band date.
+    """
+
+    def test_xlsx_authored_at_from_core_properties(
+        self, tmp_path: "Path"
+    ) -> None:
+        import zipfile
+
+        path = tmp_path / "book.xlsx"
+        core_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<cp:coreProperties '
+            'xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/'
+            'core-properties" '
+            'xmlns:dcterms="http://purl.org/dc/terms/">'
+            "<dcterms:created>2024-03-15T10:30:00Z</dcterms:created>"
+            "</cp:coreProperties>"
+        )
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("docProps/core.xml", core_xml)
+
+        backend = StubSpreadsheetBackend(
+            workbooks={
+                "book.xlsx": WorkbookData(
+                    sheets=(
+                        SheetData(
+                            name="Sheet1",
+                            headers=("col",),
+                            rows=(("v",),),
+                        ),
+                    ),
+                ),
+            },
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+
+    def test_csv_authored_at_uses_mtime(self, tmp_path: "Path") -> None:
+        from datetime import UTC, datetime
+        import os
+
+        path = tmp_path / "data.csv"
+        path.write_text("col\nv\n", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+
+        backend = StubSpreadsheetBackend(
+            workbooks={
+                "data.csv": WorkbookData(
+                    sheets=(
+                        SheetData(
+                            name="Sheet1",
+                            headers=("col",),
+                            rows=(("v",),),
+                        ),
+                    ),
+                ),
+            },
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_authored_at_emitted_in_frontmatter(self, tmp_path: "Path") -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("col\nv\n", encoding="utf-8")
+        backend = StubSpreadsheetBackend(
+            workbooks={
+                "data.csv": WorkbookData(
+                    sheets=(
+                        SheetData(
+                            name="Sheet1",
+                            headers=("col",),
+                            rows=(("v",),),
+                        ),
+                    ),
+                ),
+            },
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+        docs = ingestor.discover(path)
+        fragments = ingestor.parse(docs[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm

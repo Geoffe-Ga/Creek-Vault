@@ -28,6 +28,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import json
+import re
+
+from creek.ingest._authored_at import (
+    parse_authored_value,
+    safe_file_modified_time,
+)
 from creek.ingest._detection import is_substack_export
 from creek.ingest.base import (
     Ingestor,
@@ -336,6 +343,315 @@ def _extract_pdf_metadata(pdf_bytes: bytes) -> dict[str, Any]:
     return _extract_pdf_metadata_from_bytes(pdf_bytes)
 
 
+_HTML_META_NAME_KEYS: tuple[str, ...] = (
+    "article:published_time",
+    "dcterms.created",
+    "dc.date.issued",
+    "date",
+    "dc.date",
+    "pubdate",
+    "publishdate",
+    "publication_date",
+    "sailthru.date",
+)
+"""``<meta property|name>`` keys consulted, in order, for HTML authored_at.
+
+Order is "most explicit first": ``article:published_time`` is set by
+modern CMSes; ``dcterms.created`` is the Dublin Core canonical;
+``date`` is the bare lower-bound that any HTML page might have.
+"""
+
+_HTML_META_RE = re.compile(
+    r"<meta\s+(?:[^>]*?\s)?(?:name|property)\s*=\s*[\"']([^\"']+)[\"']"
+    r"\s+content\s*=\s*[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+"""Loose ``<meta>`` regex that handles both ``name=`` and ``property=``.
+
+A real HTML parser is over-engineered for the narrow date-extraction
+job; the issue's never-guess rule means a missed match is fine — we
+fall back to mtime. The regex tolerates either attribute order
+(content first, name first) by anchoring on the (name|property) key
+and a following content value.
+"""
+
+_JSON_LD_BLOCK_RE = re.compile(
+    r"<script[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+"""Match a ``<script type='application/ld+json'>...</script>`` block."""
+
+
+def _extract_html_authored_at(html: str) -> datetime | None:
+    """Return the HTML page's authored date, or ``None`` (FEAT-031 / #263).
+
+    Walks the fallback chain ``<meta>`` tags → JSON-LD ``datePublished``.
+    The mtime fallback lives in :func:`_resolve_document_authored_at`
+    so this function stays a pure parser.
+    """
+    meta_match = _extract_html_meta_date(html)
+    if meta_match is not None:
+        return meta_match
+    return _extract_html_json_ld_date(html)
+
+
+def _extract_html_meta_date(html: str) -> datetime | None:
+    """Try each :data:`_HTML_META_NAME_KEYS` key in order; ``None`` on miss."""
+    matches: dict[str, str] = {}
+    for key, value in _HTML_META_RE.findall(html):
+        normalised = key.strip().lower()
+        if normalised not in matches:
+            matches[normalised] = value.strip()
+    for candidate in _HTML_META_NAME_KEYS:
+        raw = matches.get(candidate.lower())
+        if raw is None:
+            continue
+        parsed = parse_authored_value(raw)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_html_json_ld_date(html: str) -> datetime | None:
+    """Scan every JSON-LD block for ``datePublished``; ``None`` on miss."""
+    for block in _JSON_LD_BLOCK_RE.findall(html):
+        try:
+            payload = json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+        for candidate in _iter_json_ld_objects(payload):
+            raw = candidate.get("datePublished") or candidate.get("dateCreated")
+            if not isinstance(raw, str):
+                continue
+            parsed = parse_authored_value(raw)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _iter_json_ld_objects(payload: Any) -> "list[dict[str, Any]]":
+    """Yield every dict in a JSON-LD payload (top-level + ``@graph`` children).
+
+    Real-world JSON-LD blocks are either a single object, a list of
+    objects, or a single object with a ``@graph`` array of objects.
+    We surface them all so :func:`_extract_html_json_ld_date` can scan
+    each one without caring about the wrapper shape.
+    """
+    objects: list[dict[str, Any]] = []
+    candidates = payload if isinstance(payload, list) else [payload]
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        objects.append(item)
+        graph = item.get("@graph")
+        if isinstance(graph, list):
+            objects.extend(g for g in graph if isinstance(g, dict))
+    return objects
+
+
+_RTF_DATE_RE = re.compile(
+    r"\\(?P<which>creatim|revtim)"
+    r"(?=[\\}])"  # boundary before \yr group or block close
+    r"(?P<rest>(?:\\(?:yr|mo|dy|hr|min|sec)-?\d+)*)",
+    re.IGNORECASE,
+)
+"""Match an RTF ``\\creatim`` / ``\\revtim`` block and its component fields."""
+
+_RTF_FIELD_RE = re.compile(r"\\(yr|mo|dy|hr|min|sec)(-?\d+)", re.IGNORECASE)
+
+
+def _extract_rtf_authored_at(rtf_text: str) -> datetime | None:
+    """Return the RTF source's authored date, or ``None`` (FEAT-031 / #263).
+
+    Prefers ``\\creatim`` (the document's creation block) over
+    ``\\revtim`` (last revision). Each component (``\\yr``, ``\\mo``,
+    ``\\dy``, ``\\hr``, ``\\min``, ``\\sec``) is optional; missing
+    fields default to ``0`` per the RTF spec, which gives us at least
+    a date-precision answer when only ``\\yr\\mo\\dy`` is present.
+    """
+    found: dict[str, str] = {}
+    for match in _RTF_DATE_RE.finditer(rtf_text):
+        which = match.group("which").lower()
+        if which not in found:
+            found[which] = match.group("rest")
+    for key in ("creatim", "revtim"):
+        block = found.get(key)
+        if block is None:
+            continue
+        parsed = _parse_rtf_date_block(block)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_rtf_date_block(block: str) -> datetime | None:
+    """Build a UTC datetime from an RTF ``\\creatim`` / ``\\revtim`` block."""
+    parts: dict[str, int] = {}
+    for name, value in _RTF_FIELD_RE.findall(block):
+        try:
+            parts[name.lower()] = int(value)
+        except ValueError:
+            continue
+    year = parts.get("yr")
+    month = parts.get("mo")
+    day = parts.get("dy")
+    if year is None or month is None or day is None:
+        return None
+    try:
+        from datetime import UTC
+
+        return datetime(
+            year=year,
+            month=month,
+            day=day,
+            hour=parts.get("hr", 0),
+            minute=parts.get("min", 0),
+            second=parts.get("sec", 0),
+            tzinfo=UTC,
+        )
+    except ValueError:
+        return None
+
+
+def _resolve_document_authored_at(
+    file_type: str,
+    raw_bytes: bytes,
+    text: str,
+    metadata: dict[str, Any],
+    file_path: Path,
+) -> datetime | None:
+    """Apply the DocumentIngestor per-format fallback chain (FEAT-031 / #263).
+
+    Each branch implements the chain documented on the issue body:
+
+    * HTML/HTM: ``<meta>`` keys + JSON-LD ``datePublished`` → mtime.
+    * PDF: ``/CreationDate`` from the document info → ``/ModDate`` → mtime.
+    * DOCX: ``dcterms:created`` → ``dcterms:modified`` → mtime.
+    * RTF: ``\\creatim`` → ``\\revtim`` → mtime.
+    * TXT (and anything unrecognised): mtime only.
+
+    ``metadata`` is the dict :meth:`DocumentIngestor._extract_metadata`
+    has already populated; we read PDF / DOCX fields out of it instead
+    of re-parsing the bytes.
+    """
+    extractor = _DOCUMENT_AUTHORED_AT_EXTRACTORS.get(file_type)
+    explicit = extractor(raw_bytes, text, metadata) if extractor is not None else None
+    if explicit is not None:
+        return explicit
+    return safe_file_modified_time(file_path)
+
+
+def _html_authored_at(
+    _raw_bytes: bytes,
+    text: str,
+    _metadata: dict[str, Any],
+) -> datetime | None:
+    """HTML extractor — delegates to :func:`_extract_html_authored_at`."""
+    return _extract_html_authored_at(text)
+
+
+def _pdf_authored_at(
+    _raw_bytes: bytes,
+    _text: str,
+    metadata: dict[str, Any],
+) -> datetime | None:
+    """PDF extractor — read ``/CreationDate`` then ``/ModDate`` from info."""
+    for key in ("creationdate", "moddate"):
+        raw = metadata.get(key)
+        if raw is None:
+            continue
+        parsed = _parse_pdf_date(raw)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_pdf_date(value: object) -> datetime | None:
+    """Parse a PDF ``/CreationDate`` / ``/ModDate`` ``D:YYYYMMDD...`` string.
+
+    PDF dates are formatted ``D:YYYYMMDDHHmmSS+HH'mm'`` per ISO 32000.
+    The strict format makes :func:`parse_authored_value` (which expects
+    ISO 8601 or one of the fallback patterns) miss them, so we
+    normalise to ISO 8601 first.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("D:"):
+        text = text[2:]
+    if len(text) < 4:
+        return None
+    parts: list[str] = []
+    pieces = (text[0:4], text[4:6], text[6:8], text[8:10], text[10:12], text[12:14])
+    for idx, piece in enumerate(pieces):
+        if not piece or not piece.isdigit():
+            break
+        parts.append(piece if idx else piece)
+    if len(parts) < 3:
+        # Need at least YYYYMMDD; surface what parse_authored_value can
+        # do with the raw string in case we got an already-ISO value.
+        return parse_authored_value(value)
+    iso = (
+        f"{parts[0]}-{parts[1]}-{parts[2]}"
+        + (f"T{parts[3]}" if len(parts) > 3 else "")
+        + (f":{parts[4]}" if len(parts) > 4 else "")
+        + (f":{parts[5]}" if len(parts) > 5 else "")
+    )
+    return parse_authored_value(iso)
+
+
+def _docx_authored_at(
+    raw_bytes: bytes,
+    _text: str,
+    metadata: dict[str, Any],
+) -> datetime | None:
+    """DOCX extractor — ``dcterms:created`` then ``dcterms:modified``."""
+    created = metadata.get("created_date")
+    parsed = parse_authored_value(created) if created is not None else None
+    if parsed is not None:
+        return parsed
+    modified = _extract_docx_modified(raw_bytes)
+    if modified is not None:
+        return parse_authored_value(modified)
+    return None
+
+
+def _extract_docx_modified(docx_bytes: bytes) -> str | None:
+    """Return the DOCX core ``dcterms:modified`` ISO string, or ``None``."""
+    try:
+        from docx import Document as DocxDocument
+    except ImportError:
+        return None
+    try:
+        doc = DocxDocument(io.BytesIO(docx_bytes))
+    except Exception:  # noqa: BLE001 — python-docx surfaces a heterogeneous set
+        logger.debug("Could not open DOCX for dcterms:modified extraction")
+        return None
+    modified = doc.core_properties.modified
+    if modified is None:
+        return None
+    return modified.isoformat()
+
+
+def _rtf_authored_at(
+    _raw_bytes: bytes,
+    text: str,
+    _metadata: dict[str, Any],
+) -> datetime | None:
+    """RTF extractor — delegates to :func:`_extract_rtf_authored_at`."""
+    return _extract_rtf_authored_at(text)
+
+
+_DOCUMENT_AUTHORED_AT_EXTRACTORS: dict[str, Any] = {
+    ".html": _html_authored_at,
+    ".htm": _html_authored_at,
+    ".pdf": _pdf_authored_at,
+    ".docx": _docx_authored_at,
+    ".rtf": _rtf_authored_at,
+}
+"""Per-file-type ``authored_at`` extractor. ``.txt`` is absent on purpose."""
+
+
 def _infer_document_platform(extension: str) -> SourcePlatform:
     """Map a file extension to a SourcePlatform value.
 
@@ -464,6 +780,13 @@ class DocumentIngestor(Ingestor):
         content = self._extract_content(file_type, raw.content, text)
         metadata = self._extract_metadata(file_type, raw.content, encoding)
         timestamp = self._resolve_timestamp(metadata, raw.path)
+        metadata["authored_at"] = _resolve_document_authored_at(
+            file_type,
+            raw.content,
+            text,
+            metadata,
+            raw.path,
+        )
 
         return [
             ParsedFragment(
@@ -618,9 +941,13 @@ class DocumentIngestor(Ingestor):
         if fragment.metadata.get("scanned"):
             source["scanned"] = True
 
-        return {
+        fm: dict[str, Any] = {
             "type": "fragment",
             "title": title,
             "source": source,
             "created": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm

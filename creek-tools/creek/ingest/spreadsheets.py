@@ -31,6 +31,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import chardet
 
+from creek.ingest._authored_at import ooxml_authored_at, safe_file_modified_time
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -375,6 +376,10 @@ class SpreadsheetIngestor(Ingestor):
         """
         workbook = self.backend.read_workbook(raw.path, has_header=has_header)
         timestamp = file_modified_time(raw.path)
+        # FEAT-031 (#263): .xlsx ships ``dcterms:created`` /
+        # ``dcterms:modified`` in the OOXML package; .csv has no
+        # in-band date so falls straight to filesystem mtime.
+        authored_at = _resolve_spreadsheet_authored_at(raw.path)
         fragments: list[ParsedFragment] = []
         for sheet in workbook.sheets:
             if sheet.is_empty:
@@ -392,6 +397,7 @@ class SpreadsheetIngestor(Ingestor):
                         "sheet": sheet.name,
                         "rows": len(sheet.rows),
                         "columns": column_count,
+                        "authored_at": authored_at,
                     },
                     source_path=str(raw.path),
                     timestamp=timestamp,
@@ -416,7 +422,7 @@ class SpreadsheetIngestor(Ingestor):
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Produce YAML frontmatter for a spreadsheet fragment."""
-        return {
+        fm: dict[str, Any] = {
             "type": "fragment",
             "source": {
                 "platform": SourcePlatform.SPREADSHEET.value,
@@ -430,6 +436,24 @@ class SpreadsheetIngestor(Ingestor):
             "columns": fragment.metadata.get("columns", 0),
             "ingested": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm
+
+
+def _resolve_spreadsheet_authored_at(path: Path) -> "datetime | None":
+    """SpreadsheetIngestor authored_at chain (FEAT-031 / #263).
+
+    ``.xlsx`` carries Dublin Core date properties; ``.csv`` does not.
+    Both fall through to the filesystem mtime when no in-band date is
+    available — the ``None`` answer is reserved for an unreadable file.
+    """
+    if path.suffix.lower() == ".xlsx":
+        ooxml = ooxml_authored_at(path)
+        if ooxml is not None:
+            return ooxml
+    return safe_file_modified_time(path)
 
 
 def _extract_headers_and_rows(

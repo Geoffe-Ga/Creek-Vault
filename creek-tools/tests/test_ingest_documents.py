@@ -739,3 +739,117 @@ class TestDocumentIngestorIngest:
         for entry in result.provenance:
             assert entry.ingestor_name == "DocumentIngestor"
             assert entry.status == "success"
+
+
+# ---- authored_at extraction (FEAT-031) ----
+
+
+class TestDocumentAuthoredAt:
+    """``DocumentIngestor`` extraction chains per file type.
+
+    FEAT-031 (#263):
+    - HTML/HTM: meta tags + JSON-LD ``datePublished`` → mtime.
+    - PDF: ``/CreationDate`` → ``/ModDate`` → mtime.
+    - DOCX: core ``dcterms:created`` → ``dcterms:modified`` → mtime.
+    - RTF: ``\\creatim`` → ``\\revtim`` → mtime.
+    - TXT: mtime only (lowest-fidelity tier).
+    """
+
+    def test_html_meta_published_time_wins(
+        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+    ) -> None:
+        path = tmp_path / "post.html"
+        path.write_text(
+            '<html><head>'
+            '<meta property="article:published_time" '
+            'content="2024-03-15T08:00:00Z">'
+            '</head><body><p>Hi</p></body></html>',
+            encoding="utf-8",
+        )
+        docs = doc_ingestor.discover(path)
+        fragments = doc_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+
+    def test_html_json_ld_date_published_used(
+        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+    ) -> None:
+        path = tmp_path / "post.html"
+        path.write_text(
+            '<html><head>'
+            '<script type="application/ld+json">'
+            '{"@type": "Article", "datePublished": "2023-06-09T12:00:00Z"}'
+            '</script></head><body><p>Hi</p></body></html>',
+            encoding="utf-8",
+        )
+        docs = doc_ingestor.discover(path)
+        fragments = doc_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2023-06-09"
+
+    def test_html_falls_back_to_mtime(
+        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+    ) -> None:
+        from datetime import UTC
+        import os
+
+        path = tmp_path / "post.html"
+        path.write_text("<html><body><p>Hi</p></body></html>", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        docs = doc_ingestor.discover(path)
+        fragments = doc_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_txt_falls_back_to_mtime_only(
+        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+    ) -> None:
+        from datetime import UTC
+        import os
+
+        path = tmp_path / "note.txt"
+        path.write_text("Meeting notes\n", encoding="utf-8")
+        expected = datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC)
+        os.utime(path, (expected.timestamp(), expected.timestamp()))
+        docs = doc_ingestor.discover(path)
+        fragments = doc_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored == expected
+
+    def test_rtf_creatim_used(
+        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+    ) -> None:
+        path = tmp_path / "doc.rtf"
+        path.write_text(
+            r"{\rtf1\ansi"
+            r"{\info"
+            r"{\creatim\yr2024\mo3\dy15\hr10\min30}"
+            r"{\revtim\yr2024\mo4\dy1\hr0\min0}"
+            r"}Hello}",
+            encoding="utf-8",
+        )
+        docs = doc_ingestor.discover(path)
+        fragments = doc_ingestor.parse(docs[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date().isoformat() == "2024-03-15"
+
+    def test_authored_at_emitted_in_frontmatter(
+        self, doc_ingestor: DocumentIngestor, tmp_path: "Path"
+    ) -> None:
+        path = tmp_path / "post.html"
+        path.write_text(
+            '<html><head>'
+            '<meta property="article:published_time" '
+            'content="2024-03-15T08:00:00Z">'
+            '</head><body><p>Hi</p></body></html>',
+            encoding="utf-8",
+        )
+        docs = doc_ingestor.discover(path)
+        fragments = doc_ingestor.parse(docs[0])
+        fm = doc_ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")

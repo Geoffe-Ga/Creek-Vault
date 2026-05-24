@@ -24,6 +24,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from creek.ingest._authored_at import ooxml_authored_at, safe_file_modified_time
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -33,6 +34,7 @@ from creek.ingest.base import (
 from creek.models import SourcePlatform
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -242,6 +244,11 @@ class PresentationIngestor(Ingestor):
             )
             return []
         timestamp = file_modified_time(raw.path)
+        # FEAT-031 (#263): try the .pptx package's core properties
+        # (``dcterms:created`` / ``dcterms:modified``) first; fall back
+        # to filesystem mtime when the package is malformed or the
+        # properties block is absent.
+        authored_at = ooxml_authored_at(raw.path) or safe_file_modified_time(raw.path)
         return [
             ParsedFragment(
                 content="",  # Markdown rendered in convert_to_markdown.
@@ -249,6 +256,7 @@ class PresentationIngestor(Ingestor):
                     "original_file": str(raw.path),
                     "title": data.title or raw.path.stem,
                     "slide_count": len(data.slides),
+                    "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
                 timestamp=timestamp,
@@ -284,7 +292,7 @@ class PresentationIngestor(Ingestor):
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Produce YAML frontmatter for a presentation fragment."""
-        return {
+        fm: dict[str, Any] = {
             "type": "fragment",
             "source": {
                 "platform": SourcePlatform.PRESENTATION.value,
@@ -297,6 +305,10 @@ class PresentationIngestor(Ingestor):
             "slide_count": fragment.metadata.get("slide_count", 0),
             "ingested": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            fm["authored_at"] = authored_at.isoformat()
+        return fm
 
 
 __all__ = [
