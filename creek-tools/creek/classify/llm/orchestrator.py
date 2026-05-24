@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 import httpx
 import yaml
 
-from creek.classify.llm import providers
 from creek.classify.llm.batch import run_batch
 from creek.classify.llm.calibration import _apply_wavelength
 from creek.classify.llm.parsing import (
@@ -29,6 +28,8 @@ from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
     ANTHROPIC_CLOUD_WARNING,
     AnthropicProvider,
+    call_ollama,
+    check_ollama_available,
 )
 
 if TYPE_CHECKING:
@@ -129,7 +130,7 @@ class LLMClassifier:
         """
         if self.config.provider == self.ANTHROPIC_PROVIDER:
             return self._check_anthropic_availability()
-        return providers.check_ollama_available(
+        return check_ollama_available(
             self.config,
             timeout=self.AVAILABILITY_TIMEOUT,
         )
@@ -219,7 +220,7 @@ class LLMClassifier:
             httpx.HTTPStatusError: On HTTP error responses.
             httpx.HTTPError: On connection or transport errors.
         """
-        return providers.call_ollama(
+        return call_ollama(
             self.config,
             prompt,
             timeout=self.REQUEST_TIMEOUT,

@@ -48,7 +48,7 @@ class AnthropicProvider:
         config: The LLM configuration specifying model, batch size, etc.
     """
 
-    DEFAULT_MODEL: str = "claude-sonnet-4-5-20250929"
+    DEFAULT_MODEL: str = "claude-sonnet-4-6"
     """Default Anthropic model when the config does not override it."""
 
     API_KEY_ENV: str = "ANTHROPIC_API_KEY"

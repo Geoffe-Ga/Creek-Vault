@@ -1171,13 +1171,13 @@ class TestAnthropicProviderModel:
         provider = AnthropicProvider(config)
         assert provider.model == "claude-custom-model"
 
-    def test_default_model_is_claude_sonnet_4_5(
+    def test_default_model_is_claude_sonnet_4_6(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The default model should be the documented Claude Sonnet 4.5."""
+        """The default model should be the documented Claude Sonnet 4.6."""
         _set_anthropic_env(monkeypatch)
-        assert AnthropicProvider.DEFAULT_MODEL == "claude-sonnet-4-5-20250929"
+        assert AnthropicProvider.DEFAULT_MODEL == "claude-sonnet-4-6"
 
 
 class TestAnthropicProviderCall:

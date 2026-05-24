@@ -904,13 +904,13 @@ llm:
   # Cloud API is available as an explicit opt-in for higher-quality classification,
   # but sends your fragments to a third-party server. Use with awareness.
   provider: ollama  # ollama (local, default) | anthropic | openai
-  model: mistral    # for ollama; or claude-sonnet-4-5-20250929 for anthropic
+  model: mistral    # for ollama; or claude-sonnet-4-6 for anthropic
   ollama_url: "http://localhost:11434"
   batch_size: 50
   max_concurrent: 5
   # To enable cloud classification (opt-in, sends data externally):
   # provider: anthropic
-  # model: claude-sonnet-4-5-20250929
+  # model: claude-sonnet-4-6
   # api_key_env: ANTHROPIC_API_KEY  # read from environment variable, never stored in config
 
 embeddings:

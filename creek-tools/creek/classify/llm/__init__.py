@@ -19,6 +19,12 @@ submodules — :mod:`prompts`, :mod:`providers`, :mod:`parsing`,
 changing any observable behaviour. This package's ``__init__`` is a
 thin re-export shim so existing imports
 (``from creek.classify.llm import …``) keep working.
+
+The underscore-prefixed names below (``_BIASED_DIMENSIONS``,
+``_parse_dosage`` etc.) are re-exported solely so that pre-refactor
+tests can keep monkey-patching them on the package namespace; they are
+deliberately absent from :data:`__all__` and are not part of the public
+API.
 """
 
 from __future__ import annotations
@@ -32,32 +38,26 @@ import time as time
 import httpx as httpx
 
 from creek.classify.llm.batch import BatchStats
-from creek.classify.llm.calibration import _BIASED_DIMENSIONS
+from creek.classify.llm.calibration import _BIASED_DIMENSIONS as _BIASED_DIMENSIONS
 from creek.classify.llm.orchestrator import (
     LLMClassificationResult,
     LLMClassifier,
 )
+from creek.classify.llm.parsing import _parse_dosage as _parse_dosage
+from creek.classify.llm.parsing import _parse_enum as _parse_enum
+from creek.classify.llm.parsing import _parse_optional_enum as _parse_optional_enum
 from creek.classify.llm.parsing import (
-    _parse_dosage,
-    _parse_enum,
-    _parse_optional_enum,
-    _split_reasoning_and_yaml,
-    _strip_code_fences,
+    _split_reasoning_and_yaml as _split_reasoning_and_yaml,
 )
+from creek.classify.llm.parsing import _strip_code_fences as _strip_code_fences
 from creek.classify.llm.prompts import CLASSIFICATION_PROMPT
 from creek.classify.llm.providers import ANTHROPIC_CLOUD_WARNING, AnthropicProvider
 
 __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
     "CLASSIFICATION_PROMPT",
-    "_BIASED_DIMENSIONS",
     "AnthropicProvider",
     "BatchStats",
     "LLMClassificationResult",
     "LLMClassifier",
-    "_parse_dosage",
-    "_parse_enum",
-    "_parse_optional_enum",
-    "_split_reasoning_and_yaml",
-    "_strip_code_fences",
 ]
