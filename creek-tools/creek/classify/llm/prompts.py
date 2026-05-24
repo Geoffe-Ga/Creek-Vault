@@ -11,10 +11,43 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from creek.classify import few_shot
+from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES, FREQUENCY_THEMES
+from creek.models import Frequency
 
 if TYPE_CHECKING:
     from creek.config import LLMConfig
     from creek.models import Fragment
+
+
+def _build_frequency_block() -> str:
+    """Render the frequency dimension lines for the classification prompt.
+
+    Pairs each canonical APTITUDE name (per §6.1 of the ontology spec)
+    with the matching Core Theme gloss. Sourcing the glosses from
+    :data:`creek.generate.indexes.FREQUENCY_THEMES` and the names from
+    :data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES` keeps the
+    prompt header in lockstep with the rest of the toolchain — see
+    ONTOLOGY-001 / ONTOLOGY-002 and the
+    ``docs/decisions/2026-05-23-frequency-naming.md`` record.
+
+    Returns:
+        A newline-joined list of indented ``- F<n>: Name — Gloss`` lines
+        ready for substitution into :data:`CLASSIFICATION_PROMPT`.
+    """
+    lines = [
+        (
+            f"   - {freq.value}: {CANONICAL_FREQUENCY_NAMES[freq]}"
+            f" — {FREQUENCY_THEMES[freq]}"
+        )
+        for freq in Frequency
+        if freq is not Frequency.UNCLASSIFIED
+    ]
+    return "\n".join(lines)
+
+
+_FREQUENCY_BLOCK: str = _build_frequency_block()
+"""Pre-rendered frequency-dimension lines baked into the prompt template."""
+
 
 CLASSIFICATION_PROMPT: str = """\
 You are a classification assistant for the Creek knowledge organization system.
@@ -22,10 +55,7 @@ You are a classification assistant for the Creek knowledge organization system.
 Given a fragment of content, classify it along the following dimensions:
 
 1. **Frequency** (APTITUDE F1-F10): Which frequency best describes the content?
-   - F1: Survival/Safety, F2: Belonging/Tribe, F3: Power/Agency,
-   - F4: Order/Structure, F5: Achievement/Strategy, F6: Community/Empathy,
-   - F7: Systems/Integration, F8: Holistic/Ecology, F9: Witness/Being,
-   - F10: Unity/Non-dual
+__FREQUENCY_BLOCK__
 
 2. **Wavelength Phase**: rising, peaking, withdrawal, diminishing, \
 bottoming_out, restoration
@@ -82,7 +112,7 @@ so calibrate honestly.
 Fragment title: {title}
 Fragment content:
 {content}
-"""
+""".replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK)
 """Prompt template for two-step LLM-based fragment classification (FEAT-017).
 
 Placeholders:

@@ -467,6 +467,58 @@ class TestClassificationPrompt:
         assert "{title}" in CLASSIFICATION_PROMPT
         assert "{content}" in CLASSIFICATION_PROMPT
 
+    def test_uses_canonical_frequency_names(self) -> None:
+        """ONTOLOGY-002: the prompt names every frequency per spec §6.1.
+
+        Drift in any of these labels — historically ``F2: Belonging/Tribe``
+        or ``F8: Holistic/Ecology`` — would silently contradict the
+        bundled few-shot rationales and erode classifier agreement on
+        every call. This regression guards the prompt against returning
+        to drifted glosses.
+        """
+        assert "F1: Agency" in CLASSIFICATION_PROMPT
+        assert "F2: Receptivity" in CLASSIFICATION_PROMPT
+        assert "F3: Self-Love / Power" in CLASSIFICATION_PROMPT
+        assert "F4: Community Love / Conformity" in CLASSIFICATION_PROMPT
+        assert "F5: Achievism" in CLASSIFICATION_PROMPT
+        assert "F6: Pluralism" in CLASSIFICATION_PROMPT
+        assert "F7: Integration" in CLASSIFICATION_PROMPT
+        assert "F8: True Self / Transcendence" in CLASSIFICATION_PROMPT
+        assert "F9: Unity" in CLASSIFICATION_PROMPT
+        assert "F10: Emptiness" in CLASSIFICATION_PROMPT
+
+    def test_excludes_pre_ontology_001_drifted_glosses(self) -> None:
+        """The pre-ONTOLOGY-002 drifted glosses must not reappear in the prompt."""
+        for drifted in (
+            "Survival/Safety",
+            "Belonging/Tribe",
+            "Power/Agency",
+            "Order/Structure",
+            "Achievement/Strategy",
+            "Community/Empathy",
+            "Systems/Integration",
+            "Holistic/Ecology",
+            "Witness/Being",
+            "Unity/Non-dual",
+        ):
+            assert drifted not in CLASSIFICATION_PROMPT, (
+                f"Pre-ONTOLOGY-002 drift {drifted!r} should not appear in prompt"
+            )
+
+    def test_frequency_lines_include_core_theme_glosses(self) -> None:
+        """Each canonical name should be paired with its Core Theme gloss.
+
+        The glosses are pulled from
+        :data:`creek.generate.indexes.FREQUENCY_THEMES`; this assertion
+        spot-checks that the prompt actually carries them rather than
+        leaving the model with bare labels.
+        """
+        from creek.generate.indexes import FREQUENCY_THEMES
+
+        assert FREQUENCY_THEMES[Frequency.F1] in CLASSIFICATION_PROMPT
+        assert FREQUENCY_THEMES[Frequency.F8] in CLASSIFICATION_PROMPT
+        assert FREQUENCY_THEMES[Frequency.F10] in CLASSIFICATION_PROMPT
+
 
 # ---- Validate Response ----
 

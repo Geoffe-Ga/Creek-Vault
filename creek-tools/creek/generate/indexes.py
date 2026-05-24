@@ -29,6 +29,26 @@ FREQUENCY_NAMES: dict[Frequency, str] = {
 }
 """Mapping from Frequency enum values to human-readable APTITUDE names."""
 
+CANONICAL_FREQUENCY_NAMES: dict[Frequency, str] = {
+    Frequency.F1: "Agency",
+    Frequency.F2: "Receptivity",
+    Frequency.F3: "Self-Love / Power",
+    Frequency.F4: "Community Love / Conformity",
+    Frequency.F5: "Achievism",
+    Frequency.F6: "Pluralism",
+    Frequency.F7: "Integration",
+    Frequency.F8: "True Self / Transcendence",
+    Frequency.F9: "Unity",
+    Frequency.F10: "Emptiness",
+}
+"""Canonical APTITUDE frequency names from §6.1 of the ontology spec.
+
+Single source of truth for the names the LLM classifier sees and that
+the decision record (``docs/decisions/2026-05-23-frequency-naming.md``)
+ratifies. Distinct from :data:`FREQUENCY_NAMES`, which carries
+slash-joined display labels for vault index notes.
+"""
+
 FREQUENCY_COLORS: dict[Frequency, str] = {
     Frequency.F1: "beige",
     Frequency.F2: "purple",
