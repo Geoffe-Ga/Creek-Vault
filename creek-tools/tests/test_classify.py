@@ -501,9 +501,9 @@ class TestClassificationPrompt:
             "Witness/Being",
             "Unity/Non-dual",
         ):
-            assert (
-                drifted not in CLASSIFICATION_PROMPT
-            ), f"Pre-ONTOLOGY-002 drift {drifted!r} should not appear in prompt"
+            assert drifted not in CLASSIFICATION_PROMPT, (
+                f"Pre-ONTOLOGY-002 drift {drifted!r} should not appear in prompt"
+            )
 
     def test_frequency_lines_include_core_theme_glosses(self) -> None:
         """Each canonical name should be paired with its Core Theme gloss.
