@@ -50,12 +50,19 @@ def _make_fragment(
     frequency: Frequency = Frequency.UNCLASSIFIED,
     confidence: Confidence | None = None,
 ) -> Fragment:
-    """Construct a test Fragment with wavelength/frequency fields."""
+    """Construct a test Fragment with wavelength/frequency fields.
+
+    Mirrors ``created`` into ``ingested`` so the FEAT-031
+    ``effective_authored_date`` helper — which falls back to
+    ``ingested`` when ``authored_at`` is unset — sees the test's
+    target date instead of the construction-time wall clock.
+    """
     return Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=SourcePlatform.JOURNAL),
         created=created,
+        ingested=created,
         frequency=FrequencyClassification(primary=frequency),
         wavelength=WavelengthClassification(
             phase=phase,

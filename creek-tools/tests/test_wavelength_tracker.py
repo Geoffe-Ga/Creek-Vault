@@ -54,12 +54,21 @@ def _make_fragment(
     emotional_texture: list[str] | None = None,
     frequency: Frequency = Frequency.UNCLASSIFIED,
 ) -> Fragment:
-    """Construct a test Fragment with the given wavelength/frequency fields."""
+    """Construct a test Fragment with the given wavelength/frequency fields.
+
+    The supplied ``created`` is mirrored into ``ingested`` so the
+    FEAT-031 ``effective_authored_date`` helper — which buckets on
+    ``authored_at`` then falls back to ``ingested`` — anchors each
+    test fragment to the date the test cares about. Without this
+    mirror every fragment would default to construction-time wall
+    clock and time-window assertions would collapse to zero hits.
+    """
     return Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=SourcePlatform.JOURNAL),
         created=created,
+        ingested=created,
         frequency=FrequencyClassification(primary=frequency),
         wavelength=WavelengthClassification(
             phase=phase,
@@ -1044,11 +1053,13 @@ class TestDataclasses:
 
 
 class TestAuthoredAtBucketing:
-    """``authored_at`` takes precedence over ``created`` for time bucketing.
+    """``authored_at`` takes precedence over ``ingested`` for time bucketing.
 
-    Without this, a Substack export ingested today would show up in
-    *this week's* wavelength snapshot even when every essay was
-    published years ago.
+    FEAT-031: without this, a Substack export ingested today would show
+    up in *this week's* wavelength snapshot even when every essay was
+    published years ago. The precedence — ``authored_at`` first,
+    ``ingested`` as honest fallback — is documented in
+    :func:`creek.time.effective_authored_at` and re-exported here.
     """
 
     def test_fragment_with_authored_at_is_bucketed_by_authored_date(
@@ -1080,16 +1091,27 @@ class TestAuthoredAtBucketing:
         )
         assert snapshot.fragment_count == 0
 
-    def test_fragment_without_authored_at_falls_back_to_created(self) -> None:
-        """When ``authored_at`` is ``None`` the bucket date is ``created``."""
+    def test_fragment_without_authored_at_falls_back_to_ingested(self) -> None:
+        """When ``authored_at`` is ``None`` the bucket date is ``ingested`` (FEAT-031).
+
+        ``ingested`` is the wall-clock moment the vault wrote the
+        fragment — always tz-aware and always present — so it is the
+        honest fallback when no source date was extracted. The
+        previous fallback (``created``) conflated authored-date and
+        filesystem-mtime and produced misleading time-bucket results
+        (FEAT-031 is the fix).
+        """
         from datetime import UTC
 
         from creek.generate.wavelength import _fragment_effective_date
 
+        ingested_today = datetime.now(tz=UTC)
         frag = _make_fragment(
             frag_id="frag-fresh",
-            created=datetime(2026, 5, 23, tzinfo=UTC),
+            created=datetime(2024, 1, 1, tzinfo=UTC),  # Filesystem-derived
         )
-        # No authored_at set → falls back to created.
+        frag = frag.model_copy(update={"ingested": ingested_today})
+        # No authored_at set → falls back to ``ingested`` (not ``created``).
         assert frag.authored_at is None
-        assert _fragment_effective_date(frag) == frag.created.date()
+        assert _fragment_effective_date(frag) == ingested_today.date()
+        assert _fragment_effective_date(frag) != frag.created.date()

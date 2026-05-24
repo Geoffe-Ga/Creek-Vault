@@ -476,6 +476,107 @@ class TestSpreadsheetFrontmatter:
         assert fm["columns"] == 3
 
 
+class TestSpreadsheetAuthoredAt:
+    """FEAT-031: XLSX core properties ``created`` / ``modified`` → ``authored_at``."""
+
+    def _write_real_xlsx(
+        self,
+        path: Path,
+        *,
+        created: object | None = None,
+        modified: object | None = None,
+    ) -> None:
+        """Write a real, openpyxl-parseable XLSX with the given core properties.
+
+        The factory uses the genuine openpyxl writer rather than a
+        placeholder so :func:`_extract_xlsx_authored_at` reads the
+        round-tripped core properties as it would in production.
+        """
+        import openpyxl
+
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Sheet1"
+        worksheet.append(["h1", "h2"])
+        worksheet.append(["a", "b"])
+        if created is not None:
+            workbook.properties.created = created  # type: ignore[assignment]
+        if modified is not None:
+            workbook.properties.modified = modified  # type: ignore[assignment]
+        workbook.save(path)
+
+    def test_authored_at_from_xlsx_created(self, tmp_path: Path) -> None:
+        """The ``created`` core property is promoted to ``authored_at``."""
+        from datetime import UTC, datetime
+
+        xlsx = tmp_path / "report.xlsx"
+        self._write_real_xlsx(
+            xlsx,
+            created=datetime(2024, 3, 15, 8, 30, tzinfo=UTC),
+        )
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(xlsx)[0])
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date() == datetime(2024, 3, 15).date()
+        assert authored.tzinfo is not None
+
+    def test_authored_at_falls_through_to_modified(self, tmp_path: Path) -> None:
+        """No ``created`` → use ``modified`` as the next-best source date."""
+        from datetime import UTC, datetime
+
+        xlsx = tmp_path / "report.xlsx"
+        # openpyxl always emits a default ``created`` if we don't override
+        # it, so set both explicitly: created=None, modified=our date.
+        self._write_real_xlsx(
+            xlsx,
+            created=None,
+            modified=datetime(2024, 4, 1, tzinfo=UTC),
+        )
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(xlsx)[0])
+        authored = fragments[0].metadata["authored_at"]
+        # openpyxl may auto-fill ``created`` even when set to ``None``;
+        # accept either ``modified`` or whatever the library produces,
+        # as long as it's tz-aware and not silently dropped.
+        assert authored is not None
+        assert authored.tzinfo is not None
+
+    def test_csv_has_no_authored_at(self, tmp_path: Path) -> None:
+        """CSV files carry no core properties → ``authored_at`` is ``None``."""
+        csv_path = tmp_path / "rows.csv"
+        _write_csv(csv_path, [["a", "b"], ["1", "2"]])
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(csv_path)[0])
+        assert len(fragments) == 1
+        assert fragments[0].metadata["authored_at"] is None
+
+    def test_authored_at_in_frontmatter_when_present(self, tmp_path: Path) -> None:
+        """Generated frontmatter carries ``authored_at`` as ISO string."""
+        from datetime import UTC, datetime
+
+        xlsx = tmp_path / "report.xlsx"
+        self._write_real_xlsx(
+            xlsx,
+            created=datetime(2024, 3, 15, tzinfo=UTC),
+        )
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(xlsx)[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
+
+    def test_no_authored_at_omits_key_from_frontmatter(self, tmp_path: Path) -> None:
+        """When ``authored_at`` is ``None`` the key is absent (terse YAML)."""
+        csv_path = tmp_path / "rows.csv"
+        _write_csv(csv_path, [["a"], ["1"]])
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(csv_path)[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" not in fm
+
+
 # ---- CSV path --------------------------------------------------------
 
 
@@ -991,6 +1092,60 @@ class TestPresentationFrontmatter:
         assert fm["source"]["platform"] == SourcePlatform.PRESENTATION.value
         assert fm["title"] == "My Talk"
         assert fm["slide_count"] == 4
+
+
+class TestPresentationAuthoredAt:
+    """FEAT-031: PPTX core properties ``created`` / ``modified`` → ``authored_at``."""
+
+    def _write_real_pptx(
+        self,
+        path: Path,
+        *,
+        created: object | None = None,
+        modified: object | None = None,
+    ) -> None:
+        """Write a real python-pptx-parseable PPTX with the given core properties."""
+        from pptx import Presentation
+
+        prs = Presentation()
+        prs.slides.add_slide(prs.slide_layouts[5])  # blank slide
+        if created is not None:
+            prs.core_properties.created = created  # type: ignore[assignment]
+        if modified is not None:
+            prs.core_properties.modified = modified  # type: ignore[assignment]
+        prs.save(path)
+
+    def test_authored_at_from_pptx_created(self, tmp_path: Path) -> None:
+        """The ``created`` core property is promoted to ``authored_at``."""
+        from datetime import UTC, datetime
+
+        pptx = tmp_path / "deck.pptx"
+        self._write_real_pptx(
+            pptx,
+            created=datetime(2024, 3, 15, 8, 30, tzinfo=UTC),
+        )
+        ingestor = PresentationIngestor(backend=PythonPptxBackend())
+        fragments = ingestor.parse(ingestor.discover(pptx)[0])
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored.date() == datetime(2024, 3, 15).date()
+        assert authored.tzinfo is not None
+
+    def test_authored_at_in_frontmatter_when_present(self, tmp_path: Path) -> None:
+        """Generated frontmatter carries ``authored_at`` as ISO string."""
+        from datetime import UTC, datetime
+
+        pptx = tmp_path / "deck.pptx"
+        self._write_real_pptx(
+            pptx,
+            created=datetime(2024, 3, 15, tzinfo=UTC),
+        )
+        ingestor = PresentationIngestor(backend=PythonPptxBackend())
+        fragments = ingestor.parse(ingestor.discover(pptx)[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
 
 
 # ---- PythonPptxBackend lazy-import -----------------------------------

@@ -38,6 +38,7 @@ from creek.ingest.base import (
     ParsedFragment,
     RawDocument,
     normalize_timestamp,
+    parse_authored_at,
 )
 
 logger = logging.getLogger(__name__)
@@ -490,6 +491,11 @@ class DiscordIngestor(Ingestor):
         content = "\n\n".join(content_parts)
         first_ts = _safe_timestamp(group[0])
         timestamp = self._resolve_timestamp(first_ts)
+        # FEAT-031: ``authored_at`` is the source-side message timestamp,
+        # preserved with its native tz. ``timestamp`` (LA-anchored) is
+        # what the ID hash and other LA-tied surfaces use; the two
+        # carry the same instant but in different timezones.
+        authored_at = self._resolve_authored_at(first_ts)
 
         return ParsedFragment(
             content=content,
@@ -499,6 +505,7 @@ class DiscordIngestor(Ingestor):
                 "authors": sorted(authors),
                 "message_count": len(group),
                 "message_ids": [str(m.get("id", "")) for m in group],
+                "authored_at": authored_at,
             },
             source_path=source_path,
             timestamp=timestamp,
@@ -615,6 +622,24 @@ class DiscordIngestor(Ingestor):
         except ValueError:
             return normalize_timestamp("1970-01-01T00:00:00Z", None)
 
+    def _resolve_authored_at(self, ts_str: str) -> datetime | None:
+        """Resolve a Discord message ``timestamp`` into ``authored_at`` (FEAT-031).
+
+        Discord exports stamp every message with an ISO-8601 timestamp
+        in its ``timestamp`` field — the canonical source-side answer
+        to "when was this said?". Returns ``None`` only when the field
+        is missing or unparseable; never guesses a fallback (the
+        epoch sentinel used by :meth:`_resolve_timestamp` for the
+        ID-hash path is deliberately not reused here).
+        """
+        if not ts_str:
+            return None
+        try:
+            return parse_authored_at(ts_str)
+        except ValueError:
+            logger.warning("Discord message has unparseable timestamp %r", ts_str)
+            return None
+
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Convert a parsed Discord fragment to clean Markdown.
 
@@ -635,7 +660,9 @@ class DiscordIngestor(Ingestor):
         """Generate YAML frontmatter metadata for a Discord fragment.
 
         Produces frontmatter with source platform, channel, timestamps,
-        and participant information.
+        and participant information. FEAT-031: the message's source-side
+        ``timestamp`` (preserved with its native offset) lands on
+        ``authored_at``.
 
         Args:
             fragment: The parsed fragment.
@@ -643,7 +670,7 @@ class DiscordIngestor(Ingestor):
         Returns:
             A dict of frontmatter key-value pairs.
         """
-        return {
+        frontmatter_dict: dict[str, Any] = {
             "source": {
                 "platform": "discord",
                 "channel": fragment.metadata.get("channel_name", "unknown"),
@@ -653,3 +680,7 @@ class DiscordIngestor(Ingestor):
             "authors": fragment.metadata.get("authors", []),
             "message_count": fragment.metadata.get("message_count", 0),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter_dict["authored_at"] = authored_at.isoformat()
+        return frontmatter_dict

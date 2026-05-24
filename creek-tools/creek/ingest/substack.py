@@ -45,7 +45,7 @@ from creek.ingest.base import (
     RawDocument,
     file_modified_time,
     normalize_encoding,
-    normalize_timestamp,
+    parse_authored_at,
 )
 from creek.ingest.html import parse_html_to_markdown
 from creek.models import SourceKind, SourcePlatform
@@ -204,7 +204,7 @@ def _resolve_authored_at(
     raw_date = (row or {}).get("post_date", "").strip()
     if raw_date:
         try:
-            authored = normalize_timestamp(raw_date, None)
+            authored = parse_authored_at(raw_date)
         except ValueError:
             logger.warning(
                 "Substack posts.csv row for %s has unparseable post_date %r",
@@ -212,7 +212,8 @@ def _resolve_authored_at(
                 raw_date,
             )
         else:
-            return authored, authored
+            if authored is not None:
+                return authored, authored
     return None, file_modified_time(file_path)
 
 

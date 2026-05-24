@@ -22,8 +22,10 @@ Exports:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,8 +37,9 @@ from creek.ingest.base import (
     RawDocument,
     normalize_encoding,
     normalize_timestamp,
+    parse_authored_at,
 )
-from creek.ingest.html import parse_html_to_markdown
+from creek.ingest.html import extract_html_authored_at, parse_html_to_markdown
 from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
@@ -262,14 +265,15 @@ def _convert_table(element: Any, doc: Any, parts: list[str]) -> None:
 def _extract_docx_metadata(docx_bytes: bytes) -> dict[str, Any]:
     """Extract metadata from DOCX core properties.
 
-    Extracts author, title, and creation date from the document's
-    core properties.
+    Extracts author, title, creation date, and modification date from
+    the document's core properties. The modification date powers the
+    FEAT-031 ``authored_at`` fallback when ``created`` is absent.
 
     Args:
         docx_bytes: Raw DOCX file bytes.
 
     Returns:
-        A dict with author, title, and created keys.
+        A dict with author, title, created, and modified keys.
     """
     from docx import (
         Document as DocxDocument,
@@ -285,18 +289,45 @@ def _extract_docx_metadata(docx_bytes: bytes) -> dict[str, Any]:
         metadata["title"] = props.title
     if props.created:
         metadata["created_date"] = props.created.isoformat()
+    if props.modified:
+        metadata["modified_date"] = props.modified.isoformat()
 
     return metadata
+
+
+def _parse_docx_authored_at(metadata: dict[str, Any]) -> datetime | None:
+    """Resolve a DOCX file's ``authored_at`` from extracted metadata.
+
+    Walks ``created_date`` (``dcterms:created``) then ``modified_date``
+    (``dcterms:modified``); returns the first parseable candidate.
+    Returns ``None`` when both keys are absent or unparseable — FEAT-031
+    forbids guessing the date.
+    """
+    for key in ("created_date", "modified_date"):
+        value = metadata.get(key)
+        if not value:
+            continue
+        try:
+            parsed = parse_authored_at(value)
+        except ValueError:
+            continue
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _extract_pdf_metadata_from_bytes(pdf_bytes: bytes) -> dict[str, Any]:
     """Extract metadata from PDF document info dictionary.
 
+    Pulls ``Author``, ``Title``, ``CreationDate``, and ``ModDate``.
+    ``ModDate`` powers the FEAT-031 ``authored_at`` fallback when
+    ``CreationDate`` is absent.
+
     Args:
         pdf_bytes: Raw PDF file bytes.
 
     Returns:
-        A dict with available metadata fields.
+        A dict with available metadata fields (lowercase keys).
     """
     from pdfminer.pdfdocument import PDFDocument
     from pdfminer.pdfparser import PDFParser
@@ -307,7 +338,7 @@ def _extract_pdf_metadata_from_bytes(pdf_bytes: bytes) -> dict[str, Any]:
         pdf_doc = PDFDocument(parser)
         for info in pdf_doc.info:
             if isinstance(info, dict):
-                for key in ("Author", "Title", "CreationDate"):
+                for key in ("Author", "Title", "CreationDate", "ModDate"):
                     value = info.get(key)
                     if value is not None:
                         decoded = (
@@ -320,6 +351,129 @@ def _extract_pdf_metadata_from_bytes(pdf_bytes: bytes) -> dict[str, Any]:
         logger.debug("Could not extract PDF metadata")
 
     return metadata
+
+
+# PDF dates are encoded as ``D:YYYYMMDDHHmmSS+HH'mm'`` per ISO 32000.
+# We strip the literal ``D:`` prefix and the apostrophes in the
+# timezone, then hand the result to ``datetime.strptime`` with two
+# format candidates (with-tz and without). Returning ``None`` rather
+# than guessing matches the FEAT-031 contract.
+_PDF_DATE_FORMATS: tuple[str, ...] = (
+    "%Y%m%d%H%M%S%z",
+    "%Y%m%d%H%M%S",
+    "%Y%m%d%H%M",
+    "%Y%m%d",
+)
+
+
+def _parse_pdf_date(raw: str) -> datetime | None:
+    """Parse a ``/CreationDate`` or ``/ModDate`` value into a tz-aware datetime.
+
+    Accepts the canonical ``D:YYYYMMDDHHmmSS+HH'mm'`` format and a
+    couple of common truncations. Returns ``None`` when no candidate
+    matches — the caller falls through to the next field, never
+    guesses.
+    """
+    cleaned = raw.strip().removeprefix("D:")
+    # Strip the PDF spec's literal apostrophes from the tz offset:
+    # ``+05'00'`` → ``+0500`` so ``%z`` parses it.
+    cleaned = cleaned.replace("'", "")
+    if cleaned.endswith(("z", "Z")):
+        cleaned = cleaned[:-1] + "+0000"
+    for fmt in _PDF_DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+        try:
+            return parse_authored_at(parsed)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_pdf_authored_at(metadata: dict[str, Any]) -> datetime | None:
+    """Resolve a PDF file's ``authored_at`` from extracted metadata.
+
+    Walks ``creationdate`` then ``moddate`` (matching the per-format
+    extraction chain in the FEAT-031 spec); each value is parsed via
+    :func:`_parse_pdf_date`. Returns ``None`` when both are absent or
+    unparseable.
+    """
+    for key in ("creationdate", "moddate"):
+        raw = metadata.get(key)
+        if not raw:
+            continue
+        parsed = _parse_pdf_date(str(raw))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+# RTF date control words follow ``\creatim`` / ``\revtim`` and embed
+# their fields via further control words (``\yr2024 \mo3 \dy15 \hr8
+# \min30 \sec0``) before the closing ``}``. The regex captures the
+# control word and the inner blob so the per-field parse can run on
+# the captured group.
+_RTF_DATE_GROUP = re.compile(
+    r"\\(creatim|revtim)\b([^}]*)",
+    re.IGNORECASE,
+)
+_RTF_DATE_FIELDS = (
+    ("yr", "year"),
+    ("mo", "month"),
+    ("dy", "day"),
+    ("hr", "hour"),
+    ("min", "minute"),
+    ("sec", "second"),
+)
+
+
+def _parse_rtf_authored_at(raw_bytes: bytes) -> datetime | None:
+    """Extract ``\\creatim`` (then ``\\revtim``) from an RTF byte stream.
+
+    RTF stores dates as a sequence of ``\\yr``/``\\mo``/``\\dy``/etc.
+    control words inside ``\\creatim{…}``. Returns a UTC-anchored
+    datetime when at least year + month + day were captured; falls
+    through to ``\\revtim`` if ``\\creatim`` is absent or unparseable.
+    The result is UTC because RTF carries no tz information — per the
+    FEAT-031 spec, that is the honest default rather than guessing.
+    """
+    try:
+        text = raw_bytes.decode("ascii", errors="replace")
+    except UnicodeDecodeError:
+        return None
+    candidates: dict[str, dict[str, int]] = {}
+    for match in _RTF_DATE_GROUP.finditer(text):
+        word = match.group(1).lower()
+        body = match.group(2)
+        fields: dict[str, int] = {}
+        for token, dest in _RTF_DATE_FIELDS:
+            sub = re.search(rf"\\{token}(-?\d+)", body)
+            if sub:
+                with contextlib.suppress(ValueError):
+                    fields[dest] = int(sub.group(1))
+        candidates[word] = fields
+    for word in ("creatim", "revtim"):
+        fields = candidates.get(word, {})
+        if not {"year", "month", "day"} <= fields.keys():
+            continue
+        try:
+            naive = datetime(
+                year=fields["year"],
+                month=fields["month"],
+                day=fields["day"],
+                hour=fields.get("hour", 0),
+                minute=fields.get("minute", 0),
+                second=fields.get("second", 0),
+            )
+        except (TypeError, ValueError):
+            continue
+        try:
+            return parse_authored_at(naive)
+        except ValueError:
+            continue
+    return None
 
 
 def _extract_pdf_metadata(pdf_bytes: bytes) -> dict[str, Any]:
@@ -452,6 +606,20 @@ class DocumentIngestor(Ingestor):
         Dispatches to DOCX, PDF, HTML, or TXT parsers based on the
         file extension. Extracts metadata where available.
 
+        FEAT-031: per-format ``authored_at`` extraction chains:
+
+        * **HTML / HTM**: ``<meta property="article:published_time">``,
+          OpenGraph, Dublin Core, ``<meta name="date">``, JSON-LD
+          ``datePublished``.
+        * **PDF**: ``/CreationDate`` (then ``/ModDate``) from the
+          document info dictionary.
+        * **DOCX**: core properties ``dcterms:created`` (then
+          ``dcterms:modified``).
+        * **RTF**: ``\\creatim`` (then ``\\revtim``).
+        * **TXT**: filesystem mtime only — no embedded date metadata
+          exists, so ``authored_at`` is ``None`` and downstream
+          surfaces fall through to ``ingested``.
+
         Args:
             raw: The raw document to parse.
 
@@ -463,6 +631,9 @@ class DocumentIngestor(Ingestor):
 
         content = self._extract_content(file_type, raw.content, text)
         metadata = self._extract_metadata(file_type, raw.content, encoding)
+        metadata["authored_at"] = self._extract_authored_at(
+            file_type, raw.content, text, metadata
+        )
         timestamp = self._resolve_timestamp(metadata, raw.path)
 
         return [
@@ -473,6 +644,36 @@ class DocumentIngestor(Ingestor):
                 timestamp=timestamp,
             )
         ]
+
+    def _extract_authored_at(
+        self,
+        file_type: str,
+        raw_bytes: bytes,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> datetime | None:
+        """Route to per-format authored-date extraction (FEAT-031).
+
+        Returns ``None`` when no source date exists or the candidate
+        parsers fail. The TXT branch is the canonical "no embedded
+        metadata" case; HTML / PDF / DOCX / RTF each consult their
+        native metadata before falling through.
+        """
+        if file_type in {".html", ".htm"}:
+            raw_value = extract_html_authored_at(text)
+            if raw_value:
+                try:
+                    return parse_authored_at(raw_value)
+                except ValueError:
+                    return None
+            return None
+        if file_type == ".pdf":
+            return _parse_pdf_authored_at(metadata)
+        if file_type == ".docx":
+            return _parse_docx_authored_at(metadata)
+        if file_type == ".rtf":
+            return _parse_rtf_authored_at(raw_bytes)
+        return None
 
     def _extract_content(self, file_type: str, raw_bytes: bytes, text: str) -> str:
         """Extract content based on file type.
@@ -618,9 +819,13 @@ class DocumentIngestor(Ingestor):
         if fragment.metadata.get("scanned"):
             source["scanned"] = True
 
-        return {
+        frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "title": title,
             "source": source,
             "created": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter_dict["authored_at"] = authored_at.isoformat()
+        return frontmatter_dict

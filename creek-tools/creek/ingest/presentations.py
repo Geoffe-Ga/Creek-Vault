@@ -29,10 +29,12 @@ from creek.ingest.base import (
     ParsedFragment,
     RawDocument,
     file_modified_time,
+    parse_authored_at,
 )
 from creek.models import SourcePlatform
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -164,6 +166,60 @@ class PythonPptxBackend:
         return stripped or None
 
 
+def _extract_pptx_authored_at(path: Path) -> datetime | None:
+    """Read the PPTX core-properties ``created`` (then ``modified``).
+
+    FEAT-031: returns the deck's source-side authored date or
+    ``None`` when neither field is populated, when ``python-pptx``
+    is unavailable, or when the file is malformed. Filesystem mtime
+    is never substituted — :attr:`Fragment.ingested` is the honest
+    fallback chosen by downstream surfaces.
+    """
+    props = _open_pptx_core_properties(path)
+    if props is None:
+        return None
+    for candidate in (
+        getattr(props, "created", None),
+        getattr(props, "modified", None),
+    ):
+        parsed = _safe_parse_authored_at(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _open_pptx_core_properties(path: Path) -> Any | None:
+    """Open *path* via python-pptx and return ``core_properties`` (or ``None``).
+
+    Centralises the optional-import + file-open + attribute-lookup
+    failure modes so :func:`_extract_pptx_authored_at` stays linear and
+    below the per-function try-block cap.
+    """
+    try:  # noqa: TRY101  # Separate optional-dep absence from file-open failure.
+        from pptx import Presentation as _Presentation
+    except ImportError:
+        return None
+    try:  # noqa: TRY101  # Distinct failure mode from the ImportError branch.
+        prs = _Presentation(str(path))
+    except Exception:  # python-pptx raises a wide set on bad files
+        logger.debug("Could not open PPTX core properties for %s", path)
+        return None
+    try:  # noqa: TRY101  # AttributeError is a distinct failure mode from file-open.
+        return prs.core_properties
+    except AttributeError:
+        return None
+
+
+def _safe_parse_authored_at(candidate: object) -> datetime | None:
+    """Wrapper that swallows :class:`ValueError` from ``parse_authored_at``."""
+    if candidate is None:
+        return None
+    try:
+        return parse_authored_at(candidate)
+    except ValueError:
+        return None
+
+
 def _slide_to_data(slide: Any, index: int) -> SlideData:
     """Convert a python-pptx slide object into a :class:`SlideData`."""
     title: str | None = None
@@ -233,7 +289,13 @@ class PresentationIngestor(Ingestor):
         ]
 
     def parse(self, raw: RawDocument) -> list[ParsedFragment]:
-        """Emit a single fragment carrying the entire presentation."""
+        """Emit a single fragment carrying the entire presentation.
+
+        FEAT-031: the PPTX core properties ``created`` (then
+        ``modified``) become ``authored_at``. Falls through to
+        ``None`` when the deck carries no creation date or when
+        ``python-pptx`` is unavailable.
+        """
         data = self.backend.read_presentation(raw.path)
         if not data.slides:
             logger.info(
@@ -242,6 +304,7 @@ class PresentationIngestor(Ingestor):
             )
             return []
         timestamp = file_modified_time(raw.path)
+        authored_at = _extract_pptx_authored_at(raw.path)
         return [
             ParsedFragment(
                 content="",  # Markdown rendered in convert_to_markdown.
@@ -249,6 +312,7 @@ class PresentationIngestor(Ingestor):
                     "original_file": str(raw.path),
                     "title": data.title or raw.path.stem,
                     "slide_count": len(data.slides),
+                    "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
                 timestamp=timestamp,
@@ -283,8 +347,13 @@ class PresentationIngestor(Ingestor):
         return "\n".join(lines).rstrip() + "\n"
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
-        """Produce YAML frontmatter for a presentation fragment."""
-        return {
+        """Produce YAML frontmatter for a presentation fragment.
+
+        FEAT-031: the deck's PPTX core-properties ``created`` /
+        ``modified`` land on ``authored_at`` as an ISO string when
+        extracted; absent otherwise.
+        """
+        frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "source": {
                 "platform": SourcePlatform.PRESENTATION.value,
@@ -297,6 +366,10 @@ class PresentationIngestor(Ingestor):
             "slide_count": fragment.metadata.get("slide_count", 0),
             "ingested": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter_dict["authored_at"] = authored_at.isoformat()
+        return frontmatter_dict
 
 
 __all__ = [

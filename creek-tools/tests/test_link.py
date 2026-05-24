@@ -50,14 +50,24 @@ def _make_fragment(
     emotional_texture: list[str] | None = None,
     fid: str | None = None,
 ) -> Fragment:
-    """Create a Fragment for testing with configurable classification fields."""
+    """Create a Fragment for testing with configurable classification fields.
+
+    The supplied ``created`` is mirrored into ``ingested`` so the
+    FEAT-031 ``effective_authored_at`` helper — which falls back to
+    ``ingested`` when ``authored_at`` is unset — sees the time the
+    test cares about. Without this mirror, every test fragment would
+    bucket at construction-time wall-clock and time-window assertions
+    would collapse.
+    """
     from creek.models import synthetic_fragment_id
 
+    timestamp = created or datetime.now()
     return Fragment(
         id=fid if fid is not None else synthetic_fragment_id(),
         title=title,
         source=FragmentSource(platform=platform),
-        created=created or datetime.now(),
+        created=timestamp,
+        ingested=timestamp,
         frequency=FrequencyClassification(
             primary=primary_freq,
             secondary=secondary_freqs or [],

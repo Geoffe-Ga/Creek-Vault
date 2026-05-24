@@ -421,6 +421,92 @@ class TestGenerateFrontmatter:
         assert fm["image_type"] == "screenshot"
 
 
+class TestImageAuthoredAtExif:
+    """FEAT-031: EXIF ``DateTimeOriginal`` / ``DateTime`` → ``authored_at``.
+
+    Pillow's image writer can stamp EXIF in JPEG output, so these
+    tests round-trip a real Pillow image through the ingestor's parse
+    path instead of mocking the metadata layer.
+    """
+
+    def _write_jpeg_with_exif(
+        self,
+        path: Path,
+        *,
+        datetime_original: str | None = None,
+        datetime_modified: str | None = None,
+    ) -> None:
+        """Write a small JPEG with the requested EXIF date tags.
+
+        EXIF strings follow the standard ``"YYYY:MM:DD HH:MM:SS"``
+        format (colons in the date, not the ISO ``-``). The image
+        itself is 8x8 white pixels — content does not matter because
+        the ingestor stub returns canned OCR text.
+        """
+        from PIL import Image
+
+        img = Image.new("RGB", (8, 8), color="white")
+        exif = img.getexif()
+        # 36867 = DateTimeOriginal, 306 = DateTime
+        if datetime_original is not None:
+            exif[36867] = datetime_original
+        if datetime_modified is not None:
+            exif[306] = datetime_modified
+        img.save(path, "JPEG", exif=exif.tobytes() if exif else b"")
+
+    def test_authored_at_from_datetime_original(self, tmp_path: Path) -> None:
+        """``DateTimeOriginal`` (shutter time) is promoted to ``authored_at``."""
+        jpeg = tmp_path / "photo.jpg"
+        self._write_jpeg_with_exif(jpeg, datetime_original="2024:03:15 08:30:45")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        fragments = ingestor.parse(ingestor.discover(jpeg)[0])
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 3, 15, 8, 30, 45, tzinfo=UTC)
+
+    def test_authored_at_falls_back_to_datetime_tag(self, tmp_path: Path) -> None:
+        """No ``DateTimeOriginal`` → ``DateTime`` (modified) is next-best."""
+        jpeg = tmp_path / "photo.jpg"
+        self._write_jpeg_with_exif(jpeg, datetime_modified="2024:04:01 09:00:00")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        fragments = ingestor.parse(ingestor.discover(jpeg)[0])
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 4, 1, 9, 0, tzinfo=UTC)
+
+    def test_image_without_exif_has_none(self, tmp_path: Path) -> None:
+        """A PNG without EXIF → ``authored_at`` is ``None``, no mtime guess."""
+        from PIL import Image
+
+        png = tmp_path / "plain.png"
+        Image.new("RGB", (8, 8), color="white").save(png, "PNG")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        fragments = ingestor.parse(ingestor.discover(png)[0])
+        assert fragments[0].metadata["authored_at"] is None
+
+    def test_authored_at_surfaces_in_frontmatter(self, tmp_path: Path) -> None:
+        """Generated frontmatter carries ``authored_at`` as ISO string."""
+        jpeg = tmp_path / "photo.jpg"
+        self._write_jpeg_with_exif(jpeg, datetime_original="2024:03:15 08:30:45")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        fragments = ingestor.parse(ingestor.discover(jpeg)[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
+
+    def test_no_authored_at_omits_key_from_frontmatter(self, tmp_path: Path) -> None:
+        """When extraction yields ``None`` the key is absent."""
+        from PIL import Image
+
+        png = tmp_path / "plain.png"
+        Image.new("RGB", (8, 8), color="white").save(png, "PNG")
+        ingestor = ImageIngestor(engine=StubOcrEngine())
+        fragments = ingestor.parse(ingestor.discover(png)[0])
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" not in fm
+
+
 # ---- ImageIngestor.ingest_pdf -----------------------------------------
 
 

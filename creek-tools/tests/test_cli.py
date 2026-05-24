@@ -208,6 +208,103 @@ def test_ingest_command_idempotent(tmp_path: Path) -> None:
     assert [p.name for p in first] == [p.name for p in second]
 
 
+def test_ingest_refresh_dates_backfills_authored_at(tmp_path: Path) -> None:
+    """``creek ingest --refresh-dates`` re-runs authored_at extraction (FEAT-031).
+
+    End-to-end: ingest a markdown file that the first pass leaves
+    without ``authored_at``, then drop a frontmatter ``published``
+    date on the source and re-run with ``--refresh-dates``. The
+    fragment file in the vault should pick up the new ``authored_at``
+    without re-ingesting the body.
+    """
+    vault = tmp_path / "vault"
+    for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
+        (vault / d).mkdir(parents=True)
+    src = tmp_path / "src"
+    src.mkdir()
+    note = src / "note.md"
+    # Start without a frontmatter date — authored_at will be None.
+    note.write_text("# Hello\n\nBody content.\n", encoding="utf-8")
+
+    runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+    fragment_files = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(fragment_files) == 1
+    # Initial state: ``authored_at`` is serialised as ``null`` (model_dump
+    # emits all fields, including the None default for FEAT-031 fragments
+    # that no ingestor extracted a date for).
+    before = fragment_files[0].read_text(encoding="utf-8")
+    assert "authored_at: null" in before
+
+    # Now stamp a published date on the source and re-run refresh.
+    note.write_text(
+        "---\npublished: 2024-03-15\n---\n# Hello\n\nBody content.\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["ingest", "--refresh-dates", "--vault", str(vault)],
+    )
+    assert result.exit_code == 0, result.output
+    after = fragment_files[0].read_text(encoding="utf-8")
+    # The refresh swapped null → ISO string; the date prefix locks the
+    # value without binding to a particular UTC time-of-day rendering.
+    assert "authored_at: null" not in after
+    assert "2024-03-15" in after
+    # Body untouched.
+    assert "Body content." in after
+
+
+def test_ingest_refresh_dates_is_idempotent(tmp_path: Path) -> None:
+    """A second ``--refresh-dates`` pass touches zero fragments.
+
+    Locks the FEAT-031 idempotency contract: the file bytes must be
+    identical across two consecutive backfill runs.
+    """
+    vault = tmp_path / "vault"
+    for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
+        (vault / d).mkdir(parents=True)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text(
+        "---\npublished: 2024-03-15\n---\n# Hello\n",
+        encoding="utf-8",
+    )
+    runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+    # First refresh pass is a no-op because authored_at is already set
+    # by the initial ingest.
+    runner.invoke(app, ["ingest", "--refresh-dates", "--vault", str(vault)])
+    fragment_files = list((vault / "01-Fragments").rglob("*.md"))
+    snapshot1 = fragment_files[0].read_bytes()
+    # Second refresh: byte-identical.
+    runner.invoke(app, ["ingest", "--refresh-dates", "--vault", str(vault)])
+    snapshot2 = fragment_files[0].read_bytes()
+    assert snapshot1 == snapshot2
+
+
 def test_redact_help() -> None:
     """Test that redact --help shows subcommand help."""
     result = runner.invoke(app, ["redact", "--help"])
