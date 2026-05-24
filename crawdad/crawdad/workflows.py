@@ -375,6 +375,14 @@ class WorkflowRegistry:
     Malformed files are logged at WARNING and skipped so a single typo
     in the vault directory does not deny access to every other
     workflow.
+
+    Caching: the first :meth:`list` / :meth:`get` call loads every file
+    and pins the result. Subsequent calls reuse the cache for the
+    lifetime of the registry instance, so a workflow added to the
+    vault directory mid-session is NOT visible until the bot is
+    restarted. This matches the FEAT-013 read-once startup pattern
+    used elsewhere in CrawDad and is intentional — workflows are
+    authored artifacts, not live state.
     """
 
     def __init__(
@@ -605,6 +613,15 @@ async def run_workflow_and_compose(
     The walker bypasses the FEAT-014 router but reuses the FEAT-015
     composer so workflow output sounds like every other CrawDad reply
     — voice-faithful, phase-aware, paradox-tolerant.
+
+    Skill-stack resolution mirrors the FEAT-029 ``AgentLoop`` pattern:
+    when ``skill_registry`` is supplied its ``.stack`` wins and the
+    ``skills`` argument is the fallback used only when the registry is
+    ``None``. The CLI runner always provides both (with ``skills``
+    defaulting to ``registry.stack``) so the registry's live, swap-
+    after-startup behaviour persists across turns; callers without a
+    registry (e.g. early unit tests) can hand a static stack in via
+    ``skills``.
 
     Returns the composer's text reply. Constraint failures bubble up as
     :class:`WorkflowConstraintError`; the caller is responsible for

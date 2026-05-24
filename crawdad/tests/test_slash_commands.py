@@ -222,7 +222,13 @@ async def test_handle_workflow_list_with_no_workflows_explains_how_to_author() -
 
 
 async def test_handle_workflow_list_without_lister_returns_soft_error() -> None:
-    """A missing lister (no MCP tools surface) yields the soft-error reply."""
+    """A missing lister names the registry, not the walker.
+
+    Closes PR #309 review feedback: the list action only reads the
+    registry — it never touches the walker — so its failure message
+    must talk about registry wiring, not "the walker has nothing to
+    call".
+    """
     replier = _FakeReplier()
 
     await handle_workflow(
@@ -234,7 +240,9 @@ async def test_handle_workflow_list_without_lister_returns_soft_error() -> None:
     )
 
     assert len(replier.sent) == 1
-    assert "aren't wired" in replier.sent[0] or "unavailable" in replier.sent[0].lower()
+    body = replier.sent[0].lower()
+    assert "registry" in body
+    assert "walker" not in body
 
 
 async def test_handle_workflow_default_action_is_list() -> None:
@@ -567,7 +575,12 @@ async def test_workflow_callback_runs_workflow_and_replies() -> None:
 
 
 async def test_workflow_callback_soft_errors_when_unwired() -> None:
-    """When no lister / runner is wired, the callback still defers and replies."""
+    """When no lister / runner is wired, the callback still defers and replies.
+
+    The default action is ``list``, which routes through
+    ``_reply_workflow_list``; the missing-lister reply mentions the
+    registry rather than the walker (PR #309 review feedback).
+    """
 
     async def _loop(_msg: str) -> str:
         return "should not be reached"
@@ -581,4 +594,5 @@ async def test_workflow_callback_soft_errors_when_unwired() -> None:
     assert interaction.response.deferred == 1
     assert len(interaction.followup.sent) == 1
     body = interaction.followup.sent[0].lower()
-    assert "aren't wired" in body or "unavailable" in body
+    assert "registry" in body
+    assert "walker" not in body

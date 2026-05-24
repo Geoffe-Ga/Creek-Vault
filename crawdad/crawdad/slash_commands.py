@@ -113,6 +113,16 @@ _SURFACE_PROMPT = (
 WORKFLOW_ACTION_LIST = "list"
 WORKFLOW_ACTION_RUN = "run"
 _WORKFLOW_ACTIONS = (WORKFLOW_ACTION_LIST, WORKFLOW_ACTION_RUN)
+# Two missing-wiring strings so each action's failure mode is honest
+# about WHY it cannot proceed. ``list`` only reads the registry, so its
+# message talks about the registry; ``run`` drives the walker, so its
+# message talks about the walker. Conflating the two would have a
+# ``list`` failure claim "the walker has nothing to call" even when the
+# registry is the missing piece (PR #309 review feedback).
+_WORKFLOW_LISTER_MISSING_REPLY = (
+    "Workflows aren't available in this session — the registry wasn't wired "
+    "up (the MCP tool surface was empty at startup)."
+)
 _WORKFLOW_RUNNER_MISSING_REPLY = (
     "Workflows aren't wired up in this session — the MCP server probably "
     "advertised no tools, so the workflow walker has nothing to call."
@@ -264,7 +274,7 @@ async def _reply_workflow_list(
 ) -> None:
     """Format and send the workflow registry to the user."""
     if workflow_lister is None:
-        await replier(_WORKFLOW_RUNNER_MISSING_REPLY)
+        await replier(_WORKFLOW_LISTER_MISSING_REPLY)
         return
     names = workflow_lister()
     if not names:

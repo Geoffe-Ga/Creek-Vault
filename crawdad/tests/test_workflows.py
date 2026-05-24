@@ -737,10 +737,55 @@ def test_wavelength_checkin_reference_workflow_parses() -> None:
 
 
 def test_compost_surfacing_reference_workflow_parses() -> None:
-    """The compost-surfacing reference workflow loads and is well-formed."""
+    """The compost-surfacing reference workflow loads and is well-formed.
+
+    Beyond the basic parse check, this pins three semantic invariants
+    that ``compost-surfacing`` must hold so a future edit cannot revert
+    the post-review fix:
+
+    * It MUST be ``phase_aware: true`` — the workflow interpolates
+      ``{{state.phase}}`` into ``creek.mine``'s ``phase`` arg, so
+      running without a session state would silently pass ``phase=""``.
+      The phase-aware flag turns that silent-bad-input path into a
+      clean ``WorkflowConstraintError`` at the walker's constraint
+      check.
+    * It MUST call ``creek.mine`` — the whole purpose is to surface
+      ranked seeds for the user's compost folder.
+    * The mine step MUST reference ``{{state.phase}}`` — otherwise the
+      ``phase_aware: true`` declaration is decorative.
+    """
     path = BUILTIN_WORKFLOWS_DIR / "compost-surfacing.workflow.yaml"
     wf = load_workflow_from_yaml(path)
-    assert len(wf.steps) >= 1
+
+    assert wf.phase_aware is True, (
+        "compost-surfacing must be phase_aware: true to refuse cleanly when "
+        "session state is unavailable (the workflow interpolates state.phase)"
+    )
+    mine_steps = [step for step in wf.steps if step.tool == "creek.mine"]
+    assert mine_steps, "compost-surfacing must surface seeds via creek.mine"
+    assert any(
+        "{{state.phase}}" in str(value) for value in mine_steps[0].args.values()
+    ), "compost-surfacing's creek.mine step must scope to the current phase"
+
+
+async def test_compost_surfacing_refuses_when_session_state_unavailable() -> None:
+    """End-to-end: compost-surfacing refuses cleanly with no session state.
+
+    Closes the gap the Claude reviewer flagged on PR #309: before
+    flipping ``phase_aware: true`` the workflow would silently pass
+    ``phase: ""`` to ``creek.mine`` when state was missing. With
+    ``phase_aware: true`` the walker's constraint check raises before
+    any MCP call fires.
+    """
+    path = BUILTIN_WORKFLOWS_DIR / "compost-surfacing.workflow.yaml"
+    wf = load_workflow_from_yaml(path)
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(_FakeSession()),
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+
+    with pytest.raises(WorkflowConstraintError, match="phase-aware"):
+        await walker.run(wf, state=None, inputs={})
 
 
 # ---------------------------------------------------------------------------
