@@ -423,6 +423,144 @@ def test_classify_reatomize_help_lists_flag() -> None:
     assert "--reatomize-direction" in plain
 
 
+def test_classify_help_mentions_anthropic_consent_env() -> None:
+    """Issue #320: ``--method llm`` help must surface CREEK_ANTHROPIC_CONSENT.
+
+    The Anthropic provider blocks at runtime if the consent env var is
+    unset; the requirement was previously undiscoverable from the help
+    text. The help must now name the variable so users see the gate
+    before they kick off a doomed classify run.
+    """
+    result = runner.invoke(app, ["classify", "--help"])
+    assert result.exit_code == 0
+    plain = _strip_ansi(result.output)
+    # Rich may wrap long help text mid-token; normalise whitespace
+    # before substring asserts so a soft line break never hides the
+    # token from the assertion.
+    normalised = re.sub(r"\s+", " ", plain)
+    assert "CREEK_ANTHROPIC_CONSENT" in normalised
+
+
+def _write_anthropic_config(vault: Path) -> Path:
+    """Write a minimal ``creek_config.yaml`` selecting the anthropic provider."""
+    config_dir = vault / "00-Creek-Meta"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "creek_config.yaml"
+    config_path.write_text(
+        "llm:\n  provider: anthropic\n",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_classify_llm_anthropic_warns_when_consent_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #320: classify must pre-flight warn about missing consent.
+
+    When the config selects the Anthropic provider, the CLI must surface
+    the consent-env-var gate BEFORE iterating fragments. Today the gate
+    only fires inside ``AnthropicProvider.__init__`` once the engine
+    starts processing the first fragment — by then any setup time has
+    been wasted.
+    """
+    from creek.classify.llm.providers import AnthropicProvider
+
+    monkeypatch.delenv(AnthropicProvider.CONSENT_ENV, raising=False)
+    monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    config_path = _write_anthropic_config(vault)
+    monkeypatch.setenv("CREEK_CONFIG", str(config_path))
+
+    result = runner.invoke(app, ["classify", "--vault", str(vault), "--method", "llm"])
+
+    # The pre-flight gate aborts the run with a clear remediation hint.
+    assert result.exit_code != 0
+    plain = _strip_ansi(result.output)
+    normalised = re.sub(r"\s+", " ", plain)
+    assert "CREEK_ANTHROPIC_CONSENT" in normalised
+
+
+def test_classify_llm_anthropic_skips_warning_when_consent_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-flight gate is silent once consent is on file.
+
+    With ``CREEK_ANTHROPIC_CONSENT`` set, the pre-flight check must not
+    abort and must not print the consent remediation text — the user
+    has already acknowledged the data-egress decision.
+    """
+    from creek.classify.llm.providers import AnthropicProvider
+
+    monkeypatch.setenv(AnthropicProvider.API_KEY_ENV, "sk-test-not-real")
+    monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "1")
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    config_path = _write_anthropic_config(vault)
+    monkeypatch.setenv("CREEK_CONFIG", str(config_path))
+
+    result = runner.invoke(app, ["classify", "--vault", str(vault), "--method", "llm"])
+
+    # Empty vault + consent on file → engine returns cleanly.
+    assert result.exit_code == 0, result.output
+    plain = _strip_ansi(result.output)
+    assert "Set CREEK_ANTHROPIC_CONSENT" not in plain
+
+
+def test_classify_rules_does_not_warn_about_anthropic_consent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--method rules`` never touches the cloud and must not nag.
+
+    Local-only runs must remain quiet even when the YAML's
+    ``llm.provider`` is ``anthropic`` and consent is unset, because
+    the rules path never opens a network connection.
+    """
+    from creek.classify.llm.providers import AnthropicProvider
+
+    monkeypatch.delenv(AnthropicProvider.CONSENT_ENV, raising=False)
+    monkeypatch.delenv(AnthropicProvider.API_KEY_ENV, raising=False)
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    config_path = _write_anthropic_config(vault)
+    monkeypatch.setenv("CREEK_CONFIG", str(config_path))
+
+    result = runner.invoke(
+        app, ["classify", "--vault", str(vault), "--method", "rules"]
+    )
+
+    assert result.exit_code == 0, result.output
+    plain = _strip_ansi(result.output)
+    assert "CREEK_ANTHROPIC_CONSENT" not in plain
+
+
+def test_classify_llm_ollama_does_not_warn_about_anthropic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Ollama-configured vault must not surface the Anthropic gate."""
+    from creek.classify.llm.providers import AnthropicProvider
+
+    monkeypatch.delenv(AnthropicProvider.CONSENT_ENV, raising=False)
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    # No config written → defaults apply (provider=ollama).
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    result = runner.invoke(app, ["classify", "--vault", str(vault), "--method", "llm"])
+
+    plain = _strip_ansi(result.output)
+    assert "CREEK_ANTHROPIC_CONSENT" not in plain
+
+
 def test_classify_rules_writes_method_to_frontmatter(tmp_path: Path) -> None:
     """``creek classify --method rules`` stamps the method on each fragment."""
     import frontmatter

@@ -748,10 +748,67 @@ _LINK_METHODS = ("embeddings", "temporal", "eddies")
 _REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
 
 
+_CLASSIFY_METHOD_HELP: str = (
+    "Classification method (rules|llm). "
+    "'rules' is local and offline. 'llm' calls the provider configured "
+    "under llm: in creek_config.yaml; the default 'ollama' provider is "
+    "local, while 'anthropic' requires both ANTHROPIC_API_KEY and "
+    "CREEK_ANTHROPIC_CONSENT=1 to be set in the environment before the "
+    "run (data-egress acknowledgement; see issue #320)."
+)
+
+
+def _preflight_anthropic_consent(config: CreekConfig) -> None:
+    """Abort early when ``--method llm`` will hit the Anthropic consent gate.
+
+    Issue #320: previously the consent requirement only surfaced once
+    :class:`creek.classify.llm.providers.AnthropicProvider` was
+    instantiated mid-classify run, after vault load and first-fragment
+    iteration. This pre-flight inspects the resolved config plus the
+    live process environment and surfaces the exact remediation BEFORE
+    any fragment work begins.
+
+    No-ops for any non-anthropic provider, and silent when consent is
+    already on file (the run continues normally).
+
+    Args:
+        config: Loaded :class:`CreekConfig` for the current invocation.
+
+    Raises:
+        typer.Exit: With code ``1`` when the Anthropic provider is
+            selected but ``CREEK_ANTHROPIC_CONSENT`` is missing or not
+            set to a truthy value.
+    """
+    from creek.classify.llm.providers import AnthropicProvider
+
+    if config.llm.provider.strip().lower() != "anthropic":
+        return
+    consent = os.environ.get(AnthropicProvider.CONSENT_ENV, "").strip().lower()
+    if consent in AnthropicProvider.CONSENT_TRUTHY:
+        return
+    console.print(
+        "[red]Anthropic provider selected in creek_config.yaml "
+        "(llm.provider: anthropic), but cloud classification requires "
+        "explicit consent.[/red]",
+    )
+    console.print(
+        f"[yellow]Set [bold]{AnthropicProvider.CONSENT_ENV}=1[/bold] "
+        "(also accepts 'true' or 'yes') to confirm that fragment "
+        "content may be sent to Anthropic's servers, then re-run "
+        "[bold]creek classify --method llm[/bold].[/yellow]",
+    )
+    console.print(
+        "[dim]To keep classification fully local instead, set "
+        "[bold]llm.provider: ollama[/bold] in your creek_config.yaml "
+        "or pass [bold]--method rules[/bold].[/dim]",
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def classify(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    method: str = typer.Option("rules", help="Classification method (rules|llm)"),
+    method: str = typer.Option("rules", help=_CLASSIFY_METHOD_HELP),
     force: bool = typer.Option(
         False,
         "--force",
@@ -843,6 +900,12 @@ def classify(
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
+    if method == "llm":
+        # Issue #320: surface the Anthropic consent-env-var gate before
+        # any vault iteration. The provider's own __init__ also raises,
+        # but only after the engine has already started — by then the
+        # operator has waited through vault load and per-fragment setup.
+        _preflight_anthropic_consent(config)
     if reatomize:
         # Late-bind the FEAT-023 CLI overrides into the loaded config so
         # downstream call-sites only ever look at the config object, not
