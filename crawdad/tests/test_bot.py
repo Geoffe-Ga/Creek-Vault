@@ -10,6 +10,7 @@ import pytest
 
 from crawdad.bot import handle_message, render_state_unavailable_reply
 from crawdad.config import CrawDadConfig
+from crawdad.consent import PendingBatchStore
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.state import SessionState, StateUnavailableError
 
@@ -1290,3 +1291,1093 @@ async def test_attachment_reply_consent_prompt_survives_long_scan_output(
     # truncated). Find a chunk of the body in the joined output.
     joined = "\n".join(channel.sent)
     assert "finding-line-" in joined
+
+
+# ---------------------------------------------------------------------------
+# FEAT-034 — Conversational consent flow
+# ---------------------------------------------------------------------------
+
+
+def _make_store(*, ttl: float = 60.0, clock_value: float = 0.0) -> PendingBatchStore:
+    """Construct a fresh ``PendingBatchStore`` with a deterministic clock."""
+    return PendingBatchStore(ttl_seconds=ttl, clock=lambda: clock_value)
+
+
+async def _stage_attachment(
+    *,
+    config: CrawDadConfig,
+    session_state: SessionState,
+    channel: _FakeChannel,
+    attachment: _FakeAttachment,
+    pending_batches: PendingBatchStore,
+    message_id: int = 100,
+    known_tools: tuple[str, ...] = ("creek.redact.scan",),
+    scan_body: str = "Scan summary: no findings",
+) -> None:
+    """Drive ``handle_message`` once with an attachment to seed a pending batch."""
+
+    class _Session:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return scan_body
+
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=message_id,
+        attachments=[attachment],
+    )
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=known_tools,
+        pending_batches=pending_batches,
+    )
+
+
+async def test_consent_token_dispatches_ingest_for_resolved_batch(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """``ingest`` follow-up calls ``creek.ingest`` for every staged file."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    ingest_calls: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            ingest_calls.append({"name": name, "args": arguments or {}})
+            return "ingested fragment-1"
+
+    followup: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        followup,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert len(ingest_calls) == 1
+    call = ingest_calls[0]
+    assert call["name"] == "creek.ingest"
+    assert call["args"]["source_type"] == "markdown"
+    assert call["args"]["input_path"] == "00-Creek-Meta/Inbound/999/100/note.md"
+    assert call["args"]["privacy_tier_ceiling"] == "personal"
+    assert len(channel.sent) == 1
+    assert "Ingest results" in channel.sent[0]
+    assert "ingested fragment-1" in channel.sent[0]
+    # Batch transitioned to "ingested" so the store still has it.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "ingested"
+
+
+async def test_consent_groups_multiple_files_by_inferred_type(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Files sharing a type are dispatched together, sorted alphabetically."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+
+    # Stage three files in one attachment turn (two markdown, one image).
+    attachments = [
+        _FakeAttachment(filename="a.md", size=4, payload=b"aaaa"),
+        _FakeAttachment(filename="b.md", size=4, payload=b"bbbb"),
+        _FakeAttachment(filename="c.png", size=4, payload=b"cccc"),
+    ]
+    msg: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=200,
+        attachments=attachments,
+    )
+
+    class _ScanSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return "no findings"
+
+    await handle_message(
+        msg,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_ScanSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    ingest_calls: list[dict[str, Any]] = []
+
+    class _IngestSession:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            ingest_calls.append({"name": name, "args": arguments or {}})
+            return "ok"
+
+    followup: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="yes",
+    )
+    await handle_message(
+        followup,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_IngestSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    # Three calls total: image then both markdowns (alphabetical type order).
+    types = [c["args"]["source_type"] for c in ingest_calls]
+    assert types == ["image", "markdown", "markdown"]
+    # Markdown files preserve upload order.
+    md_paths = [
+        c["args"]["input_path"]
+        for c in ingest_calls
+        if c["args"]["source_type"] == "markdown"
+    ]
+    assert md_paths == [
+        "00-Creek-Meta/Inbound/999/200/a.md",
+        "00-Creek-Meta/Inbound/999/200/b.md",
+    ]
+
+
+async def test_consent_type_disambiguation_question_then_ingest(
+    tmp_path: Path, session_state: SessionState
+) -> None:
+    """Unresolved-type files trigger a question; the typed reply completes ingest."""
+    from crawdad.config import AttachmentConfig
+
+    # Permit the .xyz extension so the unknown-type path can be exercised
+    # — the default allow list rejects unknown extensions at the boundary.
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        attachments=AttachmentConfig(allowed_extensions=frozenset()),
+    )
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+
+    # Stage one file with an unknown (unrecognised) extension.
+    msg: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=300,
+        attachments=[_FakeAttachment(filename="weird.xyz", size=4, payload=b"data")],
+    )
+
+    class _ScanSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return "no findings"
+
+    await handle_message(
+        msg,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_ScanSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    # User says "ingest" — bot must ask for a type, not guess.
+    consent_msg: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        consent_msg,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+    assert len(channel.sent) == 1
+    assert "`weird.xyz`" in channel.sent[0]
+    assert "markdown" in channel.sent[0]  # valid types listed
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "awaiting_type"
+    channel.sent.clear()
+
+    # User replies with a valid type — bot completes the ingest.
+    ingest_calls: list[dict[str, Any]] = []
+
+    class _IngestSession:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            ingest_calls.append({"name": name, "args": arguments or {}})
+            return "ok"
+
+    type_msg: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="document",
+    )
+    await handle_message(
+        type_msg,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_IngestSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert len(ingest_calls) == 1
+    assert ingest_calls[0]["args"]["source_type"] == "document"
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "ingested"
+
+
+async def test_consent_type_word_falls_through_when_not_awaiting_type(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A type word arriving outside ``awaiting_type`` falls through to the loop."""
+    from crawdad.intents import RouterResponse
+
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    # The batch is in awaiting_consent state. A bare "markdown" should
+    # NOT match the consent flow (no consent token yet) — fall through.
+    router = _StubRouter(RouterResponse(intents=[], compose=True))
+    composer = _StubComposer("agent-loop reply")
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="markdown",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert channel.sent == ["agent-loop reply"]
+    # Batch still in awaiting_consent — type word didn't disturb it.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "awaiting_consent"
+
+
+async def test_consent_abandon_clears_pending_batch(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """``cancel`` / ``drop`` clear the batch without dispatching ingest."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    class _NoIngestSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            raise AssertionError("creek.ingest must not run after abandonment")
+
+    cancel: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="cancel",
+    )
+    await handle_message(
+        cancel,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_NoIngestSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert len(channel.sent) == 1
+    assert "cleared" in channel.sent[0].lower()
+    assert store.get(999) is None
+
+
+async def test_consent_idempotent_re_consent_returns_already_ingested(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A second ``ingest`` after a successful ingest is a no-op with a clear reply."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    ingest_call_count = 0
+
+    class _Session:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            nonlocal ingest_call_count
+            ingest_call_count += 1
+            return "ok"
+
+    # First consent — should dispatch.
+    first: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        first,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+    assert ingest_call_count == 1
+    channel.sent.clear()
+
+    # Second consent — must NOT dispatch again, must reply "already ingested".
+    second: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        second,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert ingest_call_count == 1
+    assert len(channel.sent) == 1
+    assert "already ingested" in channel.sent[0].lower()
+
+
+async def test_consent_pending_batch_expires_after_ttl(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A stale ``ingest`` after the TTL window falls through to the agent loop."""
+    from crawdad.consent import PendingBatchStore
+    from crawdad.intents import RouterResponse
+
+    channel = _FakeChannel(id=999, sent=[])
+    clock = [0.0]
+    store = PendingBatchStore(ttl_seconds=5.0, clock=lambda: clock[0])
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    # Advance clock past TTL — batch expired.
+    clock[0] = 100.0
+
+    # Router fires (we hit the agent-loop path), so wire it through.
+    router = _StubRouter(RouterResponse(intents=[], compose=True))
+    composer = _StubComposer("agent reply")
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert channel.sent == ["agent reply"]
+    assert store.get(999) is None
+
+
+async def test_consent_unrelated_message_falls_through_to_agent_loop(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Non-consent text with a live pending batch still runs the agent loop."""
+    from crawdad.intents import RouterResponse
+
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    router = _StubRouter(RouterResponse(intents=[], compose=True))
+    composer = _StubComposer("voice reply")
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="what is surfacing today?",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert channel.sent == ["voice reply"]
+    # Batch is still there — unrelated chatter must not consume it.
+    assert store.get(999) is not None
+
+
+async def test_consent_soft_error_when_ingest_tool_not_advertised(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Consent reply with ``creek.ingest`` not advertised → documented soft error."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),  # no creek.ingest
+        pending_batches=store,
+    )
+
+    assert len(channel.sent) == 1
+    assert "creek.ingest" in channel.sent[0]
+
+
+async def test_consent_soft_error_when_mcp_unavailable_during_ingest(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """MCP subprocess death mid-ingest → documented soft "unreachable" reply."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    session = _StubSession(
+        errors={"creek.ingest": MCPUnavailableError("subprocess died")}
+    )
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert len(channel.sent) == 1
+    assert "unreachable" in channel.sent[0].lower()
+    # The batch did NOT transition to "ingested" — nothing landed.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "awaiting_consent"
+
+
+async def test_attachment_turn_supersedes_prior_pending_batch(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A fresh attachment turn overwrites any prior pending batch for the channel."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+
+    # First batch — note.md.
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+        message_id=100,
+    )
+    first = store.get(999)
+    assert first is not None
+    assert first.files[0].filename == "note.md"
+    channel.sent.clear()
+
+    # Second batch — image.png. Should overwrite.
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="image.png", size=4, payload=b"png!"),
+        pending_batches=store,
+        message_id=200,
+    )
+
+    second = store.get(999)
+    assert second is not None
+    assert second.files[0].filename == "image.png"
+    assert second is not first
+
+
+async def test_consent_with_pending_batches_none_falls_through(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Bot still works when the store isn't wired (test/unwired path)."""
+    from crawdad.intents import RouterResponse
+
+    channel = _FakeChannel(id=999, sent=[])
+    router = _StubRouter(RouterResponse(intents=[], compose=True))
+    composer = _StubComposer("agent reply")
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        # pending_batches not provided — defaults to None
+    )
+
+    assert channel.sent == ["agent reply"]
+
+
+async def test_consent_forwards_channel_tier_override(
+    tmp_path: Path, session_state: SessionState
+) -> None:
+    """The privacy tier from ``channel_privacy_tiers`` reaches every ingest call."""
+    from crawdad.config import AttachmentConfig
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        attachments=AttachmentConfig(channel_privacy_tiers={999: "intimate"}),
+    )
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    ingest_calls: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            ingest_calls.append({"name": name, "args": arguments or {}})
+            return "ok"
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert ingest_calls[0]["args"]["privacy_tier_ceiling"] == "intimate"
+
+
+async def test_consent_retry_after_partial_failure_skips_already_ingested(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A mid-batch MCP failure lets the user retry; landed files are skipped."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+
+    # Stage two markdown files in one turn.
+    attachments = [
+        _FakeAttachment(filename="a.md", size=4, payload=b"aaaa"),
+        _FakeAttachment(filename="b.md", size=4, payload=b"bbbb"),
+    ]
+    msg: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=500,
+        attachments=attachments,
+    )
+
+    class _ScanSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return "no findings"
+
+    await handle_message(
+        msg,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_ScanSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    # First consent: dispatcher succeeds on file 1, dies on file 2.
+    call_index = {"n": 0}
+
+    class _FlakySession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            call_index["n"] += 1
+            if call_index["n"] == 1:
+                return "ingested fragment-a"
+            raise MCPUnavailableError("subprocess died mid-batch")
+
+    first: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        first,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_FlakySession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+    # User saw the soft-error reply.
+    assert any("unreachable" in s.lower() for s in channel.sent)
+    # Batch stays in awaiting_consent so retries are accepted.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "awaiting_consent"
+    # file-a's hash landed on the ingested set so a retry skips it.
+    assert len(stored.ingested_hashes) == 1
+    channel.sent.clear()
+
+    # Second consent: dispatcher succeeds on file 2.
+    second_calls: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            second_calls.append({"name": name, "args": arguments or {}})
+            return "ingested fragment-b"
+
+    retry: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        retry,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    # Only file b is dispatched on the retry — file a is already on the ingested set.
+    assert len(second_calls) == 1
+    assert second_calls[0]["args"]["input_path"].endswith("b.md")
+    # Reply mentions both files: file a as "already ingested", file b with its body.
+    reply = channel.sent[-1]
+    assert "already ingested" in reply
+    assert "ingested fragment-b" in reply
+    # Now everything has landed → state transitioned.
+    final = store.get(999)
+    assert final is not None
+    assert final.state == "ingested"
+
+
+async def test_consent_dispatch_with_staged_path_outside_vault(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Files staged outside the vault still ingest with the absolute path.
+
+    Defends against a future code change where the staging dir gets
+    relocated outside ``config.vault_path`` — the ingest call should
+    keep working with the absolute path instead of crashing.
+    """
+    from crawdad.consent import PendingFile, build_pending_batch
+
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    outside_path = Path("/var/tmp/staging/note.md")
+    pf = PendingFile(
+        filename="note.md",
+        original_filename="note.md",
+        staged_path=outside_path,
+        content_hash="h-outside",
+        inferred_type="markdown",
+    )
+    batch = build_pending_batch(
+        channel_id=999,
+        staging_dir=outside_path.parent,
+        accepted_files=(pf,),
+        privacy_tier_ceiling="personal",
+        now=store.now(),
+    )
+    store.record(batch)
+
+    captured: list[dict[str, Any]] = []
+
+    class _Session:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            captured.append({"name": name, "args": arguments or {}})
+            return "ok"
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_Session()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    # The absolute path is forwarded verbatim because relative_to() raised.
+    assert captured[0]["args"]["input_path"] == str(outside_path)
+
+
+async def test_consent_concurrent_followups_dispatch_only_once(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Two concurrent ``ingest`` messages on the same channel must not double-dispatch.
+
+    Reviewer-flagged HIGH: without per-channel locking, both coroutines
+    can read ``state == "awaiting_consent"`` before either completes
+    its dispatch, double-firing ``creek.ingest`` for the same file
+    (PR #308). The per-channel lock from
+    :meth:`PendingBatchStore.lock_for` serialises the critical
+    section; the second message sees ``state == "ingested"`` and
+    replies "already ingested".
+    """
+    import asyncio
+
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    barrier = asyncio.Event()
+    call_count = 0
+
+    class _SlowSession:
+        async def call_tool(
+            self, _name: str, _arguments: dict[str, Any] | None = None
+        ) -> str:
+            nonlocal call_count
+            call_count += 1
+            await barrier.wait()
+            return "ingested fragment-1"
+
+    mcp = _StubMCPClient(_SlowSession())
+
+    msg_a: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+        id=2001,
+    )
+    msg_b: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+        id=2002,
+    )
+
+    task_a = asyncio.create_task(
+        handle_message(
+            msg_a,
+            config=config,
+            session_state=session_state,
+            bot_user_id=42,
+            mcp_client=mcp,  # type: ignore[arg-type]
+            known_tools=("creek.ingest",),
+            pending_batches=store,
+        )
+    )
+    # Yield once so task A starts and grabs the lock before B is scheduled.
+    await asyncio.sleep(0)
+    task_b = asyncio.create_task(
+        handle_message(
+            msg_b,
+            config=config,
+            session_state=session_state,
+            bot_user_id=42,
+            mcp_client=mcp,  # type: ignore[arg-type]
+            known_tools=("creek.ingest",),
+            pending_batches=store,
+        )
+    )
+    # Let task B reach the lock-acquisition point.
+    await asyncio.sleep(0)
+    # Release task A's dispatch so the critical section can finish.
+    barrier.set()
+
+    await asyncio.gather(task_a, task_b)
+
+    # Only one ``creek.ingest`` dispatch happened across both messages.
+    assert call_count == 1
+    # The second message received the "already ingested" reply.
+    assert any("already ingested" in s.lower() for s in channel.sent)
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "ingested"
+
+
+async def test_run_ingest_dispatch_swallows_unexpected_exceptions(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Non-``MCPUnavailableError`` exceptions are caught — user is never left silent.
+
+    Reviewer-flagged LOW: a TimeoutError (or any other surprise) from
+    the MCP session would otherwise propagate out of
+    ``handle_message`` and the user would see no reply. Mirrors the
+    existing ``_run_safety_scan`` behaviour.
+    """
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    class _BrokenSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            raise TimeoutError("upstream timed out")
+
+    follow: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        follow,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_BrokenSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    assert len(channel.sent) == 1
+    assert "unreachable" in channel.sent[0].lower()
+    # The batch was not marked ingested — user can retry.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "awaiting_consent"
+
+
+async def test_already_present_batch_does_not_record_pending_state(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """A duplicate upload returns ``already staged`` without seeding a batch."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    attachment = _FakeAttachment(filename="dup.md", size=4, payload=b"same")
+
+    def _build() -> Any:
+        return _FakeMessage(
+            author=_FakeAuthor(id=111),
+            channel=channel,
+            content="",
+            id=400,
+            attachments=[attachment],
+        )
+
+    class _ScanSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return "no findings"
+
+    # First upload — scan + record.
+    await handle_message(
+        _build(),
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_ScanSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+        pending_batches=store,
+    )
+    # Cancel the first batch so we have a clean slate.
+    cancel: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="cancel",
+    )
+    await handle_message(
+        cancel,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+    assert store.get(999) is None
+
+    # Second upload of identical bytes — already present; no new batch.
+    channel.sent.clear()
+    await handle_message(
+        _build(),
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_ScanSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+        pending_batches=store,
+    )
+
+    assert store.get(999) is None
+    assert any("already staged" in s.lower() for s in channel.sent)

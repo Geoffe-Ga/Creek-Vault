@@ -28,6 +28,14 @@ from crawdad.attachments import (
     format_attachment_summary,
     process_attachments,
 )
+from crawdad.consent import (
+    PendingBatch,
+    PendingBatchStore,
+    PendingFile,
+    build_pending_batch,
+    classify_followup_message,
+    format_type_question,
+)
 from crawdad.history import ConversationHistory
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPUnavailableError
@@ -35,6 +43,7 @@ from crawdad.slash_commands import register as register_slash_commands
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
     from crawdad.attachments import _AttachmentLike
     from crawdad.composer import SonnetComposer
@@ -66,18 +75,41 @@ _REDACT_TOOL_MISSING_REPLY = (
 )
 
 # FEAT-027 ships the safety-pass + staging half of the consent flow.
-# The conversational "Reply with `ingest`" follow-up that drives the
-# router into ``creek.ingest`` automatically is tracked in FEAT-028
-# (issue #281). Until then the CLI escape hatch in the prompt below is
-# the supported path.
+# FEAT-034 (issue #281) closes the loop by wiring the conversational
+# "Reply with `ingest`" follow-up directly through to ``creek.ingest``
+# via the per-channel :class:`PendingBatchStore` threaded through this
+# module. The CLI escape hatch in the prompt below is preserved for
+# users who prefer the deterministic terminal path.
 _INGEST_CONSENT_PROMPT = (
     "I did **not** ingest anything. Reply with `ingest` (or run "
-    "`creek ingest --type <type> --input <staging path>`) to proceed."
+    "`creek ingest --type <type> --input <staging path>`) to proceed. "
+    "Reply `cancel` to drop the batch."
 )
 
 _ALREADY_STAGED_REPLY = (
     "All attachments were already staged from a prior upload — nothing new "
     "to scan or ingest."
+)
+
+# FEAT-034: name of the MCP tool the consent flow dispatches when the
+# user gives an affirmative reply. Mirrors the ``creek.ingest`` server
+# tool registered in ``creek_mcp/server.py``.
+_INGEST_TOOL = "creek.ingest"
+
+_INGEST_TOOL_MISSING_REPLY = (
+    "I staged the file(s), but `creek.ingest` isn't advertised by "
+    "creek-tools yet. Run `creek ingest --type <type> --input <staging path>` "
+    "from the terminal to complete the ingest."
+)
+
+_BATCH_ABANDONED_REPLY = (
+    "Cleared the pending batch — nothing was ingested. The staged files "
+    "are still on disk under the same path; re-upload to start a new batch."
+)
+
+_ALREADY_INGESTED_REPLY = (
+    "This batch was already ingested — nothing more to do. Upload a new "
+    "file to start a fresh batch."
 )
 
 
@@ -134,6 +166,7 @@ async def handle_message(
     history: ConversationHistory | None = None,
     skills: VoiceSkillStack | None = None,
     skill_registry: SkillStackRegistry | None = None,
+    pending_batches: PendingBatchStore | None = None,
 ) -> None:
     """Process one Discord message.
 
@@ -153,6 +186,11 @@ async def handle_message(
             takes precedence over ``skills`` and routes
             ``crawdad.activate_register`` intents through to a live
             stack swap.
+        pending_batches: FEAT-034 per-channel pending-batch store. When
+            provided, a successful attachment turn records a batch on
+            the store and the next non-attachment message in the same
+            channel is inspected for a consent / abandonment token
+            *before* the agent loop runs.
 
     When ``router``, ``composer``, or ``mcp_client`` is ``None``, the
     handler falls back to the FEAT-013 stub reply — useful for tests
@@ -172,7 +210,16 @@ async def handle_message(
             config=config,
             mcp_client=mcp_client,
             known_tools=known_tools,
+            pending_batches=pending_batches,
         )
+        return
+    if await _handle_consent_followup(
+        message=message,
+        config=config,
+        mcp_client=mcp_client,
+        known_tools=known_tools,
+        pending_batches=pending_batches,
+    ):
         return
     if session_state is None:
         await message.channel.send(_STATE_UNAVAILABLE_REPLY)
@@ -226,6 +273,7 @@ async def _handle_attachments(
     config: CrawDadConfig,
     mcp_client: MCPClient | None,
     known_tools: tuple[str, ...],
+    pending_batches: PendingBatchStore | None = None,
 ) -> None:
     """FEAT-027 attachment processing: download → safety scan → reply.
 
@@ -242,11 +290,13 @@ async def _handle_attachments(
     3. Otherwise invoke ``creek.redact.scan`` on the staging directory
        via MCP. If MCP is unreachable or the tool is not advertised,
        fall back to a clear soft error rather than silently ingesting.
-    4. Reply with the combined download summary, the scan report, and a
+    4. Record the staged batch on the per-channel
+       :class:`PendingBatchStore` (FEAT-034) so a follow-up
+       ``ingest`` / ``yes`` / ``proceed`` message in the same channel
+       dispatches ``creek.ingest`` for the batch.
+    5. Reply with the combined download summary, the scan report, and a
        consent prompt. The bot **never** auto-ingests; the user must
-       respond explicitly (per FEAT-027 §Ingestion only proceeds on
-       explicit user consent — see FEAT-028 / issue #281 for the
-       conversational consent follow-up).
+       respond explicitly.
     """
     channel_id = message.channel.id
     processed = await process_attachments(
@@ -278,6 +328,19 @@ async def _handle_attachments(
         channel_id=channel_id,
     )
 
+    # Hold the per-channel consent lock during the record so a racing
+    # ``ingest`` follow-up cannot observe a half-built batch. The lock
+    # is uncontended unless the consent flow is mid-dispatch — see the
+    # ``PendingBatchStore.lock_for`` docstring for the TOCTOU rationale.
+    if pending_batches is not None:
+        async with pending_batches.lock_for(channel_id):
+            _record_pending_batch(
+                pending_batches=pending_batches,
+                processed=processed,
+                channel_id=channel_id,
+                config=config,
+            )
+
     # Send the summary + scan section first (may be truncated for long
     # scan bodies) and then the consent prompt as a separate message.
     # The consent string is short and well under the Discord cap; sending
@@ -287,6 +350,276 @@ async def _handle_attachments(
     body = "\n\n".join((summary, scan_section))
     await message.channel.send(_truncate_for_discord(body))
     await message.channel.send(_INGEST_CONSENT_PROMPT)
+
+
+def _record_pending_batch(
+    *,
+    pending_batches: PendingBatchStore | None,
+    processed: ProcessedAttachments,
+    channel_id: int,
+    config: CrawDadConfig,
+) -> None:
+    """Record *processed* on the pending-batch store, superseding prior state.
+
+    Skipped (no-op) when the store wasn't wired (test paths that don't
+    exercise the consent flow) or when no files landed on disk.
+    """
+    if pending_batches is None or not processed.accepted:
+        return
+    files = tuple(
+        PendingFile(
+            filename=a.filename,
+            original_filename=a.original_filename,
+            staged_path=a.staged_path,
+            content_hash=a.content_hash,
+            inferred_type=a.inferred_type,
+        )
+        for a in processed.accepted
+    )
+    batch = build_pending_batch(
+        channel_id=channel_id,
+        staging_dir=processed.staging_dir,
+        accepted_files=files,
+        privacy_tier_ceiling=_channel_tier(channel_id=channel_id, config=config),
+        now=pending_batches.now(),
+    )
+    pending_batches.record(batch)
+
+
+async def _handle_consent_followup(
+    *,
+    message: _MessageLike,
+    config: CrawDadConfig,
+    mcp_client: MCPClient | None,
+    known_tools: tuple[str, ...],
+    pending_batches: PendingBatchStore | None,
+) -> bool:
+    """Try to handle *message* as a follow-up to a pending consent batch.
+
+    Returns ``True`` when the message was consumed by the consent flow
+    (a reply was sent and the regular agent loop should be skipped) and
+    ``False`` when the caller should continue with normal processing.
+
+    Concurrency note: the entire read-classify-dispatch cycle runs
+    under the per-channel lock from :meth:`PendingBatchStore.lock_for`
+    so two rapid ``ingest`` messages on the same channel can't both
+    observe ``awaiting_consent`` and double-fire ``creek.ingest`` for
+    the same batch (PR #308 review HIGH).
+
+    Trust boundary: the batch is keyed by ``channel.id``, not by user
+    id, so any user the operator has allowlisted into a channel can
+    consent to that channel's pending batch. For the documented
+    personal-use deployment target this is acceptable — see FEAT-013
+    §5.1; broaden the consent key before adding multi-user channels.
+    """
+    if pending_batches is None:
+        return False
+    async with pending_batches.lock_for(message.channel.id):
+        batch = pending_batches.get(message.channel.id)
+        if batch is None:
+            return False
+
+        kind, payload = classify_followup_message(
+            message.content,
+            consent_tokens=config.consent.consent_tokens,
+            abandon_tokens=config.consent.abandon_tokens,
+        )
+        if kind == "none":
+            return False
+        if kind == "abandon":
+            pending_batches.clear(message.channel.id)
+            await message.channel.send(_BATCH_ABANDONED_REPLY)
+            return True
+        if kind == "type":
+            return await _apply_disambiguation_reply(
+                batch=batch,
+                ingest_type=payload or "",
+                message=message,
+                mcp_client=mcp_client,
+                known_tools=known_tools,
+                pending_batches=pending_batches,
+                config=config,
+            )
+        # kind == "consent"
+        return await _apply_consent_reply(
+            batch=batch,
+            message=message,
+            mcp_client=mcp_client,
+            known_tools=known_tools,
+            pending_batches=pending_batches,
+            config=config,
+        )
+
+
+async def _apply_consent_reply(
+    *,
+    batch: PendingBatch,
+    message: _MessageLike,
+    mcp_client: MCPClient | None,
+    known_tools: tuple[str, ...],
+    pending_batches: PendingBatchStore,
+    config: CrawDadConfig,
+) -> bool:
+    """Handle a ``consent``-kind follow-up against *batch*.
+
+    Branches on batch state:
+
+    * ``"ingested"``: re-consent is a clear no-op.
+    * unresolved types: transition to ``"awaiting_type"`` and ask
+      which type to apply to the unresolved subset.
+    * everything resolved: dispatch ingest immediately.
+    """
+    if batch.state == "ingested":
+        await message.channel.send(_ALREADY_INGESTED_REPLY)
+        return True
+    if batch.needs_type_disambiguation:
+        updated = batch.with_state("awaiting_type")
+        pending_batches.record(updated)
+        await message.channel.send(format_type_question(updated))
+        return True
+    await _dispatch_ingest_for_batch(
+        batch=batch,
+        message=message,
+        mcp_client=mcp_client,
+        known_tools=known_tools,
+        pending_batches=pending_batches,
+        config=config,
+    )
+    return True
+
+
+async def _apply_disambiguation_reply(
+    *,
+    batch: PendingBatch,
+    ingest_type: str,
+    message: _MessageLike,
+    mcp_client: MCPClient | None,
+    known_tools: tuple[str, ...],
+    pending_batches: PendingBatchStore,
+    config: CrawDadConfig,
+) -> bool:
+    """Handle a ``type``-kind follow-up against *batch*.
+
+    Only acts when the batch is in the ``"awaiting_type"`` state — a
+    type word landing while the batch is still ``"awaiting_consent"``
+    or already ``"ingested"`` falls through to the regular agent loop
+    so the user is never trapped inside the consent state machine.
+    """
+    if batch.state != "awaiting_type":
+        return False
+    resolved = batch.with_resolved_types(ingest_type)
+    pending_batches.record(resolved)
+    await _dispatch_ingest_for_batch(
+        batch=resolved,
+        message=message,
+        mcp_client=mcp_client,
+        known_tools=known_tools,
+        pending_batches=pending_batches,
+        config=config,
+    )
+    return True
+
+
+async def _dispatch_ingest_for_batch(
+    *,
+    batch: PendingBatch,
+    message: _MessageLike,
+    mcp_client: MCPClient | None,
+    known_tools: tuple[str, ...],
+    pending_batches: PendingBatchStore,
+    config: CrawDadConfig,
+) -> None:
+    """Invoke ``creek.ingest`` for every file in *batch* and reply.
+
+    The batch is mutated in the store to track ingested hashes (so a
+    follow-up consent in the same channel reports "already ingested")
+    and to transition state to ``"ingested"`` only once every file in
+    the batch has landed. A partial failure (mid-batch
+    :class:`MCPUnavailableError`) leaves the batch in
+    ``"awaiting_consent"`` so the user can retry; the already-landed
+    files are then skipped on the retry via their content hashes.
+    """
+    if mcp_client is None or _INGEST_TOOL not in known_tools:
+        await message.channel.send(_INGEST_TOOL_MISSING_REPLY)
+        return
+    groups = batch.resolved_groups()
+    reply, ingested = await _run_ingest_dispatch(
+        batch=batch,
+        groups=groups,
+        mcp_client=mcp_client,
+        config=config,
+    )
+    if ingested:
+        updated = batch.with_ingested(ingested)
+        # Only mark the batch ingested when every file landed — a partial
+        # failure (mid-batch MCPUnavailableError) keeps the batch in
+        # ``awaiting_consent`` so the user can retry; the already-landed
+        # files are skipped on the retry via their content hashes.
+        if updated.all_ingested:
+            updated = updated.with_state("ingested")
+        pending_batches.record(updated)
+    await message.channel.send(_truncate_for_discord(reply))
+
+
+async def _run_ingest_dispatch(
+    *,
+    batch: PendingBatch,
+    groups: tuple[tuple[str, tuple[PendingFile, ...]], ...],
+    mcp_client: MCPClient,
+    config: CrawDadConfig,
+) -> tuple[str, frozenset[str]]:
+    """Open one MCP session and call ``creek.ingest`` per file.
+
+    Returns the user-facing reply text and the set of content hashes
+    that landed successfully. A mid-batch
+    :class:`MCPUnavailableError` short-circuits remaining files and
+    surfaces the documented soft error. Any other unexpected exception
+    (timeout, protocol error, malformed JSON, …) is also caught and
+    surfaced as the same soft error rather than left to bubble up into
+    the Discord ``on_message`` handler, where it would log a stack
+    trace and leave the user staring at silence.
+    """
+    lines: list[str] = ["**Ingest results**"]
+    ingested: set[str] = set()
+    try:
+        async with mcp_client.connect() as session:
+            for ingest_type, files in groups:
+                for file in files:
+                    if file.content_hash in batch.ingested_hashes:
+                        lines.append(
+                            f"- `{file.filename}` ({ingest_type}): already ingested"
+                        )
+                        continue
+                    rel_path = _relative_to_vault(file.staged_path, config=config)
+                    body = await session.call_tool(
+                        _INGEST_TOOL,
+                        {
+                            "source_type": ingest_type,
+                            "input_path": str(rel_path),
+                            "privacy_tier_ceiling": batch.privacy_tier_ceiling,
+                        },
+                    )
+                    ingested.add(file.content_hash)
+                    lines.append(f"- `{file.filename}` ({ingest_type}): {body}")
+    except MCPUnavailableError as exc:
+        _LOGGER.warning("creek.ingest failed: %s", exc)
+        return _MCP_UNAVAILABLE_REPLY, frozenset(ingested)
+    except Exception:
+        # Match the safety-pass handler in ``_run_safety_scan``: log the
+        # full traceback for the operator, but surface a soft error to
+        # the user. Without this the exception would propagate out of
+        # ``handle_message`` and the user would be left in silence.
+        _LOGGER.exception("unexpected error during creek.ingest call")
+        return _MCP_UNAVAILABLE_REPLY, frozenset(ingested)
+    return "\n".join(lines), frozenset(ingested)
+
+
+def _relative_to_vault(path: Path, *, config: CrawDadConfig) -> Path:
+    """Render *path* relative to the vault when possible, else verbatim."""
+    try:
+        return path.relative_to(config.vault_path)
+    except ValueError:
+        return path
 
 
 async def _run_safety_scan(
@@ -426,6 +759,7 @@ class CrawDadClient(discord.Client):
         skill_registry: SkillStackRegistry | None = None,
         loop_runner: LoopRunner | None = None,
         register_switcher: RegisterSwitcher | None = None,
+        pending_batches: PendingBatchStore | None = None,
         intents: discord.Intents | None = None,
     ) -> None:
         """Store config + agent-loop components; init the parent ``Client``.
@@ -439,6 +773,12 @@ class CrawDadClient(discord.Client):
         and the ``/crawdad register`` slash command respectively, so
         register switches survive across turns within the bot's
         lifetime.
+
+        ``pending_batches`` (FEAT-034) is the per-channel pending-batch
+        store the consent flow reads on every non-attachment turn and
+        writes on every successful attachment turn. When ``None``, the
+        consent flow is disabled and the user must fall back to the
+        ``creek ingest`` CLI path.
         """
         super().__init__(intents=intents or self._default_intents())
         self._config = config
@@ -451,6 +791,7 @@ class CrawDadClient(discord.Client):
         self._skills = skills
         self._skill_registry = skill_registry
         self._loop_runner = loop_runner
+        self._pending_batches = pending_batches
         self.tree = app_commands.CommandTree(self)
         if loop_runner is not None:
             # discord.py's ``CommandTree.command`` signature is wider than
@@ -502,4 +843,5 @@ class CrawDadClient(discord.Client):
             history=self._history,
             skills=self._skills,
             skill_registry=self._skill_registry,
+            pending_batches=self._pending_batches,
         )
