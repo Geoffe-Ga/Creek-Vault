@@ -1,4 +1,4 @@
-"""Discord attachment handling (FEAT-027).
+"""Discord attachment handling (FEAT-027 + FEAT-035).
 
 CrawDad's promise is *"Discord is the door you already use."* FEAT-027
 closes the gap that prevented attachments from flowing through that
@@ -7,6 +7,14 @@ staging directory under the vault, enforces configurable per-attachment
 size + extension limits, applies idempotency, infers an ingestor type
 from the file extension, and surfaces a human-readable summary suitable
 for embedding in a Discord reply.
+
+FEAT-035 adds magic-byte content-type verification on top of the
+extension allow list: after a successful download every attachment is
+sniffed with :mod:`filetype` (binary signatures) or with a UTF-8 +
+NUL-byte content sample (text formats), and the detected MIME is
+compared against what the extension claims. Mismatches surface in the
+safety report by default; the :attr:`AttachmentConfig.reject_on_mime_mismatch`
+knob flips the soft warning into a hard rejection.
 
 The module is deliberately UI- and MCP-agnostic. The bot handler is
 responsible for calling :func:`process_attachments` once attachments are
@@ -23,7 +31,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+import filetype
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -70,6 +80,190 @@ _EXTENSION_TO_INGESTOR_TYPE: dict[str, str] = {
     ".gif": "image",
     ".webp": "image",
 }
+
+# FEAT-035: extensions whose declared content type can be verified by
+# ``filetype.guess`` against the first kilobyte of the downloaded body.
+# Each entry lists every MIME string the library may legitimately return
+# for that extension — OOXML containers, for example, are zip files at
+# the byte level so ``filetype`` correctly reports ``application/zip``
+# unless the runtime libmagic version has dedicated OOXML detection.
+_EXTENSION_TO_ACCEPTABLE_MIMES: dict[str, frozenset[str]] = {
+    ".pdf": frozenset({"application/pdf"}),
+    ".png": frozenset({"image/png"}),
+    ".jpg": frozenset({"image/jpeg"}),
+    ".jpeg": frozenset({"image/jpeg"}),
+    ".gif": frozenset({"image/gif"}),
+    ".webp": frozenset({"image/webp"}),
+    ".docx": frozenset(
+        {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/zip",
+        }
+    ),
+    ".xlsx": frozenset(
+        {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/zip",
+        }
+    ),
+    ".pptx": frozenset(
+        {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/zip",
+        }
+    ),
+}
+
+# Canonical (first-choice) MIME per extension — used as the ``expected``
+# label in the verification report. Order does not matter for the
+# membership check; this lookup is purely cosmetic so the user-facing
+# summary names the format they probably recognise.
+_EXTENSION_TO_CANONICAL_MIME: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
+}
+
+# FEAT-035: extensions that have no magic-byte signature. The verifier
+# falls back to a content sample (UTF-8 decode + NUL-byte check) — files
+# in this set are expected to be plain text, so a NUL byte or undecodable
+# bytes in the first ``_TEXT_SAMPLE_BYTES`` of the body are treated as
+# evidence that the file is actually a binary blob renamed to a text
+# extension (the polyglot case the issue calls out).
+_TEXT_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".html",
+        ".htm",
+        ".json",
+        ".csv",
+    }
+)
+
+# Sample size for the text-content heuristic. One kilobyte is enough to
+# catch every common binary header (PE / ELF / OLE / PDF / ZIP) without
+# materially extending the download path's CPU cost.
+_TEXT_SAMPLE_BYTES: int = 1024
+
+# Canonical MIME strings used by the text path so the Discord reply
+# names something meaningful when a sample fails the heuristic.
+_TEXT_CANONICAL_MIME: str = "text/plain"
+_BINARY_CANONICAL_MIME: str = "application/octet-stream"
+
+MimeStatus = Literal["match", "mismatch", "unknown"]
+
+
+@dataclass(frozen=True)
+class MimeVerification:
+    """Result of comparing a downloaded body to its extension's claim.
+
+    Attributes:
+        status: ``"match"`` when the detected (or sampled) content type
+            agrees with the extension's claim; ``"mismatch"`` when they
+            disagree (the polyglot case the FEAT-035 issue calls out);
+            ``"unknown"`` when the extension is outside both the binary
+            signature table and the text-extension whitelist, so no
+            verification could be performed.
+        detected_mime: The MIME string the verifier observed. ``None``
+            when the binary path could not match a signature and the
+            extension was not on the text list — the verifier had
+            nothing concrete to report.
+        expected_mime: The MIME string the extension claims. ``None``
+            for the ``"unknown"`` status (no canonical claim exists).
+    """
+
+    status: MimeStatus
+    detected_mime: str | None
+    expected_mime: str | None
+
+    @property
+    def is_mismatch(self) -> bool:
+        """Return ``True`` when the verification flagged a content/extension drift."""
+        return self.status == "mismatch"
+
+
+_UNKNOWN_VERIFICATION: MimeVerification = MimeVerification(
+    status="unknown",
+    detected_mime=None,
+    expected_mime=None,
+)
+
+
+def verify_mime_type(filename: str, data: bytes) -> MimeVerification:
+    """Verify *data*'s content type against *filename*'s extension claim.
+
+    Args:
+        filename: The original (raw) attachment filename. Only the
+            lowercased suffix is consulted.
+        data: The downloaded body. The verifier looks at the first
+            :data:`_TEXT_SAMPLE_BYTES` bytes for the text-extension path
+            and hands the whole buffer to :mod:`filetype` for the
+            binary path — ``filetype`` reads only the leading bytes it
+            needs, so passing the full body is cheap.
+
+    Returns:
+        A :class:`MimeVerification` describing the outcome. Extensions
+        outside the verifiable allow list return
+        :data:`_UNKNOWN_VERIFICATION` so the caller can decide whether
+        to warn or skip the soft-error path.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in _TEXT_EXTENSIONS:
+        return _verify_text_sample(data)
+    if suffix in _EXTENSION_TO_ACCEPTABLE_MIMES:
+        return _verify_binary_signature(suffix, data)
+    return _UNKNOWN_VERIFICATION
+
+
+def _verify_binary_signature(suffix: str, data: bytes) -> MimeVerification:
+    """Run ``filetype.guess`` against *data* and compare to *suffix*'s claim."""
+    guess = filetype.guess(data)
+    detected = guess.mime if guess is not None else None
+    acceptable = _EXTENSION_TO_ACCEPTABLE_MIMES[suffix]
+    expected = _EXTENSION_TO_CANONICAL_MIME[suffix]
+    if detected is not None and detected in acceptable:
+        return MimeVerification(
+            status="match", detected_mime=detected, expected_mime=expected
+        )
+    return MimeVerification(
+        status="mismatch", detected_mime=detected, expected_mime=expected
+    )
+
+
+def _verify_text_sample(data: bytes) -> MimeVerification:
+    """Sample-check that *data* is plausibly UTF-8 text with no NUL bytes."""
+    sample = data[:_TEXT_SAMPLE_BYTES]
+    if b"\x00" in sample:
+        return MimeVerification(
+            status="mismatch",
+            detected_mime=_BINARY_CANONICAL_MIME,
+            expected_mime=_TEXT_CANONICAL_MIME,
+        )
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return MimeVerification(
+            status="mismatch",
+            detected_mime=_BINARY_CANONICAL_MIME,
+            expected_mime=_TEXT_CANONICAL_MIME,
+        )
+    return MimeVerification(
+        status="match",
+        detected_mime=_TEXT_CANONICAL_MIME,
+        expected_mime=_TEXT_CANONICAL_MIME,
+    )
 
 
 class _AttachmentLike(Protocol):
@@ -122,6 +316,10 @@ class AcceptedAttachment:
             file extension, or ``None`` when the extension is unknown.
         already_present: ``True`` when an identical file existed at the
             staged path before this download (idempotent re-upload).
+        mime_verification: FEAT-035 content-type check result. Set to
+            :data:`_UNKNOWN_VERIFICATION` when verification was not
+            performed (extension outside the verifiable list, or the
+            file was rejected upstream before download).
     """
 
     filename: str
@@ -131,6 +329,7 @@ class AcceptedAttachment:
     content_hash: str
     inferred_type: str | None
     already_present: bool
+    mime_verification: MimeVerification = _UNKNOWN_VERIFICATION
 
 
 @dataclass(frozen=True)
@@ -368,6 +567,28 @@ async def _process_one(
             ),
         )
 
+    verification = verify_mime_type(attachment.filename, data)
+    if verification.is_mismatch and config.reject_on_mime_mismatch:
+        _LOGGER.info(
+            "rejecting attachment %r: MIME mismatch (expected %s, detected %s)",
+            attachment.filename,
+            verification.expected_mime,
+            verification.detected_mime,
+        )
+        return RejectedAttachment(
+            filename=attachment.filename,
+            size=len(data),
+            reason=_format_mime_mismatch_reason(verification),
+        )
+    if verification.is_mismatch:
+        _LOGGER.warning(
+            "MIME mismatch for attachment %r: extension claims %s, content "
+            "detected as %s (staging anyway; reject_on_mime_mismatch=False)",
+            attachment.filename,
+            verification.expected_mime,
+            verification.detected_mime,
+        )
+
     safe_name = sanitize_filename(attachment.filename)
     staging.mkdir(parents=True, exist_ok=True)
     target = staging / safe_name
@@ -395,7 +616,15 @@ async def _process_one(
         content_hash=content_hash,
         inferred_type=infer_ingestor_type(attachment.filename),
         already_present=already_present,
+        mime_verification=verification,
     )
+
+
+def _format_mime_mismatch_reason(verification: MimeVerification) -> str:
+    """Render a Discord-friendly rejection reason for a MIME mismatch."""
+    detected = verification.detected_mime or "unknown"
+    expected = verification.expected_mime or "unknown"
+    return f"MIME mismatch: extension claims {expected}, content detected as {detected}"
 
 
 def format_attachment_summary(
@@ -440,12 +669,33 @@ def format_attachment_summary(
             lines.append(
                 f"- `{a.filename}` — {_format_size(a.size)}, {type_hint}{marker}"
             )
+            mismatch_line = _format_mime_mismatch_warning(a.mime_verification)
+            if mismatch_line is not None:
+                lines.append(mismatch_line)
     if processed.rejected:
         lines.append("")
         lines.append("**Rejected:**")
         for r in processed.rejected:
             lines.append(f"- `{r.filename}` — {r.reason}")
     return "\n".join(lines)
+
+
+def _format_mime_mismatch_warning(verification: MimeVerification) -> str | None:
+    """Return a Discord-friendly soft-warning line, or ``None`` when not needed.
+
+    Only mismatches surface in the summary — the ``match`` and
+    ``unknown`` cases would only add noise. The warning indents under
+    the accepted-file bullet so the relationship reads clearly even
+    when several attachments are in the same batch.
+    """
+    if not verification.is_mismatch:
+        return None
+    detected = verification.detected_mime or "unknown"
+    expected = verification.expected_mime or "unknown"
+    return (
+        f"  - ⚠ MIME mismatch: extension claims `{expected}`, "
+        f"content detected as `{detected}`"
+    )
 
 
 def _format_size(num_bytes: int) -> str:

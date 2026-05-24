@@ -27,6 +27,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # the channel is on a boosted server.
 _DEFAULT_MAX_ATTACHMENT_BYTES: int = 25 * 1024 * 1024
 
+# FEAT-035: the default allow list is narrowed to extensions whose content
+# type can be verified — either by magic-byte signature (PDF, OOXML, common
+# images) or by text sampling (UTF-8 + no NUL bytes in the first KiB). The
+# pre-FEAT-035 list also accepted legacy Office formats (.doc/.xls/.ppt),
+# which the ``filetype`` library cannot reliably detect from magic bytes
+# and which carry an additional macro-execution risk. Operators who need
+# them can re-add the extensions in ``crawdad.yaml``.
 _DEFAULT_ALLOWED_EXTENSIONS: tuple[str, ...] = (
     ".md",
     ".markdown",
@@ -35,13 +42,10 @@ _DEFAULT_ALLOWED_EXTENSIONS: tuple[str, ...] = (
     ".htm",
     ".pdf",
     ".docx",
-    ".doc",
     ".json",
     ".csv",
     ".xlsx",
-    ".xls",
     ".pptx",
-    ".ppt",
     ".png",
     ".jpg",
     ".jpeg",
@@ -136,6 +140,15 @@ class AttachmentConfig(BaseModel):
             default per FEAT-011, so a missing entry never silently
             downgrades. Tier strings are validated at config-parse time;
             unknown values raise ``ValueError``.
+        reject_on_mime_mismatch: FEAT-035 knob. When ``True`` the bot
+            refuses an attachment whose downloaded bytes do not match
+            the MIME type implied by its extension; when ``False``
+            (default) the mismatch is surfaced as a soft warning in the
+            Discord safety report but the file still lands in staging.
+            Soft-warning mode preserves the v1 user-consent gate; flip
+            to ``True`` when a stricter deployment wants the bot to hard
+            reject polyglots (zip-disguised-as-pdf, executable-renamed-
+            to-md, etc.) before the user is even asked to ingest.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -152,6 +165,7 @@ class AttachmentConfig(BaseModel):
     )
     staging_subpath: Path = Field(default=_DEFAULT_STAGING_SUBPATH)
     channel_privacy_tiers: dict[int, str] = Field(default_factory=dict)
+    reject_on_mime_mismatch: bool = Field(default=False)
 
     @field_validator("allowed_extensions", "denied_extensions")
     @classmethod
