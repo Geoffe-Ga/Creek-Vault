@@ -33,7 +33,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from creek.ingest.base import Ingestor, ParsedFragment, RawDocument
+from creek.ingest.base import (
+    Ingestor,
+    ParsedFragment,
+    RawDocument,
+    parse_authored_at,
+)
 from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
@@ -390,6 +395,12 @@ class ImageIngestor(Ingestor):
         than a fragment with an empty body — empty fragments would
         clutter the vault without carrying signal.
 
+        FEAT-031: when EXIF carries ``DateTimeOriginal`` (the moment
+        the shutter fired) the fragment records it on ``authored_at``;
+        falls through to ``DateTime`` (modified) as the next-best
+        source date, and to ``None`` when neither exists or Pillow is
+        unavailable. The filesystem mtime is never substituted.
+
         Raises:
             PytesseractUnavailableError: When the default
                 :class:`PytesseractOcrEngine` is in use and
@@ -411,6 +422,7 @@ class ImageIngestor(Ingestor):
             "ocr_confidence": result.confidence,
             "image_type": result.image_type,
             "language": self.language,
+            "authored_at": _extract_exif_authored_at(raw.path),
         }
         self._tag_low_confidence(metadata, result.confidence)
         return [
@@ -455,7 +467,13 @@ class ImageIngestor(Ingestor):
         return f"{embed}\n\n{fragment.content.strip()}\n"
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
-        """Produce the YAML frontmatter for an OCR'd image fragment."""
+        """Produce the YAML frontmatter for an OCR'd image fragment.
+
+        FEAT-031: ``authored_at`` (from EXIF ``DateTimeOriginal`` or
+        ``DateTime``) is rendered as ISO when extracted; absent
+        otherwise so downstream readers fall through to the
+        ``Fragment.authored_at = None`` default.
+        """
         frontmatter: dict[str, Any] = {
             "type": "fragment",
             "source": {
@@ -473,6 +491,9 @@ class ImageIngestor(Ingestor):
         review_marker = fragment.metadata.get(_REVIEW_FRONTMATTER_KEY)
         if review_marker:
             frontmatter[_REVIEW_FRONTMATTER_KEY] = review_marker
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter["authored_at"] = authored_at.isoformat()
         return frontmatter
 
     def ingest_pdf(self, pdf_path: Path) -> list[ParsedFragment]:
@@ -521,6 +542,78 @@ class ImageIngestor(Ingestor):
 def _modified_time(path: Path) -> datetime:
     """Return the file's mtime as a timezone-aware UTC datetime."""
     return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+
+
+# EXIF tag IDs — magic numbers chosen by the standard, not by us. Hard-coded
+# rather than ``ExifTags.TAGS`` lookup so the Pillow import can stay deferred.
+_EXIF_DATETIME_ORIGINAL_TAG_ID: int = 36867  # DateTimeOriginal
+_EXIF_DATETIME_TAG_ID: int = 306  # DateTime
+
+# EXIF stores dates in the format ``"YYYY:MM:DD HH:MM:SS"`` (note the
+# colons separating the date components — non-ISO and a frequent source
+# of bugs in naïve implementations).
+_EXIF_DATETIME_FORMAT: str = "%Y:%m:%d %H:%M:%S"
+
+
+def _extract_exif_authored_at(path: Path) -> datetime | None:
+    """Read EXIF ``DateTimeOriginal`` (then ``DateTime``) from an image.
+
+    FEAT-031: returns the shutter-fired moment as a UTC-defaulted
+    tz-aware datetime, or ``None`` when neither tag exists, Pillow is
+    unavailable, or the image carries no EXIF data (PNGs / WebPs
+    often don't). The filesystem mtime is never substituted —
+    downstream surfaces fall through to :attr:`Fragment.ingested`.
+
+    EXIF datetimes are naive in the standard (no tz info); we localise
+    to UTC per the FEAT-031 spec rather than guessing the camera's
+    local zone. Cross-tz wall-clock accuracy is out of scope until an
+    ingestor parses the (separate) EXIF ``OffsetTimeOriginal`` tag.
+    """
+    exif = _load_image_exif(path)
+    if exif is None:
+        return None
+    for tag_id in (_EXIF_DATETIME_ORIGINAL_TAG_ID, _EXIF_DATETIME_TAG_ID):
+        candidate = _exif_tag_to_authored_at(exif.get(tag_id))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _load_image_exif(path: Path) -> Any | None:
+    """Open *path* via Pillow and return its EXIF mapping (or ``None``).
+
+    Centralising the optional-Pillow import + file-open failure modes
+    here keeps :func:`_extract_exif_authored_at` linear and below the
+    project's per-function try-block cap.
+    """
+    try:  # noqa: TRY101  # Separate optional-dep absence from file-open failure.
+        from PIL import Image
+    except ImportError:
+        return None
+    try:  # noqa: TRY101  # Distinct failure mode from the ImportError branch.
+        with Image.open(path) as image:
+            return image.getexif()
+    except Exception:  # Pillow raises a wide set on bad files
+        return None
+
+
+def _exif_tag_to_authored_at(raw_value: object) -> datetime | None:
+    """Parse a raw EXIF date tag into a tz-aware datetime (or ``None``).
+
+    Handles two failure modes — bad EXIF string format and
+    :func:`parse_authored_at` rejection — without exposing more than
+    one try block.
+    """
+    if not raw_value:
+        return None
+    try:  # noqa: TRY101  # Separate EXIF string-format from parse_authored_at.
+        naive = datetime.strptime(str(raw_value), _EXIF_DATETIME_FORMAT)
+    except (TypeError, ValueError):
+        return None
+    try:  # noqa: TRY101  # Distinct failure mode from the format check above.
+        return parse_authored_at(naive)
+    except ValueError:
+        return None
 
 
 __all__ = [

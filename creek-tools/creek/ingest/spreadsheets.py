@@ -36,6 +36,7 @@ from creek.ingest.base import (
     ParsedFragment,
     RawDocument,
     file_modified_time,
+    parse_authored_at,
 )
 from creek.models import SourcePlatform
 
@@ -211,6 +212,59 @@ def _cell_to_str(value: Any) -> str:
     return str(value)
 
 
+def _extract_xlsx_authored_at(path: Path) -> datetime | None:
+    """Read an XLSX file's core-properties ``created`` (then ``modified``).
+
+    FEAT-031: returns the spreadsheet's source-side authored date or
+    ``None`` when neither field is populated. CSV files (which carry
+    no core properties) and missing-openpyxl environments both
+    return ``None`` — the honest answer when no extractable date
+    exists; the filesystem mtime is never substituted here.
+    """
+    if path.suffix.lower() != ".xlsx":
+        return None
+    workbook = _open_xlsx(path)
+    if workbook is None:
+        return None
+    try:
+        props = workbook.properties
+        for candidate in (props.created, props.modified):
+            parsed = _safe_parse_authored_at(candidate)
+            if parsed is not None:
+                return parsed
+    finally:
+        workbook.close()
+    return None
+
+
+def _open_xlsx(path: Path) -> Any | None:
+    """Open *path* via openpyxl read-only, swallowing the wide error set.
+
+    Centralising the optional-import + file-open paths here keeps
+    :func:`_extract_xlsx_authored_at` linear and below the project's
+    per-function try-block cap.
+    """
+    try:  # noqa: TRY101  # Separate optional-dep absence from file-open failure.
+        import openpyxl
+    except ImportError:
+        return None
+    try:  # noqa: TRY101  # Distinct failure mode from the ImportError branch.
+        return openpyxl.load_workbook(path, read_only=True)
+    except Exception:  # BadZipFile / InvalidFile / OSError / KeyError
+        logger.debug("Could not open XLSX core properties for %s", path)
+        return None
+
+
+def _safe_parse_authored_at(candidate: object) -> datetime | None:
+    """Wrapper that swallows :class:`ValueError` from ``parse_authored_at``."""
+    if candidate is None:
+        return None
+    try:
+        return parse_authored_at(candidate)
+    except ValueError:
+        return None
+
+
 CSV_CHARDET_CONFIDENCE_THRESHOLD: float = 0.7
 """Minimum ``chardet`` confidence required to trust an auto-detected encoding.
 
@@ -372,9 +426,16 @@ class SpreadsheetIngestor(Ingestor):
         heuristic; ``True`` / ``False`` force the first row to be
         treated as headers / data respectively, in every sheet of the
         workbook.
+
+        FEAT-031: when the workbook is an XLSX, the spreadsheet's core
+        properties ``created`` (then ``modified``) become
+        ``authored_at`` on every sheet's fragment. CSV files carry no
+        authored-date metadata so they fall through to ``None`` — the
+        filesystem mtime is *not* a substitute.
         """
         workbook = self.backend.read_workbook(raw.path, has_header=has_header)
         timestamp = file_modified_time(raw.path)
+        authored_at = _extract_xlsx_authored_at(raw.path)
         fragments: list[ParsedFragment] = []
         for sheet in workbook.sheets:
             if sheet.is_empty:
@@ -392,6 +453,7 @@ class SpreadsheetIngestor(Ingestor):
                         "sheet": sheet.name,
                         "rows": len(sheet.rows),
                         "columns": column_count,
+                        "authored_at": authored_at,
                     },
                     source_path=str(raw.path),
                     timestamp=timestamp,
@@ -415,8 +477,14 @@ class SpreadsheetIngestor(Ingestor):
         return "\n".join(lines) + "\n"
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
-        """Produce YAML frontmatter for a spreadsheet fragment."""
-        return {
+        """Produce YAML frontmatter for a spreadsheet fragment.
+
+        FEAT-031: ``authored_at`` (XLSX core properties ``created`` /
+        ``modified``) lands on the frontmatter as an ISO string when
+        present; absent for CSV and for XLSX files whose core
+        properties carry no creation date.
+        """
+        frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "source": {
                 "platform": SourcePlatform.SPREADSHEET.value,
@@ -430,6 +498,10 @@ class SpreadsheetIngestor(Ingestor):
             "columns": fragment.metadata.get("columns", 0),
             "ingested": fragment.timestamp.isoformat(),
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter_dict["authored_at"] = authored_at.isoformat()
+        return frontmatter_dict
 
 
 def _extract_headers_and_rows(

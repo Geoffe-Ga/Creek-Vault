@@ -1177,6 +1177,83 @@ class TestChatGPTGenerateFrontmatter:
         assert "conversation_id" not in result["source"]
 
 
+class TestChatGPTAuthoredAt:
+    """FEAT-031: per-turn ``authored_at`` from each message's ``create_time``.
+
+    ChatGPT exports stamp every node in the mapping with a UTC
+    Unix-epoch ``create_time``. Per-turn fragments must carry the
+    user message's epoch so a 2023 conversation re-imported today
+    is bucketed under 2023, not the import wall-clock.
+    """
+
+    def test_authored_at_from_user_message_create_time(self) -> None:
+        """The user message's epoch becomes the fragment's ``authored_at``."""
+        from datetime import UTC
+
+        conv = _minimal_conversation(create_time=1700042400.0)
+        # The user message create_time is conv.create_time + 10.0
+        # = 1700042410.0
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime.fromtimestamp(1700042410.0, tz=UTC)
+        # UTC, not LA — preserves the source's instant honestly.
+        assert authored.tzinfo == UTC
+
+    def test_authored_at_falls_back_to_conversation_create_time(self) -> None:
+        """No per-message ``create_time`` → conversation-level epoch wins.
+
+        A user message without ``create_time`` (some older exports
+        omit it) still anchors to the conversation's ``create_time``
+        rather than going to ``None`` — the conversation's epoch is
+        the next-best honest source date.
+        """
+        from datetime import UTC
+
+        conv = _minimal_conversation(create_time=1700042400.0)
+        # Strip the user message's create_time.
+        conv["mapping"]["u1"]["message"].pop("create_time")
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime.fromtimestamp(1700042400.0, tz=UTC)
+
+    def test_authored_at_none_when_no_create_time_anywhere(self) -> None:
+        """Both conv- and msg-level missing → ``authored_at`` is ``None``.
+
+        FEAT-031 forbids guessing — the honest answer is ``None`` so
+        downstream time-bucket surfaces fall through to ``ingested``.
+        """
+        conv = _minimal_conversation(create_time=0.0)
+        # Wipe the user message's create_time too.
+        conv["mapping"]["u1"]["message"]["create_time"] = 0.0
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is None
+
+    def test_authored_at_in_generated_frontmatter(self) -> None:
+        """``generate_frontmatter`` surfaces ``authored_at`` as ISO string."""
+        conv = _minimal_conversation(create_time=1700042400.0)
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2023-11-15")
+
+    def test_no_authored_at_omits_key_from_frontmatter(self) -> None:
+        """When extraction yields ``None`` the key is absent (terse YAML)."""
+        conv = _minimal_conversation(create_time=0.0)
+        conv["mapping"]["u1"]["message"]["create_time"] = 0.0
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" not in fm
+
+
 # ---- Registry Tests ----
 
 

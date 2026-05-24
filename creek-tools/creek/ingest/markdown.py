@@ -28,6 +28,7 @@ from creek.ingest.base import (
     RawDocument,
     normalize_encoding,
     normalize_timestamp,
+    parse_authored_at,
 )
 from creek.models import SourcePlatform
 
@@ -211,6 +212,55 @@ def _extract_timestamp_from_frontmatter(fm_data: dict[str, Any]) -> str | None:
     return None
 
 
+# FEAT-031: authored-date precedence specific to Markdown sources.
+# ``published`` wins because a user-asserted publication date is the
+# truest source-side timestamp; ``date`` and ``created`` are common
+# author-supplied aliases. We deliberately do NOT consider
+# ``created_at``/``modified``/``updated`` — those track later edits,
+# not the original authoring moment.
+_MARKDOWN_AUTHORED_AT_KEYS: tuple[str, ...] = ("published", "date", "created")
+
+
+def _extract_authored_at_from_frontmatter(fm_data: dict[str, Any]) -> datetime | None:
+    """Resolve the source-authored timestamp from a markdown file's frontmatter.
+
+    Walks :data:`_MARKDOWN_AUTHORED_AT_KEYS` in order and returns the
+    first parseable value as a timezone-aware datetime. Returns
+    ``None`` when no key is present or every candidate fails to parse
+    — never guesses, per the FEAT-031 contract.
+
+    Values are routed through :func:`parse_authored_at` so the source
+    timezone is preserved (or UTC-defaulted) per the FEAT-031 spec.
+    Using the LA-anchored :func:`normalize_timestamp` here would shift
+    a bare ``published: 2024-03-15`` to 2024-03-14 17:00 PDT — wrong
+    answer for an authored date.
+
+    Args:
+        fm_data: The parsed frontmatter dictionary.
+
+    Returns:
+        A tz-aware datetime when a parseable field is present, else
+        ``None``.
+    """
+    for key in _MARKDOWN_AUTHORED_AT_KEYS:
+        value = fm_data.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = parse_authored_at(value)
+        except ValueError:
+            logger.warning(
+                "Markdown frontmatter %r=%r is not parseable as a date; "
+                "skipping for authored_at.",
+                key,
+                value,
+            )
+            continue
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _get_file_creation_timestamp(path: Path) -> datetime:
     """Get the file creation timestamp from filesystem metadata.
 
@@ -313,6 +363,14 @@ class MarkdownIngestor(Ingestor):
         the markdown body. Detects document type from content patterns
         and extracts a timestamp from frontmatter or filesystem metadata.
 
+        FEAT-031: when frontmatter carries a ``published`` / ``date`` /
+        ``created`` field that parses cleanly, the resulting datetime
+        is stashed on ``ParsedFragment.metadata['authored_at']`` so
+        :meth:`generate_frontmatter` can promote it into the Creek
+        fragment. ``None`` is the honest answer when no such field
+        exists — the filesystem mtime is *not* a substitute (it lives
+        in :attr:`ParsedFragment.timestamp` for ID hashing only).
+
         Args:
             raw: The raw document to parse.
 
@@ -323,6 +381,7 @@ class MarkdownIngestor(Ingestor):
         fm_data, content = self._parse_frontmatter(text)
         document_type = _detect_document_type(content)
         timestamp = self._resolve_timestamp(fm_data, raw.path)
+        authored_at = _extract_authored_at_from_frontmatter(fm_data)
 
         return [
             ParsedFragment(
@@ -330,6 +389,7 @@ class MarkdownIngestor(Ingestor):
                 metadata={
                     "existing_frontmatter": fm_data,
                     "document_type": document_type,
+                    "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
                 timestamp=timestamp,
@@ -420,6 +480,13 @@ class MarkdownIngestor(Ingestor):
             },
             "created": fragment.timestamp.isoformat(),
         }
+
+        # FEAT-031: surface the frontmatter-derived authored date when
+        # we have one. ``None`` is omitted rather than serialised so
+        # downstream readers fall through to the model default.
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            creek_defaults["authored_at"] = authored_at.isoformat()
 
         return _merge_frontmatter(creek_defaults, existing_fm)
 

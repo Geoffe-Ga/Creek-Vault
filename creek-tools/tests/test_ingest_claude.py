@@ -9,6 +9,7 @@ edge cases (empty conversations, missing fields, system prompts).
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -771,6 +772,137 @@ class TestGenerateFrontmatter:
         fragments = ingestor.parse(raw)
         fm = ingestor.generate_frontmatter(fragments[0])
         assert fm["source"]["platform"] == "claude"
+
+
+class TestClaudeAuthoredAt:
+    """FEAT-031: Claude turns carry the source-side ``created_at``.
+
+    Precedence: per-message ``created_at`` first, then conversation
+    ``created_at`` as fallback. The result preserves the source's tz
+    (UTC for ``Z``-suffixed values) and is omitted entirely when no
+    source date exists.
+    """
+
+    def test_authored_at_from_per_message_created_at(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """The human-message ``created_at`` becomes the turn's authored date."""
+        from datetime import UTC
+
+        conv = _make_single_conversation(
+            created_at="2024-11-15T10:30:00Z",
+            messages=[
+                {
+                    "role": "human",
+                    "content": "Q",
+                    "created_at": "2024-11-15T10:30:00Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": "A",
+                    "created_at": "2024-11-15T10:30:15Z",
+                },
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 1
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 11, 15, 10, 30, tzinfo=UTC)
+
+    def test_authored_at_falls_back_to_conversation_created_at(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """No per-message ``created_at`` → conversation timestamp wins."""
+        from datetime import UTC
+
+        conv = _make_single_conversation(
+            created_at="2024-11-15T10:30:00Z",
+            messages=[
+                # Drop created_at — exercise the conv-level fallback.
+                {"role": "human", "content": "Q"},
+                {"role": "assistant", "content": "A"},
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 11, 15, 10, 30, tzinfo=UTC)
+
+    def test_authored_at_none_when_no_dates_anywhere(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """All ``created_at`` missing → ``None`` (FEAT-031 forbids guessing)."""
+        conv = _make_single_conversation(
+            created_at="",
+            messages=[
+                {"role": "human", "content": "Q"},
+                {"role": "assistant", "content": "A"},
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is None
+
+    def test_authored_at_round_trips_into_frontmatter(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """The generated frontmatter carries an ISO ``authored_at`` string."""
+        conv = _make_single_conversation()
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-11-15")
+
+    def test_no_authored_at_omits_key_from_frontmatter(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """When extraction yields ``None`` the key is absent."""
+        conv = _make_single_conversation(
+            created_at="",
+            messages=[
+                {"role": "human", "content": "Q"},
+                {"role": "assistant", "content": "A"},
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        fm = ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" not in fm
+
+    def test_authored_at_preserves_source_offset(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """A ``+09:00``-suffixed ``created_at`` keeps its offset, no LA coercion."""
+        from datetime import timedelta
+
+        conv = _make_single_conversation(
+            created_at="2024-11-15T10:30:00+09:00",
+            messages=[
+                {
+                    "role": "human",
+                    "content": "Q",
+                    "created_at": "2024-11-15T10:30:00+09:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "A",
+                    "created_at": "2024-11-15T10:30:15+09:00",
+                },
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        authored = fragments[0].metadata["authored_at"]
+        assert authored is not None
+        # The hour wall-time and offset come through verbatim — no
+        # coercion to LA or UTC.
+        assert authored.hour == 10
+        assert authored.utcoffset() == timedelta(hours=9)
 
 
 # ---- ingest() Integration Tests ----

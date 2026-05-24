@@ -8,7 +8,7 @@ INGESTOR_REGISTRY registration.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -599,6 +599,134 @@ class TestMarkdownIngestorGenerateFrontmatter:
         )
         fm = md_ingestor.generate_frontmatter(fragment)
         assert fm["source"]["platform"] == SourcePlatform.JOURNAL
+
+
+class TestMarkdownIngestorAuthoredAtExtraction:
+    """FEAT-031: ``authored_at`` is parsed from frontmatter date fields.
+
+    Precedence: ``published`` > ``date`` > ``created``. The filesystem
+    mtime is *never* a substitute — ``None`` is the honest answer when
+    no parseable frontmatter date exists.
+    """
+
+    def _parse_one(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+        body: str,
+    ) -> ParsedFragment:
+        """Write *body* to a temp ``.md`` file and parse it through the ingestor.
+
+        Centralises the ``write → discover → parse`` boilerplate so each
+        test reads as a single behavioural assertion.
+        """
+        path = tmp_path / "note.md"
+        path.write_text(body, encoding="utf-8")
+        docs = md_ingestor.discover(path)
+        assert len(docs) == 1
+        parsed = md_ingestor.parse(docs[0])
+        assert len(parsed) == 1
+        return parsed[0]
+
+    def test_published_field_wins_over_date_and_created(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """``published`` is the truest source date and wins the chain."""
+        body = (
+            "---\n"
+            "published: 2024-03-15\n"
+            "date: 2024-04-01\n"
+            "created: 2024-05-01\n"
+            "---\n"
+            "# Old essay\n"
+        )
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored.date() == date(2024, 3, 15)
+        assert authored.tzinfo is not None  # never naive
+
+    def test_date_field_used_when_no_published(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """Without ``published``, ``date`` wins over ``created``."""
+        body = "---\ndate: 2024-04-01\ncreated: 2024-05-01\n---\n# Essay\n"
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored.date() == date(2024, 4, 1)
+
+    def test_created_field_used_when_no_published_or_date(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """Last in the chain: ``created`` is honoured as authored_at."""
+        body = "---\ncreated: 2024-05-01\n---\n# Essay\n"
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored.date() == date(2024, 5, 1)
+
+    def test_no_date_fields_yields_none(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """When no parseable date is present, ``authored_at`` is ``None``.
+
+        The mtime is *not* used as a substitute — FEAT-031 forbids
+        guessing. The mtime still drives ``ParsedFragment.timestamp``
+        (the ID-hash input) but does not pretend to be an authored date.
+        """
+        body = "# A note with no frontmatter\n\nJust a thought.\n"
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        assert parsed.metadata["authored_at"] is None
+
+    def test_unparseable_date_field_is_skipped(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """Garbage in a date field is logged and falls through, never crashes."""
+        body = "---\npublished: not-a-real-date\ndate: 2024-04-01\n---\n# Essay\n"
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        authored = parsed.metadata["authored_at"]
+        # Falls through to the next valid candidate (``date``).
+        assert authored is not None
+        assert authored.date() == date(2024, 4, 1)
+
+    def test_authored_at_round_trips_into_frontmatter_dict(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """Generated frontmatter carries ``authored_at`` for Pydantic to load."""
+        body = "---\npublished: 2024-03-15\n---\n# Old\n"
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        fm = md_ingestor.generate_frontmatter(parsed)
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
+
+    def test_no_authored_at_omits_key_from_frontmatter(
+        self,
+        md_ingestor: MarkdownIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """When no source date exists, ``authored_at`` is absent from the dict.
+
+        Pydantic's ``Fragment.authored_at`` defaults to ``None``, so
+        omitting the key keeps re-ingested vault files terse instead of
+        carrying redundant ``authored_at: null`` lines.
+        """
+        body = "# Plain note\n\nBody.\n"
+        parsed = self._parse_one(md_ingestor, tmp_path, body)
+        fm = md_ingestor.generate_frontmatter(parsed)
+        assert "authored_at" not in fm
 
 
 # ---- Full Pipeline Integration Tests ----

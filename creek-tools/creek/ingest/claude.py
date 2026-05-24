@@ -25,9 +25,11 @@ from creek.ingest.base import (
     RawDocument,
     normalize_encoding,
     normalize_timestamp,
+    parse_authored_at,
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from pathlib import Path
 
     from creek.clean.filters.chatbot import ChatbotFilter
@@ -190,6 +192,40 @@ def _resolve_timestamp(msg: dict[str, Any], fallback: str) -> str:
     return fallback or "2000-01-01T00:00:00Z"
 
 
+def _resolve_authored_at(
+    msg: dict[str, Any],
+    conv_created_at: str,
+) -> datetime | None:
+    """Resolve a Claude turn's ``authored_at`` (FEAT-031).
+
+    Precedence: per-message ``created_at`` first, then the
+    conversation-level ``created_at`` as fallback. Unparseable values
+    are logged and yield ``None`` so the downstream contract — never
+    guess a date — is preserved.
+
+    Args:
+        msg: The human-side message dict for the turn.
+        conv_created_at: The enclosing conversation's ``created_at``
+            string. Empty string means "no conversation timestamp"
+            and the result is ``None``.
+
+    Returns:
+        A tz-aware datetime or ``None``.
+    """
+    candidates: tuple[object, ...] = (msg.get("created_at"), conv_created_at)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = parse_authored_at(candidate)
+        except ValueError:
+            logger.warning("Claude turn has unparseable created_at %r", candidate)
+            continue
+        if parsed is not None:
+            return parsed
+    return None
+
+
 # ---- Claude Ingestor ----
 
 
@@ -320,11 +356,15 @@ class ClaudeIngestor(Ingestor):
         if model is not None:
             source["model"] = model
 
-        return {
+        frontmatter_dict: dict[str, Any] = {
             "title": f"{conv_name} (turn {turn_idx})",
             "created": fragment.timestamp.isoformat(),
             "source": source,
         }
+        authored_at: datetime | None = meta.get("authored_at")
+        if authored_at is not None:
+            frontmatter_dict["authored_at"] = authored_at.isoformat()
+        return frontmatter_dict
 
     # ---- Private Helpers ----
 
@@ -449,6 +489,10 @@ class ClaudeIngestor(Ingestor):
 
         ts_string = _resolve_timestamp(human_msg, fallback_ts)
         timestamp = normalize_timestamp(ts_string, source_tz=None)
+        # FEAT-031: ``authored_at`` preserves the source's tz; falls
+        # back to the conversation-level ``created_at`` and finally to
+        # ``None`` when no real source date exists.
+        authored_at = _resolve_authored_at(human_msg, fallback_ts)
 
         content = f"{human_text}\n\n{assistant_text}"
 
@@ -458,6 +502,7 @@ class ClaudeIngestor(Ingestor):
             "turn_index": turn_index,
             "human_text": human_text,
             "assistant_text": assistant_text,
+            "authored_at": authored_at,
         }
         if model is not None:
             metadata["model"] = model

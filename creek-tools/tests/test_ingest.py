@@ -7,7 +7,7 @@ the Ingestor ABC contract enforcement, and the concrete ``ingest()`` orchestrato
 
 import abc
 import hashlib
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -28,6 +28,7 @@ from creek.ingest.base import (
     generate_fragment_id,
     normalize_encoding,
     normalize_timestamp,
+    parse_authored_at,
 )
 
 # ---- Fixtures ----
@@ -426,6 +427,107 @@ class TestNormalizeTimestamp:
         """Invalid timestamp string should raise ValueError."""
         with pytest.raises(ValueError, match="Unable to parse timestamp"):
             normalize_timestamp("not-a-timestamp", None)
+
+
+class TestParseAuthoredAt:
+    """FEAT-031 ``parse_authored_at`` — preserve source tz; default to UTC.
+
+    Distinct from :func:`normalize_timestamp`, which always coerces to
+    America/Los_Angeles. These tests pin the contract that powers every
+    ingestor's ``authored_at`` extraction.
+    """
+
+    def test_none_input_returns_none(self) -> None:
+        """``None`` is the honest answer when no source date exists."""
+        assert parse_authored_at(None) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        """Whitespace-only strings are equivalent to ``None``."""
+        assert parse_authored_at("   ") is None
+        assert parse_authored_at("") is None
+
+    def test_naive_datetime_string_defaults_to_utc(self) -> None:
+        """The spec: naive input → UTC (NOT host tz, NOT LA)."""
+        from datetime import UTC
+
+        result = parse_authored_at("2024-03-15T08:30:00")
+        assert result is not None
+        assert result == datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+
+    def test_tz_aware_string_preserves_offset(self) -> None:
+        """A string with a tz suffix keeps its offset, no LA coercion."""
+        result = parse_authored_at("2024-03-15T08:30:00+09:00")
+        assert result is not None
+        # Same wall time + same offset — not converted to LA or UTC.
+        assert result.hour == 8
+        assert result.utcoffset() == timedelta(hours=9)
+
+    def test_bare_date_string_promoted_to_utc_midnight(self) -> None:
+        """``2024-03-15`` → 2024-03-15 00:00:00 UTC, NOT 2024-03-14 17:00 PDT.
+
+        Pins the difference from :func:`normalize_timestamp` — which
+        would slip the date by a day after LA conversion — and is the
+        reason FEAT-031 needed its own helper.
+        """
+        from datetime import UTC
+
+        result = parse_authored_at("2024-03-15")
+        assert result is not None
+        assert result == datetime(2024, 3, 15, tzinfo=UTC)
+        assert result.date() == date(2024, 3, 15)
+
+    def test_yaml_date_object_promoted_to_utc_midnight(self) -> None:
+        """YAML's bare-date type (``date``) is promoted, not stringified."""
+        from datetime import UTC
+        from datetime import date as date_
+
+        result = parse_authored_at(date_(2024, 3, 15))
+        assert result is not None
+        assert result == datetime(2024, 3, 15, tzinfo=UTC)
+
+    def test_datetime_input_passthrough_tz_aware(self) -> None:
+        """A tz-aware datetime is returned unchanged."""
+        sydney = ZoneInfo("Australia/Sydney")
+        when = datetime(2024, 3, 15, 8, 30, tzinfo=sydney)
+        result = parse_authored_at(when)
+        assert result == when
+        assert result is not None
+        assert result.tzinfo == sydney
+
+    def test_datetime_input_naive_localised_to_utc(self) -> None:
+        """A naive datetime input is UTC-localised."""
+        from datetime import UTC
+
+        naive = datetime(2024, 3, 15, 8, 30)
+        result = parse_authored_at(naive)
+        assert result == datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+
+    def test_explicit_source_tz_localises_naive_inputs(self) -> None:
+        """``source_tz`` overrides the UTC default for naive inputs."""
+        tokyo = "Asia/Tokyo"
+        result = parse_authored_at("2024-03-15T08:30:00", source_tz=tokyo)
+        assert result is not None
+        assert result.utcoffset() == timedelta(hours=9)
+        assert result.hour == 8
+
+    def test_unparseable_string_raises_value_error(self) -> None:
+        """Garbage propagates — caller decides whether to skip or fail."""
+        with pytest.raises(ValueError, match="Unable to parse timestamp"):
+            parse_authored_at("not-a-real-date")
+
+    def test_never_returns_naive_datetime(self) -> None:
+        """Invariant: the return is either ``None`` or tz-aware."""
+        candidates: list[object] = [
+            "2024-03-15",
+            "2024-03-15T08:30:00",
+            "2024-03-15T08:30:00+09:00",
+            datetime(2024, 3, 15, 8, 30),
+            datetime(2024, 3, 15, 8, 30, tzinfo=ZoneInfo("UTC")),
+        ]
+        for candidate in candidates:
+            result = parse_authored_at(candidate)
+            assert result is not None
+            assert result.tzinfo is not None
 
 
 # ---- generate_fragment_id Tests ----

@@ -542,6 +542,14 @@ def ingest(
         "-y",
         help="Skip the consent prompt for first-time sources (logged).",
     ),
+    refresh_dates: bool = typer.Option(
+        False,
+        "--refresh-dates",
+        help=(
+            "FEAT-031 backfill: re-extract authored_at on existing fragments "
+            "without re-ingesting body content. Idempotent."
+        ),
+    ),
 ) -> None:
     """Ingest a specific source type into the vault.
 
@@ -551,7 +559,17 @@ def ingest(
     :class:`~creek.vault.writer.VaultWriter`. Re-running against the same
     input is idempotent: deterministic fragment IDs ensure existing
     files are recognised and skipped.
+
+    ``--refresh-dates`` is a one-shot FEAT-031 backfill: it walks
+    ``--vault`` (or the configured vault), re-runs the per-format
+    authored-date extraction chain against each fragment's source
+    file, and rewrites the frontmatter in place. ``--type`` /
+    ``--input`` are ignored in refresh mode.
     """
+    if refresh_dates:
+        _run_refresh_dates(vault)
+        return
+
     if type is None or input is None:
         console.print("[red]--type and --input are required.[/red]")
         raise typer.Exit(code=2)
@@ -582,6 +600,39 @@ def ingest(
     if errors:
         console.print(f"[yellow]Errors: {len(errors)}[/yellow]")
         for err in errors:
+            console.print(f"  [dim]{err}[/dim]")
+
+
+def _run_refresh_dates(vault: Path | None) -> None:
+    """Execute the FEAT-031 ``--refresh-dates`` backfill.
+
+    Resolves the vault path (CLI flag → configured default), invokes
+    :func:`creek.ingest.refresh.refresh_authored_dates`, and renders a
+    one-screen summary. Exit codes mirror the rest of the CLI: 0 on
+    success (regardless of how many fragments were updated), 1 if the
+    vault path is unusable.
+    """
+    from creek.ingest.refresh import refresh_authored_dates
+
+    config = load_config()
+    vault_path = vault or config.vault_path
+    if not vault_path.exists():
+        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
+        raise typer.Exit(code=1)
+
+    result = refresh_authored_dates(vault_path)
+    console.print(
+        f"[bold green]Refreshed authored_at on {result.updated} "
+        "fragment(s).[/bold green]"
+    )
+    console.print(f"  scanned: {result.scanned}")
+    console.print(f"  already-set: {result.already_set}")
+    console.print(f"  no source date: {result.no_date_found}")
+    console.print(f"  missing source file: {result.missing_source}")
+    console.print(f"  unsupported source: {result.unsupported}")
+    if result.errors:
+        console.print(f"[yellow]Errors: {len(result.errors)}[/yellow]")
+        for err in result.errors:
             console.print(f"  [dim]{err}[/dim]")
 
 

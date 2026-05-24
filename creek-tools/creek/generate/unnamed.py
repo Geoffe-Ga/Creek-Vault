@@ -39,6 +39,7 @@ import frontmatter
 from pydantic import ValidationError
 
 from creek.models import Fragment
+from creek.time import effective_authored_date
 
 if TYPE_CHECKING:
     from datetime import date
@@ -196,21 +197,26 @@ class UnnamedDigestGenerator:
         fragments: list[Fragment],
         week_start: date,
     ) -> list[Fragment]:
-        """Return the subset of *fragments* created within the target week.
+        """Return the subset of *fragments* authored within the target week.
 
         The window is ``[week_start, week_start + 7)`` days, matching the
         standard ISO-week convention (Monday inclusive, next Monday
-        exclusive).
+        exclusive). FEAT-031: bucketing uses
+        :func:`creek.time.effective_authored_date` so a historical
+        fragment (a 2024 essay re-ingested this week) lands in its
+        true authored week, not the import week.
 
         Args:
             fragments: Candidate fragments.
             week_start: Monday of the target ISO week.
 
         Returns:
-            Fragments whose ``created`` date falls in the window.
+            Fragments whose effective authored date falls in the window.
         """
         week_end = week_start + timedelta(days=_WEEK_LENGTH_DAYS)
-        return [f for f in fragments if week_start <= f.created.date() < week_end]
+        return [
+            f for f in fragments if week_start <= effective_authored_date(f) < week_end
+        ]
 
     def detect_unnamed_clusters(
         self,

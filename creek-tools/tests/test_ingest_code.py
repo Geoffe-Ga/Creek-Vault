@@ -741,6 +741,130 @@ class TestCodeIngestorFullPipeline:
 # ---- Commit Message Tests ----
 
 
+class TestCodeIngestorAuthoredAtFromGit:
+    """FEAT-031: ``git log --diff-filter=A --follow`` → ``authored_at``.
+
+    The ingestor calls ``git log`` against each file's first-added
+    commit to recover its source-side authored date. Tests use a real
+    ``git init`` plus a single commit (no remote, no network) so the
+    integration is end-to-end yet hermetic.
+    """
+
+    def _git_repo_with_file(
+        self,
+        tmp_path: Path,
+        *,
+        committer_date: str,
+        body: str = '"""Module docstring."""\n',
+        filename: str = "src/main.py",
+    ) -> Path:
+        """Build a real git repo with one commit at *committer_date*.
+
+        Uses ``GIT_AUTHOR_DATE`` / ``GIT_COMMITTER_DATE`` env vars so
+        the recorded commit date is deterministic and independent of
+        the host clock — the assertion target.
+        """
+        import os
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        target = repo / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_AUTHOR_DATE": committer_date,
+            "GIT_COMMITTER_DATE": committer_date,
+        }
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "commit.gpgsign", "false"],
+            ["git", "add", "."],
+            ["git", "commit", "-q", "-m", "init"],
+        ):
+            subprocess.run(cmd, cwd=str(repo), check=True, env=env)  # nosec B603, B607
+        return repo
+
+    def test_first_commit_author_date_lands_on_authored_at(
+        self, code_ingestor: CodeIngestor, tmp_path: Path
+    ) -> None:
+        """A real git repo's first-commit author date → ``authored_at``."""
+        from datetime import UTC
+
+        repo = self._git_repo_with_file(
+            tmp_path, committer_date="2024-03-15T08:30:00+00:00"
+        )
+        py_file = repo / "src" / "main.py"
+        docs = code_ingestor.discover(py_file)
+        fragments = code_ingestor.parse(docs[0])
+        assert any(
+            f.metadata.get("authored_at") == datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+            for f in fragments
+        )
+
+    def test_authored_at_none_outside_git_repo(
+        self, code_ingestor: CodeIngestor, tmp_path: Path
+    ) -> None:
+        """A standalone Python file with no git history → ``None``."""
+        py_file = tmp_path / "script.py"
+        py_file.write_text('"""A script."""\n', encoding="utf-8")
+        docs = code_ingestor.discover(py_file)
+        fragments = code_ingestor.parse(docs[0])
+        for frag in fragments:
+            assert frag.metadata.get("authored_at") is None
+
+    def test_authored_at_in_frontmatter_when_extracted(
+        self, code_ingestor: CodeIngestor, tmp_path: Path
+    ) -> None:
+        """Generated frontmatter carries ``authored_at`` as ISO when present."""
+        repo = self._git_repo_with_file(
+            tmp_path, committer_date="2024-03-15T08:30:00+00:00"
+        )
+        py_file = repo / "src" / "main.py"
+        docs = code_ingestor.discover(py_file)
+        fragments = code_ingestor.parse(docs[0])
+        assert fragments
+        fm = code_ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
+
+    def test_authored_at_omitted_from_frontmatter_when_absent(
+        self, code_ingestor: CodeIngestor, tmp_path: Path
+    ) -> None:
+        """No git history → ``authored_at`` is absent from frontmatter."""
+        py_file = tmp_path / "script.py"
+        py_file.write_text('"""A script."""\n', encoding="utf-8")
+        docs = code_ingestor.discover(py_file)
+        fragments = code_ingestor.parse(docs[0])
+        assert fragments
+        fm = code_ingestor.generate_frontmatter(fragments[0])
+        assert "authored_at" not in fm
+
+    def test_readme_in_git_repo_carries_authored_at(
+        self, code_ingestor: CodeIngestor, tmp_path: Path
+    ) -> None:
+        """Markdown artifacts (README/CLAUDE.md/ADR) also pick up authored_at."""
+        from datetime import UTC
+
+        repo = self._git_repo_with_file(
+            tmp_path,
+            committer_date="2024-03-15T08:30:00+00:00",
+            filename="README.md",
+            body="# Project\n\nHello.\n",
+        )
+        readme = repo / "README.md"
+        docs = code_ingestor.discover(readme)
+        fragments = code_ingestor.parse(docs[0])
+        assert len(fragments) == 1
+        assert fragments[0].metadata["authored_at"] == datetime(
+            2024, 3, 15, 8, 30, tzinfo=UTC
+        )
+
+
 class TestCodeIngestorCommitMessages:
     """Tests for commit message extraction."""
 

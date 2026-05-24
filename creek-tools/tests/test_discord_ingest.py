@@ -9,7 +9,7 @@ custom emoji), and full pipeline integration.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -894,6 +894,159 @@ class TestDiscordIngestorGenerateFrontmatter:
         assert fm["source"]["channel_id"] == "unknown"
         assert fm["authors"] == []
         assert fm["message_count"] == 0
+
+
+class TestDiscordIngestorAuthoredAt:
+    """FEAT-031: each Discord fragment carries the message-side timestamp.
+
+    The Discord JSON export stamps every message with an ISO-8601
+    ``timestamp`` field — the canonical source-side "when was this
+    said?" answer. The ingestor must surface this on
+    :attr:`Fragment.authored_at` (preserving the source's tz offset)
+    so cross-source time-window logic can pair Discord conversations
+    with essays from other years.
+    """
+
+    def _write_channel(
+        self,
+        tmp_path: Path,
+        messages: list[dict[str, Any]],
+        *,
+        channel_id: str = "ch-1",
+        channel_name: str = "general",
+    ) -> Path:
+        """Materialise a one-channel Discord export under *tmp_path*.
+
+        Mirrors the on-disk shape Discord's "Request my data" produces
+        so the ingestor's discover-then-parse path exercises the same
+        code as production.
+        """
+        channel_dir = tmp_path / "messages" / channel_id
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "channel.json").write_text(
+            json.dumps({"id": channel_id, "name": channel_name, "type": "text"}),
+            encoding="utf-8",
+        )
+        (channel_dir / "messages.json").write_text(
+            json.dumps(messages), encoding="utf-8"
+        )
+        return tmp_path
+
+    def _ingest_first_fragment(
+        self,
+        tmp_path: Path,
+        messages: list[dict[str, Any]],
+    ) -> ParsedFragment:
+        """End-to-end: write channel, run ingestor, return one fragment."""
+        root = self._write_channel(tmp_path, messages)
+        ingestor = DiscordIngestor()
+        result = ingestor.ingest(root)
+        assert len(result.fragments) >= 1
+        return result.fragments[0]
+
+    def test_authored_at_matches_first_message_timestamp(self, tmp_path: Path) -> None:
+        """``authored_at`` carries the first message's ISO timestamp."""
+        fragment = self._ingest_first_fragment(
+            tmp_path,
+            [
+                {
+                    "id": "m1",
+                    "timestamp": "2023-08-14T22:15:30+00:00",
+                    "content": "old message",
+                    "author": {"name": "Alice"},
+                },
+            ],
+        )
+        authored = fragment.metadata["authored_at"]
+        assert authored is not None
+        assert authored.date() == date(2023, 8, 14)
+        assert authored.hour == 22  # source tz preserved
+        assert authored.tzinfo is not None
+
+    def test_authored_at_preserves_source_offset(self, tmp_path: Path) -> None:
+        """A Discord message in JST keeps its +09:00 offset, no LA coercion."""
+        fragment = self._ingest_first_fragment(
+            tmp_path,
+            [
+                {
+                    "id": "m1",
+                    "timestamp": "2024-03-15T08:30:00+09:00",
+                    "content": "msg",
+                    "author": {"name": "Hana"},
+                },
+            ],
+        )
+        authored = fragment.metadata["authored_at"]
+        assert authored is not None
+        assert authored.utcoffset() == timedelta(hours=9)
+
+    def test_missing_timestamp_yields_none(self, tmp_path: Path) -> None:
+        """No source timestamp → ``authored_at`` is ``None``, not a guess.
+
+        Without a ``timestamp`` field Discord exports are unusable for
+        time-bucketing; the honest answer is ``None`` so downstream
+        surfaces fall through to ``ingested``.
+        """
+        fragment = self._ingest_first_fragment(
+            tmp_path,
+            [
+                {
+                    "id": "m1",
+                    "content": "no timestamp",
+                    "author": {"name": "Alice"},
+                },
+            ],
+        )
+        assert fragment.metadata["authored_at"] is None
+
+    def test_unparseable_timestamp_yields_none(self, tmp_path: Path) -> None:
+        """Garbage in ``timestamp`` is logged and falls through to ``None``."""
+        fragment = self._ingest_first_fragment(
+            tmp_path,
+            [
+                {
+                    "id": "m1",
+                    "timestamp": "not-a-real-date",
+                    "content": "broken",
+                    "author": {"name": "Alice"},
+                },
+            ],
+        )
+        assert fragment.metadata["authored_at"] is None
+
+    def test_authored_at_surfaces_in_frontmatter(self, tmp_path: Path) -> None:
+        """Generated frontmatter carries ``authored_at`` as an ISO string."""
+        fragment = self._ingest_first_fragment(
+            tmp_path,
+            [
+                {
+                    "id": "m1",
+                    "timestamp": "2023-08-14T22:15:30+00:00",
+                    "content": "msg",
+                    "author": {"name": "Alice"},
+                },
+            ],
+        )
+        ingestor = DiscordIngestor()
+        fm = ingestor.generate_frontmatter(fragment)
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2023-08-14")
+
+    def test_no_authored_at_omits_key_from_frontmatter(self, tmp_path: Path) -> None:
+        """When extraction yields ``None``, the key is absent (terse YAML)."""
+        fragment = self._ingest_first_fragment(
+            tmp_path,
+            [
+                {
+                    "id": "m1",
+                    "content": "no ts",
+                    "author": {"name": "Alice"},
+                },
+            ],
+        )
+        ingestor = DiscordIngestor()
+        fm = ingestor.generate_frontmatter(fragment)
+        assert "authored_at" not in fm
 
 
 # ---- Registry tests ----

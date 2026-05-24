@@ -18,7 +18,7 @@ import abc
 import hashlib
 import logging
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -216,6 +216,51 @@ def normalize_timestamp(ts_string: str, source_tz: str | None) -> datetime:
     """
     parsed = _parse_timestamp_string(ts_string)
     return _localize_naive_timestamp(parsed, source_tz).astimezone(LA_TZ)
+
+
+def parse_authored_at(value: object, source_tz: str | None = None) -> datetime | None:
+    """Parse a value into a tz-aware ``authored_at`` datetime (FEAT-031).
+
+    The FEAT-031 contract: ``authored_at`` preserves the source's
+    timezone when one is provided and defaults to UTC otherwise. This
+    differs from :func:`normalize_timestamp`, which always converts to
+    LA — appropriate for the LA-anchored ``Fragment.created`` /
+    ``Fragment.ingested`` defaults but wrong for ``authored_at``,
+    where a bare ``2024-03-15`` should land on March 15, not slip to
+    March 14 17:00 PDT after the LA conversion.
+
+    Accepts ``str``, ``datetime``, ``date``, and ``None`` so callers
+    can hand off raw YAML-parsed values without re-stringifying. A
+    ``date`` is promoted to UTC-midnight on that day; a ``datetime``
+    is returned as-is when tz-aware, or UTC-localised when naive.
+
+    Args:
+        value: Raw value from frontmatter, EXIF, JSON, etc.
+        source_tz: Optional IANA timezone name for naive inputs.
+            Defaults to UTC per the FEAT-031 spec.
+
+    Returns:
+        A tz-aware datetime, or ``None`` when *value* is ``None`` or
+        an empty/whitespace string. Never returns a naive datetime.
+
+    Raises:
+        ValueError: If *value* is a non-empty string that no parser
+            recognises. Caller should ``try/except`` to fall through
+            to the next candidate in its extraction chain rather than
+            propagating a parse failure into the pipeline.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _localize_naive_timestamp(value, source_tz)
+    if isinstance(value, date):  # bare YAML date — promote to midnight in source_tz
+        midnight = datetime(value.year, value.month, value.day)
+        return _localize_naive_timestamp(midnight, source_tz)
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = _parse_timestamp_string(text)
+    return _localize_naive_timestamp(parsed, source_tz)
 
 
 def _parse_timestamp_string(ts_string: str) -> datetime:

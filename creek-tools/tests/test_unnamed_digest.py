@@ -179,13 +179,21 @@ class TestFilterFragmentsInWeek:
     def test_includes_week_start_inclusive(
         self, generator: UnnamedDigestGenerator
     ) -> None:
-        """Fragments created exactly at ``week_start`` are included."""
+        """Fragments created exactly at ``week_start`` are included.
+
+        FEAT-031: ``filter_fragments_in_week`` now buckets via
+        ``effective_authored_date`` (``authored_at`` → ``ingested``);
+        the test mirrors ``created`` into ``ingested`` so the fallback
+        sees the date the test intends.
+        """
         week_start = _week_start()
+        when = datetime.combine(week_start, datetime.min.time(), tzinfo=UTC)
         frag = Fragment(
             id="frag-000000000024",
             title="boundary-low",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
-            created=datetime.combine(week_start, datetime.min.time(), tzinfo=UTC),
+            created=when,
+            ingested=when,
         )
         result = generator.filter_fragments_in_week([frag], week_start)
         assert result == [frag]
@@ -195,26 +203,30 @@ class TestFilterFragmentsInWeek:
     ) -> None:
         """Fragments created on ``week_start + 7`` are excluded."""
         week_start = _week_start()
+        when = datetime.combine(
+            week_start + timedelta(days=7), datetime.min.time(), tzinfo=UTC
+        )
         frag = Fragment(
             id="frag-000000000023",
             title="boundary-high",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
-            created=datetime.combine(
-                week_start + timedelta(days=7), datetime.min.time(), tzinfo=UTC
-            ),
+            created=when,
+            ingested=when,
         )
         assert generator.filter_fragments_in_week([frag], week_start) == []
 
     def test_excludes_previous_week(self, generator: UnnamedDigestGenerator) -> None:
         """Fragments from before the window are excluded."""
         week_start = _week_start()
+        when = datetime.combine(
+            week_start - timedelta(days=1), datetime.min.time(), tzinfo=UTC
+        )
         frag = Fragment(
             id="frag-000000000022",
             title="old",
             source=FragmentSource(platform=SourcePlatform.JOURNAL),
-            created=datetime.combine(
-                week_start - timedelta(days=1), datetime.min.time(), tzinfo=UTC
-            ),
+            created=when,
+            ingested=when,
         )
         assert generator.filter_fragments_in_week([frag], week_start) == []
 

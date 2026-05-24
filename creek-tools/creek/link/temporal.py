@@ -1,9 +1,14 @@
-"""Temporal proximity linker — find fragments created near each other in time.
+"""Temporal proximity linker — find fragments authored near each other in time.
 
 Provides ``TemporalLink`` (a Pydantic model for scored temporal links) and
 ``TemporalLinker`` which groups fragments by configurable time windows,
 identifies cross-source pairs, and scores overlap across multiple
 classification dimensions.
+
+Time-bucketing uses :func:`creek.time.effective_authored_at` (FEAT-031)
+so cross-year synchronicities surface — a 2024 essay and a 2026 chat
+message can be paired because both are anchored to their source-side
+authored dates rather than the vault-write timestamp.
 """
 
 from __future__ import annotations
@@ -12,6 +17,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
+
+from creek.time import effective_authored_at
 
 if TYPE_CHECKING:
     from creek.models import Fragment
@@ -35,6 +42,13 @@ class TemporalLink(BaseModel):
     fragment_a_id: str
     fragment_b_id: str
     time_delta_hours: float
+    """Hours between the fragments' effective authored datetimes (FEAT-031).
+
+    Computed from :func:`creek.time.effective_authored_at` — the
+    ``authored_at`` field when extracted, falling back to ``ingested``.
+    Previously this used ``created`` directly, which conflated
+    source-authored date and filesystem mtime.
+    """
     overlap_score: float
     shared_dimensions: list[str]
 
@@ -129,16 +143,18 @@ class TemporalLinker:
     def find_temporal_links(
         self, fragments: list[Fragment], window_hours: int
     ) -> list[TemporalLink]:
-        """Find fragment pairs created within a time window with thematic overlap.
+        """Find fragment pairs authored within a time window with thematic overlap.
 
-        Fragments are sorted chronologically, then each pair from different
-        sources within the window is scored across frequency, wavelength,
-        mode, emotional texture, and source dimensions.
+        Fragments are sorted by effective authored datetime (FEAT-031:
+        ``authored_at`` when present, ``ingested`` otherwise), then
+        each pair from different sources within the window is scored
+        across frequency, wavelength, mode, emotional texture, and
+        source dimensions.
 
         Args:
             fragments: List of fragments to check for temporal proximity.
-            window_hours: Maximum hours between creation times to consider
-                fragments temporally linked.
+            window_hours: Maximum hours between effective authored
+                datetimes to consider fragments temporally linked.
 
         Returns:
             A list of ``TemporalLink`` objects for each qualifying pair,
@@ -156,12 +172,12 @@ class TemporalLinker:
         if len(fragments) < min_pair_size:
             return []
 
-        sorted_frags = sorted(fragments, key=lambda f: f.created)
+        sorted_frags = sorted(fragments, key=effective_authored_at)
         links: list[TemporalLink] = []
 
         for i, frag_a in enumerate(sorted_frags):
             for frag_b in sorted_frags[i + 1 :]:
-                delta = frag_b.created - frag_a.created
+                delta = effective_authored_at(frag_b) - effective_authored_at(frag_a)
                 delta_hours = delta.total_seconds() / 3600.0
 
                 if delta_hours > window_hours:

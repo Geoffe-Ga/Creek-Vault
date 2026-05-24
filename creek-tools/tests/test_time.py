@@ -8,12 +8,15 @@ These tests pin two facts that earlier code regressed on:
    in LA, so naive↔aware comparisons downstream do not raise.
 3. Host timezone does not change behaviour: setting ``TZ`` to UTC,
    Asia/Tokyo, and America/New_York produces the same answers.
+4. :func:`creek.time.effective_authored_at` codifies the FEAT-031
+   precedence (``authored_at`` → ``ingested``) that every time-bucket
+   surface routes through.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -27,7 +30,13 @@ from creek.models import (
     SourcePlatform,
     Thread,
 )
-from creek.time import LA_TZ, now_la, today_la
+from creek.time import (
+    LA_TZ,
+    effective_authored_at,
+    effective_authored_date,
+    now_la,
+    today_la,
+)
 
 
 def test_now_la_is_tz_aware_in_la() -> None:
@@ -134,6 +143,125 @@ class TestThreadDetectorDefaultNow:
         """Constructing without an explicit ``now`` yields a tz-aware moment."""
         detector = ThreadDetector()
         assert detector._now.tzinfo is not None  # pin internal state
+
+
+class TestEffectiveAuthoredAt:
+    """``effective_authored_at`` pins the FEAT-031 precedence contract."""
+
+    def _frag(
+        self,
+        *,
+        authored_at: datetime | None,
+        ingested: datetime,
+        created: datetime | None = None,
+    ) -> Fragment:
+        """Build a Fragment with the three time fields under test.
+
+        ``created`` defaults to ``ingested`` so the legacy field is
+        irrelevant to the precedence assertions — the helper must
+        consult ``authored_at`` and ``ingested`` only.
+        """
+        return Fragment(
+            id="frag-effective01",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=authored_at,
+            ingested=ingested,
+            created=created if created is not None else ingested,
+        )
+
+    def test_returns_authored_at_when_populated(self) -> None:
+        """Step 1 of the chain: ``authored_at`` wins outright."""
+        authored = datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        frag = self._frag(authored_at=authored, ingested=ingested)
+        assert effective_authored_at(frag) == authored
+
+    def test_falls_back_to_ingested_when_authored_at_none(self) -> None:
+        """Step 2 of the chain: ``ingested`` is the honest fallback."""
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        frag = self._frag(authored_at=None, ingested=ingested)
+        assert effective_authored_at(frag) == ingested
+
+    def test_does_not_consult_created(self) -> None:
+        """``created`` is deliberately not in the fallback chain.
+
+        Historically ``created`` conflated source-authored date and
+        filesystem mtime — bucketing on it produced misleading
+        time-window results. The helper must skip it entirely so a
+        legacy fragment with ``created`` set to filesystem mtime and
+        ``ingested`` set to vault-write time anchors to the latter,
+        not the former.
+        """
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        created_filesystem_mtime = datetime(2024, 1, 1, tzinfo=UTC)
+        frag = self._frag(
+            authored_at=None,
+            ingested=ingested,
+            created=created_filesystem_mtime,
+        )
+        assert effective_authored_at(frag) == ingested
+        assert effective_authored_at(frag) != frag.created
+
+    def test_preserves_timezone_of_authored_at(self) -> None:
+        """``authored_at`` is returned as-is — tz, microseconds, everything.
+
+        The helper must not silently convert to UTC or LA: callers
+        downstream may render the local-time component of the source,
+        and a coercion here would erase that information.
+        """
+        sydney = ZoneInfo("Australia/Sydney")
+        authored = datetime(2024, 3, 15, 8, 30, 45, 123456, tzinfo=sydney)
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        frag = self._frag(authored_at=authored, ingested=ingested)
+        result = effective_authored_at(frag)
+        assert result == authored
+        assert result.tzinfo == sydney
+        assert result.microsecond == 123456
+
+    def test_result_is_always_tz_aware(self) -> None:
+        """Neither branch produces a naive datetime — invariant for downstream.
+
+        Fragment validates that ``ingested`` and ``authored_at`` (when
+        present) are tz-aware via Pydantic's datetime parsing for both
+        defaults and round-tripped YAML values, so this helper inherits
+        the invariant. Pin it here so a future change to the model can't
+        silently break temporal-linker comparisons.
+        """
+        authored = datetime(2024, 3, 15, tzinfo=UTC)
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        with_authored = self._frag(authored_at=authored, ingested=ingested)
+        without_authored = self._frag(authored_at=None, ingested=ingested)
+        assert effective_authored_at(with_authored).tzinfo is not None
+        assert effective_authored_at(without_authored).tzinfo is not None
+
+
+class TestEffectiveAuthoredDate:
+    """``effective_authored_date`` is the date projection of ``authored_at``."""
+
+    def test_returns_authored_date_when_authored_at_present(self) -> None:
+        """Date component of ``authored_at`` wins."""
+        authored = datetime(2024, 3, 15, 23, 45, tzinfo=UTC)
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        frag = Fragment(
+            id="frag-date00001",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=authored,
+            ingested=ingested,
+        )
+        assert effective_authored_date(frag) == authored.date()
+
+    def test_falls_back_to_ingested_date(self) -> None:
+        """Date component of ``ingested`` is the fallback."""
+        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        frag = Fragment(
+            id="frag-date00002",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            ingested=ingested,
+        )
+        assert effective_authored_date(frag) == ingested.date()
 
 
 @pytest.mark.parametrize("tz_env", ["UTC", "Asia/Tokyo", "America/New_York"])

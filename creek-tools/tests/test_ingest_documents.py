@@ -739,3 +739,199 @@ class TestDocumentIngestorIngest:
         for entry in result.provenance:
             assert entry.ingestor_name == "DocumentIngestor"
             assert entry.status == "success"
+
+
+class TestDocumentIngestorAuthoredAtPerFormat:
+    """FEAT-031: each document format extracts ``authored_at`` from its native metadata.
+
+    HTML reads meta tags / JSON-LD, PDF reads ``/CreationDate``, DOCX
+    reads ``dcterms:created``, RTF reads ``\\creatim``. TXT has no
+    embedded date metadata so it must yield ``None``.
+    """
+
+    def _ingest_one(
+        self, doc_ingestor: DocumentIngestor, file_path: Path
+    ) -> ParsedFragment:
+        """Parse one file and return its single ParsedFragment."""
+        docs = doc_ingestor.discover(file_path)
+        assert len(docs) == 1
+        parsed = doc_ingestor.parse(docs[0])
+        assert len(parsed) == 1
+        return parsed[0]
+
+    def test_html_meta_article_published_time(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """``<meta property="article:published_time">`` is the top of the chain."""
+        from datetime import UTC
+
+        html_file = tmp_path / "post.html"
+        html_file.write_text(
+            "<html><head>"
+            '<meta property="article:published_time" '
+            'content="2024-03-15T08:30:00Z">'
+            '<meta name="date" content="2025-01-01">'
+            "</head><body><p>Hi</p></body></html>",
+            encoding="utf-8",
+        )
+        parsed = self._ingest_one(doc_ingestor, html_file)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+
+    def test_html_dc_date_fallback(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """No article:published_time / OG → Dublin Core wins next."""
+        from datetime import UTC
+
+        html_file = tmp_path / "post.html"
+        html_file.write_text(
+            "<html><head>"
+            '<meta name="DC.date.issued" content="2024-04-01">'
+            "</head><body><p>Hi</p></body></html>",
+            encoding="utf-8",
+        )
+        parsed = self._ingest_one(doc_ingestor, html_file)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 4, 1, tzinfo=UTC)
+
+    def test_html_json_ld_date_published(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """JSON-LD ``datePublished`` is the final HTML fallback."""
+        from datetime import UTC
+
+        html_file = tmp_path / "post.html"
+        html_file.write_text(
+            "<html><head>"
+            '<script type="application/ld+json">'
+            '{"@type": "Article", "datePublished": "2024-05-15"}'
+            "</script></head><body><p>Hi</p></body></html>",
+            encoding="utf-8",
+        )
+        parsed = self._ingest_one(doc_ingestor, html_file)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 5, 15, tzinfo=UTC)
+
+    def test_html_no_metadata_yields_none(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """HTML with no date metadata → ``authored_at`` is ``None``."""
+        html_file = tmp_path / "post.html"
+        html_file.write_text(
+            "<html><body><h1>Just a page</h1></body></html>",
+            encoding="utf-8",
+        )
+        parsed = self._ingest_one(doc_ingestor, html_file)
+        assert parsed.metadata["authored_at"] is None
+
+    def test_txt_files_always_yield_none(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """TXT files carry no embedded date metadata → ``None``."""
+        txt = tmp_path / "notes.txt"
+        txt.write_text("Hello\nWorld\n", encoding="utf-8")
+        parsed = self._ingest_one(doc_ingestor, txt)
+        assert parsed.metadata["authored_at"] is None
+
+    def test_docx_authored_at_from_dcterms_created(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """A real DOCX's core ``dcterms:created`` lands on ``authored_at``."""
+        from datetime import UTC
+
+        from docx import Document as DocxDocument
+
+        docx_path = tmp_path / "report.docx"
+        doc = DocxDocument()
+        doc.add_paragraph("Hello.")
+        doc.core_properties.created = datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+        doc.save(docx_path)
+        parsed = self._ingest_one(doc_ingestor, docx_path)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        # python-docx strips tz on round-trip; we just need the date.
+        assert authored.date() == datetime(2024, 3, 15).date()
+
+    def test_rtf_authored_at_from_creatim(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """RTF ``\\creatim`` control word is parsed into ``authored_at``."""
+        from datetime import UTC
+
+        rtf_path = tmp_path / "doc.rtf"
+        rtf_path.write_text(
+            "{\\rtf1\\ansi"
+            "{\\info"
+            "{\\creatim\\yr2024\\mo3\\dy15\\hr8\\min30\\sec0}"
+            "{\\revtim\\yr2024\\mo4\\dy1\\hr9\\min0\\sec0}"
+            "}"
+            "Body text.}",
+            encoding="ascii",
+        )
+        parsed = self._ingest_one(doc_ingestor, rtf_path)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 3, 15, 8, 30, tzinfo=UTC)
+
+    def test_rtf_falls_back_to_revtim(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """No ``\\creatim`` → ``\\revtim`` is the next candidate."""
+        from datetime import UTC
+
+        rtf_path = tmp_path / "doc.rtf"
+        rtf_path.write_text(
+            "{\\rtf1\\ansi"
+            "{\\info"
+            "{\\revtim\\yr2024\\mo4\\dy1\\hr9\\min0\\sec0}"
+            "}"
+            "Body text.}",
+            encoding="ascii",
+        )
+        parsed = self._ingest_one(doc_ingestor, rtf_path)
+        authored = parsed.metadata["authored_at"]
+        assert authored is not None
+        assert authored == datetime(2024, 4, 1, 9, 0, tzinfo=UTC)
+
+    def test_rtf_no_dates_yields_none(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """An RTF with no date control words → ``None``."""
+        rtf_path = tmp_path / "doc.rtf"
+        rtf_path.write_text(
+            "{\\rtf1\\ansi Body text.}",
+            encoding="ascii",
+        )
+        parsed = self._ingest_one(doc_ingestor, rtf_path)
+        assert parsed.metadata["authored_at"] is None
+
+    def test_authored_at_lands_in_generated_frontmatter(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """When extracted, ``authored_at`` is an ISO string in frontmatter."""
+        html_file = tmp_path / "post.html"
+        html_file.write_text(
+            "<html><head>"
+            '<meta property="article:published_time" '
+            'content="2024-03-15T08:30:00Z">'
+            "</head><body><p>Hi</p></body></html>",
+            encoding="utf-8",
+        )
+        parsed = self._ingest_one(doc_ingestor, html_file)
+        fm = doc_ingestor.generate_frontmatter(parsed)
+        assert "authored_at" in fm
+        assert fm["authored_at"].startswith("2024-03-15")
+
+    def test_no_authored_at_omits_key_from_frontmatter(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """``None`` ``authored_at`` is absent from the frontmatter dict."""
+        txt = tmp_path / "notes.txt"
+        txt.write_text("Hello\n", encoding="utf-8")
+        parsed = self._ingest_one(doc_ingestor, txt)
+        fm = doc_ingestor.generate_frontmatter(parsed)
+        assert "authored_at" not in fm
