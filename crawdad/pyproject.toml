@@ -16,6 +16,7 @@ dependencies = [
     "anthropic>=0.40.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
+    "filetype>=1.2.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -101,6 +102,16 @@ disallow_any_unimported = false
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
+
+# FEAT-035: ``filetype`` is a small pure-Python magic-byte sniffer that
+# does not ship a ``py.typed`` marker. The ADR documents why we picked
+# it over ``python-magic`` (no libmagic system dep, fewer moving parts);
+# the trade-off is that we cannot get static types from the upstream
+# package. We use it from a single call site (``verify_mime_type``)
+# behind a typed dataclass, so the missing-stubs surface is contained.
+[[tool.mypy.overrides]]
+module = "filetype"
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 88

@@ -1,4 +1,4 @@
-"""Tests for ``crawdad.attachments`` (FEAT-027).
+"""Tests for ``crawdad.attachments`` (FEAT-027 + FEAT-035).
 
 Covers the acceptance-criteria scenarios:
 
@@ -11,6 +11,16 @@ Covers the acceptance-criteria scenarios:
 - Filename sanitisation refuses path traversal.
 - Inferred ingestor type for known + unknown extensions.
 - Summary formatting renders relative paths.
+
+FEAT-035 adds:
+
+- Matched binary content (PDF / PNG bytes under ``.pdf`` / ``.png`` ext).
+- Matched text content (plain ASCII under ``.md`` / ``.txt``).
+- Mismatched binary (ZIP bytes under ``.pdf`` — the polyglot case).
+- Mismatched text (PE/ELF/NUL bytes under ``.md`` — disguised executable).
+- Unknown extension (``.xyz`` — no verifier, status="unknown").
+- ``reject_on_mime_mismatch=True`` flips soft warning into hard reject.
+- Summary surfaces the mismatch warning line for accepted-but-suspect files.
 """
 
 from __future__ import annotations
@@ -22,6 +32,7 @@ import pytest
 
 from crawdad.attachments import (
     AcceptedAttachment,
+    MimeVerification,
     ProcessedAttachments,
     RejectedAttachment,
     format_attachment_summary,
@@ -29,6 +40,7 @@ from crawdad.attachments import (
     process_attachments,
     sanitize_filename,
     staging_dir_for,
+    verify_mime_type,
 )
 from crawdad.config import AttachmentConfig
 
@@ -480,3 +492,357 @@ def test_format_attachment_summary_outside_vault_renders_absolute(
     processed = ProcessedAttachments(staging_dir=elsewhere, accepted=(), rejected=())
     summary = format_attachment_summary(processed, vault_path=tmp_path)
     assert str(elsewhere) in summary
+
+
+# ---------------------------------------------------------------------------
+# FEAT-035: MIME-type / magic-byte verification
+# ---------------------------------------------------------------------------
+
+# Real PDF, PNG, JPEG, GIF magic bytes — the verifier hands these straight
+# to ``filetype.guess`` so the constants need to match the canonical file
+# headers, not just look-alikes.
+_PDF_HEADER = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+_PNG_HEADER = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_JPEG_HEADER = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01"
+_GIF_HEADER = b"GIF89a" + b"\x00" * 16
+_ZIP_HEADER = b"PK\x03\x04\x14\x00\x06\x00" + b"\x00" * 16
+_PE_HEADER = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00"
+
+
+def test_verify_mime_type_matched_pdf_signature_returns_match() -> None:
+    """A real PDF header under a ``.pdf`` extension verifies as ``match``."""
+    result = verify_mime_type("doc.pdf", _PDF_HEADER + b"rest of body")
+    assert result.status == "match"
+    assert result.detected_mime == "application/pdf"
+    assert result.expected_mime == "application/pdf"
+    assert result.is_mismatch is False
+
+
+def test_verify_mime_type_matched_png_signature_returns_match() -> None:
+    """A real PNG header under a ``.png`` extension verifies as ``match``."""
+    result = verify_mime_type("photo.PNG", _PNG_HEADER)
+    assert result.status == "match"
+    assert result.detected_mime == "image/png"
+
+
+def test_verify_mime_type_matched_text_sample_returns_match() -> None:
+    """Plain UTF-8 text under a ``.md`` extension passes the text sample check.
+
+    The reported MIME is per-extension (``text/markdown`` for ``.md``,
+    ``application/json`` for ``.json``, etc.) so the user-facing summary
+    does not lie about format identity when a match surfaces.
+    """
+    result = verify_mime_type("notes.md", b"# Hello\n\nSome notes.\n")
+    assert result.status == "match"
+    assert result.detected_mime == "text/markdown"
+
+
+def test_verify_mime_type_text_match_uses_per_extension_mime() -> None:
+    """``.json`` / ``.html`` / ``.csv`` matches report their specific MIMEs."""
+    json_result = verify_mime_type("config.json", b'{"key": "value"}\n')
+    assert json_result.status == "match"
+    assert json_result.detected_mime == "application/json"
+
+    html_result = verify_mime_type("page.html", b"<!doctype html><p>hi</p>\n")
+    assert html_result.status == "match"
+    assert html_result.detected_mime == "text/html"
+
+    csv_result = verify_mime_type("data.csv", b"a,b,c\n1,2,3\n")
+    assert csv_result.status == "match"
+    assert csv_result.detected_mime == "text/csv"
+
+
+def test_verify_mime_type_zip_disguised_as_pdf_is_mismatch() -> None:
+    """The polyglot case: ZIP bytes claimed as a PDF flag as ``mismatch``.
+
+    This is the canonical FEAT-035 scenario — a ``.pdf`` filename with
+    a zip container body. The verifier reports the detected MIME so the
+    user-facing summary can name the actual format.
+    """
+    result = verify_mime_type("invoice.pdf", _ZIP_HEADER)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/zip"
+    assert result.expected_mime == "application/pdf"
+    assert result.is_mismatch is True
+
+
+def test_verify_mime_type_executable_disguised_as_markdown_is_mismatch() -> None:
+    """A PE / EXE header renamed to ``.md`` trips the NUL-byte heuristic."""
+    result = verify_mime_type("evil.md", _PE_HEADER + b"\x00" * 100)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/markdown"
+
+
+def test_verify_mime_type_invalid_utf8_under_text_extension_is_mismatch() -> None:
+    """Garbage bytes that aren't valid UTF-8 flag a mismatch under .txt."""
+    invalid_utf8 = b"\xff\xfe\xfd\xfc" * 50
+    result = verify_mime_type("garbled.txt", invalid_utf8)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_unknown_extension_returns_unknown_status() -> None:
+    """An extension outside both tables can't be verified — status=unknown."""
+    result = verify_mime_type("weird.xyz", b"any bytes here")
+    assert result.status == "unknown"
+    assert result.detected_mime is None
+    assert result.expected_mime is None
+    assert result.is_mismatch is False
+
+
+def test_verify_mime_type_unrecognised_signature_under_binary_ext_mismatches() -> None:
+    """A binary extension whose body has no matching magic bytes is a mismatch.
+
+    ``filetype.guess`` returns ``None`` when no signature matches. The
+    verifier treats that as a mismatch under a binary extension so the
+    summary still surfaces the discrepancy.
+    """
+    result = verify_mime_type("photo.png", b"random non-PNG content here")
+    assert result.status == "mismatch"
+    assert result.detected_mime is None
+    assert result.expected_mime == "image/png"
+
+
+def test_verify_mime_type_docx_zip_is_match() -> None:
+    """A real DOCX (which is a ZIP container) verifies as ``match`` under .docx."""
+    result = verify_mime_type("report.docx", _ZIP_HEADER)
+    assert result.status == "match"
+    # The library may report either the canonical OOXML MIME or the
+    # generic ZIP MIME depending on signature depth — both are acceptable.
+    assert result.detected_mime in {
+        "application/zip",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+
+
+async def test_process_attachment_with_matching_mime_lands_with_match_status(
+    tmp_path: Path, attachment_config: AttachmentConfig
+) -> None:
+    """A well-formed PDF lands in staging with mime_verification.status='match'."""
+    attachment = _FakeAttachment(
+        filename="contract.pdf",
+        size=len(_PDF_HEADER),
+        payload=_PDF_HEADER,
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=attachment_config,
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].mime_verification.status == "match"
+    assert result.accepted[0].staged_path.exists()
+
+
+async def test_process_attachment_with_mismatched_mime_still_stages_by_default(
+    tmp_path: Path, attachment_config: AttachmentConfig
+) -> None:
+    """Soft-warning mode: a polyglot still lands, but carries the mismatch flag.
+
+    Default config has ``reject_on_mime_mismatch=False`` — the bot
+    surfaces the warning in the Discord reply and keeps the file staged
+    so the user-consent gate stays the authoritative refusal point.
+    """
+    attachment = _FakeAttachment(
+        filename="invoice.pdf",
+        size=len(_ZIP_HEADER),
+        payload=_ZIP_HEADER,
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=attachment_config,
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].mime_verification.is_mismatch is True
+    assert result.accepted[0].mime_verification.detected_mime == "application/zip"
+    # File still lands on disk — soft warning, not hard reject.
+    assert result.accepted[0].staged_path.exists()
+
+
+async def test_process_attachment_with_mismatched_mime_rejected_when_configured(
+    tmp_path: Path,
+) -> None:
+    """``reject_on_mime_mismatch=True`` hard-rejects polyglots at the gate."""
+    config = AttachmentConfig(reject_on_mime_mismatch=True)
+    attachment = _FakeAttachment(
+        filename="invoice.pdf",
+        size=len(_ZIP_HEADER),
+        payload=_ZIP_HEADER,
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=config,
+    )
+    assert result.accepted == ()
+    assert len(result.rejected) == 1
+    assert "MIME mismatch" in result.rejected[0].reason
+    assert "application/pdf" in result.rejected[0].reason
+    assert "application/zip" in result.rejected[0].reason
+    # The polyglot never landed on disk in reject mode.
+    staged = tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2" / "invoice.pdf"
+    assert not staged.exists()
+
+
+async def test_process_attachment_text_polyglot_rejected_when_configured(
+    tmp_path: Path,
+) -> None:
+    """An EXE-disguised-as-markdown polyglot is rejected when reject mode is on."""
+    config = AttachmentConfig(reject_on_mime_mismatch=True)
+    attachment = _FakeAttachment(
+        filename="evil.md",
+        size=64,
+        payload=_PE_HEADER + b"\x00" * 48,
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=config,
+    )
+    assert result.accepted == ()
+    assert len(result.rejected) == 1
+    assert "MIME mismatch" in result.rejected[0].reason
+
+
+async def test_process_attachment_unknown_extension_still_accepts(
+    tmp_path: Path,
+) -> None:
+    """Unknown extension types accept silently — no verifier, no warning.
+
+    ``reject_on_mime_mismatch`` only fires on detected mismatches; an
+    ``unknown`` verification status is treated as "no information" and
+    must not trigger rejection (otherwise the knob would secretly
+    narrow the allow list). The fixture explicitly allow-lists
+    ``.toml`` so the test pins the MIME-gate behaviour — not the
+    extension-gate behaviour (covered by
+    :func:`test_empty_allowed_extensions_passes_anything_not_denied`).
+    """
+    config = AttachmentConfig(
+        allowed_extensions=frozenset({".toml"}),
+        reject_on_mime_mismatch=True,
+    )
+    attachment = _FakeAttachment(
+        filename="config.toml",
+        size=8,
+        payload=b"key = 1\n",
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=config,
+    )
+    assert len(result.accepted) == 1
+    assert result.accepted[0].mime_verification.status == "unknown"
+
+
+def test_format_attachment_summary_surfaces_mime_mismatch_warning(
+    tmp_path: Path,
+) -> None:
+    """A mismatch flag on an accepted file shows up as a ⚠ line in the summary."""
+    staging = tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2"
+    accepted = AcceptedAttachment(
+        filename="invoice.pdf",
+        original_filename="invoice.pdf",
+        size=128,
+        staged_path=staging / "invoice.pdf",
+        content_hash="a" * 64,
+        inferred_type="document",
+        already_present=False,
+        mime_verification=MimeVerification(
+            status="mismatch",
+            detected_mime="application/zip",
+            expected_mime="application/pdf",
+        ),
+    )
+    processed = ProcessedAttachments(
+        staging_dir=staging,
+        accepted=(accepted,),
+        rejected=(),
+    )
+    summary = format_attachment_summary(processed, vault_path=tmp_path)
+    assert "⚠ MIME mismatch" in summary
+    assert "application/zip" in summary
+    assert "application/pdf" in summary
+
+
+def test_format_attachment_summary_hides_warning_when_mime_matches(
+    tmp_path: Path,
+) -> None:
+    """A match (or unknown) verification adds no warning line — no false noise."""
+    staging = tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2"
+    accepted = AcceptedAttachment(
+        filename="contract.pdf",
+        original_filename="contract.pdf",
+        size=128,
+        staged_path=staging / "contract.pdf",
+        content_hash="a" * 64,
+        inferred_type="document",
+        already_present=False,
+        mime_verification=MimeVerification(
+            status="match",
+            detected_mime="application/pdf",
+            expected_mime="application/pdf",
+        ),
+    )
+    processed = ProcessedAttachments(
+        staging_dir=staging,
+        accepted=(accepted,),
+        rejected=(),
+    )
+    summary = format_attachment_summary(processed, vault_path=tmp_path)
+    assert "⚠" not in summary
+    assert "MIME mismatch" not in summary
+
+
+def test_attachment_config_reject_on_mime_mismatch_defaults_false() -> None:
+    """The knob defaults to soft-warning mode so the v1 consent gate is unchanged."""
+    config = AttachmentConfig()
+    assert config.reject_on_mime_mismatch is False
+
+
+def test_extension_mime_specs_canonical_is_member_of_acceptable() -> None:
+    """Structural integrity: every spec's ``canonical`` MIME is also acceptable.
+
+    Guards against a future contributor adding an entry where the
+    user-facing ``canonical`` label drifts away from the membership
+    set used to decide ``match`` vs ``mismatch`` — a real file of the
+    right type would otherwise be flagged as a mismatch against its
+    own canonical name.
+    """
+    from crawdad.attachments import _EXTENSION_MIME_SPECS
+
+    for suffix, spec in _EXTENSION_MIME_SPECS.items():
+        assert spec.canonical in spec.acceptable, (
+            f"{suffix}: canonical {spec.canonical!r} missing from "
+            f"acceptable set {sorted(spec.acceptable)!r}"
+        )
+
+
+def test_attachment_config_default_allowed_extensions_omits_legacy_office() -> None:
+    """FEAT-035 narrows the default allow list to verifiable extensions only.
+
+    Legacy Office formats (``.doc`` / ``.xls`` / ``.ppt``) are not in
+    :data:`crawdad.attachments._EXTENSION_TO_ACCEPTABLE_MIMES` because
+    ``filetype`` does not reliably detect OLE compound documents, so
+    they no longer ship in the default allow list. Operators who need
+    them can re-add the extensions explicitly in ``crawdad.yaml``.
+    """
+    config = AttachmentConfig()
+    for legacy in (".doc", ".xls", ".ppt"):
+        assert legacy not in config.allowed_extensions
+    # The verifiable types are still allowed by default.
+    for verifiable in (".pdf", ".docx", ".xlsx", ".pptx", ".png", ".md"):
+        assert verifiable in config.allowed_extensions
