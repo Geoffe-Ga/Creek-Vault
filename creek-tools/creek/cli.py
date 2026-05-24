@@ -542,6 +542,17 @@ def ingest(
         "-y",
         help="Skip the consent prompt for first-time sources (logged).",
     ),
+    refresh_dates: bool = typer.Option(
+        False,
+        "--refresh-dates",
+        help=(
+            "One-shot ``authored_at`` backfill (FEAT-031 / #263). "
+            "Walks the vault, re-runs each ingestor's date-extraction "
+            "step against the original source file, and writes back. "
+            "Body content is preserved. Idempotent — a second run is "
+            "a no-op when no source dates have changed."
+        ),
+    ),
 ) -> None:
     """Ingest a specific source type into the vault.
 
@@ -551,13 +562,24 @@ def ingest(
     :class:`~creek.vault.writer.VaultWriter`. Re-running against the same
     input is idempotent: deterministic fragment IDs ensure existing
     files are recognised and skipped.
+
+    Passing ``--refresh-dates`` bypasses normal ingestion entirely and
+    instead walks the existing vault to backfill
+    :attr:`creek.models.Fragment.authored_at` from each source file's
+    in-band date. ``--type`` and ``--input`` are not required in that
+    mode; only ``--vault`` (or the configured default) is used.
     """
+    config = load_config()
+    vault_path = vault or config.vault_path
+
+    if refresh_dates:
+        _run_refresh_dates(vault_path)
+        return
+
     if type is None or input is None:
         console.print("[red]--type and --input are required.[/red]")
         raise typer.Exit(code=2)
 
-    config = load_config()
-    vault_path = vault or config.vault_path
     ingestor_cls = _resolve_ingestor(type)
 
     if not input.exists():
@@ -583,6 +605,24 @@ def ingest(
         console.print(f"[yellow]Errors: {len(errors)}[/yellow]")
         for err in errors:
             console.print(f"  [dim]{err}[/dim]")
+
+
+def _run_refresh_dates(vault_path: Path) -> None:
+    """Execute the ``--refresh-dates`` backfill and print a summary line."""
+    from creek.ingest.refresh import refresh_vault_authored_at
+
+    if not vault_path.exists():
+        console.print(f"[red]Vault path not found: {vault_path}[/red]")
+        raise typer.Exit(code=2)
+    summary = refresh_vault_authored_at(vault_path)
+    console.print(
+        f"[bold green]Refreshed authored_at on {summary.updated} fragment(s)."
+        f"[/bold green]"
+    )
+    console.print(
+        f"[dim]Inspected {summary.total}; unchanged {summary.unchanged}; "
+        f"missing source {summary.missing_source}; errors {summary.errors}.[/dim]"
+    )
 
 
 def _dispatch_redact(
