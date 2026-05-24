@@ -1557,6 +1557,42 @@ def _write_seed_fragment(
     )
 
 
+def test_aptitude_labels_cover_every_frequency_name() -> None:
+    """Each ``FREQUENCY_NAMES`` part has a matching ``--seed-frequency`` label.
+
+    Regression guard against drift between the canonical ontology source
+    (``creek.generate.indexes.FREQUENCY_NAMES``) and the CLI label map.
+    """
+    from creek.cli import _aptitude_frequency_labels
+    from creek.generate.indexes import FREQUENCY_NAMES
+
+    labels = _aptitude_frequency_labels()
+    for freq, name in FREQUENCY_NAMES.items():
+        for part in name.split("/"):
+            normalized = part.strip().lower()
+            assert labels.get(normalized) == freq.value, (
+                f"missing alias '{normalized}' -> {freq.value}"
+            )
+
+
+def test_draft_seed_empty_topic_falls_back_to_mining(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-topic ''`` is a no-op; mining behaviour is preserved."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-topic", ""],
+    )
+    assert result.exit_code == 0
+    assert "No idea seeds surfaced" in result.output
+
+
 def test_draft_seed_flags_advertised_in_help() -> None:
     """``creek draft --help`` documents every FEAT-032 seed flag."""
     result = runner.invoke(app, ["draft", "--help"])

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -1600,37 +1601,30 @@ def _read_voice_core(path: Path | None) -> str:
         raise typer.Exit(code=2) from exc
 
 
-_APTITUDE_FREQUENCY_LABELS: dict[str, str] = {
-    "agency": "F1",
-    "survival": "F1",
-    "receptivity": "F2",
-    "kinship": "F2",
-    "self-love": "F3",
-    "self_love": "F3",
-    "selflove": "F3",
-    "power": "F3",
-    "community-love": "F4",
-    "community_love": "F4",
-    "conformity": "F4",
-    "achievism": "F5",
-    "innovation": "F5",
-    "pluralism": "F6",
-    "empathy": "F6",
-    "integration": "F7",
-    "systems": "F7",
-    "true-self": "F8",
-    "true_self": "F8",
-    "transcendence": "F8",
-    "unity": "F9",
-    "cosmic": "F9",
-    "emptiness": "F10",
-    "impermanence": "F10",
-}
-"""FEAT-032: APTITUDE labels accepted by ``--seed-frequency`` (case-insensitive).
+@functools.cache
+def _aptitude_frequency_labels() -> dict[str, str]:
+    """Return ``{label: Frequency.value}`` derived from ``FREQUENCY_NAMES``.
 
-Mirrors :data:`creek.generate.indexes.FREQUENCY_NAMES` so the labels
-stay aligned with the canonical UI strings.
-"""
+    Each entry in :data:`creek.generate.indexes.FREQUENCY_NAMES` is a
+    slash-separated pair (e.g. ``"Self-Love/Power"``); this helper
+    splits, lowercases, and registers each half plus hyphen /
+    underscore / no-separator variants so the CLI accepts every
+    canonical UI label without a hand-maintained duplicate. Lazily
+    computed and cached so the import graph stays shallow at CLI
+    cold-start. The returned dict is module-private; callers should
+    treat it as read-only.
+    """
+    from creek.generate.indexes import FREQUENCY_NAMES
+
+    labels: dict[str, str] = {}
+    for freq, name in FREQUENCY_NAMES.items():
+        for part in name.split("/"):
+            normalised = part.strip().lower()
+            labels[normalised] = freq.value
+            if "-" in normalised:
+                labels[normalised.replace("-", "_")] = freq.value
+                labels[normalised.replace("-", "")] = freq.value
+    return labels
 
 
 def _parse_seed_frequency(value: str | None) -> tuple[Frequency, ...]:
@@ -1645,14 +1639,15 @@ def _parse_seed_frequency(value: str | None) -> tuple[Frequency, ...]:
 
     if value is None:
         return ()
+    aliases = _aptitude_frequency_labels()
     normalised = value.strip().lower().replace(" ", "")
-    canonical = _APTITUDE_FREQUENCY_LABELS.get(normalised)
+    canonical = aliases.get(normalised)
     raw = canonical if canonical is not None else value.strip().upper()
     try:
         return (Frequency(raw),)
     except ValueError as exc:
         codes = ", ".join(f.value for f in Frequency if f != Frequency.UNCLASSIFIED)
-        labels = ", ".join(sorted(set(_APTITUDE_FREQUENCY_LABELS)))
+        labels = ", ".join(sorted(aliases))
         console.print(
             f"[red]Unknown --seed-frequency {value!r}. "
             f"Valid codes: {codes}. "

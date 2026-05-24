@@ -874,6 +874,20 @@ class TestSeedSpec:
         with pytest.raises(ValueError, match="mutually exclusive"):
             SeedSpec(fragment_id="frag-A", modes=(Mode.INHABIT,))
 
+    def test_empty_topic_is_normalised_to_none(self) -> None:
+        """An empty / whitespace-only ``topic`` is treated as unset."""
+        assert SeedSpec(topic="").topic is None
+        assert SeedSpec(topic="   ").topic is None
+        assert SeedSpec(topic="").is_empty is True
+        assert SeedSpec(topic="\t\n").is_empty is True
+
+    def test_whitespace_topic_with_filter_keeps_filter(self) -> None:
+        """A whitespace topic alongside a real filter is silently dropped."""
+        spec = SeedSpec(topic=" ", frequencies=(Frequency.F1,))
+        assert spec.topic is None
+        assert spec.frequencies == (Frequency.F1,)
+        assert spec.is_empty is False
+
 
 class TestResolveSeedFragment:
     """``resolve_seed`` with ``--seed-fragment`` yields a single-source IdeaSeed."""
@@ -1084,6 +1098,27 @@ class TestResolveSeedDimensional:
         idea = gen.resolve_seed(SeedSpec(topic="belonging"), vault_path=vault)
         assert idea.source_fragments == ("frag-B",)
         assert idea.title == "belonging"
+
+    def test_topic_matching_is_case_insensitive_across_body(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Mixed-case body text still matches a lowercase topic needle."""
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", title="Untitled"),
+            "Belonging is the name of the longing we carry.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-B", title="UNRELATED"),
+            "Nothing matching here.",
+        )
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        idea = gen.resolve_seed(SeedSpec(topic="belonging"), vault_path=vault)
+        assert idea.source_fragments == ("frag-A",)
 
     def test_dimensional_only_title_describes_corner(
         self,

@@ -56,7 +56,7 @@ from creek.models import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from creek.generate.mining import IdeaSeed, MiningStrategy
+    from creek.generate.mining import IdeaSeed
 
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,12 @@ class SeedSpec:
     modes: tuple[Mode, ...] = ()
 
     def __post_init__(self) -> None:
-        """Enforce the FEAT-032 mutual-exclusion rule on ``fragment_id``."""
+        """Normalise empty topics, then enforce the ``fragment_id`` rule."""
+        if self.topic is not None and not self.topic.strip():
+            # Whitespace-only topics produce confusing zero-match errors
+            # downstream; collapse them to ``None`` so the spec is honestly
+            # empty. ``object.__setattr__`` is required on a frozen dataclass.
+            object.__setattr__(self, "topic", None)
         if self.fragment_id is None:
             return
         conflicts = [
@@ -772,8 +777,6 @@ class DraftGenerator:
                 ``fragment_id`` is not in the vault, or the dimensional
                 / topic filters match zero fragments.
         """
-        from creek.generate.mining import IdeaSeed, MiningStrategy
-
         if spec.is_empty:
             msg = "SeedSpec is empty — cannot resolve an idea seed"
             raise SeedResolutionError(msg)
@@ -788,7 +791,7 @@ class DraftGenerator:
         )
 
         if spec.fragment_id is not None:
-            return self._seed_from_fragment_id(spec, loaded, IdeaSeed)
+            return self._seed_from_fragment_id(spec.fragment_id, loaded)
 
         matched = self._matching_fragments(spec, loaded)
         if not matched:
@@ -801,19 +804,16 @@ class DraftGenerator:
             )
             raise SeedResolutionError(msg)
 
-        return self._seed_from_matches(spec, matched, IdeaSeed, MiningStrategy)
+        return self._seed_from_matches(spec, matched)
 
     def _seed_from_fragment_id(
         self,
-        spec: SeedSpec,
+        fragment_id: str,
         loaded: dict[str, tuple[Fragment, str]],
-        idea_cls: type[IdeaSeed],
     ) -> IdeaSeed:
         """Resolve a single ``--seed-fragment`` request to an IdeaSeed."""
-        from creek.generate.mining import MiningStrategy
+        from creek.generate.mining import IdeaSeed, MiningStrategy
 
-        fragment_id = spec.fragment_id
-        assert fragment_id is not None  # nosec B101  # callers ensure this
         if fragment_id not in loaded:
             msg = (
                 f"--seed-fragment {fragment_id!r} not found in vault "
@@ -821,11 +821,14 @@ class DraftGenerator:
             )
             raise SeedResolutionError(msg)
         fragment, _body = loaded[fragment_id]
+        # ``use_enum_values=True`` persists each enum as its ``.value`` —
+        # a bare string on disk — so coerce back via ``Frequency(str(...))``
+        # before comparing against ``Frequency.UNCLASSIFIED``.
         primary = Frequency(str(fragment.frequency.primary))
         frequencies: tuple[Frequency, ...] = (
             (primary,) if primary != Frequency.UNCLASSIFIED else ()
         )
-        return idea_cls(
+        return IdeaSeed(
             strategy=MiningStrategy.RESONANCE_CHAIN,
             title=fragment.title,
             source_fragments=(fragment_id,),
@@ -864,16 +867,16 @@ class DraftGenerator:
         self,
         spec: SeedSpec,
         matched: list[tuple[Fragment, str]],
-        idea_cls: type[IdeaSeed],
-        mining_strategy_cls: type[MiningStrategy],
     ) -> IdeaSeed:
         """Synthesise an IdeaSeed from a non-empty *matched* fragment list."""
+        from creek.generate.mining import IdeaSeed, MiningStrategy
+
         fragments = [fragment for fragment, _ in matched]
         thread_ids, eddy_ids = _union_thread_and_eddy_ids(fragments)
         frequencies = spec.frequencies or _union_primary_frequencies(fragments)
         title, description = _seed_title_and_description(spec)
-        return idea_cls(
-            strategy=mining_strategy_cls.RESONANCE_CHAIN,
+        return IdeaSeed(
+            strategy=MiningStrategy.RESONANCE_CHAIN,
             title=title,
             source_fragments=tuple(fragment.id for fragment in fragments),
             threads=thread_ids,
@@ -1013,6 +1016,8 @@ def _union_primary_frequencies(fragments: list[Fragment]) -> tuple[Frequency, ..
     """Return the ordered set of classified primary frequencies in *fragments*."""
     seen: list[Frequency] = []
     for fragment in fragments:
+        # ``use_enum_values=True`` stores each enum as its ``.value`` on
+        # disk; coerce back so equality / membership checks behave.
         primary = Frequency(str(fragment.frequency.primary))
         if primary == Frequency.UNCLASSIFIED:
             continue
