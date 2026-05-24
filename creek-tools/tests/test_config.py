@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from creek.config import (
+    CONFIG_PATH_ENV_VAR,
     ChatbotCleaningConfig,
     ClassificationConfig,
     CleaningConfig,
@@ -512,6 +513,79 @@ class TestLoadConfig:
         # Unspecified sub-configs keep defaults
         assert cfg.cleaning.chatbot.filter_system_prompts is True
         assert cfg.cleaning.hygiene.staleness_days == 90
+
+
+class TestLoadConfigEnvVar:
+    """Tests for the ``CREEK_CONFIG`` env-var discovery path (INC-008)."""
+
+    def test_uses_creek_config_env_var(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """``CREEK_CONFIG`` is honoured when ``config_path`` is None."""
+        config_file = tmp_path / "vault-config.yaml"
+        config_file.write_text(yaml.dump({"timezone": "UTC"}))
+        monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(config_file))
+        # Ensure cwd has no fallback creek_config.yaml that could mask the env var.
+        monkeypatch.chdir(tmp_path)
+
+        cfg = load_config()
+        assert cfg.timezone == "UTC"
+
+    def test_explicit_config_path_overrides_env_var(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """An explicit ``config_path`` argument wins over the env var."""
+        env_file = tmp_path / "from-env.yaml"
+        env_file.write_text(yaml.dump({"timezone": "UTC"}))
+        cli_file = tmp_path / "from-cli.yaml"
+        cli_file.write_text(yaml.dump({"timezone": "Europe/London"}))
+        monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(env_file))
+
+        cfg = load_config(cli_file)
+        assert cfg.timezone == "Europe/London"
+
+    def test_env_var_pointing_to_missing_file_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A missing ``CREEK_CONFIG`` target raises rather than falling back."""
+        missing = tmp_path / "does-not-exist.yaml"
+        monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(missing))
+
+        with pytest.raises(FileNotFoundError, match=CONFIG_PATH_ENV_VAR):
+            load_config()
+
+    def test_empty_env_var_falls_through_to_cwd_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """An empty (or whitespace) env var behaves as if unset."""
+        monkeypatch.setenv(CONFIG_PATH_ENV_VAR, "   ")
+        monkeypatch.chdir(tmp_path)
+
+        cfg = load_config()
+        # No creek_config.yaml in tmp_path → defaults populated.
+        assert cfg.timezone == "America/Los_Angeles"
+
+    def test_unset_env_var_uses_cwd_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """When the env var is unset, behaviour matches the historical contract."""
+        monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"timezone": "Asia/Tokyo"}))
+        monkeypatch.chdir(tmp_path)
+
+        cfg = load_config()
+        assert cfg.timezone == "Asia/Tokyo"
 
 
 # ---------------------------------------------------------------------------

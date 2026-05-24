@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -295,5 +296,77 @@ def test_main_invokes_server_run(monkeypatch: pytest.MonkeyPatch) -> None:
             runs.append((transport,))
 
     monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
-    server_module.main()
+    server_module.main([])
     assert runs == [("stdio",)]
+
+
+def test_main_config_flag_sets_env_var_before_build_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``--config <path>`` sets ``CREEK_CONFIG`` before tools register (INC-008)."""
+    from creek.config import CONFIG_PATH_ENV_VAR
+    from creek_mcp import server as server_module
+
+    config_file = tmp_path / "vault-config.yaml"
+    config_file.write_text("timezone: UTC\n")
+    monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
+
+    captured_env: dict[str, str | None] = {}
+
+    class _StubServer:
+        def run(self, transport: str) -> None:
+            del transport
+
+    def _capture_build() -> _StubServer:
+        captured_env[CONFIG_PATH_ENV_VAR] = os.environ.get(CONFIG_PATH_ENV_VAR)
+        return _StubServer()
+
+    monkeypatch.setattr(server_module, "build_server", _capture_build)
+    server_module.main(["--config", str(config_file)])
+
+    assert captured_env[CONFIG_PATH_ENV_VAR] == str(config_file.resolve())
+
+
+def test_main_config_flag_missing_file_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--config`` pointing at a missing file exits nonzero with a clear message."""
+    from creek_mcp import server as server_module
+
+    missing = tmp_path / "no-such-config.yaml"
+
+    # build_server must not be called when --config is invalid.
+    def _explode() -> object:  # pragma: no cover - asserts non-invocation
+        msg = "build_server should not run when --config is missing"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(server_module, "build_server", _explode)
+
+    with pytest.raises(SystemExit) as exc_info:
+        server_module.main(["--config", str(missing)])
+
+    assert exc_info.value.code != 0
+    err = capsys.readouterr().err
+    assert "file not found" in err.lower()
+
+
+def test_main_without_config_flag_leaves_env_var_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``--config`` does not modify ``CREEK_CONFIG``."""
+    from creek.config import CONFIG_PATH_ENV_VAR
+    from creek_mcp import server as server_module
+
+    monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
+
+    class _StubServer:
+        def run(self, transport: str) -> None:
+            del transport
+
+    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    server_module.main([])
+
+    assert CONFIG_PATH_ENV_VAR not in os.environ
