@@ -46,10 +46,18 @@ from creek.classify.constants import (
     RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
+from creek.classify.reatomize import (
+    ClassificationTree,
+    Classifier,
+    ReatomizeConfig,
+    classify_reatomize,
+)
 from creek.classify.rules import RuleClassifier
+from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
 from creek.vault.reader import try_load_fragment
+from creek.vault.writer import VaultWriter
 
 LLM_PROGRESS_FILENAME = "llm-progress.jsonl"
 """Per-vault progress log filename written under ``00-Creek-Meta/Processing-Log/``.
@@ -63,7 +71,9 @@ _PROCESSING_LOG_SUBDIR = ("00-Creek-Meta", "Processing-Log")
 """Per-vault subdirectory carrying the LLM progress + trace logs."""
 
 if TYPE_CHECKING:
-    from creek.config import CreekConfig
+    from collections.abc import Iterator
+
+    from creek.config import ClassificationConfig, CreekConfig
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +177,15 @@ def run_classify(
         progress_path = progress_dir / LLM_PROGRESS_FILENAME
         trace_log_path = progress_dir / CLASSIFY_TRACE_LOG_FILENAME
 
+    # The vault writer is only needed when re-atomization is enabled —
+    # building it eagerly avoids per-fragment construction cost and
+    # surfaces a missing ``01-Fragments`` once, here, rather than
+    # mid-loop.
+    reatomize_enabled = method == LLM_METHOD and config.classification.reatomize
+    vault_writer: VaultWriter | None = (
+        VaultWriter(vault_path=vault_path) if reatomize_enabled else None
+    )
+
     for md_file in sorted(fragments_root.rglob("*.md")):
         _process_file(
             md_file=md_file,
@@ -174,10 +193,11 @@ def run_classify(
             force=force,
             rules=rules,
             llm=llm,
-            confidence_threshold=config.classification.confidence_threshold,
+            classification_config=config.classification,
             counts=counts,
             progress_path=progress_path,
             trace_log_path=trace_log_path,
+            vault_writer=vault_writer,
         )
 
     return ClassifySummary(
@@ -232,10 +252,11 @@ def _process_file(
     force: bool,
     rules: RuleClassifier,
     llm: LLMClassifier | None,
-    confidence_threshold: float,
+    classification_config: ClassificationConfig,
     counts: _RunCounts,
     progress_path: Path | None,
     trace_log_path: Path | None,
+    vault_writer: VaultWriter | None,
 ) -> None:
     """Classify a single fragment file and update ``counts`` in place.
 
@@ -245,7 +266,9 @@ def _process_file(
         force: Whether to overwrite previously-classified fragments.
         rules: Shared :class:`RuleClassifier` instance.
         llm: Shared :class:`LLMClassifier` (when ``method == "llm"``).
-        confidence_threshold: Threshold below which the LLM is invoked.
+        classification_config: Full FEAT-023-aware classification config.
+            Drives both the LLM-vs-rules threshold and the
+            ``reatomize`` opt-in.
         counts: Mutable per-run counters; mutated in place.
         progress_path: Optional path to the LLM-progress checkpoint file
             (OPS-001). When set, the fragment ID is appended after a
@@ -256,20 +279,16 @@ def _process_file(
             log. When set, ``intimate``-tier fragments route their full
             reasoning trace here instead of into frontmatter; other
             tiers store a truncated trace in frontmatter regardless.
+        vault_writer: Shared :class:`VaultWriter` for persisting
+            FEAT-023 children. ``None`` when re-atomization is not
+            enabled for this run.
     """
-    try:
-        record = _read_fragment(md_file)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
-        counts.errors.append(f"unreadable fragment {md_file}: {exc}")
-        return
+    record = _load_classifiable_fragment(
+        md_file=md_file,
+        counts=counts,
+    )
     if record is None:
-        # File parsed cleanly but is not a Creek fragment (no
-        # ``type: fragment`` field, or schema mismatch). Silently skip —
-        # markdown notes coexist with fragments in the vault, and it
-        # would be misleading to count them in ``total``.
         return
-    # Only count files we actually identify as Creek fragments.
-    counts.total += 1
     fragment, body, raw = record
 
     # Skip fragments whose previous run already settled the classification.
@@ -285,8 +304,95 @@ def _process_file(
         method=method,
         rules=rules,
         llm=llm,
-        confidence_threshold=confidence_threshold,
+        confidence_threshold=classification_config.confidence_threshold,
     )
+
+    # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
+    # True we run the orchestrator on the root fragment and persist any
+    # newly-derived child fragments. The root's frontmatter still flows
+    # through the existing write path below so the per-run provenance
+    # stamps (method, classified_at, reasoning) stay consistent with the
+    # non-reatomize code path.
+    if vault_writer is not None and not was_skipped:
+        _maybe_reatomize_and_persist(
+            root_fragment=new_fragment,
+            body=body,
+            rules=rules,
+            llm=llm,
+            classification_config=classification_config,
+            vault_writer=vault_writer,
+            counts=counts,
+        )
+
+    _finalise_fragment_write(
+        md_file=md_file,
+        new_fragment=new_fragment,
+        body=body,
+        raw=raw,
+        reasoning=reasoning,
+        method=method,
+        was_skipped=was_skipped,
+        counts=counts,
+        progress_path=progress_path,
+        trace_log_path=trace_log_path,
+    )
+
+
+def _load_classifiable_fragment(
+    *,
+    md_file: Path,
+    counts: _RunCounts,
+) -> tuple[Fragment, str, dict[str, object]] | None:
+    """Read ``md_file`` and decide whether it needs a fresh classification.
+
+    Returns the ``(fragment, body, raw)`` triple when the file should
+    flow into the classifier. Returns ``None`` when the file is not a
+    Creek fragment or is unreadable. Updates ``counts`` in place for
+    the ``total`` and ``errors`` cases so the caller only handles the
+    happy path. The OPS-001 / issue #321 "preserved" short-circuit is
+    applied by :func:`_record_if_preserved` in :func:`_process_file`
+    so the per-reason counters (``preserved_manual`` vs
+    ``preserved_llm``) stay the single source of truth.
+
+    Args:
+        md_file: Vault fragment to consider.
+        counts: Mutable per-run counters; mutated in place when the
+            fragment is identified or proves unreadable.
+    """
+    try:
+        record = _read_fragment(md_file)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        counts.errors.append(f"unreadable fragment {md_file}: {exc}")
+        return None
+    if record is None:
+        # File parsed cleanly but is not a Creek fragment (no
+        # ``type: fragment`` field, or schema mismatch). Silently skip —
+        # markdown notes coexist with fragments in the vault, and it
+        # would be misleading to count them in ``total``.
+        return None
+    # Only count files we actually identify as Creek fragments.
+    counts.total += 1
+    return record
+
+
+def _finalise_fragment_write(
+    *,
+    md_file: Path,
+    new_fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+    reasoning: str,
+    method: str,
+    was_skipped: bool,
+    counts: _RunCounts,
+    progress_path: Path | None,
+    trace_log_path: Path | None,
+) -> None:
+    """Persist the (re-)classified root fragment back to its source file.
+
+    Pulled out of :func:`_process_file` so the FEAT-023 wire-up does
+    not push that function past the cyclomatic-complexity ceiling.
+    """
     # When ``--method llm`` short-circuits because the rule classifier
     # already produced a confident answer, the provenance stamp must
     # reflect what actually classified the fragment ("rules"), not
@@ -360,6 +466,151 @@ def _classify_one(
         raise RuntimeError(msg)
     llm_result = llm.classify_with_reasoning(rule_result, content=body)
     return llm_result.fragment, False, llm_result.reasoning
+
+
+def _build_reatomize_classifier(
+    *,
+    rules: RuleClassifier,
+    llm: LLMClassifier | None,
+    confidence_threshold: float,
+) -> Classifier:
+    """Build a :class:`Classifier` closure for :func:`classify_reatomize`.
+
+    Each call reuses the same rule + LLM dispatch logic as the legacy
+    single-pass path (:func:`_classify_one`), but returns the
+    ``(IngestedFragment, confidence)`` shape FEAT-023 expects so the
+    orchestrator can recurse on low-confidence results.
+
+    Args:
+        rules: Shared :class:`RuleClassifier`.
+        llm: Shared :class:`LLMClassifier`; ``None`` short-circuits to
+            the rule result + the rule-derived confidence score.
+        confidence_threshold: Floor below which the LLM is invoked.
+
+    Returns:
+        A callable matching the FEAT-023 :data:`Classifier` protocol.
+    """
+
+    def _classify(
+        ingested: IngestedFragment,
+    ) -> tuple[IngestedFragment, float]:
+        classified, _was_skipped, _reasoning = _classify_one(
+            fragment=ingested.fragment,
+            body=ingested.body,
+            method=LLM_METHOD if llm is not None else RULES_METHOD,
+            rules=rules,
+            llm=llm,
+            confidence_threshold=confidence_threshold,
+        )
+        confidence = rules.confidence_score(classified, content=ingested.body)
+        return (
+            IngestedFragment(fragment=classified, body=ingested.body),
+            confidence,
+        )
+
+    return _classify
+
+
+def _maybe_reatomize_and_persist(
+    *,
+    root_fragment: Fragment,
+    body: str,
+    rules: RuleClassifier,
+    llm: LLMClassifier | None,
+    classification_config: ClassificationConfig,
+    vault_writer: VaultWriter,
+    counts: _RunCounts,
+) -> None:
+    """Run FEAT-023 orchestrator on ``root_fragment`` and persist new children.
+
+    Only invoked when ``classification.reatomize`` is True. The root
+    file itself is rewritten by the surrounding caller via the normal
+    write path; this helper's responsibility is the recursive children
+    only — they are net-new files that need a fresh on-disk identity
+    via the platform-routing :class:`VaultWriter`.
+
+    Persistence errors are appended to :attr:`_RunCounts.errors` so
+    a single failed child does not abort the run.
+
+    Args:
+        root_fragment: The already-classified root fragment.
+        body: The root fragment's markdown body (for the splitter).
+        rules: Shared :class:`RuleClassifier`.
+        llm: Shared :class:`LLMClassifier`.
+        classification_config: Drives the FEAT-023 knobs (threshold,
+            max-depth, direction).
+        vault_writer: Reusable writer for child fragment files.
+        counts: Mutable per-run counters; child write failures are
+            recorded as errors here.
+    """
+    reatomize_config = ReatomizeConfig.from_classification_config(
+        classification_config,
+    )
+    classifier = _build_reatomize_classifier(
+        rules=rules,
+        llm=llm,
+        confidence_threshold=classification_config.confidence_threshold,
+    )
+    tree = classify_reatomize(
+        IngestedFragment(fragment=root_fragment, body=body),
+        classifier,
+        config=reatomize_config,
+    )
+    _persist_reatomized_children(
+        tree=tree,
+        root_id=root_fragment.id,
+        vault_writer=vault_writer,
+        counts=counts,
+    )
+
+
+def _persist_reatomized_children(
+    *,
+    tree: ClassificationTree,
+    root_id: str,
+    vault_writer: VaultWriter,
+    counts: _RunCounts,
+) -> None:
+    """Walk *tree* and write every descendant fragment to the vault.
+
+    The root node (``fragment.id == root_id``) is **not** written here —
+    the surrounding engine already rewrites the source file in place.
+    Every other node is a child produced by the FEAT-021 splitter (or
+    FEAT-022 aggregator) and needs its own file under the appropriate
+    ``01-Fragments/<subfolder>/`` directory.
+
+    Args:
+        tree: Output of :func:`classify_reatomize`.
+        root_id: ID of the fragment whose file the engine already owns.
+        vault_writer: Shared :class:`VaultWriter` instance.
+        counts: Mutable per-run counters; write failures are recorded
+            on :attr:`_RunCounts.errors`.
+    """
+    for node in _walk_tree(tree):
+        child_fragment = node.fragment.fragment
+        if child_fragment.id == root_id:
+            continue
+        try:
+            vault_writer.write_fragment(child_fragment, body=node.fragment.body)
+        except (OSError, KeyError) as exc:
+            counts.errors.append(
+                f"failed to write reatomized child {child_fragment.id}: {exc}",
+            )
+
+
+def _walk_tree(
+    tree: ClassificationTree,
+) -> Iterator[ClassificationTree]:
+    """Yield every node of ``tree`` in depth-first pre-order.
+
+    Pulled out so the persistence loop reads as a flat ``for`` over
+    nodes rather than a hand-rolled recursive walker — the latter would
+    have to share state with persistence and would push the function
+    over the cyclomatic-complexity ceiling.
+    """
+    yield tree
+    for child in tree.children:
+        yield from _walk_tree(child)
 
 
 def _route_reasoning(
