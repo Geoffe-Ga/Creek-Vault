@@ -11,8 +11,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from creek.classify import few_shot
-from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES, FREQUENCY_THEMES
-from creek.models import Frequency
+from creek.generate.indexes import (
+    CANONICAL_FREQUENCY_NAMES,
+    FREQUENCY_COLORS,
+    FREQUENCY_THEMES,
+)
+from creek.models import Color, Frequency
 
 if TYPE_CHECKING:
     from creek.config import LLMConfig
@@ -49,6 +53,54 @@ _FREQUENCY_BLOCK: str = _build_frequency_block()
 """Pre-rendered frequency-dimension lines baked into the prompt template."""
 
 
+def _build_color_block() -> str:
+    """Render the Spiral Dynamics color vocabulary for the prompt.
+
+    The wavelength's ``color`` field carries the Spiral Dynamics color
+    associated with the primary frequency (§7.2 of the ontology spec).
+    Listing the canonical values inline lets the LLM pick from the
+    documented vocabulary rather than guessing free-form strings like
+    ``"blueish"`` that the parser would silently drop to
+    ``unclassified`` — closing the issue #319 gap that left every
+    classified fragment with ``wavelength.color: unclassified``.
+
+    Returns:
+        A single comma-joined list of every non-unclassified
+        :class:`Color` value, suitable for embedding mid-sentence in
+        :data:`CLASSIFICATION_PROMPT`.
+    """
+    return ", ".join(
+        color.value for color in Color if color is not Color.UNCLASSIFIED
+    )
+
+
+_COLOR_BLOCK: str = _build_color_block()
+"""Pre-rendered Spiral Dynamics color vocabulary for the prompt."""
+
+
+def _build_frequency_color_block() -> str:
+    """Render the Frequency-to-Color mapping for the prompt.
+
+    Shows the model the canonical F1=beige / F2=purple / ... mapping
+    so its ``wavelength.color`` pick is anchored to its
+    ``frequency.primary`` pick instead of drifting independently. This
+    is the explicit linkage the ontology spec (§7.2, §6.1) calls out
+    but the original prompt left to the model's prior knowledge.
+
+    Returns:
+        A newline-joined list of ``- F<n>: <color>`` lines.
+    """
+    return "\n".join(
+        f"   - {freq.value}: {FREQUENCY_COLORS[freq]}"
+        for freq in Frequency
+        if freq is not Frequency.UNCLASSIFIED
+    )
+
+
+_FREQUENCY_COLOR_BLOCK: str = _build_frequency_color_block()
+"""Pre-rendered Frequency-to-Color mapping baked into the prompt template."""
+
+
 CLASSIFICATION_PROMPT: str = """\
 You are a classification assistant for the Creek knowledge organization system.
 
@@ -66,10 +118,19 @@ bottoming_out, restoration
 
 5. **Dosage**: medicine, toxic, ambiguous
 
-6. **Voice Register**: confessional, analytical, playful, prophetic, \
+6. **Wavelength Color** (Spiral Dynamics color of the primary frequency): \
+__COLOR_BLOCK__. The canonical mapping is:
+__FREQUENCY_COLOR_BLOCK__
+
+7. **Wavelength Descriptor**: a single short phrase from the Mode map that
+   best names this fragment's stance (e.g. ``"Gnosis"``, ``"Power-With"``,
+   ``"Social Anxiety"``, ``"Introspectivity"``). Leave as an empty string
+   only when no descriptor fits — never invent one.
+
+8. **Voice Register**: confessional, analytical, playful, prophetic, \
 instructional, raw, conversational
 
-7. **Confidence**: musing, exploring, forming, settled, conviction
+9. **Confidence**: musing, exploring, forming, settled, conviction
 
 A few labelled examples (do not include these in your YAML output):
 
@@ -79,12 +140,17 @@ Two-step protocol (FEAT-017):
 
 Step 1 — Reason briefly. Walk through which frequency this most resonates
 with and why, then which phase, then which mode, orientation, and dosage,
-and finally the voice register. Two to four short sentences total.
+which color and descriptor follow from those, and finally the voice
+register. Two to four short sentences total.
 
 Step 2 — Emit your classification as valid YAML inside a fenced
-```yaml ... ``` block. The YAML must follow this exact schema (do not
-include any other keys; ``confidence_scores`` reports how certain you
-are about each gated dimension, on a 0.0-1.0 scale):
+```yaml ... ``` block. **You MUST emit the full ``wavelength:`` block
+with all six sub-fields (phase, mode, orientation, dosage, color,
+descriptor) on every response — omitting any of them leaves the
+fragment with ``unclassified`` defaults and is treated as a
+regression (issue #319).** The YAML must follow this exact schema (do
+not include any other keys; ``confidence_scores`` reports how certain
+you are about each gated dimension, on a 0.0-1.0 scale):
 
 ```yaml
 frequency:
@@ -95,6 +161,8 @@ wavelength:
   mode: express
   orientation: do
   dosage: medicine
+  color: red
+  descriptor: Power-With
 voice:
   voice_register: analytical
   confidence: forming
@@ -105,14 +173,17 @@ confidence_scores:
 ```
 
 If a dimension is genuinely unclear, set ``unclassified`` rather than
-guessing. For Mode / Orientation / Dosage we will treat any
-``confidence_scores`` entry below {threshold:.2f} as ``unclassified``,
-so calibrate honestly.
+guessing (use an empty string ``""`` for descriptor when none fits).
+For Mode / Orientation / Dosage we will treat any ``confidence_scores``
+entry below {threshold:.2f} as ``unclassified``, so calibrate honestly.
 
 Fragment title: {title}
 Fragment content:
 {content}
-""".replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK)
+""".replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK).replace(
+    "__COLOR_BLOCK__",
+    _COLOR_BLOCK,
+).replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
 """Prompt template for two-step LLM-based fragment classification (FEAT-017).
 
 Placeholders:
@@ -123,6 +194,13 @@ Placeholders:
   rewarded rather than penalised.
 - ``{title}``, ``{content}``: the fragment being classified, after
   :func:`_sanitise_for_prompt` neutralises injection vectors.
+
+Issue #319: the ``wavelength`` schema example carries all six
+sub-fields (phase, mode, orientation, dosage, color, descriptor)
+because models follow the explicit YAML far more reliably than the
+bullet-point list above it. Drop a field from the schema and the
+classifier silently regresses to the pre-fix state where every
+fragment had ``wavelength.color: unclassified``.
 """
 
 

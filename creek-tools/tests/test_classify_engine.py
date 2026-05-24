@@ -618,3 +618,85 @@ def test_preserved_llm_counts_only_prior_llm_runs(tmp_path: Path) -> None:
     assert summary.preserved_manual == 0
     assert summary.preserved_llm == 1
     assert summary.classified == 0
+
+
+# ---- Issue #319: wavelength round-trips end-to-end through --method llm ----
+
+
+_WAVELENGTH_FULL_YAML: str = """\
+frequency:
+  primary: F3
+  secondary: []
+wavelength:
+  phase: peaking
+  mode: express
+  orientation: do
+  dosage: medicine
+  color: red
+  descriptor: Power-With
+voice:
+  voice_register: prophetic
+  confidence: settled
+confidence_scores:
+  mode: 0.9
+  orientation: 0.9
+  dosage: 0.9
+"""
+"""Reference LLM response covering every Wavelength sub-field.
+
+Lives next to its consumer so a regression in the prompt/parser
+contract is visible alongside the round-trip assertion that catches
+it, rather than buried in a fixtures directory.
+"""
+
+
+def test_run_classify_llm_persists_all_wavelength_fields(tmp_path: Path) -> None:
+    """Issue #319: wavelength.color and wavelength.descriptor reach disk.
+
+    Reproduces the user-visible bug end-to-end with a mocked LLM
+    response: a fragment classified via ``--method llm`` must persist
+    ``color`` and ``descriptor`` to its frontmatter, not just the
+    historical four-field subset (phase / mode / orientation / dosage).
+    Asserts on the on-disk YAML — not the in-memory ``Fragment`` —
+    because that is what the user inspects after the run.
+    """
+    from creek.classify.llm import LLMClassifier
+
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-wavefull001",
+        title="exuberant declaration",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="ordinary content with no rule-classifier signal keywords",
+    )
+
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force LLM path
+
+    with (
+        patch.object(LLMClassifier, "_check_availability", return_value=True),
+        patch.object(LLMClassifier, "_invoke_llm", return_value=_WAVELENGTH_FULL_YAML),
+    ):
+        summary = run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+    assert summary.classified == 1
+    reloaded = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-wavefull001.md"),
+    )
+    wavelength = reloaded["wavelength"]
+    assert isinstance(wavelength, dict)
+    assert wavelength["phase"] == "peaking"
+    assert wavelength["mode"] == "express"
+    assert wavelength["orientation"] == "do"
+    assert wavelength["dosage"] == "medicine"
+    assert wavelength["color"] == "red"
+    assert wavelength["descriptor"] == "Power-With"

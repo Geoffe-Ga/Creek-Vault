@@ -35,6 +35,7 @@ from creek.classify.rules import (
 from creek.classify.rules import RuleClassifier as RuleClassifierDirect
 from creek.config import ClassificationConfig, LLMConfig
 from creek.models import (
+    Color,
     Confidence,
     Dosage,
     Fragment,
@@ -519,6 +520,52 @@ class TestClassificationPrompt:
         assert FREQUENCY_THEMES[Frequency.F8] in CLASSIFICATION_PROMPT
         assert FREQUENCY_THEMES[Frequency.F10] in CLASSIFICATION_PROMPT
 
+    def test_prompt_lists_all_six_wavelength_dimensions(self) -> None:
+        """Issue #319: every Wavelength sub-field must be named in the prompt.
+
+        Before the fix, ``color`` and ``descriptor`` were absent from
+        both the dimensions list and the YAML schema example, so the
+        LLM had no reason to emit them and every fragment ended up with
+        ``wavelength.color: unclassified`` / ``wavelength.descriptor:
+        ''``. The ontology spec (§5.1) defines all six sub-fields, so
+        the prompt must request all six.
+        """
+        prompt_lower = CLASSIFICATION_PROMPT.lower()
+        assert "phase" in prompt_lower
+        assert "mode" in prompt_lower
+        assert "orientation" in prompt_lower
+        assert "dosage" in prompt_lower
+        assert "color" in prompt_lower
+        assert "descriptor" in prompt_lower
+
+    def test_prompt_yaml_example_includes_color_and_descriptor(self) -> None:
+        """Issue #319: the YAML schema example must show color + descriptor.
+
+        Anthropic and Ollama both follow the explicit YAML example far
+        more reliably than the bullet-point list above it. If the schema
+        block does not name ``color:`` and ``descriptor:`` the model
+        omits them, and the resulting fragment frontmatter is missing
+        the spiral-dynamics color / mode-map descriptor the ontology
+        depends on.
+        """
+        assert "color:" in CLASSIFICATION_PROMPT
+        assert "descriptor:" in CLASSIFICATION_PROMPT
+
+    def test_prompt_lists_all_spiral_dynamics_colors(self) -> None:
+        """Issue #319: every :class:`Color` value should be advertised.
+
+        Listing the enum values inline lets the LLM pick from the
+        documented vocabulary rather than guessing free-form strings
+        like ``"blueish"`` that the parser would silently drop to
+        ``unclassified``.
+        """
+        for color in Color:
+            if color is Color.UNCLASSIFIED:
+                continue
+            assert color.value in CLASSIFICATION_PROMPT, (
+                f"Color {color.value!r} missing from CLASSIFICATION_PROMPT"
+            )
+
 
 # ---- Validate Response ----
 
@@ -671,6 +718,99 @@ class TestApplyClassification:
         assert result.wavelength.mode == Mode.EXPRESS
         assert result.wavelength.orientation == Orientation.DO
         assert result.wavelength.dosage == Dosage.MEDICINE
+
+    def test_applies_wavelength_color_and_descriptor(self) -> None:
+        """Issue #319: ``color`` and ``descriptor`` round-trip from LLM YAML.
+
+        Before the fix, the parser only read four of the six
+        :class:`WavelengthClassification` fields, so a model that
+        correctly emitted ``color`` and ``descriptor`` saw both values
+        silently dropped on the floor.
+        """
+        config = LLMConfig()
+        classifier = LLMClassifier(config=config)
+        frag = _make_fragment()
+        data: dict[str, object] = {
+            "wavelength": {
+                "phase": "peaking",
+                "mode": "express",
+                "orientation": "do",
+                "dosage": "medicine",
+                "color": "red",
+                "descriptor": "Power-With",
+            },
+        }
+        result = classifier._apply_classification(frag, data)
+        assert result.wavelength.color == Color.RED
+        assert result.wavelength.descriptor == "Power-With"
+
+    def test_applies_wavelength_descriptor_strips_whitespace(self) -> None:
+        """Issue #319: descriptor is normalised, not stored raw.
+
+        Stripping leading/trailing whitespace prevents indexers and
+        downstream skill loaders from treating ``" Gnosis"`` and
+        ``"Gnosis"`` as two distinct descriptors.
+        """
+        config = LLMConfig()
+        classifier = LLMClassifier(config=config)
+        frag = _make_fragment()
+        data: dict[str, object] = {
+            "wavelength": {"descriptor": "  Gnosis  "},
+        }
+        result = classifier._apply_classification(frag, data)
+        assert result.wavelength.descriptor == "Gnosis"
+
+    def test_applies_wavelength_unknown_color_falls_back(self) -> None:
+        """Issue #319: a free-form color value defaults to ``unclassified``.
+
+        Defends against a model that emits ``"blueish"`` or ``"#ff0000"``
+        instead of one of the canonical Spiral Dynamics colors — the
+        fragment should fail honestly rather than carry a junk value.
+        """
+        config = LLMConfig()
+        classifier = LLMClassifier(config=config)
+        frag = _make_fragment()
+        data: dict[str, object] = {
+            "wavelength": {"color": "blueish-not-real"},
+        }
+        result = classifier._apply_classification(frag, data)
+        assert result.wavelength.color == Color.UNCLASSIFIED
+
+    def test_applies_wavelength_non_string_descriptor_falls_back(self) -> None:
+        """Issue #319: a non-string descriptor must not crash the parser.
+
+        Models occasionally emit ``descriptor: 42`` or ``descriptor:
+        null`` — we coerce to empty string so the fragment is still
+        writable rather than raising mid-batch.
+        """
+        config = LLMConfig()
+        classifier = LLMClassifier(config=config)
+        frag = _make_fragment()
+        data: dict[str, object] = {
+            "wavelength": {"descriptor": None},
+        }
+        result = classifier._apply_classification(frag, data)
+        assert result.wavelength.descriptor == ""
+
+    def test_applies_wavelength_descriptor_caps_runaway_length(self) -> None:
+        """Issue #319: an absurdly long descriptor is truncated, not dropped.
+
+        A pathological LLM response that emits a 50 KiB descriptor
+        would otherwise bloat the YAML frontmatter and disk footprint
+        of every fragment. Capping at a sensible ceiling keeps the
+        signal while bounding the damage.
+        """
+        from creek.classify.llm.parsing import _MAX_DESCRIPTOR_CHARS
+
+        config = LLMConfig()
+        classifier = LLMClassifier(config=config)
+        frag = _make_fragment()
+        runaway = "X" * (_MAX_DESCRIPTOR_CHARS * 5)
+        data: dict[str, object] = {
+            "wavelength": {"descriptor": runaway},
+        }
+        result = classifier._apply_classification(frag, data)
+        assert len(result.wavelength.descriptor) == _MAX_DESCRIPTOR_CHARS
 
     def test_applies_voice(self) -> None:
         """Voice fields should be applied to fragment."""
