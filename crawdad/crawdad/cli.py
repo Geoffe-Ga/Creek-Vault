@@ -23,6 +23,7 @@ from crawdad.config import (
     DEFAULT_ROUTER_MODEL,
     load_config,
 )
+from crawdad.consent import PendingBatchStore
 from crawdad.history import ConversationHistory
 from crawdad.intents import ToolInfo
 from crawdad.loop import run_one_turn
@@ -104,6 +105,9 @@ def run_bot(config: CrawDadConfig) -> None:
     skill_registry = SkillStackRegistry(
         stack=initial_skills, vault_path=config.vault_path, state=session_state
     )
+    pending_batches = PendingBatchStore(
+        ttl_seconds=config.consent.pending_batch_ttl_seconds,
+    )
     components = _build_agent_components(config=config, tool_details=tool_details)
     loop_runner = _build_loop_runner(
         components=components,
@@ -122,6 +126,7 @@ def run_bot(config: CrawDadConfig) -> None:
         skill_registry=skill_registry,
         loop_runner=loop_runner,
         register_switcher=skill_registry.activate_register,
+        pending_batches=pending_batches,
     )
     client.run(config.discord_bot_token)
 

@@ -248,3 +248,89 @@ def test_load_config_reject_on_mime_mismatch_defaults_false_when_absent(
 
     config = load_config(yaml_path)
     assert config.attachments.reject_on_mime_mismatch is False
+
+
+# ---------------------------------------------------------------------------
+# FEAT-034 — ConsentConfig
+# ---------------------------------------------------------------------------
+
+
+def test_consent_config_defaults_match_module_constants() -> None:
+    """The bare ``ConsentConfig`` adopts the consent-module defaults verbatim."""
+    from crawdad.config import ConsentConfig
+    from crawdad.consent import (
+        DEFAULT_ABANDON_TOKENS,
+        DEFAULT_CONSENT_TOKENS,
+        DEFAULT_PENDING_BATCH_TTL_SECONDS,
+    )
+
+    cfg = ConsentConfig()
+
+    assert cfg.consent_tokens == DEFAULT_CONSENT_TOKENS
+    assert cfg.abandon_tokens == DEFAULT_ABANDON_TOKENS
+    assert cfg.pending_batch_ttl_seconds == DEFAULT_PENDING_BATCH_TTL_SECONDS
+
+
+def test_consent_config_normalises_tokens_to_lowercase() -> None:
+    """Raw mixed-case tokens lowercase and trim before storage."""
+    from crawdad.config import ConsentConfig
+
+    cfg = ConsentConfig(
+        consent_tokens=frozenset({"  INGEST ", "Yes", ""}),
+        abandon_tokens=frozenset({"CANCEL"}),
+    )
+
+    assert cfg.consent_tokens == frozenset({"ingest", "yes"})
+    assert cfg.abandon_tokens == frozenset({"cancel"})
+
+
+def test_consent_config_rejects_non_positive_ttl(tmp_path: Path) -> None:
+    """TTL must be strictly positive — zero or non-positive breaks eviction."""
+    from crawdad.config import ConsentConfig
+
+    with pytest.raises(ValidationError):
+        ConsentConfig(pending_batch_ttl_seconds=0)
+    with pytest.raises(ValidationError):
+        ConsentConfig(pending_batch_ttl_seconds=-1.0)
+
+
+def test_crawdad_config_carries_consent_subconfig(tmp_path: Path) -> None:
+    """``CrawDadConfig`` ships with a default ``ConsentConfig`` attached."""
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[222],
+    )
+
+    assert "ingest" in config.consent.consent_tokens
+    assert "cancel" in config.consent.abandon_tokens
+    assert config.consent.pending_batch_ttl_seconds > 0
+
+
+def test_load_config_parses_consent_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``consent`` YAML block overrides the bundled defaults."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n"
+        "consent:\n"
+        "  consent_tokens: ['do it']\n"
+        "  abandon_tokens: ['hold off']\n"
+        "  pending_batch_ttl_seconds: 60\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    config = load_config(yaml_path)
+
+    assert config.consent.consent_tokens == frozenset({"do it"})
+    assert config.consent.abandon_tokens == frozenset({"hold off"})
+    assert config.consent.pending_batch_ttl_seconds == 60.0

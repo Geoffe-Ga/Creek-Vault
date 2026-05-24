@@ -21,6 +21,12 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from crawdad.consent import (
+    DEFAULT_ABANDON_TOKENS,
+    DEFAULT_CONSENT_TOKENS,
+    DEFAULT_PENDING_BATCH_TTL_SECONDS,
+)
+
 # Discord's free-tier upload limit is 25 MiB (Boost levels raise it).
 # Bot-side default mirrors that so users see a clear refusal rather
 # than a confusing partial download. Override in ``crawdad.yaml`` if
@@ -229,6 +235,62 @@ class AttachmentConfig(BaseModel):
         return value
 
 
+class ConsentConfig(BaseModel):
+    """FEAT-034 conversational-consent knobs.
+
+    The consent flow lets a user reply with ``ingest`` (or any of the
+    other affirmative tokens below) to dispatch ``creek.ingest`` for a
+    previously staged batch of Discord attachments. Operators can
+    widen the token lists or shorten the timeout per deployment.
+
+    Attributes:
+        consent_tokens: Affirmative tokens that trigger ingest dispatch
+            for the channel's most recently staged batch. Matching is
+            case-insensitive after stripping surrounding whitespace and
+            ASCII punctuation; the user's message must normalise to a
+            token verbatim (multi-word tokens like ``"go ahead"`` keep
+            their internal space).
+        abandon_tokens: Tokens that clear the pending batch without
+            dispatching ingest. Matched with the same normalisation
+            rules as the consent tokens.
+        pending_batch_ttl_seconds: Maximum age of a pending batch
+            before it is treated as expired. A stale "yes" after this
+            window falls through to the agent loop instead of
+            triggering an unexpected ingest.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    consent_tokens: frozenset[str] = Field(
+        default_factory=lambda: frozenset(DEFAULT_CONSENT_TOKENS),
+    )
+    abandon_tokens: frozenset[str] = Field(
+        default_factory=lambda: frozenset(DEFAULT_ABANDON_TOKENS),
+    )
+    pending_batch_ttl_seconds: float = Field(
+        default=DEFAULT_PENDING_BATCH_TTL_SECONDS,
+        gt=0,
+    )
+
+    @field_validator("consent_tokens", "abandon_tokens")
+    @classmethod
+    def _normalise_tokens(cls, value: frozenset[str]) -> frozenset[str]:
+        """Lowercase + strip every token; drop empties.
+
+        Stored verbatim so the runtime comparison against the
+        already-normalised inbound message text is a single equality
+        check.
+        """
+        normalised: set[str] = set()
+        for raw in value:
+            if not raw:
+                continue
+            cleaned = raw.lower().strip()
+            if cleaned:
+                normalised.add(cleaned)
+        return frozenset(normalised)
+
+
 class CrawDadConfig(BaseModel):
     """Immutable runtime configuration for the bot.
 
@@ -245,6 +307,7 @@ class CrawDadConfig(BaseModel):
     allowed_user_ids: tuple[int, ...]
     allowed_channel_ids: tuple[int, ...]
     attachments: AttachmentConfig = Field(default_factory=AttachmentConfig)
+    consent: ConsentConfig = Field(default_factory=ConsentConfig)
 
     @field_validator("allowed_user_ids", "allowed_channel_ids")
     @classmethod
