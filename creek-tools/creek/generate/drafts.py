@@ -47,6 +47,8 @@ from creek.models import (
     CompiledPage,
     Eddy,
     Fragment,
+    Frequency,
+    Mode,
     Phase,
     Thread,
 )
@@ -81,6 +83,86 @@ DraftLLM = Callable[[str], str]
 
 
 @dataclass(frozen=True)
+class SeedSpec:
+    """Manual seed specification for ``creek draft`` (FEAT-032).
+
+    Each field is optional and combinable per the FEAT-032 rules:
+
+    * ``fragment_id`` is mutually exclusive with every other field — when
+      it is set, the draft follows on from one specific fragment.
+    * ``topic`` may be combined with any dimensional filter to narrow
+      the candidate source material.
+    * The three dimensional filters (frequencies / phases / modes) AND
+      together: a candidate fragment must satisfy every supplied
+      dimension. An empty tuple means "do not filter on this dimension".
+
+    Attributes:
+        fragment_id: Specific fragment ID to draft a follow-up from.
+        topic: Free-form topic phrase guiding the essay.
+        frequencies: APTITUDE frequencies to restrict candidates to.
+        phases: Wavelength phases to restrict candidates to.
+        modes: Wavelength modes (stances) to restrict candidates to.
+    """
+
+    fragment_id: str | None = None
+    topic: str | None = None
+    frequencies: tuple[Frequency, ...] = ()
+    phases: tuple[Phase, ...] = ()
+    modes: tuple[Mode, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Normalise empty topics, then enforce the ``fragment_id`` rule."""
+        if self.topic is not None and not self.topic.strip():
+            # Whitespace-only topics produce confusing zero-match errors
+            # downstream; collapse them to ``None`` so the spec is honestly
+            # empty. ``object.__setattr__`` is required on a frozen dataclass.
+            object.__setattr__(self, "topic", None)
+        if self.fragment_id is None:
+            return
+        conflicts = [
+            name
+            for name, value in (
+                ("topic", self.topic),
+                ("frequencies", self.frequencies),
+                ("phases", self.phases),
+                ("modes", self.modes),
+            )
+            if value
+        ]
+        if conflicts:
+            msg = (
+                f"SeedSpec.fragment_id is mutually exclusive with "
+                f"{', '.join(conflicts)}"
+            )
+            raise ValueError(msg)
+
+    @property
+    def is_empty(self) -> bool:
+        """Return ``True`` when no manual seed dimension is set."""
+        return not (
+            self.fragment_id
+            or self.topic
+            or self.frequencies
+            or self.phases
+            or self.modes
+        )
+
+    @property
+    def has_dimensional_filter(self) -> bool:
+        """Return ``True`` when at least one classification filter is set."""
+        return bool(self.frequencies or self.phases or self.modes)
+
+
+class SeedResolutionError(ValueError):
+    """Raised when a :class:`SeedSpec` cannot be resolved to any candidates.
+
+    The CLI surfaces the message to the operator as an honest "no
+    matching source material" error rather than silently falling back
+    to unfiltered drafting (FEAT-032 acceptance criterion).
+    """
+
+
+@dataclass(frozen=True)
 class Draft:
     """An LLM-generated essay draft with full provenance.
 
@@ -94,6 +176,9 @@ class Draft:
         skill_stack: Relative paths of activated SKILL.md files.
         prompt: The full LLM prompt (for reproducibility).
         generated_date: When the draft was generated.
+        seed_spec: Manual-seed specification (FEAT-032) when the draft
+            was produced via ``creek draft --seed-*`` flags; ``None``
+            for drafts surfaced via the idea miner.
     """
 
     title: str
@@ -105,6 +190,7 @@ class Draft:
     skill_stack: tuple[str, ...]
     prompt: str
     generated_date: datetime
+    seed_spec: SeedSpec | None = None
 
     def __post_init__(self) -> None:
         """Validate draft invariants."""
@@ -197,6 +283,63 @@ def _load_eddies_by_id(root: Path) -> dict[str, Eddy]:
             continue
         collected[eddy.id] = eddy
     return collected
+
+
+def _fragment_matches_dimensions(
+    fragment: Fragment,
+    *,
+    frequencies: tuple[Frequency, ...] = (),
+    phases: tuple[Phase, ...] = (),
+    modes: tuple[Mode, ...] = (),
+) -> bool:
+    """Return ``True`` when *fragment* matches every supplied dimension.
+
+    An empty tuple for a given dimension means "do not filter on it".
+    Fragments persisted with ``use_enum_values=True`` store the enum's
+    ``.value``, so comparisons happen against the StrEnum value to
+    cover both the in-memory enum and the on-disk string form.
+    """
+    if frequencies:
+        primary = str(fragment.frequency.primary)
+        if primary not in {freq.value for freq in frequencies}:
+            return False
+    if phases:
+        phase = str(fragment.wavelength.phase)
+        if phase not in {ph.value for ph in phases}:
+            return False
+    if modes:
+        mode = str(fragment.wavelength.mode)
+        if mode not in {md.value for md in modes}:
+            return False
+    return True
+
+
+def _topic_matches_fragment(fragment: Fragment, body: str, topic: str) -> bool:
+    """Return ``True`` when *topic* appears in fragment title or body.
+
+    Case-insensitive substring match — the v1 surface for
+    ``--seed-topic``. Embedding-based retrieval is a documented
+    follow-up; substring matching is honest about what the heuristic
+    can promise on a young vault without an embeddings index.
+    """
+    needle = topic.strip().lower()
+    if not needle:
+        return False
+    if needle in fragment.title.lower():
+        return True
+    return needle in body.lower()
+
+
+def _seed_dimension_descriptor(spec: SeedSpec) -> str:
+    """Render the dimensional intersection of *spec* as ``F1 x rising x inhabit``."""
+    parts: list[str] = []
+    if spec.frequencies:
+        parts.append(" / ".join(freq.value for freq in spec.frequencies))
+    if spec.phases:
+        parts.append(" / ".join(ph.value for ph in spec.phases))
+    if spec.modes:
+        parts.append(" / ".join(md.value for md in spec.modes))
+    return " x ".join(parts)
 
 
 def _dominant(values: list[str]) -> str | None:
@@ -613,6 +756,223 @@ class DraftGenerator:
             generated_date=datetime.now(tz=UTC),
         )
 
+    def resolve_seed(
+        self,
+        spec: SeedSpec,
+        *,
+        vault_path: Path,
+        fragments: dict[str, tuple[Fragment, str]] | None = None,
+    ) -> IdeaSeed:
+        """Build an :class:`IdeaSeed` from a manual *spec* (FEAT-032).
+
+        Resolution rules:
+
+        * ``spec.fragment_id`` set → load that one fragment and seed the
+          idea with its title / threads / eddies / primary frequency.
+          Missing IDs raise :class:`SeedResolutionError`.
+        * Otherwise → filter every loaded fragment through
+          :func:`_fragment_matches_dimensions` and, when supplied,
+          ``spec.topic``. Zero matches raise
+          :class:`SeedResolutionError`.
+
+        Args:
+            spec: The manual seed specification.
+            vault_path: Vault root used to load fragments when
+                *fragments* is not supplied.
+            fragments: Optional pre-loaded ``{id: (Fragment, body)}``
+                map; when given, the vault is not re-scanned.
+
+        Returns:
+            A synthetic :class:`IdeaSeed` whose dimensions reflect the
+            user's request rather than a mined heuristic.
+
+        Raises:
+            SeedResolutionError: When *spec* is empty, the requested
+                ``fragment_id`` is not in the vault, or the dimensional
+                / topic filters match zero fragments.
+        """
+        if spec.is_empty:
+            msg = "SeedSpec is empty — cannot resolve an idea seed"
+            raise SeedResolutionError(msg)
+
+        loaded = (
+            fragments
+            if fragments is not None
+            else _load_fragments_by_id(
+                vault_path / _FRAGMENTS_SUBDIR,
+                privacy_override=self.privacy_override,
+            )
+        )
+
+        if spec.fragment_id is not None:
+            return self._seed_from_fragment_id(spec.fragment_id, loaded)
+
+        matched = self._matching_fragments(spec, loaded)
+        if not matched:
+            descriptor = _seed_dimension_descriptor(spec)
+            topic_part = f" topic {spec.topic!r}" if spec.topic else ""
+            filter_part = f" filters {descriptor}" if descriptor else ""
+            msg = (
+                f"No source material matches{topic_part}{filter_part}. "
+                "Try widening the filters or pouring in more sources."
+            )
+            raise SeedResolutionError(msg)
+
+        return self._seed_from_matches(spec, matched)
+
+    def _seed_from_fragment_id(
+        self,
+        fragment_id: str,
+        loaded: dict[str, tuple[Fragment, str]],
+    ) -> IdeaSeed:
+        """Resolve a single ``--seed-fragment`` request to an IdeaSeed."""
+        from creek.generate.mining import IdeaSeed, MiningStrategy
+
+        if fragment_id not in loaded:
+            msg = (
+                f"--seed-fragment {fragment_id!r} not found in vault "
+                "(or excluded by the active privacy tier filter)."
+            )
+            raise SeedResolutionError(msg)
+        fragment, _body = loaded[fragment_id]
+        # ``use_enum_values=True`` persists each enum as its ``.value`` —
+        # a bare string on disk — so coerce back via ``Frequency(str(...))``
+        # before comparing against ``Frequency.UNCLASSIFIED``.
+        primary = Frequency(str(fragment.frequency.primary))
+        frequencies: tuple[Frequency, ...] = (
+            (primary,) if primary != Frequency.UNCLASSIFIED else ()
+        )
+        return IdeaSeed(
+            strategy=MiningStrategy.RESONANCE_CHAIN,
+            title=fragment.title,
+            source_fragments=(fragment_id,),
+            threads=tuple(fragment.threads),
+            eddies=tuple(fragment.eddies),
+            frequency_affinity=frequencies,
+            brief_description=(
+                f"User-directed follow-up to fragment {fragment_id}: {fragment.title}."
+            ),
+            score=0.0,
+        )
+
+    def _matching_fragments(
+        self,
+        spec: SeedSpec,
+        loaded: dict[str, tuple[Fragment, str]],
+    ) -> list[tuple[Fragment, str]]:
+        """Return ``(fragment, body)`` tuples that satisfy *spec*'s filters."""
+        matched: list[tuple[Fragment, str]] = []
+        for fragment, body in loaded.values():
+            if not _fragment_matches_dimensions(
+                fragment,
+                frequencies=spec.frequencies,
+                phases=spec.phases,
+                modes=spec.modes,
+            ):
+                continue
+            if spec.topic is not None and not _topic_matches_fragment(
+                fragment, body, spec.topic
+            ):
+                continue
+            matched.append((fragment, body))
+        return matched
+
+    def _seed_from_matches(
+        self,
+        spec: SeedSpec,
+        matched: list[tuple[Fragment, str]],
+    ) -> IdeaSeed:
+        """Synthesise an IdeaSeed from a non-empty *matched* fragment list."""
+        from creek.generate.mining import IdeaSeed, MiningStrategy
+
+        fragments = [fragment for fragment, _ in matched]
+        thread_ids, eddy_ids = _union_thread_and_eddy_ids(fragments)
+        frequencies = spec.frequencies or _union_primary_frequencies(fragments)
+        title, description = _seed_title_and_description(spec)
+        return IdeaSeed(
+            strategy=MiningStrategy.RESONANCE_CHAIN,
+            title=title,
+            source_fragments=tuple(fragment.id for fragment in fragments),
+            threads=thread_ids,
+            eddies=eddy_ids,
+            frequency_affinity=frequencies,
+            brief_description=description,
+            score=0.0,
+        )
+
+    def generate_seeded_draft(
+        self,
+        spec: SeedSpec,
+        *,
+        vault_path: Path,
+        current_phase: Phase | None = None,
+    ) -> Draft:
+        """Generate a :class:`Draft` from a manual *spec* (FEAT-032).
+
+        Resolves the spec to a synthetic :class:`IdeaSeed`, runs the
+        same skill-stack / source-material / prompt pipeline as
+        :meth:`generate_draft`, then stamps the returned draft with
+        the originating ``seed_spec`` for provenance.
+
+        When the spec carries an explicit ``--seed-phase`` filter and
+        the caller did not pass ``current_phase``, the spec's phase is
+        used so the activated phase skill matches the user's request.
+
+        Args:
+            spec: The manual seed specification.
+            vault_path: Vault root used for fragment loading, skill
+                resolution, and source-material gathering.
+            current_phase: Optional phase override for skill selection.
+
+        Returns:
+            A :class:`Draft` whose ``seed_spec`` field records the
+            originating manual seed.
+
+        Raises:
+            SeedResolutionError: Propagated from :meth:`resolve_seed`.
+            RuntimeError: When the LLM returns an empty body.
+        """
+        fragments = _load_fragments_by_id(
+            vault_path / _FRAGMENTS_SUBDIR,
+            privacy_override=self.privacy_override,
+        )
+        idea = self.resolve_seed(spec, vault_path=vault_path, fragments=fragments)
+        compiled_pages = self._resolve_compiled_pages(vault_path, None)
+        effective_phase = current_phase
+        if effective_phase is None and spec.phases:
+            effective_phase = spec.phases[0]
+        skill_stack = self.select_skill_stack(
+            idea,
+            vault_path=vault_path,
+            current_phase=effective_phase,
+            fragments=fragments,
+        )
+        source_material = self.gather_source_material(
+            idea,
+            vault_path=vault_path,
+            fragments=fragments,
+            compiled_pages=compiled_pages,
+        )
+        prompt = self._compose_prompt(idea, skill_stack, source_material)
+        body = self._llm(prompt).strip()
+        if not body:
+            msg = "LLM returned an empty draft body"
+            raise RuntimeError(msg)
+        return Draft(
+            title=idea.title,
+            body=body,
+            idea_strategy=idea.strategy.value,
+            source_fragments=idea.source_fragments,
+            threads=idea.threads,
+            eddies=idea.eddies,
+            skill_stack=tuple(
+                str(p.relative_to(self.skills_root)) for p in skill_stack
+            ),
+            prompt=prompt,
+            generated_date=datetime.now(tz=UTC),
+            seed_spec=spec,
+        )
+
     def save_draft(self, draft: Draft, vault_path: Path) -> Path:
         """Write *draft* to ``07-Voice/Drafts/YYYY-MM-DD-{slug}.md``.
 
@@ -644,8 +1004,85 @@ class DraftGenerator:
             generated_date=draft.generated_date.isoformat(),
             prompt=draft.prompt,
         )
+        if draft.seed_spec is not None:
+            post["seed"] = _serialise_seed_spec(draft.seed_spec)
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
+
+
+def _union_thread_and_eddy_ids(
+    fragments: list[Fragment],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(thread_ids, eddy_ids)`` in first-seen order across *fragments*."""
+    thread_ids: list[str] = []
+    eddy_ids: list[str] = []
+    for fragment in fragments:
+        for tid in fragment.threads:
+            if tid not in thread_ids:
+                thread_ids.append(tid)
+        for eid in fragment.eddies:
+            if eid not in eddy_ids:
+                eddy_ids.append(eid)
+    return tuple(thread_ids), tuple(eddy_ids)
+
+
+def _union_primary_frequencies(fragments: list[Fragment]) -> tuple[Frequency, ...]:
+    """Return the ordered set of classified primary frequencies in *fragments*."""
+    seen: list[Frequency] = []
+    for fragment in fragments:
+        # ``use_enum_values=True`` stores each enum as its ``.value`` on
+        # disk; coerce back so equality / membership checks behave.
+        primary = Frequency(str(fragment.frequency.primary))
+        if primary == Frequency.UNCLASSIFIED:
+            continue
+        if primary not in seen:
+            seen.append(primary)
+    return tuple(seen)
+
+
+def _seed_title_and_description(spec: SeedSpec) -> tuple[str, str]:
+    """Return the synthetic IdeaSeed ``(title, description)`` for *spec*.
+
+    The topic (when supplied) becomes the title; otherwise the title
+    summarises the dimensional intersection. The description always
+    captions the result as user-directed for downstream provenance.
+    """
+    descriptor = _seed_dimension_descriptor(spec)
+    if spec.topic is not None:
+        title = spec.topic
+        if descriptor:
+            description = (
+                f"User-directed draft on {spec.topic!r}, drawing from "
+                f"the {descriptor} corner of the vault."
+            )
+        else:
+            description = f"User-directed draft on {spec.topic!r}."
+        return title, description
+    return (
+        f"From the {descriptor} corner",
+        f"User-directed draft from the {descriptor} corner of the vault.",
+    )
+
+
+def _serialise_seed_spec(spec: SeedSpec) -> dict[str, object]:
+    """Render *spec* as a frontmatter-friendly mapping (FEAT-032 provenance).
+
+    Only the populated fields are emitted so the YAML stays compact;
+    a reader can re-run ``creek draft`` with the same flags by
+    inspecting the recorded mapping.
+    """
+    payload: dict[str, object] = {}
+    if spec.fragment_id is not None:
+        payload["fragment_id"] = spec.fragment_id
+    if spec.topic is not None:
+        payload["topic"] = spec.topic
+    if spec.frequencies:
+        payload["frequencies"] = [freq.value for freq in spec.frequencies]
+    if spec.phases:
+        payload["phases"] = [ph.value for ph in spec.phases]
+    if spec.modes:
+        payload["modes"] = [md.value for md in spec.modes]
+    return payload
 
 
 def _render_compiled_entry(target_id: str, page: CompiledPage) -> str:

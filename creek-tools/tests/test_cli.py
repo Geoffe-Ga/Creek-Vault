@@ -1506,3 +1506,424 @@ def test_mine_bypass_compiled_warns_and_skips_routing(
     assert captured["bypass"] is True
     assert "--bypass-compiled" in result.output
     assert "side-step" in result.output.lower()
+
+
+# ---- FEAT-032 manual seeding flags -----------------------------------
+
+
+def _seed_test_vault(vault: Path) -> None:
+    """Scaffold the minimal vault layout the seed-CLI tests expect."""
+    for sub in ("01-Fragments", "02-Threads", "03-Eddies", "07-Voice/Drafts"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+
+
+def _write_seed_fragment(
+    vault: Path,
+    *,
+    frag_id: str,
+    primary: str = "F1",
+    phase: str = "unclassified",
+    mode: str = "unclassified",
+    title: str = "A note",
+    body: str = "Body text.",
+) -> None:
+    """Write a minimal fragment markdown file with the requested classification."""
+    import frontmatter
+
+    metadata = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": title,
+        "source": {"platform": "claude", "kind": "unclassified"},
+        "created": "2026-03-01T00:00:00+00:00",
+        "ingested": "2026-03-01T00:00:00+00:00",
+        "frequency": {"primary": primary, "secondary": []},
+        "wavelength": {
+            "phase": phase,
+            "mode": mode,
+            "orientation": "unclassified",
+            "dosage": "unclassified",
+            "color": "unclassified",
+            "descriptor": "",
+        },
+        "voice": {"voice_register": None, "confidence": None},
+        "praxis_potential": "latent",
+        "privacy_tier": "open",
+    }
+    post = frontmatter.Post(content=body, **metadata)
+    (vault / "01-Fragments" / f"{frag_id}.md").write_text(
+        frontmatter.dumps(post),
+        encoding="utf-8",
+    )
+
+
+def test_aptitude_labels_cover_every_frequency_name() -> None:
+    """Each ``FREQUENCY_NAMES`` part has a matching ``--seed-frequency`` label.
+
+    Regression guard against drift between the canonical ontology source
+    (``creek.generate.indexes.FREQUENCY_NAMES``) and the CLI label map.
+    """
+    from creek.cli import _aptitude_frequency_labels
+    from creek.generate.indexes import FREQUENCY_NAMES
+
+    labels = _aptitude_frequency_labels()
+    for freq, name in FREQUENCY_NAMES.items():
+        for part in name.split("/"):
+            normalized = part.strip().lower()
+            assert labels.get(normalized) == freq.value, (
+                f"missing alias '{normalized}' -> {freq.value}"
+            )
+
+
+def test_draft_seed_empty_topic_falls_back_to_mining(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-topic ''`` is a no-op; mining behaviour is preserved."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-topic", ""],
+    )
+    assert result.exit_code == 0
+    assert "No idea seeds surfaced" in result.output
+
+
+def test_draft_seed_flags_advertised_in_help() -> None:
+    """``creek draft --help`` documents every FEAT-032 seed flag."""
+    result = runner.invoke(app, ["draft", "--help"])
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 0
+    for flag in (
+        "--seed-fragment",
+        "--seed-topic",
+        "--seed-frequency",
+        "--seed-phase",
+        "--seed-mode",
+    ):
+        assert flag in output, f"missing {flag} in draft help"
+
+
+def test_draft_seed_fragment_mutually_exclusive_with_topic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-fragment`` plus ``--seed-topic`` exits 2 with a clear message."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-fragment",
+            "frag-A",
+            "--seed-topic",
+            "X",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
+def test_draft_seed_fragment_mutually_exclusive_with_frequency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-fragment`` plus ``--seed-frequency`` exits 2."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-fragment",
+            "frag-A",
+            "--seed-frequency",
+            "F1",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
+def test_draft_seed_invalid_frequency_lists_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown ``--seed-frequency`` exits 2 and lists valid codes + labels."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-frequency",
+            "ascending",
+        ],
+    )
+    assert result.exit_code == 2
+    output = _strip_ansi(result.output)
+    assert "Unknown --seed-frequency" in output
+    assert "F1" in output
+
+
+def test_draft_seed_invalid_phase_lists_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown ``--seed-phase`` exits 2 with the valid phases listed."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-phase",
+            "ascending",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "rising" in result.output
+
+
+def test_draft_seed_invalid_mode_lists_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown ``--seed-mode`` exits 2 with the valid stances listed."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-mode",
+            "drifting",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "inhabit" in result.output
+
+
+def test_draft_seed_fragment_happy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-fragment`` builds a draft from one specific fragment."""
+    import frontmatter as fm
+
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda: lambda _p: "Body composed from frag-keep.",
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(
+        vault,
+        frag_id="frag-keep",
+        primary="F1",
+        title="Naming what orbits",
+    )
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-fragment", "frag-keep"],
+    )
+    assert result.exit_code == 0, result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    post = fm.load(str(drafts[0]))
+    assert post.metadata["seed"] == {"fragment_id": "frag-keep"}
+    assert post.metadata["source_fragments"] == ["frag-keep"]
+
+
+def test_draft_seed_unknown_fragment_errors_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown ``--seed-fragment`` exits 1 with an honest message."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-fragment", "missing"],
+    )
+    assert result.exit_code == 1
+    assert "not found" in result.output
+
+
+def test_draft_seed_dimensional_filters_combine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-frequency`` + ``--seed-phase`` writes a draft from the intersection."""
+    import frontmatter as fm
+
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda: lambda _p: "Composed from the intersection.",
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(
+        vault,
+        frag_id="frag-A",
+        primary="F1",
+        phase="rising",
+        mode="integrate",
+    )
+    _write_seed_fragment(
+        vault,
+        frag_id="frag-B",
+        primary="F1",
+        phase="peaking",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-frequency",
+            "agency",
+            "--seed-phase",
+            "rising",
+            "--seed-mode",
+            "integrate",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    post = fm.load(str(drafts[0]))
+    seed = post.metadata["seed"]
+    assert seed["frequencies"] == ["F1"]
+    assert seed["phases"] == ["rising"]
+    assert seed["modes"] == ["integrate"]
+    assert post.metadata["source_fragments"] == ["frag-A"]
+
+
+def test_draft_seed_zero_match_exits_with_honest_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dimensional filter with zero matches exits 1 — never a silent fallback."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(vault, frag_id="frag-A", primary="F1")
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-frequency",
+            "F10",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "No source material matches" in result.output
+
+
+def test_draft_seed_topic_with_frequency_filters_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-topic`` + ``--seed-frequency`` saves the seed flags as provenance."""
+    import frontmatter as fm
+
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "Draft.")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(
+        vault,
+        frag_id="frag-A",
+        primary="F2",
+        title="Belonging at the edge",
+        body="A note about belonging in community.",
+    )
+    _write_seed_fragment(
+        vault,
+        frag_id="frag-B",
+        primary="F2",
+        title="Solo travel",
+        body="Going alone.",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-topic",
+            "belonging",
+            "--seed-frequency",
+            "receptivity",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    post = fm.load(str(drafts[0]))
+    assert post.metadata["seed"] == {
+        "topic": "belonging",
+        "frequencies": ["F2"],
+    }
+    assert post.metadata["source_fragments"] == ["frag-A"]
+
+
+def test_draft_without_seed_flags_keeps_mining_behaviour(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default behaviour is unchanged when no seed flags are passed."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    assert result.exit_code == 0
+    assert "No idea seeds surfaced" in result.output

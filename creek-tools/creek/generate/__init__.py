@@ -48,6 +48,8 @@ from creek.generate.drafts import (
     Draft,
     DraftGenerator,
     DraftLLM,
+    SeedResolutionError,
+    SeedSpec,
 )
 from creek.generate.indexes import FREQUENCY_COLORS, FREQUENCY_NAMES, IndexGenerator
 from creek.generate.lexicon import (
@@ -207,6 +209,8 @@ __all__ = [
     "PhaseTransition",
     "PunctuationHabits",
     "RhetoricalMoves",
+    "SeedResolutionError",
+    "SeedSpec",
     "SentenceMetrics",
     "SkillExemplar",
     "SkillTreeGenerator",
