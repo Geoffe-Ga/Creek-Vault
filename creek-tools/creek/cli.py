@@ -923,14 +923,27 @@ def classify(
         )
     vault_path = _resolve_vault(vault)
 
-    from creek.classify.classify_engine import run_classify
-
-    summary = run_classify(
-        vault_path=vault_path,
-        config=config,
-        method=method,
-        force=force,
+    from creek.classify.classify_engine import (
+        LLMProviderUnavailableError,
+        run_classify,
     )
+
+    try:
+        summary = run_classify(
+            vault_path=vault_path,
+            config=config,
+            method=method,
+            force=force,
+        )
+    except LLMProviderUnavailableError as exc:
+        # The engine refused to iterate because the configured LLM
+        # provider is unreachable. Surface the provider-specific
+        # remediation hint and exit non-zero so a shell pipeline does
+        # NOT see "Classified N of N" plus a clean exit when zero
+        # fragments were actually classified.
+        console.print(f"[red]Classification aborted: {exc}.[/red]")
+        raise typer.Exit(code=1) from exc
+
     # Issue #321: report manual-preserved and prior-LLM-preserved as
     # distinct counts so the operator can tell genuine hand-curation
     # ("a person tagged these") apart from the OPS-001 resume path

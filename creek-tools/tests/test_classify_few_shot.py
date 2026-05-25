@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pytest
 
 from creek.classify import few_shot
 from creek.classify.few_shot import (
@@ -13,9 +13,6 @@ from creek.classify.few_shot import (
     render_block,
     sample_examples,
 )
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class TestExamplesLoad:
@@ -212,9 +209,7 @@ class TestCoerceGuard:
 
     def test_coerce_rejects_non_dict(self) -> None:
         """The TypeError branch fires when the gate is bypassed."""
-        import pytest as _pytest
-
-        with _pytest.raises(TypeError, match="non-dict"):
+        with pytest.raises(TypeError, match="non-dict"):
             few_shot._coerce("not a dict")  # type: ignore[arg-type]
 
 

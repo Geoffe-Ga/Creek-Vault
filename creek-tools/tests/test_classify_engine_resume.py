@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import frontmatter
+import pytest
 
-from creek.classify.classify_engine import LLM_PROGRESS_FILENAME, run_classify
+from creek.classify.classify_engine import (
+    LLM_PROGRESS_FILENAME,
+    LLMClassifier,
+    run_classify,
+)
 from creek.classify.llm import LLMClassificationResult
 from creek.config import CreekConfig
 from creek.models import Fragment, FragmentSource, SourcePlatform
@@ -27,6 +32,25 @@ def _stub_llm_result(frag: Fragment, content: str = "") -> LLMClassificationResu
     """Stub for ``classify_with_reasoning`` used across resume tests."""
     del content
     return LLMClassificationResult(fragment=frag, reasoning="")
+
+
+@pytest.fixture(autouse=True)
+def _force_llm_available() -> object:
+    """Bypass the LLM-availability gate for resume-contract tests.
+
+    The OPS-001 resume tests exercise the engine with ``--method llm``
+    but rely on the LLM being mocked out at the
+    ``classify_with_reasoning`` boundary. Without this patch the
+    availability check fires first (no Ollama daemon in the test env)
+    and the engine aborts before the resume logic runs.
+    """
+    with patch.object(
+        LLMClassifier,
+        "available",
+        new_callable=PropertyMock,
+        return_value=True,
+    ) as patched:
+        yield patched
 
 
 if TYPE_CHECKING:

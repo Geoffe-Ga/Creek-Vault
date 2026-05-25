@@ -78,6 +78,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class LLMProviderUnavailableError(RuntimeError):
+    """Raised when ``creek classify --method llm`` cannot reach its provider.
+
+    Surfaced by :func:`run_classify` *before* any fragment is rewritten
+    so that:
+
+    1. The CLI can exit non-zero instead of pretending the run
+       succeeded with zero work done.
+    2. The vault stays clean — no fragments end up stamped with
+       ``classification_method: llm`` when the LLM never actually ran.
+
+    The configured provider name is preserved on the exception so the
+    CLI message can name it ("anthropic" / "ollama") and point the
+    operator at the right environment variable to fix.
+
+    Attributes:
+        provider: The configured ``llm.provider`` (e.g. ``"anthropic"``).
+    """
+
+    def __init__(self, provider: str, detail: str) -> None:
+        """Build the exception with a CLI-ready message.
+
+        Args:
+            provider: The configured LLM provider name.
+            detail: Provider-specific reason (env var missing, health
+                check failed, etc.) — embedded in the message so the
+                operator does not have to scroll back through warnings
+                to see what went wrong.
+        """
+        self.provider = provider
+        super().__init__(
+            f"LLM provider {provider!r} is unavailable: {detail}",
+        )
+
+
 @dataclass(frozen=True)
 class ClassifySummary:
     """Counts produced by a single ``creek classify`` run.
@@ -158,6 +193,13 @@ def run_classify(
 
     Returns:
         A :class:`ClassifySummary` reporting per-method counts.
+
+    Raises:
+        LLMProviderUnavailableError: When ``method == "llm"`` and the
+            configured provider fails its availability check. Raised
+            *before* any fragment is processed so the vault is not
+            polluted with bogus ``classification_method: llm`` stamps
+            when the LLM never ran.
     """
     fragments_root = vault_path / "01-Fragments"
     if not fragments_root.exists():
@@ -165,6 +207,18 @@ def run_classify(
 
     rules = RuleClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
+    if llm is not None and not llm.available:
+        # Refuse to iterate when the provider is unreachable so the
+        # vault is never stamped with ``classification_method: llm``
+        # for fragments the LLM never actually saw. The orchestrator
+        # already logged the provider-specific reason (missing API
+        # key, missing consent env var, Ollama down) as a WARNING;
+        # we capture it here for the operator-facing message so the
+        # remediation hint is not buried in stderr.
+        raise LLMProviderUnavailableError(
+            provider=config.llm.provider,
+            detail=_describe_llm_unavailability(config.llm.provider),
+        )
     counts = _RunCounts()
     progress_path: Path | None = None
     trace_log_path: Path | None = None
@@ -768,6 +822,36 @@ def _write_fragment(
     post = frontmatter.Post(content=body)
     post.metadata.update(new_metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def _describe_llm_unavailability(provider: str) -> str:
+    """Build a remediation hint for :class:`LLMProviderUnavailableError`.
+
+    The hint is provider-specific so a first-time user can act on it
+    without scrolling back through orchestrator WARNING logs. Anthropic
+    needs two env vars (API key + consent); Ollama needs the local
+    daemon to be reachable.
+
+    Args:
+        provider: ``llm.provider`` from the loaded config.
+
+    Returns:
+        Human-readable sentence the CLI can render verbatim.
+    """
+    if provider == "anthropic":
+        return (
+            "set ANTHROPIC_API_KEY and CREEK_ANTHROPIC_CONSENT=1 to "
+            "authorise sending fragment content to Anthropic's servers"
+        )
+    if provider == "ollama":
+        return (
+            "ensure the Ollama daemon is running and reachable at the "
+            "URL configured under `llm.url` in creek_config.yaml"
+        )
+    return (
+        "check the `llm.*` settings in creek_config.yaml and the "
+        "provider-specific credentials / health-check requirements"
+    )
 
 
 def _record_llm_progress(progress_path: Path, fragment_id: str) -> None:
