@@ -27,6 +27,7 @@ from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
     RawDocument,
+    file_modified_time,
     normalize_encoding,
 )
 
@@ -44,6 +45,30 @@ _BINARY_CHECK_SIZE = 8192
 
 # If more than 10% of bytes are non-text control chars, treat as binary
 _BINARY_CONTROL_THRESHOLD = 0.10
+
+
+def _safe_file_mtime(path: Path) -> datetime | None:
+    """Return *path*'s mtime as a tz-aware datetime, or ``None`` defensively.
+
+    FEAT-031 (issue #335): the GenericIngestor's authored_at extraction
+    chain is filesystem mtime only — the lowest-fidelity honest answer
+    when nothing better is available. Synthetic :class:`RawDocument`
+    instances in tests (or any future caller that passes a path with no
+    file behind it) must not raise; this wrapper swallows
+    ``FileNotFoundError`` / ``OSError`` from :func:`Path.stat` and
+    surfaces ``None`` instead, matching the FEAT-031 contract that
+    ``authored_at`` is optional.
+
+    Args:
+        path: The filesystem path to stat.
+
+    Returns:
+        A tz-aware UTC datetime when the file exists, else ``None``.
+    """
+    try:
+        return file_modified_time(path)
+    except OSError:
+        return None
 
 
 def _is_binary_content(raw_bytes: bytes) -> bool:
@@ -194,6 +219,13 @@ class GenericIngestor(Ingestor):
         Attempts multi-encoding text decoding via ``_try_decode``.
         Binary files and empty files are skipped (return empty list).
 
+        FEAT-031 (issue #335): populates ``metadata['authored_at']``
+        from the file's mtime — the lowest-fidelity honest answer the
+        generic fallback can offer. Defensive against synthetic
+        :class:`RawDocument` instances whose ``path`` does not exist
+        on disk: those produce ``authored_at = None`` rather than
+        raising.
+
         Args:
             raw: The raw document to parse.
 
@@ -213,12 +245,14 @@ class GenericIngestor(Ingestor):
             return []
 
         now = datetime.now(tz=LA_TZ)
+        authored_at = _safe_file_mtime(raw.path)
         return [
             ParsedFragment(
                 content=text,
                 metadata={
                     "file_extension": raw.path.suffix.lower(),
                     "source_type": "generic",
+                    "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
                 timestamp=now,
@@ -249,7 +283,10 @@ class GenericIngestor(Ingestor):
         """Generate YAML frontmatter for an unclaimed file.
 
         Sets ``source.platform`` to ``"unknown"`` and routes to
-        ``01-Fragments/Unsorted/``.
+        ``01-Fragments/Unsorted/``. FEAT-031 (issue #335): emits
+        ``authored_at`` as an ISO string when the parse stage
+        captured the file's mtime; omits the key when the metadata
+        value is missing or ``None`` (honest absence).
 
         Args:
             fragment: The parsed fragment.
@@ -258,7 +295,7 @@ class GenericIngestor(Ingestor):
             A dict of frontmatter key-value pairs.
         """
         title = Path(fragment.source_path).stem
-        return {
+        frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "title": title,
             "source": {
@@ -268,3 +305,7 @@ class GenericIngestor(Ingestor):
             "created": fragment.timestamp.isoformat(),
             "routing": "01-Fragments/Unsorted/",
         }
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        if authored_at is not None:
+            frontmatter_dict["authored_at"] = authored_at.isoformat()
+        return frontmatter_dict
