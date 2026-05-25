@@ -59,8 +59,10 @@ class PurgeAuditEntry(BaseModel):
         affected_fragments: Fragment IDs touched by the operation.
         fragments_deleted: Number of fragment files removed from disk.
         references_scrubbed: Number of wiki-link references removed.
-        embeddings_removed: Number of fragments whose embeddings should
-            be considered invalidated by the purge.
+        embeddings_removed: Real number of rows dropped from
+            ``<vault>/00-Creek-Meta/embeddings.parquet`` by the purge
+            (GAP-001). Zero when the cache had not been built yet or
+            when no rows matched; the actual row delta otherwise.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         target: Legacy field preserved for backward compatibility on

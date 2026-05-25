@@ -99,6 +99,10 @@ class PurgeResult(BaseModel):
         threads_updated: Thread files whose metadata changed.
         eddies_updated: Eddy files whose metadata changed.
         classifications_reset: Fragments whose classifications were wiped.
+        embeddings_removed: Real count of embedding cache rows that were
+            removed (or would be removed in a dry run). Zero for
+            metadata-only operations and for runs where the cache had
+            no matching rows (GAP-001).
     """
 
     operation: str
@@ -112,6 +116,7 @@ class PurgeResult(BaseModel):
     threads_updated: int = 0
     eddies_updated: int = 0
     classifications_reset: int = 0
+    embeddings_removed: int = 0
 
 
 class PurgeEngine:
@@ -186,6 +191,9 @@ class PurgeEngine:
         if not self.dry_run:
             frag_file.unlink()
 
+        result.embeddings_removed = self._purge_cache_for(
+            result.affected_fragment_ids,
+        )
         self._write_audit(result)
         return result
 
@@ -210,6 +218,9 @@ class PurgeEngine:
         matches = self._fragments_from_source(source_type)
         for frag_file, post in matches:
             self._purge_single(frag_file, post, result)
+        result.embeddings_removed = self._purge_cache_for(
+            result.affected_fragment_ids,
+        )
         self._write_audit(result)
         return result
 
@@ -258,6 +269,9 @@ class PurgeEngine:
         matches = self._fragments_from_source_path(source_path, match=match)
         for frag_file, post in matches:
             self._purge_single(frag_file, post, result)
+        result.embeddings_removed = self._purge_cache_for(
+            result.affected_fragment_ids,
+        )
         self._write_audit(result)
         return result
 
@@ -352,6 +366,9 @@ class PurgeEngine:
             if created is None or not (start <= created <= end):
                 continue
             self._purge_single(frag_file, post, result)
+        result.embeddings_removed = self._purge_cache_for(
+            result.affected_fragment_ids,
+        )
         self._write_audit(result)
         return result
 
@@ -393,10 +410,55 @@ class PurgeEngine:
                 continue
             self._wipe_folder_contents(folder_path, result)
         result.fragments_affected = len(result.deleted_files)
+        result.embeddings_removed = self._delete_cache_file()
         self._write_audit(result)
         return result
 
     # -- Private helpers -------------------------------------------------
+
+    def _purge_cache_for(self, fragment_ids: list[str]) -> int:
+        """Drop matching rows from the embeddings cache (GAP-001).
+
+        Called by every file-deleting purge operation *after* the
+        fragments have been removed from disk so the audit entry's
+        ``embeddings_removed`` reflects what is now provably gone from
+        the parquet cache (or what *would* be gone in a dry run).
+
+        Args:
+            fragment_ids: Fragment IDs whose cached embedding rows
+                should be scrubbed.
+
+        Returns:
+            Number of cache rows removed (or counted-only in dry-run).
+        """
+        from creek.link.embeddings import (
+            embeddings_cache_path,
+            purge_fragment_ids_from_cache,
+        )
+
+        return purge_fragment_ids_from_cache(
+            embeddings_cache_path(self.vault_path),
+            fragment_ids,
+            dry_run=self.dry_run,
+        )
+
+    def _delete_cache_file(self) -> int:
+        """Delete the embeddings cache outright (GAP-001 vault path).
+
+        Returns:
+            Number of rows that were in the cache when it was removed
+            (or that would be removed in a dry run). Zero when the
+            cache file did not exist.
+        """
+        from creek.link.embeddings import (
+            delete_embeddings_cache,
+            embeddings_cache_path,
+        )
+
+        return delete_embeddings_cache(
+            embeddings_cache_path(self.vault_path),
+            dry_run=self.dry_run,
+        )
 
     def _purge_single(
         self,
@@ -658,10 +720,11 @@ class PurgeEngine:
         ``fragments_deleted`` counts only operations that remove files
         from disk (see :data:`_FILE_DELETING_OPERATIONS`);
         ``classifications`` resets metadata in place and therefore
-        reports zero deletions. ``embeddings_removed`` mirrors
-        ``fragments_deleted`` because every deleted fragment's cached
-        embedding is invalidated at the next ``creek link`` run; the
-        engine does not maintain the embedding cache directly.
+        reports zero deletions. ``embeddings_removed`` is the *real*
+        number of rows the engine just dropped from
+        ``<vault>/00-Creek-Meta/embeddings.parquet`` (GAP-001) — zero
+        when the cache had not been built yet, zero for metadata-only
+        operations, and the actual row delta otherwise.
 
         Args:
             result: The result whose metadata should be logged.
@@ -690,7 +753,7 @@ class PurgeEngine:
             affected_fragments=result.affected_fragment_ids.copy(),
             fragments_deleted=fragments_deleted,
             references_scrubbed=result.wikilinks_removed,
-            embeddings_removed=fragments_deleted,
+            embeddings_removed=result.embeddings_removed,
             dry_run=result.dry_run,
         )
         self.audit_log.append(entry)

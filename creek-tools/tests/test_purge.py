@@ -305,7 +305,12 @@ def test_fragment_purge_dry_run_preserves_everything(tmp_path: Path) -> None:
 
 
 def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
-    """A purge_fragment call appends exactly one audit entry."""
+    """A purge_fragment call appends exactly one audit entry.
+
+    ``embeddings_removed`` is *zero* here because no embeddings cache
+    was built (GAP-001). The honest-count contract is verified
+    end-to-end by the GAP-001 tests further down in this file.
+    """
     vault = _make_vault(tmp_path)
     _write_fragment(vault, "frag-A", "Alpha")
     engine = PurgeEngine(vault)
@@ -319,7 +324,7 @@ def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
     assert entry.criteria == {"fragment_id": "frag-A"}
     assert entry.affected_fragments == ["frag-A"]
     assert entry.fragments_deleted == 1
-    assert entry.embeddings_removed == 1
+    assert entry.embeddings_removed == 0
     assert entry.operator == "human via CLI"
     assert entry.dry_run is False
 
@@ -1545,3 +1550,260 @@ def test_write_audit_rejects_unknown_operation(tmp_path: Path) -> None:
                 dry_run=False,
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# GAP-001 — purge actually removes embedding cache rows
+# ---------------------------------------------------------------------------
+
+
+def _seed_embeddings_cache(vault: Path, fragment_ids: list[str]) -> Path:
+    """Write a parquet cache with one row per supplied fragment ID.
+
+    Uses :meth:`EmbeddingLinker.save_cache` so the layout matches the
+    real one bit-for-bit; tests then assert on row presence via
+    :meth:`EmbeddingLinker.load_cache`.
+    """
+    from datetime import UTC, datetime
+
+    from creek.config import EmbeddingsConfig
+    from creek.link.embeddings import (
+        CachedEmbedding,
+        EmbeddingLinker,
+        embeddings_cache_path,
+    )
+
+    linker = EmbeddingLinker(config=EmbeddingsConfig())
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    entries = {
+        fid: CachedEmbedding(
+            fragment_id=fid,
+            content_hash="hash-" + fid,
+            model_name=linker.config.model,
+            vector=[0.1, 0.2, 0.3],
+            computed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        for fid in fragment_ids
+    }
+    linker.save_cache(entries, cache_path)
+    return cache_path
+
+
+def _load_cache_ids(vault: Path) -> set[str]:
+    """Return the set of fragment IDs currently in the embeddings cache."""
+    from creek.config import EmbeddingsConfig
+    from creek.link.embeddings import EmbeddingLinker, embeddings_cache_path
+
+    linker = EmbeddingLinker(config=EmbeddingsConfig())
+    return set(linker.load_cache(embeddings_cache_path(vault)).keys())
+
+
+def test_fragment_purge_removes_embedding_row(tmp_path: Path) -> None:
+    """``creek purge fragment <id>`` drops that fragment's row from the cache."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_fragment(vault, "frag-B", "Bravo")
+    _seed_embeddings_cache(vault, ["frag-A", "frag-B"])
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.embeddings_removed == 1
+    assert _load_cache_ids(vault) == {"frag-B"}
+
+
+def test_source_purge_removes_embedding_rows_for_each_fragment(
+    tmp_path: Path,
+) -> None:
+    """Every fragment from the purged source is scrubbed from the cache."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    _write_fragment(vault, "frag-B", "Bravo", platform="claude")
+    _write_fragment(
+        vault,
+        "frag-C",
+        "Charlie",
+        platform="discord",
+        subfolder="Messages",
+    )
+    _seed_embeddings_cache(vault, ["frag-A", "frag-B", "frag-C"])
+
+    result = PurgeEngine(vault).purge_source("claude")
+
+    assert result.embeddings_removed == 2
+    assert _load_cache_ids(vault) == {"frag-C"}
+
+
+def test_source_path_purge_removes_embedding_rows(tmp_path: Path) -> None:
+    """``purge_source_path`` scrubs cache rows for matched fragments (GAP-001).
+
+    Closes the only file-deleting purge operation lacking an end-to-end
+    GAP-001 smoke test. Uses ``--match substring`` so a single call
+    catches more than one fragment, proving the shared
+    ``_purge_cache_for`` helper is reached from this entry point too.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault,
+        "frag-A",
+        "Alpha",
+        original_file="/exports/2026-04-28.json",
+    )
+    _write_fragment_with_original(
+        vault,
+        "frag-B",
+        "Bravo",
+        original_file="/exports/2026-04-29.json",
+    )
+    _write_fragment_with_original(
+        vault,
+        "frag-C",
+        "Charlie",
+        original_file="/notes/diary.md",
+    )
+    _seed_embeddings_cache(vault, ["frag-A", "frag-B", "frag-C"])
+
+    engine = PurgeEngine(vault)
+    result = engine.purge_source_path("/exports/", match="substring")
+
+    assert result.embeddings_removed == 2
+    assert _load_cache_ids(vault) == {"frag-C"}
+    entries = engine.audit_log.read()
+    assert entries[-1].operation == "source-path"
+    assert entries[-1].embeddings_removed == 2
+
+
+def test_daterange_purge_removes_embedding_rows_in_range(tmp_path: Path) -> None:
+    """Fragments inside the purged window lose their cache row; others stay."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(
+        vault,
+        "frag-old",
+        "Old",
+        created=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    _write_fragment(
+        vault,
+        "frag-mid",
+        "Mid",
+        created=datetime(2024, 6, 1, tzinfo=UTC),
+    )
+    _write_fragment(
+        vault,
+        "frag-new",
+        "New",
+        created=datetime(2025, 1, 1, tzinfo=UTC),
+    )
+    _seed_embeddings_cache(vault, ["frag-old", "frag-mid", "frag-new"])
+
+    result = PurgeEngine(vault).purge_daterange(
+        date(2024, 5, 1),
+        date(2024, 12, 31),
+    )
+
+    assert result.embeddings_removed == 1
+    assert _load_cache_ids(vault) == {"frag-old", "frag-new"}
+
+
+def test_vault_purge_deletes_embedding_cache_file(tmp_path: Path) -> None:
+    """``creek purge vault`` removes the parquet cache outright (criterion 4)."""
+    from creek.link.embeddings import embeddings_cache_path
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    cache_path = _seed_embeddings_cache(vault, ["frag-A"])
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.embeddings_removed == 1
+    assert not cache_path.exists()
+    assert not embeddings_cache_path(vault).exists()
+
+
+def test_fragment_purge_embeddings_removed_zero_when_cache_missing(
+    tmp_path: Path,
+) -> None:
+    """Audit reports zero when the cache file has never been built (criterion 5)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+
+    engine = PurgeEngine(vault)
+    result = engine.purge_fragment("frag-A")
+
+    assert result.embeddings_removed == 0
+    entries = engine.audit_log.read()
+    assert entries[-1].embeddings_removed == 0
+
+
+def test_fragment_purge_audit_reflects_real_cache_removal(tmp_path: Path) -> None:
+    """The audit entry's ``embeddings_removed`` equals the real row delta."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _seed_embeddings_cache(vault, ["frag-A"])
+
+    engine = PurgeEngine(vault)
+    engine.purge_fragment("frag-A")
+
+    entries = engine.audit_log.read()
+    last = entries[-1]
+    assert last.embeddings_removed == 1
+    assert last.fragments_deleted == 1
+
+
+def test_fragment_purge_audit_zero_when_id_not_in_cache(tmp_path: Path) -> None:
+    """If the deleted fragment was never embedded, the audit is honest about it."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    # Cache contains other fragments but not frag-A.
+    _seed_embeddings_cache(vault, ["frag-B", "frag-C"])
+
+    engine = PurgeEngine(vault)
+    engine.purge_fragment("frag-A")
+
+    entries = engine.audit_log.read()
+    assert entries[-1].embeddings_removed == 0
+    # Untouched rows survive.
+    assert _load_cache_ids(vault) == {"frag-B", "frag-C"}
+
+
+def test_fragment_purge_dry_run_preserves_cache(tmp_path: Path) -> None:
+    """Dry-run reports the would-remove count without rewriting the cache."""
+    from creek.link.embeddings import embeddings_cache_path
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    cache_path = _seed_embeddings_cache(vault, ["frag-A"])
+    before_bytes = cache_path.read_bytes()
+
+    result = PurgeEngine(vault, dry_run=True).purge_fragment("frag-A")
+
+    assert result.embeddings_removed == 1
+    assert embeddings_cache_path(vault).read_bytes() == before_bytes
+
+
+def test_vault_purge_dry_run_preserves_cache_file(tmp_path: Path) -> None:
+    """Dry-run vault purge counts cache rows but keeps the parquet on disk."""
+    from creek.link.embeddings import embeddings_cache_path
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _seed_embeddings_cache(vault, ["frag-A", "frag-B"])
+
+    result = PurgeEngine(vault, dry_run=True).purge_vault(
+        VAULT_PURGE_CONFIRMATION,
+    )
+
+    assert result.embeddings_removed == 2
+    assert embeddings_cache_path(vault).exists()
+
+
+def test_classifications_purge_does_not_touch_cache(tmp_path: Path) -> None:
+    """Classifications reset is metadata-only; embeddings stay valid (still 0)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _seed_embeddings_cache(vault, ["frag-A"])
+
+    result = PurgeEngine(vault).purge_classifications()
+
+    assert result.embeddings_removed == 0
+    assert _load_cache_ids(vault) == {"frag-A"}
