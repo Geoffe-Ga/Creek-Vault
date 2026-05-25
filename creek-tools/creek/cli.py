@@ -1093,12 +1093,11 @@ def link(
 def _format_link_summary(summary: LinkSummary) -> str:
     """Render a method-specific summary message for the ``creek link`` CLI.
 
-    Issue #338: the legacy message ("X fragment(s), Y link(s)") used the
-    word "link" for two incompatible things — pairwise cosine edges
-    cached in the parquet (embeddings) and topic clusters that may or
-    may not have been written to disk (eddies). The per-method
-    formatting below names the actual side effect so operators can
-    correlate the number with what they see on disk.
+    Each method gets its own phrasing because the word "link" used to mean
+    two incompatible things: pairwise cosine edges cached in the parquet
+    (embeddings) and topic clusters that may or may not have been written
+    to disk (eddies). Per-method strings name the actual side effect so
+    operators can correlate the number with what they see on disk.
 
     Args:
         summary: The link summary returned by
@@ -1106,6 +1105,9 @@ def _format_link_summary(summary: LinkSummary) -> str:
 
     Returns:
         A Rich-markup string ready for :func:`console.print`.
+
+    Raises:
+        ValueError: If ``summary.method`` is not a known linker name.
     """
     fragments = summary.fragment_count
     if summary.method == "embeddings":
@@ -1122,11 +1124,13 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"{summary.member_fragments_updated} fragment(s) updated with "
             f"`eddies:` wiki-links."
         )
-    else:
-        # Temporal (issue #338 scope: leave behaviour unchanged).
+    elif summary.method == "temporal":
         body = (
             f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
         )
+    else:
+        msg = f"Unknown link method: {summary.method!r}"
+        raise ValueError(msg)
     return f"[bold green]{body}[/bold green]"
 
 

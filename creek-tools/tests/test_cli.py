@@ -1146,7 +1146,7 @@ def test_link_eddies_output_phrases_eddies_written(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     output_lower = result.output.lower()
-    assert "edd" in output_lower  # mentions eddies
+    assert "eddies" in output_lower
     # Both halves of the contract are surfaced explicitly.
     assert "detected" in output_lower
     assert "written" in output_lower

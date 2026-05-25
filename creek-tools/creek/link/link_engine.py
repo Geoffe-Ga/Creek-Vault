@@ -6,12 +6,11 @@ resulting link count back to the CLI. Honours ``--rebuild`` by deleting
 the cached embeddings parquet so the embedding linker recomputes from
 scratch.
 
-Issue #338: the eddies linker materialises its output inline — it
-writes an ``Eddy`` markdown file per detected cluster under
-``03-Eddies/`` and updates each member fragment's ``eddies:``
-frontmatter with the corresponding wiki-link. The CLI's summary reports
-the same numbers operators can see on disk so "1 link reported" can no
-longer disagree with "0 files written".
+The eddies linker materialises its output inline — it writes an
+``Eddy`` markdown file per detected cluster under ``03-Eddies/`` and
+updates each member fragment's ``eddies:`` frontmatter with the
+corresponding wiki-link, so the CLI's summary counts match what
+operators see on disk.
 """
 
 from __future__ import annotations
@@ -50,8 +49,8 @@ class LinkSummary:
     CLI can phrase what actually happened — pairwise similarity edges
     cached in a parquet are *not* per-fragment frontmatter links, and an
     eddy cluster *detected* in memory is not the same as an eddy file
-    *written* to disk. Issue #338 was filed because the original
-    ``link_count`` field overloaded both concepts under one label.
+    *written* to disk. ``link_count`` is preserved as a back-compat
+    mirror of the method-specific count.
 
     Attributes:
         method: Linker that was run (``embeddings`` / ``temporal`` /
@@ -158,16 +157,16 @@ def _run_eddies(
     cache_path: Path,
     vault_path: Path,
 ) -> LinkSummary:
-    """Detect eddies and materialise them inline (issue #338).
+    """Detect eddies and materialise them inline.
 
-    Issue #338 picked inline materialisation over deferring to
-    ``creek compile`` for two reasons:
+    Inline materialisation is chosen over deferring to ``creek compile``
+    for two reasons:
 
     1. The detector already produces fully-formed :class:`Eddy` models
-       and a membership map; the only missing step was the filesystem
+       and a membership map; the only missing step is the filesystem
        write — :meth:`VaultWriter.write_eddy` already exists.
     2. The ``creek compile`` flow is a per-target manual invocation; it
-       was never the bulk persistence path for detected eddies.
+       is not the bulk persistence path for detected eddies.
 
     The function:
 
@@ -207,9 +206,6 @@ def _run_eddies(
             method="eddies",
             fragment_count=len(fragments),
             link_count=0,
-            eddies_detected=0,
-            eddies_written=0,
-            member_fragments_updated=0,
         )
 
     updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
@@ -300,12 +296,13 @@ def _persist_fragment_eddy_updates(
     Returns:
         Number of fragment files that were successfully rewritten.
     """
-    records = iter_vault_fragments(vault_path / "01-Fragments")
-    path_by_id: dict[str, Path] = {frag.id: path for path, frag, _, _ in records}
-    raw_by_id: dict[str, dict[str, object]] = {
-        frag.id: raw for _, frag, _, raw in records
-    }
-    body_by_id: dict[str, str] = {frag.id: body for _, frag, body, _ in records}
+    path_by_id: dict[str, Path] = {}
+    raw_by_id: dict[str, dict[str, object]] = {}
+    body_by_id: dict[str, str] = {}
+    for path, frag, body, raw in iter_vault_fragments(vault_path / "01-Fragments"):
+        path_by_id[frag.id] = path
+        raw_by_id[frag.id] = raw
+        body_by_id[frag.id] = body
 
     written = 0
     for before, after in zip(original, updated, strict=True):

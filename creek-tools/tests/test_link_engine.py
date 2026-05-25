@@ -634,10 +634,22 @@ def test_run_link_eddies_fragment_write_oserror_is_logged(tmp_path: Path) -> Non
     # the eddy file itself still lands.
     real_write_text = _Path.write_text
 
-    def _selective_write(self: _Path, *args: object, **kwargs: object) -> int:
+    def _selective_write(
+        self: _Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
         if self.suffix == ".md" and self.parent.name == "Notes":
             raise OSError("read-only volume")
-        return real_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real_write_text(
+            self,
+            data,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
 
     with patch.object(_Path, "write_text", _selective_write):
         summary = run_link(
@@ -651,3 +663,67 @@ def test_run_link_eddies_fragment_write_oserror_is_logged(tmp_path: Path) -> Non
     # fragment frontmatter was rewritten.
     assert summary.eddies_written >= 1
     assert summary.member_fragments_updated == 0
+
+
+def test_run_link_eddies_preserves_extra_frontmatter_and_body(
+    tmp_path: Path,
+) -> None:
+    """Rewriting a fragment's ``eddies:`` list does not drop other keys.
+
+    The fragment-rewrite path re-reads the raw YAML so operator-applied
+    keys (``classification_method``, custom tags) and the markdown body
+    survive verbatim. Without this guarantee a future refactor that
+    dropped the ``raw.copy()`` step would silently corrupt user vaults.
+    """
+    from datetime import datetime, timedelta
+
+    import frontmatter
+
+    vault = tmp_path / "vault"
+    base = datetime(2026, 4, 1)
+    day_offsets = [600, 45, 400, 120, 500, 15]
+    fragments: list[Fragment] = []
+    custom_body = "Body paragraph one.\n\nBody paragraph two with [[link]]."
+    for i in range(6):
+        frag = Fragment(
+            id=f"frag-extras-{i:03d}",
+            title="Ceramics studio practice",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            created=base - timedelta(days=day_offsets[i]),
+        )
+        _write_fragment(
+            vault=vault,
+            fragment=frag,
+            body=custom_body,
+            method="manual",
+            extras={"operator_tags": ["studio", "ritual"], "custom_key": "preserved"},
+        )
+        fragments.append(frag)
+
+    config = CreekConfig()
+    linker = EmbeddingLinker(config=config.embeddings)
+    vectors = {frag.id: [1.0, 0.0, 0.0] for frag in fragments}
+    entries = linker.build_cache_entries(fragments, vectors)
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(entries, cache_path)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+    assert summary.member_fragments_updated == len(fragments)
+
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    for frag in fragments:
+        post = frontmatter.load(str(fragments_dir / f"{frag.id}.md"))
+        assert post.get("classification_method") == "manual"
+        assert post.get("operator_tags") == ["studio", "ritual"]
+        assert post.get("custom_key") == "preserved"
+        assert post.content == custom_body
+        eddies_field = post.get("eddies") or []
+        assert any(
+            isinstance(entry, str) and entry.startswith("[[") for entry in eddies_field
+        ), f"Fragment {frag.id} lost its eddy wiki-link"
