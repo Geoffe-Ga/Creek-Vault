@@ -9,18 +9,41 @@ files.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import frontmatter
+import pytest
 
-from creek.classify.classify_engine import run_classify
-from creek.classify.llm import LLMClassificationResult
+from creek.classify.classify_engine import (
+    LLMProviderUnavailableError,
+    _describe_llm_unavailability,
+    run_classify,
+)
+from creek.classify.llm import LLMClassificationResult, LLMClassifier
 from creek.config import CreekConfig
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from tests.helpers import write_fragment_file as _write_fragment
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+@pytest.fixture(autouse=True)
+def _force_llm_available() -> object:
+    """Bypass the LLM-availability gate for engine tests by default.
+
+    Most engine tests mock the LLM at the ``classify_with_reasoning``
+    boundary and rely on the availability gate being open. Tests that
+    exercise the unavailable path (issue #317) re-patch ``available``
+    locally to return ``False``.
+    """
+    with patch.object(
+        LLMClassifier,
+        "available",
+        new_callable=PropertyMock,
+        return_value=True,
+    ) as patched:
+        yield patched
 
 
 def test_run_classify_returns_zeroes_when_no_fragments_dir(tmp_path: Path) -> None:
@@ -851,3 +874,221 @@ def test_run_classify_reatomize_invokes_orchestrator(tmp_path: Path) -> None:
         )
 
     spy.assert_called()
+
+
+# ---- --method llm fails loudly when the provider is unavailable ----
+
+
+def test_run_classify_llm_unavailable_raises_before_processing(
+    tmp_path: Path,
+) -> None:
+    """``--method llm`` raises when the provider is unavailable.
+
+    Symptom from the bug report: when the Anthropic provider is
+    configured but ``CREEK_ANTHROPIC_CONSENT`` is unset, the engine
+    iterated over every fragment, the LLM short-circuited to "return
+    unchanged", and the summary lied that "Classified N of N"
+    succeeded. Worse, the process exited 0 — a shell pipeline reading
+    the exit code saw a clean success.
+
+    Fix contract: when the engine is asked for ``--method llm`` and the
+    classifier reports ``available is False``, it raises
+    :class:`LLMProviderUnavailableError` **before** rewriting any
+    fragments. The CLI translates this to a non-zero exit.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-llmunavail01",
+        title="placeholder",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    file = _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="ordinary content with no signal keywords at all",
+    )
+    original_text = file.read_text(encoding="utf-8")
+
+    with (
+        patch.object(
+            LLMClassifier,
+            "available",
+            new_callable=PropertyMock,
+            return_value=False,
+        ),
+        pytest.raises(LLMProviderUnavailableError),
+    ):
+        run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="llm",
+            force=False,
+        )
+
+    # Fragments on disk are untouched — no spurious ``classification_method:
+    # llm`` stamp gets written when the LLM never actually ran.
+    assert file.read_text(encoding="utf-8") == original_text
+
+
+def test_run_classify_llm_unavailable_message_names_provider(
+    tmp_path: Path,
+) -> None:
+    """The unavailable error mentions the configured provider name.
+
+    A first-time user staring at ``creek classify --method llm`` failing
+    needs to know which provider Creek tried to reach so they can fix
+    the right environment variable. Pin the provider name into the
+    error message.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-llmunavail02",
+        title="placeholder",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="content",
+    )
+    config = CreekConfig()
+    config.llm.provider = "anthropic"
+
+    with (
+        patch.object(
+            LLMClassifier,
+            "available",
+            new_callable=PropertyMock,
+            return_value=False,
+        ),
+        pytest.raises(LLMProviderUnavailableError, match="anthropic"),
+    ):
+        run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+
+def test_run_classify_llm_unavailable_skips_progress_dir_writes(
+    tmp_path: Path,
+) -> None:
+    """The progress log file is not created when the LLM never runs.
+
+    A non-zero-exit failure path should leave the vault clean: no
+    bookkeeping artefacts that suggest a partial run. The progress
+    directory (00-Creek-Meta/Processing-Log) gets created up-front, but
+    the ``llm-progress.jsonl`` file inside it should never appear when
+    the LLM never executes.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-llmunavail03",
+        title="placeholder",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="content",
+    )
+
+    with (
+        patch.object(
+            LLMClassifier,
+            "available",
+            new_callable=PropertyMock,
+            return_value=False,
+        ),
+        pytest.raises(LLMProviderUnavailableError),
+    ):
+        run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="llm",
+            force=False,
+        )
+
+    progress_file = vault / "00-Creek-Meta" / "Processing-Log" / "llm-progress.jsonl"
+    assert not progress_file.exists()
+
+
+# ---- _describe_llm_unavailability: per-provider remediation hint ----
+
+
+def test_describe_llm_unavailability_anthropic_mentions_api_key_and_consent() -> None:
+    """The Anthropic hint names both env vars the operator must set.
+
+    Pinning both names so a search for either ``ANTHROPIC_API_KEY`` or
+    ``CREEK_ANTHROPIC_CONSENT`` in the codebase keeps surfacing the
+    user-facing remediation copy. If a future refactor splits these into
+    separate sentences the test still passes; if either disappears the
+    test fails loudly.
+    """
+    message = _describe_llm_unavailability("anthropic")
+    assert "ANTHROPIC_API_KEY" in message
+    assert "CREEK_ANTHROPIC_CONSENT" in message
+
+
+def test_describe_llm_unavailability_ollama_mentions_daemon_and_url() -> None:
+    """The Ollama hint points at the local daemon and the config URL key.
+
+    Ollama failures are local-process failures (daemon not running, wrong
+    port), so the remediation has to direct the operator at the daemon
+    and the ``llm.url`` setting that controls where Creek looks for it.
+    """
+    message = _describe_llm_unavailability("ollama")
+    assert "Ollama" in message or "ollama" in message
+    assert "llm.url" in message
+
+
+def test_describe_llm_unavailability_unknown_provider_falls_back_to_generic() -> None:
+    """Unknown providers get a generic ``creek_config.yaml`` pointer.
+
+    Pins the fallback branch so adding a third provider to
+    ``orchestrator.py`` without updating this helper does not silently
+    swallow the operator-facing remediation hint — instead they get the
+    generic message until the helper is taught about the new provider.
+    """
+    message = _describe_llm_unavailability("vertex")
+    assert "creek_config.yaml" in message
+    # The generic branch must NOT leak provider-specific env-var names
+    # that would be misleading for the unknown provider.
+    assert "ANTHROPIC_API_KEY" not in message
+    assert "Ollama" not in message
+
+
+def test_run_classify_rules_does_not_construct_llm(
+    tmp_path: Path,
+) -> None:
+    """``--method rules`` never constructs the LLM classifier.
+
+    The availability gate must not bleed into the rules-only path —
+    a vault without any LLM credentials configured must classify with
+    rules cleanly.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-rulesonly001",
+        title="rules only",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body="power dominance bold rage warrior conquest",
+    )
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier",
+    ) as mock_cls:
+        summary = run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="rules",
+            force=False,
+        )
+
+    mock_cls.assert_not_called()
+    assert summary.classified == 1

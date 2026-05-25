@@ -719,6 +719,139 @@ def test_classify_summary_distinguishes_manual_and_prior_llm(tmp_path: Path) -> 
     assert "1 previously LLM-classified preserved" in normalized
 
 
+# ---- Issue #317: --method llm exits non-zero on unavailable provider ----
+
+
+def _seed_single_fragment(vault: Path) -> Path:
+    """Write one minimal Creek fragment under *vault* and return its path.
+
+    Local CLI-test seed. The engine-test suite has a richer
+    :func:`tests.helpers.write_fragment_file` helper; this one is kept
+    minimal so the CLI tests can assert on a known-clean
+    ``ordinary content`` body without inheriting engine-test fixtures.
+    """
+    import frontmatter
+
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True)
+    fragment = Fragment(
+        id="frag-cliseed00001",
+        title="placeholder",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    file = fragments_dir / "frag.md"
+    file.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="ordinary content",
+                **fragment.model_dump(mode="json"),
+            ),
+        ),
+        encoding="utf-8",
+    )
+    return file
+
+
+def test_classify_llm_unavailable_exits_non_zero(tmp_path: Path) -> None:
+    """``creek classify --method llm`` exits non-zero when provider is down.
+
+    Reproduces the reported symptom: prior to the fix the CLI printed
+    ``Classified N of N`` and exited 0 even when the LLM provider had
+    not run a single classification. The shell pipeline could not
+    distinguish success from silent failure.
+    """
+    from unittest.mock import PropertyMock, patch
+
+    from creek.classify.classify_engine import LLMClassifier
+
+    vault = tmp_path / "vault"
+    _seed_single_fragment(vault)
+
+    with patch.object(
+        LLMClassifier,
+        "available",
+        new_callable=PropertyMock,
+        return_value=False,
+    ):
+        result = runner.invoke(
+            app,
+            ["classify", "--vault", str(vault), "--method", "llm"],
+        )
+
+    assert result.exit_code != 0, result.output
+    # The misleading "Classified N of N" summary must NOT appear when
+    # zero fragments were classified — that is the second half of the
+    # bug report.
+    assert "Classified" not in result.output
+
+
+def test_classify_llm_unavailable_message_names_provider(
+    tmp_path: Path,
+) -> None:
+    """The aborted-run message names the provider so the user can fix it."""
+    from unittest.mock import PropertyMock, patch
+
+    from creek.classify.classify_engine import LLMClassifier
+
+    vault = tmp_path / "vault"
+    _seed_single_fragment(vault)
+
+    # CreekConfig defaults to provider="ollama"; the message must say so.
+    with patch.object(
+        LLMClassifier,
+        "available",
+        new_callable=PropertyMock,
+        return_value=False,
+    ):
+        result = runner.invoke(
+            app,
+            ["classify", "--vault", str(vault), "--method", "llm"],
+        )
+
+    plain = _strip_ansi(result.output)
+    assert "ollama" in plain
+    assert "aborted" in plain.lower() or "unavailable" in plain.lower()
+
+
+def test_classify_llm_unavailable_leaves_fragment_unstamped(
+    tmp_path: Path,
+) -> None:
+    """No fragment ends up stamped with ``classification_method: llm``.
+
+    The pre-fix bug rewrote every fragment with ``classification_method:
+    llm`` even when the LLM never ran — corrupting the resume contract
+    (next run would skip them, thinking they were already classified).
+    Pin the fix: when the provider is unavailable, fragments are left
+    completely untouched.
+    """
+    from unittest.mock import PropertyMock, patch
+
+    import frontmatter
+
+    from creek.classify.classify_engine import LLMClassifier
+
+    vault = tmp_path / "vault"
+    file = _seed_single_fragment(vault)
+    before = frontmatter.load(str(file))
+    assert "classification_method" not in before.metadata
+
+    with patch.object(
+        LLMClassifier,
+        "available",
+        new_callable=PropertyMock,
+        return_value=False,
+    ):
+        runner.invoke(
+            app,
+            ["classify", "--vault", str(vault), "--method", "llm"],
+        )
+
+    after = frontmatter.load(str(file))
+    assert "classification_method" not in after.metadata
+
+
 # ---- FEAT-017b: --calibrate ----
 
 

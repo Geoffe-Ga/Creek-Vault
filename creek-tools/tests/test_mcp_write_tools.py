@@ -381,6 +381,58 @@ def test_classify_runs_rules_on_empty_vault(vault: Path) -> None:
     assert entries[-1]["affected_fragment_ids"] == []
 
 
+def test_classify_refuses_when_llm_provider_unavailable(vault: Path) -> None:
+    """MCP classify returns a structured refusal, not a traceback.
+
+    The fail-fast gate in :func:`run_classify` raises
+    ``LLMProviderUnavailableError`` when the LLM cannot be reached. The
+    MCP wrapper must translate that to the standard ``status: refused``
+    payload so callers see a stable shape, never an unhandled
+    ``RuntimeError`` propagating through the MCP transport.
+    """
+    from unittest.mock import PropertyMock, patch
+
+    from creek.classify.classify_engine import LLMClassifier
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+
+    # Seed at least one fragment so the engine reaches the gate (an
+    # empty 01-Fragments early-returns before the availability check).
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    fragment = Fragment(
+        id="frag-mcpunavail01",
+        title="placeholder",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    file = fragments_dir / "frag.md"
+    file.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="content",
+                **fragment.model_dump(mode="json"),
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.object(
+        LLMClassifier,
+        "available",
+        new_callable=PropertyMock,
+        return_value=False,
+    ):
+        result = classify_tool(
+            vault_path=vault,
+            method="llm",
+            privacy_tier_ceiling=TierCeiling.OPEN,
+            consumer="crawdad",
+        )
+
+    assert result["status"] == "refused"
+    assert result["tool"] == "creek.classify"
+    assert "unavailable" in result["reason"]
+
+
 # ---------------------------------------------------------------------------
 # link
 # ---------------------------------------------------------------------------
