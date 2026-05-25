@@ -20,7 +20,7 @@ from creek.classify.privacy_filter import (
     parse_include_tier,
     record_privacy_override,
 )
-from creek.config import load_config
+from creek.config import load_config, resolve_config_path
 from creek.consent import ConsentManager
 from creek.models import PrivacyTier
 from creek.pipeline import Pipeline, RedactionRequiredError
@@ -485,7 +485,7 @@ def process(
     pre-LLM yield line emitted at the end of the run reports the
     deterministic / local-model / residue counts.
     """
-    config = load_config()
+    config = _load_config_for_vault(vault)
     source_path = source or config.source_drive
     vault_path = vault or config.vault_path
 
@@ -574,7 +574,7 @@ def ingest(
         console.print("[red]--type and --input are required.[/red]")
         raise typer.Exit(code=2)
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     ingestor_cls = _resolve_ingestor(type)
 
@@ -614,7 +614,7 @@ def _run_refresh_dates(vault: Path | None) -> None:
     """
     from creek.ingest.refresh import refresh_authored_dates
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     if not vault_path.exists():
         console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
@@ -675,7 +675,7 @@ def _dispatch_redact(
 
     if scan:
         src = require_flag(source, "--scan", "--source", console)
-        run_scan(src, report=report, verbose=verbose, console=console)
+        run_scan(src, report=report, verbose=verbose, console=console, vault=vault)
         return
     if apply:
         src = require_flag(source, "--apply", "--source", console)
@@ -825,6 +825,7 @@ def classify(
         _run_calibration_cli(
             fixture_path=calibration_fixture,
             enforce_floors=enforce_floors,
+            vault=vault,
         )
         return
 
@@ -841,7 +842,7 @@ def classify(
         )
         raise typer.Exit(code=2)
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     if reatomize:
         # Late-bind the FEAT-023 CLI overrides into the loaded config so
         # downstream call-sites only ever look at the config object, not
@@ -917,6 +918,7 @@ def _run_calibration_cli(
     *,
     fixture_path: Path | None,
     enforce_floors: bool,
+    vault: Path | None = None,
 ) -> None:
     """Drive `creek classify --calibrate` end-to-end (FEAT-017b).
 
@@ -929,6 +931,8 @@ def _run_calibration_cli(
         fixture_path: Operator-supplied fixture path; ``None`` falls
             back to :data:`_DEFAULT_CALIBRATION_FIXTURE`.
         enforce_floors: Exit non-zero on floor breach when ``True``.
+        vault: Optional vault root threaded through for config
+            auto-discovery (issue #322).
     """
     from creek.classify.calibration import (
         CalibrationFloorBreachError,
@@ -954,7 +958,7 @@ def _run_calibration_cli(
         console.print(message)
         raise typer.Exit(code=2)
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     classifier = LLMClassifier(config=config.llm)
     report = run_calibration(classifier, load_fixture(resolved))
     console.print(report.render())
@@ -995,7 +999,7 @@ def link(
         )
         raise typer.Exit(code=2)
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
 
     from creek.link.link_engine import run_link
@@ -1051,7 +1055,7 @@ def compile_(
         )
         raise typer.Exit(code=2)
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
     kind = cast("CompileTargetKind", target_kind)
     written = compile_to_vault(
@@ -1083,7 +1087,7 @@ def _report_unnamed(vault_path: Path) -> None:
     from creek.generate.unnamed import UnnamedDigestGenerator
     from creek.link.embeddings import EmbeddingLinker
 
-    config = load_config()
+    config = _load_config_for_vault(vault_path)
     linker = EmbeddingLinker(config=config.embeddings)
     digest_generator = UnnamedDigestGenerator(embedding_linker=linker)
     today = _date.today()
@@ -1165,7 +1169,7 @@ def report(
     not available. ``mine`` and ``draft`` audit *after* the handler
     runs because the IDs are derived from mining seeds.
     """
-    config = load_config()
+    config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     override = _parse_include_tier(include_tier)
     _audit_privacy_override_if_needed(
@@ -1263,7 +1267,7 @@ def lint(
     """
     from creek.lint import LintRunner, parse_since
 
-    config = load_config()
+    config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     since_dt = None
     if since is not None:
@@ -1799,6 +1803,10 @@ def _build_draft_llm() -> DraftLLM:
     """Construct a :data:`DraftLLM` callable from the configured LLM provider.
 
     Uses the Ollama/Anthropic adapter already wired up for classification.
+    Reads the vault-resolved config via :func:`load_config` so the helper
+    keeps a stable zero-arg signature; the ``draft`` command pre-warms
+    ``CREEK_CONFIG`` resolution by calling :func:`_load_config_for_vault`
+    upstream (issue #322).
 
     Returns:
         A callable ``(prompt) -> response`` ready to feed to
@@ -2220,6 +2228,27 @@ def save_cmd(
 # ---------------------------------------------------------------------------
 
 
+def _load_config_for_vault(vault: Path | None) -> CreekConfig:
+    """Load :class:`CreekConfig`, auto-discovering ``--vault``'s config (issue #322).
+
+    Wraps :func:`creek.config.resolve_config_path` + :func:`load_config`
+    so every CLI command that accepts ``--vault <path>`` automatically
+    picks up ``<path>/00-Creek-Meta/creek_config.yaml`` when neither
+    ``--config`` nor ``CREEK_CONFIG`` is set. Explicit overrides still
+    take precedence; the helper is otherwise transparent to existing
+    callers.
+
+    Args:
+        vault: Vault root from the command's ``--vault`` flag, or
+            ``None`` when the command was invoked without one.
+
+    Returns:
+        A fully-validated :class:`CreekConfig`.
+    """
+    config_path = resolve_config_path(vault, None)
+    return load_config(config_path)
+
+
 def _resolve_vault(vault: Path | None) -> Path:
     """Resolve vault path from argument or config.
 
@@ -2231,7 +2260,7 @@ def _resolve_vault(vault: Path | None) -> Path:
     """
     if vault is not None:
         return vault
-    return load_config().vault_path
+    return _load_config_for_vault(vault).vault_path
 
 
 @clean_app.command(name="orphans")

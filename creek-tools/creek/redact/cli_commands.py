@@ -24,7 +24,7 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
-from creek.config import load_config
+from creek.config import load_config, resolve_config_path
 from creek.redact.audit import RedactionAuditEntry, RedactionAuditLog
 from creek.redact.patterns import PATTERN_METADATA
 from creek.redact.redactor import Redactor
@@ -338,6 +338,7 @@ def run_scan(
     report: bool,
     verbose: bool,
     console: Console,
+    vault: Path | None = None,
 ) -> ScanSummary:
     """Scan *source* for sensitive data and render a report.
 
@@ -346,12 +347,15 @@ def run_scan(
         report: When ``True``, render the detailed markdown report.
         verbose: When ``True``, also list every individual match.
         console: Rich console sink.
+        vault: Optional vault root used to auto-discover
+            ``<vault>/00-Creek-Meta/creek_config.yaml`` (issue #322).
+            Ignored when ``CREEK_CONFIG`` is set or the file is absent.
 
     Returns:
         The :class:`ScanSummary` produced by the scanner.
     """
     _require_existing(console, source, "Source path")
-    config = load_config()
+    config = load_config(resolve_config_path(vault, None))
     scanner, summary = _scan_source(source, config)
     render_summary(summary, console)
     if verbose:
@@ -556,7 +560,7 @@ def run_apply(
     _require_existing(console, source, "Source path")
     if source.is_dir():
         _assert_no_escaping_symlinks(source, console=console, label="source")
-    config = load_config()
+    config = load_config(resolve_config_path(vault, None))
     vault_path = vault if vault is not None else config.vault_path
     scanner, summary = _scan_source(source, config)
     render_summary(summary, console)
@@ -613,7 +617,7 @@ def run_review(
     _require_existing(console, vault, "Vault path")
     if vault.is_dir():
         _assert_no_escaping_symlinks(vault, console=console, label="vault")
-    config = load_config()
+    config = load_config(resolve_config_path(vault, None))
     scanner, summary = _scan_source(vault, config)
     render_summary(summary, console)
     if verbose:
