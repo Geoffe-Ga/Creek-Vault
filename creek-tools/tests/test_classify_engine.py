@@ -700,3 +700,154 @@ def test_run_classify_llm_persists_all_wavelength_fields(tmp_path: Path) -> None
     assert wavelength["dosage"] == "medicine"
     assert wavelength["color"] == "red"
     assert wavelength["descriptor"] == "Power-With"
+
+
+# ---- Issue #318: YAML ``classification.reatomize: true`` is honored --------
+
+
+_MULTI_PARAGRAPH_BODY: str = (
+    "First paragraph carries some loose musing about ordinary subject matter.\n"
+    "\n"
+    "Second paragraph shifts register entirely and pulls in another thread.\n"
+    "\n"
+    "Third paragraph closes with yet another distinct slice of content."
+)
+"""Body wide enough that the FEAT-021 splitter produces multiple children.
+
+The ``document``-level splitter cascades to paragraph chunks when no
+headings exist, so three blank-line-separated paragraphs guarantee
+three child fragments are produced.
+"""
+
+
+def test_run_classify_honors_yaml_reatomize_default(tmp_path: Path) -> None:
+    """``classification.reatomize: true`` fires FEAT-023 without ``--reatomize``.
+
+    Regression test for issue #318: setting the YAML default for
+    ``classification.reatomize`` previously had no effect — only the
+    ``--reatomize`` CLI flag fired the splitter. The wire-up lives in
+    the engine, so YAML and CLI now reach the same code path.
+    """
+    vault = tmp_path / "vault"
+    parent = Fragment(
+        id="frag-yamlreatm01",
+        title="document needing zoom-in",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=parent, body=_MULTI_PARAGRAPH_BODY)
+
+    config = CreekConfig()
+    # The smoking gun: only the YAML default is on. No CLI flag involved.
+    config.classification.reatomize = True
+    # Force the LLM path even on the (already short) rule result so the
+    # mocked LLM low-confidence return value drives the orchestrator.
+    config.classification.confidence_threshold = 1.0
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=lambda f, content="": LLMClassificationResult(
+            fragment=f,
+            reasoning="",
+        ),
+    ):
+        summary = run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+    # The root fragment is still counted as classified.
+    assert summary.total == 1
+    assert summary.classified == 1
+
+    # The splitter produced child fragment files with the parent ID set.
+    notes_dir = vault / "01-Fragments" / "Notes"
+    children = [
+        frontmatter.load(str(p))
+        for p in notes_dir.glob("*.md")
+        if p.name != "frag-yamlreatm01.md"
+    ]
+    assert children, "FEAT-023 splitter did not write any child fragments"
+    assert all(child.metadata.get("parent_id") == parent.id for child in children)
+
+
+def test_run_classify_skips_reatomize_when_yaml_disables_it(tmp_path: Path) -> None:
+    """The default (``reatomize: false``) keeps the engine on the single-pass path."""
+    vault = tmp_path / "vault"
+    parent = Fragment(
+        id="frag-noreatm0001",
+        title="document staying whole",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=parent, body=_MULTI_PARAGRAPH_BODY)
+
+    config = CreekConfig()
+    # Defaults: reatomize is False. Force LLM path; mock low-confidence return.
+    config.classification.confidence_threshold = 1.0
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=lambda f, content="": LLMClassificationResult(
+            fragment=f,
+            reasoning="",
+        ),
+    ):
+        run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+    notes_dir = vault / "01-Fragments" / "Notes"
+    # No new files: the single original fragment file is the only output.
+    assert sorted(p.name for p in notes_dir.glob("*.md")) == [
+        "frag-noreatm0001.md",
+    ]
+
+
+def test_run_classify_reatomize_invokes_orchestrator(tmp_path: Path) -> None:
+    """When YAML enables reatomize, ``classify_reatomize`` is invoked, not bypassed.
+
+    This pins the wire-up at the call-site level so a future refactor
+    that satisfies the "children on disk" assertion via a different
+    code path still has to go through the FEAT-023 orchestrator (or
+    explicitly reroute this test).
+    """
+    vault = tmp_path / "vault"
+    parent = Fragment(
+        id="frag-orchcall001",
+        title="check orchestrator",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=parent, body=_MULTI_PARAGRAPH_BODY)
+
+    config = CreekConfig()
+    config.classification.reatomize = True
+    config.classification.confidence_threshold = 1.0
+
+    with (
+        patch(
+            "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+            side_effect=lambda f, content="": LLMClassificationResult(
+                fragment=f,
+                reasoning="",
+            ),
+        ),
+        patch(
+            "creek.classify.classify_engine.classify_reatomize",
+            wraps=__import__(
+                "creek.classify.reatomize",
+                fromlist=["classify_reatomize"],
+            ).classify_reatomize,
+        ) as spy,
+    ):
+        run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+    spy.assert_called()
