@@ -33,6 +33,7 @@ from creek.models import (
     Thread,
     ThreadStatus,
 )
+from creek.time import effective_authored_at
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -410,7 +411,10 @@ class CompostTracker:
         """Return a project candidate for *tag*, or ``None`` if still active."""
         if len(frags) < self.project_min_fragments:
             return None
-        last_seen = max(frag.created for frag in frags)
+        # FEAT-031: measure silence against the authored-date precedence
+        # so a project whose fragments were merely *ingested* recently
+        # but authored long ago is still recognised as silent.
+        last_seen = max(effective_authored_at(frag) for frag in frags)
         if last_seen >= cutoff:
             return None
         days = (self._now - last_seen).days

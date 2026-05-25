@@ -126,12 +126,21 @@ def _fragment(
     tags: list[str] | None = None,
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED,
 ) -> Fragment:
-    """Build a minimal fragment for testing."""
+    """Build a minimal fragment for testing.
+
+    The supplied ``created`` is mirrored into ``ingested`` so the
+    FEAT-031 ``effective_authored_at`` helper — which falls back to
+    ``ingested`` when ``authored_at`` is unset — sees the time the
+    test cares about. Without the mirror, every test fragment would
+    surface at construction-time wall-clock (tz-aware) and silence
+    calculations against a naive ``self._now`` would raise.
+    """
     return Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=SourcePlatform.JOURNAL),
         created=created,
+        ingested=created,
         frequency=FrequencyClassification(primary=Frequency.F5),
         voice=VoiceClassification(confidence=confidence),
         praxis_potential=praxis_potential,
@@ -494,6 +503,42 @@ class TestDetectCompostCandidates:
         candidates = tracker.detect_compost_candidates([resolved_thread], [frag])
         thread_cand = next(c for c in candidates if c.source_type == "thread")
         assert frag.id in thread_cand.energy_fragment_ids
+
+    def test_project_silence_cutoff_uses_authored_at(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """FEAT-031: project silence is measured against ``authored_at``.
+
+        All fragments share the same recent ``created`` (they were
+        ingested today, in one batch), but they were *authored* years
+        ago — well past the dormancy threshold. Without FEAT-031 the
+        project would look active and silently escape compost; with the
+        fix the authored history surfaces it as a silent project.
+        """
+        ingest_moment = reference_now - timedelta(hours=1)
+        authored_dates = [
+            datetime(2024, 1, 15, 12, 0, 0),
+            datetime(2024, 2, 10, 12, 0, 0),
+            datetime(2024, 3, 5, 12, 0, 0),
+        ]
+        fragments = [
+            Fragment(
+                id=f"frag-feat031-proj-{i}",
+                title=f"Greenhouse notes {i}",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                created=ingest_moment,
+                ingested=ingest_moment,
+                authored_at=authored,
+                frequency=FrequencyClassification(primary=Frequency.F5),
+                tags=["greenhouse"],
+            )
+            for i, authored in enumerate(authored_dates)
+        ]
+        tracker = CompostTracker(now=reference_now)
+        candidates = tracker.detect_compost_candidates([], fragments)
+        project_candidates = [c for c in candidates if c.source_type == "project"]
+        assert any(c.source_id == "greenhouse" for c in project_candidates)
 
 
 # ---- CompostTracker.create_compost_note ----
