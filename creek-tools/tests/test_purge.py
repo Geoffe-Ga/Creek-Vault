@@ -1634,6 +1634,45 @@ def test_source_purge_removes_embedding_rows_for_each_fragment(
     assert _load_cache_ids(vault) == {"frag-C"}
 
 
+def test_source_path_purge_removes_embedding_rows(tmp_path: Path) -> None:
+    """``purge_source_path`` scrubs cache rows for matched fragments (GAP-001).
+
+    Closes the only file-deleting purge operation lacking an end-to-end
+    GAP-001 smoke test. Uses ``--match substring`` so a single call
+    catches more than one fragment, proving the shared
+    ``_purge_cache_for`` helper is reached from this entry point too.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault,
+        "frag-A",
+        "Alpha",
+        original_file="/exports/2026-04-28.json",
+    )
+    _write_fragment_with_original(
+        vault,
+        "frag-B",
+        "Bravo",
+        original_file="/exports/2026-04-29.json",
+    )
+    _write_fragment_with_original(
+        vault,
+        "frag-C",
+        "Charlie",
+        original_file="/notes/diary.md",
+    )
+    _seed_embeddings_cache(vault, ["frag-A", "frag-B", "frag-C"])
+
+    engine = PurgeEngine(vault)
+    result = engine.purge_source_path("/exports/", match="substring")
+
+    assert result.embeddings_removed == 2
+    assert _load_cache_ids(vault) == {"frag-C"}
+    entries = engine.audit_log.read()
+    assert entries[-1].operation == "source-path"
+    assert entries[-1].embeddings_removed == 2
+
+
 def test_daterange_purge_removes_embedding_rows_in_range(tmp_path: Path) -> None:
     """Fragments inside the purged window lose their cache row; others stay."""
     vault = _make_vault(tmp_path)
