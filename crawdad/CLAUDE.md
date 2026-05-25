@@ -34,8 +34,12 @@ complete and ships:
   routing to `10-Liminal/Paradoxes/`.
 - Voice-skill activation per session from `<vault>/creek-skills/`
   (voice-core + phase + register).
-- Six `/crawdad` Discord slash commands (FEAT-016): `reflect`,
-  `checkin`, `surface`, `draft`, `save`, `workflow`.
+- Seven `/crawdad` Discord slash commands (FEAT-016 + FEAT-029 +
+  ADAPT-003): `reflect`, `checkin`, `surface`, `draft`, `save`,
+  `register`, `workflow`. `workflow` supports `list` (enumerate) and
+  `run <name>` (deterministic walk over a YAML file) — see
+  `crawdad/crawdad/workflows.py` and
+  `docs/adr/2026-05-24_workflow-file-location.md`.
 - A user + channel allowlist; non-allowlisted users get *no* response
   (silent ignore, per FEAT-013's personal-use scoping).
 - Session-state load from `<vault>/00-Creek-Meta/State/latest.md` at
@@ -59,7 +63,9 @@ crawdad/
 │   ├── router.py           # Haiku intent router (FEAT-014)
 │   ├── skill_loader.py     # Voice-skill stack loader (FEAT-015)
 │   ├── slash_commands.py   # /crawdad Discord slash commands (FEAT-016)
-│   └── state.py            # load_session_state — latest.md parser
+│   ├── state.py            # load_session_state — latest.md parser
+│   ├── workflows.py        # Authored workflow DSL (ADAPT-003)
+│   └── builtin_workflows/  # Reference workflows shipped with the package
 ├── tests/                  # One test file per source module
 ├── scripts/                # check-all, lint, test, etc.
 ├── docs/

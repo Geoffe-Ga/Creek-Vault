@@ -1,0 +1,664 @@
+"""Workflow DSL (ADAPT-003 / issue #268).
+
+CrawDad composite commands compile down to a deterministic walk over
+authored YAML files. Each file declares a named workflow: a list of
+:class:`WorkflowStep` entries that map one-to-one to MCP tool calls,
+plus first-class constraint metadata (``phase_aware`` /
+``privacy_tier_floor``) the walker enforces before any tool fires.
+
+File format
+-----------
+
+Plain YAML. No custom grammar, no Jinja2 dependency. A workflow file
+looks like::
+
+    name: substack-draft-phase-transitions
+    description: Draft a Substack post on phase transitions
+    trigger: "/crawdad workflow run substack-draft-phase-transitions"
+    phase_aware: true
+    allowed_phases: [rising, peak]
+    privacy_tier_floor: personal
+    inputs: [topic]
+    steps:
+      - id: read
+        tool: creek.state.read
+        args: { period: weekly }
+      - id: mine
+        tool: creek.mine
+        args:
+          strategy: thread-terminus
+          phase: "{{state.phase}}"
+          topic: "{{input.topic}}"
+
+File location
+-------------
+
+Two-source registry, decided in
+``docs/adr/2026-05-24_workflow-file-location.md``:
+
+1. Built-in reference workflows ship in
+   :data:`BUILTIN_WORKFLOWS_DIR` (this package). They are checked into
+   the repo and discoverable on every install.
+2. User-authored workflows live in
+   ``<vault>/00-Creek-Meta/Workflows/`` (see :data:`VAULT_WORKFLOWS_SUBPATH`).
+   A user file with the same ``name`` as a built-in wins.
+
+Interpolation
+-------------
+
+Step ``args`` strings may reference three namespaces inside ``{{...}}``::
+
+    {{state.phase}}        -> phase slug extracted from latest.md (or "")
+    {{state.wavelength}}   -> raw wavelength snapshot text (or "")
+    {{input.<key>}}        -> caller-supplied input value (or "")
+    {{step.<id>.body}}     -> previous step's tool-result body (or "")
+
+Unknown namespaces are left in place verbatim — that surfaces a typo
+to the workflow author instead of silently swallowing it.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from crawdad.dispatcher import ToolResult
+from crawdad.intents import PrivacyTierCeiling
+
+if TYPE_CHECKING:
+    from crawdad.mcp_client import MCPClient
+    from crawdad.skill_loader import SkillStackRegistry, VoiceSkillStack
+    from crawdad.state import SessionState
+
+_LOGGER = logging.getLogger("crawdad.workflows")
+
+# Built-in reference workflows are co-located with the package source so
+# they ship on every install and remain discoverable by the registry
+# without any vault layout. The directory contains one
+# ``*.workflow.yaml`` file per workflow.
+BUILTIN_WORKFLOWS_DIR: Path = Path(__file__).resolve().parent / "builtin_workflows"
+
+# Vault-relative subpath the registry scans for user-authored workflows.
+# Mirrors the existing ``00-Creek-Meta/State/`` convention so workflows
+# land in a single canonical Creek-Meta home.
+VAULT_WORKFLOWS_SUBPATH: Path = Path("00-Creek-Meta") / "Workflows"
+
+_WORKFLOW_FILE_SUFFIX = ".workflow.yaml"
+
+# ``\w`` matches the YAML-friendly subset we accept inside placeholder
+# tokens (alphanumerics, underscore). Dotted access is the only nesting
+# syntax — anything richer requires Jinja2 and pulls in a dependency the
+# v1.1 surface does not need yet.
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+
+# Phase regex matches FEAT-015 / skill_loader extraction so a workflow's
+# ``state.phase`` reference is the same slug the voice-skill loader uses.
+_PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z\-]+)", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class WorkflowParseError(RuntimeError):
+    """A workflow YAML file could not be loaded or did not match the schema.
+
+    Surfaces YAML syntax errors and Pydantic validation errors as a
+    single error type so callers only need one ``except`` clause.
+    """
+
+
+class WorkflowConstraintError(RuntimeError):
+    """The walker refused to run a workflow because a declared constraint failed.
+
+    Raised for any of: missing required input, missing session-state
+    phase when ``phase_aware: true``, current phase not in
+    ``allowed_phases``, or a step referencing an unadvertised MCP tool.
+    """
+
+
+class WorkflowNotFoundError(RuntimeError):
+    """No workflow with the requested name was found in the registry."""
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+
+class WorkflowStep(BaseModel):
+    """One MCP tool call inside a workflow.
+
+    ``id`` is the addressable handle later steps reference via
+    ``{{step.<id>.body}}``. ``tool`` is the MCP tool name, validated
+    against the live ``known_tools`` set at walk time. ``args`` is the
+    raw arg dict; any nested string is interpolated by the walker.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str = Field(min_length=1)
+    tool: str = Field(min_length=1)
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowDefinition(BaseModel):
+    """An authored workflow loaded from a ``*.workflow.yaml`` file.
+
+    ``phase_aware`` and ``privacy_tier_floor`` are the AC's first-class
+    constraint attributes. The walker treats them as soft-fail gates
+    rather than runtime errors so the slash-command surface can return
+    a clean user-facing message instead of a stack trace.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(min_length=1)
+    description: str
+    trigger: str | None = None
+    phase_aware: bool = False
+    allowed_phases: tuple[str, ...] = ()
+    privacy_tier_floor: PrivacyTierCeiling = PrivacyTierCeiling.OPEN
+    inputs: tuple[str, ...] = ()
+    steps: tuple[WorkflowStep, ...]
+
+    @field_validator("steps")
+    @classmethod
+    def _validate_steps(
+        cls, value: tuple[WorkflowStep, ...]
+    ) -> tuple[WorkflowStep, ...]:
+        """Refuse empty step lists and duplicate step ids."""
+        if not value:
+            msg = "workflow must declare at least one step"
+            raise ValueError(msg)
+        seen: set[str] = set()
+        for step in value:
+            if step.id in seen:
+                msg = f"duplicate step id {step.id!r} in workflow"
+                raise ValueError(msg)
+            seen.add(step.id)
+        return value
+
+
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
+
+
+def load_workflow_from_yaml(path: Path) -> WorkflowDefinition:
+    """Read and validate a workflow file.
+
+    Args:
+        path: Filesystem path to a ``*.workflow.yaml`` document.
+
+    Returns:
+        A frozen :class:`WorkflowDefinition`.
+
+    Raises:
+        WorkflowParseError: file missing, YAML invalid, or schema mismatch.
+    """
+    if not path.is_file():
+        msg = f"workflow file not found: {path}"
+        raise WorkflowParseError(msg)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        msg = f"invalid YAML in {path}: {exc}"
+        raise WorkflowParseError(msg) from exc
+    if not isinstance(raw, dict):
+        msg = f"workflow document at {path} must be a mapping at the top level"
+        raise WorkflowParseError(msg)
+    try:
+        return WorkflowDefinition.model_validate(raw)
+    except ValidationError as exc:
+        msg = f"workflow schema validation failed for {path}: {exc}"
+        raise WorkflowParseError(msg) from exc
+
+
+# ---------------------------------------------------------------------------
+# Phase resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_phase(state: SessionState | None) -> str | None:
+    """Extract the phase slug from a session state's wavelength snapshot.
+
+    Returns ``None`` when there is no state, no wavelength snapshot, or
+    no recognisable ``Phase: **<slug>**`` token. Mirrors the slug-shape
+    convention used in :mod:`crawdad.skill_loader` so a workflow's
+    ``{{state.phase}}`` value matches the voice-skill loader's phase.
+    """
+    if state is None or not state.wavelength_snapshot:
+        return None
+    match = _PHASE_RE.search(state.wavelength_snapshot)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+# ---------------------------------------------------------------------------
+# Interpolation
+# ---------------------------------------------------------------------------
+
+
+def interpolate(
+    value: Any,
+    *,
+    state: SessionState | None,
+    inputs: dict[str, str],
+    step_results: dict[str, ToolResult],
+) -> Any:
+    """Recursively resolve ``{{...}}`` placeholders inside *value*.
+
+    String values are scanned with :data:`_PLACEHOLDER_RE`; each match
+    is resolved against the supplied state, inputs, and prior step
+    results. Dicts and lists are recursed element-wise so a deeply
+    nested ``args`` block (e.g. ``{"filters": {"phase": "..."}}``) is
+    interpolated through.
+
+    Non-string scalars (int, bool, None, etc.) are returned unchanged.
+    Unknown namespaces are left in place verbatim — surfacing a typo
+    in MCP logs is more useful than silently swallowing it.
+    """
+    if isinstance(value, str):
+        return _interpolate_string(
+            value, state=state, inputs=inputs, step_results=step_results
+        )
+    if isinstance(value, dict):
+        return {
+            k: interpolate(v, state=state, inputs=inputs, step_results=step_results)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            interpolate(item, state=state, inputs=inputs, step_results=step_results)
+            for item in value
+        ]
+    return value
+
+
+def _interpolate_string(
+    text: str,
+    *,
+    state: SessionState | None,
+    inputs: dict[str, str],
+    step_results: dict[str, ToolResult],
+) -> str:
+    """Scan *text* and substitute every recognised ``{{...}}`` placeholder."""
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(1)
+        resolved = _resolve_token(
+            token, state=state, inputs=inputs, step_results=step_results
+        )
+        if resolved is None:
+            # Unknown namespace — leave placeholder untouched so the
+            # author sees the typo in MCP logs rather than silently
+            # getting an empty string.
+            return match.group(0)
+        return resolved
+
+    return _PLACEHOLDER_RE.sub(_replace, text)
+
+
+def _resolve_token(
+    token: str,
+    *,
+    state: SessionState | None,
+    inputs: dict[str, str],
+    step_results: dict[str, ToolResult],
+) -> str | None:
+    """Return the resolved value for *token*, or ``None`` for unknown namespaces."""
+    parts = token.split(".")
+    namespace = parts[0]
+    if namespace == "state":
+        return _resolve_state(parts[1:], state)
+    if namespace == "input":
+        return _resolve_input(parts[1:], inputs)
+    if namespace == "step":
+        return _resolve_step(parts[1:], step_results)
+    return None
+
+
+def _resolve_state(parts: list[str], state: SessionState | None) -> str:
+    """Resolve ``state.<field>`` references. Missing values → empty string."""
+    if not parts or state is None:
+        return ""
+    field = parts[0]
+    if field == "phase":
+        return resolve_phase(state) or ""
+    if field == "wavelength":
+        return state.wavelength_snapshot or ""
+    return ""
+
+
+def _resolve_input(parts: list[str], inputs: dict[str, str]) -> str:
+    """Resolve ``input.<key>`` references. Missing keys → empty string."""
+    if not parts:
+        return ""
+    return inputs.get(parts[0], "")
+
+
+def _resolve_step(parts: list[str], step_results: dict[str, ToolResult]) -> str:
+    """Resolve ``step.<id>.<field>`` references. Missing ids → empty string."""
+    if len(parts) < 2:
+        return ""
+    step_id, field = parts[0], parts[1]
+    result = step_results.get(step_id)
+    if result is None:
+        return ""
+    if field == "body":
+        return result.body
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+
+class WorkflowRegistry:
+    """Discover and look up workflow definitions.
+
+    The registry scans two sources in order:
+
+    1. :data:`BUILTIN_WORKFLOWS_DIR` — packaged reference workflows.
+    2. ``<vault>/00-Creek-Meta/Workflows/`` — user-authored files.
+
+    A user-authored workflow with the same ``name`` as a built-in wins.
+    Malformed files are logged at WARNING and skipped so a single typo
+    in the vault directory does not deny access to every other
+    workflow.
+
+    Caching: the first :meth:`list` / :meth:`get` call loads every file
+    and pins the result. Subsequent calls reuse the cache for the
+    lifetime of the registry instance, so a workflow added to the
+    vault directory mid-session is NOT visible until the bot is
+    restarted. This matches the FEAT-013 read-once startup pattern
+    used elsewhere in CrawDad and is intentional — workflows are
+    authored artifacts, not live state.
+    """
+
+    def __init__(
+        self,
+        *,
+        vault_path: Path,
+        builtin_dir: Path = BUILTIN_WORKFLOWS_DIR,
+    ) -> None:
+        """Cache the discovery paths. Workflows are loaded lazily on access."""
+        self._vault_path = vault_path
+        self._builtin_dir = builtin_dir
+        self._cache: dict[str, WorkflowDefinition] | None = None
+
+    def list(self) -> list[WorkflowDefinition]:
+        """Return every discovered workflow, sorted by name."""
+        return sorted(self._all().values(), key=lambda wf: wf.name)
+
+    def get(self, name: str) -> WorkflowDefinition:
+        """Return the workflow matching *name*.
+
+        Raises:
+            WorkflowNotFoundError: no workflow with that name exists.
+        """
+        workflows = self._all()
+        if name not in workflows:
+            available = ", ".join(sorted(workflows)) or "(none)"
+            msg = f"no workflow named {name!r}; available: {available}"
+            raise WorkflowNotFoundError(msg)
+        return workflows[name]
+
+    def _all(self) -> dict[str, WorkflowDefinition]:
+        """Return ``{name: workflow}`` for every discoverable workflow.
+
+        Built-ins first, then vault user-authored — the second write
+        wins, so a vault override replaces the built-in entry.
+        """
+        if self._cache is not None:
+            return self._cache
+        collected: dict[str, WorkflowDefinition] = {}
+        _absorb_dir(collected, self._builtin_dir)
+        _absorb_dir(collected, self._vault_path / VAULT_WORKFLOWS_SUBPATH)
+        self._cache = collected
+        return collected
+
+
+def _absorb_dir(target: dict[str, WorkflowDefinition], directory: Path) -> None:
+    """Load every ``*.workflow.yaml`` file from *directory* into *target*.
+
+    Missing or non-directory paths are silently ignored. Files that
+    fail to parse are logged at WARNING and skipped so one typo cannot
+    deny access to every other workflow.
+    """
+    if not directory.is_dir():
+        return
+    for path in sorted(directory.glob(f"*{_WORKFLOW_FILE_SUFFIX}")):
+        try:
+            wf = load_workflow_from_yaml(path)
+        except WorkflowParseError as exc:
+            _LOGGER.warning("skipping invalid workflow %s: %s", path, exc)
+            continue
+        target[wf.name] = wf
+
+
+# ---------------------------------------------------------------------------
+# Walker
+# ---------------------------------------------------------------------------
+
+
+class WorkflowWalker:
+    """Deterministic step walker for an authored workflow.
+
+    The walker opens a single MCP session per workflow run, calls each
+    step's tool with its interpolated args, and returns the ordered
+    list of :class:`ToolResult` envelopes. The LLM router is bypassed
+    entirely — the workflow file IS the routing decision.
+    """
+
+    def __init__(
+        self,
+        *,
+        mcp_client: MCPClient | Any,
+        known_tools: tuple[str, ...] | frozenset[str],
+    ) -> None:
+        """Cache the MCP client and the advertised tool surface."""
+        self._mcp_client = mcp_client
+        self._known_tools = frozenset(known_tools)
+
+    async def run(
+        self,
+        workflow: WorkflowDefinition,
+        *,
+        state: SessionState | None,
+        inputs: dict[str, str],
+    ) -> list[ToolResult]:
+        """Execute *workflow* against the current session.
+
+        Args:
+            workflow: The definition to run.
+            state: Session state for phase resolution / ``state.*``
+                interpolation. ``None`` is allowed for non-phase-aware
+                workflows.
+            inputs: User-supplied input values for ``{{input.<key>}}``
+                references.
+
+        Returns:
+            One :class:`ToolResult` per step, in document order.
+
+        Raises:
+            WorkflowConstraintError: a declared constraint refused the
+                run — missing input, wrong phase, unknown tool, etc.
+        """
+        self._check_constraints(workflow, state=state, inputs=inputs)
+        async with self._mcp_client.connect() as session:
+            return await self._execute_steps(
+                workflow, session=session, state=state, inputs=inputs
+            )
+
+    def _check_constraints(
+        self,
+        workflow: WorkflowDefinition,
+        *,
+        state: SessionState | None,
+        inputs: dict[str, str],
+    ) -> None:
+        """Validate phase, inputs, and tool surface before any tool fires."""
+        missing_inputs = [name for name in workflow.inputs if name not in inputs]
+        if missing_inputs:
+            msg = (
+                f"workflow {workflow.name!r} requires inputs {missing_inputs} "
+                "that were not provided"
+            )
+            raise WorkflowConstraintError(msg)
+        unknown_tools = [
+            step.tool for step in workflow.steps if step.tool not in self._known_tools
+        ]
+        if unknown_tools:
+            msg = (
+                f"workflow {workflow.name!r} references tools that are not "
+                f"advertised by the MCP server: {unknown_tools}"
+            )
+            raise WorkflowConstraintError(msg)
+        if workflow.phase_aware:
+            self._check_phase(workflow, state)
+
+    def _check_phase(
+        self, workflow: WorkflowDefinition, state: SessionState | None
+    ) -> None:
+        """Refuse phase-aware workflows when the current phase doesn't match."""
+        phase = resolve_phase(state)
+        if phase is None:
+            msg = (
+                f"workflow {workflow.name!r} is phase-aware but no session "
+                "phase is available — run `creek state` first"
+            )
+            raise WorkflowConstraintError(msg)
+        if workflow.allowed_phases and phase not in workflow.allowed_phases:
+            msg = (
+                f"workflow {workflow.name!r} refuses to run in phase "
+                f"{phase!r}; allowed phases: {list(workflow.allowed_phases)}"
+            )
+            raise WorkflowConstraintError(msg)
+
+    async def _execute_steps(
+        self,
+        workflow: WorkflowDefinition,
+        *,
+        session: Any,
+        state: SessionState | None,
+        inputs: dict[str, str],
+    ) -> list[ToolResult]:
+        """Walk each step in order, threading prior results into later args."""
+        step_results: dict[str, ToolResult] = {}
+        ordered: list[ToolResult] = []
+        for step in workflow.steps:
+            resolved_args = interpolate(
+                step.args, state=state, inputs=inputs, step_results=step_results
+            )
+            arguments = _build_call_arguments(
+                resolved_args, workflow.privacy_tier_floor
+            )
+            body = await session.call_tool(step.tool, arguments)
+            result = ToolResult(
+                intent_type=step.tool,
+                body=body,
+                privacy_tier_ceiling=workflow.privacy_tier_floor,
+            )
+            step_results[step.id] = result
+            ordered.append(result)
+        return ordered
+
+
+def _build_call_arguments(
+    resolved_args: Any, floor: PrivacyTierCeiling
+) -> dict[str, Any]:
+    """Merge interpolated args with the privacy floor, matching dispatcher semantics.
+
+    The MCP server reads ``privacy_tier_ceiling`` as a sibling argument
+    on every tool call (see :mod:`crawdad.dispatcher._build_arguments`).
+    The workflow's declared floor is the contract; any colliding key
+    in the user-authored args is overwritten so a workflow author
+    cannot accidentally smuggle a looser tier in through the args dict.
+    """
+    payload: dict[str, Any] = (
+        dict(resolved_args) if isinstance(resolved_args, dict) else {}
+    )
+    payload["privacy_tier_ceiling"] = floor.value
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# High-level runner
+# ---------------------------------------------------------------------------
+
+
+async def run_workflow_and_compose(
+    *,
+    workflow: WorkflowDefinition,
+    inputs: dict[str, str],
+    state: SessionState | None,
+    skills: VoiceSkillStack,
+    skill_registry: SkillStackRegistry | None,
+    composer: Any,
+    mcp_client: Any,
+    known_tools: tuple[str, ...],
+) -> str:
+    """Walk *workflow* end-to-end and ask the composer for the user-facing reply.
+
+    The walker bypasses the FEAT-014 router but reuses the FEAT-015
+    composer so workflow output sounds like every other CrawDad reply
+    — voice-faithful, phase-aware, paradox-tolerant.
+
+    Skill-stack resolution mirrors the FEAT-029 ``AgentLoop`` pattern:
+    when ``skill_registry`` is supplied its ``.stack`` wins and the
+    ``skills`` argument is the fallback used only when the registry is
+    ``None``. The CLI runner always provides both (with ``skills``
+    defaulting to ``registry.stack``) so the registry's live, swap-
+    after-startup behaviour persists across turns; callers without a
+    registry (e.g. early unit tests) can hand a static stack in via
+    ``skills``.
+
+    Returns the composer's text reply. Constraint failures bubble up as
+    :class:`WorkflowConstraintError`; the caller is responsible for
+    mapping them to a Discord soft error.
+    """
+    from crawdad.history import ConversationHistory
+
+    walker = WorkflowWalker(mcp_client=mcp_client, known_tools=known_tools)
+    results = await walker.run(workflow, state=state, inputs=inputs)
+    active_skills = skills if skill_registry is None else skill_registry.stack
+    pseudo_message = _synthesize_user_message(workflow, inputs)
+    reply = await composer.compose(
+        user_message=pseudo_message,
+        tool_results=results,
+        history=ConversationHistory(),
+        state=state,
+        skills=active_skills,
+    )
+    return cast("str", reply)
+
+
+def _synthesize_user_message(
+    workflow: WorkflowDefinition, inputs: dict[str, str]
+) -> str:
+    """Return the synthetic user message the composer sees for a workflow run.
+
+    The composer expects a user message describing intent; for a
+    workflow run there is no free-text turn, so we fabricate one from
+    the workflow name + description + supplied inputs. This lets the
+    composer condition its reply on the right context without changing
+    its interface.
+    """
+    lines = [
+        f"Run workflow: {workflow.name}.",
+        workflow.description,
+    ]
+    if inputs:
+        rendered = ", ".join(f"{k}={v!r}" for k, v in sorted(inputs.items()))
+        lines.append(f"Inputs: {rendered}.")
+    return "\n".join(lines)

@@ -31,13 +31,14 @@ from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
 from crawdad.skill_loader import SkillStackRegistry, load_skills_for_session
 from crawdad.state import StateUnavailableError, load_session_state
+from crawdad.workflows import WorkflowRegistry, run_workflow_and_compose
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from crawdad.config import CrawDadConfig
     from crawdad.mcp_client import ToolDetails
-    from crawdad.slash_commands import LoopRunner
+    from crawdad.slash_commands import LoopRunner, WorkflowRunner
     from crawdad.state import SessionState
 
 _LOGGER = logging.getLogger("crawdad.cli")
@@ -114,6 +115,13 @@ def run_bot(config: CrawDadConfig) -> None:
         session_state=session_state,
         skill_registry=skill_registry,
     )
+    workflow_registry = WorkflowRegistry(vault_path=config.vault_path)
+    workflow_runner = _build_workflow_runner(
+        components=components,
+        session_state=session_state,
+        skill_registry=skill_registry,
+        registry=workflow_registry,
+    )
     client = CrawDadClient(
         config=config,
         session_state=session_state,
@@ -127,8 +135,72 @@ def run_bot(config: CrawDadConfig) -> None:
         loop_runner=loop_runner,
         register_switcher=skill_registry.activate_register,
         pending_batches=pending_batches,
+        workflow_lister=_build_workflow_lister(workflow_registry),
+        workflow_runner=workflow_runner,
     )
     client.run(config.discord_bot_token)
+
+
+def _build_workflow_lister(
+    registry: WorkflowRegistry,
+) -> Callable[[], list[str]]:
+    """Return a closure that enumerates registry names for the slash command."""
+
+    def _lister() -> list[str]:
+        """Return discovered workflow names, sorted by name."""
+        return [wf.name for wf in registry.list()]
+
+    return _lister
+
+
+def _build_workflow_runner(
+    *,
+    components: _AgentComponents,
+    session_state: SessionState | None,
+    skill_registry: SkillStackRegistry,
+    registry: WorkflowRegistry,
+) -> WorkflowRunner | None:
+    """Return a closure that runs a named workflow end-to-end.
+
+    Returns ``None`` when the composer isn't wired (no MCP tools
+    advertised) — the slash command surface then soft-errors instead
+    of failing during workflow execution.
+    """
+    if components.composer is None:
+        return None
+    composer = components.composer
+    mcp_client = components.mcp_client
+    known_tools = components.known_tools
+
+    async def _runner(name: str, inputs: dict[str, str]) -> str:
+        """Run *name* by looking it up in the registry and composing the reply.
+
+        Surface failures (constraint errors, unknown name, composer
+        exceptions) as a single Discord-safe string so the slash command
+        can pass them through without translating again.
+        """
+        try:
+            workflow = registry.get(name)
+        except Exception as exc:
+            _LOGGER.warning("workflow lookup failed for %r: %s", name, exc)
+            return _truncate_for_discord(f"could not find workflow `{name}`: {exc}")
+        try:
+            reply = await run_workflow_and_compose(
+                workflow=workflow,
+                inputs=inputs,
+                state=session_state,
+                skills=skill_registry.stack,
+                skill_registry=skill_registry,
+                composer=composer,
+                mcp_client=mcp_client,
+                known_tools=known_tools,
+            )
+        except Exception as exc:
+            _LOGGER.warning("workflow %r failed mid-run: %s", name, exc)
+            return _truncate_for_discord(f"workflow `{name}` failed: {exc}")
+        return _truncate_for_discord(reply)
+
+    return _runner
 
 
 def _build_loop_runner(

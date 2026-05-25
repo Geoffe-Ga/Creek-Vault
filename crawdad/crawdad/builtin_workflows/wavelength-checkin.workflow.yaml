@@ -1,0 +1,18 @@
+# Reference workflow: a quick wavelength check-in for the last week.
+# See ADAPT-003 (issue #268) for context.
+#
+# ``creek.state.read`` is the FEAT-010 cheap path — it hands back the
+# pre-rendered ``00-Creek-Meta/State/latest.md`` so the composer's
+# wavelength summary doesn't pay for a full vault walk.
+name: wavelength-checkin
+description: |
+  Read the latest audit report and surface the current phase, dosage,
+  and recent transitions. The composer wraps the raw state read in the
+  user's voice register.
+trigger: "/crawdad workflow run wavelength-checkin"
+phase_aware: false
+privacy_tier_floor: open
+steps:
+  - id: read
+    tool: creek.state.read
+    args: {}

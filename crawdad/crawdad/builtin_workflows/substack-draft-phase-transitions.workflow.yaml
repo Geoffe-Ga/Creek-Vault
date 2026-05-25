@@ -1,0 +1,30 @@
+# Reference workflow: draft a Substack-style post, scoped to the user's
+# current wavelength phase. See ADAPT-003 (issue #268) for context.
+#
+# The composer wraps the draft tool's structured response in the user's
+# voice register — voice fidelity for the draft *body* itself is owned
+# by ``creek.draft``'s in-tool skill stack (FEAT-005), not by this
+# workflow.
+name: substack-draft-phase-transitions
+description: |
+  Draft a phase-aware essay scoped to the user's current wavelength.
+  Reads latest state, mines essay seeds for the active phase, then
+  drafts the top-ranked seed via ``creek.draft``.
+trigger: "/crawdad workflow run substack-draft-phase-transitions"
+phase_aware: true
+privacy_tier_floor: personal
+inputs: []
+steps:
+  - id: read
+    tool: creek.state.read
+    args: {}
+  - id: mine
+    tool: creek.mine
+    args:
+      phase: "{{state.phase}}"
+      limit: 5
+  - id: draft
+    tool: creek.draft
+    args:
+      phase: "{{state.phase}}"
+      index: 0
