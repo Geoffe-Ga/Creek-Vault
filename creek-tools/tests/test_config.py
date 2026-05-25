@@ -392,6 +392,69 @@ class TestCleaningConfig:
 
 
 # ---------------------------------------------------------------------------
+# MiningConfig (issue #340)
+# ---------------------------------------------------------------------------
+
+
+class TestMiningConfig:
+    """Tests for ``MiningConfig`` — issue #340 expose mining knobs to YAML."""
+
+    def test_defaults_match_library(self) -> None:
+        """Mining defaults mirror the constants in ``creek.generate.mining``."""
+        from creek.config import MiningConfig
+        from creek.generate.mining import (
+            DEFAULT_MIN_CHAIN_LENGTH,
+            DEFAULT_MIN_THREAD_FRAGMENTS,
+            DEFAULT_SIMILARITY_LIMINAL,
+            DEFAULT_SIMILARITY_RESONANCE,
+        )
+
+        cfg = MiningConfig()
+        assert cfg.min_thread_fragments == DEFAULT_MIN_THREAD_FRAGMENTS
+        assert cfg.min_chain_length == DEFAULT_MIN_CHAIN_LENGTH
+        assert cfg.similarity_liminal == pytest.approx(DEFAULT_SIMILARITY_LIMINAL)
+        assert cfg.similarity_resonance == pytest.approx(DEFAULT_SIMILARITY_RESONANCE)
+
+    def test_custom_values(self) -> None:
+        """``MiningConfig`` accepts overrides for every knob."""
+        from creek.config import MiningConfig
+
+        cfg = MiningConfig(
+            min_thread_fragments=4,
+            min_chain_length=2,
+            similarity_liminal=0.2,
+            similarity_resonance=0.5,
+        )
+        assert cfg.min_thread_fragments == 4
+        assert cfg.min_chain_length == 2
+        assert cfg.similarity_liminal == pytest.approx(0.2)
+        assert cfg.similarity_resonance == pytest.approx(0.5)
+
+    def test_similarity_floors_reject_out_of_range(self) -> None:
+        """Cosine-like similarities must live in ``[0, 1]``."""
+        from creek.config import MiningConfig
+
+        with pytest.raises(ValueError, match="less than or equal to 1"):
+            MiningConfig(similarity_liminal=1.5)
+        with pytest.raises(ValueError, match="greater than or equal to 0"):
+            MiningConfig(similarity_resonance=-0.1)
+
+    def test_min_thread_fragments_must_be_positive(self) -> None:
+        """A non-positive thread floor would surface every active thread."""
+        from creek.config import MiningConfig
+
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            MiningConfig(min_thread_fragments=0)
+
+    def test_min_chain_length_must_be_at_least_two(self) -> None:
+        """Chains of <2 fragments aren't chains — they're singletons."""
+        from creek.config import MiningConfig
+
+        with pytest.raises(ValueError, match="greater than or equal to 2"):
+            MiningConfig(min_chain_length=1)
+
+
+# ---------------------------------------------------------------------------
 # Top-level CreekConfig
 # ---------------------------------------------------------------------------
 

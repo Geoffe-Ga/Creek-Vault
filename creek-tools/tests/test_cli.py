@@ -1925,6 +1925,75 @@ def test_mine_bypass_compiled_warns_and_skips_routing(
     assert "side-step" in result.output.lower()
 
 
+# ---- Issue #340: zero-seed diagnostics -------------------------------
+
+
+def test_mine_no_seeds_message_names_top_score_and_threshold(
+    tmp_path: Path,
+) -> None:
+    """The zero-seed CLI output reports the top score and threshold (issue #340)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = runner.invoke(app, ["mine", "--vault", str(vault)])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.output)
+    assert "No idea seeds surfaced" in output
+    # Diagnostic: explicit score / threshold callouts so the user can
+    # tell whether the run was *close* or nowhere near.
+    assert "score" in output.lower()
+    assert "threshold" in output.lower()
+    # Operators are pointed at the gap log for fallback reasons.
+    assert "compile-gaps.jsonl" in output
+
+
+def test_mine_respects_creek_config_mining_knobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek_config.yaml`` mining knobs are passed through to ``IdeaMiner``."""
+    import pytest as _pytest
+    import yaml
+
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mining": {
+                    "min_thread_fragments": 2,
+                    "min_chain_length": 2,
+                    "similarity_liminal": 0.1,
+                    "similarity_resonance": 0.2,
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+    from creek.generate.mining import IdeaMiner
+
+    real_init = IdeaMiner.__init__
+
+    def _spy_init(self: IdeaMiner, **kwargs: object) -> None:
+        captured.update(kwargs)
+        real_init(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(IdeaMiner, "__init__", _spy_init)
+    result = runner.invoke(
+        app,
+        ["mine", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["min_thread_fragments"] == 2
+    assert captured["min_chain_length"] == 2
+    assert captured["similarity_liminal"] == _pytest.approx(0.1)
+    assert captured["similarity_resonance"] == _pytest.approx(0.2)
+
+
 # ---- FEAT-032 manual seeding flags -----------------------------------
 
 

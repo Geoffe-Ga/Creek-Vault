@@ -87,6 +87,17 @@ DEFAULT_MIN_CHAIN_LENGTH: int = 3
 """Minimum number of fragments in a resonance chain for it to surface."""
 
 
+_NO_ACTIVE_THREADS: str = "no active threads available"
+_NO_LIMINAL_FRAGMENTS: str = "no liminal fragments in 10-Liminal/{Unnamed,Compost}"
+_NO_PHASE_MATCHES: str = "no fragments matched the current phase"
+_NO_SYNCHRONICITIES: str = (
+    "no synchronicity records on disk under 10-Liminal/Synchronicities; "
+    "embeddings.parquet edges do not contribute until they are written as "
+    "synchronicity notes (run `creek link` to populate)"
+)
+_UNCLASSIFIED_PHASE: str = "wavelength window skipped (current phase is unclassified)"
+
+
 _STOPWORDS: frozenset[str] = frozenset(
     {
         "a",
@@ -171,6 +182,73 @@ class MiningStrategy(StrEnum):
     THREAD_TERMINUS = "thread_terminus"
     RESONANCE_CHAIN = "resonance_chain"
     WAVELENGTH_WINDOW = "wavelength_window"
+
+
+@dataclass(frozen=True)
+class StrategyDiagnostic:
+    """One strategy's per-run diagnostic counters (issue #340).
+
+    Attributes:
+        strategy: Which mining strategy this diagnostic describes.
+        candidates_considered: How many distinct items the strategy
+            examined before applying its filters (e.g. threads scanned,
+            phase-matching fragments, components walked, liminal
+            fragments considered).
+        candidates_kept: How many of those items survived all filters
+            and became seeds.
+        top_score: Highest score observed across *candidates_considered*
+            even when none were kept — lets the operator tell "almost
+            kept" from "miles off".
+        threshold: The dominant per-strategy threshold the score is
+            compared against. Score and threshold share units so the
+            CLI can present them side by side without conversion.
+        fallback_reason: Human-readable reason a strategy had nothing
+            to do (e.g. ``"no synchronicity records on disk"``), or
+            ``None`` when the strategy ran normally.
+    """
+
+    strategy: MiningStrategy
+    candidates_considered: int
+    candidates_kept: int
+    top_score: float
+    threshold: float
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MiningRunReport:
+    """Snapshot of an :meth:`IdeaMiner.mine_all_with_report` invocation.
+
+    Aggregates the seeds returned by :meth:`IdeaMiner.mine_all` with one
+    :class:`StrategyDiagnostic` per strategy so the CLI can explain a
+    zero-seed run without re-mining.
+    """
+
+    seeds: tuple[IdeaSeed, ...]
+    diagnostics: tuple[StrategyDiagnostic, ...]
+
+    @property
+    def top_score(self) -> float:
+        """Return the highest candidate score across every strategy."""
+        if not self.diagnostics:
+            return 0.0
+        return max(diag.top_score for diag in self.diagnostics)
+
+    @property
+    def top_threshold(self) -> float:
+        """Return the threshold of the strategy that scored the highest.
+
+        When several strategies tie on ``top_score`` (commonly all zero
+        on an empty vault), the smallest threshold is chosen — this is
+        the most informative value to surface in the "no seeds" message
+        because it's the one a user is likeliest to want to lower.
+        """
+        if not self.diagnostics:
+            return 0.0
+        winners = [
+            diag for diag in self.diagnostics if diag.top_score == self.top_score
+        ]
+        return min(diag.threshold for diag in winners)
 
 
 @dataclass(frozen=True)
@@ -511,24 +589,57 @@ class IdeaMiner:
         fragments. Missing pages append a ``compile-needed`` entry to
         ``compile-gaps.jsonl``.
         """
-        snap = self._resolve_snapshot(vault_path, snapshot)
-        seeds: list[IdeaSeed] = []
-        for thread in snap.threads:
-            if not _is_active(thread):
-                continue
-            if thread.fragment_count <= self.min_thread_fragments:
-                continue
-            if self._has_matching_essay(thread.title, snap.published_essay_titles):
-                continue
-            seeds.append(
-                self._seed_from_thread(
-                    thread,
-                    snap.fragments,
-                    snap.compiled_pages,
-                    vault_path,
-                ),
-            )
+        seeds, _diag = self._mine_thread_terminus_with_diagnostic(
+            vault_path,
+            snapshot=snapshot,
+        )
         return seeds
+
+    def _mine_thread_terminus_with_diagnostic(
+        self,
+        vault_path: Path,
+        *,
+        snapshot: MiningSnapshot | None = None,
+    ) -> tuple[list[IdeaSeed], StrategyDiagnostic]:
+        """Run :meth:`mine_thread_terminus` and emit a diagnostic record.
+
+        ``threshold`` is reported in raw fragment-count units so the
+        diagnostic reads naturally ("top thread has 15 fragments,
+        threshold is 10") rather than as a normalised ratio.
+        """
+        snap = self._resolve_snapshot(vault_path, snapshot)
+        candidates = [
+            thread
+            for thread in snap.threads
+            if _is_active(thread)
+            and not self._has_matching_essay(
+                thread.title,
+                snap.published_essay_titles,
+            )
+        ]
+        seeds = [
+            self._seed_from_thread(
+                thread,
+                snap.fragments,
+                snap.compiled_pages,
+                vault_path,
+            )
+            for thread in candidates
+            if thread.fragment_count > self.min_thread_fragments
+        ]
+        top_score = float(
+            max((thread.fragment_count for thread in candidates), default=0),
+        )
+        diagnostic = StrategyDiagnostic(
+            strategy=MiningStrategy.THREAD_TERMINUS,
+            candidates_considered=len(candidates),
+            candidates_kept=len(seeds),
+            top_score=top_score,
+            threshold=float(self.min_thread_fragments),
+            fallback_reason=None if candidates else _NO_ACTIVE_THREADS,
+        )
+        _emit_diagnostic(diagnostic)
+        return seeds, diagnostic
 
     def _has_matching_essay(
         self,
@@ -605,28 +716,60 @@ class IdeaMiner:
             snapshot: Optional pre-loaded snapshot to avoid re-scanning
                 the vault between strategies.
         """
-        snap = self._resolve_snapshot(vault_path, snapshot)
-        combined: list[IdeaSeed] = []
-        combined.extend(self.mine_thread_terminus(vault_path, snapshot=snap))
-        combined.extend(self.mine_liminal_cross_eddy(vault_path, snapshot=snap))
-        combined.extend(
-            self.mine_wavelength_windows(
+        return list(
+            self.mine_all_with_report(
                 vault_path,
                 current_phase=current_phase,
-                snapshot=snap,
-            ),
+                snapshot=snapshot,
+            ).seeds,
         )
-        combined.extend(self.mine_resonance_chains(vault_path, snapshot=snap))
 
-        deduped: list[IdeaSeed] = []
-        seen: set[IdeaSeed] = set()
-        for seed in combined:
-            if seed in seen:
-                continue
-            seen.add(seed)
-            deduped.append(seed)
-        deduped.sort(key=lambda s: (-s.score, s.strategy.value, s.title))
-        return deduped
+    def mine_all_with_report(
+        self,
+        vault_path: Path,
+        *,
+        current_phase: Phase,
+        snapshot: MiningSnapshot | None = None,
+    ) -> MiningRunReport:
+        """Run every strategy and return seeds plus per-strategy diagnostics.
+
+        This is the observability surface the CLI uses to explain a
+        zero-seed run (issue #340). Each :class:`StrategyDiagnostic` in
+        the returned :class:`MiningRunReport` reports candidates
+        considered, candidates kept, the top score the strategy saw,
+        the threshold the score is measured against, and an optional
+        fallback reason.
+
+        Args:
+            vault_path: Root of the Obsidian vault.
+            current_phase: The current Archetypal Wavelength phase.
+                :attr:`Phase.UNCLASSIFIED` skips the wavelength strategy.
+            snapshot: Optional pre-loaded snapshot to avoid re-scanning
+                the vault between strategies.
+        """
+        snap = self._resolve_snapshot(vault_path, snapshot)
+        thread_seeds, thread_diag = self._mine_thread_terminus_with_diagnostic(
+            vault_path,
+            snapshot=snap,
+        )
+        liminal_seeds, liminal_diag = self._mine_liminal_cross_eddy_with_diagnostic(
+            vault_path,
+            snapshot=snap,
+        )
+        wave_seeds, wave_diag = self._mine_wavelength_windows_with_diagnostic(
+            vault_path,
+            current_phase=current_phase,
+            snapshot=snap,
+        )
+        chain_seeds, chain_diag = self._mine_resonance_chains_with_diagnostic(
+            vault_path,
+            snapshot=snap,
+        )
+        combined = thread_seeds + liminal_seeds + wave_seeds + chain_seeds
+        return MiningRunReport(
+            seeds=tuple(_dedupe_sorted_seeds(combined)),
+            diagnostics=(thread_diag, liminal_diag, wave_diag, chain_diag),
+        )
 
     # ---- Strategy: Resonance chain ----
 
@@ -643,6 +786,26 @@ class IdeaMiner:
         distinct source platforms qualify. Edges with similarity below
         :attr:`similarity_resonance` are ignored.
         """
+        seeds, _diag = self._mine_resonance_chains_with_diagnostic(
+            vault_path,
+            snapshot=snapshot,
+        )
+        return seeds
+
+    def _mine_resonance_chains_with_diagnostic(
+        self,
+        vault_path: Path,
+        *,
+        snapshot: MiningSnapshot | None = None,
+    ) -> tuple[list[IdeaSeed], StrategyDiagnostic]:
+        """Run :meth:`mine_resonance_chains` and emit a diagnostic record.
+
+        Reports the largest connected component size as ``top_score``
+        and the chain-length floor as ``threshold`` so the operator
+        sees the gap in raw fragment counts. When no synchronicity
+        records exist on disk, the diagnostic carries a fallback
+        reason and a ``compile-needed`` entry is appended.
+        """
         snap = self._resolve_snapshot(vault_path, snapshot)
         qualified_edges = [
             (a, b)
@@ -651,12 +814,48 @@ class IdeaMiner:
         ]
         components = _connected_components(qualified_edges)
         fragments_by_id = {frag.id: frag for frag, _body in snap.fragments}
-        seeds: list[IdeaSeed] = []
-        for component in components:
-            seed = self._chain_seed(component, fragments_by_id)
-            if seed is not None:
-                seeds.append(seed)
-        return seeds
+        seeds = [
+            seed
+            for seed in (
+                self._chain_seed(component, fragments_by_id) for component in components
+            )
+            if seed is not None
+        ]
+        top_score = float(max((len(c) for c in components), default=0))
+        fallback_reason = self._resonance_fallback_reason(
+            snap.synchronicities,
+            snap.compiled_pages,
+            vault_path,
+        )
+        diagnostic = StrategyDiagnostic(
+            strategy=MiningStrategy.RESONANCE_CHAIN,
+            candidates_considered=len(components),
+            candidates_kept=len(seeds),
+            top_score=top_score,
+            threshold=float(self.min_chain_length),
+            fallback_reason=fallback_reason,
+        )
+        _emit_diagnostic(diagnostic)
+        return seeds, diagnostic
+
+    def _resonance_fallback_reason(
+        self,
+        synchronicities: tuple[tuple[str, str, float], ...],
+        compiled: CompiledPageIndex,
+        vault_path: Path,
+    ) -> str | None:
+        """Log + return a fallback reason when no synchronicities exist."""
+        if synchronicities:
+            return None
+        if not compiled.bypassed:
+            log_compile_gap(
+                vault_path,
+                target_kind="synchronicities",
+                target_id="10-Liminal/Synchronicities",
+                surfaced_by="mine.resonance_chain",
+                reason="missing",
+            )
+        return _NO_SYNCHRONICITIES
 
     def _chain_seed(
         self,
@@ -715,25 +914,68 @@ class IdeaMiner:
         provenance are deferred until the index is recompiled. Missing
         frequency indexes log a ``compile-needed`` entry.
         """
+        seeds, _diag = self._mine_wavelength_windows_with_diagnostic(
+            vault_path,
+            current_phase=current_phase,
+            snapshot=snapshot,
+        )
+        return seeds
+
+    def _mine_wavelength_windows_with_diagnostic(
+        self,
+        vault_path: Path,
+        *,
+        current_phase: Phase,
+        snapshot: MiningSnapshot | None = None,
+    ) -> tuple[list[IdeaSeed], StrategyDiagnostic]:
+        """Run :meth:`mine_wavelength_windows` and emit a diagnostic record.
+
+        The wavelength strategy is a binary phase + praxis gate, so
+        ``top_score`` is reported as the number of phase-matching
+        fragments and ``threshold`` is the minimum needed (1) for any
+        seed to surface — making the gap visible without lying about
+        per-candidate similarity.
+        """
         if str(current_phase) == Phase.UNCLASSIFIED.value:
-            return []
+            diag = StrategyDiagnostic(
+                strategy=MiningStrategy.WAVELENGTH_WINDOW,
+                candidates_considered=0,
+                candidates_kept=0,
+                top_score=0.0,
+                threshold=1.0,
+                fallback_reason=_UNCLASSIFIED_PHASE,
+            )
+            _emit_diagnostic(diag)
+            return [], diag
         snap = self._resolve_snapshot(vault_path, snapshot)
+        phase_matches = [
+            frag
+            for frag, _body in snap.fragments
+            if _matches_phase(frag, current_phase)
+        ]
         gaps_logged: set[str] = set()
-        seeds: list[IdeaSeed] = []
-        for fragment, _body in snap.fragments:
-            if not _matches_phase(fragment, current_phase):
-                continue
-            if str(fragment.praxis_potential) != PraxisPotential.EXPLICIT.value:
-                continue
-            if not self._frequency_admits_fragment(
-                fragment,
+        seeds = [
+            self._seed_from_phase_match(frag, current_phase)
+            for frag in phase_matches
+            if str(frag.praxis_potential) == PraxisPotential.EXPLICIT.value
+            and self._frequency_admits_fragment(
+                frag,
                 snap.compiled_pages,
                 vault_path,
                 gaps_logged,
-            ):
-                continue
-            seeds.append(self._seed_from_phase_match(fragment, current_phase))
-        return seeds
+            )
+        ]
+        reason = None if phase_matches else _NO_PHASE_MATCHES
+        diagnostic = StrategyDiagnostic(
+            strategy=MiningStrategy.WAVELENGTH_WINDOW,
+            candidates_considered=len(phase_matches),
+            candidates_kept=len(seeds),
+            top_score=float(len(seeds)),
+            threshold=1.0,
+            fallback_reason=reason,
+        )
+        _emit_diagnostic(diagnostic)
+        return seeds, diagnostic
 
     def _frequency_admits_fragment(
         self,
@@ -805,11 +1047,25 @@ class IdeaMiner:
         one exists, falling back to the eddy's frontmatter description
         and recording a ``compile-needed`` entry per missing eddy.
         """
+        seeds, _diag = self._mine_liminal_cross_eddy_with_diagnostic(
+            vault_path,
+            snapshot=snapshot,
+        )
+        return seeds
+
+    def _mine_liminal_cross_eddy_with_diagnostic(
+        self,
+        vault_path: Path,
+        *,
+        snapshot: MiningSnapshot | None = None,
+    ) -> tuple[list[IdeaSeed], StrategyDiagnostic]:
+        """Run :meth:`mine_liminal_cross_eddy` and emit a diagnostic record."""
         snap = self._resolve_snapshot(vault_path, snapshot)
         gaps_logged: set[str] = set()
         seeds: list[IdeaSeed] = []
+        best_score = 0.0
         for fragment, body, _kind in snap.liminal_fragments:
-            best = self._best_eddy_match(
+            best = self._best_eddy_match_unfiltered(
                 fragment,
                 body,
                 snap.eddies,
@@ -820,8 +1076,20 @@ class IdeaMiner:
             if best is None:
                 continue
             eddy, score = best
-            seeds.append(self._seed_from_liminal(fragment, eddy, score))
-        return seeds
+            best_score = max(best_score, score)
+            if score >= self.similarity_liminal:
+                seeds.append(self._seed_from_liminal(fragment, eddy, score))
+        reason = None if snap.liminal_fragments else _NO_LIMINAL_FRAGMENTS
+        diagnostic = StrategyDiagnostic(
+            strategy=MiningStrategy.LIMINAL_CROSS_EDDY,
+            candidates_considered=len(snap.liminal_fragments),
+            candidates_kept=len(seeds),
+            top_score=best_score,
+            threshold=self.similarity_liminal,
+            fallback_reason=reason,
+        )
+        _emit_diagnostic(diagnostic)
+        return seeds, diagnostic
 
     def _best_eddy_match(
         self,
@@ -833,6 +1101,34 @@ class IdeaMiner:
         gaps_logged: set[str],
     ) -> tuple[Eddy, float] | None:
         """Return the eddy with the highest similarity above threshold."""
+        best = self._best_eddy_match_unfiltered(
+            fragment,
+            body,
+            eddies,
+            compiled,
+            vault_path,
+            gaps_logged,
+        )
+        if best is None or best[1] < self.similarity_liminal:
+            return None
+        return best
+
+    def _best_eddy_match_unfiltered(
+        self,
+        fragment: Fragment,
+        body: str,
+        eddies: tuple[Eddy, ...],
+        compiled: CompiledPageIndex,
+        vault_path: Path,
+        gaps_logged: set[str],
+    ) -> tuple[Eddy, float] | None:
+        """Return the highest-similarity eddy regardless of threshold.
+
+        Used by :meth:`_mine_liminal_cross_eddy_with_diagnostic` so the
+        diagnostic can surface the best score even when it failed to
+        clear :attr:`similarity_liminal`. Returns ``None`` when *eddies*
+        is empty.
+        """
         frag_text = f"{fragment.title}\n{body}"
         scored: list[tuple[Eddy, float]] = []
         for eddy in eddies:
@@ -842,9 +1138,7 @@ class IdeaMiner:
                 vault_path,
                 gaps_logged,
             )
-            score = self._similarity_fn(frag_text, eddy_text)
-            if score >= self.similarity_liminal:
-                scored.append((eddy, score))
+            scored.append((eddy, self._similarity_fn(frag_text, eddy_text)))
         if not scored:
             return None
         scored.sort(key=operator.itemgetter(1), reverse=True)
@@ -904,6 +1198,41 @@ class IdeaMiner:
             brief_description=description,
             score=score,
         )
+
+
+def _emit_diagnostic(diagnostic: StrategyDiagnostic) -> None:
+    """Log a one-line INFO record summarising one strategy's run.
+
+    The shape (``[mine] <strategy>: ...``) is part of the operator
+    contract — operators grep for it in pipeline logs to triage a
+    zero-seed mining run (issue #340). Changing the prefix without
+    updating downstream tooling will silently break that workflow.
+    """
+    reason = (
+        f" reason={diagnostic.fallback_reason}" if diagnostic.fallback_reason else ""
+    )
+    logger.info(
+        "[mine] %s: %d considered, %d kept (top_score=%.3f threshold=%.3f)%s",
+        diagnostic.strategy.value,
+        diagnostic.candidates_considered,
+        diagnostic.candidates_kept,
+        diagnostic.top_score,
+        diagnostic.threshold,
+        reason,
+    )
+
+
+def _dedupe_sorted_seeds(seeds: list[IdeaSeed]) -> list[IdeaSeed]:
+    """Deduplicate *seeds* by identity, then sort by score desc / strategy / title."""
+    deduped: list[IdeaSeed] = []
+    seen: set[IdeaSeed] = set()
+    for seed in seeds:
+        if seed in seen:
+            continue
+        seen.add(seed)
+        deduped.append(seed)
+    deduped.sort(key=lambda s: (-s.score, s.strategy.value, s.title))
+    return deduped
 
 
 def _fragment_frequencies(fragment: Fragment) -> tuple[Frequency, ...]:

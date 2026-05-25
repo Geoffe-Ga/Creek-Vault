@@ -1283,3 +1283,206 @@ class TestPhaseFilteredSeedsEdgeCases:
         assert any(s.strategy == MiningStrategy.THREAD_TERMINUS for s in seeds), (
             "unrecognised phase must fall through to all strategies"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #340: honest diagnostics for a zero-seed mining run
+# ---------------------------------------------------------------------------
+
+
+class TestMiningRunReport:
+    """``IdeaMiner.mine_all_with_report`` exposes per-strategy diagnostics.
+
+    The bug we're patching: a 188-fragment vault returns ``No idea seeds
+    surfaced`` with no explanation. The miner must expose enough state
+    to tell the operator *why* — top score, threshold, fallback reason.
+    """
+
+    def test_report_records_one_diagnostic_per_strategy(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Every strategy contributes exactly one diagnostic to the report."""
+        report = miner.mine_all_with_report(vault, current_phase=Phase.RISING)
+
+        strategies = {diag.strategy for diag in report.diagnostics}
+        assert strategies == set(MiningStrategy)
+
+    def test_report_seeds_match_mine_all(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """``report.seeds`` equals ``mine_all`` output (no drift)."""
+        _write_thread(
+            vault,
+            _build_thread(
+                thread_id="thread-big",
+                title="Unique thread title",
+                fragment_count=15,
+            ),
+        )
+        legacy = miner.mine_all(vault, current_phase=Phase.UNCLASSIFIED)
+        report = miner.mine_all_with_report(vault, current_phase=Phase.UNCLASSIFIED)
+
+        assert list(report.seeds) == legacy
+
+    def test_report_top_score_reflects_best_candidate(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """``top_score`` reflects best per-strategy score, even when zero kept."""
+        # No fragments — every strategy considers zero candidates.
+        empty_report = miner.mine_all_with_report(vault, current_phase=Phase.RISING)
+        assert empty_report.top_score == 0.0
+        assert empty_report.seeds == ()
+
+    def test_diagnostic_counts_threshold_and_candidates_for_thread_terminus(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Thread terminus reports candidates considered and the threshold."""
+        _write_thread(
+            vault,
+            _build_thread(
+                thread_id="thread-big",
+                title="Big thread",
+                fragment_count=15,
+            ),
+        )
+        _write_thread(
+            vault,
+            _build_thread(
+                thread_id="thread-tiny",
+                title="Tiny thread",
+                fragment_count=2,
+            ),
+        )
+        report = miner.mine_all_with_report(vault, current_phase=Phase.UNCLASSIFIED)
+        diag = next(
+            d
+            for d in report.diagnostics
+            if d.strategy is MiningStrategy.THREAD_TERMINUS
+        )
+
+        assert diag.candidates_considered == 2
+        assert diag.candidates_kept == 1
+        assert diag.threshold == float(miner.min_thread_fragments)
+        assert diag.top_score == 15.0
+
+    def test_resonance_chain_zero_synchronicities_records_fallback_reason(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """When no synchronicity records exist, the diagnostic explains the miss."""
+        report = miner.mine_all_with_report(vault, current_phase=Phase.UNCLASSIFIED)
+        diag = next(
+            d
+            for d in report.diagnostics
+            if d.strategy is MiningStrategy.RESONANCE_CHAIN
+        )
+        assert diag.candidates_considered == 0
+        assert diag.fallback_reason is not None
+        assert "synchron" in diag.fallback_reason.lower()
+
+
+class TestMiningDiagnosticLogLines:
+    """Each strategy emits a single INFO log line with diagnostic numbers."""
+
+    def test_every_strategy_emits_log_line(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """All four strategies log a ``[mine] <strategy>: ...`` line at INFO."""
+        with caplog.at_level("INFO", logger="creek.generate.mining"):
+            miner.mine_all_with_report(vault, current_phase=Phase.RISING)
+
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        for strategy in MiningStrategy:
+            assert f"[mine] {strategy.value}" in log_text, (
+                f"missing diagnostic line for {strategy.value}: {log_text!r}"
+            )
+
+    def test_log_line_names_threshold(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The diagnostic line includes the active threshold value."""
+        with caplog.at_level("INFO", logger="creek.generate.mining"):
+            miner.mine_all_with_report(vault, current_phase=Phase.RISING)
+
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "threshold=" in log_text
+
+
+class TestMiningFallbackGapLog:
+    """Strategies that hit a fallback append to ``compile-gaps.jsonl``.
+
+    The wavelength-window and thread-terminus paths already log
+    compile-needed entries when their compiled pages are missing. The
+    resonance-chain strategy now also records a fallback entry when it
+    has no synchronicity records to walk — without that the operator
+    has no breadcrumb explaining the zero-seed outcome.
+    """
+
+    def test_resonance_chain_logs_missing_synchronicities(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """A run with zero synchronicities appends one resonance-chain gap entry."""
+        miner.mine_all_with_report(vault, current_phase=Phase.UNCLASSIFIED)
+
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert gaps_log.exists()
+        lines = gaps_log.read_text(encoding="utf-8").strip().splitlines()
+        entries = [json.loads(line) for line in lines]
+        assert any(e["surfaced_by"] == "mine.resonance_chain" for e in entries), entries
+
+    def test_resonance_chain_bypass_does_not_log(
+        self,
+        vault: Path,
+    ) -> None:
+        """Bypass mode suppresses the resonance-chain fallback log."""
+        IdeaMiner(bypass_compiled=True).mine_all_with_report(
+            vault,
+            current_phase=Phase.UNCLASSIFIED,
+        )
+
+        gaps_log = vault / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+        assert not gaps_log.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #340: MiningConfig knobs exposed via creek_config.yaml
+# ---------------------------------------------------------------------------
+
+
+class TestIdeaMinerConfigKnobs:
+    """The four mining thresholds are individually overridable.
+
+    ``creek_config.yaml`` exposes these knobs so an operator can calibrate
+    a small-N corpus without monkey-patching defaults. The CLI passes
+    them through; the constructor must accept any subset.
+    """
+
+    def test_constructor_accepts_overridden_thresholds(self) -> None:
+        """All four mining knobs are individually overridable."""
+        custom = IdeaMiner(
+            min_thread_fragments=5,
+            min_chain_length=2,
+            similarity_liminal=0.2,
+            similarity_resonance=0.4,
+        )
+        assert custom.min_thread_fragments == 5
+        assert custom.min_chain_length == 2
+        assert custom.similarity_liminal == pytest.approx(0.2)
+        assert custom.similarity_resonance == pytest.approx(0.4)
