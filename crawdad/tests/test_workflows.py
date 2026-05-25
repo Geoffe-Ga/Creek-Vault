@@ -30,6 +30,7 @@ from crawdad.workflows import (
     WorkflowParseError,
     WorkflowRegistry,
     WorkflowStep,
+    WorkflowStepError,
     WorkflowWalker,
     _synthesize_user_message,
     interpolate,
@@ -278,15 +279,20 @@ def test_interpolate_step_body() -> None:
     assert out == "previous: phase: rising"
 
 
-def test_interpolate_step_unknown_yields_empty() -> None:
-    """A reference to an unknown step id resolves to empty string."""
-    out = interpolate(
-        "nothing here: [{{step.missing.body}}]",
-        state=None,
-        inputs={},
-        step_results={},
-    )
-    assert out == "nothing here: []"
+def test_interpolate_step_unknown_id_raises_step_error() -> None:
+    """A reference to an unknown step id is a workflow bug — surface it loudly.
+
+    Phase 2 (#326) tightens this from the Phase 1 stub's empty-string
+    fallback: a step reference always pins a real upstream output, so a
+    forward / typo'd reference is an authoring error worth failing on.
+    """
+    with pytest.raises(WorkflowStepError, match=r"step\.missing"):
+        interpolate(
+            "nothing here: [{{step.missing.body}}]",
+            state=None,
+            inputs={},
+            step_results={},
+        )
 
 
 def test_interpolate_unknown_namespace_passes_through() -> None:
@@ -398,26 +404,46 @@ def test_interpolate_input_namespace_with_no_field_yields_empty() -> None:
     assert out == "[]"
 
 
-def test_interpolate_step_with_no_field_yields_empty() -> None:
-    """A ``{{step.<id>}}`` reference without a field resolves to empty string."""
-    out = interpolate(
-        "[{{step.read}}]",
-        state=None,
-        inputs={},
-        step_results={"read": ToolResult(intent_type="x", body="b")},
-    )
-    assert out == "[]"
+def test_interpolate_bare_step_namespace_raises_step_error() -> None:
+    """``{{step}}`` with no id at all is also a malformed reference."""
+    with pytest.raises(WorkflowStepError, match="step"):
+        interpolate(
+            "[{{step}}]",
+            state=None,
+            inputs={},
+            step_results={},
+        )
 
 
-def test_interpolate_step_with_unknown_field_yields_empty() -> None:
-    """``{{step.<id>.bogus}}`` (not ``body``) resolves to empty string."""
-    out = interpolate(
-        "[{{step.read.bogus}}]",
-        state=None,
-        inputs={},
-        step_results={"read": ToolResult(intent_type="x", body="b")},
-    )
-    assert out == "[]"
+def test_interpolate_step_with_no_field_raises_step_error() -> None:
+    """``{{step.<id>}}`` with no trailing field is a malformed reference.
+
+    Phase 2 (#326): the only valid step accessor today is ``.body``, so
+    omitting the field is an authoring bug; we surface it instead of
+    silently resolving to empty.
+    """
+    with pytest.raises(WorkflowStepError, match=r"step\.read"):
+        interpolate(
+            "[{{step.read}}]",
+            state=None,
+            inputs={},
+            step_results={"read": ToolResult(intent_type="x", body="b")},
+        )
+
+
+def test_interpolate_step_with_unknown_field_raises_step_error() -> None:
+    """``{{step.<id>.bogus}}`` (not ``body``) is a malformed reference.
+
+    Phase 2 (#326): the walker only exposes ``body`` on a step result;
+    any other field is a typo and must fail loudly.
+    """
+    with pytest.raises(WorkflowStepError, match="bogus"):
+        interpolate(
+            "[{{step.read.bogus}}]",
+            state=None,
+            inputs={},
+            step_results={"read": ToolResult(intent_type="x", body="b")},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +743,152 @@ async def test_walker_supplies_required_input() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Walker — error propagation (ADAPT-003 Phase 2 / #326)
+# ---------------------------------------------------------------------------
+
+
+class _FailingSession:
+    """An :class:`MCPSession`-shaped fake that fails on a specific tool name."""
+
+    def __init__(self, failing_tool: str, *, error: Exception) -> None:
+        """Configure which tool name raises and what exception to raise."""
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._failing_tool = failing_tool
+        self._error = error
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> str:
+        """Record the call; raise the canned exception when *name* matches."""
+        self.calls.append((name, arguments or {}))
+        if name == self._failing_tool:
+            raise self._error
+        return ""
+
+
+async def test_walker_aborts_when_step_references_missing_upstream_step() -> None:
+    """A reference to a step id that has not run yet halts the walker loudly.
+
+    Phase 2 acceptance: a forward / typo'd ``{{step.<id>.body}}`` is an
+    authoring error. The walker raises :class:`WorkflowStepError` naming
+    the offending step so the operator can locate the typo.
+    """
+    wf = WorkflowDefinition(
+        name="bad-ref",
+        description="references a step that does not exist",
+        steps=(
+            WorkflowStep(
+                id="mine",
+                tool="creek.mine",
+                args={"echo": "{{step.notthere.body}}"},
+            ),
+        ),
+    )
+    session = _FakeSession()
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(session),
+        known_tools=("creek.mine",),
+    )
+
+    with pytest.raises(WorkflowStepError, match="mine") as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    # The error message names BOTH the failing step id (so the operator
+    # can find it in the workflow file) AND the missing upstream id (so
+    # they know what to fix).
+    assert "notthere" in str(excinfo.value)
+    # The tool was never invoked — interpolation failed first.
+    assert session.calls == []
+
+
+async def test_walker_aborts_when_step_references_unknown_field() -> None:
+    """``{{step.<id>.bogus}}`` halts the walker with a clear error.
+
+    Only ``.body`` is exposed on a step result today; any other field is
+    a typo worth failing loudly on.
+    """
+    wf = WorkflowDefinition(
+        name="bad-field",
+        description="references a field that does not exist",
+        steps=(
+            WorkflowStep(id="read", tool="creek.state.read"),
+            WorkflowStep(
+                id="mine",
+                tool="creek.mine",
+                args={"echo": "{{step.read.bogus}}"},
+            ),
+        ),
+    )
+    session = _FakeSession(responses={"creek.state.read": "ok"})
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(session),
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+
+    with pytest.raises(WorkflowStepError, match="mine") as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    assert "bogus" in str(excinfo.value)
+    # The first step ran successfully; the second step never reached
+    # the tool call because interpolation failed.
+    assert [name for name, _ in session.calls] == ["creek.state.read"]
+
+
+async def test_walker_aborts_on_mcp_tool_failure_mid_workflow() -> None:
+    """If an MCP tool raises mid-workflow, the walker halts and names the step.
+
+    The second step's ``creek.mine`` call fails — the walker must
+    surface that with a :class:`WorkflowStepError` naming the failing
+    step (``mine``) and embedding the upstream error message.
+    """
+    failing = _FailingSession(
+        "creek.mine", error=RuntimeError("mcp boom: tool exploded")
+    )
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(failing),  # type: ignore[arg-type]
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+
+    with pytest.raises(WorkflowStepError, match="mine") as excinfo:
+        await walker.run(_simple_workflow(), state=None, inputs={})
+
+    message = str(excinfo.value)
+    assert "creek.mine" in message
+    assert "mcp boom" in message
+    # The original exception is preserved as the chained cause so
+    # callers can introspect it (or surface the original type).
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    # The first step succeeded; the second step ran (failed) and the
+    # third step was never attempted.
+    assert [name for name, _ in failing.calls] == [
+        "creek.state.read",
+        "creek.mine",
+    ]
+
+
+async def test_walker_step_error_carries_step_and_tool_metadata() -> None:
+    """``WorkflowStepError`` exposes step id, tool name, and workflow name as attrs.
+
+    A structured error is more useful to callers than message-only
+    surfacing — the slash command may want to format the step id
+    differently, and tests/log analysers can pin on attributes rather
+    than scraping the message string.
+    """
+    failing = _FailingSession("creek.mine", error=ValueError("nope"))
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(failing),  # type: ignore[arg-type]
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+
+    with pytest.raises(WorkflowStepError) as excinfo:
+        await walker.run(_simple_workflow(), state=None, inputs={})
+
+    assert excinfo.value.step_id == "mine"
+    assert excinfo.value.tool == "creek.mine"
+    assert excinfo.value.workflow_name == "test-flow"
+
+
+# ---------------------------------------------------------------------------
 # Reference workflows
 # ---------------------------------------------------------------------------
 
@@ -786,6 +958,82 @@ async def test_compost_surfacing_refuses_when_session_state_unavailable() -> Non
 
     with pytest.raises(WorkflowConstraintError, match="phase-aware"):
         await walker.run(wf, state=None, inputs={})
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: all reference workflows run against a mocked MCP client (#326)
+# ---------------------------------------------------------------------------
+
+
+# Canned responses for every MCP tool any reference workflow calls. The
+# values are placeholders — the e2e test asserts on the call sequence
+# (the wiring contract) not on the body text (which the composer owns).
+_REFERENCE_TOOL_RESPONSES: dict[str, str] = {
+    "creek.state.read": (
+        "## Wavelength snapshot\n- Phase: **rising** (confidence 0.84)\n"
+    ),
+    "creek.mine": "[]",
+    "creek.draft": "draft body",
+}
+
+
+@pytest.mark.parametrize(
+    ("workflow_filename", "expected_calls"),
+    [
+        (
+            "wavelength-checkin.workflow.yaml",
+            ["creek.state.read"],
+        ),
+        (
+            "compost-surfacing.workflow.yaml",
+            ["creek.state.read", "creek.mine"],
+        ),
+        (
+            "substack-draft-phase-transitions.workflow.yaml",
+            ["creek.state.read", "creek.mine", "creek.draft"],
+        ),
+    ],
+    ids=["wavelength-checkin", "compost-surfacing", "substack-draft"],
+)
+async def test_reference_workflows_walk_end_to_end_against_mocked_mcp(
+    workflow_filename: str,
+    expected_calls: list[str],
+    vault_with_state: Path,
+) -> None:
+    """Every shipped reference workflow walks to completion on a mocked MCP.
+
+    The mocked MCP client is the integration boundary called out in
+    issue #326's e2e recipe: we never spawn a real subprocess but we
+    DO exercise the full walker → tool dispatch → result chain →
+    constraint enforcement path for every step the reference workflow
+    declares. The phase-aware workflows are run with the populated
+    ``vault_with_state`` fixture so the ``state.phase`` interpolation
+    has a real ``rising`` slug to substitute.
+    """
+    from crawdad.state import load_session_state
+
+    path = BUILTIN_WORKFLOWS_DIR / workflow_filename
+    wf = load_workflow_from_yaml(path)
+    state = load_session_state(vault_with_state)
+    session = _FakeSession(responses=dict(_REFERENCE_TOOL_RESPONSES))
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(session),
+        known_tools=tuple(_REFERENCE_TOOL_RESPONSES),
+    )
+
+    results = await walker.run(wf, state=state, inputs={})
+
+    # Every declared step ran and yielded a ToolResult, in document order.
+    assert [name for name, _ in session.calls] == expected_calls
+    assert [r.intent_type for r in results] == expected_calls
+    # Phase-aware workflows must have had ``{{state.phase}}`` resolved
+    # against the live session (not left as a literal placeholder).
+    for _name, args in session.calls:
+        for value in args.values():
+            if isinstance(value, str):
+                assert "{{" not in value, (
+                    f"unresolved placeholder leaked into MCP call args: {args!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
