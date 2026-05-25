@@ -30,6 +30,64 @@ the variable, so callers (e.g. CrawDad spawning ``creek-tools-mcp``)
 can keep the configured vault config discoverable regardless of cwd.
 """
 
+VAULT_CONFIG_RELPATH = Path("00-Creek-Meta") / "creek_config.yaml"
+"""Canonical location of ``creek_config.yaml`` inside a scaffolded vault.
+
+Mirrors the path written by ``creek init --vault <path>`` so callers
+can resolve a vault's config without re-deriving the layout.
+"""
+
+
+def resolve_config_path(
+    vault: Path | None,
+    explicit: Path | None,
+) -> Path | None:
+    """Pick the effective ``creek_config.yaml`` path from CLI/env/vault inputs.
+
+    Resolution order, highest precedence first:
+
+    1. ``explicit`` — typically a ``--config <path>`` CLI flag.
+    2. The ``CREEK_CONFIG`` environment variable, when set and
+       non-empty. A non-existent target raises ``FileNotFoundError``,
+       preserving the INC-008 "explicit env var declares intent"
+       contract even when ``--vault`` is also supplied (issue #322).
+    3. ``<vault>/00-Creek-Meta/creek_config.yaml``, when *vault* is
+       supplied and the file exists.
+    4. ``None`` — callers fall back to :func:`load_config`'s historical
+       cwd-default + warning behaviour.
+
+    Args:
+        vault: Vault root from ``--vault``, or ``None``.
+        explicit: Operator-supplied config path (e.g. ``--config``), or
+            ``None``.
+
+    Returns:
+        The resolved config path, or ``None`` to defer to
+        :func:`load_config`'s default discovery.
+
+    Raises:
+        FileNotFoundError: When ``CREEK_CONFIG`` names a path that does
+            not exist on disk.
+    """
+    if explicit is not None:
+        return explicit
+    env_value = os.environ.get(CONFIG_PATH_ENV_VAR, "").strip()
+    if env_value:
+        env_path = Path(env_value)
+        if not env_path.exists():
+            msg = (
+                f"{CONFIG_PATH_ENV_VAR} points to {env_path}, but no "
+                "file exists there. Unset the environment variable or "
+                "correct the path."
+            )
+            raise FileNotFoundError(msg)
+        return env_path
+    if vault is not None:
+        candidate = vault / VAULT_CONFIG_RELPATH
+        if candidate.exists():
+            return candidate
+    return None
+
 
 class LLMConfig(BaseModel):
     """LLM provider configuration."""
