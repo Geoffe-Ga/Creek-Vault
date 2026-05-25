@@ -391,6 +391,24 @@ def test_dry_run_open_workflow_with_no_overrides() -> None:
     assert "period" in body  # args rendered too
 
 
+def test_dry_run_personal_workflow_runs_without_overrides() -> None:
+    """A ``personal``-floor workflow dry-runs without any override flags.
+
+    Phase 1 only gates the ``intimate`` floor; ``personal`` is
+    advisory until Phase 2 wires real privacy enforcement. This test
+    pins the current intent so that a future contributor doesn't
+    silently add a half-built gate or wonder if the omission is a bug.
+    """
+    workflow = _build(privacy_tier_floor=PrivacyTierFloor.PERSONAL)
+
+    lines = dry_run_workflow(workflow, current_phase=None, allow_intimate=False)
+
+    body = "\n".join(lines)
+    assert "Phase 1 dry-run" in body
+    assert "personal" in body  # tier surfaced in the header
+    assert "creek.state.read" in body
+
+
 def test_dry_run_labels_output_as_phase_1_dry_run() -> None:
     """Every dry-run output is explicitly labelled — no one mistakes it for live."""
     workflow = _build()

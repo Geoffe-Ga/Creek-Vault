@@ -97,10 +97,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _add_workflows_parser(sub: argparse._SubParsersAction[Any]) -> None:
-    """Wire the ``crawdad workflows {list,run}`` subcommands (ADAPT-003 Phase 1)."""
+    """Wire the ``crawdad workflows {list,run}`` subcommands."""
     workflows = sub.add_parser(
         "workflows",
-        help="List or dry-run Jig-style workflows (ADAPT-003 Phase 1).",
+        help="List or dry-run Jig-style workflows.",
     )
     workflow_actions = workflows.add_subparsers(dest="workflow_action", required=True)
     workflow_actions.add_parser("list", help="List the bundled workflows.")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -285,7 +286,7 @@ async def test_handle_workflow_run_requires_name() -> None:
 
 
 async def test_handle_workflow_run_intimate_requires_override(
-    tmp_path: Any,
+    tmp_path: Path,
 ) -> None:
     """An intimate-floor workflow refuses without ``allow_intimate=True``."""
     from crawdad.workflows import WorkflowRegistry
@@ -322,7 +323,7 @@ async def test_handle_workflow_run_intimate_requires_override(
 
 
 async def test_handle_workflow_empty_registry_replies_friendly(
-    tmp_path: Any,
+    tmp_path: Path,
 ) -> None:
     """``list`` with no workflows returns a friendly empty message."""
     from crawdad.workflows import WorkflowRegistry

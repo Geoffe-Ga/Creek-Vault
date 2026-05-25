@@ -233,7 +233,14 @@ def _enforce_constraints(
     current_phase: str | None,
     allow_intimate: bool,
 ) -> None:
-    """Reject the workflow if a declared constraint isn't satisfied."""
+    """Reject the workflow if a declared constraint isn't satisfied.
+
+    Phase 1 enforces the ``intimate`` privacy-tier floor only;
+    ``personal`` is advisory and runs without an override, because
+    real privacy enforcement (consent prompts, audit log) lands with
+    the live walker. Treat the ``personal`` branch as a deliberate
+    no-op, not a forgotten check.
+    """
     if workflow.phase_aware and not current_phase:
         raise WorkflowConstraintError(PHASE_AWARE_WITHOUT_CURRENT_PHASE)
     if workflow.privacy_tier_floor is PrivacyTierFloor.INTIMATE and not allow_intimate:
