@@ -839,15 +839,48 @@ def load_config(
     return CreekConfig()
 
 
+_ANTHROPIC_CONSENT_NOTE: str = """\
+# -----------------------------------------------------------------------------
+# Anthropic cloud classification (opt-in) -- issue #320
+# -----------------------------------------------------------------------------
+# Switching ``llm.provider`` below to ``anthropic`` enables cloud-based
+# classification. Fragment content will be sent to Anthropic's servers,
+# so the provider refuses to start unless TWO environment variables are
+# set explicitly:
+#
+#   export ANTHROPIC_API_KEY=sk-ant-...        # your API key
+#   export CREEK_ANTHROPIC_CONSENT=1           # consent to data egress
+#
+# Without ``CREEK_ANTHROPIC_CONSENT`` the ``creek classify --method llm``
+# run will abort before iterating any fragments. The default provider
+# (``ollama``) is fully local and needs neither variable.
+# -----------------------------------------------------------------------------
+"""
+"""Operator-facing notice prepended to generated configs.
+
+Discoverability is the whole point: fresh users who flip
+``llm.provider`` to ``anthropic`` should learn about the
+``CREEK_ANTHROPIC_CONSENT`` gate from the config file itself rather
+than from a runtime failure mid-classify. The block is YAML-comment-
+only so it survives a round-trip through ``yaml.safe_load`` without
+introducing any new keys (issue #320).
+"""
+
+
 def generate_default_config(output_path: Path) -> None:
     """Generate a default ``creek_config.yaml`` file.
 
     Serialises the default ``CreekConfig`` to YAML and writes it to
     *output_path*, providing a starting template that users can customise.
 
+    The output is prefixed with :data:`_ANTHROPIC_CONSENT_NOTE` so a
+    first-time user sees the ``CREEK_ANTHROPIC_CONSENT`` requirement
+    before flipping ``llm.provider`` to ``anthropic`` (issue #320).
+
     Args:
         output_path: Destination file path for the generated YAML.
     """
     data: dict[str, object] = CreekConfig().model_dump(mode="json")
     with output_path.open("w") as f:
+        f.write(_ANTHROPIC_CONSENT_NOTE)
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

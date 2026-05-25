@@ -656,3 +656,40 @@ class TestGenerateDefaultConfig:
         assert "cleaning" in data
         assert "discord" in data["cleaning"]
         assert "quality" in data["cleaning"]
+
+    def test_generated_config_mentions_anthropic_consent_env(
+        self, tmp_path: Path
+    ) -> None:
+        """Issue #320: the starter config must mention CREEK_ANTHROPIC_CONSENT.
+
+        First-time users who switch ``llm.provider`` to ``anthropic`` should
+        discover the consent-env-var requirement from the config file itself
+        rather than from a runtime failure mid-classify-run.
+        """
+        output = tmp_path / "creek_config.yaml"
+        generate_default_config(output)
+
+        text = output.read_text(encoding="utf-8")
+        # The note lives as a YAML comment near the llm: block, so it must
+        # survive a round-trip parse without changing the data shape.
+        assert "CREEK_ANTHROPIC_CONSENT" in text
+        assert "ANTHROPIC_API_KEY" in text
+        assert "anthropic" in text.lower()
+
+        # The note is purely a comment — it must not introduce new keys
+        # into the parsed config.
+        with output.open() as f:
+            data = yaml.safe_load(f)
+        assert "vault_path" in data
+        assert "llm" in data
+
+    def test_generated_config_round_trips_with_consent_note(
+        self, tmp_path: Path
+    ) -> None:
+        """The added consent comment must not break load_config round-trips."""
+        output = tmp_path / "creek_config.yaml"
+        generate_default_config(output)
+
+        cfg = load_config(output)
+        # The comment is informational — provider default still ollama.
+        assert cfg.llm.provider == "ollama"
