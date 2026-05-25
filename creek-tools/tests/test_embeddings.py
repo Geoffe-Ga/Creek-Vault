@@ -351,6 +351,146 @@ class TestEmbeddingsCachePath:
         )
 
 
+class TestPurgeFragmentIdsFromCache:
+    """Tests for ``purge_fragment_ids_from_cache`` (GAP-001)."""
+
+    def _seed_cache(self, tmp_path: Path, ids: list[str]) -> Path:
+        """Write a parquet cache with one row per supplied fragment id."""
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+        linker.save_cache(
+            {fid: _entry(fid, vector=[0.1, 0.2]) for fid in ids},
+            cache_path,
+        )
+        return cache_path
+
+    def test_returns_zero_when_cache_missing(self, tmp_path: Path) -> None:
+        """A missing cache file is treated as zero rows removed, not an error."""
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        removed = purge_fragment_ids_from_cache(
+            tmp_path / "nonexistent.parquet",
+            ["frag-A"],
+        )
+        assert removed == 0
+
+    def test_returns_zero_for_empty_id_set(self, tmp_path: Path) -> None:
+        """An empty id collection is a no-op even when the cache exists."""
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        cache_path = self._seed_cache(tmp_path, ["frag-A", "frag-B"])
+        removed = purge_fragment_ids_from_cache(cache_path, [])
+        assert removed == 0
+        # Cache untouched.
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        assert set(linker.load_cache(cache_path).keys()) == {"frag-A", "frag-B"}
+
+    def test_removes_matching_rows_only(self, tmp_path: Path) -> None:
+        """Only rows whose fragment_id appears in the purge set are removed."""
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        cache_path = self._seed_cache(
+            tmp_path,
+            ["frag-A", "frag-B", "frag-C"],
+        )
+
+        removed = purge_fragment_ids_from_cache(cache_path, ["frag-A", "frag-C"])
+
+        assert removed == 2
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        survivors = linker.load_cache(cache_path)
+        assert set(survivors.keys()) == {"frag-B"}
+
+    def test_returns_zero_when_no_ids_match(self, tmp_path: Path) -> None:
+        """Purging IDs that aren't in the cache reports zero removals."""
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        cache_path = self._seed_cache(tmp_path, ["frag-A"])
+
+        removed = purge_fragment_ids_from_cache(cache_path, ["frag-missing"])
+
+        assert removed == 0
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        assert set(linker.load_cache(cache_path).keys()) == {"frag-A"}
+
+    def test_purging_every_row_keeps_file(self, tmp_path: Path) -> None:
+        """Removing every row leaves an empty parquet on disk, not a missing file."""
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        cache_path = self._seed_cache(tmp_path, ["frag-A", "frag-B"])
+
+        removed = purge_fragment_ids_from_cache(cache_path, ["frag-A", "frag-B"])
+
+        assert removed == 2
+        assert cache_path.exists()
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        assert linker.load_cache(cache_path) == {}
+
+    def test_dry_run_counts_without_writing(self, tmp_path: Path) -> None:
+        """``dry_run=True`` reports the would-be count without rewriting the file."""
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        cache_path = self._seed_cache(tmp_path, ["frag-A", "frag-B"])
+        before_bytes = cache_path.read_bytes()
+
+        removed = purge_fragment_ids_from_cache(
+            cache_path,
+            ["frag-A"],
+            dry_run=True,
+        )
+
+        assert removed == 1
+        assert cache_path.read_bytes() == before_bytes
+
+
+class TestDeleteEmbeddingsCache:
+    """Tests for ``delete_embeddings_cache`` (GAP-001 vault path)."""
+
+    def test_unlinks_existing_cache_and_returns_row_count(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The whole file is removed; the return value is the prior row count."""
+        from creek.link.embeddings import delete_embeddings_cache
+
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+        linker.save_cache(
+            {
+                "frag-A": _entry("frag-A", vector=[0.1]),
+                "frag-B": _entry("frag-B", vector=[0.2]),
+            },
+            cache_path,
+        )
+
+        removed = delete_embeddings_cache(cache_path)
+
+        assert removed == 2
+        assert not cache_path.exists()
+
+    def test_returns_zero_when_cache_missing(self, tmp_path: Path) -> None:
+        """A missing cache is a no-op, not an error."""
+        from creek.link.embeddings import delete_embeddings_cache
+
+        assert delete_embeddings_cache(tmp_path / "nope.parquet") == 0
+
+    def test_dry_run_preserves_cache_file(self, tmp_path: Path) -> None:
+        """``dry_run=True`` still reports the row count but keeps the file."""
+        from creek.link.embeddings import delete_embeddings_cache
+
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+        linker.save_cache(
+            {"frag-A": _entry("frag-A", vector=[0.1])},
+            cache_path,
+        )
+
+        removed = delete_embeddings_cache(cache_path, dry_run=True)
+
+        assert removed == 1
+        assert cache_path.exists()
+
+
 # ---- Find Resonances ----
 
 

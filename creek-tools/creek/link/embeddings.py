@@ -28,7 +28,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
     from pathlib import Path
 
     from sentence_transformers import SentenceTransformer as SentenceTransformerType
@@ -139,6 +139,99 @@ def embeddings_cache_path(vault_path: Path) -> Path:
         ``<vault>/00-Creek-Meta/embeddings.parquet``.
     """
     return vault_path / EMBEDDINGS_CACHE_DIR / EMBEDDINGS_CACHE_FILENAME
+
+
+def purge_fragment_ids_from_cache(
+    cache_path: Path,
+    fragment_ids: Iterable[str],
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Remove rows whose ``fragment_id`` matches *fragment_ids* (GAP-001).
+
+    The purge engine deletes fragments from disk but, before this hook,
+    left their cached embedding vectors in
+    ``<vault>/00-Creek-Meta/embeddings.parquet``. That broke the
+    right-to-be-forgotten contract for intimate-tier content because
+    sentence-transformer embeddings are partially invertible. This helper
+    is the per-row scrubber the engine now calls.
+
+    A missing cache file is treated as zero rows removed (cache simply
+    has not been built yet) rather than an error, so the purge engine
+    can call this unconditionally without first probing the filesystem.
+
+    Args:
+        cache_path: Embeddings parquet path (typically the result of
+            :func:`embeddings_cache_path`).
+        fragment_ids: IDs whose rows should be dropped.
+        dry_run: When ``True``, count matches without rewriting the file.
+
+    Returns:
+        Number of rows actually removed (or that would be removed in a
+        dry run). Zero when the file is missing, the id set is empty,
+        or no rows match.
+    """
+    ids_set = set(fragment_ids)
+    if not ids_set or not cache_path.exists():
+        return 0
+
+    import pyarrow as pa  # lazy: pyarrow lives in the [embeddings] extra
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(cache_path)
+    ids_in_cache = table["fragment_id"].to_pylist()
+    keep_mask = [fid not in ids_set for fid in ids_in_cache]
+    removed = len(ids_in_cache) - sum(keep_mask)
+    if removed == 0:
+        return 0
+
+    if not dry_run:
+        keep_array = pa.array(keep_mask, type=pa.bool_())
+        pq.write_table(
+            table.filter(keep_array),
+            cache_path,
+            compression="snappy",
+        )
+        logger.info(
+            "Purged %d row(s) from embeddings cache %s",
+            removed,
+            cache_path,
+        )
+    return removed
+
+
+def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
+    """Delete the entire embeddings cache file (GAP-001 vault path).
+
+    ``creek purge vault`` wipes every fragment, so a row-by-row scrub is
+    pointless overhead. Deleting the parquet file outright also matches
+    the threat model's expectation that nothing of intimate-tier content
+    survives a full-vault purge — including the embedding vectors,
+    which are partially invertible.
+
+    Args:
+        cache_path: Embeddings parquet path.
+        dry_run: When ``True``, count rows but leave the file alone.
+
+    Returns:
+        Number of rows that were in the file when it was deleted
+        (or that would be deleted in a dry run). Zero when the file
+        does not exist.
+    """
+    if not cache_path.exists():
+        return 0
+
+    import pyarrow.parquet as pq  # lazy: pyarrow lives in the [embeddings] extra
+
+    row_count = int(pq.read_metadata(cache_path).num_rows)
+    if not dry_run:
+        cache_path.unlink()
+        logger.info(
+            "Deleted embeddings cache %s (%d row(s) removed)",
+            cache_path,
+            row_count,
+        )
+    return row_count
 
 
 def _load_sentence_transformer(

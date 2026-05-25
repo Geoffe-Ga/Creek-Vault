@@ -120,9 +120,15 @@ from most to least likely:
 - **Use `creek purge` for right-to-be-forgotten requests.**
   Per-fragment, per-source, per-date-range, or full-vault — see
   [cleaning-and-purge](../cleaning-and-purge.md).
-- **Wipe the embedding cache** when you wipe vault content. It is
-  *not* automatically purged when you `creek purge vault`. Delete the
-  configured cache directory manually.
+- **Embedding cache hygiene is built into `creek purge`.** Per-fragment,
+  per-source, and per-date-range purges drop the matching rows from
+  `<vault>/00-Creek-Meta/embeddings.parquet`; `creek purge vault`
+  deletes the parquet file outright. The audit log's
+  `embeddings_removed` field carries the real row delta — zero when
+  the cache had not been built yet, otherwise the exact count
+  (GAP-001). If you maintain a *secondary* embedding cache outside
+  the vault (e.g. a notebook or experiment store), you still need to
+  wipe that one yourself.
 - **Rotate the OAuth token after exposure.** Run
   `creek gdrive --revoke` immediately if `token.json` was ever
   copied off the host. See [configuration → google_drive →

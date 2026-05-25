@@ -195,6 +195,17 @@ Every purge appends one JSONL line to `<vault>/00-Creek-Meta/audit/purge.jsonl`.
 }
 ```
 
+`embeddings_removed` is the real number of rows dropped from
+`<vault>/00-Creek-Meta/embeddings.parquet` in that call (GAP-001):
+
+- Zero when the embeddings cache has not been built yet (no `creek
+  link` run has materialised the parquet).
+- The exact row delta when the cache exists — *not* mirrored from
+  `fragments_deleted`. Purging a fragment that was never embedded
+  reports `embeddings_removed: 0` even though `fragments_deleted: 1`.
+- For `creek purge vault`, this counts every row that was in the
+  cache file the engine just deleted outright.
+
 `creek redact --apply` writes alongside it at `<vault>/00-Creek-Meta/audit/redact.jsonl`. Privacy-tier overrides (e.g. `creek mine --include-tier intimate`) write to `<vault>/00-Creek-Meta/audit/privacy.jsonl`. Operational provenance from ingestion stays at `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl` (separate location: not compliance-grade, allowed to be lossy).
 
 A pre-Batch-C `Processing-Log/purge-log.json` from older installs is migrated automatically on first read or write — every legacy entry is replayed into the new chain, a `purge.audit.migration` marker is recorded, and the old file is removed.
