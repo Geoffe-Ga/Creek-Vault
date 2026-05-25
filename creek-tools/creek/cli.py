@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import DraftLLM, SeedSpec
     from creek.ingest.base import Ingestor
+    from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
@@ -1086,11 +1087,47 @@ def link(
         method=method,
         rebuild=rebuild,
     )
-    console.print(
-        f"[bold green]{method.capitalize()} linker: "
-        f"{summary.fragment_count} fragment(s), "
-        f"{summary.link_count} link(s).[/bold green]",
-    )
+    console.print(_format_link_summary(summary))
+
+
+def _format_link_summary(summary: LinkSummary) -> str:
+    """Render a method-specific summary message for the ``creek link`` CLI.
+
+    Issue #338: the legacy message ("X fragment(s), Y link(s)") used the
+    word "link" for two incompatible things — pairwise cosine edges
+    cached in the parquet (embeddings) and topic clusters that may or
+    may not have been written to disk (eddies). The per-method
+    formatting below names the actual side effect so operators can
+    correlate the number with what they see on disk.
+
+    Args:
+        summary: The link summary returned by
+            :func:`creek.link.link_engine.run_link`.
+
+    Returns:
+        A Rich-markup string ready for :func:`console.print`.
+    """
+    fragments = summary.fragment_count
+    if summary.method == "embeddings":
+        body = (
+            f"Embeddings linker: {fragments} fragment(s) embedded, "
+            f"{summary.similarity_edges} similarity edge(s) cached in "
+            f"00-Creek-Meta/embeddings.parquet."
+        )
+    elif summary.method == "eddies":
+        body = (
+            f"Eddies linker: {fragments} fragment(s) scanned, "
+            f"{summary.eddies_detected} eddy(ies) detected, "
+            f"{summary.eddies_written} eddy file(s) written to 03-Eddies/, "
+            f"{summary.member_fragments_updated} fragment(s) updated with "
+            f"`eddies:` wiki-links."
+        )
+    else:
+        # Temporal (issue #338 scope: leave behaviour unchanged).
+        body = (
+            f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
+        )
+    return f"[bold green]{body}[/bold green]"
 
 
 @app.command(name="compile")
