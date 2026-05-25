@@ -537,3 +537,84 @@ def test_rules_method_does_not_persist_reasoning(tmp_path: Path) -> None:
         str(vault / "01-Fragments" / "Notes" / "frag-rulesreas01.md"),
     )
     assert CLASSIFICATION_REASONING_KEY not in reloaded.metadata
+
+
+# ---- Issue #321: preserved counter splits manual vs prior-LLM ----
+
+
+def test_preserved_manual_counts_only_genuinely_manual_fragments(
+    tmp_path: Path,
+) -> None:
+    """``preserved_manual`` reflects only ``classification_method: manual``.
+
+    Issue #321: prior to the fix, a fragment stamped by a partial LLM
+    run inflated ``preserved_manual``, causing the CLI to report "N
+    manual preserved" even though no human had ever touched the file.
+    Pin the contract: the field name must match the data.
+    """
+    vault = tmp_path / "vault"
+    manual_frag = Fragment(
+        id="frag-trulymanual0",
+        title="Hand-tagged",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=manual_frag,
+        body="body",
+        method="manual",
+    )
+    llm_frag = Fragment(
+        id="frag-priorllm0001",
+        title="Prior LLM run",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=llm_frag,
+        body="body",
+        method="llm",
+    )
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert summary.preserved_manual == 1
+    assert summary.preserved_llm == 1
+    assert summary.classified == 0
+
+
+def test_preserved_llm_counts_only_prior_llm_runs(tmp_path: Path) -> None:
+    """``preserved_llm`` counts fragments preserved by the OPS-001 resume path.
+
+    A fragment carrying ``classification_method: llm`` from a previous
+    (possibly partial) run must be tallied separately from manual
+    decisions so the CLI message can distinguish the two.
+    """
+    vault = tmp_path / "vault"
+    frag = Fragment(
+        id="frag-priorllm0002",
+        title="Prior LLM only",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=frag,
+        body="body",
+        method="llm",
+    )
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert summary.preserved_manual == 0
+    assert summary.preserved_llm == 1
+    assert summary.classified == 0

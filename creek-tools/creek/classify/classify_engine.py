@@ -62,8 +62,6 @@ the file.
 _PROCESSING_LOG_SUBDIR = ("00-Creek-Meta", "Processing-Log")
 """Per-vault subdirectory carrying the LLM progress + trace logs."""
 
-_RESUMABLE_METHODS: frozenset[str] = frozenset({MANUAL_METHOD, LLM_METHOD})
-
 if TYPE_CHECKING:
     from creek.config import CreekConfig
 
@@ -87,15 +85,20 @@ class ClassifySummary:
             ``--method llm`` run that short-circuits to the rule
             result still counts as classified — the work is real and
             the file is rewritten.
-        preserved_manual: Fragments left unchanged because a prior run
-            already settled the classification and ``--force`` was not
-            passed. Covers both ``classification_method: manual`` (the
-            original operator-curated case) and ``classification_method:
-            llm`` (OPS-001 resume — re-running ``--method llm`` after a
-            crash skips fragments already classified by the LLM so the
-            operator does not re-pay for tokens). The field name is
-            kept for backwards compatibility; rename to ``preserved`` is
-            tracked alongside the next CLI message refresh.
+        preserved_manual: Fragments left unchanged because a human
+            previously stamped ``classification_method: manual`` and
+            ``--force`` was not passed. This counter reflects genuine
+            operator curation only; fragments preserved by the OPS-001
+            LLM resume path are reported on ``preserved_llm`` so the
+            CLI summary can label the two reasons honestly (issue
+            #321).
+        preserved_llm: Fragments left unchanged because a prior
+            ``--method llm`` run already stamped them with
+            ``classification_method: llm`` and ``--force`` was not
+            passed. Re-running ``--method llm`` after a crash skips
+            these so the operator does not re-pay for tokens (OPS-001
+            resume contract). Distinct from :attr:`preserved_manual`
+            because the user never touched these files.
         skipped_high_confidence: Subset of ``classified`` for which
             the LLM was not invoked because the rule classifier
             produced a high-confidence answer. The fragment is still
@@ -106,6 +109,7 @@ class ClassifySummary:
     total: int
     classified: int
     preserved_manual: int
+    preserved_llm: int
     skipped_high_confidence: int
     errors: tuple[str, ...]
 
@@ -120,7 +124,8 @@ class _RunCounts:
 
     total: int = 0
     classified: int = 0
-    preserved: int = 0
+    preserved_manual: int = 0
+    preserved_llm: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -146,7 +151,7 @@ def run_classify(
     """
     fragments_root = vault_path / "01-Fragments"
     if not fragments_root.exists():
-        return ClassifySummary(0, 0, 0, 0, ())
+        return ClassifySummary(0, 0, 0, 0, 0, ())
 
     rules = RuleClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
@@ -178,13 +183,46 @@ def run_classify(
     return ClassifySummary(
         total=counts.total,
         classified=counts.classified,
-        preserved_manual=counts.preserved,
+        preserved_manual=counts.preserved_manual,
+        preserved_llm=counts.preserved_llm,
         skipped_high_confidence=counts.skipped,
         # Snapshot-by-tuple so the frozen dataclass is genuinely
         # immutable: the caller can't accidentally append to the
         # underlying list and reach into completed-run state.
         errors=tuple(counts.errors),
     )
+
+
+def _record_if_preserved(
+    raw: dict[str, object],
+    counts: _RunCounts,
+) -> bool:
+    """Update *counts* in place when *raw* names a preserved prior method.
+
+    Returns ``True`` (caller should short-circuit) when the fragment's
+    existing ``classification_method`` is either ``manual`` (operator
+    curation) or ``llm`` (paid LLM call from a prior OPS-001 resume
+    point). The two reasons are tallied separately so the CLI summary
+    can label them distinctly (issue #321) rather than blaming the
+    operator for state actually left behind by automation.
+
+    Args:
+        raw: Frontmatter dict for the fragment under consideration.
+        counts: Mutable per-run counters; mutated in place when the
+            fragment is preserved.
+
+    Returns:
+        ``True`` when the fragment is preserved (caller must not
+        re-classify it); ``False`` when classification should proceed.
+    """
+    existing_method = raw.get(CLASSIFICATION_METHOD_KEY)
+    if existing_method == MANUAL_METHOD:
+        counts.preserved_manual += 1
+        return True
+    if existing_method == LLM_METHOD:
+        counts.preserved_llm += 1
+        return True
+    return False
 
 
 def _process_file(
@@ -234,12 +272,11 @@ def _process_file(
     counts.total += 1
     fragment, body, raw = record
 
-    # Skip fragments whose previous run already settled the classification:
-    # ``manual`` is operator-curated; ``llm`` is a paid LLM call we don't
-    # want to repeat after a crash (OPS-001 resume contract). Pass
-    # ``--force`` to re-classify everything.
-    if not force and raw.get(CLASSIFICATION_METHOD_KEY) in _RESUMABLE_METHODS:
-        counts.preserved += 1
+    # Skip fragments whose previous run already settled the classification.
+    # Tracked on distinct counters so the CLI summary can label "manual
+    # preserved" and "previously LLM-classified preserved" honestly
+    # (issue #321).
+    if not force and _record_if_preserved(raw, counts):
         return
 
     new_fragment, was_skipped, reasoning = _classify_one(
