@@ -16,8 +16,13 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TypeVar
 
-from creek.classify.llm.parsing import _parse_dosage, _parse_enum
+from creek.classify.llm.parsing import (
+    _parse_descriptor,
+    _parse_dosage,
+    _parse_enum,
+)
 from creek.models import (
+    Color,
     Dosage,
     Mode,
     Orientation,
@@ -116,8 +121,14 @@ def _apply_wavelength(
     the model's pick intact — the bias only fires when the model
     explicitly reports low confidence.
 
-    Phase is **not** gated by the bias (FEAT-017 calls phase a stable
-    signal; gating it would be more cost than benefit).
+    Phase, Color, and Descriptor are **not** gated by the bias.
+    FEAT-017 calls phase a stable signal (gating it would be more
+    cost than benefit); issue #319 added color and descriptor to the
+    extracted set so the wavelength block reaches disk complete.
+    Color tracks the primary frequency (a stable signal) and
+    descriptor is a free-form label, not a categorical pick — neither
+    benefits from the confidence-bias gating that protects the noisy
+    mode/orientation/dosage axes.
 
     Args:
         data: Parsed LLM response.
@@ -151,4 +162,16 @@ def _apply_wavelength(
             score=_confidence_score(scores, "dosage"),
             threshold=unclassified_threshold,
         ),
+        # Issue #319: color + descriptor were silently dropped pre-fix,
+        # so every classified fragment landed with
+        # ``wavelength.color: unclassified`` and
+        # ``wavelength.descriptor: ''``. Neither is gated by the FEAT-017
+        # confidence bias — color tracks frequency (a stable signal) and
+        # descriptor is a free-form label, not a categorical pick.
+        color=_parse_enum(
+            wave_data.get("color"),
+            Color,
+            Color.UNCLASSIFIED,
+        ),
+        descriptor=_parse_descriptor(wave_data.get("descriptor")),
     )

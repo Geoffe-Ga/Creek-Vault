@@ -41,6 +41,16 @@ _DOSAGE_AMBIGUOUS_MARKERS: frozenset[str] = frozenset(
 """String values treated as ``Dosage.AMBIGUOUS``."""
 
 
+_MAX_DESCRIPTOR_CHARS: int = 128
+"""Cap on the length of the wavelength descriptor accepted from the LLM.
+
+The descriptor is a short phrase from the Mode map (``"Gnosis"``,
+``"Power-With"``, etc.); 128 characters comfortably covers every
+documented value while bounding pathological responses that would
+otherwise bloat fragment frontmatter on disk. See issue #319.
+"""
+
+
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     {"frequency", "wavelength", "voice", "confidence_scores"},
 )
@@ -139,6 +149,35 @@ def _parse_optional_enum(
         if member.value.lower() == val_str:
             return member
     return None
+
+
+def _parse_descriptor(value: object) -> str:
+    """Parse and normalise the wavelength ``descriptor`` field (issue #319).
+
+    The descriptor is the only free-form field in
+    :class:`creek.models.WavelengthClassification` — it carries a
+    short phrase from the Mode map like ``"Gnosis"`` or
+    ``"Power-With"``. Stripping whitespace prevents indexers from
+    treating ``" Gnosis"`` and ``"Gnosis"`` as two distinct values,
+    capping the length protects against pathological model output
+    that would bloat the on-disk YAML, and the non-string fallback
+    keeps a single junk response from crashing the entire batch.
+
+    Args:
+        value: Raw value from the LLM's ``wavelength.descriptor``
+            field. May be any YAML scalar (str, int, None, bool, …).
+
+    Returns:
+        A whitespace-stripped string of at most
+        :data:`_MAX_DESCRIPTOR_CHARS` characters. Empty string when
+        the input is ``None`` or not a string.
+    """
+    if not isinstance(value, str):
+        return ""
+    stripped = value.strip()
+    if len(stripped) > _MAX_DESCRIPTOR_CHARS:
+        return stripped[:_MAX_DESCRIPTOR_CHARS]
+    return stripped
 
 
 def _parse_dosage(value: object) -> Dosage:
