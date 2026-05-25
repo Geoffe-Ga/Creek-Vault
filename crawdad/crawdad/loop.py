@@ -1,4 +1,4 @@
-"""Five-round agent loop (FEAT-015).
+"""Bounded-round agent loop (FEAT-015, FEAT-036).
 
 Orchestrates the FEAT-014 router + dispatcher around the FEAT-015
 Sonnet composer. The loop's contract:
@@ -21,12 +21,16 @@ Sonnet composer. The loop's contract:
           dispatcher.dispatch(intents)  →  aggregate ToolResults
               │
               ▼
-       (loop until MAX_LOOP_ROUNDS rounds; the 6th attempt is refused)
+       (loop until ``max_rounds`` rounds; the next attempt is refused)
+
+The cap defaults to :data:`MAX_LOOP_ROUNDS` (5) and can be raised or
+lowered per deployment via the ``max_loop_rounds`` key in
+``crawdad.yaml`` (FEAT-036, bounded ``[1, 50]``).
 
 Side-effects: the loop appends ``user`` and ``assistant`` turns to the
 shared :class:`ConversationHistory` (the source the next router pass
-consumes). On the 6th-round refusal the history is cleared per FEAT-015
-§pre-decided choice §27.
+consumes). On a cap-exhaustion refusal the history is cleared per
+FEAT-015 §pre-decided choice §27.
 
 Paradox routing (§31): if any tool result mentions a paradox AND the
 advertised tool set includes ``creek.save``, the loop injects a
@@ -298,6 +302,7 @@ async def run_one_turn(
     session_state: SessionState | None,
     skills: VoiceSkillStack,
     skill_registry: SkillStackRegistry | None = None,
+    max_rounds: int = MAX_LOOP_ROUNDS,
 ) -> LoopOutcome:
     """Convenience wrapper the bot handler calls.
 
@@ -309,6 +314,11 @@ async def run_one_turn(
     active skill stack from the registry and routes
     ``crawdad.activate_register`` intents through it so the register
     switch persists across turns.
+
+    ``max_rounds`` (FEAT-036) — operator-configurable cap forwarded to
+    :class:`AgentLoop`. Defaults to :data:`MAX_LOOP_ROUNDS` so callers
+    that do not thread the config value preserve the pre-FEAT-036
+    behaviour.
     """
     loop = AgentLoop(
         router=router,
@@ -319,5 +329,6 @@ async def run_one_turn(
         session_state=session_state,
         skills=skills,
         skill_registry=skill_registry,
+        max_rounds=max_rounds,
     )
     return await loop.run(message)

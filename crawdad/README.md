@@ -10,8 +10,10 @@ CrawDad v1.0 ships:
 - A `discord.py` client that connects to Discord and forwards messages
   to a pure-logic handler.
 - The two-LLM agent loop (FEAT-014 + FEAT-015) — Haiku for intent
-  extraction, Sonnet for voice-faithful composition, capped at 5
-  rounds with paradox routing to `10-Liminal/Paradoxes/`.
+  extraction, Sonnet for voice-faithful composition, capped at
+  `MAX_LOOP_ROUNDS` (default 5; operator-configurable via
+  `crawdad.yaml::max_loop_rounds`, bounded `[1, 50]` — FEAT-036) with
+  paradox routing to `10-Liminal/Paradoxes/`.
 - An async MCP stdio client wrapping the Anthropic `mcp` SDK.
 - Voice-skill activation per session from `<vault>/creek-skills/`.
 - The six `/crawdad` slash commands (FEAT-016): `reflect`, `checkin`,
@@ -44,7 +46,25 @@ allowed_user_ids:
   - 123456789012345678   # the developer's Discord user id
 allowed_channel_ids:
   - 234567890123456789   # the channel the bot will respond in
+# Optional FEAT-036 knob: raise the agent-loop round cap when a single
+# user turn legitimately needs more router/dispatcher passes (multi-
+# source ingest, large re-classification asks, long workflow chains).
+# Default 5; bounded [1, 50] — the upper bound prevents pathological
+# runaway loops. Omit the key to keep the v1 default.
+# max_loop_rounds: 12
 ```
+
+### Configuration keys
+
+| Key | Required | Default | Notes |
+|---|---|---|---|
+| `vault_path` | yes | — | Absolute path to the Obsidian vault root. |
+| `mcp_server_command` | no | `[creek-tools-mcp]` | argv for the MCP subprocess. |
+| `allowed_user_ids` | yes | — | Discord user ids permitted to message the bot. |
+| `allowed_channel_ids` | yes | — | Channels the bot will respond in. |
+| `attachments` | no | see source | Per-attachment limits, allow/deny lists, channel privacy tiers (FEAT-027/035). |
+| `consent` | no | see source | Conversational consent tokens + TTL (FEAT-034). |
+| `max_loop_rounds` | no | `5` | FEAT-036 agent-loop round cap, bounded `[1, 50]`. Raise when a single user turn legitimately needs more router/dispatcher passes (multi-source ingest, large re-classification asks, long workflow chains); the upper bound prevents pathological runaway loops. |
 
 ## Slash commands (FEAT-016)
 
@@ -87,7 +107,7 @@ CrawDadClient.{on_message, /crawdad <cmd>}  (crawdad/bot.py + slash_commands.py)
   ▼
 handle_message  /  loop_runner closure
   ▼
-loop.run_one_turn   (FEAT-015 agent loop, capped at 5 rounds)
+loop.run_one_turn   (FEAT-015 agent loop, capped at max_loop_rounds; default 5)
   ▼  ┌──────────────────────────────────────────────────────────┐
      │ Haiku router (FEAT-014)   →   JSON intents               │
      │ MCP dispatcher            →   creek.state / lint / ...   │

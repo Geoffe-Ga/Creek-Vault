@@ -114,6 +114,7 @@ def run_bot(config: CrawDadConfig) -> None:
         components=components,
         session_state=session_state,
         skill_registry=skill_registry,
+        max_rounds=config.max_loop_rounds,
     )
     workflow_registry = WorkflowRegistry(vault_path=config.vault_path)
     workflow_runner = _build_workflow_runner(
@@ -208,6 +209,7 @@ def _build_loop_runner(
     components: _AgentComponents,
     session_state: SessionState | None,
     skill_registry: SkillStackRegistry,
+    max_rounds: int,
 ) -> LoopRunner | None:
     """Return a closure that runs one loop turn end-to-end.
 
@@ -217,6 +219,10 @@ def _build_loop_runner(
 
     The closure captures the :class:`SkillStackRegistry` so FEAT-029
     register switches persist across turns within the same bot session.
+
+    ``max_rounds`` (FEAT-036) is forwarded to :func:`run_one_turn` so
+    the configured cap applies uniformly to free-text turns and slash
+    commands.
     """
     if components.router is None or components.composer is None:
         return None
@@ -249,6 +255,7 @@ def _build_loop_runner(
                 session_state=session_state,
                 skills=skill_registry.stack,
                 skill_registry=skill_registry,
+                max_rounds=max_rounds,
             )
             return _truncate_for_discord(outcome.reply)
         except Exception:

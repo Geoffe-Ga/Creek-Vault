@@ -679,3 +679,68 @@ async def test_loop_uses_known_intent_handling(
     name, args = session.calls[0]
     assert name == "creek.state.read"
     assert args["privacy_tier_ceiling"] == "personal"
+
+
+async def test_run_one_turn_forwards_max_rounds_to_agent_loop(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """FEAT-036: ``run_one_turn`` propagates ``max_rounds`` into the loop cap.
+
+    Two rounds of tool calls followed by a third would normally compose
+    fine — but with ``max_rounds=2`` the loop must refuse on the third
+    router pass with the ``too_deep`` outcome instead of composing.
+    """
+    scripted = [
+        RouterResponse(intents=[Intent(type="creek.state.read")]),
+        RouterResponse(intents=[Intent(type="creek.state.read")]),
+        RouterResponse(intents=[], compose=True),
+    ]
+    router = _ScriptedRouter(scripted)
+    composer = _ScriptedComposer("(unused - cap should fire first)")
+    history = ConversationHistory()
+
+    outcome = await run_one_turn(
+        message="loop forever",
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(
+            _ScriptedSession(replies={"creek.state.read": "body"})
+        ),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=history,
+        session_state=state,
+        skills=skills,
+        max_rounds=2,
+    )
+
+    assert outcome.kind == "too_deep"
+    assert composer.calls == []
+    assert history.as_list() == []
+
+
+async def test_run_one_turn_default_max_rounds_uses_module_constant(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """``run_one_turn`` without ``max_rounds`` inherits ``MAX_LOOP_ROUNDS``."""
+    scripted = [
+        RouterResponse(intents=[Intent(type="creek.state.read")])
+        for _ in range(MAX_LOOP_ROUNDS + 1)
+    ]
+    router = _ScriptedRouter(scripted)
+    composer = _ScriptedComposer("(unused)")
+
+    outcome = await run_one_turn(
+        message="loop forever",
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(
+            _ScriptedSession(replies={"creek.state.read": "body"})
+        ),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+    )
+
+    assert outcome.kind == "too_deep"
+    assert len(router.calls) == MAX_LOOP_ROUNDS
