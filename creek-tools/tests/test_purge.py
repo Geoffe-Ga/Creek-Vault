@@ -305,11 +305,11 @@ def test_fragment_purge_dry_run_preserves_everything(tmp_path: Path) -> None:
 
 
 def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
-    """A purge_fragment call appends exactly one audit entry.
+    """A purge_fragment call appends one intent + one outcome entry (GAP-002).
 
-    ``embeddings_removed`` is *zero* here because no embeddings cache
-    was built (GAP-001). The honest-count contract is verified
-    end-to-end by the GAP-001 tests further down in this file.
+    ``embeddings_removed`` is *zero* on the outcome here because no
+    embeddings cache was built (GAP-001). The intent line carries the
+    planned scope; the outcome line carries the real counts.
     """
     vault = _make_vault(tmp_path)
     _write_fragment(vault, "frag-A", "Alpha")
@@ -318,15 +318,20 @@ def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
     engine.purge_fragment("frag-A")
 
     entries = PurgeAuditLog(vault).read()
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry.operation == "fragment"
-    assert entry.criteria == {"fragment_id": "frag-A"}
-    assert entry.affected_fragments == ["frag-A"]
-    assert entry.fragments_deleted == 1
-    assert entry.embeddings_removed == 0
-    assert entry.operator == "human via CLI"
-    assert entry.dry_run is False
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert intent.operation == "fragment"
+    assert intent.criteria == {"fragment_id": "frag-A"}
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert outcome.operation == "fragment"
+    assert outcome.criteria == {"fragment_id": "frag-A"}
+    assert outcome.affected_fragments == ["frag-A"]
+    assert outcome.fragments_deleted == 1
+    assert outcome.embeddings_removed == 0
+    assert outcome.operator == "human via CLI"
+    assert outcome.dry_run is False
 
 
 # ---------------------------------------------------------------------------
@@ -1807,3 +1812,282 @@ def test_classifications_purge_does_not_touch_cache(tmp_path: Path) -> None:
 
     assert result.embeddings_removed == 0
     assert _load_cache_ids(vault) == {"frag-A"}
+
+
+# ---------------------------------------------------------------------------
+# GAP-002 — pre-destruction intent + post-destruction outcome audit pairs
+# ---------------------------------------------------------------------------
+
+
+def _entries_for_run(vault: Path) -> list[PurgeAuditEntry]:
+    """Return non-migration purge entries from the audit log."""
+    return [
+        e for e in PurgeAuditLog(vault).read() if e.operation != "purge.audit.migration"
+    ]
+
+
+def test_purge_vault_writes_intent_before_destruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``purge_vault`` records an intent entry before unlinking anything.
+
+    GAP-002 acceptance criterion #1: the intent entry must be on disk
+    *before* the first destructive operation, so a SIGKILL mid-wipe
+    still leaves a forensic trail naming what was being attempted.
+    """
+    import shutil as shutil_mod
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    (vault / "01-Fragments" / "sub").mkdir(parents=True, exist_ok=True)
+    (vault / "01-Fragments" / "sub" / "x.md").write_text("x", encoding="utf-8")
+
+    captured_entries_at_first_rmtree: list[PurgeAuditEntry] = []
+    real_rmtree = shutil_mod.rmtree
+
+    def spy_rmtree(*args: object, **kwargs: object) -> None:
+        # First time rmtree is invoked, snapshot the audit log so we
+        # can prove the intent line was already there.
+        if not captured_entries_at_first_rmtree:
+            captured_entries_at_first_rmtree.extend(_entries_for_run(vault))
+        real_rmtree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("creek.purge.engine.shutil.rmtree", spy_rmtree)
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert captured_entries_at_first_rmtree, "rmtree was never called"
+    first_seen = captured_entries_at_first_rmtree[0]
+    assert first_seen.phase == "intent"
+    assert first_seen.operation == "vault"
+    assert first_seen.operation_id
+
+
+def test_purge_vault_emits_intent_then_outcome_pair(tmp_path: Path) -> None:
+    """On success, two entries (intent + complete outcome) share operation_id."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert intent.operation_id == outcome.operation_id
+    assert intent.operation == "vault" == outcome.operation
+
+
+def test_purge_vault_outcome_status_partial_on_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the wipe loop raises, outcome records ``status="partial"``.
+
+    GAP-002 acceptance criterion #3: the exception propagates *and* the
+    log gets an outcome line saying what survived (intent already wrote
+    what was being attempted; outcome closes the trail with the partial
+    state).
+    """
+    import shutil as shutil_mod
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_thread(vault, "thread-1", "Waves")
+    # Add a subdirectory to 02-Threads so rmtree gets called there.
+    (vault / "02-Threads" / "sub").mkdir(parents=True, exist_ok=True)
+    (vault / "02-Threads" / "sub" / "x.md").write_text("x", encoding="utf-8")
+
+    real_rmtree = shutil_mod.rmtree
+    call_count = {"n": 0}
+
+    def flaky_rmtree(*args: object, **kwargs: object) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            msg = "simulated mid-purge OSError"
+            raise OSError(msg)
+        real_rmtree(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("creek.purge.engine.shutil.rmtree", flaky_rmtree)
+
+    with pytest.raises(OSError, match="simulated mid-purge"):
+        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "partial"
+    assert intent.operation_id == outcome.operation_id
+    assert outcome.failure_reason
+    assert "simulated mid-purge" in outcome.failure_reason
+
+
+def test_purge_fragment_emits_intent_then_outcome_pair(tmp_path: Path) -> None:
+    """Per-fragment purge follows the same intent/outcome contract."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert intent.operation_id == outcome.operation_id
+    # Intent carries the scope; outcome carries the counts.
+    assert intent.criteria == outcome.criteria == {"fragment_id": "frag-A"}
+    assert outcome.fragments_deleted == 1
+
+
+def test_purge_source_emits_intent_then_outcome_pair(tmp_path: Path) -> None:
+    """``purge_source`` writes intent before, outcome after."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    _write_fragment(vault, "frag-B", "Bravo", platform="claude")
+
+    PurgeEngine(vault).purge_source("claude")
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.status == "complete"
+    assert intent.operation_id == outcome.operation_id
+    assert outcome.fragments_deleted == 2
+
+
+def test_purge_source_path_emits_intent_then_outcome_pair(tmp_path: Path) -> None:
+    """``purge_source_path`` writes intent before, outcome after."""
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault,
+        "frag-A",
+        "Alpha",
+        original_file="/exports/2026-04-28.json",
+    )
+
+    PurgeEngine(vault).purge_source_path("/exports/", match="substring")
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert intent.operation_id == outcome.operation_id
+
+
+def test_purge_daterange_emits_intent_then_outcome_pair(tmp_path: Path) -> None:
+    """``purge_daterange`` writes intent before, outcome after."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(
+        vault,
+        "frag-mid",
+        "Mid",
+        created=datetime(2024, 6, 1, tzinfo=UTC),
+    )
+
+    PurgeEngine(vault).purge_daterange(date(2024, 1, 1), date(2024, 12, 31))
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.status == "complete"
+    assert intent.operation_id == outcome.operation_id
+
+
+def test_purge_classifications_emits_intent_then_outcome_pair(
+    tmp_path: Path,
+) -> None:
+    """Even metadata-only ops emit the pair; recovery still depends on intent."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+
+    PurgeEngine(vault).purge_classifications()
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert intent.operation_id == outcome.operation_id
+
+
+def test_audit_chain_intact_across_intent_outcome_pairs(tmp_path: Path) -> None:
+    """Two pairs in a row leave a verifiable four-entry hash chain."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_fragment(vault, "frag-B", "Bravo")
+
+    engine = PurgeEngine(vault)
+    engine.purge_fragment("frag-A")
+    engine.purge_fragment("frag-B")
+
+    PurgeAuditLog(vault).verify()  # raises if chain is broken
+    entries = _entries_for_run(vault)
+    assert [e.phase for e in entries] == ["intent", "outcome", "intent", "outcome"]
+    # Each pair's operation_ids match; the two pairs differ.
+    assert entries[0].operation_id == entries[1].operation_id
+    assert entries[2].operation_id == entries[3].operation_id
+    assert entries[0].operation_id != entries[2].operation_id
+
+
+def test_purge_fragment_intent_logged_even_when_target_missing(
+    tmp_path: Path,
+) -> None:
+    """A no-op purge (target not found) still emits the intent/outcome pair.
+
+    Forensic value: an operator who fat-fingers a fragment ID should
+    still see *that* they tried to purge it. The outcome reports zero
+    deletions but the intent records the attempt.
+    """
+    vault = _make_vault(tmp_path)
+
+    PurgeEngine(vault).purge_fragment("frag-missing")
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert outcome.fragments_deleted == 0
+
+
+def test_legacy_audit_entries_default_to_outcome_phase(tmp_path: Path) -> None:
+    """Pre-GAP-002 entries (no phase/operation_id) read back as outcomes.
+
+    Backward compatibility: an audit log that predates the schema change
+    must keep reading cleanly; missing fields take sensible defaults
+    (``phase="outcome"`` because that's what those entries always were
+    de-facto, even though the field didn't exist).
+    """
+    vault = _make_vault(tmp_path)
+    log = PurgeAuditLog(vault)
+    # Append an entry the pre-GAP-002 way — directly through the
+    # underlying AuditLog so it lands without phase/operation_id.
+    from creek.audit import AuditLog
+
+    AuditLog(log.log_path).append(
+        {
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "operation": "fragment",
+            "criteria": {"fragment_id": "frag-old"},
+            "affected_fragments": ["frag-old"],
+            "fragments_deleted": 1,
+        },
+    )
+
+    entries = PurgeAuditLog(vault).read()
+    assert len(entries) == 1
+    assert entries[0].phase == "outcome"
+    assert entries[0].operation_id == ""
+    assert entries[0].status is None

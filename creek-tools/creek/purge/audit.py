@@ -6,6 +6,15 @@ entry captures the timestamp, operation, criteria dict, affected
 fragment IDs, deletion counts, references scrubbed, embeddings removed,
 operator, and dry-run flag.
 
+Phase pairing (GAP-002): every purge operation emits **two** entries —
+an ``intent`` line written *before* the first destructive op, then an
+``outcome`` line written *after* the destructive section completes
+(``status="complete"``) or after an exception aborts it
+(``status="partial"``). Both entries share a UUID4 ``operation_id`` so
+a recovery tool can pair them. Pre-GAP-002 entries have no ``phase``
+field; they read back as ``phase="outcome"`` with an empty
+``operation_id`` and ``status=None``.
+
 Timezone (BUG-002): purge-audit entries deliberately stamp ``UTC``
 rather than ``America/Los_Angeles`` (the rest of the pipeline). The
 audit chain is forensic infrastructure — its consumers are operators
@@ -30,7 +39,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +54,12 @@ LEGACY_PURGE_LOG_RELPATH = Path("00-Creek-Meta/Processing-Log/purge-log.json")
 
 PURGE_AUDIT_RELPATH = Path("00-Creek-Meta/audit/purge.jsonl")
 """Canonical Batch-C purge audit log location."""
+
+PurgePhase = Literal["intent", "outcome"]
+"""GAP-002 phase discriminator on each purge audit entry."""
+
+PurgeOutcomeStatus = Literal["complete", "partial"]
+"""``outcome`` entries set this to record whether the body ran to completion."""
 
 
 class PurgeAuditEntry(BaseModel):
@@ -65,6 +80,17 @@ class PurgeAuditEntry(BaseModel):
             when no rows matched; the actual row delta otherwise.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
+        phase: GAP-002 discriminator. ``"intent"`` is written before
+            any destructive op; ``"outcome"`` is written after. Pre-
+            GAP-002 entries default to ``"outcome"`` since that's what
+            they always semantically were.
+        operation_id: UUID4 that pairs an intent entry with its
+            matching outcome. Empty string for pre-GAP-002 entries.
+        status: For outcome entries only — ``"complete"`` if the body
+            ran without raising, ``"partial"`` if it aborted partway.
+            ``None`` for intent entries and for pre-GAP-002 outcomes.
+        failure_reason: Short string capturing the exception type and
+            message when ``status="partial"``; ``None`` otherwise.
         target: Legacy field preserved for backward compatibility on
             read; populated only when reading pre-Batch-C entries.
         count: Legacy fragment count preserved for backward compatibility
@@ -82,6 +108,11 @@ class PurgeAuditEntry(BaseModel):
     embeddings_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
+
+    phase: PurgePhase = "outcome"
+    operation_id: str = ""
+    status: PurgeOutcomeStatus | None = None
+    failure_reason: str | None = None
 
     target: str | None = None
     count: int | None = None
@@ -106,6 +137,9 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("affected_fragments", [])
     upgraded.setdefault("references_scrubbed", 0)
     upgraded.setdefault("embeddings_removed", 0)
+    # GAP-002 fields take their schema defaults via Pydantic when
+    # absent, so we leave them out here rather than fabricating a
+    # phase / operation_id that doesn't correspond to anything on disk.
     return upgraded
 
 
