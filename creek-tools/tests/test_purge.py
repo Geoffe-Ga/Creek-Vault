@@ -33,6 +33,11 @@ runner = CliRunner()
 def _make_vault(tmp_path: Path) -> Path:
     """Create a minimal vault with the directories purge needs.
 
+    Also seeds ``00-Creek-Meta/creek_config.yaml`` — the marker file
+    ``purge_vault`` checks for under GAP-003. Tests that want to
+    simulate a non-Creek directory create their own decoy without
+    going through this helper.
+
     Args:
         tmp_path: Pytest temporary directory.
 
@@ -49,6 +54,10 @@ def _make_vault(tmp_path: Path) -> Path:
         "04-Praxis",
     ]:
         (vault / d).mkdir(parents=True, exist_ok=True)
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        "# minimal marker for GAP-003\n",
+        encoding="utf-8",
+    )
     return vault
 
 
@@ -664,6 +673,115 @@ def test_vault_purge_dry_run_preserves(tmp_path: Path) -> None:
     assert result.dry_run is True
     assert result.fragments_affected >= 1
     assert frag.exists()
+
+
+# ---------------------------------------------------------------------------
+# GAP-003 — purge_vault refuses directories that are not Creek vaults
+# ---------------------------------------------------------------------------
+
+
+def test_vault_purge_refuses_directory_with_no_meta_folder(
+    tmp_path: Path,
+) -> None:
+    """A directory missing ``00-Creek-Meta/`` is not a Creek vault (GAP-003).
+
+    The decoy looks vault-ish (numeric-prefix folders, ``.md`` files
+    inside) but was never ``creek init``-ed. Engine must refuse and the
+    decoy files must survive.
+    """
+    decoy = tmp_path / "not-a-vault"
+    (decoy / "01-Fragments").mkdir(parents=True)
+    important = decoy / "01-Fragments" / "important.md"
+    important.write_text("hello", encoding="utf-8")
+    engine = PurgeEngine(decoy)
+
+    with pytest.raises(ValueError, match="does not appear to be a Creek vault"):
+        engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert important.exists()
+
+
+def test_vault_purge_refuses_directory_with_meta_but_no_config(
+    tmp_path: Path,
+) -> None:
+    """``00-Creek-Meta/`` alone isn't enough — ``creek_config.yaml`` is the marker."""
+    decoy = tmp_path / "half-vault"
+    (decoy / "00-Creek-Meta").mkdir(parents=True)
+    (decoy / "01-Fragments").mkdir(parents=True)
+    important = decoy / "01-Fragments" / "important.md"
+    important.write_text("hello", encoding="utf-8")
+    engine = PurgeEngine(decoy)
+
+    with pytest.raises(ValueError, match="does not appear to be a Creek vault"):
+        engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert important.exists()
+
+
+def test_vault_purge_error_message_names_the_marker_file(
+    tmp_path: Path,
+) -> None:
+    """The error names the marker file the engine looked for (criterion 2)."""
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    engine = PurgeEngine(decoy)
+
+    with pytest.raises(ValueError, match=r"creek_config\.yaml"):
+        engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+
+
+def test_vault_purge_accepts_directory_with_marker(tmp_path: Path) -> None:
+    """A directory carrying the marker is recognised as a Creek vault."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+
+    # No exception raised — the marker created by _make_vault suffices.
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+
+def test_vault_purge_writes_no_audit_when_marker_missing(
+    tmp_path: Path,
+) -> None:
+    """Marker check runs *before* the intent audit entry (criterion 1).
+
+    A refusal must leave the audit log untouched; otherwise an operator
+    can't tell the marker-missing case apart from a successful purge by
+    looking at the log alone.
+    """
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    engine = PurgeEngine(decoy)
+
+    with pytest.raises(ValueError, match="does not appear to be a Creek vault"):
+        engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    audit_path = decoy / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    assert not audit_path.exists()
+
+
+def test_cli_purge_vault_refuses_non_creek_directory(tmp_path: Path) -> None:
+    """``creek purge vault`` exits non-zero with a clear message (criterion 2)."""
+    decoy = tmp_path / "decoy"
+    (decoy / "01-Fragments").mkdir(parents=True)
+    survivor = decoy / "01-Fragments" / "x.md"
+    survivor.write_text("hi", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "purge",
+            "vault",
+            "--vault",
+            str(decoy),
+            "--confirm-text",
+            VAULT_PURGE_CONFIRMATION,
+            "--force-non-interactive",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "does not appear to be a Creek vault" in result.output
+    assert survivor.exists()
 
 
 # ---------------------------------------------------------------------------

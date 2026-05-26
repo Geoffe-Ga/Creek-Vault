@@ -64,6 +64,18 @@ _VAULT_CONTENT_FOLDERS: tuple[str, ...] = (
 VAULT_PURGE_CONFIRMATION = "I understand this is irreversible"
 """Exact phrase required to confirm a full-vault purge."""
 
+VAULT_MARKER_RELPATH = ("00-Creek-Meta", "creek_config.yaml")
+"""Relative path to the file that proves a directory is a Creek vault (GAP-003).
+
+The vault marker is the per-vault config file ``creek init`` deploys at
+``<vault>/00-Creek-Meta/creek_config.yaml``. It survives every purge
+operation (``purge_vault`` preserves ``00-Creek-Meta/`` and the audit
+log is mandated non-purgeable), so its absence is a reliable signal
+that the supplied path was never ``creek init``-ed — most likely a
+typo on ``--vault`` that points at an unrelated directory with
+coincidentally numeric-prefix folders.
+"""
+
 _CLASSIFICATION_RESET_FIELDS: tuple[str, ...] = (
     "frequency",
     "wavelength",
@@ -417,7 +429,10 @@ class PurgeEngine:
             A :class:`PurgeResult` describing the destruction.
 
         Raises:
-            ValueError: If ``confirmation`` does not match.
+            ValueError: If ``confirmation`` does not match, or if
+                ``self.vault_path`` does not look like a Creek vault
+                (no ``00-Creek-Meta/creek_config.yaml`` marker file —
+                GAP-003).
         """
         if confirmation != VAULT_PURGE_CONFIRMATION:
             msg = (
@@ -425,6 +440,7 @@ class PurgeEngine:
                 f"{VAULT_PURGE_CONFIRMATION!r}"
             )
             raise ValueError(msg)
+        self._require_vault_marker()
 
         result = PurgeResult(
             operation="vault",
@@ -446,6 +462,32 @@ class PurgeEngine:
         return self._run_audited(result, body)
 
     # -- Private helpers -------------------------------------------------
+
+    def _require_vault_marker(self) -> None:
+        """Refuse to operate on a directory that is not a Creek vault (GAP-003).
+
+        Looks for ``<vault>/00-Creek-Meta/creek_config.yaml`` — the
+        per-vault config file that ``creek init`` deploys and that
+        survives every purge operation. Its absence almost always
+        means the operator typoed ``--vault`` and is pointing at an
+        unrelated directory with coincidentally numeric-prefix
+        folders. Raising here, *before* the intent audit line is
+        written, prevents an entry from being committed to a
+        non-vault's would-be audit log.
+
+        Raises:
+            ValueError: When the marker file is not present. The
+                message names the absolute path of the file the engine
+                looked for so the operator can diagnose the typo.
+        """
+        marker = self.vault_path.joinpath(*VAULT_MARKER_RELPATH)
+        if not marker.is_file():
+            msg = (
+                f"{self.vault_path} does not appear to be a Creek vault "
+                f"(missing marker file {marker}). Run `creek init "
+                f"--vault <path>` first, or fix the --vault argument."
+            )
+            raise ValueError(msg)
 
     def _purge_cache_for(self, fragment_ids: list[str]) -> int:
         """Drop matching rows from the embeddings cache (GAP-001).
