@@ -41,6 +41,7 @@ from creek.classify.privacy_filter import (
     filter_fragments_by_tier,
 )
 from creek.generate.compile_routing import (
+    COMPILE_GAPS_RELPATH,
     CompiledPageIndex,
     empty_index,
     load_compiled_pages,
@@ -85,6 +86,14 @@ DEFAULT_MIN_THREAD_FRAGMENTS: int = 10
 
 DEFAULT_MIN_CHAIN_LENGTH: int = 3
 """Minimum number of fragments in a resonance chain for it to surface."""
+
+COMPILE_GAPS_LOG_RELPATH: Path = COMPILE_GAPS_RELPATH
+"""Re-export of the canonical compile-gaps log path.
+
+CLI callers and tests pinning the diagnostic wording import this symbol
+instead of repeating the literal vault-relative string, keeping the
+mining surface honest about its single source of truth.
+"""
 
 
 _NO_ACTIVE_THREADS: str = "no active threads available"
@@ -970,7 +979,12 @@ class IdeaMiner:
             strategy=MiningStrategy.WAVELENGTH_WINDOW,
             candidates_considered=len(phase_matches),
             candidates_kept=len(seeds),
-            top_score=float(len(seeds)),
+            # Pre-threshold peak (matches docstring + the pattern used by
+            # the other three strategies). Reporting ``len(seeds)`` here
+            # would conflate "no phase matches at all" with "phase matches
+            # all dropped by the praxis-explicit gate" — exactly the
+            # ambiguity issue #340 / PR #346 exists to resolve.
+            top_score=float(len(phase_matches)),
             threshold=1.0,
             fallback_reason=reason,
         )

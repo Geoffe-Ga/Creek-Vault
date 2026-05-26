@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+import pytest
 from typer.testing import CliRunner
 
 from creek.cli import app
-
-if TYPE_CHECKING:
-    import pytest
 
 runner = CliRunner()
 
@@ -1953,7 +1950,6 @@ def test_mine_respects_creek_config_mining_knobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``creek_config.yaml`` mining knobs are passed through to ``IdeaMiner``."""
-    import pytest as _pytest
     import yaml
 
     vault = tmp_path / "vault"
@@ -1990,8 +1986,8 @@ def test_mine_respects_creek_config_mining_knobs(
     assert result.exit_code == 0, result.output
     assert captured["min_thread_fragments"] == 2
     assert captured["min_chain_length"] == 2
-    assert captured["similarity_liminal"] == _pytest.approx(0.1)
-    assert captured["similarity_resonance"] == _pytest.approx(0.2)
+    assert captured["similarity_liminal"] == pytest.approx(0.1)
+    assert captured["similarity_resonance"] == pytest.approx(0.2)
 
 
 # ---- FEAT-032 manual seeding flags -----------------------------------

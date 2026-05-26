@@ -1373,6 +1373,43 @@ class TestMiningRunReport:
         assert diag.threshold == float(miner.min_thread_fragments)
         assert diag.top_score == 15.0
 
+    def test_wavelength_top_score_reports_phase_matches_not_seeds(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Wavelength ``top_score`` is the pre-threshold phase-match count.
+
+        Regression for the issue #340 review on PR #346: when 10 fragments
+        match the current phase but every one is dropped by the
+        ``praxis_potential == EXPLICIT`` gate, the diagnostic must report
+        ``top_score=10.0`` (the pre-gate count) — not ``0.0``, which would
+        be indistinguishable from "no phase matches at all".
+        """
+        n_phase_matches = 10
+        for idx in range(n_phase_matches):
+            frag = _build_fragment(
+                frag_id=f"frag-rising-{idx}",
+                title=f"Rising fragment {idx}",
+                phase=Phase.RISING,
+                praxis=PraxisPotential.LATENT,  # gated out by EXPLICIT filter
+            )
+            _write_fragment(vault, frag, f"Body {idx}")
+
+        report = miner.mine_all_with_report(vault, current_phase=Phase.RISING)
+        diag = next(
+            d
+            for d in report.diagnostics
+            if d.strategy is MiningStrategy.WAVELENGTH_WINDOW
+        )
+
+        assert diag.candidates_considered == n_phase_matches
+        assert diag.candidates_kept == 0
+        # The bug: top_score was len(seeds)=0, making it indistinguishable
+        # from "no phase matches at all". The fix reports len(phase_matches)=10.
+        assert diag.top_score == float(n_phase_matches)
+        assert diag.threshold == 1.0
+
     def test_resonance_chain_zero_synchronicities_records_fallback_reason(
         self,
         vault: Path,

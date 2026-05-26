@@ -1691,7 +1691,11 @@ def mine(
     from creek.generate.mining import IdeaMiner
 
     config = _load_config_for_vault(vault)
-    vault_path = vault if vault is not None else config.vault_path
+    # Route the resolved vault through ``_resolve_vault`` so future
+    # symlink/existence/type-coercion hooks added to that helper apply
+    # uniformly across every CLI subcommand, regardless of whether the
+    # path came from ``--vault`` or the auto-discovered config.
+    vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     current_phase = _parse_phase(phase)
     override = _parse_include_tier(include_tier)
     if bypass_compiled:
@@ -1740,10 +1744,12 @@ def _print_no_seeds_diagnostic(
     to clear, then points the operator at ``compile-gaps.jsonl`` for
     fallback breadcrumbs.
     """
+    from creek.generate.mining import COMPILE_GAPS_LOG_RELPATH
+
     n_strategies = len(report.diagnostics)
     top_score = report.top_score
     threshold = report.top_threshold
-    gaps_path = vault_path / "00-Creek-Meta/Processing-Log/compile-gaps.jsonl"
+    gaps_path = vault_path / COMPILE_GAPS_LOG_RELPATH
     console.print(
         f"[yellow]No idea seeds surfaced. Ran {n_strategies} strategies; "
         f"top candidate scored {top_score:.2f} (threshold {threshold:.2f}). "
