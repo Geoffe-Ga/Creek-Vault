@@ -1752,17 +1752,17 @@ def test_mine_help() -> None:
     assert "mine" in result.output.lower()
 
 
-def test_mine_command() -> None:
+def test_mine_command(tmp_path: Path) -> None:
     """Test that mine command runs with required args."""
-    result = runner.invoke(app, ["mine", "--vault", "/fake/vault"])
+    result = runner.invoke(app, ["mine", "--vault", str(tmp_path)])
     assert result.exit_code == 0
 
 
-def test_mine_with_phase() -> None:
+def test_mine_with_phase(tmp_path: Path) -> None:
     """Test that mine command accepts a wavelength phase option."""
     result = runner.invoke(
         app,
-        ["mine", "--vault", "/fake/vault", "--phase", "rising"],
+        ["mine", "--vault", str(tmp_path), "--phase", "rising"],
     )
     assert result.exit_code == 0
 
