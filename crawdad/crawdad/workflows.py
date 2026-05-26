@@ -148,6 +148,12 @@ class WorkflowStepError(RuntimeError):
     *which* workflow blew up without scraping the message string. The
     underlying exception is preserved via ``__cause__``.
 
+    Invariant: this exception is ONLY ever raised with complete
+    metadata. The interpolation helpers that lack workflow / step
+    context raise the private :class:`_StepRefError` instead; the
+    walker catches that and rebrands into a fully-populated
+    :class:`WorkflowStepError`.
+
     Attributes:
         step_id: The ``id`` of the failing step.
         tool: The MCP tool name the step was about to call.
@@ -167,6 +173,24 @@ class WorkflowStepError(RuntimeError):
         self.step_id = step_id
         self.tool = tool
         self.workflow_name = workflow_name
+
+
+class _StepRefError(ValueError):
+    """Private — raised by :func:`_resolve_step`, wrapped by the walker.
+
+    The interpolation layer cannot construct a meaningful
+    :class:`WorkflowStepError` because it has no workflow or step
+    context — only the walker has those. Raising this distinct private
+    type lets the walker rebrand into a fully-populated
+    :class:`WorkflowStepError` while keeping :class:`WorkflowStepError`'s
+    contract (always has ``step_id`` / ``tool`` / ``workflow_name``)
+    intact for direct callers.
+
+    Subclasses :class:`ValueError` because a malformed step reference
+    really is a bad value — that placement keeps it discoverable to any
+    caller that already handles interpolation problems with a broad
+    ``except ValueError``.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -392,21 +416,24 @@ def _resolve_step(parts: list[str], step_results: dict[str, ToolResult]) -> str:
 
     Phase 2 (#326): step references are strict. A forward reference to
     a step that has not run yet, a bare ``{{step.<id>}}`` with no
-    field, or any field other than ``body`` raises
-    :class:`WorkflowStepError`. The walker catches the error to attach
-    workflow + offending-step metadata before re-raising.
+    field, or any field other than ``body`` raises the private
+    :class:`_StepRefError`. The walker catches the error and rebrands
+    it as a fully-populated :class:`WorkflowStepError` via
+    :func:`_rebrand_step_error`. Direct callers of this helper (or of
+    :func:`interpolate`) see :class:`_StepRefError`, which subclasses
+    :class:`ValueError`.
     """
     if not parts:
         msg = "step reference {{step}} is missing both id and field"
-        raise WorkflowStepError(msg, step_id="", tool="", workflow_name="")
+        raise _StepRefError(msg)
     if len(parts) < 2:
         step_id = parts[0]
         msg = (
             f"step reference {{step.{step_id}}} is missing a field; "
             "the only addressable field today is `body` "
-            "(e.g. {{step." + step_id + ".body}})"
+            f"(e.g. {{{{step.{step_id}.body}}}})"
         )
-        raise WorkflowStepError(msg, step_id="", tool="", workflow_name="")
+        raise _StepRefError(msg)
     step_id, field = parts[0], parts[1]
     result = step_results.get(step_id)
     if result is None:
@@ -416,13 +443,13 @@ def _resolve_step(parts: list[str], step_results: dict[str, ToolResult]) -> str:
             f"upstream step that has not run yet; available step ids: "
             f"{available}"
         )
-        raise WorkflowStepError(msg, step_id="", tool="", workflow_name="")
+        raise _StepRefError(msg)
     if field != "body":
         msg = (
             f"step reference {{step.{step_id}.{field}}} uses unknown "
             "field; the only addressable field today is `body`"
         )
-        raise WorkflowStepError(msg, step_id="", tool="", workflow_name="")
+        raise _StepRefError(msg)
     return result.body
 
 
@@ -668,7 +695,7 @@ class WorkflowWalker:
                 resolved_args, workflow.privacy_tier_floor
             )
             body = await session.call_tool(step.tool, arguments)
-        except WorkflowStepError as exc:
+        except (_StepRefError, WorkflowStepError) as exc:
             raise _rebrand_step_error(exc, workflow=workflow, step=step) from exc
         except Exception as exc:
             raise _wrap_step_failure(exc, workflow=workflow, step=step) from exc
@@ -680,17 +707,27 @@ class WorkflowWalker:
 
 
 def _rebrand_step_error(
-    exc: WorkflowStepError,
+    exc: _StepRefError | WorkflowStepError,
     *,
     workflow: WorkflowDefinition,
     step: WorkflowStep,
 ) -> WorkflowStepError:
     """Attach workflow + step metadata to an interpolation-time step error.
 
-    ``_resolve_step`` raises :class:`WorkflowStepError` without knowing
-    which workflow or step it is being called from — the walker has
-    that context, so it re-raises here with the metadata filled in and
-    the original (anonymous) message prefixed by the step location.
+    :func:`_resolve_step` raises :class:`_StepRefError` because it has
+    no workflow / step context to populate a full
+    :class:`WorkflowStepError`. The walker has that context, so it
+    re-raises here with the metadata filled in and the original
+    (anonymous) message prefixed by the step location. The original
+    exception is preserved via ``__cause__`` at the raise site so the
+    caller can ``isinstance(exc.__cause__, _StepRefError)`` to
+    distinguish "interpolation failed" from "MCP tool raised".
+
+    Accepts :class:`WorkflowStepError` too as defence-in-depth: if a
+    downstream helper ever surfaces one already populated, the walker
+    rebrands it under the current step's identity rather than letting
+    a stale identity leak through. In practice only
+    :class:`_StepRefError` reaches this path today.
     """
     location = f"workflow {workflow.name!r} step {step.id!r} (tool {step.tool!r})"
     return WorkflowStepError(
@@ -774,9 +811,20 @@ async def run_workflow_and_compose(
     registry (e.g. early unit tests) can hand a static stack in via
     ``skills``.
 
-    Returns the composer's text reply. Constraint failures bubble up as
-    :class:`WorkflowConstraintError`; the caller is responsible for
-    mapping them to a Discord soft error.
+    Returns:
+        The composer's text reply. Callers map this directly into a
+        Discord message body.
+
+    Raises:
+        WorkflowConstraintError: a declared constraint refused the run
+            (missing required input, wrong phase, unknown MCP tool).
+            Callers map these to a Discord soft error rather than
+            crashing the bot.
+        WorkflowStepError: the walker aborted mid-walk because a step
+            failed — either its interpolation references an
+            unresolvable upstream step or its MCP tool call raised.
+            The error names the failing step + tool + workflow and
+            chains the original exception via ``__cause__``.
     """
     from crawdad.history import ConversationHistory
 

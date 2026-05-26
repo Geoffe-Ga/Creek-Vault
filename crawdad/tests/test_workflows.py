@@ -32,6 +32,7 @@ from crawdad.workflows import (
     WorkflowStep,
     WorkflowStepError,
     WorkflowWalker,
+    _StepRefError,
     _synthesize_user_message,
     interpolate,
     load_workflow_from_yaml,
@@ -279,14 +280,20 @@ def test_interpolate_step_body() -> None:
     assert out == "previous: phase: rising"
 
 
-def test_interpolate_step_unknown_id_raises_step_error() -> None:
+def test_interpolate_step_unknown_id_raises_step_ref_error() -> None:
     """A reference to an unknown step id is a workflow bug — surface it loudly.
 
     Phase 2 (#326) tightens this from the Phase 1 stub's empty-string
     fallback: a step reference always pins a real upstream output, so a
     forward / typo'd reference is an authoring error worth failing on.
+
+    At the interpolation layer the public :class:`WorkflowStepError`
+    cannot be raised with valid metadata (interpolation has no workflow
+    or step context), so the private :class:`_StepRefError` is raised
+    and the walker rebrands it into a :class:`WorkflowStepError` with
+    full metadata before bubbling up.
     """
-    with pytest.raises(WorkflowStepError, match=r"step\.missing"):
+    with pytest.raises(_StepRefError, match=r"step\.missing"):
         interpolate(
             "nothing here: [{{step.missing.body}}]",
             state=None,
@@ -404,9 +411,9 @@ def test_interpolate_input_namespace_with_no_field_yields_empty() -> None:
     assert out == "[]"
 
 
-def test_interpolate_bare_step_namespace_raises_step_error() -> None:
+def test_interpolate_bare_step_namespace_raises_step_ref_error() -> None:
     """``{{step}}`` with no id at all is also a malformed reference."""
-    with pytest.raises(WorkflowStepError, match="step"):
+    with pytest.raises(_StepRefError, match="step"):
         interpolate(
             "[{{step}}]",
             state=None,
@@ -415,14 +422,14 @@ def test_interpolate_bare_step_namespace_raises_step_error() -> None:
         )
 
 
-def test_interpolate_step_with_no_field_raises_step_error() -> None:
+def test_interpolate_step_with_no_field_raises_step_ref_error() -> None:
     """``{{step.<id>}}`` with no trailing field is a malformed reference.
 
     Phase 2 (#326): the only valid step accessor today is ``.body``, so
     omitting the field is an authoring bug; we surface it instead of
     silently resolving to empty.
     """
-    with pytest.raises(WorkflowStepError, match=r"step\.read"):
+    with pytest.raises(_StepRefError, match=r"step\.read"):
         interpolate(
             "[{{step.read}}]",
             state=None,
@@ -431,19 +438,43 @@ def test_interpolate_step_with_no_field_raises_step_error() -> None:
         )
 
 
-def test_interpolate_step_with_unknown_field_raises_step_error() -> None:
+def test_interpolate_step_with_unknown_field_raises_step_ref_error() -> None:
     """``{{step.<id>.bogus}}`` (not ``body``) is a malformed reference.
 
     Phase 2 (#326): the walker only exposes ``body`` on a step result;
     any other field is a typo and must fail loudly.
     """
-    with pytest.raises(WorkflowStepError, match="bogus"):
+    with pytest.raises(_StepRefError, match="bogus"):
         interpolate(
             "[{{step.read.bogus}}]",
             state=None,
             inputs={},
             step_results={"read": ToolResult(intent_type="x", body="b")},
         )
+
+
+def test_step_ref_error_is_value_error_subclass() -> None:
+    """``_StepRefError`` is a :class:`ValueError` so callers can catch broadly.
+
+    Promised by the docstring: this is a private exception type, raised
+    only by :func:`_resolve_step` and rebranded by the walker into a
+    :class:`WorkflowStepError`. Inheriting from :class:`ValueError`
+    keeps it discoverable to any caller that was already handling
+    interpolation errors with a broad ``except ValueError`` clause.
+    """
+    assert issubclass(_StepRefError, ValueError)
+
+
+def test_step_ref_error_is_not_workflow_step_error() -> None:
+    """``_StepRefError`` and :class:`WorkflowStepError` are distinct types.
+
+    The boundary matters: :class:`WorkflowStepError` always carries
+    structured ``step_id`` / ``tool`` / ``workflow_name`` attributes;
+    :class:`_StepRefError` is the marker for the interpolation layer
+    that has none of that context yet.
+    """
+    assert not issubclass(_StepRefError, WorkflowStepError)
+    assert not issubclass(WorkflowStepError, _StepRefError)
 
 
 # ---------------------------------------------------------------------------
@@ -584,9 +615,17 @@ class _FakeSession:
 
 
 class _FakeMCPClient:
-    """An :class:`MCPClient`-shaped fake that yields :class:`_FakeSession`."""
+    """An :class:`MCPClient`-shaped fake that yields a session.
 
-    def __init__(self, session: _FakeSession) -> None:
+    The session is typed as :class:`typing.Any` so the same fake client
+    can wrap either a :class:`_FakeSession` (happy path) or a
+    :class:`_FailingSession` (error-path tests) without a ``# type:
+    ignore[arg-type]`` at every call site. Both fakes implement the
+    same ``call_tool`` shape; the walker only ever invokes that one
+    method.
+    """
+
+    def __init__(self, session: Any) -> None:
         """Stash the session that ``connect()`` will yield."""
         self._session = session
 
@@ -799,6 +838,48 @@ async def test_walker_aborts_when_step_references_missing_upstream_step() -> Non
     assert "notthere" in str(excinfo.value)
     # The tool was never invoked — interpolation failed first.
     assert session.calls == []
+    # The rebranded walker error preserves the original interpolation
+    # error as ``__cause__`` so log analysers and tests can pin on the
+    # interpolation-layer marker without scraping the message string.
+    assert isinstance(excinfo.value.__cause__, _StepRefError)
+
+
+async def test_walker_rebrands_interpolation_error_with_full_metadata() -> None:
+    """A `_StepRefError` is rebranded into a fully-populated WorkflowStepError.
+
+    The reviewer's blocker fix: the public :class:`WorkflowStepError`
+    must NEVER be raised with empty ``step_id`` / ``tool`` /
+    ``workflow_name`` attributes. When interpolation raises
+    :class:`_StepRefError`, the walker catches it and re-raises with
+    the workflow's name and the failing step's id + tool baked in.
+    """
+    wf = WorkflowDefinition(
+        name="rebrand-flow",
+        description="missing upstream reference triggers rebrand",
+        steps=(
+            WorkflowStep(
+                id="mine",
+                tool="creek.mine",
+                args={"echo": "{{step.ghost.body}}"},
+            ),
+        ),
+    )
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(_FakeSession()),
+        known_tools=("creek.mine",),
+    )
+
+    with pytest.raises(WorkflowStepError) as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    # All three metadata attributes are populated — never empty strings.
+    assert excinfo.value.step_id == "mine"
+    assert excinfo.value.tool == "creek.mine"
+    assert excinfo.value.workflow_name == "rebrand-flow"
+    # The cause chain preserves the private interpolation-layer marker
+    # so callers can disambiguate "interpolation aborted" from "MCP tool
+    # raised" by inspecting ``__cause__`` instead of the message text.
+    assert isinstance(excinfo.value.__cause__, _StepRefError)
 
 
 async def test_walker_aborts_when_step_references_unknown_field() -> None:
@@ -845,7 +926,7 @@ async def test_walker_aborts_on_mcp_tool_failure_mid_workflow() -> None:
         "creek.mine", error=RuntimeError("mcp boom: tool exploded")
     )
     walker = WorkflowWalker(
-        mcp_client=_FakeMCPClient(failing),  # type: ignore[arg-type]
+        mcp_client=_FakeMCPClient(failing),
         known_tools=("creek.state.read", "creek.mine"),
     )
 
@@ -876,7 +957,7 @@ async def test_walker_step_error_carries_step_and_tool_metadata() -> None:
     """
     failing = _FailingSession("creek.mine", error=ValueError("nope"))
     walker = WorkflowWalker(
-        mcp_client=_FakeMCPClient(failing),  # type: ignore[arg-type]
+        mcp_client=_FakeMCPClient(failing),
         known_tools=("creek.state.read", "creek.mine"),
     )
 
