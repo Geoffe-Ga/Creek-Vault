@@ -1328,16 +1328,24 @@ class TestMiningRunReport:
 
         assert list(report.seeds) == legacy
 
-    def test_report_top_score_reflects_best_candidate(
+    def test_empty_vault_yields_per_strategy_diagnostics_and_no_seeds(
         self,
         vault: Path,
         miner: IdeaMiner,
     ) -> None:
-        """``top_score`` reflects best per-strategy score, even when zero kept."""
-        # No fragments — every strategy considers zero candidates.
+        """Empty vault produces one diagnostic per strategy, all with zero kept.
+
+        Replaces a previous ``top_score`` aggregate check. Per-strategy
+        scores are reported in different units (fragment counts vs.
+        Jaccard similarity vs. binary 1.0 gates), so ``max()`` across
+        them is meaningless and the aggregate property was removed.
+        """
         empty_report = miner.mine_all_with_report(vault, current_phase=Phase.RISING)
-        assert empty_report.top_score == 0.0
         assert empty_report.seeds == ()
+        assert {diag.strategy for diag in empty_report.diagnostics} == set(
+            MiningStrategy,
+        )
+        assert all(diag.candidates_kept == 0 for diag in empty_report.diagnostics)
 
     def test_diagnostic_counts_threshold_and_candidates_for_thread_terminus(
         self,
@@ -1409,6 +1417,11 @@ class TestMiningRunReport:
         # from "no phase matches at all". The fix reports len(phase_matches)=10.
         assert diag.top_score == float(n_phase_matches)
         assert diag.threshold == 1.0
+        # And the praxis-gate-drop case names itself explicitly, instead
+        # of leaving fallback_reason=None (which silenced the failure
+        # mode in the original PR #346 review).
+        assert diag.fallback_reason is not None
+        assert "praxis_potential=EXPLICIT" in diag.fallback_reason
 
     def test_resonance_chain_zero_synchronicities_records_fallback_reason(
         self,

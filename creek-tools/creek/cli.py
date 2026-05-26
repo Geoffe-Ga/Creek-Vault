@@ -1691,10 +1691,7 @@ def mine(
     from creek.generate.mining import IdeaMiner
 
     config = _load_config_for_vault(vault)
-    # Route the resolved vault through ``_resolve_vault`` so future
-    # symlink/existence/type-coercion hooks added to that helper apply
-    # uniformly across every CLI subcommand, regardless of whether the
-    # path came from ``--vault`` or the auto-discovered config.
+    # Re-resolve so future _resolve_vault hooks apply regardless of source.
     vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     current_phase = _parse_phase(phase)
     override = _parse_include_tier(include_tier)
@@ -1738,23 +1735,32 @@ def _print_no_seeds_diagnostic(
     *,
     vault_path: Path,
 ) -> None:
-    """Print the issue #340 zero-seed diagnostic message.
+    """Print a per-strategy breakdown when no seeds surfaced.
 
-    The message names the highest score and the threshold it failed
-    to clear, then points the operator at ``compile-gaps.jsonl`` for
-    fallback breadcrumbs.
+    Each strategy reports its own score/threshold in its own units
+    (fragment counts, component sizes, Jaccard similarity, binary
+    gates) so the operator can read across them without conversion.
+    Points at ``compile-gaps.jsonl`` for fallback breadcrumbs.
     """
     from creek.generate.mining import COMPILE_GAPS_LOG_RELPATH
 
     n_strategies = len(report.diagnostics)
-    top_score = report.top_score
-    threshold = report.top_threshold
     gaps_path = vault_path / COMPILE_GAPS_LOG_RELPATH
-    console.print(
-        f"[yellow]No idea seeds surfaced. Ran {n_strategies} strategies; "
-        f"top candidate scored {top_score:.2f} (threshold {threshold:.2f}). "
-        f"See {gaps_path} for fallback reasons.[/yellow]",
-    )
+    lines = [
+        f"[yellow]No idea seeds surfaced. Per-strategy breakdown "
+        f"({n_strategies} strategies):[/yellow]",
+    ]
+    for diag in report.diagnostics:
+        suffix = f" — {diag.fallback_reason}" if diag.fallback_reason else ""
+        lines.append(
+            f"  [yellow]{diag.strategy.value:<20}"
+            f" {diag.candidates_considered} considered,"
+            f" {diag.candidates_kept} kept"
+            f" (top score {diag.top_score:.2f} /"
+            f" threshold {diag.threshold:.2f}){suffix}[/yellow]",
+        )
+    lines.append(f"[yellow]See {gaps_path} for fallback breadcrumbs.[/yellow]")
+    console.print("\n".join(lines))
 
 
 def _read_voice_core(path: Path | None) -> str:

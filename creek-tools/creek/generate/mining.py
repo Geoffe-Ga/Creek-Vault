@@ -99,6 +99,7 @@ mining surface honest about its single source of truth.
 _NO_ACTIVE_THREADS: str = "no active threads available"
 _NO_LIMINAL_FRAGMENTS: str = "no liminal fragments in 10-Liminal/{Unnamed,Compost}"
 _NO_PHASE_MATCHES: str = "no fragments matched the current phase"
+_NO_EXPLICIT_PRAXIS: str = "phase matches found but none had praxis_potential=EXPLICIT"
 _NO_SYNCHRONICITIES: str = (
     "no synchronicity records on disk under 10-Liminal/Synchronicities; "
     "embeddings.parquet edges do not contribute until they are written as "
@@ -231,33 +232,17 @@ class MiningRunReport:
     Aggregates the seeds returned by :meth:`IdeaMiner.mine_all` with one
     :class:`StrategyDiagnostic` per strategy so the CLI can explain a
     zero-seed run without re-mining.
+
+    ``top_score`` / ``top_threshold`` aggregates are intentionally
+    omitted — the four strategies report scores in incompatible units
+    (fragment counts vs. Jaccard similarity vs. a binary 1.0 gate) and
+    ``max()`` across them is meaningless. Callers needing a summary
+    must iterate ``diagnostics`` and surface each strategy's units
+    side-by-side.
     """
 
     seeds: tuple[IdeaSeed, ...]
     diagnostics: tuple[StrategyDiagnostic, ...]
-
-    @property
-    def top_score(self) -> float:
-        """Return the highest candidate score across every strategy."""
-        if not self.diagnostics:
-            return 0.0
-        return max(diag.top_score for diag in self.diagnostics)
-
-    @property
-    def top_threshold(self) -> float:
-        """Return the threshold of the strategy that scored the highest.
-
-        When several strategies tie on ``top_score`` (commonly all zero
-        on an empty vault), the smallest threshold is chosen — this is
-        the most informative value to surface in the "no seeds" message
-        because it's the one a user is likeliest to want to lower.
-        """
-        if not self.diagnostics:
-            return 0.0
-        winners = [
-            diag for diag in self.diagnostics if diag.top_score == self.top_score
-        ]
-        return min(diag.threshold for diag in winners)
 
 
 @dataclass(frozen=True)
@@ -974,16 +959,23 @@ class IdeaMiner:
                 gaps_logged,
             )
         ]
-        reason = None if phase_matches else _NO_PHASE_MATCHES
+        if not phase_matches:
+            reason: str | None = _NO_PHASE_MATCHES
+        elif not seeds:
+            reason = _NO_EXPLICIT_PRAXIS
+        else:
+            reason = None
         diagnostic = StrategyDiagnostic(
             strategy=MiningStrategy.WAVELENGTH_WINDOW,
             candidates_considered=len(phase_matches),
             candidates_kept=len(seeds),
-            # Pre-threshold peak (matches docstring + the pattern used by
-            # the other three strategies). Reporting ``len(seeds)`` here
-            # would conflate "no phase matches at all" with "phase matches
-            # all dropped by the praxis-explicit gate" — exactly the
-            # ambiguity issue #340 / PR #346 exists to resolve.
+            # Pre-threshold peak — matches the pattern used by the other
+            # three strategies. ``len(seeds)`` here would conflate "no
+            # phase matches at all" with "all dropped by the praxis gate".
+            # The praxis-gate-drop case is surfaced explicitly via
+            # ``fallback_reason`` above so the per-strategy CLI breakdown
+            # can name the real failure mode without operators having to
+            # guess from a raw count.
             top_score=float(len(phase_matches)),
             threshold=1.0,
             fallback_reason=reason,

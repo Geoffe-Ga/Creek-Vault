@@ -1925,10 +1925,10 @@ def test_mine_bypass_compiled_warns_and_skips_routing(
 # ---- Issue #340: zero-seed diagnostics -------------------------------
 
 
-def test_mine_no_seeds_message_names_top_score_and_threshold(
+def test_mine_no_seeds_message_lists_per_strategy_breakdown(
     tmp_path: Path,
 ) -> None:
-    """The zero-seed CLI output reports the top score and threshold (issue #340)."""
+    """The zero-seed CLI output reports per-strategy diagnostics (issue #340)."""
     vault = tmp_path / "vault"
     vault.mkdir()
 
@@ -1937,10 +1937,21 @@ def test_mine_no_seeds_message_names_top_score_and_threshold(
     assert result.exit_code == 0
     output = _strip_ansi(result.output)
     assert "No idea seeds surfaced" in output
-    # Diagnostic: explicit score / threshold callouts so the user can
-    # tell whether the run was *close* or nowhere near.
+    # Every strategy gets its own line so per-strategy units stay
+    # coherent (fragment counts vs. Jaccard similarity vs. binary gate).
+    for name in (
+        "thread_terminus",
+        "liminal_cross_eddy",
+        "wavelength_window",
+        "resonance_chain",
+    ):
+        assert name in output
+    # Each row still shows the score / threshold pair side-by-side so the
+    # operator can tell whether a run was *close* or nowhere near.
     assert "score" in output.lower()
     assert "threshold" in output.lower()
+    assert "considered" in output.lower()
+    assert "kept" in output.lower()
     # Operators are pointed at the gap log for fallback reasons.
     assert "compile-gaps.jsonl" in output
 
