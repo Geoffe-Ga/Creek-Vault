@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
-from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
+from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -820,7 +820,7 @@ class PurgeEngine:
         result: PurgeResult,
         operation_id: str,
         *,
-        status: str,
+        status: PurgeOutcomeStatus,
         failure_reason: str | None = None,
     ) -> None:
         """Append the GAP-002 ``outcome`` entry for *result*.
@@ -860,7 +860,7 @@ class PurgeEngine:
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,
-            status=status,  # type: ignore[arg-type]
+            status=status,
             failure_reason=failure_reason,
         )
         self.audit_log.append(entry)
