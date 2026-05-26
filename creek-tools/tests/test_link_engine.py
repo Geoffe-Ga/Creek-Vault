@@ -344,3 +344,386 @@ def test_run_link_unreadable_cache_recomputes(tmp_path: Path) -> None:
     # Cache was rewritten as a valid parquet.
     loaded = EmbeddingLinker(config=CreekConfig().embeddings).load_cache(cache_path)
     assert fragment.id in loaded
+
+
+# ----- Issue #338: eddy materialization tests --------------------------------
+
+
+def _embedded_eddy_fragments(
+    vault: Path,
+    *,
+    count: int = 6,
+) -> list[Fragment]:
+    """Seed *vault* with *count* fragments and matching tight-cluster embeddings.
+
+    Mirrors the production layout: each fragment lives under
+    ``01-Fragments/Notes/`` and there is a parquet cache at
+    ``00-Creek-Meta/embeddings.parquet`` with near-identical vectors so
+    DBSCAN forms one dense, temporally scattered cluster (an eddy).
+
+    Args:
+        vault: Vault root.
+        count: Number of fragments to seed (defaults to 6, above the
+            default ``min_fragments`` of 5).
+
+    Returns:
+        The list of created fragments in creation order.
+    """
+    from datetime import datetime, timedelta
+
+    # Two-year spread keeps the Spearman correlation low so the cluster
+    # qualifies as a scattered eddy rather than a directional thread.
+    base = datetime(2026, 4, 1)
+    day_offsets = [600, 45, 400, 120, 500, 15, 250, 75]
+    fragments: list[Fragment] = []
+    for i in range(count):
+        frag = Fragment(
+            id=f"frag-issue338-{i:03d}",
+            title="Ceramics studio practice",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            created=base - timedelta(days=day_offsets[i % len(day_offsets)]),
+        )
+        _write_fragment(vault=vault, fragment=frag, body="body")
+        fragments.append(frag)
+
+    # Persist the embeddings cache so the eddies linker can consume it
+    # without invoking the sentence-transformer.
+    config = CreekConfig()
+    linker = EmbeddingLinker(config=config.embeddings)
+    vectors = {frag.id: [1.0, 0.0, 0.0] for frag in fragments}
+    entries = linker.build_cache_entries(fragments, vectors)
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(entries, cache_path)
+    return fragments
+
+
+def test_run_link_eddies_materialises_eddy_files(tmp_path: Path) -> None:
+    """The eddies linker writes a markdown file under ``03-Eddies/`` per detected eddy.
+
+    Issue #338 Problem A: the linker previously reported eddy counts but
+    never persisted the eddy notes to disk. The user-visible vault stayed
+    empty even when ``1 link(s)`` was reported.
+    """
+    vault = tmp_path / "vault"
+    _embedded_eddy_fragments(vault)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+
+    eddy_dir = vault / "03-Eddies"
+    # At least one eddy file landed on disk.
+    md_files = [p for p in eddy_dir.rglob("*.md") if p.name != ".gitkeep"]
+    assert md_files, (
+        f"Expected eddies linker to write at least one .md file under "
+        f"{eddy_dir}, found none. Summary: {summary}"
+    )
+    # The reported count matches the number of files written.
+    assert summary.eddies_written == len(md_files)
+    assert summary.eddies_detected == len(md_files)
+
+
+def test_run_link_eddies_updates_member_fragment_frontmatter(tmp_path: Path) -> None:
+    """Member fragments have the eddy's wikilink in their ``eddies:`` frontmatter.
+
+    Without this the eddy file is unreachable from the fragments that
+    compose it — operators see a stub note but the constituent fragments
+    do not point at the eddy from their YAML headers.
+    """
+    import frontmatter
+
+    vault = tmp_path / "vault"
+    seeded = _embedded_eddy_fragments(vault)
+
+    run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+
+    # Read the eddy file back to get the expected wikilink target.
+    eddy_dir = vault / "03-Eddies"
+    eddy_files = [p for p in eddy_dir.rglob("*.md") if p.name != ".gitkeep"]
+    assert eddy_files, "eddies linker must materialize at least one eddy file"
+    eddy_post = frontmatter.load(str(eddy_files[0]))
+    eddy_title = eddy_post.get("title")
+    assert isinstance(eddy_title, str) and eddy_title
+
+    expected_link = f"[[{eddy_title}]]"
+
+    # Every seeded fragment is a cluster member, so every fragment file
+    # should now reference the eddy by wikilink.
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    seen_links = 0
+    for frag in seeded:
+        path = fragments_dir / f"{frag.id}.md"
+        assert path.exists(), f"Seeded fragment {frag.id} should still exist on disk"
+        post = frontmatter.load(str(path))
+        eddies_field = post.get("eddies") or []
+        if expected_link in eddies_field:
+            seen_links += 1
+    assert seen_links == len(seeded), (
+        f"Expected every member fragment to reference the eddy "
+        f"{expected_link!r}; only {seen_links}/{len(seeded)} did."
+    )
+
+
+def test_run_link_eddies_summary_reports_zero_when_no_clusters(
+    tmp_path: Path,
+) -> None:
+    """A sparse vault produces a summary with zero detected, zero written.
+
+    Pins the symmetric "nothing happened" contract: when the linker
+    finds no eddies the user-visible vault is unchanged and the counters
+    both read zero.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-noeddy00000",
+        title="Lonely note",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+
+    assert summary.eddies_detected == 0
+    assert summary.eddies_written == 0
+    eddy_dir = vault / "03-Eddies"
+    if eddy_dir.exists():
+        assert [p for p in eddy_dir.rglob("*.md") if p.name != ".gitkeep"] == []
+
+
+def test_run_link_embeddings_summary_exposes_edge_count(tmp_path: Path) -> None:
+    """The embeddings summary exposes a ``similarity_edges`` count.
+
+    Issue #338 Problem B: the previous output called pairwise similarity
+    edges "link(s)", implying a per-fragment frontmatter side effect
+    that never happened. The structured summary now exposes a
+    method-specific field so the CLI can phrase the side effect
+    accurately.
+    """
+    vault = tmp_path / "vault"
+    fragment = Fragment(
+        id="frag-edges00000",
+        title="Edge fragment",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=fragment, body="body")
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="embeddings",
+        rebuild=False,
+    )
+
+    # The new field always exists for the embeddings method.
+    assert summary.similarity_edges == summary.link_count
+
+
+def test_run_link_eddies_persists_even_when_writer_dispatch_changes(
+    tmp_path: Path,
+) -> None:
+    """The materialization path delegates through ``VaultWriter.write_eddy``.
+
+    Pins the architectural decision (inline materialization, not deferral
+    to ``creek compile``) so a future refactor cannot silently regress by
+    swapping the writer for a no-op.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    _embedded_eddy_fragments(vault)
+
+    with patch(
+        "creek.link.link_engine.VaultWriter.write_eddy",
+        autospec=True,
+    ) as mock_write:
+        mock_write.side_effect = lambda self, eddy: (
+            self.vault_path / "03-Eddies" / f"{eddy.id}.md"
+        )
+        run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="eddies",
+            rebuild=False,
+        )
+
+    assert mock_write.called, (
+        "The eddies linker must persist detected eddies via VaultWriter.write_eddy"
+    )
+
+
+def test_run_link_eddies_write_oserror_does_not_crash(tmp_path: Path) -> None:
+    """An ``OSError`` while persisting an eddy is logged and skipped.
+
+    Disk full, read-only volume, or permission errors must not propagate
+    — the rest of the linker has nothing to roll back and a single bad
+    write should not block the entire run.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    _embedded_eddy_fragments(vault)
+
+    with patch(
+        "creek.link.link_engine.VaultWriter.write_eddy",
+        side_effect=OSError("disk full"),
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="eddies",
+            rebuild=False,
+        )
+
+    # Detected count survives but written count is zero because every
+    # write failed.
+    assert summary.eddies_detected >= 1
+    assert summary.eddies_written == 0
+
+
+def test_run_link_eddies_skips_missing_vault_scaffold(tmp_path: Path) -> None:
+    """A vault missing ``00-Creek-Meta`` does not crash the eddy materialiser.
+
+    The link engine is invoked against whatever path the operator
+    provides; a half-set-up vault should produce a clean warning rather
+    than a ``FileNotFoundError`` traceback.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    _embedded_eddy_fragments(vault)
+
+    with patch(
+        "creek.link.link_engine.VaultWriter",
+        side_effect=FileNotFoundError("missing dir"),
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="eddies",
+            rebuild=False,
+        )
+
+    # Detection still ran; persistence was skipped wholesale.
+    assert summary.eddies_detected >= 1
+    assert summary.eddies_written == 0
+
+
+def test_run_link_eddies_fragment_write_oserror_is_logged(tmp_path: Path) -> None:
+    """A failed fragment rewrite is counted as not-updated; no crash."""
+    from pathlib import Path as _Path
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    _embedded_eddy_fragments(vault)
+
+    # Force every fragment rewrite to fail. write_eddy is left intact so
+    # the eddy file itself still lands.
+    real_write_text = _Path.write_text
+
+    def _selective_write(
+        self: _Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        if self.suffix == ".md" and self.parent.name == "Notes":
+            raise OSError("read-only volume")
+        return real_write_text(
+            self,
+            data,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    with patch.object(_Path, "write_text", _selective_write):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="eddies",
+            rebuild=False,
+        )
+
+    # Eddy file landed (write_eddy uses os.open, not write_text) but no
+    # fragment frontmatter was rewritten.
+    assert summary.eddies_written >= 1
+    assert summary.member_fragments_updated == 0
+
+
+def test_run_link_eddies_preserves_extra_frontmatter_and_body(
+    tmp_path: Path,
+) -> None:
+    """Rewriting a fragment's ``eddies:`` list does not drop other keys.
+
+    The fragment-rewrite path re-reads the raw YAML so operator-applied
+    keys (``classification_method``, custom tags) and the markdown body
+    survive verbatim. Without this guarantee a future refactor that
+    dropped the ``raw.copy()`` step would silently corrupt user vaults.
+    """
+    from datetime import datetime, timedelta
+
+    import frontmatter
+
+    vault = tmp_path / "vault"
+    base = datetime(2026, 4, 1)
+    day_offsets = [600, 45, 400, 120, 500, 15]
+    fragments: list[Fragment] = []
+    custom_body = "Body paragraph one.\n\nBody paragraph two with [[link]]."
+    for i in range(6):
+        frag = Fragment(
+            id=f"frag-extras-{i:03d}",
+            title="Ceramics studio practice",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            created=base - timedelta(days=day_offsets[i]),
+        )
+        _write_fragment(
+            vault=vault,
+            fragment=frag,
+            body=custom_body,
+            method="manual",
+            extras={"operator_tags": ["studio", "ritual"], "custom_key": "preserved"},
+        )
+        fragments.append(frag)
+
+    config = CreekConfig()
+    linker = EmbeddingLinker(config=config.embeddings)
+    vectors = {frag.id: [1.0, 0.0, 0.0] for frag in fragments}
+    entries = linker.build_cache_entries(fragments, vectors)
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(entries, cache_path)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+    assert summary.member_fragments_updated == len(fragments)
+
+    fragments_dir = vault / "01-Fragments" / "Notes"
+    for frag in fragments:
+        post = frontmatter.load(str(fragments_dir / f"{frag.id}.md"))
+        assert post.get("classification_method") == "manual"
+        assert post.get("operator_tags") == ["studio", "ritual"]
+        assert post.get("custom_key") == "preserved"
+        assert post.content == custom_body
+        eddies_field = post.get("eddies") or []
+        assert any(
+            isinstance(entry, str) and entry.startswith("[[") for entry in eddies_field
+        ), f"Fragment {frag.id} lost its eddy wiki-link"

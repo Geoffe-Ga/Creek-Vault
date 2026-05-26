@@ -1108,6 +1108,51 @@ def test_link_rebuild_clears_embeddings_cache(tmp_path: Path) -> None:
     assert not cache_path.exists()
 
 
+def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None:
+    """Embeddings CLI output explicitly says "similarity edges", not "links".
+
+    Issue #338 Problem B: the pre-fix output used "link(s)" for pairwise
+    similarity edges stored only in the parquet cache. That implied a
+    user-visible side effect in fragment frontmatter that did not exist.
+    The fix is to phrase the count accurately as similarity edges
+    cached in the parquet so operators know what they're being shown.
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["link", "--vault", str(vault), "--method", "embeddings"],
+    )
+    assert result.exit_code == 0, result.output
+    # New phrasing — accurate to what the embeddings method does.
+    assert "similarity edge" in result.output.lower()
+    assert "embeddings.parquet" in result.output
+
+
+def test_link_eddies_output_phrases_eddies_written(tmp_path: Path) -> None:
+    """Eddies CLI output reports both detected and written counts.
+
+    Issue #338 Problem A: the pre-fix output said ``1 link(s)`` even when
+    nothing materialised in the vault. The fix is to make the side
+    effect (an eddy .md under ``03-Eddies/``) explicit in the count.
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["link", "--vault", str(vault), "--method", "eddies"],
+    )
+    assert result.exit_code == 0, result.output
+    output_lower = result.output.lower()
+    assert "eddies" in output_lower
+    # Both halves of the contract are surfaced explicitly.
+    assert "detected" in output_lower
+    assert "written" in output_lower
+    assert "03-eddies" in output_lower
+
+
 def test_report_help() -> None:
     """Test that report --help shows subcommand help."""
     result = runner.invoke(app, ["report", "--help"])

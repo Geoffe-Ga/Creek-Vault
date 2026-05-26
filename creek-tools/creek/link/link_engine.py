@@ -5,6 +5,12 @@ chosen linker stage (embeddings, temporal, or eddies), and reports the
 resulting link count back to the CLI. Honours ``--rebuild`` by deleting
 the cached embeddings parquet so the embedding linker recomputes from
 scratch.
+
+The eddies linker materialises its output inline — it writes an
+``Eddy`` markdown file per detected cluster under ``03-Eddies/`` and
+updates each member fragment's ``eddies:`` frontmatter with the
+corresponding wiki-link, so the CLI's summary counts match what
+operators see on disk.
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
+
+import frontmatter
 
 from creek.link.eddies import EddyDetector
 from creek.link.embeddings import (
@@ -24,10 +32,11 @@ from creek.link.embeddings import (
 )
 from creek.link.temporal import TemporalLinker
 from creek.vault.reader import iter_vault_fragments
+from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
     from creek.config import CreekConfig
-    from creek.models import Fragment
+    from creek.models import Eddy, Fragment
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +45,42 @@ logger = logging.getLogger(__name__)
 class LinkSummary:
     """Counts produced by a single ``creek link`` run.
 
+    The structured fields make the contract per-method explicit so the
+    CLI can phrase what actually happened — pairwise similarity edges
+    cached in a parquet are *not* per-fragment frontmatter links, and an
+    eddy cluster *detected* in memory is not the same as an eddy file
+    *written* to disk. ``link_count`` is preserved as a back-compat
+    mirror of the method-specific count.
+
     Attributes:
         method: Linker that was run (``embeddings`` / ``temporal`` /
             ``eddies``).
         fragment_count: Number of fragments loaded from the vault.
-        link_count: Edges or clusters produced (resonances, temporal
-            links, or eddy clusters depending on ``method``).
+        link_count: Generic count for back-compat; mirrors the
+            method-specific count (resonance edges, temporal links, or
+            eddies detected).
+        similarity_edges: Pairwise cosine-similarity edges cached in the
+            embeddings parquet. Only populated for ``method ==
+            "embeddings"`` (zero elsewhere).
+        eddies_detected: Eddy clusters returned by the detector. Only
+            populated for ``method == "eddies"``.
+        eddies_written: Eddy markdown files persisted under
+            ``03-Eddies/`` by the materialisation step. Equal to
+            ``eddies_detected`` when every write succeeds; smaller when
+            duplicate-id collisions short-circuit a write or the writer
+            fails. Only populated for ``method == "eddies"``.
+        member_fragments_updated: Fragments whose on-disk ``eddies:``
+            frontmatter was rewritten to include a new wiki-link. Only
+            populated for ``method == "eddies"``.
     """
 
     method: str
     fragment_count: int
     link_count: int
+    similarity_edges: int = 0
+    eddies_detected: int = 0
+    eddies_written: int = 0
+    member_fragments_updated: int = 0
 
 
 def run_link(
@@ -89,31 +123,218 @@ def run_link(
             config=config,
             cache_path=cache_path,
         )
-    elif method == "temporal":
+        return LinkSummary(
+            method=method,
+            fragment_count=len(fragments),
+            link_count=link_count,
+            similarity_edges=link_count,
+        )
+    if method == "temporal":
         temporal = TemporalLinker()
         links = temporal.find_temporal_links(
             fragments,
             window_hours=config.linking.temporal_window_hours,
         )
-        link_count = len(links)
-    else:
-        embeddings = _load_or_compute_embeddings(
-            fragments=fragments,
-            config=config,
-            cache_path=cache_path,
+        return LinkSummary(
+            method=method,
+            fragment_count=len(fragments),
+            link_count=len(links),
         )
-        detector = EddyDetector(embeddings=embeddings)
-        eddies = detector.detect_eddies(
-            fragments,
-            min_fragments=config.linking.eddy_min_fragments,
+
+    # method == "eddies"
+    return _run_eddies(
+        fragments=fragments,
+        config=config,
+        cache_path=cache_path,
+        vault_path=vault_path,
+    )
+
+
+def _run_eddies(
+    *,
+    fragments: list[Fragment],
+    config: CreekConfig,
+    cache_path: Path,
+    vault_path: Path,
+) -> LinkSummary:
+    """Detect eddies and materialise them inline.
+
+    Inline materialisation is chosen over deferring to ``creek compile``
+    for two reasons:
+
+    1. The detector already produces fully-formed :class:`Eddy` models
+       and a membership map; the only missing step is the filesystem
+       write — :meth:`VaultWriter.write_eddy` already exists.
+    2. The ``creek compile`` flow is a per-target manual invocation; it
+       is not the bulk persistence path for detected eddies.
+
+    The function:
+
+    * runs DBSCAN over the cached embeddings,
+    * writes one ``Eddy`` markdown file per detected cluster under
+      ``03-Eddies/``,
+    * rewrites each member fragment's ``eddies:`` frontmatter to include
+      the corresponding ``[[Eddy Title]]`` wiki-link (no rewrites for
+      fragments that already carried the link).
+
+    Disk failures degrade gracefully: a write that raises ``OSError`` is
+    logged and skipped so a single bad file cannot block the rest of
+    the run, and the returned summary reflects the partial work.
+
+    Args:
+        fragments: Fragments loaded from the vault.
+        config: Loaded Creek configuration.
+        cache_path: Embeddings parquet path.
+        vault_path: Vault root.
+
+    Returns:
+        A populated :class:`LinkSummary` for the eddies method.
+    """
+    embeddings = _load_or_compute_embeddings(
+        fragments=fragments,
+        config=config,
+        cache_path=cache_path,
+    )
+    detector = EddyDetector(embeddings=embeddings)
+    eddies = detector.detect_eddies(
+        fragments,
+        min_fragments=config.linking.eddy_min_fragments,
+    )
+
+    if not eddies:
+        return LinkSummary(
+            method="eddies",
+            fragment_count=len(fragments),
+            link_count=0,
         )
-        link_count = len(eddies)
+
+    updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
+    written_paths = _write_eddy_files(eddies, vault_path)
+    fragments_updated = _persist_fragment_eddy_updates(
+        original=fragments,
+        updated=updated_fragments,
+        vault_path=vault_path,
+    )
 
     return LinkSummary(
-        method=method,
+        method="eddies",
         fragment_count=len(fragments),
-        link_count=link_count,
+        link_count=len(eddies),
+        eddies_detected=len(eddies),
+        eddies_written=len(written_paths),
+        member_fragments_updated=fragments_updated,
     )
+
+
+def _write_eddy_files(eddies: list[Eddy], vault_path: Path) -> list[Path]:
+    """Persist each eddy as a markdown file under ``03-Eddies/``.
+
+    Uses :class:`VaultWriter` so per-directory ID indexing, atomic
+    create, and provenance logging all behave consistently with the rest
+    of the pipeline. A failed write (``OSError`` from a full disk or
+    read-only volume) is logged and the remaining eddies are still
+    attempted — losing one eddy file should not break the others.
+
+    Args:
+        eddies: Eddies returned by :meth:`EddyDetector.detect_eddies`.
+        vault_path: Vault root.
+
+    Returns:
+        Paths of the eddy files that were successfully written.
+    """
+    try:
+        writer = VaultWriter(vault_path=vault_path)
+    except FileNotFoundError:
+        # The vault scaffold is incomplete (no ``00-Creek-Meta`` or
+        # ``01-Fragments`` yet). The link engine is invoked against
+        # whatever the operator points at; we shouldn't crash on a
+        # half-set-up vault when there's nothing to materialise into.
+        logger.warning(
+            "Skipping eddy materialisation: vault %s is missing required dirs",
+            vault_path,
+        )
+        return []
+
+    written: list[Path] = []
+    for eddy in eddies:
+        try:
+            path = writer.write_eddy(eddy)
+        except OSError as exc:
+            logger.warning(
+                "Failed to write eddy %s (%s) under %s: %s",
+                eddy.id,
+                eddy.title,
+                vault_path / "03-Eddies",
+                exc,
+            )
+            continue
+        written.append(path)
+    return written
+
+
+def _persist_fragment_eddy_updates(
+    *,
+    original: list[Fragment],
+    updated: list[Fragment],
+    vault_path: Path,
+) -> int:
+    """Rewrite fragment frontmatter when the ``eddies:`` list changed.
+
+    Re-reads each fragment file so non-Fragment frontmatter keys (e.g.
+    operator-applied tags, ``classification_method``) are preserved
+    verbatim — the same approach the classify engine uses for in-place
+    fragment rewrites. Only fragments whose ``eddies`` list actually
+    grew are touched.
+
+    Args:
+        original: Fragments as loaded from disk.
+        updated: Fragments returned by
+            :meth:`EddyDetector.assign_fragments_to_eddies`. Must be
+            the same length as *original* and in the same order.
+        vault_path: Vault root.
+
+    Returns:
+        Number of fragment files that were successfully rewritten.
+    """
+    path_by_id: dict[str, Path] = {}
+    raw_by_id: dict[str, dict[str, object]] = {}
+    body_by_id: dict[str, str] = {}
+    for path, frag, body, raw in iter_vault_fragments(vault_path / "01-Fragments"):
+        path_by_id[frag.id] = path
+        raw_by_id[frag.id] = raw
+        body_by_id[frag.id] = body
+
+    written = 0
+    for before, after in zip(original, updated, strict=True):
+        if before.eddies == after.eddies:
+            continue
+        md_path = path_by_id.get(after.id)
+        if md_path is None:
+            # The fragment landed in the detector via the in-memory
+            # path but doesn't have a backing file (test scenario or
+            # the file was unlinked between load and rewrite). Skip
+            # rather than crash — there is nothing to update.
+            logger.debug(
+                "Skipping fragment frontmatter update for %s: no file on disk",
+                after.id,
+            )
+            continue
+        raw = raw_by_id.get(after.id, {}).copy()
+        raw.update(after.model_dump(mode="json"))
+        post = frontmatter.Post(content=body_by_id.get(after.id, ""))
+        post.metadata.update(raw)
+        try:
+            md_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "Failed to rewrite fragment %s at %s: %s",
+                after.id,
+                md_path,
+                exc,
+            )
+            continue
+        written += 1
+    return written
 
 
 def _run_embeddings(

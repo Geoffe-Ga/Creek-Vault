@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import DraftLLM, SeedSpec
     from creek.ingest.base import Ingestor
+    from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
@@ -1086,11 +1087,51 @@ def link(
         method=method,
         rebuild=rebuild,
     )
-    console.print(
-        f"[bold green]{method.capitalize()} linker: "
-        f"{summary.fragment_count} fragment(s), "
-        f"{summary.link_count} link(s).[/bold green]",
-    )
+    console.print(_format_link_summary(summary))
+
+
+def _format_link_summary(summary: LinkSummary) -> str:
+    """Render a method-specific summary message for the ``creek link`` CLI.
+
+    Each method gets its own phrasing because the word "link" used to mean
+    two incompatible things: pairwise cosine edges cached in the parquet
+    (embeddings) and topic clusters that may or may not have been written
+    to disk (eddies). Per-method strings name the actual side effect so
+    operators can correlate the number with what they see on disk.
+
+    Args:
+        summary: The link summary returned by
+            :func:`creek.link.link_engine.run_link`.
+
+    Returns:
+        A Rich-markup string ready for :func:`console.print`.
+
+    Raises:
+        ValueError: If ``summary.method`` is not a known linker name.
+    """
+    fragments = summary.fragment_count
+    if summary.method == "embeddings":
+        body = (
+            f"Embeddings linker: {fragments} fragment(s) embedded, "
+            f"{summary.similarity_edges} similarity edge(s) cached in "
+            f"00-Creek-Meta/embeddings.parquet."
+        )
+    elif summary.method == "eddies":
+        body = (
+            f"Eddies linker: {fragments} fragment(s) scanned, "
+            f"{summary.eddies_detected} eddy(ies) detected, "
+            f"{summary.eddies_written} eddy file(s) written to 03-Eddies/, "
+            f"{summary.member_fragments_updated} fragment(s) updated with "
+            f"`eddies:` wiki-links."
+        )
+    elif summary.method == "temporal":
+        body = (
+            f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
+        )
+    else:
+        msg = f"Unknown link method: {summary.method!r}"
+        raise ValueError(msg)
+    return f"[bold green]{body}[/bold green]"
 
 
 @app.command(name="compile")
