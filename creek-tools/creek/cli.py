@@ -1580,12 +1580,27 @@ def skills_generate(
         "--include-tier",
         help=_INCLUDE_TIER_HELP,
     ),
+    signature_only: bool = typer.Option(
+        False,
+        "--signature-only",
+        help=(
+            "Emit the signature-only variant (.SIGNATURE.md): abstract "
+            "voice patterns only, no quoted exemplar passages from "
+            "user writing. Coexists with the legacy .SKILL.md tree "
+            "(issue #353)."
+        ),
+    ),
 ) -> None:
     """Generate the Voice Skill Tree (Section 11.4).
 
-    Writes a tree of ``SKILL.md`` files under *output* (default
+    Writes a tree of skill files under *output* (default
     ``<vault>/creek-skills``) covering frequencies, phases, modes,
-    registers, threads, eddies, and two meta skills.
+    registers, threads, eddies, and two meta skills. The default
+    variant emits ``.SKILL.md`` files that include quoted exemplar
+    passages harvested from the vault. With ``--signature-only``,
+    ``.SIGNATURE.md`` files are emitted instead — same voice patterns,
+    anti-patterns, and writing instructions but zero quoted user
+    content. The two variants can coexist in the same output directory.
     """
     override = _parse_include_tier(include_tier)
     # Skill tree generation already excludes intimate exemplars; the
@@ -1610,10 +1625,13 @@ def skills_generate(
 
     vault_path = _resolve_vault(vault)
     output_dir = output if output is not None else vault_path / "creek-skills"
-    written = SkillTreeGenerator().generate_all_skills(vault_path, output_dir)
+    written = SkillTreeGenerator(
+        signature_only=signature_only,
+    ).generate_all_skills(vault_path, output_dir)
+    variant_label = "signature-only" if signature_only else "exemplar-bearing"
     console.print(
-        f"[bold green]Voice Skill Tree generated ({len(written)} files) "
-        f"at {output_dir}[/bold green]",
+        f"[bold green]Voice Skill Tree generated ({len(written)} "
+        f"{variant_label} files) at {output_dir}[/bold green]",
     )
 
 
