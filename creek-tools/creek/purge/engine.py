@@ -9,8 +9,22 @@ Implements the five purge operations required by issue #46:
 - **purge_vault**: destroy all vault content, preserving folder structure.
 
 Every operation supports a dry-run mode that previews changes without
-writing to disk, and writes an entry to the
-:class:`~creek.purge.audit.PurgeAuditLog` recording what happened.
+writing to disk. Each call emits a **pair** of audit entries (GAP-002):
+an ``intent`` line *before* the first destructive op, then an
+``outcome`` line *after* the body completes (``status="complete"``) or
+after an exception aborts it (``status="partial"``). The pair shares a
+UUID4 ``operation_id`` so a crash recovery tool can reconstruct what
+was being attempted from the intent line alone.
+
+The engine is **not** transactional: a SIGKILL between two ``unlink``
+calls leaves the filesystem in a partial state. The intent log is the
+recovery contract — an operator inspecting
+``<vault>/00-Creek-Meta/audit/purge.jsonl`` after a crash will see the
+intent entry naming what was being attempted, and (if the process got
+that far) an outcome entry with ``status="partial"`` recording how far
+the work had progressed. A staging-directory rename pattern would
+deliver real atomicity at the cost of doubling the I/O budget for
+every purge; it is deferred to a future hardening pass.
 """
 
 from __future__ import annotations
@@ -18,13 +32,14 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import uuid
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
 from pydantic import BaseModel, Field
 
-from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
+from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -166,36 +181,37 @@ class PurgeEngine:
             criteria={"fragment_id": fragment_id},
             dry_run=self.dry_run,
         )
-        frag_file, post = self._find_fragment_by_id(fragment_id)
-        if frag_file is None or post is None:
-            self._write_audit(result)
-            return result
 
-        title = str(post.get("title", frag_file.stem))
-        thread_ids = _str_list(post.get("threads"))
-        eddy_ids = _str_list(post.get("eddies"))
+        def body() -> None:
+            """Run the per-fragment destructive ops, mutating ``result``."""
+            frag_file, post = self._find_fragment_by_id(fragment_id)
+            if frag_file is None or post is None:
+                return
+            title = str(post.get("title", frag_file.stem))
+            thread_ids = _str_list(post.get("threads"))
+            eddy_ids = _str_list(post.get("eddies"))
+            result.deleted_files.append(str(frag_file))
+            result.affected_fragment_ids.append(fragment_id)
+            result.fragments_affected = 1
+            result.wikilinks_removed = self._scrub_wikilinks(
+                title,
+                exclude=frag_file,
+            )
+            result.threads_updated = self._decrement_counts(
+                "02-Threads",
+                thread_ids,
+            )
+            result.eddies_updated = self._decrement_counts(
+                "03-Eddies",
+                eddy_ids,
+            )
+            if not self.dry_run:
+                frag_file.unlink()
+            result.embeddings_removed = self._purge_cache_for(
+                result.affected_fragment_ids,
+            )
 
-        result.deleted_files.append(str(frag_file))
-        result.affected_fragment_ids.append(fragment_id)
-        result.fragments_affected = 1
-        result.wikilinks_removed = self._scrub_wikilinks(title, exclude=frag_file)
-        result.threads_updated = self._decrement_counts(
-            "02-Threads",
-            thread_ids,
-        )
-        result.eddies_updated = self._decrement_counts(
-            "03-Eddies",
-            eddy_ids,
-        )
-
-        if not self.dry_run:
-            frag_file.unlink()
-
-        result.embeddings_removed = self._purge_cache_for(
-            result.affected_fragment_ids,
-        )
-        self._write_audit(result)
-        return result
+        return self._run_audited(result, body)
 
     # -- Source purge -----------------------------------------------------
 
@@ -215,14 +231,17 @@ class PurgeEngine:
             criteria={"source_type": source_type},
             dry_run=self.dry_run,
         )
-        matches = self._fragments_from_source(source_type)
-        for frag_file, post in matches:
-            self._purge_single(frag_file, post, result)
-        result.embeddings_removed = self._purge_cache_for(
-            result.affected_fragment_ids,
-        )
-        self._write_audit(result)
-        return result
+
+        def body() -> None:
+            """Run the per-source destructive ops, mutating ``result``."""
+            matches = self._fragments_from_source(source_type)
+            for frag_file, post in matches:
+                self._purge_single(frag_file, post, result)
+            result.embeddings_removed = self._purge_cache_for(
+                result.affected_fragment_ids,
+            )
+
+        return self._run_audited(result, body)
 
     def count_fragments_from_source(self, source_type: str) -> int:
         """Count fragments currently attributed to a source platform.
@@ -266,14 +285,17 @@ class PurgeEngine:
             criteria={"source_path": source_path, "match": match},
             dry_run=self.dry_run,
         )
-        matches = self._fragments_from_source_path(source_path, match=match)
-        for frag_file, post in matches:
-            self._purge_single(frag_file, post, result)
-        result.embeddings_removed = self._purge_cache_for(
-            result.affected_fragment_ids,
-        )
-        self._write_audit(result)
-        return result
+
+        def body() -> None:
+            """Run the source-path destructive ops, mutating ``result``."""
+            matches = self._fragments_from_source_path(source_path, match=match)
+            for frag_file, post in matches:
+                self._purge_single(frag_file, post, result)
+            result.embeddings_removed = self._purge_cache_for(
+                result.affected_fragment_ids,
+            )
+
+        return self._run_audited(result, body)
 
     def count_fragments_from_source_path(
         self,
@@ -310,23 +332,26 @@ class PurgeEngine:
             criteria={"scope": "all"},
             dry_run=self.dry_run,
         )
-        for frag_file in self._list_fragment_files():
-            post = self._load_frontmatter(frag_file)
-            if post is None:
-                continue
-            if self._reset_classifications(post):
-                result.classifications_reset += 1
-                frag_id = post.get("id")
-                if isinstance(frag_id, str):
-                    result.affected_fragment_ids.append(frag_id)
-                if not self.dry_run:
-                    frag_file.write_text(
-                        frontmatter.dumps(post),
-                        encoding="utf-8",
-                    )
-        result.fragments_affected = result.classifications_reset
-        self._write_audit(result)
-        return result
+
+        def body() -> None:
+            """Reset classification fields on every fragment, mutating ``result``."""
+            for frag_file in self._list_fragment_files():
+                post = self._load_frontmatter(frag_file)
+                if post is None:
+                    continue
+                if self._reset_classifications(post):
+                    result.classifications_reset += 1
+                    frag_id = post.get("id")
+                    if isinstance(frag_id, str):
+                        result.affected_fragment_ids.append(frag_id)
+                    if not self.dry_run:
+                        frag_file.write_text(
+                            frontmatter.dumps(post),
+                            encoding="utf-8",
+                        )
+            result.fragments_affected = result.classifications_reset
+
+        return self._run_audited(result, body)
 
     # -- Daterange purge -------------------------------------------------
 
@@ -358,19 +383,22 @@ class PurgeEngine:
             criteria={"start": start.isoformat(), "end": end.isoformat()},
             dry_run=self.dry_run,
         )
-        for frag_file in self._list_fragment_files():
-            post = self._load_frontmatter(frag_file)
-            if post is None:
-                continue
-            created = _coerce_date(post.get("created"))
-            if created is None or not (start <= created <= end):
-                continue
-            self._purge_single(frag_file, post, result)
-        result.embeddings_removed = self._purge_cache_for(
-            result.affected_fragment_ids,
-        )
-        self._write_audit(result)
-        return result
+
+        def body() -> None:
+            """Run the date-range destructive ops, mutating ``result``."""
+            for frag_file in self._list_fragment_files():
+                post = self._load_frontmatter(frag_file)
+                if post is None:
+                    continue
+                created = _coerce_date(post.get("created"))
+                if created is None or not (start <= created <= end):
+                    continue
+                self._purge_single(frag_file, post, result)
+            result.embeddings_removed = self._purge_cache_for(
+                result.affected_fragment_ids,
+            )
+
+        return self._run_audited(result, body)
 
     # -- Vault purge ------------------------------------------------------
 
@@ -404,15 +432,18 @@ class PurgeEngine:
             criteria={"scope": "entire vault"},
             dry_run=self.dry_run,
         )
-        for folder in _VAULT_CONTENT_FOLDERS:
-            folder_path = self.vault_path / folder
-            if not folder_path.is_dir():
-                continue
-            self._wipe_folder_contents(folder_path, result)
-        result.fragments_affected = len(result.deleted_files)
-        result.embeddings_removed = self._delete_cache_file()
-        self._write_audit(result)
-        return result
+
+        def body() -> None:
+            """Wipe every vault-content folder, mutating ``result``."""
+            for folder in _VAULT_CONTENT_FOLDERS:
+                folder_path = self.vault_path / folder
+                if not folder_path.is_dir():
+                    continue
+                self._wipe_folder_contents(folder_path, result)
+            result.fragments_affected = len(result.deleted_files)
+            result.embeddings_removed = self._delete_cache_file()
+
+        return self._run_audited(result, body)
 
     # -- Private helpers -------------------------------------------------
 
@@ -714,8 +745,85 @@ class PurgeEngine:
             else:
                 entry.unlink()
 
-    def _write_audit(self, result: PurgeResult) -> None:
-        """Append a :class:`PurgeAuditEntry` for a completed purge.
+    def _run_audited(
+        self,
+        result: PurgeResult,
+        body: Callable[[], None],
+    ) -> PurgeResult:
+        """Wrap a purge body in the GAP-002 intent → outcome audit pair.
+
+        Emits an ``intent`` entry before invoking *body*, then an
+        ``outcome`` entry after — ``status="complete"`` on success,
+        ``status="partial"`` (with the exception type + message in
+        ``failure_reason``) when *body* raises. The exception then
+        propagates so callers see the failure.
+
+        The intent entry is the engine's recovery contract: even a
+        SIGKILL between the intent write and the first destructive op
+        leaves a forensic trail naming what was being attempted.
+
+        Args:
+            result: Result accumulator the body will populate.
+            body: Callable that does the actual destructive work and
+                mutates *result* in place.
+
+        Returns:
+            The same ``result`` with counts populated.
+
+        Raises:
+            Exception: Whatever *body* raises, after the partial
+                outcome line has been written.
+        """
+        operation_id = uuid.uuid4().hex
+        self._write_intent_audit(result, operation_id)
+        try:
+            body()
+        except BaseException as exc:
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            self._write_outcome_audit(
+                result,
+                operation_id,
+                status="partial",
+                failure_reason=failure_reason,
+            )
+            raise
+        self._write_outcome_audit(result, operation_id, status="complete")
+        return result
+
+    def _write_intent_audit(
+        self,
+        result: PurgeResult,
+        operation_id: str,
+    ) -> None:
+        """Append the GAP-002 ``intent`` entry for *result*.
+
+        The intent line captures the *planned* scope (operation name,
+        criteria, dry-run flag). Counts are deliberately zero — they
+        are not known until the body runs.
+
+        Args:
+            result: Result accumulator carrying the planned criteria.
+            operation_id: UUID4 hex linking this intent to its outcome.
+        """
+        self._validate_operation(result.operation)
+        entry = PurgeAuditEntry(
+            operation=result.operation,
+            criteria=result.criteria.copy(),
+            dry_run=result.dry_run,
+            phase="intent",
+            operation_id=operation_id,
+        )
+        self.audit_log.append(entry)
+
+    def _write_outcome_audit(
+        self,
+        result: PurgeResult,
+        operation_id: str,
+        *,
+        status: PurgeOutcomeStatus,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Append the GAP-002 ``outcome`` entry for *result*.
 
         ``fragments_deleted`` counts only operations that remove files
         from disk (see :data:`_FILE_DELETING_OPERATIONS`);
@@ -728,6 +836,11 @@ class PurgeEngine:
 
         Args:
             result: The result whose metadata should be logged.
+            operation_id: UUID4 hex matching the paired intent entry.
+            status: ``"complete"`` if the body ran to the end, or
+                ``"partial"`` if it raised.
+            failure_reason: Short ``"<ExceptionType>: <message>"`` when
+                ``status="partial"``; ``None`` otherwise.
 
         Raises:
             ValueError: If ``result.operation`` is not a known purge
@@ -735,17 +848,7 @@ class PurgeEngine:
                 so a new operation type cannot silently default to
                 ``deletes_files=True``.
         """
-        if result.operation in _FILE_DELETING_OPERATIONS:
-            deletes_files = True
-        elif result.operation == "classifications":
-            deletes_files = False
-        else:
-            msg = (
-                f"Unknown purge operation {result.operation!r}; classify it "
-                f"explicitly in _FILE_DELETING_OPERATIONS or add a metadata-only "
-                f"branch before logging."
-            )
-            raise ValueError(msg)
+        deletes_files = self._validate_operation(result.operation)
         fragments_deleted = result.fragments_affected if deletes_files else 0
         entry = PurgeAuditEntry(
             operation=result.operation,
@@ -755,8 +858,53 @@ class PurgeEngine:
             references_scrubbed=result.wikilinks_removed,
             embeddings_removed=result.embeddings_removed,
             dry_run=result.dry_run,
+            phase="outcome",
+            operation_id=operation_id,
+            status=status,
+            failure_reason=failure_reason,
         )
         self.audit_log.append(entry)
+
+    def _validate_operation(self, operation: str) -> bool:
+        """Confirm *operation* is known and return whether it deletes files.
+
+        Args:
+            operation: The operation name to validate.
+
+        Returns:
+            ``True`` when the operation removes files from disk,
+            ``False`` for metadata-only operations.
+
+        Raises:
+            ValueError: When *operation* is neither in
+                :data:`_FILE_DELETING_OPERATIONS` nor the metadata-only
+                allowlist.
+        """
+        if operation in _FILE_DELETING_OPERATIONS:
+            return True
+        if operation == "classifications":
+            return False
+        msg = (
+            f"Unknown purge operation {operation!r}; classify it "
+            f"explicitly in _FILE_DELETING_OPERATIONS or add a metadata-only "
+            f"branch before logging."
+        )
+        raise ValueError(msg)
+
+    def _write_audit(self, result: PurgeResult) -> None:
+        """Backward-compat shim that writes a single outcome entry.
+
+        Pre-existing callers (and a small handful of tests) treat
+        ``_write_audit`` as "emit one final audit line". The GAP-002
+        contract has the engine emit *two* lines per operation via
+        :meth:`_run_audited`. This shim is preserved so direct callers
+        keep working: they get an outcome line with a fresh
+        ``operation_id`` and ``status="complete"``, no paired intent.
+
+        Args:
+            result: Result whose metadata should be logged.
+        """
+        self._write_outcome_audit(result, uuid.uuid4().hex, status="complete")
 
 
 _CLASSIFICATION_DEFAULTS: dict[str, dict[str, object]] = {

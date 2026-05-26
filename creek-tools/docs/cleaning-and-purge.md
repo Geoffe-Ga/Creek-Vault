@@ -178,24 +178,41 @@ The `WARNING` log entry written when `--force-non-interactive` is used will surf
 
 ## Audit trail
 
-Every purge appends one JSONL line to `<vault>/00-Creek-Meta/audit/purge.jsonl`. Each entry carries an inline `prev_hash` (sha256 of the previous line) so a tampered or truncated log can be detected via the verification API:
+Every purge writes **two** JSONL lines to `<vault>/00-Creek-Meta/audit/purge.jsonl`: an `intent` line *before* the first destructive op, then an `outcome` line *after* the body completes (or after an exception aborts it). Both lines share a UUID4 `operation_id` so a recovery tool can pair them, and both extend the `prev_hash` sha256 chain so a tampered or truncated log can be detected via the verification API:
 
 ```json
 {
-  "operation": "source",
-  "criteria": {"source_type": "claude"},
-  "affected_fragments": ["frag-...", "frag-..."],
+  "operation": "vault",
+  "criteria": {"scope": "entire vault"},
   "operator": "sgsg",
   "timestamp": "2026-04-28T18:01:23Z",
+  "phase": "intent",
+  "operation_id": "9f1c…",
+  "dry_run": false,
+  "prev_hash": "0000…"
+}
+{
+  "operation": "vault",
+  "criteria": {"scope": "entire vault"},
+  "affected_fragments": ["frag-…", "frag-…"],
+  "operator": "sgsg",
+  "timestamp": "2026-04-28T18:01:24Z",
+  "phase": "outcome",
+  "operation_id": "9f1c…",
+  "status": "complete",
   "fragments_deleted": 47,
   "references_scrubbed": 312,
   "embeddings_removed": 47,
   "dry_run": false,
-  "prev_hash": "0000…"
+  "prev_hash": "abcd…"
 }
 ```
 
-`embeddings_removed` is the real number of rows dropped from
+If the process is killed *between* the two writes (SIGKILL, power loss, OOM kill), the intent line is on disk and the outcome line is not. An operator inspecting the log knows that vault `<id>` was being attempted at `<timestamp>` and can reconcile against the filesystem. If the body raises a Python exception, the engine writes an outcome line with `status="partial"` and a `failure_reason` field naming the exception type and message; the original exception then propagates.
+
+`creek purge` is **not** transactional — there is no staging-directory rename pattern, so a crash partway through `_wipe_folder_contents` can still leave the filesystem half-deleted. The intent + outcome pair is the recovery contract: it tells you *what was attempted* and *how far it got*, but does not roll back. Pre-GAP-002 entries (no `phase` field) read back as `phase="outcome"` with `operation_id=""` and `status=null` for backward compatibility.
+
+The outcome line's `embeddings_removed` is the real number of rows dropped from
 `<vault>/00-Creek-Meta/embeddings.parquet` in that call (GAP-001):
 
 - Zero when the embeddings cache has not been built yet (no `creek
