@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 from tqdm import tqdm
 
 from creek.models import Eddy
+from creek.time import effective_authored_at, effective_authored_date
 
 if TYPE_CHECKING:
     from datetime import date
@@ -310,17 +311,22 @@ def _spearman_with_time(distances: list[float]) -> float:
 
 
 def _median_date(fragments: list[Fragment]) -> date:
-    """Return the median fragment creation date.
+    """Return the median fragment authored date.
+
+    Uses :func:`creek.time.effective_authored_at` /
+    :func:`creek.time.effective_authored_date` (FEAT-031) so the median
+    reflects when the fragments were *authored* — not the wall-clock
+    moment they were ingested into the vault.
 
     Args:
         fragments: Non-empty list of fragments.
 
     Returns:
-        The median ``created`` date (lower-median for even counts).
+        The median authored date (lower-median for even counts).
     """
-    sorted_frags = sorted(fragments, key=lambda f: f.created)
+    sorted_frags = sorted(fragments, key=effective_authored_at)
     mid = len(sorted_frags) // 2
-    return sorted_frags[mid].created.date()
+    return effective_authored_date(sorted_frags[mid])
 
 
 class EddyDetector:
@@ -554,7 +560,7 @@ class EddyDetector:
                 continue
             cluster_frags = sorted(
                 (frag_by_id[fid] for fid in members),
-                key=lambda f: f.created,
+                key=effective_authored_at,
             )
             if self._has_temporal_direction(cluster_frags):
                 continue

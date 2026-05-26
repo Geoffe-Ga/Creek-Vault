@@ -1102,6 +1102,82 @@ class TestThreadDetector:
         detector.detect_threads([_make_fragment("Solo")])
         assert detector.thread_members == {}
 
+    def test_detect_threads_buckets_by_authored_at_not_created(self) -> None:
+        """FEAT-031: bucketing uses ``authored_at`` when present.
+
+        Three fragments share the same ``created`` (the wall-clock moment
+        Creek ingested them) but carry ``authored_at`` values spread
+        across two years. With a 30-day window, bucketing on ``created``
+        would happily fold them into one thread; bucketing on
+        ``authored_at`` correctly leaves them too far apart to link.
+        """
+        now = datetime(2026, 4, 1)
+        ingest_moment = now - timedelta(hours=1)
+        # All three appear at the same "ingested" wall-clock moment, but
+        # were authored years apart.
+        authored_dates = [
+            datetime(2024, 1, 15, 9, 0, 0),
+            datetime(2025, 2, 10, 9, 0, 0),
+            datetime(2026, 3, 20, 9, 0, 0),
+        ]
+        fragments = [
+            Fragment(
+                id=f"frag-feat031-thr-{i}",
+                title=f"Reading Practice {i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=ingest_moment,
+                ingested=ingest_moment,
+                authored_at=authored,
+                frequency=FrequencyClassification(primary=Frequency.F4),
+                wavelength=WavelengthClassification(phase=Phase.UNCLASSIFIED),
+            )
+            for i, authored in enumerate(authored_dates)
+        ]
+        detector = ThreadDetector(now=now, window_days=30)
+        result = detector.detect_threads(fragments)
+        # Spread across years; window is 30 days → no thread forms.
+        assert result == []
+
+    def test_detect_threads_first_last_seen_use_authored_at(self) -> None:
+        """FEAT-031: thread ``first_seen``/``last_seen`` use ``authored_at``.
+
+        Three fragments share the same ingest wall-clock but their
+        ``authored_at`` values span ~20 days, all within the 30-day
+        window so they unite into a single thread. The thread bounds
+        must reflect the authored dates, not the (identical) ingested
+        timestamp.
+        """
+        now = datetime(2026, 4, 1)
+        ingest_moment = now - timedelta(hours=1)
+        # Earliest authored 25 days ago, latest 5 days ago (within window).
+        authored_dates = [
+            now - timedelta(days=25),
+            now - timedelta(days=15),
+            now - timedelta(days=5),
+        ]
+        fragments = [
+            Fragment(
+                id=f"frag-feat031-bounds-{i}",
+                title=f"Reading {i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=ingest_moment,
+                ingested=ingest_moment,
+                authored_at=authored,
+                frequency=FrequencyClassification(primary=Frequency.F4),
+                wavelength=WavelengthClassification(phase=Phase.UNCLASSIFIED),
+            )
+            for i, authored in enumerate(authored_dates)
+        ]
+        detector = ThreadDetector(now=now, window_days=30)
+        result = detector.detect_threads(fragments)
+        assert len(result) == 1
+        thread = result[0]
+        # If bucketing used ``created``, both bounds would equal
+        # ingest_moment.date() — i.e. they would be equal. The authored
+        # range must surface explicit min/max separation.
+        assert thread.first_seen == authored_dates[0].date()
+        assert thread.last_seen == authored_dates[-1].date()
+
 
 class TestThreadAssignment:
     """Tests for assign_fragments_to_threads."""
@@ -1284,12 +1360,20 @@ def _eddy_fragment(
     created: datetime,
     threads: list[str] | None = None,
 ) -> Fragment:
-    """Build a Fragment with an explicit ID (needed to match embeddings)."""
+    """Build a Fragment with an explicit ID (needed to match embeddings).
+
+    Mirrors ``created`` into ``ingested`` so the FEAT-031
+    ``effective_authored_at`` helper — which falls back to ``ingested``
+    when ``authored_at`` is unset — sees the time the test cares about.
+    Without the mirror, eddy formation dates would anchor to
+    construction-time wall-clock instead of the configured offsets.
+    """
     return Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=SourcePlatform.CLAUDE),
         created=created,
+        ingested=created,
         frequency=FrequencyClassification(primary=Frequency.F1),
         wavelength=WavelengthClassification(phase=Phase.UNCLASSIFIED),
         threads=threads or [],
@@ -1617,6 +1701,41 @@ class TestEddyDetector:
         result = detector.detect_eddies(fragments)
         assert len(result) == 1
         assert result[0].title == "!!"
+
+    def test_detect_eddies_formed_uses_authored_at_not_created(self) -> None:
+        """FEAT-031: ``Eddy.formed`` is the median ``authored_at`` date.
+
+        All six fragments share the same ``created`` (single ingest
+        moment) but were authored on widely separated dates. Bucketing
+        on ``created`` would put the formation date at "today"; correct
+        FEAT-031 behaviour anchors it to the median authored date.
+        """
+        now = datetime(2026, 4, 1, 12, 0, 0)
+        ingest_moment = now - timedelta(hours=1)
+        ids = [f"frag-feat031-eddy-{i}" for i in range(5)]
+        # Offsets sorted ascending: 5, 100, 250, 400, 700 days ago.
+        # Median index 2 → 250 days ago = expected ``formed`` date.
+        authored_offsets = [400, 5, 700, 250, 100]
+        fragments = [
+            Fragment(
+                id=fid,
+                title="Voicework Study",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=ingest_moment,
+                ingested=ingest_moment,
+                authored_at=now - timedelta(days=authored_offsets[i]),
+                frequency=FrequencyClassification(primary=Frequency.F1),
+                wavelength=WavelengthClassification(phase=Phase.UNCLASSIFIED),
+            )
+            for i, fid in enumerate(ids)
+        ]
+        detector = EddyDetector(embeddings=_dense_embeddings(ids))
+        result = detector.detect_eddies(fragments)
+        assert len(result) == 1
+        # Without FEAT-031 the median would be ingest_moment.date(); the
+        # correct answer is 250 days before ``now``.
+        assert result[0].formed == (now - timedelta(days=250)).date()
+        assert result[0].formed != ingest_moment.date()
 
 
 class TestEddyAssignment:

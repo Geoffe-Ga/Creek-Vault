@@ -11,7 +11,10 @@ The criteria are deliberately strict:
 
 1. Semantic similarity strictly greater than 0.9.
 2. The two fragments come from *different* source platforms.
-3. Their creation timestamps are separated by more than 30 days.
+3. Their authored timestamps are separated by more than 30 days
+   (FEAT-031: routed through :func:`creek.time.effective_authored_at`
+   so a multi-year corpus ingested in one batch still surfaces
+   cross-year pairs).
 4. The pair is not obviously about the same project/task (status-update
    phrases and shared proper-noun project names are filtered out).
 """
@@ -26,6 +29,7 @@ import frontmatter
 
 from creek.link.embeddings import Resonance
 from creek.models import Synchronicity
+from creek.time import effective_authored_at
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -242,7 +246,11 @@ class SynchronicityDetector:
             from_level=from_level,
             to_level=to_level,
         )
-        gap_days = (later.created - earlier.created).days
+        # FEAT-031: gap is measured against the authored-date
+        # precedence so cross-year synchronicities survive batch
+        # ingestion (which would otherwise collapse ``created`` to a
+        # single wall-clock moment and reduce the gap to zero).
+        gap_days = (effective_authored_at(later) - effective_authored_at(earlier)).days
         if gap_days <= self.min_time_gap_days:
             return None
 
@@ -288,7 +296,10 @@ class SynchronicityDetector:
         Returns:
             ``(earlier, later, level_earlier, level_later)``.
         """
-        if frag_a.created <= frag_b.created:
+        # FEAT-031: order by the authored-date precedence so the
+        # "earlier" fragment is the one actually authored first, even
+        # when both share an ingest-time ``created`` wall-clock.
+        if effective_authored_at(frag_a) <= effective_authored_at(frag_b):
             return frag_a, frag_b, from_level, to_level
         return frag_b, frag_a, to_level, from_level
 
@@ -356,13 +367,16 @@ class SynchronicityDetector:
             A markdown string with fragment excerpts, numeric details,
             the reflection prompt, and the ``#synchronicity`` tag.
         """
+        # FEAT-031: render the authored-date precedence so the body
+        # answers "when was this written?" rather than "when did Creek
+        # see it?".
+        date_a = effective_authored_at(frag_a).date().isoformat()
+        date_b = effective_authored_at(frag_b).date().isoformat()
         lines = [
             "## Fragment excerpts",
             "",
-            f"- **{frag_a.source.platform}** ({frag_a.created.date().isoformat()}): "
-            f"{frag_a.title}",
-            f"- **{frag_b.source.platform}** ({frag_b.created.date().isoformat()}): "
-            f"{frag_b.title}",
+            f"- **{frag_a.source.platform}** ({date_a}): {frag_a.title}",
+            f"- **{frag_b.source.platform}** ({date_b}): {frag_b.title}",
             "",
             "## Details",
             "",

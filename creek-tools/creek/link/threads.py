@@ -7,6 +7,12 @@ consistent* (semantic similarity above a threshold AND frequency
 agreement) into clusters. Clusters that meet the configured minimum
 fragment count become :class:`~creek.models.Thread` instances.
 
+Time-bucketing routes through :func:`creek.time.effective_authored_at`
+and :func:`creek.time.effective_authored_date` (FEAT-031) so a multi-
+year corpus ingested in one batch produces honest first/last bounds
+and window comparisons — instead of collapsing every fragment to a
+single ingest-time wall-clock.
+
 The module also offers fragment-to-thread assignment (adding wiki-links
 to fragment ``threads`` frontmatter) and a heuristic for suggesting
 thread merges when two threads appear to cover the same topic.
@@ -24,7 +30,7 @@ from typing import TYPE_CHECKING
 from tqdm import tqdm
 
 from creek.models import Frequency, Thread, ThreadStatus
-from creek.time import now_la
+from creek.time import effective_authored_at, effective_authored_date, now_la
 
 if TYPE_CHECKING:
     from creek.models import Fragment
@@ -382,7 +388,7 @@ class ThreadDetector:
             self._thread_members = {}
             return []
 
-        sorted_frags = sorted(fragments, key=lambda f: f.created)
+        sorted_frags = sorted(fragments, key=effective_authored_at)
         frag_by_id = {f.id: f for f in sorted_frags}
         uf = self._cluster(sorted_frags)
         threads = self._materialise_threads(uf, frag_by_id, min_fragments)
@@ -395,7 +401,11 @@ class ThreadDetector:
         """Walk the sliding window, unioning topic-consistent pairs.
 
         Args:
-            sorted_frags: Fragments pre-sorted by ``created`` ascending.
+            sorted_frags: Fragments pre-sorted by
+                :func:`creek.time.effective_authored_at` ascending
+                (FEAT-031). Window comparisons use the same helper so
+                a multi-year corpus ingested in one batch does not
+                collapse into a single window.
 
         Returns:
             A populated :class:`_UnionFind` covering every fragment ID.
@@ -415,8 +425,9 @@ class ThreadDetector:
             disable=not sys.stderr.isatty(),
         )
         for i, frag_a in outer:
+            anchor_at = effective_authored_at(frag_a)
             for frag_b in sorted_frags[i + 1 :]:
-                if frag_b.created - frag_a.created > window:
+                if effective_authored_at(frag_b) - anchor_at > window:
                     break
                 if self._topic_consistent(frag_a, frag_b):
                     uf.union(frag_a.id, frag_b.id)
@@ -446,7 +457,7 @@ class ThreadDetector:
                 continue
             cluster = sorted(
                 (frag_by_id[fid] for fid in member_ids),
-                key=lambda f: f.created,
+                key=effective_authored_at,
             )
             thread = self._build_thread(cluster)
             threads.append(thread)
@@ -507,8 +518,11 @@ class ThreadDetector:
         Returns:
             A populated :class:`~creek.models.Thread`.
         """
-        first_seen = min(f.created for f in frags).date()
-        last_seen = max(f.created for f in frags).date()
+        # FEAT-031: bucket on the authored-date precedence so a multi-
+        # year corpus ingested in one batch surfaces honest first/last
+        # bounds instead of collapsing to today's wall-clock.
+        first_seen = min(effective_authored_date(f) for f in frags)
+        last_seen = max(effective_authored_date(f) for f in frags)
         return Thread(
             title=self._generate_title(frags),
             status=self._compute_status(last_seen),

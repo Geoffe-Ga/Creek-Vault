@@ -54,12 +54,20 @@ def _make_fragment(
     platform: SourcePlatform,
     created: datetime,
 ) -> Fragment:
-    """Construct a test Fragment with the given identifying fields."""
+    """Construct a test Fragment with the given identifying fields.
+
+    Mirrors ``created`` into ``ingested`` so the FEAT-031
+    ``effective_authored_at`` helper — which falls back to ``ingested``
+    when ``authored_at`` is unset — sees the time the test cares about.
+    Without the mirror, time-gap and chronological-pair assertions
+    would collapse to construction-time wall-clock.
+    """
     return Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=platform),
         created=created,
+        ingested=created,
     )
 
 
@@ -428,6 +436,147 @@ class TestDetectSynchronicities:
         assert sync.source_b == SourcePlatform.JOURNAL
 
 
+# ---- FEAT-031 effective_authored_at precedence ----
+
+
+def _authored_fragment(
+    *,
+    frag_id: str,
+    title: str,
+    platform: SourcePlatform,
+    ingest_moment: datetime,
+    authored_at: datetime,
+) -> Fragment:
+    """Build a Fragment with split ``created`` vs ``authored_at`` timestamps.
+
+    Models the real-world ingestion case FEAT-031 was filed for: a
+    multi-year corpus ingested in one batch, where ``created`` /
+    ``ingested`` collapse to a single wall-clock moment but each
+    fragment's source-side authored date lives in its own past.
+    """
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=platform),
+        created=ingest_moment,
+        ingested=ingest_moment,
+        authored_at=authored_at,
+    )
+
+
+class TestEffectiveAuthoredAtPrecedence:
+    """FEAT-031: gap / chronological ordering / rendered body use authored_at."""
+
+    def test_time_gap_uses_authored_at_not_created(
+        self,
+        detector: SynchronicityDetector,
+    ) -> None:
+        """The synchronicity gap is computed from ``authored_at``.
+
+        Both fragments share the same ``created`` (ingested in the same
+        batch) but their ``authored_at`` values are 105 days apart on
+        different platforms. Without FEAT-031, the gap would collapse
+        to 0 and the synchronicity would be filtered out by the
+        ``min_time_gap_days`` rule.
+        """
+        ingest_moment = datetime(2026, 5, 1, 10, 0, 0)
+        fragments = {
+            "frag-a": _authored_fragment(
+                frag_id="frag-a",
+                title="the river remembers every stone it has touched",
+                platform=SourcePlatform.DISCORD,
+                ingest_moment=ingest_moment,
+                authored_at=datetime(2025, 1, 5, 10, 0, 0),
+            ),
+            "frag-b": _authored_fragment(
+                frag_id="frag-b",
+                title="the river remembers every stone it has touched",
+                platform=SourcePlatform.JOURNAL,
+                ingest_moment=ingest_moment,
+                authored_at=datetime(2025, 4, 20, 10, 0, 0),
+            ),
+        }
+        resonances = [("frag-a", "frag-b", 0.95)]
+        result = detector.detect_synchronicities(resonances, fragments)
+        assert len(result) == 1
+        assert result[0].time_gap_days == 105
+
+    def test_chronological_pair_uses_authored_at(
+        self,
+        detector: SynchronicityDetector,
+    ) -> None:
+        """Earlier-by-``authored_at`` becomes ``fragment_a_id``.
+
+        ``frag-late-creation`` is ``created`` *first* (in the ingest
+        order) but ``authored_at`` *later*. Chronological pairing must
+        therefore put ``frag-early-creation`` first.
+        """
+        fragments = {
+            "frag-late-creation": _authored_fragment(
+                frag_id="frag-late-creation",
+                title="the long quiet between voices",
+                platform=SourcePlatform.DISCORD,
+                ingest_moment=datetime(2026, 5, 1, 8, 0, 0),
+                authored_at=datetime(2026, 1, 10, 9, 0, 0),
+            ),
+            "frag-early-creation": _authored_fragment(
+                frag_id="frag-early-creation",
+                title="the long quiet between voices",
+                platform=SourcePlatform.JOURNAL,
+                ingest_moment=datetime(2026, 5, 1, 9, 0, 0),
+                authored_at=datetime(2024, 9, 1, 9, 0, 0),
+            ),
+        }
+        resonances = [("frag-late-creation", "frag-early-creation", 0.95)]
+        result = detector.detect_synchronicities(resonances, fragments)
+        assert len(result) == 1
+        # Earlier authored_at wins, regardless of ingest order.
+        assert result[0].fragment_a_id == "frag-early-creation"
+        assert result[0].fragment_b_id == "frag-late-creation"
+
+    def test_render_body_uses_authored_at_date(
+        self,
+        detector: SynchronicityDetector,
+        vault_path: Path,
+    ) -> None:
+        """The rendered note body shows authored dates, not ingest dates.
+
+        The body's bulleted excerpts include the date for each fragment.
+        FEAT-031 requires that date to be the authored date — the answer
+        to "when was this written?" — not the wall-clock moment the
+        vault wrote the fragment.
+        """
+        ingest_moment = datetime(2026, 5, 1, 10, 0, 0)
+        fragments = {
+            "frag-a": _authored_fragment(
+                frag_id="frag-a",
+                title="the river remembers every stone it has touched",
+                platform=SourcePlatform.DISCORD,
+                ingest_moment=ingest_moment,
+                authored_at=datetime(2025, 1, 5, 10, 0, 0),
+            ),
+            "frag-b": _authored_fragment(
+                frag_id="frag-b",
+                title="the river remembers every stone it has touched",
+                platform=SourcePlatform.JOURNAL,
+                ingest_moment=ingest_moment,
+                authored_at=datetime(2025, 4, 20, 10, 0, 0),
+            ),
+        }
+        resonances = [("frag-a", "frag-b", 0.95)]
+        syncs = detector.detect_synchronicities(resonances, fragments)
+        note_path = detector.create_synchronicity_note(
+            syncs[0],
+            fragments,
+            vault_path,
+        )
+        body = frontmatter.loads(note_path.read_text(encoding="utf-8")).content
+        # Authored dates are present; ingest date is not.
+        assert "2025-01-05" in body
+        assert "2025-04-20" in body
+        assert ingest_moment.date().isoformat() not in body
+
+
 # ---- FEAT-024 cross-level ranking ----
 
 
@@ -439,12 +588,18 @@ def _level_fragment(
     created: datetime,
     level: FragmentLevel,
 ) -> Fragment:
-    """Construct a test Fragment with an explicit structural level."""
+    """Construct a test Fragment with an explicit structural level.
+
+    Mirrors ``created`` into ``ingested`` so the FEAT-031
+    ``effective_authored_at`` helper resolves to the supplied time
+    when ``authored_at`` is unset.
+    """
     return Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=platform),
         created=created,
+        ingested=created,
         level=level,
     )
 
