@@ -640,6 +640,55 @@ class CompostConfig(BaseModel):
     """
 
 
+class MiningConfig(BaseModel):
+    """Configuration for ``creek mine`` thresholds (issue #340).
+
+    The four mining strategies use independent thresholds that were
+    previously hard-coded in :mod:`creek.generate.mining`. Exposing them
+    here lets an operator calibrate against their actual corpus size
+    without monkey-patching defaults — the canonical fix for
+    "188 fragments, zero seeds" surfaced in issue #340.
+
+    Defaults mirror the module-level constants so behaviour is
+    unchanged for users who do not set the ``mining:`` section in
+    ``creek_config.yaml``.
+    """
+
+    min_thread_fragments: int = Field(default=10, ge=1)
+    """Threads with strictly more fragments than this become terminus
+    candidates. Default ``10`` matches
+    :data:`creek.generate.mining.DEFAULT_MIN_THREAD_FRAGMENTS`. Lower
+    this on a small-N corpus where the typical thread is only a handful
+    of fragments long.
+    """
+
+    min_chain_length: int = Field(default=3, ge=2)
+    """Minimum number of fragments in a resonance chain for it to
+    surface as a seed. Default ``3`` matches
+    :data:`creek.generate.mining.DEFAULT_MIN_CHAIN_LENGTH`. ``2`` is
+    permitted (a pair is technically a degenerate chain) for tuning
+    against very small synchronicity sets.
+    """
+
+    similarity_liminal: float = Field(default=0.35, ge=0.0, le=1.0)
+    """Minimum Jaccard overlap between a liminal fragment and an eddy.
+    Default ``0.35`` matches
+    :data:`creek.generate.mining.DEFAULT_SIMILARITY_LIMINAL`. Increase
+    for stricter, fewer matches; decrease to admit weaker echoes.
+    """
+
+    similarity_resonance: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Minimum similarity for two fragments to share a resonance-chain
+    edge. Default ``0.6`` matches
+    :data:`creek.generate.mining.DEFAULT_SIMILARITY_RESONANCE`. The
+    miner reads synchronicity records from
+    ``10-Liminal/Synchronicities/`` — embeddings-only edges (those
+    that never landed in a synchronicity note) do not contribute, so
+    lowering this knob alone will not surface chains from an
+    unpopulated synchronicities folder.
+    """
+
+
 class LintConfig(BaseModel):
     """Configuration for ``creek lint`` checks (FEAT-008, FEAT-025).
 
@@ -747,6 +796,9 @@ class CreekConfig(BaseSettings):
 
     lint: LintConfig = Field(default_factory=LintConfig)
     """Lint check toggles (FEAT-008 / FEAT-025)."""
+
+    mining: MiningConfig = Field(default_factory=MiningConfig)
+    """Idea-mining thresholds (issue #340)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""

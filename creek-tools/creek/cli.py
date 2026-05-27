@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from creek.generate.compost_embedding import CompostExemplar
     from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import DraftLLM, SeedSpec
+    from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
     from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Frequency, Mode, Phase
@@ -1730,18 +1731,25 @@ def mine(
     """
     from creek.generate.mining import IdeaMiner
 
-    vault_path = _resolve_vault(vault)
+    config = _load_config_for_vault(vault)
+    # Re-resolve so future _resolve_vault hooks apply regardless of source.
+    vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     current_phase = _parse_phase(phase)
     override = _parse_include_tier(include_tier)
     if bypass_compiled:
         _warn_bypass_compiled("mine")
-    seeds = IdeaMiner(
+    report = IdeaMiner(
         privacy_override=override,
         bypass_compiled=bypass_compiled,
-    ).mine_all(
+        min_thread_fragments=config.mining.min_thread_fragments,
+        min_chain_length=config.mining.min_chain_length,
+        similarity_liminal=config.mining.similarity_liminal,
+        similarity_resonance=config.mining.similarity_resonance,
+    ).mine_all_with_report(
         vault_path,
         current_phase=current_phase,
     )
+    seeds = list(report.seeds)
     fragment_ids = sorted({fid for seed in seeds for fid in seed.source_fragments})
     _audit_privacy_override_if_needed(
         vault_path=vault_path,
@@ -1750,7 +1758,7 @@ def mine(
         fragment_ids=fragment_ids,
     )
     if not seeds:
-        console.print("[yellow]No idea seeds surfaced.[/yellow]")
+        _print_no_seeds_diagnostic(report, vault_path=vault_path)
         return
 
     display = seeds if limit <= 0 else seeds[:limit]
@@ -1761,6 +1769,39 @@ def mine(
     for seed in display:
         table.add_row(seed.strategy.value, seed.title, f"{seed.score:.2f}")
     console.print(table)
+
+
+def _print_no_seeds_diagnostic(
+    report: MiningRunReport,
+    *,
+    vault_path: Path,
+) -> None:
+    """Print a per-strategy breakdown when no seeds surfaced.
+
+    Each strategy reports its own score/threshold in its own units
+    (fragment counts, component sizes, Jaccard similarity, binary
+    gates) so the operator can read across them without conversion.
+    Points at ``compile-gaps.jsonl`` for fallback breadcrumbs.
+    """
+    from creek.generate.mining import COMPILE_GAPS_LOG_RELPATH
+
+    n_strategies = len(report.diagnostics)
+    gaps_path = vault_path / COMPILE_GAPS_LOG_RELPATH
+    lines = [
+        f"[yellow]No idea seeds surfaced. Per-strategy breakdown "
+        f"({n_strategies} strategies):[/yellow]",
+    ]
+    for diag in report.diagnostics:
+        suffix = f" — {diag.fallback_reason}" if diag.fallback_reason else ""
+        lines.append(
+            f"  [yellow]{diag.strategy.value:<20}"
+            f" {diag.candidates_considered} considered,"
+            f" {diag.candidates_kept} kept"
+            f" (top score {diag.top_score:.2f} /"
+            f" threshold {diag.threshold:.2f}){suffix}[/yellow]",
+        )
+    lines.append(f"[yellow]See {gaps_path} for fallback breadcrumbs.[/yellow]")
+    console.print("\n".join(lines))
 
 
 def _read_voice_core(path: Path | None) -> str:
