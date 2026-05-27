@@ -1439,6 +1439,58 @@ class TestMiningRunReport:
         assert diag.fallback_reason is not None
         assert "synchron" in diag.fallback_reason.lower()
 
+    def test_resonance_chain_short_components_records_fallback_reason(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Symmetric to the no-synchronicities case: when synchronicities
+        exist but every connected component is below ``min_chain_length``,
+        the diagnostic must name the gap (largest component size vs.
+        threshold) instead of leaving ``fallback_reason=None``. Closes the
+        ``almost kept`` blind spot raised in the PR #346 re-review.
+        """
+        # Build a 2-fragment component (below default min_chain_length=3).
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="a", title="A"),
+            "Body A.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="b",
+                title="B",
+                platform=SourcePlatform.CLAUDE,
+            ),
+            "Body B.",
+        )
+        _write_synchronicity(
+            vault,
+            _build_sync(
+                sync_id="s1",
+                frag_a="a",
+                frag_b="b",
+                similarity=0.95,
+                source_a=SourcePlatform.JOURNAL,
+                source_b=SourcePlatform.CLAUDE,
+            ),
+        )
+
+        report = miner.mine_all_with_report(vault, current_phase=Phase.UNCLASSIFIED)
+        diag = next(
+            d
+            for d in report.diagnostics
+            if d.strategy is MiningStrategy.RESONANCE_CHAIN
+        )
+
+        assert diag.candidates_considered == 1  # one component
+        assert diag.candidates_kept == 0  # below min_chain_length
+        assert diag.top_score == 2.0  # largest component size
+        assert diag.fallback_reason is not None
+        assert "min_chain_length" in diag.fallback_reason
+        assert "2" in diag.fallback_reason  # actual largest component size
+
 
 class TestMiningDiagnosticLogLines:
     """Each strategy emits a single INFO log line with diagnostic numbers."""

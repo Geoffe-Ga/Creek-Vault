@@ -105,6 +105,10 @@ _NO_SYNCHRONICITIES: str = (
     "embeddings.parquet edges do not contribute until they are written as "
     "synchronicity notes (run `creek link` to populate)"
 )
+_NO_QUALIFYING_CHAIN: str = (
+    "synchronicities exist but largest component has {largest} fragments, "
+    "below min_chain_length={threshold}"
+)
 _UNCLASSIFIED_PHASE: str = "wavelength window skipped (current phase is unclassified)"
 
 
@@ -815,11 +819,14 @@ class IdeaMiner:
             )
             if seed is not None
         ]
-        top_score = float(max((len(c) for c in components), default=0))
+        largest_component = max((len(c) for c in components), default=0)
+        top_score = float(largest_component)
         fallback_reason = self._resonance_fallback_reason(
-            snap.synchronicities,
-            snap.compiled_pages,
-            vault_path,
+            synchronicities=snap.synchronicities,
+            seeds_kept=len(seeds),
+            largest_component=largest_component,
+            compiled=snap.compiled_pages,
+            vault_path=vault_path,
         )
         diagnostic = StrategyDiagnostic(
             strategy=MiningStrategy.RESONANCE_CHAIN,
@@ -834,22 +841,43 @@ class IdeaMiner:
 
     def _resonance_fallback_reason(
         self,
+        *,
         synchronicities: tuple[tuple[str, str, float], ...],
+        seeds_kept: int,
+        largest_component: int,
         compiled: CompiledPageIndex,
         vault_path: Path,
     ) -> str | None:
-        """Log + return a fallback reason when no synchronicities exist."""
-        if synchronicities:
-            return None
-        if not compiled.bypassed:
-            log_compile_gap(
-                vault_path,
-                target_kind="synchronicities",
-                target_id="10-Liminal/Synchronicities",
-                surfaced_by="mine.resonance_chain",
-                reason="missing",
+        """Return a fallback reason when no seeds surfaced.
+
+        Three cases:
+
+        - Synchronicities missing entirely → return ``_NO_SYNCHRONICITIES``
+          and (unless bypass mode is set) append a ``compile-needed``
+          entry to ``compile-gaps.jsonl`` so ``creek lint`` can surface
+          the gap later.
+        - Synchronicities exist but every connected component is shorter
+          than ``min_chain_length`` → return ``_NO_QUALIFYING_CHAIN``
+          named with the actual largest component size. Symmetric to
+          the wavelength ``_NO_EXPLICIT_PRAXIS`` case.
+        - At least one chain seed kept → return ``None``.
+        """
+        if not synchronicities:
+            if not compiled.bypassed:
+                log_compile_gap(
+                    vault_path,
+                    target_kind="synchronicities",
+                    target_id="10-Liminal/Synchronicities",
+                    surfaced_by="mine.resonance_chain",
+                    reason="missing",
+                )
+            return _NO_SYNCHRONICITIES
+        if seeds_kept == 0:
+            return _NO_QUALIFYING_CHAIN.format(
+                largest=largest_component,
+                threshold=self.min_chain_length,
             )
-        return _NO_SYNCHRONICITIES
+        return None
 
     def _chain_seed(
         self,
@@ -1096,28 +1124,6 @@ class IdeaMiner:
         )
         _emit_diagnostic(diagnostic)
         return seeds, diagnostic
-
-    def _best_eddy_match(
-        self,
-        fragment: Fragment,
-        body: str,
-        eddies: tuple[Eddy, ...],
-        compiled: CompiledPageIndex,
-        vault_path: Path,
-        gaps_logged: set[str],
-    ) -> tuple[Eddy, float] | None:
-        """Return the eddy with the highest similarity above threshold."""
-        best = self._best_eddy_match_unfiltered(
-            fragment,
-            body,
-            eddies,
-            compiled,
-            vault_path,
-            gaps_logged,
-        )
-        if best is None or best[1] < self.similarity_liminal:
-            return None
-        return best
 
     def _best_eddy_match_unfiltered(
         self,
