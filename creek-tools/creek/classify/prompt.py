@@ -40,26 +40,34 @@ re-gloss in one place reaches both detectors.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
-from enum import StrEnum
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING
 
-import yaml
-
-# Import the shared dimension blocks and parser helpers via the
-# ``creek.classify.llm`` package surface rather than the underlying
-# submodules. The package's ``__init__.py`` declares these as the
-# contracted import path, so a future reorganisation of ``parsing.py``
-# or ``prompts.py`` only needs to update the re-export — this module
-# stays untouched.
+# Import the shared dimension blocks via the ``creek.classify.llm``
+# package surface rather than the underlying submodules. The package's
+# ``__init__.py`` declares these as the contracted import path, so a
+# future reorganisation of ``parsing.py`` or ``prompts.py`` only needs
+# to update the re-export — this module stays untouched.
 from creek.classify.llm import (
     _COLOR_BLOCK,
     _FREQUENCY_BLOCK,
     _FREQUENCY_COLOR_BLOCK,
     _sanitise_for_prompt,
     _split_reasoning_and_yaml,
-    _strip_code_fences,
+)
+
+# Promoted in #365: the weighted-tuple primitive and the YAML parser
+# helpers now live in :mod:`creek.classify.weighted` so the
+# fragment-level classifier (#366) and the holonic combiner (#367) can
+# import them without depending on this prompt-detection module.
+# Re-export them here so PR #359's public surface (``from
+# creek.classify.prompt import WeightedDimension, ...``) keeps working
+# unchanged.
+from creek.classify.weighted import (
+    WeightedDimension,
+    _coerce_weight,
+    _load_yaml_dict,
+    _parse_dimension,
 )
 from creek.models import (
     Dosage,
@@ -74,29 +82,6 @@ if TYPE_CHECKING:
     from creek.config import LLMConfig
 
 logger = logging.getLogger(__name__)
-
-
-_DimT = TypeVar("_DimT", bound=StrEnum)
-
-
-@dataclass(frozen=True)
-class WeightedDimension(Generic[_DimT]):
-    """A single ontology-dimension value paired with a detection weight.
-
-    Used inside :class:`PromptOntology` to model "this prompt
-    activates Phase ``rising`` at strength 0.7 and Phase
-    ``bottoming_out`` at strength 0.4." Weights live in
-    ``[0.0, 1.0]``; the parser clamps any out-of-range value so a
-    misbehaving LLM cannot inject negative or super-unit weights into
-    downstream consumers.
-
-    Attributes:
-        value: The dimension's canonical enum member.
-        weight: Detection strength in ``[0.0, 1.0]``.
-    """
-
-    value: _DimT
-    weight: float
 
 
 @dataclass(frozen=True)
@@ -236,19 +221,6 @@ reaches this template automatically.
 """
 
 
-_ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {
-        "frequencies",
-        "phases",
-        "modes",
-        "orientations",
-        "dosages",
-        "voice_registers",
-        "overall_confidence",
-    },
-)
-
-
 def build_prompt_ontology_prompt(
     prompt: str,
     *,
@@ -277,151 +249,6 @@ def build_prompt_ontology_prompt(
         threshold=unclassified_threshold,
         prompt=safe,
     )
-
-
-def _coerce_weight(value: object) -> float:
-    """Coerce a YAML-loaded weight value into ``[0.0, 1.0]``.
-
-    A non-numeric value is treated as zero rather than raising — the
-    parser is intentionally lenient on per-entry weights so one bad
-    entry cannot drop the whole detection. The clamp keeps downstream
-    composition arithmetic stable (negative weights would invert
-    rankings; weights > 1 would amplify a single dimension over the
-    others without bound).
-
-    Args:
-        value: Raw YAML scalar; expected to be a float-like number.
-
-    Returns:
-        A float in ``[0.0, 1.0]``.
-    """
-    if isinstance(value, bool):
-        return 0.0
-    if not isinstance(value, (int, float)):
-        return 0.0
-    weight = float(value)
-    if not math.isfinite(weight):
-        # NaN slips past both clamp branches because NaN comparisons
-        # always return False, and ±inf would amplify rankings without
-        # bound. Both collapse to zero so downstream composition stays
-        # finite.
-        return 0.0
-    if weight < 0.0:
-        return 0.0
-    if weight > 1.0:
-        return 1.0
-    return weight
-
-
-def _parse_enum_value(value: object, enum_type: type[_DimT]) -> _DimT | None:
-    """Resolve a YAML scalar to a :class:`StrEnum` member, or ``None``.
-
-    Used by :func:`_parse_dimension` to skip unknown values silently
-    rather than raise — the LLM may emit a value that doesn't map to
-    a canonical enum member (a typo, an outdated alias), and the
-    detector's job is to return what it can rather than abort.
-
-    Args:
-        value: Raw YAML scalar.
-        enum_type: The target :class:`StrEnum` subclass.
-
-    Returns:
-        The matching enum member, or ``None`` if no match exists.
-    """
-    if value is None:
-        return None
-    val_str = str(value).lower().strip()
-    if not val_str:
-        return None
-    for member in enum_type:
-        if member.value.lower() == val_str:
-            return member
-    return None
-
-
-def _parse_dimension(
-    data: dict[str, object],
-    key: str,
-    enum_type: type[_DimT],
-) -> tuple[WeightedDimension[_DimT], ...]:
-    """Parse a single dimension's list of ``{value, weight}`` entries.
-
-    Tolerates the common failure modes the LLM produces in practice:
-
-    * the dimension key is missing entirely (return empty tuple);
-    * the dimension's value is not a list (return empty tuple);
-    * an individual entry lacks a ``value`` field or has an unknown
-      value (drop the entry);
-    * an individual entry lacks a ``weight`` field (admit at zero so
-      the caller still sees the model picked it).
-
-    Entries are returned sorted by weight descending so the heaviest
-    signal sits at index 0; ties preserve the LLM's YAML response order
-    because :py:meth:`list.sort` is stable.
-
-    Args:
-        data: Parsed top-level YAML dict.
-        key: Top-level key for this dimension (``"frequencies"`` etc.).
-        enum_type: Target :class:`StrEnum` subclass for the dimension.
-
-    Returns:
-        Tuple of weighted entries, sorted by weight descending.
-    """
-    raw = data.get(key)
-    if not isinstance(raw, list):
-        return ()
-    parsed: list[WeightedDimension[_DimT]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        enum_value = _parse_enum_value(entry.get("value"), enum_type)
-        if enum_value is None:
-            continue
-        weight = _coerce_weight(entry.get("weight"))
-        parsed.append(WeightedDimension(value=enum_value, weight=weight))
-    parsed.sort(key=lambda wd: wd.weight, reverse=True)
-    return tuple(parsed)
-
-
-def _load_yaml_dict(yaml_text: str) -> dict[str, object]:
-    """Parse the YAML payload and assert the documented shape.
-
-    Mirrors :func:`creek.classify.llm.parsing.validate_response` but
-    against the prompt-ontology schema. Strips markdown fences first
-    so a model that nests its YAML inside ```yaml ... ``` round-trips
-    correctly. Rejects multi-document payloads (a classic
-    LLM-output-spoofing vector) and any top-level keys outside
-    :data:`_ALLOWED_TOP_LEVEL_KEYS`.
-
-    Args:
-        yaml_text: The YAML body extracted from the LLM response.
-
-    Returns:
-        The parsed dict.
-
-    Raises:
-        ValueError: On multi-document payloads, non-dict roots, or
-            unexpected top-level keys.
-    """
-    text = _strip_code_fences(yaml_text)
-    try:
-        docs = list(yaml.safe_load_all(text))
-    except yaml.YAMLError as exc:
-        msg = f"Invalid YAML in prompt-ontology response: {exc}"
-        raise ValueError(msg) from exc
-    if len(docs) > 1:
-        msg = f"multi-document YAML response rejected ({len(docs)} documents)"
-        raise ValueError(msg)
-    parsed: object = docs[0] if docs else None
-    if not isinstance(parsed, dict):
-        msg = f"Expected YAML dict, got {type(parsed).__name__}"
-        raise ValueError(msg)  # noqa: TRY004  # ValueError matches the documented schema-validation contract on this function and on detect_ontology's caller; switching to TypeError would break the documented Raises section without functional benefit.
-    keys = {str(k) for k in parsed}
-    extras = keys - _ALLOWED_TOP_LEVEL_KEYS
-    if extras:
-        msg = f"unexpected top-level keys in prompt-ontology response: {sorted(extras)}"
-        raise ValueError(msg)
-    return {str(k): v for k, v in parsed.items()}
 
 
 def parse_prompt_ontology_response(
