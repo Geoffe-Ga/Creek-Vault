@@ -95,6 +95,16 @@ must be classified explicitly here — defaulting unknown operations to
 "deletes files" would risk over-counting deletions in audit entries.
 """
 
+PURGED_MARKER = "[purged]"
+"""GAP-004 replacement string for scrubbed fragment-ID references.
+
+Used by :meth:`PurgeEngine._scrub_provenance` for both YAML frontmatter
+list entries (e.g. ``source_fragments: [...]`` in drafts) and bare
+fragment-ID mentions in body text. A literal placeholder leaves a
+forensic trail — the user can see *that* a reference existed — without
+exposing the original ID, satisfying the RTBF contract.
+"""
+
 
 def _str_list(value: object) -> list[str]:
     """Coerce a frontmatter list value into a list of strings.
@@ -130,6 +140,11 @@ class PurgeResult(BaseModel):
             removed (or would be removed in a dry run). Zero for
             metadata-only operations and for runs where the cache had
             no matching rows (GAP-001).
+        provenance_scrubbed: Number of fragment-ID mentions replaced
+            with ``[purged]`` across the vault (GAP-004). Counts YAML
+            list entries (e.g. ``source_fragments``) and bare body-text
+            mentions in every ``.md`` file; the wiki-link count stays
+            on :attr:`wikilinks_removed`.
     """
 
     operation: str
@@ -144,6 +159,7 @@ class PurgeResult(BaseModel):
     eddies_updated: int = 0
     classifications_reset: int = 0
     embeddings_removed: int = 0
+    provenance_scrubbed: int = 0
 
 
 class PurgeEngine:
@@ -207,6 +223,10 @@ class PurgeEngine:
             result.fragments_affected = 1
             result.wikilinks_removed = self._scrub_wikilinks(
                 title,
+                exclude=frag_file,
+            )
+            result.provenance_scrubbed += self._scrub_provenance(
+                fragment_id,
                 exclude=frag_file,
             )
             result.threads_updated = self._decrement_counts(
@@ -559,6 +579,11 @@ class PurgeEngine:
             title,
             exclude=frag_file,
         )
+        if isinstance(frag_id, str):
+            result.provenance_scrubbed += self._scrub_provenance(
+                frag_id,
+                exclude=frag_file,
+            )
         result.threads_updated += self._decrement_counts(
             "02-Threads",
             thread_ids,
@@ -713,6 +738,51 @@ class PurgeEngine:
         if count and not self.dry_run:
             md_file.write_text(new_text, encoding="utf-8")
         return count
+
+    def _scrub_provenance(self, fragment_id: str, *, exclude: Path) -> int:
+        """Replace word-boundary ``fragment_id`` mentions with ``[purged]`` (GAP-004).
+
+        Walks every ``.md`` file in the vault — derived content under
+        ``04-Praxis``, ``05-Wavelength``, ``07-Voice/Drafts``,
+        ``08-Decisions``, the deployed skill tree under
+        ``00-Creek-Meta/Skills``, etc. — and replaces bare
+        fragment-ID occurrences with the :data:`PURGED_MARKER`
+        placeholder. Catches both YAML provenance list entries
+        (``source_fragments: [frag-…]`` in drafts and mining ideas)
+        and prose mentions of the ID in the body in a single pass.
+
+        The compliance audit log at
+        ``00-Creek-Meta/audit/purge.jsonl`` is a JSONL file (not
+        Markdown) so the recursive walk naturally excludes it — the
+        audit's ``affected_fragments`` list keeps the real ID for
+        compliance reconstruction.
+
+        Wiki-links to the fragment's *title* are still scrubbed by
+        :meth:`_scrub_wikilinks` because they match by name, not by ID.
+
+        Args:
+            fragment_id: The exact fragment ID to scrub.
+            exclude: Path to skip (the file currently being deleted).
+
+        Returns:
+            Total number of replacements across the vault.
+        """
+        if not fragment_id:
+            return 0
+        pattern = re.compile(rf"\b{re.escape(fragment_id)}\b")
+        total_removed = 0
+        for md_file in self._list_vault_md_files():
+            if md_file == exclude:
+                continue
+            try:
+                text = md_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            new_text, count = pattern.subn(PURGED_MARKER, text)
+            if count and not self.dry_run:
+                md_file.write_text(new_text, encoding="utf-8")
+            total_removed += count
+        return total_removed
 
     def _decrement_counts(
         self,
@@ -899,6 +969,7 @@ class PurgeEngine:
             fragments_deleted=fragments_deleted,
             references_scrubbed=result.wikilinks_removed,
             embeddings_removed=result.embeddings_removed,
+            provenance_scrubbed=result.provenance_scrubbed,
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,

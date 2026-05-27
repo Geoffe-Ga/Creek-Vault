@@ -78,6 +78,11 @@ class PurgeAuditEntry(BaseModel):
             ``<vault>/00-Creek-Meta/embeddings.parquet`` by the purge
             (GAP-001). Zero when the cache had not been built yet or
             when no rows matched; the actual row delta otherwise.
+        provenance_scrubbed: Number of bare fragment-ID mentions
+            replaced with ``[purged]`` across derived content (GAP-004).
+            Counts YAML provenance lists (e.g. ``source_fragments`` in
+            drafts) plus body-text mentions of the ID. Wiki-link
+            removals stay on ``references_scrubbed``.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before
@@ -106,6 +111,7 @@ class PurgeAuditEntry(BaseModel):
     fragments_deleted: int = 0
     references_scrubbed: int = 0
     embeddings_removed: int = 0
+    provenance_scrubbed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
@@ -137,6 +143,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("affected_fragments", [])
     upgraded.setdefault("references_scrubbed", 0)
     upgraded.setdefault("embeddings_removed", 0)
+    upgraded.setdefault("provenance_scrubbed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
     # absent, so we leave them out here rather than fabricating a
     # phase / operation_id that doesn't correspond to anything on disk.
@@ -303,6 +310,7 @@ class PurgeAuditLog:
             "fragments_deleted": 0,
             "references_scrubbed": 0,
             "embeddings_removed": 0,
+            "provenance_scrubbed": 0,
             "operator": "system",
             "dry_run": False,
             "migrated_entries": migrated_count,

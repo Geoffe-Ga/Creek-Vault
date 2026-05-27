@@ -70,8 +70,8 @@ creek clean report --vault ~/Obsidian/Creek-Vault
 
 1. **Refuses without confirmation** unless you pass `--yes`.
 2. **Records an audit entry** by appending one JSONL line to `<vault>/00-Creek-Meta/audit/purge.jsonl` with the criteria, the affected fragment IDs, and the operator. The file is hash-chained — see [Audit trail](#audit-trail) for the integrity guarantees.
-3. **Scrubs every reference** — wiki-links pointing at the deleted fragment(s) are removed from every other fragment's frontmatter and body.
-4. **Removes embeddings** from the cache at the next `creek link` run so the deleted content is no longer surfaceable through resonances.
+3. **Scrubs every reference** — wiki-links pointing at the deleted fragment(s) are removed from every other `.md` file in the vault (matched by title), and every word-boundary mention of the deleted fragment ID is replaced with the `[purged]` placeholder across YAML frontmatter (e.g. `source_fragments: […]` in drafts and mining ideas) and body text. The walk covers `04-Praxis/`, `05-Wavelength/`, `06-Frequencies/`, `07-Voice/Drafts/`, `08-Decisions/`, `09-Reference/`, `10-Liminal/`, and `00-Creek-Meta/Skills/` (deployed skill tree). The compliance audit log itself (`00-Creek-Meta/audit/purge.jsonl`) is JSONL, not Markdown, and is intentionally excluded — `affected_fragments` in audit entries keeps the real ID for forensic reconstruction (GAP-004).
+4. **Removes embeddings** from `<vault>/00-Creek-Meta/embeddings.parquet` (GAP-001). Per-fragment / per-source / per-date-range purges drop matching rows; `creek purge vault` deletes the file outright.
 
 ### `creek purge fragment`
 

@@ -2209,3 +2209,218 @@ def test_legacy_audit_entries_default_to_outcome_phase(tmp_path: Path) -> None:
     assert entries[0].phase == "outcome"
     assert entries[0].operation_id == ""
     assert entries[0].status is None
+
+
+# ---------------------------------------------------------------------------
+# GAP-004 — purge scrubs YAML provenance + bare-ID body mentions vault-wide
+# ---------------------------------------------------------------------------
+
+
+def _write_derived_note(
+    vault: Path,
+    *,
+    subfolder: str,
+    name: str,
+    body: str,
+    metadata: dict[str, object] | None = None,
+) -> Path:
+    """Write an arbitrary derived note (praxis / draft / etc.) under *subfolder*."""
+    target_dir = vault / subfolder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{name}.md"
+    post = frontmatter.Post(content=body, **(metadata or {}))
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+@pytest.mark.parametrize(
+    "subfolder",
+    [
+        "04-Praxis",
+        "05-Wavelength",
+        "06-Frequencies",
+        "07-Voice/Drafts",
+        "08-Decisions",
+        "09-Reference",
+        "10-Liminal",
+        "00-Creek-Meta/Skills",
+    ],
+)
+def test_fragment_purge_scrubs_source_fragments_in_every_relevant_folder(
+    tmp_path: Path,
+    subfolder: str,
+) -> None:
+    """``source_fragments`` YAML list entries are scrubbed vault-wide (GAP-004).
+
+    Verifies the new contract across every folder named in the GAP-004
+    issue — derived content in 04-Praxis, weekly wavelength reports,
+    Voice drafts, decisions/reference/liminal note trees, and the
+    deployed skill tree.
+
+    The contract is grep-based: the operator runs ``grep -r <id>`` and
+    expects no match. We assert on the raw file text rather than the
+    YAML-parsed structure because the literal placeholder ``[purged]``
+    is itself bracket-flavoured and YAML re-parses it as a one-element
+    nested list. That detail is downstream; the file content is the
+    user-facing forensic surface.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    note = _write_derived_note(
+        vault,
+        subfolder=subfolder,
+        name="derived",
+        body="A derived note referencing the soon-deleted fragment.",
+        metadata={"source_fragments": ["frag-A", "frag-B"]},
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    text = note.read_text(encoding="utf-8")
+    assert "frag-A" not in text
+    assert "[purged]" in text
+    assert "frag-B" in text
+
+
+def test_fragment_purge_scrubs_bare_id_mentions_in_body(tmp_path: Path) -> None:
+    """Body-text mentions of the fragment ID are replaced with ``[purged]``."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    draft = _write_derived_note(
+        vault,
+        subfolder="07-Voice/Drafts",
+        name="d1",
+        body="A draft built from frag-A. See also frag-A for details.",
+        metadata={"type": "draft"},
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    text = draft.read_text(encoding="utf-8")
+    assert "frag-A" not in text
+    assert text.count("[purged]") == 2  # two body mentions
+
+
+def test_fragment_purge_does_not_match_id_as_substring(tmp_path: Path) -> None:
+    """Word-boundary regex avoids over-matching ``frag-A`` inside ``frag-ABC``."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    sibling = _write_derived_note(
+        vault,
+        subfolder="07-Voice/Drafts",
+        name="d2",
+        body="The fragments frag-A and frag-ABC are different.",
+        metadata={"source_fragments": ["frag-A", "frag-ABC"]},
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    text = sibling.read_text(encoding="utf-8")
+    assert "frag-ABC" in text  # the longer ID survives
+    # Word-boundary regex matches frag-A but not the prefix of frag-ABC.
+    # Two "frag-A" occurrences (YAML list + body) both get scrubbed.
+    assert "[purged]" in text
+    # Plain "frag-A" with a trailing word boundary should not appear.
+    import re
+
+    assert not re.search(r"\bfrag-A\b", text)
+
+
+def test_fragment_purge_leaves_audit_log_untouched(tmp_path: Path) -> None:
+    """The compliance audit log (00-Creek-Meta/audit/purge.jsonl) is not scrubbed.
+
+    JSONL files aren't ``.md`` so the recursive walk excludes them — but
+    pin the invariant explicitly so a future refactor that broadens the
+    scrubber surface cannot silently mutate the compliance record.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    audit_path = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    audit_text = audit_path.read_text(encoding="utf-8")
+    assert "frag-A" in audit_text  # affected_fragments retains the real ID
+
+
+def test_fragment_purge_records_provenance_scrubs_in_result(tmp_path: Path) -> None:
+    """``PurgeResult.provenance_scrubbed`` tallies the scrubbed mentions."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_derived_note(
+        vault,
+        subfolder="04-Praxis",
+        name="p1",
+        body="See frag-A.",
+        metadata={"source_fragments": ["frag-A"]},
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    # YAML list entry + one body mention = 2 substitutions in the praxis
+    # file. The deleted fragment file itself is excluded from the scrub.
+    assert result.provenance_scrubbed >= 2
+
+
+def test_fragment_purge_audit_outcome_records_provenance_scrubs(
+    tmp_path: Path,
+) -> None:
+    """The GAP-002 outcome line carries the provenance-scrub count."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_derived_note(
+        vault,
+        subfolder="07-Voice/Drafts",
+        name="d1",
+        body="From frag-A.",
+        metadata={"source_fragments": ["frag-A"]},
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    entries = [
+        e for e in PurgeAuditLog(vault).read() if e.operation != "purge.audit.migration"
+    ]
+    outcome = entries[-1]
+    assert outcome.phase == "outcome"
+    assert outcome.provenance_scrubbed >= 1
+
+
+def test_fragment_purge_dry_run_does_not_scrub(tmp_path: Path) -> None:
+    """Dry-run reports the would-be count without writing to derived files."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    draft = _write_derived_note(
+        vault,
+        subfolder="07-Voice/Drafts",
+        name="d1",
+        body="From frag-A.",
+        metadata={"source_fragments": ["frag-A"]},
+    )
+    before = draft.read_text(encoding="utf-8")
+
+    result = PurgeEngine(vault, dry_run=True).purge_fragment("frag-A")
+
+    assert result.provenance_scrubbed >= 1
+    assert draft.read_text(encoding="utf-8") == before
+
+
+def test_source_purge_scrubs_provenance_for_each_fragment(tmp_path: Path) -> None:
+    """``purge_source`` scrubs every purged fragment's references."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    _write_fragment(vault, "frag-B", "Bravo", platform="claude")
+    derived = _write_derived_note(
+        vault,
+        subfolder="04-Praxis",
+        name="p1",
+        body="Built from frag-A and frag-B.",
+        metadata={"source_fragments": ["frag-A", "frag-B"]},
+    )
+
+    PurgeEngine(vault).purge_source("claude")
+
+    text = derived.read_text(encoding="utf-8")
+    assert "frag-A" not in text
+    assert "frag-B" not in text
+    assert text.count("[purged]") == 4  # 2 YAML + 2 body

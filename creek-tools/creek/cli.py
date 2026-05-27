@@ -2638,7 +2638,14 @@ def purge_fragment(
         help="Skip interactive confirmation",
     ),
 ) -> None:
-    """Delete a fragment and scrub every reference to it."""
+    """Delete a fragment and scrub every reference to it.
+
+    Scrubbing covers (GAP-004): wiki-links by title removed from every
+    `.md` file in the vault, plus YAML provenance lists and bare body
+    mentions of the fragment ID replaced with ``[purged]`` across
+    01-Fragments through 10-Liminal and the deployed Skills tree.
+    Embedding-cache rows for the fragment are also dropped (GAP-001).
+    """
     engine = _build_engine(vault, dry_run=dry_run)
     if not dry_run and not _confirm(
         f"Purge fragment {fragment_id!r} and all references?",
@@ -2705,7 +2712,10 @@ def purge_source(
       a configurable ``--match`` mode (INC-008): ``exact`` (default),
       ``substring``, or ``regex``.
 
-    The two are mutually exclusive; pass exactly one.
+    The two are mutually exclusive; pass exactly one. Reference
+    scrubbing (GAP-004) runs for every matched fragment: wiki-links
+    by title plus word-boundary ID mentions replaced with
+    ``[purged]`` across the whole vault.
     """
     if (source_type is None) == (source_path is None):
         console.print(
