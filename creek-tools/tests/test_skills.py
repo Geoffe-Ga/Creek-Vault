@@ -1525,6 +1525,67 @@ class TestSignatureOnlyVariant:
         )
         assert post.metadata["variant"] == "skill"
 
+    def test_default_variant_tags_do_not_duplicate_skill(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Legacy SKILL frontmatter ``tags`` list contains ``skill`` exactly once.
+
+        Regression for PR #357 review: the previous tag list expanded
+        ``[\"skill\", category, variant, ...]`` with ``variant == \"skill\"``,
+        yielding two identical ``\"skill\"`` entries that confuse any
+        downstream consumer that parses the raw frontmatter.
+        """
+        generator.generate_frequency_skills(vault, output_dir)
+        post = frontmatter.load(
+            str(output_dir / "frequencies" / "F3.SKILL.md"),
+        )
+        tags = post.metadata["tags"]
+        assert tags.count("skill") == 1
+        assert "frequency" in tags
+
+    def test_signature_variant_tags_include_signature_marker(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """The SIGNATURE variant gets a distinguishing ``signature`` tag.
+
+        The tag is what lets a downstream loader filter for the new
+        variant; dropping it would erase the only frontmatter-level
+        difference between the two trees beyond the filename suffix.
+        """
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        post = frontmatter.load(
+            str(output_dir / "frequencies" / "F3.SIGNATURE.md"),
+        )
+        tags = post.metadata["tags"]
+        assert "signature" in tags
+        assert tags.count("skill") == 1
+
+    def test_skill_header_does_not_reference_dead_signature_file(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Default SKILL banner does not point at a possibly-missing SIGNATURE file.
+
+        Regression for PR #357 review: the previous banner read \"see the
+        matching ``.SIGNATURE.md`` file\", which is a dead reference for
+        any operator who has only ever run the default command. The
+        replacement banner names the CLI invocation that produces the
+        alternative variant instead.
+        """
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "matching" not in body
+        assert "see the matching" not in body
+        assert "--signature-only" in body
+
 
 class TestSignatureOnlyCovering:
     """Signature-only generation covers every category of skill."""

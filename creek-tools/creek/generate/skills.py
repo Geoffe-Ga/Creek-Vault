@@ -127,11 +127,18 @@ _SIGNATURE_HEADER_BODY: str = (
 _SKILL_HEADER_BODY: str = (
     "**Variant: SKILL.** This skill file is the legacy exemplar-bearing "
     "variant — it pairs voice patterns with quoted passages harvested "
-    "from the user's classified Fragments. For the abstract-only "
-    "alternative without quoted content, see the matching "
-    "``.SIGNATURE.md`` file."
+    "from the user's classified Fragments. The abstract-only alternative "
+    "without quoted content can be generated alongside this file via "
+    "``creek skills generate --signature-only`` (issue #353)."
 )
-"""Top-of-body banner that announces a legacy exemplar-bearing file."""
+"""Top-of-body banner that announces a legacy exemplar-bearing file.
+
+The banner points at the CLI invocation that generates the alternative
+``.SIGNATURE.md`` variant rather than at the file itself: a fresh
+default-only generation leaves no ``.SIGNATURE.md`` on disk, and the
+previous wording (\"see the matching ``.SIGNATURE.md`` file\") then
+read as a broken reference — PR #357 review feedback.
+"""
 
 _EXEMPLAR_WORDS_MIN: int = 30
 """Exemplar passages below this word count are skipped as too thin."""
@@ -808,7 +815,14 @@ def _write_skill(
         The path the file was written to.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    tags = ["skill", category, variant, *extra_tags]
+    # ``"skill"`` already sits at position 0; appending ``variant`` when
+    # the variant string is also ``"skill"`` would duplicate the tag and
+    # confuse anything that counts occurrences in the raw frontmatter
+    # (PR #357 review). Frontmatter still carries the ``variant`` field
+    # unconditionally so the two variants stay distinguishable at the
+    # field level, not just the tag level.
+    variant_tags = [variant] if variant != _VARIANT_SKILL else []
+    tags = ["skill", category, *variant_tags, *extra_tags]
     full_body = _prepend_variant_banner(body.strip(), variant=variant)
     post = frontmatter.Post(
         content=full_body + "\n",
