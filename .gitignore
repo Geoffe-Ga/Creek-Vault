@@ -67,3 +67,6 @@
 **/.vscode/
 **/*.swp
 **/*.swo
+
+# Claude Code local worktrees
+.claude/worktrees/
