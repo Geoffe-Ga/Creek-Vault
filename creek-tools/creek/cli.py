@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from creek.config import CreekConfig
     from creek.generate.compost_embedding import CompostExemplar
     from creek.generate.compost_verifier import SupportsVerifyCompost
-    from creek.generate.drafts import DraftLLM, SeedSpec
+    from creek.generate.drafts import DraftGenerator, DraftLLM, SeedSpec
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
     from creek.link.link_engine import LinkSummary
@@ -2004,6 +2004,43 @@ def _build_draft_llm() -> DraftLLM:
     return classifier.invoke_prompt
 
 
+def _run_seeded_draft(
+    generator: DraftGenerator,
+    *,
+    seed_spec: SeedSpec,
+    vault_path: Path,
+    current_phase: Phase,
+    override: PrivacyTierOverride | None,
+) -> None:
+    """Run the seeded-draft pipeline and surface errors as typer exits.
+
+    Extracted from :func:`draft` so the CLI command body stays under
+    the cyclomatic-complexity floor. The branches it owns are the two
+    expected error surfaces (``SeedResolutionError`` and
+    ``PluralitySourceError``) plus the happy-path save / audit.
+    """
+    from creek.generate.drafts import SeedResolutionError
+    from creek.generate.twist import PluralitySourceError
+
+    try:
+        draft_obj = generator.generate_seeded_draft(
+            seed_spec,
+            vault_path=vault_path,
+            current_phase=current_phase,
+        )
+    except (SeedResolutionError, PluralitySourceError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="draft",
+        override=override,
+        fragment_ids=list(draft_obj.source_fragments),
+    )
+    saved_path = generator.save_draft(draft_obj, vault_path)
+    console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+
+
 @app.command()
 def draft(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
@@ -2080,6 +2117,17 @@ def draft(
             "(inhabit, express, collaborate, integrate, absorb)."
         ),
     ),
+    ontology_twist: bool = typer.Option(
+        False,
+        "--ontology-twist",
+        help=(
+            "Issue #352: enable ontology-twist composition. Computes the "
+            "delta between the retrieved source profile and the operator's "
+            "target profile, names divergent dimensions in the prompt, and "
+            "forbids verbatim paraphrase. Requires >=2 source fragments. "
+            "Gated behind a flag while epic #349 is in development."
+        ),
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -2096,8 +2144,15 @@ def draft(
     bypassed and the draft is generated from the matching fragments,
     with the seed flags recorded in the draft's frontmatter for
     reproducibility.
+
+    Issue #352: pass ``--ontology-twist`` alongside a seed flag to
+    enable ontology-twist composition — the draft's source / target
+    ontology profiles are recorded in frontmatter, divergent dimensions
+    are named in the prompt, and the LLM is instructed to recombine
+    across the corpus rather than paraphrase any single source.
+    Requires at least two source fragments.
     """
-    from creek.generate.drafts import DraftGenerator, SeedResolutionError
+    from creek.generate.drafts import DraftGenerator
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
@@ -2112,6 +2167,12 @@ def draft(
         seed_phase=seed_phase,
         seed_mode=seed_mode,
     )
+    if ontology_twist and seed_spec is None:
+        console.print(
+            "[red]--ontology-twist requires a seed (use --seed-topic, "
+            "--seed-frequency, --seed-phase, or --seed-mode).[/red]",
+        )
+        raise typer.Exit(code=2)
     llm = _build_draft_llm()
     if bypass_compiled:
         _warn_bypass_compiled("draft")
@@ -2122,26 +2183,17 @@ def draft(
         voice_core=voice_text,
         privacy_override=override,
         bypass_compiled=bypass_compiled,
+        ontology_twist=ontology_twist,
     )
 
     if seed_spec is not None:
-        try:
-            draft_obj = generator.generate_seeded_draft(
-                seed_spec,
-                vault_path=vault_path,
-                current_phase=current_phase,
-            )
-        except SeedResolutionError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(code=1) from exc
-        _audit_privacy_override_if_needed(
+        _run_seeded_draft(
+            generator,
+            seed_spec=seed_spec,
             vault_path=vault_path,
-            command="draft",
+            current_phase=current_phase,
             override=override,
-            fragment_ids=list(draft_obj.source_fragments),
         )
-        saved_path = generator.save_draft(draft_obj, vault_path)
-        console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
         return
 
     seeds = IdeaMiner(

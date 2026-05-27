@@ -53,6 +53,14 @@ from creek.generate.dimensional_retrieval import (
     raise_if_all_empty,
     union_fragment_ids,
 )
+from creek.generate.twist import (
+    OntologyProfile,
+    format_twist_directive,
+    require_plural_sources,
+    source_profile_from_fragments,
+    target_profile_from_spec,
+    twist_dimensions,
+)
 from creek.models import (
     CompiledPage,
     Eddy,
@@ -198,6 +206,22 @@ class SeedResolutionError(ValueError):
 
 
 @dataclass(frozen=True)
+class _TwistPayload:
+    """Bundle of twist-composition outputs threaded into :class:`Draft`.
+
+    The default-constructed instance represents "no twist": the
+    directive is empty so :meth:`DraftGenerator._compose_prompt` skips
+    the block, both profiles stay ``None`` so the frontmatter writer
+    omits them, and the dimensions tuple is empty.
+    """
+
+    directive: str = ""
+    source_profile: OntologyProfile | None = None
+    target_profile: OntologyProfile | None = None
+    dimensions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Draft:
     """An LLM-generated essay draft with full provenance.
 
@@ -221,6 +245,17 @@ class Draft:
             section. Empty when the draft used the legacy
             single-dimension path; populated whenever
             :func:`assemble_per_dimension_corpus` ran.
+        source_profile: Ontology profile aggregated from the retrieved
+            source fragments (issue #352). ``None`` when the draft did
+            not pass through the twist composition path.
+        target_profile: Ontology profile asked for by the operator
+            (explicit flags + detected :class:`PromptOntology`). ``None``
+            when the draft did not pass through the twist composition
+            path.
+        twist_dimensions: Ordered tuple of dimension names where the
+            source profile diverges from the target profile (issue
+            #352). Empty when the two profiles match (regression
+            baseline) or when twist composition was not requested.
     """
 
     title: str
@@ -234,6 +269,9 @@ class Draft:
     generated_date: datetime
     seed_spec: SeedSpec | None = None
     per_dimension_sources: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    source_profile: OntologyProfile | None = None
+    target_profile: OntologyProfile | None = None
+    twist_dimensions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate draft invariants."""
@@ -451,6 +489,7 @@ class DraftGenerator:
         voice_core: str = "",
         privacy_override: PrivacyTierOverride | None = None,
         bypass_compiled: bool = False,
+        ontology_twist: bool = False,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -468,12 +507,20 @@ class DraftGenerator:
                 step skips the compiled layer and pulls fragments
                 directly. Default ``False`` honours the FEAT-004
                 compile-then-query discipline.
+            ontology_twist: When ``True``, activate the issue #352
+                composition path: compute source/target ontology
+                profiles, name the divergent dimensions in the prompt,
+                forbid verbatim paraphrase, and require ≥2 source
+                fragments. Default ``False`` keeps the legacy
+                composition path (epic #349 gates the flag while in
+                development).
         """
         self._llm = llm
         self.skills_root = skills_root
         self.voice_core = voice_core
         self.privacy_override = privacy_override
         self.bypass_compiled = bypass_compiled
+        self.ontology_twist = ontology_twist
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -735,6 +782,8 @@ class DraftGenerator:
         source_material: str,
         *,
         per_dimension_material: str = "",
+        twist_directive: str = "",
+        twist_active: bool = False,
     ) -> str:
         """Assemble the LLM prompt from voice-core + skills + source + ask.
 
@@ -744,6 +793,10 @@ class DraftGenerator:
         them. Both blocks may co-exist — the per-dimension block carries
         the dimensional corpus slices, the legacy block still carries
         thread / eddy context for the synthetic IdeaSeed.
+
+        When *twist_directive* is supplied (issue #352), it is inserted
+        immediately before the ``## Ask`` block so the LLM sees the
+        recombination instruction as the last thing before its task.
         """
         parts: list[str] = []
         if self.voice_core:
@@ -755,8 +808,14 @@ class DraftGenerator:
             parts.append(per_dimension_material)
         if source_material:
             parts.append(f"## Source material\n{source_material}")
+        if twist_directive:
+            parts.append(twist_directive)
         parts.append(
-            _compose_ask_section(idea, per_dimension=bool(per_dimension_material)),
+            _compose_ask_section(
+                idea,
+                per_dimension=bool(per_dimension_material),
+                twist=twist_active,
+            ),
         )
         return "\n\n".join(parts)
 
@@ -1016,6 +1075,16 @@ class DraftGenerator:
         the caller did not pass ``current_phase``, the spec's phase is
         used so the activated phase skill matches the user's request.
 
+        When :attr:`ontology_twist` is enabled (issue #352), the
+        retrieved source material has its dominant ontology profile
+        compared against the operator's target profile; divergent
+        dimensions are named in a ``## Twist directive`` block and the
+        ``## Ask`` is rewritten to forbid verbatim paraphrase. The
+        helper :func:`require_plural_sources` raises
+        :class:`PluralitySourceError` when fewer than two source
+        fragments matched, since recombination requires more than one
+        input.
+
         Args:
             spec: The manual seed specification.
             vault_path: Vault root used for fragment loading, skill
@@ -1024,10 +1093,14 @@ class DraftGenerator:
 
         Returns:
             A :class:`Draft` whose ``seed_spec`` field records the
-            originating manual seed.
+            originating manual seed and (when twist composition is
+            active) whose ``source_profile`` / ``target_profile`` /
+            ``twist_dimensions`` fields record the ontology delta.
 
         Raises:
             SeedResolutionError: Propagated from :meth:`resolve_seed`.
+            PluralitySourceError: When twist composition is requested
+                but fewer than two source fragments matched.
             RuntimeError: When the LLM returns an empty body.
         """
         fragments = _load_fragments_by_id(
@@ -1052,6 +1125,7 @@ class DraftGenerator:
             confidence_threshold=spec.ontology_confidence_threshold,
         )
         per_dimension_material = _render_per_dimension_sections(slices, fragments)
+        twist_payload = self._build_twist_payload(spec, idea, fragments)
         source_material = self.gather_source_material(
             idea,
             vault_path=vault_path,
@@ -1064,6 +1138,8 @@ class DraftGenerator:
             skill_stack,
             source_material,
             per_dimension_material=per_dimension_material,
+            twist_directive=twist_payload.directive,
+            twist_active=bool(twist_payload.dimensions),
         )
         body = self._llm(prompt).strip()
         if not body:
@@ -1083,6 +1159,39 @@ class DraftGenerator:
             generated_date=datetime.now(tz=UTC),
             seed_spec=spec,
             per_dimension_sources=_slices_as_provenance(slices),
+            source_profile=twist_payload.source_profile,
+            target_profile=twist_payload.target_profile,
+            twist_dimensions=twist_payload.dimensions,
+        )
+
+    def _build_twist_payload(
+        self,
+        spec: SeedSpec,
+        idea: IdeaSeed,
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> _TwistPayload:
+        """Build the ontology-twist payload for :meth:`generate_seeded_draft`.
+
+        Returns an empty payload when :attr:`ontology_twist` is off so
+        the legacy composition path is byte-for-byte unchanged.
+        Otherwise enforces the plurality floor, computes source / target
+        profiles, and renders the twist directive block.
+        """
+        if not self.ontology_twist:
+            return _TwistPayload()
+        require_plural_sources(idea.source_fragments)
+        retrieved = [
+            fragments[fid][0] for fid in idea.source_fragments if fid in fragments
+        ]
+        source_profile = source_profile_from_fragments(retrieved)
+        target_profile = target_profile_from_spec(spec)
+        divergent = twist_dimensions(source_profile, target_profile)
+        directive = format_twist_directive(source_profile, target_profile, divergent)
+        return _TwistPayload(
+            directive=directive,
+            source_profile=source_profile,
+            target_profile=target_profile,
+            dimensions=tuple(divergent),
         )
 
     def save_draft(self, draft: Draft, vault_path: Path) -> Path:
@@ -1122,6 +1231,12 @@ class DraftGenerator:
             post["per_dimension_sources"] = _serialise_per_dimension_sources(
                 draft.per_dimension_sources,
             )
+        if draft.source_profile is not None:
+            post["source_profile"] = draft.source_profile.as_mapping()
+        if draft.target_profile is not None:
+            post["target_profile"] = draft.target_profile.as_mapping()
+        if draft.twist_dimensions:
+            post["twist_dimensions"] = list(draft.twist_dimensions)
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
@@ -1268,15 +1383,34 @@ def _slices_as_provenance(
     )
 
 
-def _compose_ask_section(idea: IdeaSeed, *, per_dimension: bool) -> str:
-    """Return the ``## Ask`` block, switching wording for per-dimension mode.
+def _compose_ask_section(
+    idea: IdeaSeed,
+    *,
+    per_dimension: bool,
+    twist: bool = False,
+) -> str:
+    """Return the ``## Ask`` block, switching wording for per-dimension / twist mode.
 
     When per-dimension material is in play (issue #351), the ask
     explicitly invites the model to weave across the labelled slices
-    rather than treating them as one homogeneous corpus. Otherwise it
-    keeps the original wording so existing tests and mined-idea drafts
+    rather than treating them as one homogeneous corpus. When ontology
+    twist is also on (issue #352), the ask references the twist
+    directive so the LLM treats it as load-bearing. Otherwise it keeps
+    the original wording so existing tests and mined-idea drafts
     continue to compose identically.
     """
+    if twist:
+        return (
+            "## Ask\n"
+            f'Write a draft essay titled "{idea.title}". '
+            f"{idea.brief_description} "
+            "Follow the twist directive above: use the source musings "
+            "as ideas being explored, but voice them through the target "
+            "combination's style. Do not paraphrase any single source "
+            "verbatim — recombine across the corpus. Honour the "
+            "activated skills. Write as the human — not as an AI. "
+            "Cite source fragments by their IDs where relevant."
+        )
     if per_dimension:
         return (
             "## Ask\n"

@@ -18,6 +18,7 @@ from creek.generate.drafts import (
 from creek.generate.mining import IdeaSeed, MiningStrategy
 from creek.models import (
     Confidence,
+    Dosage,
     Eddy,
     Fragment,
     FragmentSource,
@@ -55,6 +56,7 @@ def _build_fragment(
     orientation: Orientation = Orientation.UNCLASSIFIED,
     register: VoiceRegister | None = None,
     phase: Phase = Phase.UNCLASSIFIED,
+    dosage: Dosage = Dosage.UNCLASSIFIED,
     threads: tuple[str, ...] = (),
     eddies: tuple[str, ...] = (),
 ) -> Fragment:
@@ -73,6 +75,7 @@ def _build_fragment(
             mode=mode,
             orientation=orientation,
             phase=phase,
+            dosage=dosage,
         ),
         voice=VoiceClassification(
             voice_register=register,
@@ -1939,3 +1942,656 @@ class TestSeedSpecOntologyField:
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
             SeedSpec(fragment_id="frag-A", ontology=ontology)
+
+
+# ---- Issue #352: ontology-twist composition --------------------------------
+
+
+class TestOntologyTwistHelpers:
+    """Pure functions in :mod:`creek.generate.twist`."""
+
+    def test_source_profile_picks_dominant_value_per_dimension(self) -> None:
+        """The dominant non-unclassified value wins for each dimension."""
+        from creek.generate.twist import (
+            UNSPECIFIED,
+            source_profile_from_fragments,
+        )
+
+        fragments = [
+            _build_fragment(
+                frag_id="f1",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+                register=VoiceRegister.ANALYTICAL,
+            ),
+            _build_fragment(
+                frag_id="f2",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+                register=VoiceRegister.ANALYTICAL,
+            ),
+            _build_fragment(
+                frag_id="f3",
+                primary=Frequency.F3,
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+                dosage=Dosage.TOXIC,
+                register=VoiceRegister.PROPHETIC,
+            ),
+        ]
+
+        profile = source_profile_from_fragments(fragments)
+
+        assert profile.phase == "peaking"
+        assert profile.mode == "inhabit"
+        assert profile.frequency == "F7"
+        assert profile.dosage == "medicine"
+        assert profile.voice_register == "analytical"
+        assert UNSPECIFIED == "unspecified"
+
+    def test_source_profile_skips_unclassified_values(self) -> None:
+        """``unclassified`` is filtered before the dominance vote."""
+        from creek.generate.twist import (
+            UNSPECIFIED,
+            source_profile_from_fragments,
+        )
+
+        fragments = [
+            # First two fragments are unclassified on phase; only the third
+            # carries a real signal. The dominant pick should be that one
+            # rather than ``unclassified``.
+            _build_fragment(frag_id="f1"),
+            _build_fragment(frag_id="f2"),
+            _build_fragment(frag_id="f3", phase=Phase.WITHDRAWAL),
+        ]
+
+        profile = source_profile_from_fragments(fragments)
+
+        assert profile.phase == "withdrawal"
+        # Frequency is F1 across all three (default), so it wins.
+        assert profile.frequency == "F1"
+        # No fragment carried a mode, dosage, or register — leave them open.
+        assert profile.mode == UNSPECIFIED
+        assert profile.dosage == UNSPECIFIED
+        assert profile.voice_register == UNSPECIFIED
+
+    def test_source_profile_empty_fragments_yields_all_unspecified(self) -> None:
+        """An empty corpus leaves every dimension as :data:`UNSPECIFIED`."""
+        from creek.generate.twist import UNSPECIFIED, source_profile_from_fragments
+
+        profile = source_profile_from_fragments([])
+
+        assert profile.phase == UNSPECIFIED
+        assert profile.mode == UNSPECIFIED
+        assert profile.frequency == UNSPECIFIED
+        assert profile.dosage == UNSPECIFIED
+        assert profile.voice_register == UNSPECIFIED
+
+    def test_target_profile_explicit_flags_win(self) -> None:
+        """``SeedSpec.phases`` / ``modes`` / ``frequencies`` outrank ontology."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+        from creek.generate.twist import target_profile_from_spec
+
+        # Ontology asks for rising/express/F2 but the operator's flags
+        # pin peaking/inhabit/F7. Explicit picks should win the duel.
+        ontology = PromptOntology(
+            prompt="x",
+            phases=(WeightedDimension(value=Phase.RISING, weight=0.9),),
+            modes=(WeightedDimension(value=Mode.EXPRESS, weight=0.8),),
+            frequencies=(WeightedDimension(value=Frequency.F2, weight=0.7),),
+        )
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.INHABIT,),
+            frequencies=(Frequency.F7,),
+            ontology=ontology,
+        )
+
+        profile = target_profile_from_spec(spec)
+
+        assert profile.phase == "peaking"
+        assert profile.mode == "inhabit"
+        assert profile.frequency == "F7"
+
+    def test_target_profile_includes_dosage_and_register_from_ontology(self) -> None:
+        """Dosage and voice register come from the ontology heaviest pick."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+        from creek.generate.twist import target_profile_from_spec
+
+        ontology = PromptOntology(
+            prompt="x",
+            dosages=(WeightedDimension(value=Dosage.TOXIC, weight=0.7),),
+            voice_registers=(
+                WeightedDimension(value=VoiceRegister.PROPHETIC, weight=0.8),
+            ),
+        )
+        spec = SeedSpec(ontology=ontology)
+
+        profile = target_profile_from_spec(spec)
+
+        assert profile.dosage == "toxic"
+        assert profile.voice_register == "prophetic"
+
+    def test_target_profile_no_signal_yields_unspecified(self) -> None:
+        """No flags and no ontology means every dimension is unspecified."""
+        from creek.generate.twist import UNSPECIFIED, target_profile_from_spec
+
+        spec = SeedSpec(topic="x")
+        profile = target_profile_from_spec(spec)
+
+        assert profile.phase == UNSPECIFIED
+        assert profile.mode == UNSPECIFIED
+        assert profile.frequency == UNSPECIFIED
+        assert profile.dosage == UNSPECIFIED
+        assert profile.voice_register == UNSPECIFIED
+
+    def test_twist_dimensions_lists_only_concrete_diffs(self) -> None:
+        """Divergence requires both sides to be specified and different."""
+        from creek.generate.twist import OntologyProfile, twist_dimensions
+
+        source = OntologyProfile(phase="peaking", mode="inhabit", frequency="F7")
+        target = OntologyProfile(
+            phase="withdrawal",
+            mode="inhabit",
+            frequency="F3",
+        )
+
+        diff = twist_dimensions(source, target)
+
+        # phase and frequency diverge; mode matches and is therefore omitted.
+        # dosage / voice_register are unspecified on both sides, so they too
+        # are omitted (we don't invent divergences the operator didn't ask
+        # for).
+        assert diff == ["phase", "frequency"]
+
+    def test_twist_dimensions_empty_when_profiles_match(self) -> None:
+        """source == target collapses to an empty divergence list."""
+        from creek.generate.twist import OntologyProfile, twist_dimensions
+
+        profile = OntologyProfile(phase="peaking", mode="inhabit", frequency="F7")
+        assert twist_dimensions(profile, profile) == []
+
+    def test_format_twist_directive_names_diverging_dimensions(self) -> None:
+        """The directive lists divergent dimensions with arrows."""
+        from creek.generate.twist import (
+            OntologyProfile,
+            format_twist_directive,
+        )
+
+        source = OntologyProfile(phase="peaking", frequency="F7")
+        target = OntologyProfile(phase="withdrawal", frequency="F3")
+
+        directive = format_twist_directive(
+            source,
+            target,
+            ["phase", "frequency"],
+        )
+
+        assert "## Twist directive" in directive
+        assert "phase: peaking -> withdrawal" in directive
+        assert "frequency: F7 -> F3" in directive
+        # Verbatim-paraphrase clause from the issue body must appear.
+        assert "Do not paraphrase any single source verbatim" in directive
+        assert "Recombine across the corpus" in directive
+
+    def test_format_twist_directive_no_twist_collapses_to_noop(self) -> None:
+        """No divergent dimensions yields a benign single-line directive."""
+        from creek.generate.twist import (
+            OntologyProfile,
+            format_twist_directive,
+        )
+
+        profile = OntologyProfile(phase="peaking")
+
+        directive = format_twist_directive(profile, profile, [])
+
+        assert "## Twist directive" in directive
+        # No "diverge" wording and no arrow lines.
+        assert "->" not in directive
+        assert "paraphrase" not in directive.lower()
+
+    def test_require_plural_sources_passes_with_two_or_more(self) -> None:
+        """Two or more sources is enough to recombine across."""
+        from creek.generate.twist import require_plural_sources
+
+        require_plural_sources(("frag-A", "frag-B"))
+        require_plural_sources(("frag-A", "frag-B", "frag-C"))
+
+    def test_require_plural_sources_raises_on_singleton(self) -> None:
+        """A single source fails loudly because recombination needs two."""
+        from creek.generate.twist import (
+            PluralitySourceError,
+            require_plural_sources,
+        )
+
+        with pytest.raises(PluralitySourceError, match="at least two"):
+            require_plural_sources(("frag-A",))
+
+    def test_require_plural_sources_raises_on_empty(self) -> None:
+        """Zero sources also fails — the message names the actual count."""
+        from creek.generate.twist import (
+            PluralitySourceError,
+            require_plural_sources,
+        )
+
+        with pytest.raises(PluralitySourceError, match="got 0"):
+            require_plural_sources(())
+
+
+class TestOntologyTwistComposition:
+    """End-to-end behaviour: ``DraftGenerator(ontology_twist=True)``."""
+
+    def _seed_two_peaking_inhabit_fragments(self, vault: Path) -> None:
+        """Seed two source fragments at ``phase=peaking, mode=inhabit, F7``.
+
+        Used by tests that need a plural source set with a known source
+        profile so the twist delta is predictable.
+        """
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            "A body about integration.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            "B body about empathy.",
+        )
+
+    def test_target_equals_source_collapses_to_baseline_prompt(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """When target==source the twist directive is a no-op (regression baseline).
+
+        Acceptance criterion: "when target == source, composition
+        behaves like today's draft." The prompt still carries the
+        ``## Twist directive`` header for transparency but does not
+        instruct any re-framing.
+        """
+        self._seed_two_peaking_inhabit_fragments(vault)
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        generator = DraftGenerator(
+            llm=llm,
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        # Operator targets peaking/inhabit — same as the source corpus.
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.INHABIT,),
+        )
+
+        draft = generator.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        assert "## Twist directive" in prompt
+        # No diff arrows and no paraphrase clause when profiles match.
+        assert "->" not in prompt
+        assert "Do not paraphrase" not in prompt
+        # Draft's twist_dimensions is empty because nothing diverged.
+        assert draft.twist_dimensions == ()
+        # Both profiles are recorded for transparency.
+        assert draft.source_profile is not None
+        assert draft.target_profile is not None
+        assert draft.source_profile.phase == "peaking"
+        assert draft.target_profile.phase == "peaking"
+
+    def test_partial_twist_names_diverging_dimensions(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A 1-2 dimension twist names exactly the divergent dimensions.
+
+        Acceptance criterion: "when target differs from source, the
+        prompt explicitly names the differing dimensions and instructs
+        the LLM to apply the target's style to the source's content."
+        """
+        self._seed_two_peaking_inhabit_fragments(vault)
+        # Also add a fragment in the WITHDRAWAL phase so the dimensional
+        # retrieval has material in that slice; the source profile will
+        # still be dominated by the peaking pair.
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-C",
+                primary=Frequency.F7,
+                phase=Phase.WITHDRAWAL,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            "Withdrawal body about shadow.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        generator = DraftGenerator(
+            llm=llm,
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        # Target asks for withdrawal+inhabit; source corpus is dominantly
+        # peaking+inhabit so only the phase dimension diverges.
+        spec = SeedSpec(
+            phases=(Phase.WITHDRAWAL,),
+            modes=(Mode.INHABIT,),
+        )
+
+        draft = generator.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        assert "## Twist directive" in prompt
+        # The phase dimension diverges (peaking -> withdrawal) and that
+        # exact line is in the prompt.
+        assert "phase: peaking -> withdrawal" in prompt
+        assert "Do not paraphrase any single source verbatim" in prompt
+        # Mode matches on both sides so it is NOT named as divergent.
+        assert "mode:" not in prompt.split("## Twist directive")[1]
+        # Draft records the divergent dimensions.
+        assert draft.twist_dimensions == ("phase",)
+        assert draft.source_profile is not None
+        assert draft.target_profile is not None
+        assert draft.source_profile.phase == "peaking"
+        assert draft.target_profile.phase == "withdrawal"
+
+    def test_full_twist_names_every_diverging_dimension(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A full twist surfaces every divergent dimension in the prompt.
+
+        Acceptance criterion: "tests covering ... full twist (every
+        dimension diverges)."
+
+        Setup: source corpus is F7 / peaking / inhabit / medicine /
+        analytical. The vault also carries one out-of-profile fragment
+        on every divergent dimension so the per-dimension retrieval
+        finds material on each requested slice. The target profile is
+        driven entirely by the ontology so phase/mode/frequency can
+        diverge from the explicit retrieval flags.
+        """
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+
+        # Two source-profile fragments — these drive the dominant source
+        # profile across every dimension.
+        for frag_id in ("frag-src-1", "frag-src-2"):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=frag_id,
+                    primary=Frequency.F7,
+                    phase=Phase.PEAKING,
+                    mode=Mode.INHABIT,
+                    dosage=Dosage.MEDICINE,
+                    register=VoiceRegister.ANALYTICAL,
+                ),
+                f"{frag_id} body.",
+            )
+        # One off-profile fragment per divergent retrieval slice. These
+        # let the per-dimension OR retrieval find material on each
+        # requested dimension; they're outvoted in the source profile
+        # by the two source-profile fragments above.
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-withdrawal",
+                primary=Frequency.F7,
+                phase=Phase.WITHDRAWAL,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+                register=VoiceRegister.ANALYTICAL,
+            ),
+            "Withdrawal body.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-express",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.EXPRESS,
+                dosage=Dosage.MEDICINE,
+                register=VoiceRegister.ANALYTICAL,
+            ),
+            "Express body.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-f3",
+                primary=Frequency.F3,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+                register=VoiceRegister.ANALYTICAL,
+            ),
+            "F3 body.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        generator = DraftGenerator(
+            llm=llm,
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        ontology = PromptOntology(
+            prompt="x",
+            dosages=(WeightedDimension(value=Dosage.TOXIC, weight=0.8),),
+            voice_registers=(
+                WeightedDimension(value=VoiceRegister.PROPHETIC, weight=0.8),
+            ),
+        )
+        # Explicit flags drive both retrieval AND the target profile on
+        # phase/mode/frequency; the ontology supplies dosage + register
+        # for the target. All five target picks differ from the source
+        # corpus's dominant profile.
+        spec = SeedSpec(
+            phases=(Phase.WITHDRAWAL,),
+            modes=(Mode.EXPRESS,),
+            frequencies=(Frequency.F3,),
+            ontology=ontology,
+        )
+
+        draft = generator.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        # All five dimensions diverge from source to target.
+        assert "phase: peaking -> withdrawal" in prompt
+        assert "stance: inhabit -> express" in prompt
+        assert "frequency: F7 -> F3" in prompt
+        assert "dosage: medicine -> toxic" in prompt
+        assert "voice register: analytical -> prophetic" in prompt
+        assert set(draft.twist_dimensions) == {
+            "phase",
+            "mode",
+            "frequency",
+            "dosage",
+            "voice_register",
+        }
+
+    def test_plurality_failure_raises_loudly(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Single-source retrieval fails fast under twist composition.
+
+        Acceptance criterion: "Composition requires plurality of source
+        fragments — fails loudly if only one source matches."
+        """
+        from creek.generate.twist import PluralitySourceError
+
+        # Only one fragment matches the peaking phase.
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-only",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+            ),
+            "The only body.",
+        )
+
+        generator = DraftGenerator(
+            llm=lambda _p: "Drafted.",
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        spec = SeedSpec(phases=(Phase.PEAKING,))
+
+        with pytest.raises(PluralitySourceError, match="at least two"):
+            generator.generate_seeded_draft(spec, vault_path=vault)
+
+    def test_frontmatter_records_source_target_and_twist_dimensions(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance criterion: frontmatter records source/target profiles."""
+        self._seed_two_peaking_inhabit_fragments(vault)
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-C",
+                primary=Frequency.F7,
+                phase=Phase.WITHDRAWAL,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            "Withdrawal body.",
+        )
+
+        generator = DraftGenerator(
+            llm=lambda _p: "Drafted body.",
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        spec = SeedSpec(
+            phases=(Phase.WITHDRAWAL,),
+            modes=(Mode.INHABIT,),
+        )
+
+        draft = generator.generate_seeded_draft(spec, vault_path=vault)
+        path = generator.save_draft(draft, vault)
+
+        post = frontmatter.load(str(path))
+        meta = post.metadata
+        assert meta["source_profile"]["phase"] == "peaking"
+        assert meta["target_profile"]["phase"] == "withdrawal"
+        assert meta["twist_dimensions"] == ["phase"]
+
+    def test_frontmatter_omits_twist_fields_when_flag_disabled(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Default ``DraftGenerator`` (flag off) writes no twist fields.
+
+        The flag is gated while in development; opting out must leave
+        the existing frontmatter shape untouched.
+        """
+        self._seed_two_peaking_inhabit_fragments(vault)
+
+        generator = DraftGenerator(
+            llm=lambda _p: "Drafted body.",
+            skills_root=skills_root,
+        )
+        spec = SeedSpec(phases=(Phase.PEAKING,))
+
+        draft = generator.generate_seeded_draft(spec, vault_path=vault)
+        path = generator.save_draft(draft, vault)
+
+        post = frontmatter.load(str(path))
+        assert "source_profile" not in post.metadata
+        assert "target_profile" not in post.metadata
+        assert "twist_dimensions" not in post.metadata
+        # And the Draft itself carries the empty defaults.
+        assert draft.source_profile is None
+        assert draft.target_profile is None
+        assert draft.twist_dimensions == ()
+
+    def test_prompt_forbids_verbatim_paraphrase_under_twist(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance criterion: the prompt forbids verbatim paraphrase.
+
+        The directive sentence from the issue body must appear in the
+        prompt whenever the twist composition path is active and any
+        dimension diverges.
+        """
+        self._seed_two_peaking_inhabit_fragments(vault)
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-C",
+                primary=Frequency.F7,
+                phase=Phase.WITHDRAWAL,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            "Withdrawal body.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        generator = DraftGenerator(
+            llm=llm,
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        spec = SeedSpec(
+            phases=(Phase.WITHDRAWAL,),
+            modes=(Mode.INHABIT,),
+        )
+
+        generator.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        assert "Use the provided source musings" in prompt
+        assert "Do not paraphrase any single source verbatim" in prompt
+        assert "Recombine across the corpus" in prompt
