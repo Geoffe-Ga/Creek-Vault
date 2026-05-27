@@ -283,10 +283,9 @@ class TestParsePromptOntologyResponse:
     def test_nan_weight_collapses_to_zero(self) -> None:
         """NaN weights collapse to zero so downstream rankings stay finite.
 
-        Regression for PR #359 review: ``NaN`` slips past both the
-        ``< 0.0`` and ``> 1.0`` clamp branches because NaN comparisons
-        always return ``False``. The parser now treats any non-finite
-        value as a missing signal.
+        ``NaN`` slips past both the ``< 0.0`` and ``> 1.0`` clamp
+        branches because NaN comparisons always return ``False``. The
+        parser must treat any non-finite value as a missing signal.
         """
         payload = _yaml_payload(
             frequencies="  - value: F3\n    weight: .nan",
@@ -474,11 +473,31 @@ class TestDetectOntology:
     def test_empty_prompt_short_circuits_to_empty_ontology(
         self,
         llm_config: LLMConfig,
-        fake_invoke: list[str],
     ) -> None:
-        """A whitespace-only prompt is not sent to the LLM at all."""
-        fake_invoke[0] = "should-not-be-called"
-        ontology = detect_ontology("   \n  ", llm_config)
+        """A whitespace-only prompt is not sent to the LLM at all.
+
+        The assertion proves the short-circuit by raising
+        :class:`AssertionError` from ``invoke_prompt`` itself —
+        :func:`detect_ontology` catches ``RuntimeError`` / ``OSError`` /
+        ``ValueError`` but lets ``AssertionError`` propagate, so the
+        test only passes when the LLM is never contacted.
+        """
+
+        def _must_not_be_called(_self: object, _prompt: str) -> str:
+            msg = "invoke_prompt must not be called for a whitespace prompt"
+            raise AssertionError(msg)
+
+        with (
+            patch(
+                "creek.classify.llm.LLMClassifier._check_availability",
+                return_value=True,
+            ),
+            patch(
+                "creek.classify.llm.LLMClassifier.invoke_prompt",
+                new=_must_not_be_called,
+            ),
+        ):
+            ontology = detect_ontology("   \n  ", llm_config)
         assert ontology == PromptOntology(prompt="   \n  ")
 
     def test_provider_exception_surfaces_as_empty_ontology(

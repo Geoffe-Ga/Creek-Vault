@@ -297,7 +297,7 @@ def _coerce_weight(value: object) -> float:
         # NaN slips past both clamp branches because NaN comparisons
         # always return False, and ±inf would amplify rankings without
         # bound. Both collapse to zero so downstream composition stays
-        # honest (PR #359 review).
+        # finite.
         return 0.0
     if weight < 0.0:
         return 0.0
@@ -349,7 +349,8 @@ def _parse_dimension(
       the caller still sees the model picked it).
 
     Entries are returned sorted by weight descending so the heaviest
-    signal sits at index 0; ties are stable on enum declaration order.
+    signal sits at index 0; ties preserve the LLM's YAML response order
+    because :py:meth:`list.sort` is stable.
 
     Args:
         data: Parsed top-level YAML dict.
