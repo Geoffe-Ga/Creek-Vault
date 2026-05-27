@@ -36,6 +36,7 @@ fields in sync until the broader epic completes and consumers migrate.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from enum import StrEnum
@@ -51,7 +52,16 @@ from pydantic import BaseModel, ConfigDict
 # while ``creek.classify.llm`` is still partially loaded — the package
 # re-export isn't yet visible. Going to ``parsing.py`` directly side-
 # steps the cycle without leaking the layering.
-from creek.classify.llm.parsing import _strip_code_fences
+from creek.classify.llm.parsing import (
+    _split_reasoning_and_yaml,
+    _strip_code_fences,
+)
+from creek.classify.llm.prompts import (
+    _COLOR_BLOCK,
+    _FREQUENCY_BLOCK,
+    _FREQUENCY_COLOR_BLOCK,
+    _sanitise_for_prompt,
+)
 from creek.models import (
     Color,
     Dosage,
@@ -66,11 +76,19 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
-    from creek.models import Fragment
+    from creek.config import LLMConfig
+    from creek.ingest.base import IngestedFragment
+    from creek.models import Fragment, FragmentLevel
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
+    "WEIGHTED_CLASSIFICATION_TEMPLATE",
     "WeightedDimension",
     "WeightedFragmentClassification",
+    "build_weighted_classification_prompt",
+    "classify_weighted",
+    "parse_weighted_yaml",
 ]
 
 
@@ -595,3 +613,258 @@ def _top_value_optional(
 # ``Fragment.model_rebuild`` here ourselves so the rebuild has a single
 # source of truth and the import dependency stays models → weighted
 # rather than mutually recursive at runtime.
+
+
+# ---- LLM-driven fragment classifier (issue #366) ---------------------------
+
+
+WEIGHTED_CLASSIFICATION_TEMPLATE: str = (
+    """\
+You are an ontology-classification assistant for the Creek knowledge
+organisation system. The writer has supplied a fragment of their own
+content (an essay paragraph, a chat exchange, a journal entry) and
+wants it placed on the Creek dimensions — but **with weights** in
+[0.0, 1.0] per detected value rather than a single canonical pick.
+A fragment that legitimately spans multiple frequencies, multiple
+phases, or multiple registers should emit multiple weighted entries.
+
+DIMENSIONS:
+
+1. **Frequencies** (APTITUDE F1-F10):
+__FREQUENCY_BLOCK__
+
+2. **Wavelength Phase**: rising, peaking, withdrawal, diminishing, \
+bottoming_out, restoration
+
+3. **Engagement Mode**: inhabit, express, collaborate, integrate, absorb
+
+4. **Orientation**: do, feel, do_feel
+
+5. **Dosage**: medicine, toxic, ambiguous
+
+6. **Voice Register**: confessional, analytical, playful, prophetic, \
+instructional, raw, conversational
+
+Wavelength Color (Spiral Dynamics) is anchored to the primary
+frequency for downstream visualisation only — you do not need to
+score it here. Canonical vocabulary, for reference: __COLOR_BLOCK__.
+The canonical frequency→color mapping is:
+__FREQUENCY_COLOR_BLOCK__
+
+PROTOCOL:
+
+Step 1 — Reason briefly. Walk through which frequencies the fragment
+activates and why, then phases, modes, orientation, dosage, register.
+Two to four sentences.
+
+Step 2 — Emit your classification as YAML inside a fenced ```yaml ... ```
+block. Only list dimension values you genuinely detect; omit entries
+that would have weight < 0.05 rather than padding the YAML. Use this
+exact schema (no extra top-level keys):
+
+```yaml
+frequencies:
+  - value: F3
+    weight: 0.8
+  - value: F5
+    weight: 0.4
+phases:
+  - value: rising
+    weight: 0.6
+modes:
+  - value: express
+    weight: 0.5
+orientations:
+  - value: do_feel
+    weight: 0.7
+dosages:
+  - value: toxic
+    weight: 0.6
+  - value: medicine
+    weight: 0.3
+voice_registers:
+  - value: analytical
+    weight: 0.5
+overall_confidence: 0.7
+```
+
+``overall_confidence`` is your honest self-rating of the whole
+classification. Calibrate to the FEAT-017 threshold of {threshold:.2f}
+— above it means "I would stand behind this classification", below
+means "I would defer to a human." Per-dimension weights below this
+threshold will be ignored by downstream composition by default.
+
+FRAGMENT LEVEL: {level}
+FRAGMENT TITLE: {title}
+
+FRAGMENT CONTENT:
+{content}
+""".replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK)
+    .replace("__COLOR_BLOCK__", _COLOR_BLOCK)
+    .replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
+)
+"""LLM prompt template for fragment-level weighted classification (#366).
+
+Placeholders:
+
+- ``{threshold}``: ``LLMConfig.unclassified_threshold`` shown to the
+  model so it calibrates its self-reported overall confidence
+  honestly against the same FEAT-017 floor the single-pick fragment
+  classifier uses.
+- ``{level}``: the fragment's :class:`FragmentLevel`; surfaces
+  whether the model is looking at a sentence-sized atom or a
+  whole-document parent so it can scale conviction accordingly.
+- ``{title}``: the (sanitised) fragment title.
+- ``{content}``: the (sanitised) fragment body.
+
+The Frequency / Colour / Frequency→Colour blocks are pulled directly
+from :mod:`creek.classify.llm.prompts` (the shared canonical source)
+so renames or re-glosses in one place reach both this template and
+the :data:`creek.classify.prompt.PROMPT_ONTOLOGY_TEMPLATE`.
+"""
+
+
+def build_weighted_classification_prompt(
+    body: str,
+    *,
+    title: str = "",
+    level: FragmentLevel = "document",
+    unclassified_threshold: float,
+) -> str:
+    """Build the LLM prompt for weighted-classification of a fragment.
+
+    The fragment body and title are attacker-controlled (they originate
+    from third-party messages, scraped material, ingested chat logs).
+    Each is passed through
+    :func:`creek.classify.llm.prompts._sanitise_for_prompt` to
+    neutralise YAML-fence and HTML-comment injection and to cap the
+    content length before substitution; see SEC-004 for the threat
+    model. The threshold value is substituted into the template so
+    the LLM calibrates its self-reported confidence against the same
+    FEAT-017 floor the legacy single-pick classifier uses.
+
+    Args:
+        body: Raw fragment body text.
+        title: Optional fragment title; empty string is acceptable.
+        level: Structural level the fragment sits at — feeds into the
+            prompt so the LLM can scale its conviction appropriately
+            for an atom vs. a whole document.
+        unclassified_threshold: ``LLMConfig.unclassified_threshold``
+            value; shown to the model verbatim with two decimals.
+
+    Returns:
+        The fully-formatted prompt string, ready to send to a provider.
+    """
+    safe_title = _sanitise_for_prompt(title) if title else "(no title)"
+    safe_body = _sanitise_for_prompt(body) if body.strip() else "(no content)"
+    return WEIGHTED_CLASSIFICATION_TEMPLATE.format(
+        threshold=unclassified_threshold,
+        level=level,
+        title=safe_title,
+        content=safe_body,
+    )
+
+
+def parse_weighted_yaml(response: str) -> WeightedFragmentClassification:
+    """Parse an LLM response into a :class:`WeightedFragmentClassification`.
+
+    Splits reasoning from YAML, dispatches to per-dimension parsers,
+    and assembles the result. This is the shared parser core used by
+    both the prompt-ontology detector (which adds a ``prompt`` echo on
+    top) and the fragment classifier (which uses the bare result).
+
+    Args:
+        response: Raw LLM response text. May include reasoning
+            preamble + a fenced ```yaml ... ``` block; both layouts
+            are tolerated.
+
+    Returns:
+        The parsed :class:`WeightedFragmentClassification`, with the
+        reasoning preamble in its ``reasoning`` field and per-dimension
+        weighted tuples sorted descending.
+
+    Raises:
+        ValueError: When the YAML payload is malformed, multi-document,
+            or contains unexpected top-level keys.
+    """
+    reasoning, yaml_text = _split_reasoning_and_yaml(response)
+    data = _load_yaml_dict(yaml_text)
+    return WeightedFragmentClassification(
+        frequencies=_parse_dimension(data, "frequencies", Frequency),
+        phases=_parse_dimension(data, "phases", Phase),
+        modes=_parse_dimension(data, "modes", Mode),
+        orientations=_parse_dimension(data, "orientations", Orientation),
+        dosages=_parse_dimension(data, "dosages", Dosage),
+        voice_registers=_parse_dimension(data, "voice_registers", VoiceRegister),
+        overall_confidence=_coerce_weight(data.get("overall_confidence")),
+        reasoning=reasoning,
+    )
+
+
+def classify_weighted(
+    fragment: IngestedFragment,
+    config: LLMConfig,
+) -> WeightedFragmentClassification:
+    """Classify a fragment, returning a weighted ontology profile (#366).
+
+    Fragment-level twin of
+    :func:`creek.classify.prompt.detect_ontology`. Same dispatch path
+    (:class:`creek.classify.llm.LLMClassifier`), same YAML schema, same
+    parser core — only the framing differs. Returns one
+    :class:`WeightedFragmentClassification` with tuples sorted
+    descending, the model's reasoning preamble, and the model's
+    self-reported overall confidence.
+
+    Short-circuits to an empty :class:`WeightedFragmentClassification`
+    when the fragment body is whitespace-only, when the provider is
+    unavailable, or when the call raises — the caller can then decide
+    whether to abort or to proceed without weighted guidance.
+
+    Args:
+        fragment: The fragment (paired with its body via
+            :class:`IngestedFragment`) to classify.
+        config: LLM provider configuration (provider, model, threshold).
+
+    Returns:
+        The detected :class:`WeightedFragmentClassification`; empty
+        (all-zeros) when classification could not run.
+    """
+    if not fragment.body.strip():
+        return WeightedFragmentClassification()
+
+    # Import inside the function to avoid pulling the heavy classify
+    # package into module-load time — :mod:`creek.classify.weighted`
+    # is itself imported from :mod:`creek.models` to resolve the
+    # ``Fragment.weighted`` forward reference, and a top-level
+    # ``from creek.classify.llm import LLMClassifier`` would deepen
+    # the cycle past the partial-load tolerance that today works.
+    from creek.classify.llm import LLMClassifier
+
+    classifier = LLMClassifier(config)
+    if not classifier.available:
+        logger.warning(
+            "LLM provider %r unavailable; returning empty weighted classification",
+            config.provider,
+        )
+        return WeightedFragmentClassification()
+
+    prompt = build_weighted_classification_prompt(
+        body=fragment.body,
+        title=fragment.fragment.title,
+        level=fragment.fragment.level,
+        unclassified_threshold=config.unclassified_threshold,
+    )
+    try:
+        response = classifier.invoke_prompt(prompt)
+        parsed = parse_weighted_yaml(response)
+    except (RuntimeError, OSError, ValueError) as exc:
+        # ValueError covers malformed YAML and schema violations from
+        # the parser; RuntimeError/OSError cover provider transport
+        # failures. Both collapse to "no signal" so the caller can
+        # decide whether to proceed without weighted guidance.
+        logger.warning(
+            "Weighted fragment classification failed (%s); returning empty result",
+            exc,
+        )
+        return WeightedFragmentClassification()
+    return parsed
