@@ -55,12 +55,11 @@ from creek.generate.dimensional_retrieval import (
     union_fragment_ids,
 )
 from creek.generate.grounding import (
-    DERIVATIVE_FRONTMATTER_KEY,
-    GROUNDING_FRONTMATTER_KEY,
-    PARAGRAPH_ANNOTATIONS_KEY,
     EmbeddingFn,
     GroundingReport,
     GroundingThresholds,
+    ParagraphAnnotation,
+    build_grounding_frontmatter,
     score_draft,
 )
 from creek.generate.twist import (
@@ -301,7 +300,7 @@ class Draft:
     twist_dimensions: tuple[str, ...] = ()
     derivative_score: float | None = None
     grounding_score: float | None = None
-    paragraph_grounding: tuple[dict[str, object], ...] = field(default_factory=tuple)
+    paragraph_grounding: tuple[ParagraphAnnotation, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         """Validate draft invariants."""
@@ -1347,12 +1346,13 @@ class DraftGenerator:
             post["target_profile"] = draft.target_profile.as_mapping()
         if draft.twist_dimensions:
             post["twist_dimensions"] = list(draft.twist_dimensions)
-        if draft.derivative_score is not None:
-            post[DERIVATIVE_FRONTMATTER_KEY] = round(draft.derivative_score, 4)
-        if draft.grounding_score is not None:
-            post[GROUNDING_FRONTMATTER_KEY] = round(draft.grounding_score, 4)
-        if draft.paragraph_grounding:
-            post[PARAGRAPH_ANNOTATIONS_KEY] = list(draft.paragraph_grounding)
+        guard_fields = build_grounding_frontmatter(
+            derivative_score=draft.derivative_score,
+            grounding_score=draft.grounding_score,
+            paragraph_annotations=draft.paragraph_grounding,
+        )
+        for key, value in guard_fields.items():
+            post[key] = value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
@@ -1434,7 +1434,7 @@ def _serialise_seed_spec(spec: SeedSpec) -> dict[str, object]:
 
 def _guard_annotations(
     report: GroundingReport | None,
-) -> tuple[dict[str, object], ...]:
+) -> tuple[ParagraphAnnotation, ...]:
     """Return the per-paragraph annotation tuple for the :class:`Draft` field.
 
     Returns an empty tuple when *report* is ``None`` (guard disabled)

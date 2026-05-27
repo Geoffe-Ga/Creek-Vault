@@ -34,11 +34,28 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, TypedDict, final
 
 if TYPE_CHECKING:
     from creek.config import DraftConfig
+
+
+class ParagraphAnnotation(TypedDict):
+    """Frontmatter shape for a single paragraph's grounding annotation.
+
+    The four fields mirror :class:`ParagraphScore` minus the raw text
+    (which lives in the draft body itself). Declaring this as a
+    ``TypedDict`` lets ``mypy --strict`` flag key typos and missing
+    fields at the call site instead of waiting for a YAML-decode
+    failure downstream — see PR #380 review feedback.
+    """
+
+    index: int
+    max_similarity: float
+    is_derivative: bool
+    is_grounded: bool
+
 
 EmbeddingFn = Callable[[str], list[float]]
 """Signature for paragraph-level embedding callables.
@@ -123,7 +140,7 @@ class ParagraphScore:
     is_derivative: bool
     is_grounded: bool
 
-    def to_annotation(self) -> dict[str, object]:
+    def to_annotation(self) -> ParagraphAnnotation:
         """Return the frontmatter-friendly mapping for this paragraph.
 
         ``text`` is intentionally omitted; an operator who needs the
@@ -131,17 +148,25 @@ class ParagraphScore:
         annotations slim avoids ballooning every draft file with two
         copies of the body.
         """
-        return {
-            "index": self.index,
-            "max_similarity": round(self.max_similarity, 4),
-            "is_derivative": self.is_derivative,
-            "is_grounded": self.is_grounded,
-        }
+        return ParagraphAnnotation(
+            index=self.index,
+            max_similarity=round(self.max_similarity, 4),
+            is_derivative=self.is_derivative,
+            is_grounded=self.is_grounded,
+        )
 
 
+@final
 @dataclass(frozen=True)
 class GroundingReport:
     """The guard's verdict for one draft.
+
+    The flag booleans are always derived from ``derivative_score`` and
+    ``grounding_score`` via :attr:`is_flagged_derivative` /
+    :attr:`is_flagged_ungrounded` so a YAML round-trip in the lint
+    check never produces a stale verdict. The ``@final`` decorator
+    prevents subclasses from introducing fields that would silently
+    bypass that derivation.
 
     Attributes:
         derivative_score: Maximum :attr:`ParagraphScore.max_similarity`
@@ -161,11 +186,6 @@ class GroundingReport:
     grounding_score: float
     paragraph_scores: tuple[ParagraphScore, ...]
     thresholds: GroundingThresholds
-    # Deliberately field-less: the cached flag booleans are derived from
-    # ``derivative_score`` and ``grounding_score`` so re-deserialising
-    # the report (e.g. after a YAML round-trip in the lint check) never
-    # produces a stale verdict. See :attr:`is_flagged_derivative`.
-    _: tuple[()] = field(default=(), repr=False)
 
     @property
     def is_flagged_derivative(self) -> bool:
@@ -217,17 +237,59 @@ class GroundingReport:
     def to_frontmatter(self) -> dict[str, object]:
         """Render the report as the frontmatter payload ``save_draft`` writes.
 
-        The two scalar scores are rounded to four decimals so YAML diffs
-        do not churn on the trailing-precision noise that
-        sentence-transformer outputs naturally produce.
+        Delegates to :func:`build_grounding_frontmatter` so the
+        ``Draft``-stored fields (which the lint check reads) and the
+        live :class:`GroundingReport` (which the generator emits)
+        serialise identically.
         """
-        return {
-            DERIVATIVE_FRONTMATTER_KEY: round(self.derivative_score, 4),
-            GROUNDING_FRONTMATTER_KEY: round(self.grounding_score, 4),
-            PARAGRAPH_ANNOTATIONS_KEY: [
+        return build_grounding_frontmatter(
+            derivative_score=self.derivative_score,
+            grounding_score=self.grounding_score,
+            paragraph_annotations=tuple(
                 score.to_annotation() for score in self.paragraph_scores
-            ],
-        }
+            ),
+        )
+
+
+def build_grounding_frontmatter(
+    *,
+    derivative_score: float | None,
+    grounding_score: float | None,
+    paragraph_annotations: Sequence[ParagraphAnnotation],
+) -> dict[str, object]:
+    """Build the partial frontmatter payload for grounding guard fields.
+
+    Single source of truth for how the three grounding fields appear in
+    on-disk draft frontmatter: callers either pass a live
+    :class:`GroundingReport` via :meth:`GroundingReport.to_frontmatter`
+    or pass the previously-stored :class:`~creek.generate.drafts.Draft`
+    fields via ``save_draft``. Either path produces the same shape so a
+    rename of a frontmatter key only happens here.
+
+    ``None`` scalars and empty annotation tuples are skipped so a
+    pre-guard draft (saved before the guard ran) never grows zero-value
+    fields that would mislead the lint check into running on them.
+
+    Args:
+        derivative_score: Scalar from a finished guard run, or ``None``
+            when the guard did not run.
+        grounding_score: Scalar from a finished guard run, or ``None``
+            when the guard did not run.
+        paragraph_annotations: Per-paragraph annotation entries. Pass
+            an empty sequence (or ``()``) when the guard did not run.
+
+    Returns:
+        A dict carrying only the keys whose values are populated. The
+        caller merges this into the rest of the frontmatter post.
+    """
+    payload: dict[str, object] = {}
+    if derivative_score is not None:
+        payload[DERIVATIVE_FRONTMATTER_KEY] = round(derivative_score, 4)
+    if grounding_score is not None:
+        payload[GROUNDING_FRONTMATTER_KEY] = round(grounding_score, 4)
+    if paragraph_annotations:
+        payload[PARAGRAPH_ANNOTATIONS_KEY] = list(paragraph_annotations)
+    return payload
 
 
 def split_paragraphs(body: str) -> list[str]:

@@ -41,6 +41,7 @@ from creek.generate.grounding import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +460,7 @@ class TestReportSerialisation:
 # ---------------------------------------------------------------------------
 
 
-def _build_guard_vault(tmp_path: object, body: str) -> object:
+def _build_guard_vault(tmp_path: Path, body: str) -> Path:
     """Materialise a minimal vault with one fragment whose body is *body*.
 
     Centralised because every guard-wiring test below needs the same
@@ -467,7 +468,6 @@ def _build_guard_vault(tmp_path: object, body: str) -> object:
     test wants the source paragraph to be).
     """
     from datetime import UTC, datetime
-    from pathlib import Path
 
     import frontmatter
 
@@ -483,7 +483,7 @@ def _build_guard_vault(tmp_path: object, body: str) -> object:
         WavelengthClassification,
     )
 
-    vault = Path(str(tmp_path))
+    vault = tmp_path
     (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
     (vault / "07-Voice" / "Drafts").mkdir(parents=True, exist_ok=True)
     frag = Fragment(
@@ -525,13 +525,13 @@ def _make_idea(title: str = "Echo essay") -> object:
 class TestDraftGeneratorGuardWiring:
     """The guard must populate the new :class:`Draft` fields end-to-end."""
 
-    def test_guard_runs_when_embedding_fn_is_wired(self, tmp_path: object) -> None:
+    def test_guard_runs_when_embedding_fn_is_wired(self, tmp_path: Path) -> None:
         """A wired embedding callable populates the new ``Draft`` fields."""
         from creek.generate.drafts import DraftGenerator
 
         source_paragraph = "The source paragraph."
         vault = _build_guard_vault(tmp_path, source_paragraph)
-        skills_root = vault / "skills"  # type: ignore[operator]
+        skills_root = vault / "skills"
         skills_root.mkdir()
         table = {source_paragraph: _hashed_vector(source_paragraph)}
         gen = DraftGenerator(
@@ -546,12 +546,12 @@ class TestDraftGeneratorGuardWiring:
         assert len(draft.paragraph_grounding) == 1
         assert draft.paragraph_grounding[0]["is_derivative"] is True
 
-    def test_guard_skipped_when_no_embedding_fn(self, tmp_path: object) -> None:
+    def test_guard_skipped_when_no_embedding_fn(self, tmp_path: Path) -> None:
         """No embedding callable → the guard fields stay ``None``/empty."""
         from creek.generate.drafts import DraftGenerator
 
         vault = _build_guard_vault(tmp_path, "Source body.")
-        skills_root = vault / "skills"  # type: ignore[operator]
+        skills_root = vault / "skills"
         skills_root.mkdir()
         gen = DraftGenerator(
             llm=lambda _p: "An invented draft body.",
@@ -562,7 +562,7 @@ class TestDraftGeneratorGuardWiring:
         assert draft.grounding_score is None
         assert draft.paragraph_grounding == ()
 
-    def test_save_draft_writes_guard_frontmatter(self, tmp_path: object) -> None:
+    def test_save_draft_writes_guard_frontmatter(self, tmp_path: Path) -> None:
         """``save_draft`` mirrors the scores into the saved markdown frontmatter."""
         import frontmatter
 
@@ -570,7 +570,7 @@ class TestDraftGeneratorGuardWiring:
 
         source_paragraph = "Saved source paragraph."
         vault = _build_guard_vault(tmp_path, source_paragraph)
-        skills_root = vault / "skills"  # type: ignore[operator]
+        skills_root = vault / "skills"
         skills_root.mkdir()
         table = {source_paragraph: _hashed_vector(source_paragraph)}
         gen = DraftGenerator(
@@ -590,7 +590,7 @@ class TestDraftGeneratorGuardWiring:
 
     def test_save_draft_omits_guard_fields_when_unscored(
         self,
-        tmp_path: object,
+        tmp_path: Path,
     ) -> None:
         """Unscored drafts do not leak ``derivative_score`` keys into frontmatter."""
         import frontmatter
@@ -598,7 +598,7 @@ class TestDraftGeneratorGuardWiring:
         from creek.generate.drafts import DraftGenerator
 
         vault = _build_guard_vault(tmp_path, "Source.")
-        skills_root = vault / "skills"  # type: ignore[operator]
+        skills_root = vault / "skills"
         skills_root.mkdir()
         gen = DraftGenerator(
             llm=lambda _p: "An unscored draft body.",
@@ -613,14 +613,14 @@ class TestDraftGeneratorGuardWiring:
 
     def test_guard_prints_summary_to_stderr(
         self,
-        tmp_path: object,
+        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """The guard prints a one-line summary to stderr for the operator."""
         from creek.generate.drafts import DraftGenerator
 
         vault = _build_guard_vault(tmp_path, "Source body.")
-        skills_root = vault / "skills"  # type: ignore[operator]
+        skills_root = vault / "skills"
         skills_root.mkdir()
         gen = DraftGenerator(
             llm=lambda _p: "An invented but distinct draft body.",
