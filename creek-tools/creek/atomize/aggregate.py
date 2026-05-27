@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
 
+    from creek.classify.weighted import WeightedFragmentClassification
     from creek.models import FragmentLevel
 
 __all__ = ["AggregateLevel", "AggregationConfig", "aggregate"]
@@ -73,6 +74,15 @@ class AggregationConfig:
     session_max_gap_minutes: int = 360
     joiner: str = "\n\n"
     embedder: Callable[[list[str]], list[list[float]]] | None = None
+    # Issue #369: structural gate for weighted bubble-up. When the
+    # fraction of children that carry a non-``None`` ``Fragment.weighted``
+    # falls below this floor, the aggregated parent's ``weighted`` is
+    # ``None`` rather than the combiner's no-signal fallback — the
+    # vault is too sparsely classified for this aggregation to be
+    # meaningful. Confidence-based dampening is handled by the combiner
+    # itself (#367); this floor only decides whether to *call* the
+    # combiner.
+    weighted_fill_floor: float = 0.5
 
 
 def aggregate(
@@ -278,6 +288,7 @@ def _build_parent(
     earliest = min(c.created for c in children)
     latest = max(c.created for c in children)
     source_keys = _contributing_source_keys(children) if cross_source else None
+    weighted = _combine_children_weighted(children, config.weighted_fill_floor)
     return Fragment(
         id=parent_id,
         title=title,
@@ -292,7 +303,59 @@ def _build_parent(
             _speakers(children),
             source_keys=source_keys,
         ),
+        weighted=weighted,
     )
+
+
+def _combine_children_weighted(
+    children: list[Fragment],
+    fill_floor: float,
+) -> WeightedFragmentClassification | None:
+    """Combine children's weighted profiles into an aggregated-parent profile.
+
+    Issue #369: the zoom-out twin of #368's split bubble-up. Five terse
+    chat messages that classify as ``unclassified`` in isolation should
+    nonetheless aggregate into an exchange whose combined weighted
+    profile is non-empty and consistent — at least when enough of the
+    children carry any classification at all.
+
+    Two gates apply, in order:
+
+    1. **Structural fill floor**: the fraction of children with
+       non-``None`` ``Fragment.weighted`` must reach
+       ``config.weighted_fill_floor`` (default 0.5). The vault is too
+       sparsely classified for this aggregation to be meaningful
+       otherwise — return ``None`` honestly.
+    2. **Confidence-driven combine**: the holonic combiner (#367) takes
+       over, treating each child's ``overall_confidence`` as its mass
+       per the conviction x confidence contract. No explicit ``weights``
+       are passed, so length is nowhere in this call path.
+
+    Args:
+        children: Aggregated children.
+        fill_floor: Minimum fraction of children that must carry
+            ``Fragment.weighted``; below this the parent's ``weighted``
+            is ``None``.
+
+    Returns:
+        The combined :class:`WeightedFragmentClassification`, or
+        ``None`` when the fill-floor gate fires.
+    """
+    # Local import dodges the import-graph cycle:
+    # creek.models -> creek.classify.weighted -> creek.atomize ...
+    # at module-load time. Aggregation runs strictly after model
+    # construction, so a function-scoped import is safe.
+    from creek.classify.holonic import combine
+
+    weighted_children = [c.weighted for c in children if c.weighted is not None]
+    if not children:
+        return None
+    fraction_with_weighted = len(weighted_children) / len(children)
+    if fraction_with_weighted < fill_floor:
+        return None
+    if not weighted_children:
+        return None
+    return combine(weighted_children)
 
 
 def _inherit_source(children: list[Fragment]) -> FragmentSource:
