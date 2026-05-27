@@ -66,14 +66,14 @@ Decides what to do with non-self content. Three configurable modes (set `cleanin
 
 Universal constraints applied across all modes:
 
-- Non-self fragments are **never** voice-proxy eligible (the field is now a derived property — see [BUG-009](../../plans/git-issues/BUG-009-voice-proxy-eligible-flag-stale.md)).
+- Non-self fragments are **never** voice-proxy eligible (the field is now a derived property — see `BUG-009`; use `git log --grep='BUG-009'` for the origin commit).
 - Non-self fragments are **never** classified `intimate`; an `intimate` tier on a non-self fragment is downgraded to `personal`.
 
 ### [`validator.py`](../creek/clean/validator.py) — `FragmentValidator`
 
 Checks required fields, UTF-8 encoding, ISO-8601 timestamps, and a configurable minimum content length. Invalid fragments are routed to the review queue rather than discarded — see `cleaning.validation`.
 
-Failure mode: a fragment with mojibake (e.g. CSV decoded as cp1252 by mistake — see [BUG-010](../../plans/git-issues/BUG-010-csv-cp1252-fallback-silent-mojibake.md)) lands in review, where you can re-ingest with the right encoding.
+Failure mode: a fragment with mojibake (e.g. CSV decoded as cp1252 by mistake — see `BUG-010`; use `git log --grep='BUG-010'` for the origin commit) lands in review, where you can re-ingest with the right encoding.
 
 ### [`quality.py`](../creek/clean/quality.py) — `QualityScorer`
 
@@ -126,8 +126,8 @@ Most config sections have a `enabled: bool` (or per-rule `skip_*` toggles). To d
 | 30 % of fragments dropped silently | `QualityScorer` skip threshold too high | `cleaning.quality.skip_threshold` |
 | Real human turns missing from chatbot exports | `ChatbotFilter` over-aggressive | `cleaning.chatbot.min_human_turn_chars`, `skip_short_human` |
 | Discord short replies missing | `DiscordFilter` short-text rule | `cleaning.discord.min_chars`, `preserve_replies` |
-| Mojibake in CSV-derived fragments | `cp1252` fallback fired ([BUG-010](../../plans/git-issues/BUG-010-csv-cp1252-fallback-silent-mojibake.md)) | Re-ingest with explicit encoding; check the WARNING log line for the offending file |
-| Voice-proxy eligibility wrong | Stale `voice_proxy_eligible` field | Pull from a build that includes [BUG-009](../../plans/git-issues/BUG-009-voice-proxy-eligible-flag-stale.md) — the field is now a derived property |
+| Mojibake in CSV-derived fragments | `cp1252` fallback fired (`BUG-010`) | Re-ingest with explicit encoding; check the WARNING log line for the offending file |
+| Voice-proxy eligibility wrong | Stale `voice_proxy_eligible` field | Pull from a build that includes `BUG-009` — the field is now a derived property |
 | Duplicate fragments accepted | Stale `dedup-manifest.json` from earlier run | Delete `<vault>/00-Creek-Meta/dedup-manifest.json` and re-ingest |
 
 ---

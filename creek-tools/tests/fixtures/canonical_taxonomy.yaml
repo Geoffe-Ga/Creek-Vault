@@ -15,11 +15,12 @@
 # updated in lockstep — that is the point of the test.
 #
 # Drift values listed under ``deprecated_aliases`` come from the
-# pre-INC-019 documentation drift documented in
-# ``plans/git-issues/INC-019-spec-impl-drift-phase-mode-frequency-taxonomy.md``.
-# They are mapped to the canonical names so vaults written by older
-# tool versions remain loadable for one release with a deprecation
-# warning, after which the alias hooks will be removed.
+# pre-INC-019 documentation drift; the long-form ``plans/git-issues/``
+# directory was retired in #243, so use ``git log --grep='INC-019'``
+# to locate the originating commits. They are mapped to the canonical
+# names so vaults written by older tool versions remain loadable for
+# one release with a deprecation warning, after which the alias hooks
+# will be removed.
 phases:
   canonical:
     - rising

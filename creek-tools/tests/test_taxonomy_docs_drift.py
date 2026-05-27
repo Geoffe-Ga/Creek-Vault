@@ -5,9 +5,10 @@ strings in ``creek-tools/creek/`` must use the canonical taxonomy
 verbatim. These tests grep the relevant files and assert the drifted
 phase / mode / frequency strings do not reappear.
 
-Drift values are taken from
-``plans/git-issues/INC-019-spec-impl-drift-phase-mode-frequency-taxonomy.md``.
-The canonical names are pinned in
+Drift values originated in the INC-019 spec; the long-form
+``plans/git-issues/`` directory was retired in #243, so use
+``git log --grep='INC-019'`` to locate the originating commits. The
+canonical names are pinned in
 ``tests/fixtures/canonical_taxonomy.yaml``.
 """
 

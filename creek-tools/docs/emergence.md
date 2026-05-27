@@ -124,7 +124,7 @@ Every numeric threshold above is pinned by a regression test in `tests/`. Change
 - The Unnamed-Digest similarity floor (0.7)
 - The Tag-Garden growth detection deltas
 
-require the corresponding test and this doc to move together. If you find a §10 criterion you cannot locate in code, file a `BUG-*` under `plans/git-issues/` rather than letting the gap go un-tracked.
+require the corresponding test and this doc to move together. If you find a §10 criterion you cannot locate in code, open a GitHub issue (use a `BUG-*` prefix in the title so the design-trace lineage stays grep-able) rather than letting the gap go un-tracked.
 
 ---
 

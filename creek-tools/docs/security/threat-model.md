@@ -147,7 +147,9 @@ Creek **does not** aim to provide:
 
 ## Cross-references
 
-Issue files live at the repository root under `plans/git-issues/`:
+The codebase annotates design-trace work with short IDs: `SEC-*`, `INC-*`, `OPS-*`, `BUG-*`, `FEAT-*`, `TEST-*`. The original `plans/git-issues/` directory of long-form spec files was retired in #243; the IDs survive as commit-message tags and inline code annotations. To locate the originating context for an ID, search the commit history (`git log --grep='SEC-005'` etc.) or the GitHub issue tracker for `geoffe-ga/creek-vault`.
+
+Notable threat-model-adjacent IDs that have shipped or are in flight:
 
 - **SEC-002** — Redaction pattern coverage gaps
 - **SEC-003** — Symlink refusal in redaction (resolved)
@@ -156,6 +158,3 @@ Issue files live at the repository root under `plans/git-issues/`:
 - **SEC-006** — Privacy-tier enforcement in mine/draft
 - **SEC-008** — OAuth token hygiene (resolved)
 - **OPS-002** — Non-interactive purge refusal (resolved)
-
-Each is filed under its short ID; search the issue tracker or the
-in-repo `plans/git-issues/` directory for the full text.

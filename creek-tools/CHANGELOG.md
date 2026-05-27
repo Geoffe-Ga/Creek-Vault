@@ -1,8 +1,11 @@
 # Changelog
 
 All notable changes to `creek-tools` are documented here. Versioning is
-loose during pre-1.0 development; the headings below track FEAT IDs from
-`plans/git-issues/`.
+loose during pre-1.0 development; the headings below track design-trace
+IDs (`FEAT-*`, `INC-*`, `BUG-*`, …) embedded in commit messages and
+inline code annotations. The original `plans/git-issues/` directory of
+long-form spec files was retired in #243; use `git log --grep='<ID>'`
+to locate the originating commit for any reference below.
 
 ## Unreleased
 
