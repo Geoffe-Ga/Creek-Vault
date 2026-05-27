@@ -45,6 +45,11 @@ def vault(tmp_path: Path) -> Iterator[Path]:
         ("03-Eddies",),
     ):
         (tmp_path.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
+    # GAP-003 marker so `purge_vault` recognises this as a Creek vault.
+    (tmp_path / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        "# minimal marker for GAP-003\n",
+        encoding="utf-8",
+    )
     metadata = {
         "type": "fragment",
         "id": "frag-001",
