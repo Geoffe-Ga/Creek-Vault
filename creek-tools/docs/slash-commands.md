@@ -83,4 +83,4 @@ elevated token in `mcp.json`.
 
 - `creek-tools/docs/mcp.md` — MCP tool surface and privacy tier rules.
 - `crawdad/CLAUDE.md` — CrawDad architecture and quality bar.
-- [`plans/git-issues/FEAT-016-slash-command-grammar.md`](../../plans/git-issues/FEAT-016-slash-command-grammar.md) — the FEAT spec.
+- `FEAT-016` — the original slash-command-grammar spec; the `plans/git-issues/` directory was retired in #243, so use `git log --grep='FEAT-016'` for the implementing commits.

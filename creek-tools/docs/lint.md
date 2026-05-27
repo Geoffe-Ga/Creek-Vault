@@ -85,5 +85,5 @@ appends it to the audit report under the `## Lint summary` section
   unifies.
 - [`00-Creek-Meta/Skills/lint.SKILL.md`](../../00-Creek-Meta/Skills/lint.SKILL.md)
   — the schema skill that load-bears these rules.
-- [FEAT-008](../../plans/git-issues/done/FEAT-008-creek-lint-unified-hygiene.md)
-  — the implementation plan.
+- `FEAT-008` — the implementation plan (use `git log --grep='FEAT-008'`
+  for the originating commits; `plans/git-issues/` was retired in #243).
