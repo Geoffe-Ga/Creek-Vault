@@ -9,10 +9,12 @@ conftest.py to avoid model downloads.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 
 from creek.config import EmbeddingsConfig
 from creek.link.embeddings import (
@@ -28,8 +30,6 @@ from creek.models import Fragment, FragmentLevel, FragmentSource, SourcePlatform
 if TYPE_CHECKING:
     from pathlib import Path
     from unittest.mock import MagicMock
-
-    import pytest
 
 _DIMS = 384  # all-MiniLM-L6-v2 output dimensions
 
@@ -86,6 +86,95 @@ class TestLoadModel:
             "all-MiniLM-L6-v2",
             cache_dir,
         )
+
+
+class TestLoadModelFailure:
+    """GAP-008: ``EmbeddingModelUnavailableError`` wraps underlying failures."""
+
+    def test_oserror_is_wrapped_in_typed_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ``OSError`` from sentence-transformers becomes a typed error.
+
+        The most common production failure mode — model weights missing
+        and no network access on first run — surfaces as an ``OSError``
+        from deep inside the sentence-transformers / torch stack. The
+        typed error must name the model so the operator can act on the
+        error message alone (GAP-008 acceptance criterion 3).
+        """
+        from creek.link.embeddings import EmbeddingModelUnavailableError
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            msg = "model not downloaded and network unreachable"
+            raise OSError(msg)
+
+        monkeypatch.setattr(
+            "creek.link.embeddings._load_sentence_transformer",
+            boom,
+        )
+
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(model="all-MiniLM-L6-v2"),
+        )
+        with pytest.raises(
+            EmbeddingModelUnavailableError,
+            match="all-MiniLM-L6-v2",
+        ) as excinfo:
+            linker.load_model()
+
+        # Message names the remediation surface: `creek link
+        # --method embeddings` on a host with network access.
+        assert "creek link" in str(excinfo.value)
+        # The original OSError is preserved as __cause__ so the operator
+        # can inspect the underlying failure if needed.
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_runtimeerror_from_torch_is_wrapped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Torch-level ``RuntimeError`` (e.g. CUDA OOM) also yields the typed error."""
+        from creek.link.embeddings import EmbeddingModelUnavailableError
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            msg = "CUDA out of memory"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            "creek.link.embeddings._load_sentence_transformer",
+            boom,
+        )
+
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        with pytest.raises(EmbeddingModelUnavailableError):
+            linker.load_model()
+
+    def test_message_mentions_cache_dir_when_configured(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Operators with a non-default cache_dir see it in the error message."""
+        from creek.link.embeddings import EmbeddingModelUnavailableError
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError("missing")
+
+        monkeypatch.setattr(
+            "creek.link.embeddings._load_sentence_transformer",
+            boom,
+        )
+
+        cache_dir = str(tmp_path / "models")
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(cache_dir=cache_dir),
+        )
+        with pytest.raises(
+            EmbeddingModelUnavailableError,
+            match=re.escape(cache_dir),
+        ):
+            linker.load_model()
 
 
 # ---- Single Embedding ----
