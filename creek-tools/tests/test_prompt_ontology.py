@@ -120,6 +120,44 @@ def _yaml_payload(
     return "\n".join(sections)
 
 
+# ---- Cross-module import contract ----
+
+
+class TestSharedSymbolReexports:
+    """The shared parser / prompt-block helpers reach prompt.py via the package.
+
+    :mod:`creek.classify.prompt` imports the dimension blocks
+    (``_FREQUENCY_BLOCK`` etc.) and the parser helpers
+    (``_split_reasoning_and_yaml`` etc.) through ``creek.classify.llm``
+    rather than directly from the submodules. The package surface is
+    the stability contract, so these tests pin that the re-exports
+    exist and resolve to the same objects as the submodule originals.
+    """
+
+    def test_dimension_blocks_re_exported(self) -> None:
+        """Dimension prompt blocks resolve identically via package and submodule."""
+        from creek.classify import llm as llm_package
+        from creek.classify.llm import prompts as prompts_module
+
+        assert llm_package._FREQUENCY_BLOCK is prompts_module._FREQUENCY_BLOCK
+        assert llm_package._COLOR_BLOCK is prompts_module._COLOR_BLOCK
+        assert (
+            llm_package._FREQUENCY_COLOR_BLOCK is prompts_module._FREQUENCY_COLOR_BLOCK
+        )
+        assert llm_package._sanitise_for_prompt is prompts_module._sanitise_for_prompt
+
+    def test_parser_helpers_re_exported(self) -> None:
+        """Parser helpers resolve identically via package and submodule."""
+        from creek.classify import llm as llm_package
+        from creek.classify.llm import parsing as parsing_module
+
+        assert (
+            llm_package._split_reasoning_and_yaml
+            is parsing_module._split_reasoning_and_yaml
+        )
+        assert llm_package._strip_code_fences is parsing_module._strip_code_fences
+
+
 # ---- Dataclass shape ----
 
 

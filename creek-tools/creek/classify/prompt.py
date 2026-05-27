@@ -47,12 +47,19 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 
 import yaml
 
-from creek.classify.llm.parsing import _split_reasoning_and_yaml, _strip_code_fences
-from creek.classify.llm.prompts import (
+# Import the shared dimension blocks and parser helpers via the
+# ``creek.classify.llm`` package surface rather than the underlying
+# submodules. The package's ``__init__.py`` declares these as the
+# contracted import path, so a future reorganisation of ``parsing.py``
+# or ``prompts.py`` only needs to update the re-export — this module
+# stays untouched.
+from creek.classify.llm import (
     _COLOR_BLOCK,
     _FREQUENCY_BLOCK,
     _FREQUENCY_COLOR_BLOCK,
     _sanitise_for_prompt,
+    _split_reasoning_and_yaml,
+    _strip_code_fences,
 )
 from creek.models import (
     Dosage,
