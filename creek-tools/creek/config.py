@@ -264,6 +264,24 @@ class ClassificationConfig(BaseModel):
     — useful for triage runs over a known-uniform corpus.
     """
 
+    weighted_classification: bool = False
+    """Opt-in switch for epic-#364 / sub-issue-#366 weighted classification.
+
+    When ``False`` (default) the classify pipeline behaves exactly as
+    it did before #366: a single canonical pick per dimension lands on
+    :attr:`Fragment.frequency` / :attr:`Fragment.wavelength` /
+    :attr:`Fragment.voice`, and :attr:`Fragment.weighted` stays
+    ``None``. When ``True``, every LLM-classified fragment also gets a
+    :class:`~creek.classify.weighted.WeightedFragmentClassification`
+    persisted to :attr:`Fragment.weighted`; the legacy single-pick
+    fields are derived from the top weighted entries via
+    :meth:`WeightedFragmentClassification.to_legacy` so downstream
+    consumers (lint, compile, voice-skill generation) keep working
+    unchanged. The rule-based classifier path is unaffected — only
+    LLM-classified fragments carry the weighted profile in this
+    sub-issue.
+    """
+
 
 class ContextConfig(BaseModel):
     """Non-user content handling configuration.

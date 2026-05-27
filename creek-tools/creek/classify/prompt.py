@@ -53,7 +53,6 @@ from creek.classify.llm import (
     _FREQUENCY_BLOCK,
     _FREQUENCY_COLOR_BLOCK,
     _sanitise_for_prompt,
-    _split_reasoning_and_yaml,
 )
 
 # Promoted in #365: the weighted-tuple primitive and the YAML parser
@@ -62,24 +61,39 @@ from creek.classify.llm import (
 # import them without depending on this prompt-detection module.
 # Re-export them here so PR #359's public surface (``from
 # creek.classify.prompt import WeightedDimension, ...``) keeps working
-# unchanged.
+# unchanged. ``parse_weighted_yaml`` is the shared YAML parser core
+# that both this prompt-detection module and the fragment-level
+# classifier (#366) dispatch through.
+# Underscore-prefixed re-exports preserve the PR #359 import contract
+# (``from creek.classify.prompt import _coerce_weight``, etc.) for
+# tests and downstream callers that still target this module's
+# private namespace. The ``as`` aliases convert the imports into the
+# re-export form ruff/pylint recognises so they do not trip on
+# unused-import.
 from creek.classify.weighted import (
     WeightedDimension,
-    _coerce_weight,
-    _load_yaml_dict,
-    _parse_dimension,
+    parse_weighted_yaml,
 )
-from creek.models import (
-    Dosage,
-    Frequency,
-    Mode,
-    Orientation,
-    Phase,
-    VoiceRegister,
+from creek.classify.weighted import (
+    _coerce_weight as _coerce_weight,
+)
+from creek.classify.weighted import (
+    _load_yaml_dict as _load_yaml_dict,
+)
+from creek.classify.weighted import (
+    _parse_dimension as _parse_dimension,
 )
 
 if TYPE_CHECKING:
     from creek.config import LLMConfig
+    from creek.models import (
+        Dosage,
+        Frequency,
+        Mode,
+        Orientation,
+        Phase,
+        VoiceRegister,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -276,18 +290,22 @@ def parse_prompt_ontology_response(
         ValueError: When the YAML payload is malformed, multi-document,
             or contains unexpected top-level keys.
     """
-    reasoning, yaml_text = _split_reasoning_and_yaml(response)
-    data = _load_yaml_dict(yaml_text)
+    # The actual parsing lives on
+    # :func:`creek.classify.weighted.parse_weighted_yaml` so the
+    # prompt-level and fragment-level paths share one source of truth
+    # (issue #366). The wrapper here only adds the ``prompt`` echo
+    # onto the resulting dataclass.
+    parsed = parse_weighted_yaml(response)
     return PromptOntology(
         prompt=prompt,
-        frequencies=_parse_dimension(data, "frequencies", Frequency),
-        phases=_parse_dimension(data, "phases", Phase),
-        modes=_parse_dimension(data, "modes", Mode),
-        orientations=_parse_dimension(data, "orientations", Orientation),
-        dosages=_parse_dimension(data, "dosages", Dosage),
-        voice_registers=_parse_dimension(data, "voice_registers", VoiceRegister),
-        overall_confidence=_coerce_weight(data.get("overall_confidence")),
-        reasoning=reasoning,
+        frequencies=parsed.frequencies,
+        phases=parsed.phases,
+        modes=parsed.modes,
+        orientations=parsed.orientations,
+        dosages=parsed.dosages,
+        voice_registers=parsed.voice_registers,
+        overall_confidence=parsed.overall_confidence,
+        reasoning=parsed.reasoning,
     )
 
 

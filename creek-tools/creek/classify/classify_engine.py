@@ -53,6 +53,7 @@ from creek.classify.reatomize import (
     classify_reatomize,
 )
 from creek.classify.rules import RuleClassifier
+from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
@@ -73,7 +74,7 @@ _PROCESSING_LOG_SUBDIR = ("00-Creek-Meta", "Processing-Log")
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from creek.config import ClassificationConfig, CreekConfig
+    from creek.config import ClassificationConfig, CreekConfig, LLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,7 @@ def _process_file(
         rules=rules,
         llm=llm,
         confidence_threshold=classification_config.confidence_threshold,
+        weighted_classification=classification_config.weighted_classification,
     )
 
     # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
@@ -487,6 +489,7 @@ def _classify_one(
     rules: RuleClassifier,
     llm: LLMClassifier | None,
     confidence_threshold: float,
+    weighted_classification: bool = False,
 ) -> tuple[Fragment, bool, str]:
     """Run the chosen classifier on a single fragment.
 
@@ -498,6 +501,16 @@ def _classify_one(
         llm: :class:`LLMClassifier` instance when ``method == "llm"``.
         confidence_threshold: Threshold below which the LLM is invoked
             during ``--method llm`` runs.
+        weighted_classification: When ``True`` (issue #366), the LLM
+            path dispatches through
+            :func:`creek.classify.weighted.classify_weighted`, persists
+            the resulting weighted profile to
+            :attr:`Fragment.weighted`, and derives the legacy
+            single-pick fields via
+            :meth:`WeightedFragmentClassification.to_legacy` so
+            downstream consumers stay synchronised. Has no effect on
+            the rules path or on ``--method llm`` runs where the rule
+            classifier already cleared the confidence floor.
 
     Returns:
         ``(updated_fragment, skipped, reasoning)``. ``skipped`` is
@@ -518,8 +531,59 @@ def _classify_one(
     if llm is None:  # pragma: no cover  # no issue: defensive guard, unreachable
         msg = "LLM classifier required when method='llm'"
         raise RuntimeError(msg)
+    if weighted_classification:
+        return _classify_one_weighted(rule_result, body, llm.config)
     llm_result = llm.classify_with_reasoning(rule_result, content=body)
     return llm_result.fragment, False, llm_result.reasoning
+
+
+def _classify_one_weighted(
+    fragment: Fragment,
+    body: str,
+    llm_config: LLMConfig,
+) -> tuple[Fragment, bool, str]:
+    """Dispatch the LLM call through the #366 weighted classifier.
+
+    Replaces the single-pick LLM path when
+    :attr:`ClassificationConfig.weighted_classification` is set.
+    Populates :attr:`Fragment.weighted` with the full weighted
+    profile and derives the legacy single-pick fields from the
+    profile's top entries via
+    :meth:`WeightedFragmentClassification.to_legacy` so existing
+    consumers (lint, compile, voice-skill generation) stay
+    synchronised. When the underlying call fails soft to an empty
+    profile (provider unavailable, transport error, malformed YAML)
+    the legacy fields collapse to ``UNCLASSIFIED`` — the operator
+    sees the same "no signal" verdict the single-pick path produces
+    on failure.
+
+    Args:
+        fragment: Fragment carrying any rule-classifier output that
+            the LLM call is about to override.
+        body: Markdown body, supplied because :class:`Fragment` does
+            not carry its content text on the model itself.
+        llm_config: Provider configuration; honours the same Ollama /
+            Anthropic selection the legacy LLM path uses.
+
+    Returns:
+        ``(updated_fragment, False, reasoning)``: the weighted profile
+        plus its derived legacy fields land on the returned Fragment;
+        ``False`` reflects "the LLM was actually invoked"; the
+        reasoning trace mirrors the model's preamble for FEAT-017
+        observability.
+    """
+    ingested = IngestedFragment(fragment=fragment, body=body)
+    weighted = classify_weighted(ingested, llm_config)
+    freq, wave, voice = weighted.to_legacy()
+    updated = fragment.model_copy(
+        update={
+            "weighted": weighted,
+            "frequency": freq,
+            "wavelength": wave,
+            "voice": voice,
+        },
+    )
+    return updated, False, weighted.reasoning
 
 
 def _build_reatomize_classifier(
