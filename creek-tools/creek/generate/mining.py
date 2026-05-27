@@ -24,6 +24,7 @@ sophisticated scoring.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import operator
 import re
@@ -48,18 +49,20 @@ from creek.generate.compile_routing import (
     log_compile_gap,
 )
 from creek.models import (
+    Dosage,
     Eddy,
     Fragment,
+    Frequency,
+    Mode,
     Phase,
     PraxisPotential,
     Thread,
     ThreadStatus,
+    VoiceRegister,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    from creek.models import Frequency
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +113,9 @@ _NO_QUALIFYING_CHAIN: str = (
     "below min_chain_length={threshold}"
 )
 _UNCLASSIFIED_PHASE: str = "wavelength window skipped (current phase is unclassified)"
+
+DEFAULT_UNEXPLORED_LIMIT: int = 10
+"""Default number of under-explored ontology tuples to surface (#356)."""
 
 
 _STOPWORDS: frozenset[str] = frozenset(
@@ -190,12 +196,18 @@ def _jaccard_similarity(left: str, right: str) -> float:
 
 
 class MiningStrategy(StrEnum):
-    """Which of the four Section 11.5 strategies produced an idea seed."""
+    """Which mining strategy produced an idea seed.
+
+    The first four entries are the Section 11.5 strategies; the fifth,
+    ``UNEXPLORED_ONTOLOGY`` (#356), surfaces ontology combinations the
+    user has not yet inhabited as essay-seed candidates.
+    """
 
     LIMINAL_CROSS_EDDY = "liminal_cross_eddy"
     THREAD_TERMINUS = "thread_terminus"
     RESONANCE_CHAIN = "resonance_chain"
     WAVELENGTH_WINDOW = "wavelength_window"
+    UNEXPLORED_ONTOLOGY = "unexplored_ontology"
 
 
 @dataclass(frozen=True)
@@ -278,6 +290,37 @@ class IdeaSeed:
         if self.score < 0:
             msg = f"IdeaSeed.score must be non-negative, got {self.score!r}"
             raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class OntologyTuple:
+    """A point in (phase x frequency x mode x register x dosage) space (#356).
+
+    Represents one cell of the Cartesian product of the five classifying
+    dimensions the user assigns to fragments. Used by the
+    unexplored-ontology mining strategy to measure coverage and surface
+    under-inhabited corners as essay seeds.
+
+    Attributes:
+        phase: Archetypal Wavelength phase (e.g. ``Phase.WITHDRAWAL``).
+        frequency: APTITUDE frequency F1..F10.
+        mode: Engagement mode (``Mode.INHABIT`` etc.).
+        voice_register: Voice register; never ``None`` for a valid tuple.
+        dosage: Medicine / toxic / ambiguous dosage classification.
+    """
+
+    phase: Phase
+    frequency: Frequency
+    mode: Mode
+    voice_register: VoiceRegister
+    dosage: Dosage
+
+    def label(self) -> str:
+        """Return ``"phase x frequency x mode x register x dosage"`` for display."""
+        return (
+            f"{self.phase.value} x {self.frequency.value} x {self.mode.value} "
+            f"x {self.voice_register.value} x {self.dosage.value}"
+        )
 
 
 @dataclass(frozen=True)
@@ -389,6 +432,7 @@ def _load_liminal_fragments(
 
 
 _ModelT = TypeVar("_ModelT", Thread, Eddy)
+_EnumT = TypeVar("_EnumT", bound=StrEnum)
 
 
 def _load_typed(
@@ -696,6 +740,56 @@ class IdeaMiner:
             score=score,
         )
 
+    # ---- Strategy: Unexplored ontology (#356) ----
+
+    def mine_unexplored_ontology(
+        self,
+        vault_path: Path,
+        *,
+        limit: int = 0,
+        snapshot: MiningSnapshot | None = None,
+        require_corpus: bool = True,
+    ) -> list[IdeaSeed]:
+        """Return seeds for the rarest dimension tuples (#356).
+
+        Tuples are points in (phase x frequency x mode x register x dosage)
+        space. The strategy enumerates every fully-classified Cartesian point in
+        dimension space, measures the user's coverage from existing
+        fragments, then ranks by inverse coverage so the corners they
+        have not yet inhabited surface first. The score is
+        ``1 / (1 + count)``; empty cells score ``1.0`` and saturated
+        cells trend toward ``0``.
+
+        Args:
+            vault_path: Root of the Obsidian vault.
+            limit: Maximum number of seeds to surface. ``0`` (the default)
+                returns :data:`DEFAULT_UNEXPLORED_LIMIT` seeds. Negative
+                values clamp to zero, matching the rest of the public
+                surface.
+            snapshot: Optional pre-loaded snapshot to avoid re-scanning
+                the vault between strategies.
+            require_corpus: When ``True`` (the default), return an empty
+                list if the vault contains zero fragments — surfacing
+                "every combination is unexplored" against an empty
+                corpus is uninformative. Tests may set ``False`` to
+                exercise the empty-corpus rank-ordering directly.
+        """
+        snap = self._resolve_snapshot(vault_path, snapshot)
+        if require_corpus and not snap.fragments:
+            return []
+        if limit < 0:
+            # Honour the docstring "negative values clamp to zero":
+            # ``limit == 0`` means "use the default", ``limit < 0``
+            # means "no seeds, full stop" (a caller passing a negative
+            # value almost certainly arrived there by arithmetic that
+            # underflowed, and a silent fallback to the default would
+            # hide the bug).
+            return []
+        coverage = _coverage_by_tuple(snap.fragments)
+        effective_limit = DEFAULT_UNEXPLORED_LIMIT if limit == 0 else limit
+        ranked = _rank_tuples_by_inverse_coverage(coverage, effective_limit)
+        return list(itertools.starmap(_seed_from_ontology_tuple, ranked))
+
     # ---- Combined ----
 
     def mine_all(
@@ -763,11 +857,49 @@ class IdeaMiner:
             vault_path,
             snapshot=snap,
         )
-        combined = thread_seeds + liminal_seeds + wave_seeds + chain_seeds
+        gap_seeds, gap_diag = self._mine_unexplored_ontology_with_diagnostic(
+            vault_path,
+            snapshot=snap,
+        )
+        combined = thread_seeds + liminal_seeds + wave_seeds + chain_seeds + gap_seeds
         return MiningRunReport(
             seeds=tuple(_dedupe_sorted_seeds(combined)),
-            diagnostics=(thread_diag, liminal_diag, wave_diag, chain_diag),
+            diagnostics=(
+                thread_diag,
+                liminal_diag,
+                wave_diag,
+                chain_diag,
+                gap_diag,
+            ),
         )
+
+    def _mine_unexplored_ontology_with_diagnostic(
+        self,
+        vault_path: Path,
+        *,
+        snapshot: MiningSnapshot | None = None,
+    ) -> tuple[list[IdeaSeed], StrategyDiagnostic]:
+        """Run :meth:`mine_unexplored_ontology` and emit a diagnostic record.
+
+        Reports the cartesian product size as ``candidates_considered``
+        (one entry per (phase x frequency x mode x register x dosage)
+        cell), the number of seeds returned as ``candidates_kept``, the
+        highest inverse-coverage score as ``top_score``, and ``0.0`` as
+        the threshold — every cell is reportable, so the floor is
+        nominal rather than enforced.
+        """
+        seeds = self.mine_unexplored_ontology(vault_path, snapshot=snapshot)
+        top_score = max((seed.score for seed in seeds), default=0.0)
+        diagnostic = StrategyDiagnostic(
+            strategy=MiningStrategy.UNEXPLORED_ONTOLOGY,
+            candidates_considered=len(_enumerate_ontology_tuples()),
+            candidates_kept=len(seeds),
+            top_score=top_score,
+            threshold=0.0,
+            fallback_reason=None,
+        )
+        _emit_diagnostic(diagnostic)
+        return seeds, diagnostic
 
     # ---- Strategy: Resonance chain ----
 
@@ -1253,18 +1385,154 @@ def _fragment_frequencies(fragment: Fragment) -> tuple[Frequency, ...]:
     ``use_enum_values=True`` means the attributes are raw strings; callers
     still receive :class:`Frequency` values for type safety.
     """
-    from creek.models import Frequency as _Freq  # local import keeps deps tight
-
-    primary = _Freq(fragment.frequency.primary)
+    primary = Frequency(fragment.frequency.primary)
     result: list[Frequency] = [primary]
     seen = {primary}
     for secondary in fragment.frequency.secondary:
-        freq = _Freq(secondary)
+        freq = Frequency(secondary)
         if freq in seen:
             continue
         seen.add(freq)
         result.append(freq)
     return tuple(result)
+
+
+def _fragment_to_ontology_tuple(fragment: Fragment) -> OntologyTuple | None:
+    """Return the fragment's full ontology position, or ``None`` if any axis is unset.
+
+    Fragments missing a dimension (``UNCLASSIFIED`` phase / frequency /
+    mode / dosage or absent voice register) do not contribute to coverage:
+    counting them would falsely inflate the rarest-corner signal with
+    fragments that are themselves under-classified.
+    """
+    register = fragment.voice.voice_register
+    if register is None:
+        return None
+    try:
+        phase = Phase(fragment.wavelength.phase)
+        frequency = Frequency(fragment.frequency.primary)
+        mode = Mode(fragment.wavelength.mode)
+        dosage = Dosage(fragment.wavelength.dosage)
+        voice = VoiceRegister(register)
+    except ValueError:
+        return None
+    unclassified = {
+        phase == Phase.UNCLASSIFIED,
+        frequency == Frequency.UNCLASSIFIED,
+        mode == Mode.UNCLASSIFIED,
+        dosage == Dosage.UNCLASSIFIED,
+    }
+    if True in unclassified:
+        return None
+    return OntologyTuple(
+        phase=phase,
+        frequency=frequency,
+        mode=mode,
+        voice_register=voice,
+        dosage=dosage,
+    )
+
+
+def _coverage_by_tuple(
+    fragments: tuple[tuple[Fragment, str], ...],
+) -> dict[OntologyTuple, int]:
+    """Return a count of how many fragments occupy each ontology tuple.
+
+    Only fully-classified fragments contribute. Tuples with zero
+    coverage are absent from the returned mapping; the caller materialises
+    them by enumerating the full Cartesian product.
+    """
+    counts: dict[OntologyTuple, int] = {}
+    for fragment, _body in fragments:
+        position = _fragment_to_ontology_tuple(fragment)
+        if position is None:
+            continue
+        counts[position] = counts.get(position, 0) + 1
+    return counts
+
+
+def _classified_values(enum_cls: type[_EnumT], unclassified: _EnumT) -> list[_EnumT]:
+    """Return every enum member except the ``UNCLASSIFIED`` sentinel."""
+    return [value for value in enum_cls if value is not unclassified]
+
+
+def _enumerate_ontology_tuples() -> list[OntologyTuple]:
+    """Return every fully-classified point in the dimension Cartesian product.
+
+    ``UNCLASSIFIED`` values are excluded from every dimension so seeds
+    represent meaningful corners. The order is deterministic — the
+    enum-iteration order is the source — so equal-score ranks are stable
+    across runs.
+    """
+    product = itertools.product(
+        _classified_values(Phase, Phase.UNCLASSIFIED),
+        _classified_values(Frequency, Frequency.UNCLASSIFIED),
+        _classified_values(Mode, Mode.UNCLASSIFIED),
+        VoiceRegister,
+        _classified_values(Dosage, Dosage.UNCLASSIFIED),
+    )
+    return list(itertools.starmap(_build_ontology_tuple, product))
+
+
+def _build_ontology_tuple(
+    phase: Phase,
+    frequency: Frequency,
+    mode: Mode,
+    register: VoiceRegister,
+    dosage: Dosage,
+) -> OntologyTuple:
+    """Return an :class:`OntologyTuple` for the five dimensional positions."""
+    return OntologyTuple(
+        phase=phase,
+        frequency=frequency,
+        mode=mode,
+        voice_register=register,
+        dosage=dosage,
+    )
+
+
+def _rank_tuples_by_inverse_coverage(
+    coverage: dict[OntologyTuple, int],
+    limit: int,
+) -> list[tuple[OntologyTuple, int]]:
+    """Return the *limit* rarest tuples as ``(position, count)`` pairs.
+
+    Empty cells (count zero) rank highest. Ties resolve deterministically
+    by the order returned from :func:`_enumerate_ontology_tuples`.
+    """
+    ranked: list[tuple[OntologyTuple, int]] = [
+        (position, coverage.get(position, 0))
+        for position in _enumerate_ontology_tuples()
+    ]
+    ranked.sort(key=operator.itemgetter(1))
+    return ranked[:limit]
+
+
+def _seed_from_ontology_tuple(position: OntologyTuple, count: int) -> IdeaSeed:
+    """Build an :class:`IdeaSeed` for an under-explored ontology tuple."""
+    label = position.label()
+    if count == 0:
+        coverage_clause = "never inhabited"
+    else:
+        coverage_clause = f"barely touched ({count} fragments)"
+    description = (
+        f"Your voice in {position.phase.value}, working "
+        f"{position.frequency.value} material in {position.mode.value} mode, "
+        f"in the {position.voice_register.value} register at the "
+        f"{position.dosage.value} dosage - a corner you have "
+        f"{coverage_clause}. "
+        "What would the essay you have not yet written here sound like?"
+    )
+    return IdeaSeed(
+        strategy=MiningStrategy.UNEXPLORED_ONTOLOGY,
+        title=f"Unexplored: {label}",
+        source_fragments=(),
+        threads=(),
+        eddies=(),
+        frequency_affinity=(position.frequency,),
+        brief_description=description,
+        score=1.0 / (1 + count),
+    )
 
 
 def _connected_components(edges: list[tuple[str, str]]) -> list[frozenset[str]]:
@@ -1294,12 +1562,10 @@ def _connected_components(edges: list[tuple[str, str]]) -> list[frozenset[str]]:
 
 def _union_frequencies(fragments: list[Fragment]) -> tuple[Frequency, ...]:
     """Return the ordered union of primary frequencies in *fragments*."""
-    from creek.models import Frequency as _Freq
-
     seen: list[Frequency] = []
     seen_set: set[Frequency] = set()
     for fragment in fragments:
-        freq = _Freq(fragment.frequency.primary)
+        freq = Frequency(fragment.frequency.primary)
         if freq in seen_set:
             continue
         seen_set.add(freq)
