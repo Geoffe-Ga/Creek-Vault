@@ -280,6 +280,34 @@ class TestParsePromptOntologyResponse:
         ontology = parse_prompt_ontology_response(payload, prompt="seed")
         assert ontology.phases == (WeightedDimension(value=Phase.RISING, weight=0.0),)
 
+    def test_nan_weight_collapses_to_zero(self) -> None:
+        """NaN weights collapse to zero so downstream rankings stay finite.
+
+        Regression for PR #359 review: ``NaN`` slips past both the
+        ``< 0.0`` and ``> 1.0`` clamp branches because NaN comparisons
+        always return ``False``. The parser now treats any non-finite
+        value as a missing signal.
+        """
+        payload = _yaml_payload(
+            frequencies="  - value: F3\n    weight: .nan",
+            overall_confidence=float("nan"),
+        )
+        ontology = parse_prompt_ontology_response(payload, prompt="seed")
+        assert ontology.frequencies == (
+            WeightedDimension(value=Frequency.F3, weight=0.0),
+        )
+        assert ontology.overall_confidence == 0.0
+
+    def test_infinite_weight_collapses_to_zero(self) -> None:
+        """Positive infinity is also non-finite and must not propagate."""
+        payload = _yaml_payload(
+            frequencies="  - value: F3\n    weight: .inf",
+        )
+        ontology = parse_prompt_ontology_response(payload, prompt="seed")
+        assert ontology.frequencies == (
+            WeightedDimension(value=Frequency.F3, weight=0.0),
+        )
+
     def test_missing_dimension_is_empty_tuple(self) -> None:
         """Dimensions absent from the response produce an empty tuple."""
         payload = _yaml_payload(voice_registers="")

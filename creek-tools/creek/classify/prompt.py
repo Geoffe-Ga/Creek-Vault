@@ -40,6 +40,7 @@ re-gloss in one place reaches both detectors.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Generic, TypeVar
@@ -292,6 +293,12 @@ def _coerce_weight(value: object) -> float:
     if not isinstance(value, (int, float)):
         return 0.0
     weight = float(value)
+    if not math.isfinite(weight):
+        # NaN slips past both clamp branches because NaN comparisons
+        # always return False, and ±inf would amplify rankings without
+        # bound. Both collapse to zero so downstream composition stays
+        # honest (PR #359 review).
+        return 0.0
     if weight < 0.0:
         return 0.0
     if weight > 1.0:
@@ -400,7 +407,7 @@ def _load_yaml_dict(yaml_text: str) -> dict[str, object]:
     parsed: object = docs[0] if docs else None
     if not isinstance(parsed, dict):
         msg = f"Expected YAML dict, got {type(parsed).__name__}"
-        raise ValueError(msg)  # noqa: TRY004
+        raise ValueError(msg)  # noqa: TRY004  # ValueError matches the documented schema-validation contract on this function and on detect_ontology's caller; switching to TypeError would break the documented Raises section without functional benefit.
     keys = {str(k) for k in parsed}
     extras = keys - _ALLOWED_TOP_LEVEL_KEYS
     if extras:
