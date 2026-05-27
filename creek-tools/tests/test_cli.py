@@ -2548,3 +2548,121 @@ def test_draft_without_seed_flags_keeps_mining_behaviour(
     result = runner.invoke(app, ["draft", "--vault", str(vault)])
     assert result.exit_code == 0
     assert "No idea seeds surfaced" in result.output
+
+
+# ---- Issue #352: --ontology-twist CLI flag ---------------------------------
+
+
+def test_draft_ontology_twist_advertised_in_help() -> None:
+    """``creek draft --help`` documents ``--ontology-twist``."""
+    result = runner.invoke(app, ["draft", "--help"])
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 0
+    assert "--ontology-twist" in output
+
+
+def test_draft_ontology_twist_without_seed_exits_with_clear_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--ontology-twist`` alone (no seed) exits 2 with a clear hint."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--ontology-twist"],
+    )
+    assert result.exit_code == 2
+    output = _strip_ansi(result.output)
+    assert "--ontology-twist requires a seed" in output
+
+
+def test_draft_ontology_twist_plurality_failure_exits_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-source twist fails fast at the CLI with the plurality error.
+
+    Issue #352 acceptance: "fails loudly if only one source matches".
+    """
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(vault, frag_id="frag-only", primary="F1", phase="peaking")
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-phase",
+            "peaking",
+            "--ontology-twist",
+        ],
+    )
+    assert result.exit_code == 1
+    output = _strip_ansi(result.output)
+    assert "at least two source fragments" in output
+
+
+def test_draft_ontology_twist_happy_path_writes_twist_frontmatter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--ontology-twist`` with a plural source set records twist provenance.
+
+    Two withdrawal-phase fragments are retrieved by the explicit
+    ``--seed-phase withdrawal`` filter; the target profile takes the
+    withdrawal pick from the same flag, so divergence (if any) comes
+    from inspecting both profiles. The acceptance criterion is that the
+    frontmatter records source/target profiles + twist_dimensions.
+    """
+    import frontmatter as fm
+
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda: lambda _p: "Twisted draft body.",
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    # Two withdrawal-phase fragments so the WITHDRAWAL slice is plural;
+    # both also share mode=inhabit so source.mode is deterministic.
+    _write_seed_fragment(
+        vault, frag_id="frag-A", primary="F1", phase="withdrawal", mode="inhabit"
+    )
+    _write_seed_fragment(
+        vault, frag_id="frag-B", primary="F1", phase="withdrawal", mode="inhabit"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-phase",
+            "withdrawal",
+            "--seed-mode",
+            "express",
+            "--ontology-twist",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    post = fm.load(str(drafts[0]))
+    # Frontmatter records both profiles and the divergent dimensions.
+    assert post.metadata["source_profile"]["phase"] == "withdrawal"
+    assert post.metadata["source_profile"]["mode"] == "inhabit"
+    assert post.metadata["target_profile"]["phase"] == "withdrawal"
+    assert post.metadata["target_profile"]["mode"] == "express"
+    # Only mode diverges between source and target.
+    assert post.metadata["twist_dimensions"] == ["mode"]
