@@ -707,6 +707,37 @@ class MiningConfig(BaseModel):
     """
 
 
+class DraftConfig(BaseModel):
+    """Configuration for the ``creek draft`` grounding guard (issue #355).
+
+    The bidirectional grounding guard surfaces two failure modes after a
+    draft is generated:
+
+    * **Too derivative** — at least one draft paragraph paraphrases a
+      source-fragment paragraph closely (cosine similarity above
+      :attr:`derivative_upper`).
+    * **Too ungrounded** — fewer than :attr:`grounding_lower` fraction of
+      draft paragraphs share *any* similarity with a source paragraph
+      above the same lower bound, i.e. the draft is conceptually
+      invented.
+
+    Defaults are deliberately lenient (0.85 / 0.30); operators tighten
+    once they have a calibration set for their own corpus. Both
+    thresholds are cosine similarities and so must live in ``[0.0, 1.0]``.
+    """
+
+    derivative_upper: float = Field(default=0.85, ge=0.0, le=1.0)
+    """Paragraph cosine-similarity ceiling above which a draft paragraph
+    is treated as a paraphrase of a source paragraph and the draft is
+    flagged ``too derivative``."""
+
+    grounding_lower: float = Field(default=0.30, ge=0.0, le=1.0)
+    """Cosine-similarity floor a draft paragraph must clear against
+    *some* source paragraph to count as grounded. Doubles as the
+    minimum acceptable fraction of grounded paragraphs: drafts whose
+    grounded fraction sits below this value are flagged ``too ungrounded``."""
+
+
 class LintConfig(BaseModel):
     """Configuration for ``creek lint`` checks (FEAT-008, FEAT-025).
 
@@ -817,6 +848,9 @@ class CreekConfig(BaseSettings):
 
     mining: MiningConfig = Field(default_factory=MiningConfig)
     """Idea-mining thresholds (issue #340)."""
+
+    draft: DraftConfig = Field(default_factory=DraftConfig)
+    """Bidirectional grounding-guard thresholds (issue #355)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""

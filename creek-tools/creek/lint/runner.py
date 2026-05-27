@@ -22,6 +22,9 @@ from creek.lint.checks import (
     compost as compost_check,
 )
 from creek.lint.checks import (
+    draft_grounding as draft_grounding_check,
+)
+from creek.lint.checks import (
     paradox as paradox_check,
 )
 from creek.lint.checks import (
@@ -62,6 +65,7 @@ DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "skill-size",
     "tags",
     "compost",
+    "draft-grounding",
 )
 """Cheap checks that always run by default (link graph + frontmatter only)."""
 
@@ -80,6 +84,7 @@ _REGISTRY: dict[str, _CheckCallable] = {
     "skill-size": skill_size_budget.run,
     "tags": tags_check.run,
     "compost": compost_check.run,
+    "draft-grounding": draft_grounding_check.run,
     "paradox": paradox_check.run,
     "synchronicity": synchronicity_check.run,
     "unnamed": unnamed_check.run,
