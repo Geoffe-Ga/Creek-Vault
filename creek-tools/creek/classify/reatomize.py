@@ -46,7 +46,9 @@ __all__ = [
     "Direction",
     "ReatomizeConfig",
     "StopReason",
+    "bubble_up_weighted",
     "choose_direction",
+    "choose_intelligent_unit",
     "classify_reatomize",
     "classify_reatomize_stream",
 ]
@@ -545,3 +547,164 @@ def _tree_for_parent(
         stop_reason=stop,
         children=child_trees,
     )
+
+
+# ---- Weighted bubble-up (issue #368) ---------------------------------------
+
+
+def bubble_up_weighted(tree: ClassificationTree) -> ClassificationTree:
+    """Recursively roll up children's weighted classifications onto parents.
+
+    Walks the tree depth-first, combining each non-leaf node's
+    children via :func:`creek.classify.holonic.combine` (which
+    enforces the conviction x confidence contract from #367 — length
+    is never the default mass) and stamping the combined
+    :class:`~creek.classify.weighted.WeightedFragmentClassification`
+    onto the parent fragment's :attr:`weighted` field. Leaves flow
+    through unchanged.
+
+    Children whose :attr:`Fragment.weighted` is ``None`` are excluded
+    from the combine (zero-confidence pass-through, #367 invariant) —
+    they do not pollute the parent's profile. When every child's
+    weighted is ``None``, the parent's weighted stays ``None`` too
+    (honest "no signal" rather than fabricating one).
+
+    Args:
+        tree: The classification tree produced by
+            :func:`classify_reatomize`. Each leaf is expected to
+            already carry a :attr:`Fragment.weighted` populated by
+            #366's classifier; missing ``weighted`` is treated as
+            "no signal" and skipped.
+
+    Returns:
+        A new tree with every internal node's
+        :attr:`Fragment.weighted` derived from its children's
+        weighted profiles. Leaves are returned unchanged.
+    """
+    # Local import dodges the cycle that would otherwise form via
+    # creek.models -> creek.classify.weighted -> creek.classify.holonic
+    # at module load; reatomize itself is loaded after models so this is fine.
+    from creek.classify.holonic import combine
+
+    if not tree.children:
+        return tree
+
+    bubbled_children = tuple(bubble_up_weighted(child) for child in tree.children)
+
+    weighted_inputs = [
+        child.fragment.fragment.weighted
+        for child in bubbled_children
+        if child.fragment.fragment.weighted is not None
+    ]
+    if not weighted_inputs:
+        # No contributing children — leave the parent's ``weighted``
+        # untouched (honest "no signal").
+        return ClassificationTree(
+            fragment=tree.fragment,
+            confidence=tree.confidence,
+            stop_reason=tree.stop_reason,
+            children=bubbled_children,
+            depth=tree.depth,
+        )
+
+    combined = combine(weighted_inputs)
+    new_parent_fragment = tree.fragment.fragment.model_copy(
+        update={"weighted": combined},
+    )
+    new_parent_ingested = IngestedFragment(
+        fragment=new_parent_fragment,
+        body=tree.fragment.body,
+    )
+    return ClassificationTree(
+        fragment=new_parent_ingested,
+        confidence=tree.confidence,
+        stop_reason=tree.stop_reason,
+        children=bubbled_children,
+        depth=tree.depth,
+    )
+
+
+def choose_intelligent_unit(
+    tree: ClassificationTree,
+    *,
+    threshold: float = 0.6,
+    material_delta: float = 0.05,
+) -> ClassificationTree:
+    """Pick the holarchy level whose weighted profile is the right grain.
+
+    Walks the (bubbled) tree and surfaces the deepest descendant
+    whose ``Fragment.weighted.overall_confidence`` reaches
+    ``threshold`` and whose immediate ancestor does not improve
+    confidence by more than ``material_delta``. Falls back to the
+    root when no descendant clears the bar — the operator still gets
+    a usable answer, just at coarser grain.
+
+    Args:
+        tree: A bubbled :class:`ClassificationTree`. Should be the
+            output of :func:`bubble_up_weighted`; raw orchestrator
+            output without bubbling will return the root since no
+            parent has a ``weighted`` set.
+        threshold: Confidence floor — a node must reach this to be
+            considered a candidate.
+        material_delta: A child's confidence improves on its parent
+            "materially" when the parent's confidence is at most
+            ``material_delta`` higher. When the parent fails this
+            test, the child is preferred as a finer-grain unit.
+
+    Returns:
+        The chosen :class:`ClassificationTree` node. The caller can
+        compare ``chosen.depth`` against ``tree.depth`` to learn the
+        recommended grain.
+    """
+    return _choose_intelligent_unit_recursive(
+        tree,
+        threshold=threshold,
+        material_delta=material_delta,
+    )
+
+
+def _choose_intelligent_unit_recursive(
+    node: ClassificationTree,
+    *,
+    threshold: float,
+    material_delta: float,
+) -> ClassificationTree:
+    """Recursion body for :func:`choose_intelligent_unit`.
+
+    Considers ``node`` plus the result of recursing into each child.
+    When a child's confidence reaches the threshold and the parent
+    does not materially improve on the child, the child wins. Ties
+    (no child clears) fall back to ``node`` itself.
+    """
+    node_confidence = _node_confidence_or_zero(node)
+
+    best_descendant: ClassificationTree | None = None
+    for child in node.children:
+        descendant = _choose_intelligent_unit_recursive(
+            child,
+            threshold=threshold,
+            material_delta=material_delta,
+        )
+        desc_confidence = _node_confidence_or_zero(descendant)
+        if desc_confidence < threshold:
+            continue
+        if node_confidence - desc_confidence > material_delta:
+            # Parent materially outperforms — prefer the parent
+            # (this iteration), so do not promote the descendant.
+            continue
+        if best_descendant is None or desc_confidence > _node_confidence_or_zero(
+            best_descendant
+        ):
+            best_descendant = descendant
+
+    if best_descendant is not None:
+        return best_descendant
+    return node
+
+
+def _node_confidence_or_zero(node: ClassificationTree) -> float:
+    """Return ``node``'s weighted overall_confidence, defaulting to 0.0."""
+    weighted = node.fragment.fragment.weighted
+    if weighted is None:
+        return 0.0
+    return weighted.overall_confidence
