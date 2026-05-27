@@ -106,6 +106,39 @@ _EDDIES_DIR: str = "eddies"
 _META_DIR: str = "meta"
 
 _SKILL_SUFFIX: str = ".SKILL.md"
+_SIGNATURE_SUFFIX: str = ".SIGNATURE.md"
+
+_VARIANT_SKILL: str = "skill"
+"""Frontmatter value for the legacy exemplar-bearing variant."""
+
+_VARIANT_SIGNATURE: str = "signature"
+"""Frontmatter value for the abstract, exemplar-free variant (issue #353)."""
+
+_SIGNATURE_HEADER_BODY: str = (
+    "**Variant: SIGNATURE.** This skill file is the *signature-only* "
+    "variant — it carries voice texture, anti-patterns, writing "
+    "instructions, and register prompts but no quoted user content. "
+    "Source material is expected to come from a separate retrieval "
+    "pathway so the language model is not biased toward replicating "
+    "specific passages. See issue #353."
+)
+"""Top-of-body banner that announces a signature-only file."""
+
+_SKILL_HEADER_BODY: str = (
+    "**Variant: SKILL.** This skill file is the legacy exemplar-bearing "
+    "variant — it pairs voice patterns with quoted passages harvested "
+    "from the user's classified Fragments. The abstract-only alternative "
+    "without quoted content can be generated alongside this file via "
+    "``creek skills generate --signature-only`` (issue #353)."
+)
+"""Top-of-body banner that announces a legacy exemplar-bearing file.
+
+The banner points at the CLI invocation that generates the alternative
+``.SIGNATURE.md`` variant rather than at the file itself: a fresh
+default-only generation leaves no ``.SIGNATURE.md`` on disk, and the
+previous wording (\"see the matching ``.SIGNATURE.md`` file\") then
+read as a broken reference — PR #357 review feedback.
+"""
 
 _EXEMPLAR_WORDS_MIN: int = 30
 """Exemplar passages below this word count are skipped as too thin."""
@@ -758,21 +791,84 @@ def _write_skill(
     title: str,
     body: str,
     extra_tags: Iterable[str] = (),
+    variant: str = _VARIANT_SKILL,
 ) -> Path:
-    """Persist a SKILL.md file with frontmatter and return its path."""
+    """Persist a skill markdown file with frontmatter and return its path.
+
+    Args:
+        target: Output file path. The caller chooses the suffix
+            (``.SKILL.md`` or ``.SIGNATURE.md``) so both variants can
+            coexist in the same directory.
+        category: Skill category (``frequency``, ``phase``, ...).
+        key: The dimension key (``F3``, ``rising``, ...).
+        title: Human-readable title.
+        body: Rendered markdown body. A variant banner is prepended.
+        extra_tags: Additional tag values appended after the canonical
+            ``skill``/category tags.
+        variant: Either :data:`_VARIANT_SKILL` (default, legacy
+            exemplar-bearing files) or :data:`_VARIANT_SIGNATURE`
+            (abstract-only files; issue #353). The value is recorded in
+            frontmatter and the corresponding banner is rendered at the
+            top of the body.
+
+    Returns:
+        The path the file was written to.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
-    tags = ["skill", category, *extra_tags]
+    # ``"skill"`` already sits at position 0; appending ``variant`` when
+    # the variant string is also ``"skill"`` would duplicate the tag and
+    # confuse anything that counts occurrences in the raw frontmatter
+    # (PR #357 review). Frontmatter still carries the ``variant`` field
+    # unconditionally so the two variants stay distinguishable at the
+    # field level, not just the tag level.
+    variant_tags = [variant] if variant != _VARIANT_SKILL else []
+    tags = ["skill", category, *variant_tags, *extra_tags]
+    full_body = _prepend_variant_banner(body.strip(), variant=variant)
     post = frontmatter.Post(
-        content=body.strip() + "\n",
+        content=full_body + "\n",
         type="skill",
         category=category,
         key=key,
         title=title,
+        variant=variant,
         generated_date=datetime.now(tz=UTC).isoformat(),
         tags=tags,
     )
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
+
+
+def _prepend_variant_banner(body: str, *, variant: str) -> str:
+    """Prepend the variant declaration banner to *body*.
+
+    The banner is the first block in every generated file so a human (or
+    a downstream loader) can immediately tell whether the file is the
+    legacy ``SKILL`` variant or the signature-only ``SIGNATURE`` variant
+    (issue #353).
+
+    Args:
+        body: The rendered markdown body without any banner.
+        variant: Either :data:`_VARIANT_SKILL` or
+            :data:`_VARIANT_SIGNATURE`.
+
+    Returns:
+        The body with the variant banner prepended.
+    """
+    banner = (
+        _SIGNATURE_HEADER_BODY if variant == _VARIANT_SIGNATURE else _SKILL_HEADER_BODY
+    )
+    return f"{banner}\n\n{body}"
+
+
+def _skill_filename(stem: str, *, signature_only: bool) -> str:
+    """Return the filename for a skill *stem* respecting the variant.
+
+    The signature-only variant uses ``.SIGNATURE.md`` so it can coexist
+    with the legacy ``.SKILL.md`` variant in the same directory
+    (issue #353).
+    """
+    suffix = _SIGNATURE_SUFFIX if signature_only else _SKILL_SUFFIX
+    return f"{stem}{suffix}"
 
 
 # ---- Generator ----
@@ -790,6 +886,12 @@ class SkillTreeGenerator:
             file. Defaults to five.
         allow_intimate: When ``True``, fragments tagged ``intimate``
             participate in exemplar harvesting. Defaults to ``False``.
+        signature_only: When ``True`` (issue #353), emit the
+            signature-only variant. Files are written under the
+            ``.SIGNATURE.md`` suffix, the exemplar section is omitted
+            entirely, and frontmatter records ``variant: signature`` so
+            downstream consumers can pick the variant deliberately.
+            Defaults to ``False`` (legacy exemplar-bearing behaviour).
     """
 
     def __init__(
@@ -799,6 +901,7 @@ class SkillTreeGenerator:
         min_eddy_fragments: int = DEFAULT_MIN_EDDY_FRAGMENTS,
         max_exemplars: int = DEFAULT_MAX_EXEMPLARS,
         allow_intimate: bool = False,
+        signature_only: bool = False,
     ) -> None:
         """Initialise the generator with the given configuration.
 
@@ -810,6 +913,10 @@ class SkillTreeGenerator:
             max_exemplars: Maximum exemplar passages per skill.
             allow_intimate: Whether to include ``intimate`` privacy
                 tier fragments during harvesting.
+            signature_only: When ``True``, write the signature-only
+                variant (issue #353) — abstract patterns only, no
+                quoted user content, ``.SIGNATURE.md`` suffix. The two
+                variants are designed to coexist in the same vault.
 
         Raises:
             ValueError: When any numeric threshold is negative.
@@ -827,6 +934,7 @@ class SkillTreeGenerator:
         self.min_eddy_fragments = min_eddy_fragments
         self.max_exemplars = max_exemplars
         self.allow_intimate = allow_intimate
+        self.signature_only = signature_only
 
     # -- Public surface ------------------------------------------------
 
@@ -962,25 +1070,32 @@ class SkillTreeGenerator:
             output_dir: Destination directory for the skill tree.
 
         Returns:
-            Paths to the two written meta SKILL files.
+            Paths to the two written meta skill files.
         """
         meta_dir = output_dir / _META_DIR
+        variant = self._variant_tag()
         written: list[Path] = [
             _write_skill(
-                meta_dir / f"voice-core{_SKILL_SUFFIX}",
+                meta_dir
+                / _skill_filename("voice-core", signature_only=self.signature_only),
                 category="meta",
                 key="voice-core",
                 title="Voice Core — Master Profile",
                 body=self._render_voice_core_body(),
                 extra_tags=("voice-core",),
+                variant=variant,
             ),
             _write_skill(
-                meta_dir / f"skill-activation-guide{_SKILL_SUFFIX}",
+                meta_dir
+                / _skill_filename(
+                    "skill-activation-guide", signature_only=self.signature_only
+                ),
                 category="meta",
                 key="skill-activation-guide",
                 title="Skill Activation Guide",
                 body=self._render_activation_guide_body(),
                 extra_tags=("activation-guide",),
+                variant=variant,
             ),
         ]
         return written
@@ -992,14 +1107,16 @@ class SkillTreeGenerator:
         snapshot: VaultSnapshot,
         output_dir: Path,
     ) -> list[Path]:
-        """Render one SKILL.md per frequency using *snapshot* exemplars."""
+        """Render one skill file per frequency using *snapshot* exemplars."""
         target_dir = output_dir / _FREQUENCIES_DIR
         by_frequency = _group_fragments_by_frequency(snapshot.fragments)
         written: list[Path] = []
         for freq_key in FREQUENCY_KEYS:
-            exemplars = self._pick_exemplars(by_frequency.get(freq_key, []))
+            exemplars = self._maybe_pick_exemplars(by_frequency.get(freq_key, []))
             body = self._render_frequency_body(freq_key, exemplars)
-            target = target_dir / f"{freq_key}{_SKILL_SUFFIX}"
+            target = target_dir / _skill_filename(
+                freq_key, signature_only=self.signature_only
+            )
             written.append(
                 _write_skill(
                     target,
@@ -1008,6 +1125,7 @@ class SkillTreeGenerator:
                     title=f"{freq_key}: {FREQUENCY_NAMES[Frequency(freq_key)]}",
                     body=body,
                     extra_tags=(freq_key,),
+                    variant=self._variant_tag(),
                 ),
             )
         return written
@@ -1017,14 +1135,16 @@ class SkillTreeGenerator:
         snapshot: VaultSnapshot,
         output_dir: Path,
     ) -> list[Path]:
-        """Render one SKILL.md per wavelength phase."""
+        """Render one skill file per wavelength phase."""
         target_dir = output_dir / _PHASES_DIR
         by_phase = _group_fragments_by_phase(snapshot.fragments)
         written: list[Path] = []
         for phase_key in PHASE_KEYS:
-            exemplars = self._pick_exemplars(by_phase.get(phase_key, []))
+            exemplars = self._maybe_pick_exemplars(by_phase.get(phase_key, []))
             body = self._render_phase_body(phase_key, exemplars)
-            target = target_dir / f"{phase_key}{_SKILL_SUFFIX}"
+            target = target_dir / _skill_filename(
+                phase_key, signature_only=self.signature_only
+            )
             written.append(
                 _write_skill(
                     target,
@@ -1033,6 +1153,7 @@ class SkillTreeGenerator:
                     title=f"Phase: {phase_key.replace('_', ' ').title()}",
                     body=body,
                     extra_tags=(phase_key,),
+                    variant=self._variant_tag(),
                 ),
             )
         return written
@@ -1042,26 +1163,28 @@ class SkillTreeGenerator:
         snapshot: VaultSnapshot,
         output_dir: Path,
     ) -> list[Path]:
-        """Render one SKILL.md per Mode/Orientation pair."""
+        """Render one skill file per Mode/Orientation pair."""
         target_dir = output_dir / _MODES_DIR
         by_pair = _group_fragments_by_mode_orientation(snapshot.fragments)
         written: list[Path] = []
         for mode_key, orientation_key in MODE_ORIENTATION_KEYS:
             pair = (mode_key, orientation_key)
-            exemplars = self._pick_exemplars(by_pair.get(pair, []))
+            exemplars = self._maybe_pick_exemplars(by_pair.get(pair, []))
             body = self._render_mode_body(mode_key, orientation_key, exemplars)
-            filename = _mode_orientation_key(mode_key, orientation_key)
+            stem = _mode_orientation_key(mode_key, orientation_key)
+            filename = _skill_filename(stem, signature_only=self.signature_only)
             title = (
                 f"{mode_key.capitalize()}-{orientation_key.replace('_', '/').title()}"
             )
             written.append(
                 _write_skill(
-                    target_dir / f"{filename}{_SKILL_SUFFIX}",
+                    target_dir / filename,
                     category="mode",
-                    key=filename,
+                    key=stem,
                     title=title,
                     body=body,
                     extra_tags=(mode_key, orientation_key),
+                    variant=self._variant_tag(),
                 ),
             )
         return written
@@ -1071,21 +1194,23 @@ class SkillTreeGenerator:
         snapshot: VaultSnapshot,
         output_dir: Path,
     ) -> list[Path]:
-        """Render one SKILL.md per voice register."""
+        """Render one skill file per voice register."""
         target_dir = output_dir / _REGISTERS_DIR
         by_register = _group_fragments_by_register(snapshot.fragments)
         written: list[Path] = []
         for register_key in REGISTER_KEYS:
-            exemplars = self._pick_exemplars(by_register.get(register_key, []))
+            exemplars = self._maybe_pick_exemplars(by_register.get(register_key, []))
             body = self._render_register_body(register_key, exemplars)
+            filename = _skill_filename(register_key, signature_only=self.signature_only)
             written.append(
                 _write_skill(
-                    target_dir / f"{register_key}{_SKILL_SUFFIX}",
+                    target_dir / filename,
                     category="register",
                     key=register_key,
                     title=f"Register: {register_key.title()}",
                     body=body,
                     extra_tags=(register_key,),
+                    variant=self._variant_tag(),
                 ),
             )
         return written
@@ -1095,7 +1220,7 @@ class SkillTreeGenerator:
         snapshot: VaultSnapshot,
         output_dir: Path,
     ) -> list[Path]:
-        """Render one SKILL.md per qualifying thread."""
+        """Render one skill file per qualifying thread."""
         target_dir = output_dir / _THREADS_DIR
         qualifying = [
             thread
@@ -1108,14 +1233,16 @@ class SkillTreeGenerator:
             body = self._render_thread_body(thread)
             slug = _unique_slug(_slugify(thread.title), thread.id, used_slugs)
             used_slugs.add(slug)
+            filename = _skill_filename(slug, signature_only=self.signature_only)
             written.append(
                 _write_skill(
-                    target_dir / f"{slug}{_SKILL_SUFFIX}",
+                    target_dir / filename,
                     category="thread",
                     key=thread.id,
                     title=f"Thread: {thread.title}",
                     body=body,
                     extra_tags=("thread",),
+                    variant=self._variant_tag(),
                 ),
             )
         return written
@@ -1125,7 +1252,7 @@ class SkillTreeGenerator:
         snapshot: VaultSnapshot,
         output_dir: Path,
     ) -> list[Path]:
-        """Render one SKILL.md per qualifying eddy."""
+        """Render one skill file per qualifying eddy."""
         target_dir = output_dir / _EDDIES_DIR
         qualifying = [
             eddy
@@ -1138,14 +1265,16 @@ class SkillTreeGenerator:
             body = self._render_eddy_body(eddy)
             slug = _unique_slug(_slugify(eddy.title), eddy.id, used_slugs)
             used_slugs.add(slug)
+            filename = _skill_filename(slug, signature_only=self.signature_only)
             written.append(
                 _write_skill(
-                    target_dir / f"{slug}{_SKILL_SUFFIX}",
+                    target_dir / filename,
                     category="eddy",
                     key=eddy.id,
                     title=f"Eddy: {eddy.title}",
                     body=body,
                     extra_tags=("eddy",),
+                    variant=self._variant_tag(),
                 ),
             )
         return written
@@ -1167,6 +1296,41 @@ class SkillTreeGenerator:
                 break
         return exemplars
 
+    def _maybe_pick_exemplars(
+        self,
+        candidates: list[tuple[Fragment, str]],
+    ) -> list[SkillExemplar]:
+        """Return exemplars, or an empty list when signature-only is set.
+
+        In signature-only mode the renderers must never see any
+        exemplars: this keeps the abstract-only contract enforceable at
+        a single chokepoint rather than relying on every renderer to
+        remember to filter (issue #353).
+        """
+        if self.signature_only:
+            return []
+        return self._pick_exemplars(candidates)
+
+    def _variant_tag(self) -> str:
+        """Return the frontmatter variant tag for the current mode."""
+        return _VARIANT_SIGNATURE if self.signature_only else _VARIANT_SKILL
+
+    def _maybe_render_exemplar_section(
+        self,
+        exemplars: list[SkillExemplar],
+    ) -> list[str]:
+        """Return the rendered exemplar section, or no sections at all.
+
+        Signature-only files (issue #353) must omit the exemplar
+        section entirely so no quoted user content — including the
+        placeholder fallback — appears in the output. Splat the return
+        value into the renderer's join sequence so callers do not need
+        to special-case the mode.
+        """
+        if self.signature_only:
+            return []
+        return [_render_exemplar_section(exemplars)]
+
     # -- Renderers ----------------------------------------------------
 
     def _render_frequency_body(
@@ -1174,7 +1338,7 @@ class SkillTreeGenerator:
         freq_key: str,
         exemplars: list[SkillExemplar],
     ) -> str:
-        """Render the full markdown body for a Frequency SKILL."""
+        """Render the full markdown body for a Frequency skill file."""
         freq = Frequency(freq_key)
         name = FREQUENCY_NAMES[freq]
         theme = FREQUENCY_THEMES[freq]
@@ -1204,7 +1368,7 @@ class SkillTreeGenerator:
             [
                 activation,
                 _render_section("Description", description),
-                _render_exemplar_section(exemplars),
+                *self._maybe_render_exemplar_section(exemplars),
                 _render_section("Writing Instructions", instructions),
                 _render_section("Anti-Patterns", anti_patterns),
                 _render_section("Combining With Other Skills", combination),
@@ -1241,7 +1405,7 @@ class SkillTreeGenerator:
             [
                 activation,
                 _render_section("Description", description),
-                _render_exemplar_section(exemplars),
+                *self._maybe_render_exemplar_section(exemplars),
                 _render_section("Writing Instructions", instructions),
                 _render_section("Anti-Patterns", anti_patterns),
                 _render_section("Combining With Other Skills", combination),
@@ -1282,7 +1446,7 @@ class SkillTreeGenerator:
             [
                 activation,
                 _render_section("Description", description),
-                _render_exemplar_section(exemplars),
+                *self._maybe_render_exemplar_section(exemplars),
                 _render_section("Writing Instructions", instructions),
                 _render_section("Anti-Patterns", anti_patterns),
                 _render_section("Combining With Other Skills", combination),
@@ -1316,7 +1480,7 @@ class SkillTreeGenerator:
             [
                 activation,
                 _render_section("Description", description),
-                _render_exemplar_section(exemplars),
+                *self._maybe_render_exemplar_section(exemplars),
                 _render_section(
                     "Writing Instructions",
                     instructions,

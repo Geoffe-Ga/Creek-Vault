@@ -1790,6 +1790,68 @@ def test_skills_command(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
+def test_skills_signature_only_flag_emits_signature_files(tmp_path: Path) -> None:
+    """``--signature-only`` writes .SIGNATURE.md files alongside no SKILL ones."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    output = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        [
+            "skills",
+            "generate",
+            "--generate",
+            "--signature-only",
+            "--vault",
+            str(vault),
+            "--output",
+            str(output),
+        ],
+    )
+    assert result.exit_code == 0
+    assert "signature-only" in result.output
+    signature_files = list(output.rglob("*.SIGNATURE.md"))
+    skill_files = list(output.rglob("*.SKILL.md"))
+    assert signature_files, "expected signature files to be written"
+    assert not skill_files, "signature-only run must not emit .SKILL.md"
+
+
+def test_skills_both_variants_can_coexist(tmp_path: Path) -> None:
+    """Running with and without ``--signature-only`` produces both trees."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    output = tmp_path / "out"
+    default_run = runner.invoke(
+        app,
+        [
+            "skills",
+            "generate",
+            "--generate",
+            "--vault",
+            str(vault),
+            "--output",
+            str(output),
+        ],
+    )
+    assert default_run.exit_code == 0
+    signature_run = runner.invoke(
+        app,
+        [
+            "skills",
+            "generate",
+            "--generate",
+            "--signature-only",
+            "--vault",
+            str(vault),
+            "--output",
+            str(output),
+        ],
+    )
+    assert signature_run.exit_code == 0
+    assert list(output.rglob("*.SKILL.md"))
+    assert list(output.rglob("*.SIGNATURE.md"))
+
+
 def test_mine_help() -> None:
     """Test that mine --help shows subcommand help."""
     result = runner.invoke(app, ["mine", "--help"])

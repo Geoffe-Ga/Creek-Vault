@@ -1358,3 +1358,391 @@ class TestSnapshotInvalidFragments:
         generator.generate_register_skills(vault, output_dir)
         body = (output_dir / "registers" / "prophetic.SKILL.md").read_text()
         assert "Prophetic line" in body
+
+
+# ---- Signature-only variant (issue #353) ----
+
+
+SIGNATURE_PASSAGE_MARKER = "Verbatim user prose: standing in my heat alone"
+
+
+def _populated_vault_for_signature_tests(vault_path: Path) -> Fragment:
+    """Write a single proxy-eligible fragment whose body is recognisable.
+
+    Used by signature-only tests to guarantee that the ``SKILL`` variant
+    contains a quoted exemplar while the ``SIGNATURE`` variant does not.
+    """
+    fragment = _build_fragment(
+        frag_id="frag-sig-marker",
+        title="Standing in my heat",
+        frequency=Frequency.F3,
+        phase=Phase.RISING,
+        mode=Mode.EXPRESS,
+        orientation=Orientation.DO,
+        register=VoiceRegister.CONFESSIONAL,
+    )
+    body = (
+        f"{SIGNATURE_PASSAGE_MARKER} for the very first sentence, with "
+        "more than the minimum number of words required to register as "
+        "substantive voice data inside the passage extractor. "
+        f"{SIGNATURE_PASSAGE_MARKER} once more in a second sentence so the "
+        "extractor has multiple sentences to choose between."
+    )
+    _write_fragment(vault_path, fragment, body)
+    return fragment
+
+
+class TestSignatureOnlyConstructor:
+    """``signature_only`` is exposed as a constructor flag."""
+
+    def test_default_signature_only_is_false(self) -> None:
+        """The default mode keeps backwards-compatible SKILL behaviour."""
+        generator = SkillTreeGenerator()
+        assert not generator.signature_only
+
+    def test_signature_only_flag_is_accepted(self) -> None:
+        """Passing ``signature_only=True`` is preserved on the instance."""
+        generator = SkillTreeGenerator(signature_only=True)
+        assert generator.signature_only
+
+
+class TestSignatureOnlyVariant:
+    """Signature-only generation strips quoted exemplars and fragment IDs."""
+
+    def test_signature_only_uses_signature_suffix(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Signature files are written under ``F*.SIGNATURE.md``."""
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_frequency_skills(vault, output_dir)
+        assert all(p.name.endswith(".SIGNATURE.md") for p in paths)
+        assert not any(p.name.endswith(".SKILL.md") for p in paths)
+
+    def test_signature_only_skips_exemplar_section(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Signature-only output omits the ``## Exemplar Passages`` heading."""
+        _populated_vault_for_signature_tests(vault)
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SIGNATURE.md").read_text()
+        assert "## Exemplar Passages" not in body
+
+    def test_signature_only_excludes_quoted_passages(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """No quoted prose from any fragment should reach the signature output."""
+        _populated_vault_for_signature_tests(vault)
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SIGNATURE.md").read_text()
+        assert SIGNATURE_PASSAGE_MARKER not in body
+
+    def test_signature_only_excludes_fragment_ids(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Fragment IDs never appear in signature-only files."""
+        fragment = _populated_vault_for_signature_tests(vault)
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SIGNATURE.md").read_text()
+        assert fragment.id not in body
+
+    def test_signature_only_preserves_voice_texture(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """All non-exemplar dimension fields remain populated."""
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SIGNATURE.md").read_text()
+        # The non-exemplar sections must still be present.
+        assert "# Activation" in body
+        assert "## Description" in body
+        assert "## Writing Instructions" in body
+        assert "## Anti-Patterns" in body
+        assert "## Combining With Other Skills" in body
+        # Voice texture content (from FREQUENCY_VOICE_TEXTURES["F3"])
+        # must still drive the body so the LLM keeps signature guidance.
+        assert "Declarative first-person" in body
+
+    def test_signature_only_announces_variant_in_header(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Each signature file begins with a variant declaration header."""
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SIGNATURE.md").read_text()
+        assert "Variant: SIGNATURE" in body
+        assert "no quoted user content" in body.lower()
+
+    def test_default_variant_announces_skill_header(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """The legacy SKILL variant declares itself in its own header."""
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "Variant: SKILL" in body
+
+    def test_signature_only_frontmatter_records_variant(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """The frontmatter ``variant`` field distinguishes the two variants."""
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        post = frontmatter.load(
+            str(output_dir / "frequencies" / "F3.SIGNATURE.md"),
+        )
+        assert post.metadata["variant"] == "signature"
+
+    def test_default_variant_frontmatter_records_skill(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """The default variant records ``variant: skill`` in frontmatter."""
+        generator.generate_frequency_skills(vault, output_dir)
+        post = frontmatter.load(
+            str(output_dir / "frequencies" / "F3.SKILL.md"),
+        )
+        assert post.metadata["variant"] == "skill"
+
+    def test_default_variant_tags_do_not_duplicate_skill(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Legacy SKILL frontmatter ``tags`` list contains ``skill`` exactly once.
+
+        Regression for PR #357 review: the previous tag list expanded
+        ``[\"skill\", category, variant, ...]`` with ``variant == \"skill\"``,
+        yielding two identical ``\"skill\"`` entries that confuse any
+        downstream consumer that parses the raw frontmatter.
+        """
+        generator.generate_frequency_skills(vault, output_dir)
+        post = frontmatter.load(
+            str(output_dir / "frequencies" / "F3.SKILL.md"),
+        )
+        tags = post.metadata["tags"]
+        assert tags.count("skill") == 1
+        assert "frequency" in tags
+
+    def test_signature_variant_tags_include_signature_marker(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """The SIGNATURE variant gets a distinguishing ``signature`` tag.
+
+        The tag is what lets a downstream loader filter for the new
+        variant; dropping it would erase the only frontmatter-level
+        difference between the two trees beyond the filename suffix.
+        """
+        generator = SkillTreeGenerator(signature_only=True)
+        generator.generate_frequency_skills(vault, output_dir)
+        post = frontmatter.load(
+            str(output_dir / "frequencies" / "F3.SIGNATURE.md"),
+        )
+        tags = post.metadata["tags"]
+        assert "signature" in tags
+        assert tags.count("skill") == 1
+
+    def test_skill_header_does_not_reference_dead_signature_file(
+        self,
+        vault: Path,
+        output_dir: Path,
+        generator: SkillTreeGenerator,
+    ) -> None:
+        """Default SKILL banner does not point at a possibly-missing SIGNATURE file.
+
+        Regression for PR #357 review: the previous banner read \"see the
+        matching ``.SIGNATURE.md`` file\", which is a dead reference for
+        any operator who has only ever run the default command. The
+        replacement banner names the CLI invocation that produces the
+        alternative variant instead.
+        """
+        generator.generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "matching" not in body
+        assert "see the matching" not in body
+        assert "--signature-only" in body
+
+
+class TestSignatureOnlyCovering:
+    """Signature-only generation covers every category of skill."""
+
+    def test_signature_only_covers_phases(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Phase skill files appear as ``<phase>.SIGNATURE.md``."""
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_phase_skills(vault, output_dir)
+        assert len(paths) == 6
+        assert all(p.name.endswith(".SIGNATURE.md") for p in paths)
+
+    def test_signature_only_covers_modes(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Mode skill files appear with the SIGNATURE suffix."""
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_mode_skills(vault, output_dir)
+        assert len(paths) == 9
+        assert all(p.name.endswith(".SIGNATURE.md") for p in paths)
+
+    def test_signature_only_covers_registers(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Register skill files appear with the SIGNATURE suffix."""
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_register_skills(vault, output_dir)
+        assert len(paths) == 7
+        assert all(p.name.endswith(".SIGNATURE.md") for p in paths)
+
+    def test_signature_only_covers_threads(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Qualifying threads earn a SIGNATURE file (threads have no exemplars)."""
+        thread = Thread(
+            id="thread-sig",
+            title="Signature Thread",
+            status=ThreadStatus.ACTIVE,
+            fragment_count=25,
+            description="Spans many seasons.",
+        )
+        _write_thread(vault, thread)
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_thread_skills(vault, output_dir)
+        assert len(paths) == 1
+        assert paths[0].name.endswith(".SIGNATURE.md")
+        body = paths[0].read_text()
+        assert "Variant: SIGNATURE" in body
+
+    def test_signature_only_covers_eddies(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Qualifying eddies earn a SIGNATURE file."""
+        eddy = Eddy(
+            id="eddy-sig",
+            title="Signature Eddy",
+            fragment_count=42,
+            threads=["thread-sig"],
+            description="Major cluster.",
+        )
+        _write_eddy(vault, eddy)
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_eddy_skills(vault, output_dir)
+        assert len(paths) == 1
+        assert paths[0].name.endswith(".SIGNATURE.md")
+
+    def test_signature_only_covers_meta(
+        self,
+        output_dir: Path,
+    ) -> None:
+        """Meta skills carry the SIGNATURE suffix in signature mode."""
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_meta_skills(output_dir)
+        assert len(paths) == 2
+        assert all(p.name.endswith(".SIGNATURE.md") for p in paths)
+        body = paths[0].read_text()
+        assert "Variant: SIGNATURE" in body
+
+    def test_signature_only_generate_all_writes_signature_tree(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """``generate_all_skills`` produces only SIGNATURE files when enabled."""
+        paths = SkillTreeGenerator(
+            signature_only=True,
+        ).generate_all_skills(vault, output_dir)
+        assert len(paths) == 34
+        assert all(p.name.endswith(".SIGNATURE.md") for p in paths)
+
+
+class TestSignatureAndSkillCoexist:
+    """Both variants live side-by-side in the same output directory."""
+
+    def test_both_variants_coexist_without_overwrite(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Running both generators writes distinct files for each variant."""
+        SkillTreeGenerator().generate_frequency_skills(vault, output_dir)
+        SkillTreeGenerator(signature_only=True).generate_frequency_skills(
+            vault,
+            output_dir,
+        )
+        freq_dir = output_dir / "frequencies"
+        assert (freq_dir / "F3.SKILL.md").exists()
+        assert (freq_dir / "F3.SIGNATURE.md").exists()
+        skill_files = sorted(p.name for p in freq_dir.glob("F*.SKILL.md"))
+        signature_files = sorted(p.name for p in freq_dir.glob("F*.SIGNATURE.md"))
+        assert len(skill_files) == 10
+        assert len(signature_files) == 10
+
+    def test_skill_variant_contains_exemplars_when_available(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """The SKILL variant still quotes the user's prose."""
+        _populated_vault_for_signature_tests(vault)
+        SkillTreeGenerator().generate_frequency_skills(vault, output_dir)
+        skill_body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert SIGNATURE_PASSAGE_MARKER in skill_body
+        assert "## Exemplar Passages" in skill_body
+
+    def test_signature_variant_remains_clean_alongside_skill(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """The SIGNATURE variant must stay quote-free even when SKILL ran first."""
+        _populated_vault_for_signature_tests(vault)
+        SkillTreeGenerator().generate_frequency_skills(vault, output_dir)
+        SkillTreeGenerator(signature_only=True).generate_frequency_skills(
+            vault,
+            output_dir,
+        )
+        signature_body = (output_dir / "frequencies" / "F3.SIGNATURE.md").read_text()
+        assert SIGNATURE_PASSAGE_MARKER not in signature_body
+        assert "## Exemplar Passages" not in signature_body
+        # The legacy file remained intact across the second generation pass.
+        skill_body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert SIGNATURE_PASSAGE_MARKER in skill_body
