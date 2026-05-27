@@ -2390,7 +2390,13 @@ def test_draft_seed_dimensional_filters_combine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--seed-frequency`` + ``--seed-phase`` writes a draft from the intersection."""
+    """``--seed-frequency`` + ``--seed-phase`` writes a per-dimension blended draft.
+
+    Per issue #351 the three dimensions now OR rather than AND; each
+    contributes its slice independently and the union is the seed.
+    The frontmatter records per-dimension attribution so the operator
+    can trace which fragment came from which dimension.
+    """
     import frontmatter as fm
 
     from creek import cli as cli_module
@@ -2398,7 +2404,7 @@ def test_draft_seed_dimensional_filters_combine(
     monkeypatch.setattr(
         cli_module,
         "_build_draft_llm",
-        lambda: lambda _p: "Composed from the intersection.",
+        lambda: lambda _p: "Composed from the per-dimension blend.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2437,14 +2443,28 @@ def test_draft_seed_dimensional_filters_combine(
     assert seed["frequencies"] == ["F1"]
     assert seed["phases"] == ["rising"]
     assert seed["modes"] == ["integrate"]
-    assert post.metadata["source_fragments"] == ["frag-A"]
+    # Both fragments make it in: frag-A matches all three dims; frag-B
+    # matches only the F1 frequency. Order follows first-seen within
+    # the union (phase first, then mode, then frequency).
+    assert set(post.metadata["source_fragments"]) == {"frag-A", "frag-B"}
+    # Per-dimension attribution records which fragment came from which
+    # dimension — the issue #351 acceptance criterion.
+    per_dim = post.metadata["per_dimension_sources"]
+    assert per_dim["phase:rising"] == ["frag-A"]
+    assert per_dim["mode:integrate"] == ["frag-A"]
+    assert set(per_dim["frequency:F1"]) == {"frag-A", "frag-B"}
 
 
 def test_draft_seed_zero_match_exits_with_honest_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dimensional filter with zero matches exits 1 — never a silent fallback."""
+    """A dimensional filter with zero matches exits 1 — never a silent fallback.
+
+    Per issue #351 the wording shifted to "No source material in any
+    attempted dimension: <labels>" so the operator can see which
+    filters to widen.
+    """
     from creek import cli as cli_module
 
     monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
@@ -2462,7 +2482,8 @@ def test_draft_seed_zero_match_exits_with_honest_message(
         ],
     )
     assert result.exit_code == 1
-    assert "No source material matches" in result.output
+    assert "No source material in any attempted dimension" in result.output
+    assert "the F10 frequency" in result.output
 
 
 def test_draft_seed_topic_with_frequency_filters_candidates(

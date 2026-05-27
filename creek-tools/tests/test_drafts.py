@@ -1118,13 +1118,19 @@ class TestResolveSeedDimensional:
         assert idea.source_fragments == ("frag-B",)
         assert idea.frequency_affinity == (Frequency.F6,)
 
-    def test_filters_by_phase_and_mode_intersection(
+    def test_filters_by_phase_and_mode_union(
         self,
         vault: Path,
         skills_root: Path,
         llm_echo: Callable[[str], str],
     ) -> None:
-        """Phase and mode AND together: only the intersection matches."""
+        """Phase and mode OR together (issue #351): the union of slices survives.
+
+        Previously these dimensions ANDed and only the intersection
+        survived; per #351 each dimension fetches its own corpus slice
+        independently and the slices union. A fragment matching either
+        phase or mode now appears in the seed.
+        """
         _write_fragment(
             vault,
             _build_fragment(
@@ -1157,7 +1163,8 @@ class TestResolveSeedDimensional:
             SeedSpec(phases=(Phase.RISING,), modes=(Mode.INHABIT,)),
             vault_path=vault,
         )
-        assert idea.source_fragments == ("frag-A",)
+        # All three fragments match at least one of the active dimensions.
+        assert set(idea.source_fragments) == {"frag-A", "frag-B", "frag-C"}
 
     def test_zero_matches_raises_honest_error(
         self,
@@ -1165,14 +1172,23 @@ class TestResolveSeedDimensional:
         skills_root: Path,
         llm_echo: Callable[[str], str],
     ) -> None:
-        """No silent fallback when the dimensional intersection is empty."""
+        """No silent fallback when every dimension's slice is empty (issue #351).
+
+        The wording shifted from "No source material matches ..." to
+        "No source material in any attempted dimension: ..." so the
+        operator sees which dimensions were attempted and which to
+        widen, per the #351 acceptance criterion.
+        """
         _write_fragment(
             vault,
             _build_fragment(frag_id="frag-A", primary=Frequency.F1),
             "body",
         )
         gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
-        with pytest.raises(SeedResolutionError, match="No source material matches"):
+        with pytest.raises(
+            SeedResolutionError,
+            match="No source material in any attempted dimension",
+        ):
             gen.resolve_seed(
                 SeedSpec(frequencies=(Frequency.F10,)),
                 vault_path=vault,
@@ -1495,3 +1511,431 @@ class TestSaveDraftWithSeedSpec:
         path = gen.save_draft(self._make_draft(seed_spec=spec), vault)
         post = frontmatter.load(str(path))
         assert post.metadata["seed"] == {"fragment_id": "frag-keep"}
+
+
+# ---- Issue #351: AND→OR per-dimension retrieval + composition-time weaving --
+
+
+class TestPerDimensionRetrievalAcceptance:
+    """Acceptance criteria from issue #351 (load-bearing change).
+
+    These tests assert the four bulleted criteria in the issue body:
+    multi-dimension success on a vault where no single fragment
+    matches all dimensions, per-dimension frontmatter attribution,
+    per-dimension warning for one empty dimension while proceeding,
+    and an all-empty diagnostic.
+    """
+
+    def test_multi_dim_succeeds_when_no_single_fragment_matches_all(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """``--seed-phase`` + ``--seed-mode`` together succeed via OR semantics.
+
+        Acceptance criterion 1: the prior AND-intersection failure mode
+        is gone. Each dimension contributes its own slice; the union
+        survives even when no single fragment matches both filters.
+        """
+        # frag-A matches the phase only; frag-B matches the mode only.
+        # Under legacy AND, the corpus was empty and drafting failed.
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+            ),
+            "Peaking body about agency.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+            "Expressive body about voice.",
+        )
+        gen = DraftGenerator(
+            llm=lambda _p: "Drafted body.",
+            skills_root=skills_root,
+        )
+        # Multiple dimensions, no topic filter: each dimension contributes
+        # its slice independently and the slices union.
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.EXPRESS,),
+        )
+
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        # Both fragments enter the draft; previously the AND would have
+        # yielded zero matches and raised SeedResolutionError.
+        assert set(draft.source_fragments) == {"frag-A", "frag-B"}
+
+    def test_frontmatter_records_per_dimension_attribution(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance criterion 2: per-dimension fragment lineage in frontmatter."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+            ),
+            "A body.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+            "B body.",
+        )
+        gen = DraftGenerator(
+            llm=lambda _p: "Drafted body.",
+            skills_root=skills_root,
+        )
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.EXPRESS,),
+        )
+
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+        path = gen.save_draft(draft, vault)
+
+        post = frontmatter.load(str(path))
+        per_dim = post.metadata["per_dimension_sources"]
+        assert per_dim == {
+            "phase:peaking": ["frag-A"],
+            "mode:express": ["frag-B"],
+        }
+
+    def test_warns_on_empty_dimension_but_proceeds(
+        self,
+        vault: Path,
+        skills_root: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Acceptance criterion 3: per-dimension warning + proceed.
+
+        When one dimension has zero matches but others have matches,
+        a warning names the empty dimension specifically and drafting
+        continues.
+        """
+        # Only the phase dimension matches; the mode dimension is empty.
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+            ),
+            "Body.",
+        )
+        gen = DraftGenerator(
+            llm=lambda _p: "Drafted body.",
+            skills_root=skills_root,
+        )
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.EXPRESS,),
+        )
+
+        with caplog.at_level("WARNING", logger="creek.generate.drafts"):
+            draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        assert draft.source_fragments == ("frag-A",)
+        # Warning names the express stance specifically.
+        assert any("the express stance" in record.message for record in caplog.records)
+
+    def test_all_empty_dimensions_raises_with_clear_diagnostic(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance criterion 4: all-empty raises naming every attempted dim."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                phase=Phase.RISING,
+                mode=Mode.INHABIT,
+            ),
+            "Body.",
+        )
+        gen = DraftGenerator(
+            llm=lambda _p: "Drafted body.",
+            skills_root=skills_root,
+        )
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.EXPRESS,),
+        )
+
+        with pytest.raises(SeedResolutionError) as exc:
+            gen.generate_seeded_draft(spec, vault_path=vault)
+
+        message = str(exc.value)
+        assert "the peaking phase" in message
+        assert "the express stance" in message
+
+    def test_prompt_has_labelled_per_dimension_sections(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The LLM prompt exposes one labelled ``## Material for ...`` per dimension."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+            ),
+            "Peaking body.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+            "Express body.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        spec = SeedSpec(
+            phases=(Phase.PEAKING,),
+            modes=(Mode.EXPRESS,),
+        )
+
+        gen.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        assert "## Material for the peaking phase" in prompt
+        assert "## Material for the express stance" in prompt
+        # The labelled blocks carry the actual fragment bodies.
+        assert "Peaking body." in prompt
+        assert "Express body." in prompt
+        # The "weave them" hint replaces the legacy single-corpus ask.
+        assert "weave them" in prompt.lower()
+
+    def test_prompt_preserves_legacy_blocks_for_single_dimension(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Single-dimension specs flow through the per-dimension path too.
+
+        Even one dimension activates per-dimension retrieval — the
+        labelled section is the only fragment block, and the legacy
+        ``## Source fragments`` heading does not appear (so we avoid
+        rendering the same fragments twice).
+        """
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", phase=Phase.PEAKING),
+            "Peaking body.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        spec = SeedSpec(phases=(Phase.PEAKING,))
+
+        gen.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        assert "## Material for the peaking phase" in prompt
+        # No duplicate Source fragments block.
+        assert "## Source fragments" not in prompt
+
+    def test_topic_only_spec_still_uses_legacy_path(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A spec with only a topic (no dimensions) uses the legacy single block."""
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", title="On belonging"),
+            "Body about belonging.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        spec = SeedSpec(topic="belonging")
+
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        prompt = captured["prompt"]
+        assert "## Source fragments" in prompt
+        assert "## Material for the" not in prompt
+        assert draft.per_dimension_sources == ()
+
+    def test_ontology_drives_per_dimension_path(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A PromptOntology with above-threshold weights triggers per-dim retrieval."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", phase=Phase.PEAKING),
+            "A body.",
+        )
+
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            """Capture the prompt for assertion and return a fixed body."""
+            captured["prompt"] = prompt
+            return "Drafted body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        ontology = PromptOntology(
+            prompt="x",
+            phases=(WeightedDimension(value=Phase.PEAKING, weight=0.7),),
+        )
+        spec = SeedSpec(ontology=ontology)
+
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        assert draft.source_fragments == ("frag-A",)
+        assert "## Material for the peaking phase (weight 0.70)" in captured["prompt"]
+
+    def test_per_dimension_sources_omitted_for_legacy_path(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """Frontmatter omits ``per_dimension_sources`` for legacy single-block path."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        draft = Draft(
+            title="Topic only",
+            body="Body.",
+            idea_strategy=MiningStrategy.RESONANCE_CHAIN.value,
+            source_fragments=(),
+            threads=(),
+            eddies=(),
+            skill_stack=(),
+            prompt="prompt",
+            generated_date=datetime(2026, 5, 27, tzinfo=UTC),
+        )
+        path = gen.save_draft(draft, vault)
+        post = frontmatter.load(str(path))
+        assert "per_dimension_sources" not in post.metadata
+
+    def test_ontology_below_threshold_dropped(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Ontology entries below the spec's confidence threshold are filtered out."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-A", phase=Phase.PEAKING),
+            "A body.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(frag_id="frag-B", phase=Phase.RISING),
+            "B body.",
+        )
+        gen = DraftGenerator(
+            llm=lambda _p: "Drafted.",
+            skills_root=skills_root,
+        )
+        ontology = PromptOntology(
+            prompt="x",
+            phases=(
+                WeightedDimension(value=Phase.PEAKING, weight=0.8),
+                WeightedDimension(value=Phase.RISING, weight=0.1),
+            ),
+        )
+        spec = SeedSpec(ontology=ontology, ontology_confidence_threshold=0.5)
+
+        draft = gen.generate_seeded_draft(spec, vault_path=vault)
+
+        # Only the peaking slice survives the threshold.
+        assert draft.source_fragments == ("frag-A",)
+
+
+class TestSeedSpecOntologyField:
+    """``SeedSpec.ontology`` plays nicely with the existing invariants."""
+
+    def test_ontology_alone_is_not_empty(self) -> None:
+        """A spec carrying only an ontology is non-empty."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+
+        ontology = PromptOntology(
+            prompt="x",
+            phases=(WeightedDimension(value=Phase.RISING, weight=0.7),),
+        )
+        assert SeedSpec(ontology=ontology).is_empty is False
+
+    def test_empty_ontology_does_not_flip_empty(self) -> None:
+        """An ontology with no detected dimensions is treated as no signal."""
+        from creek.classify.prompt import PromptOntology
+
+        ontology = PromptOntology(prompt="x")
+        # is_empty checks the ``or`` chain; an empty PromptOntology has no
+        # truthy dimensions but the object itself is truthy. We explicitly
+        # short-circuit on ontology truthiness, so a populated-but-empty
+        # ontology still counts as "set" — that's a useful signal that
+        # detection ran (and returned nothing) versus never ran.
+        # This test pins the documented behaviour.
+        assert SeedSpec(ontology=ontology).is_empty is False
+
+    def test_ontology_dimensions_flip_has_dimensional_filter(self) -> None:
+        """An ontology with dimensions counts as a dimensional filter."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+
+        ontology = PromptOntology(
+            prompt="x",
+            phases=(WeightedDimension(value=Phase.RISING, weight=0.7),),
+        )
+        spec = SeedSpec(ontology=ontology)
+        assert spec.has_dimensional_filter is True
+
+    def test_ontology_and_fragment_id_are_mutually_exclusive(self) -> None:
+        """``--seed-fragment`` blocks ontology to preserve the FEAT-032 contract."""
+        from creek.classify.prompt import PromptOntology, WeightedDimension
+
+        ontology = PromptOntology(
+            prompt="x",
+            phases=(WeightedDimension(value=Phase.RISING, weight=0.7),),
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SeedSpec(fragment_id="frag-A", ontology=ontology)

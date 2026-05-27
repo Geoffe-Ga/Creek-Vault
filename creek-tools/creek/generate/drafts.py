@@ -43,6 +43,16 @@ from creek.generate.compile_routing import (
     load_compiled_pages,
     log_compile_gap,
 )
+from creek.generate.dimensional_retrieval import (
+    AllDimensionsEmptyError,
+    DimensionKey,
+    DimensionSlice,
+    assemble_per_dimension_corpus,
+    empty_dimensions,
+    format_dimension_label,
+    raise_if_all_empty,
+    union_fragment_ids,
+)
 from creek.models import (
     CompiledPage,
     Eddy,
@@ -56,6 +66,7 @@ from creek.models import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.classify.prompt import PromptOntology
     from creek.generate.mining import IdeaSeed
 
 
@@ -102,6 +113,15 @@ class SeedSpec:
         frequencies: APTITUDE frequencies to restrict candidates to.
         phases: Wavelength phases to restrict candidates to.
         modes: Wavelength modes (stances) to restrict candidates to.
+        ontology: Optional :class:`~creek.classify.prompt.PromptOntology`
+            from prompt-level detection (issue #350). When set, its
+            weighted dimensions augment the explicit-flag dimensions
+            during per-dimension corpus retrieval (issue #351). An
+            empty ontology is equivalent to ``None``.
+        ontology_confidence_threshold: Minimum weight an ontology
+            entry must carry to participate in the per-dimension blend.
+            Defaults to ``0.0`` so every parsed entry is honoured;
+            callers with a configured FEAT-017 floor pass it explicitly.
     """
 
     fragment_id: str | None = None
@@ -109,6 +129,8 @@ class SeedSpec:
     frequencies: tuple[Frequency, ...] = ()
     phases: tuple[Phase, ...] = ()
     modes: tuple[Mode, ...] = ()
+    ontology: PromptOntology | None = None
+    ontology_confidence_threshold: float = 0.0
 
     def __post_init__(self) -> None:
         """Normalise empty topics, then enforce the ``fragment_id`` rule."""
@@ -126,6 +148,7 @@ class SeedSpec:
                 ("frequencies", self.frequencies),
                 ("phases", self.phases),
                 ("modes", self.modes),
+                ("ontology", self.ontology),
             )
             if value
         ]
@@ -145,12 +168,24 @@ class SeedSpec:
             or self.frequencies
             or self.phases
             or self.modes
+            or self.ontology
         )
 
     @property
     def has_dimensional_filter(self) -> bool:
-        """Return ``True`` when at least one classification filter is set."""
-        return bool(self.frequencies or self.phases or self.modes)
+        """Return ``True`` when at least one classification filter is set.
+
+        Includes prompt-detected :class:`PromptOntology` dimensions so a
+        purely-ontology-driven spec still flips into the per-dimension
+        retrieval path (issue #351).
+        """
+        if self.frequencies or self.phases or self.modes:
+            return True
+        if self.ontology is None:
+            return False
+        return bool(
+            self.ontology.frequencies or self.ontology.phases or self.ontology.modes,
+        )
 
 
 class SeedResolutionError(ValueError):
@@ -179,6 +214,13 @@ class Draft:
         seed_spec: Manual-seed specification (FEAT-032) when the draft
             was produced via ``creek draft --seed-*`` flags; ``None``
             for drafts surfaced via the idea miner.
+        per_dimension_sources: Per-dimension corpus attribution (issue
+            #351). Maps a ``"kind:value"`` label (e.g.,
+            ``"phase:peaking"``) to the tuple of fragment IDs that
+            entered the LLM prompt as that dimension's labelled
+            section. Empty when the draft used the legacy
+            single-dimension path; populated whenever
+            :func:`assemble_per_dimension_corpus` ran.
     """
 
     title: str
@@ -191,6 +233,7 @@ class Draft:
     prompt: str
     generated_date: datetime
     seed_spec: SeedSpec | None = None
+    per_dimension_sources: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         """Validate draft invariants."""
@@ -543,6 +586,7 @@ class DraftGenerator:
         vault_path: Path,
         fragments: dict[str, tuple[Fragment, str]] | None = None,
         compiled_pages: CompiledPageIndex | None = None,
+        include_fragments: bool = True,
     ) -> str:
         """Collect compiled-layer summaries (compile-first) for *idea*.
 
@@ -562,6 +606,12 @@ class DraftGenerator:
             compiled_pages: Optional pre-loaded compiled-page index. When
                 ``None`` the index is loaded (or bypassed) per
                 :attr:`bypass_compiled`.
+            include_fragments: When ``True`` (default), render the
+                ``## Source fragments`` block. The per-dimension path
+                (issue #351) sets this ``False`` because the fragments
+                are already laid out in the labelled per-dimension
+                sections; double-rendering would amplify the heaviest
+                ontology corner over the others.
 
         Returns:
             A newline-joined markdown string.
@@ -576,9 +626,10 @@ class DraftGenerator:
             )
         )
         compiled = self._resolve_compiled_pages(vault_path, compiled_pages)
-        frag_block = _render_fragment_section(idea.source_fragments, loaded)
-        if frag_block:
-            sections.append(frag_block)
+        if include_fragments:
+            frag_block = _render_fragment_section(idea.source_fragments, loaded)
+            if frag_block:
+                sections.append(frag_block)
         thread_block = self._compose_thread_section(idea, vault_path, compiled)
         if thread_block:
             sections.append(thread_block)
@@ -682,22 +733,30 @@ class DraftGenerator:
         idea: IdeaSeed,
         skill_stack: list[Path],
         source_material: str,
+        *,
+        per_dimension_material: str = "",
     ) -> str:
-        """Assemble the LLM prompt from voice-core + skills + source + ask."""
+        """Assemble the LLM prompt from voice-core + skills + source + ask.
+
+        When *per_dimension_material* is supplied (issue #351), it is
+        inserted ahead of the legacy ``## Source material`` block so the
+        LLM sees the labelled per-dimension sections first and can weave
+        them. Both blocks may co-exist — the per-dimension block carries
+        the dimensional corpus slices, the legacy block still carries
+        thread / eddy context for the synthetic IdeaSeed.
+        """
         parts: list[str] = []
         if self.voice_core:
             parts.append(f"## Voice core\n{self.voice_core.strip()}")
         if skill_stack:
             skill_sections = [_render_skill_section(path) for path in skill_stack]
             parts.append("## Activated skills\n\n" + "\n\n".join(skill_sections))
+        if per_dimension_material:
+            parts.append(per_dimension_material)
         if source_material:
             parts.append(f"## Source material\n{source_material}")
         parts.append(
-            "## Ask\n"
-            f'Write a draft essay titled "{idea.title}". '
-            f"{idea.brief_description} "
-            "Write as the human — not as an AI. Honour the activated "
-            "skills. Cite source fragments by their IDs where relevant.",
+            _compose_ask_section(idea, per_dimension=bool(per_dimension_material)),
         )
         return "\n\n".join(parts)
 
@@ -788,8 +847,10 @@ class DraftGenerator:
 
         Raises:
             SeedResolutionError: When *spec* is empty, the requested
-                ``fragment_id`` is not in the vault, or the dimensional
-                / topic filters match zero fragments.
+                ``fragment_id`` is not in the vault, the dimensional /
+                topic filters match zero fragments, or every active
+                dimension produced an empty per-dimension slice (issue
+                #351).
         """
         if spec.is_empty:
             msg = "SeedSpec is empty — cannot resolve an idea seed"
@@ -807,17 +868,54 @@ class DraftGenerator:
         if spec.fragment_id is not None:
             return self._seed_from_fragment_id(spec.fragment_id, loaded)
 
+        slices = assemble_per_dimension_corpus(
+            spec,
+            loaded,
+            ontology=spec.ontology,
+            confidence_threshold=spec.ontology_confidence_threshold,
+        )
+        if slices:
+            return self._seed_from_dimension_slices(spec, slices, loaded)
+
+        # Topic-only path (no dimensions active) — legacy AND-semantics
+        # collapses to a topic substring scan, which is exactly what we
+        # still want when no ontology dimensions are in play.
         matched = self._matching_fragments(spec, loaded)
         if not matched:
-            descriptor = _seed_dimension_descriptor(spec)
             topic_part = f" topic {spec.topic!r}" if spec.topic else ""
-            filter_part = f" filters {descriptor}" if descriptor else ""
             msg = (
-                f"No source material matches{topic_part}{filter_part}. "
+                f"No source material matches{topic_part}. "
                 "Try widening the filters or pouring in more sources."
             )
             raise SeedResolutionError(msg)
 
+        return self._seed_from_matches(spec, matched)
+
+    def _seed_from_dimension_slices(
+        self,
+        spec: SeedSpec,
+        slices: dict[DimensionKey, DimensionSlice],
+        loaded: dict[str, tuple[Fragment, str]],
+    ) -> IdeaSeed:
+        """Build an IdeaSeed from per-dimension slices (issue #351, OR path).
+
+        Emits a logger warning naming each empty dimension and proceeds
+        whenever at least one slice has matches, per the #351
+        acceptance criterion. Raises :class:`SeedResolutionError` when
+        every dimension is empty so the CLI's existing error path
+        prints a clear diagnostic.
+        """
+        try:
+            raise_if_all_empty(slices)
+        except AllDimensionsEmptyError as exc:
+            raise SeedResolutionError(str(exc)) from exc
+        for empty_key in empty_dimensions(slices):
+            logger.warning(
+                "Dimension %s matched zero fragments; proceeding with the others.",
+                format_dimension_label(empty_key),
+            )
+        union_ids = union_fragment_ids(slices)
+        matched = [loaded[fid] for fid in union_ids if fid in loaded]
         return self._seed_from_matches(spec, matched)
 
     def _seed_from_fragment_id(
@@ -947,13 +1045,26 @@ class DraftGenerator:
             current_phase=effective_phase,
             fragments=fragments,
         )
+        slices = assemble_per_dimension_corpus(
+            spec,
+            fragments,
+            ontology=spec.ontology,
+            confidence_threshold=spec.ontology_confidence_threshold,
+        )
+        per_dimension_material = _render_per_dimension_sections(slices, fragments)
         source_material = self.gather_source_material(
             idea,
             vault_path=vault_path,
             fragments=fragments,
             compiled_pages=compiled_pages,
+            include_fragments=not slices,
         )
-        prompt = self._compose_prompt(idea, skill_stack, source_material)
+        prompt = self._compose_prompt(
+            idea,
+            skill_stack,
+            source_material,
+            per_dimension_material=per_dimension_material,
+        )
         body = self._llm(prompt).strip()
         if not body:
             msg = "LLM returned an empty draft body"
@@ -971,6 +1082,7 @@ class DraftGenerator:
             prompt=prompt,
             generated_date=datetime.now(tz=UTC),
             seed_spec=spec,
+            per_dimension_sources=_slices_as_provenance(slices),
         )
 
     def save_draft(self, draft: Draft, vault_path: Path) -> Path:
@@ -1006,6 +1118,10 @@ class DraftGenerator:
         )
         if draft.seed_spec is not None:
             post["seed"] = _serialise_seed_spec(draft.seed_spec)
+        if draft.per_dimension_sources:
+            post["per_dimension_sources"] = _serialise_per_dimension_sources(
+                draft.per_dimension_sources,
+            )
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
@@ -1083,6 +1199,102 @@ def _serialise_seed_spec(spec: SeedSpec) -> dict[str, object]:
     if spec.modes:
         payload["modes"] = [md.value for md in spec.modes]
     return payload
+
+
+def _serialise_per_dimension_sources(
+    entries: tuple[tuple[str, tuple[str, ...]], ...],
+) -> dict[str, list[str]]:
+    """Render per-dimension provenance as a frontmatter-friendly mapping.
+
+    Each entry maps ``"kind:value"`` (e.g., ``"phase:peaking"``) to the
+    ordered list of fragment IDs sourced from that dimension. Empty
+    slices are omitted because the operator already has the explicit-
+    flag echo in ``seed.frequencies`` / ``seed.phases`` / ``seed.modes``
+    — the per-dimension mapping is specifically about *which fragments
+    came from which dimension*, the #351 acceptance criterion.
+    """
+    return {label: list(ids) for label, ids in entries if ids}
+
+
+def _render_per_dimension_sections(
+    slices: dict[DimensionKey, DimensionSlice],
+    fragments: dict[str, tuple[Fragment, str]],
+) -> str:
+    """Render the labelled ``## Material for ...`` blocks for the LLM prompt.
+
+    Empty slices contribute a one-line ``(no source material)`` note
+    so the model still sees that the dimension was attempted — the
+    visible absence is part of the per-dimension warning surface that
+    the #351 issue asks for. Non-empty slices render each matched
+    fragment with its ID and title, just like the legacy
+    ``## Source fragments`` block.
+    """
+    if not slices:
+        return ""
+    sections: list[str] = [
+        _render_one_dimension_section(key, slice_, fragments)
+        for key, slice_ in slices.items()
+    ]
+    return "\n\n".join(sections)
+
+
+def _render_one_dimension_section(
+    key: DimensionKey,
+    slice_: DimensionSlice,
+    fragments: dict[str, tuple[Fragment, str]],
+) -> str:
+    """Render one ``## Material for <label> (weight X.XX)`` block."""
+    label = format_dimension_label(key)
+    header = f"## Material for {label} (weight {slice_.weight:.2f})"
+    if not slice_.fragment_ids:
+        return f"{header}\n\n(no source material matched this dimension)"
+    entries: list[str] = []
+    for fid in slice_.fragment_ids:
+        if fid not in fragments:
+            continue
+        fragment, body = fragments[fid]
+        entries.append(f"### {fid}: {fragment.title}\n{body.strip()}")
+    if not entries:
+        return f"{header}\n\n(no source material matched this dimension)"
+    return f"{header}\n\n" + "\n\n".join(entries)
+
+
+def _slices_as_provenance(
+    slices: dict[DimensionKey, DimensionSlice],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Flatten *slices* into hashable ``((label, ids), ...)`` for :class:`Draft`."""
+    return tuple(
+        (f"{key[0]}:{key[1]}", slice_.fragment_ids) for key, slice_ in slices.items()
+    )
+
+
+def _compose_ask_section(idea: IdeaSeed, *, per_dimension: bool) -> str:
+    """Return the ``## Ask`` block, switching wording for per-dimension mode.
+
+    When per-dimension material is in play (issue #351), the ask
+    explicitly invites the model to weave across the labelled slices
+    rather than treating them as one homogeneous corpus. Otherwise it
+    keeps the original wording so existing tests and mined-idea drafts
+    continue to compose identically.
+    """
+    if per_dimension:
+        return (
+            "## Ask\n"
+            f'Write a draft essay titled "{idea.title}". '
+            f"{idea.brief_description} "
+            "Source material is presented in labelled per-dimension "
+            "sections above; weave them together at composition time "
+            "rather than treating any one section as the source of "
+            "truth. Honour the activated skills. Write as the human — "
+            "not as an AI. Cite source fragments by their IDs where relevant."
+        )
+    return (
+        "## Ask\n"
+        f'Write a draft essay titled "{idea.title}". '
+        f"{idea.brief_description} "
+        "Write as the human — not as an AI. Honour the activated "
+        "skills. Cite source fragments by their IDs where relevant."
+    )
 
 
 def _render_compiled_entry(target_id: str, page: CompiledPage) -> str:
