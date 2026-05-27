@@ -67,6 +67,12 @@ class AggregationConfig:
             strings; required for multi-exchange ``burst`` runs. Injected
             so tests and calibration scripts can stub the
             sentence-transformers dependency.
+        weighted_fill_floor: Minimum fraction of children that must
+            carry a non-``None`` :attr:`Fragment.weighted` before the
+            aggregator calls the holonic combiner. Must be in
+            ``[0.0, 1.0]``; below the floor the parent's ``weighted``
+            stays ``None`` rather than being fabricated from too-thin
+            input.
     """
 
     exchange_max_gap_minutes: int = 30
@@ -74,10 +80,21 @@ class AggregationConfig:
     session_max_gap_minutes: int = 360
     joiner: str = "\n\n"
     embedder: Callable[[list[str]], list[list[float]]] | None = None
-    # Minimum fraction of children that must carry weighted before we
-    # call the combiner; below this, the parent's ``weighted`` is None
-    # rather than a fabricated no-signal profile.
     weighted_fill_floor: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Validate ``weighted_fill_floor`` stays inside ``[0.0, 1.0]``.
+
+        Catches typos (negative floor = combiner always fires; floor >
+        1.0 = combiner never fires) at construction time rather than
+        letting them silently change aggregation behaviour.
+        """
+        if not 0.0 <= self.weighted_fill_floor <= 1.0:
+            msg = (
+                "weighted_fill_floor must be in [0.0, 1.0], "
+                f"got {self.weighted_fill_floor}"
+            )
+            raise ValueError(msg)
 
 
 def aggregate(

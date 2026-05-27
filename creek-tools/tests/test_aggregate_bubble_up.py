@@ -279,3 +279,19 @@ class TestAggregateIdempotence:
         second = aggregate(children, level="exchange", config=AggregationConfig())
         # Both runs produce one parent each; their ``weighted`` is equal.
         assert first[0].weighted == second[0].weighted
+
+
+class TestAggregationConfigValidation:
+    """``AggregationConfig`` rejects out-of-range ``weighted_fill_floor`` values."""
+
+    @pytest.mark.parametrize("bad_floor", [-0.01, -1.0, 1.01, 2.0])
+    def test_out_of_range_fill_floor_raises(self, bad_floor: float) -> None:
+        """A floor outside ``[0.0, 1.0]`` fails fast at construction time."""
+        with pytest.raises(ValueError, match="weighted_fill_floor must be in"):
+            AggregationConfig(weighted_fill_floor=bad_floor)
+
+    @pytest.mark.parametrize("good_floor", [0.0, 0.5, 1.0])
+    def test_in_range_fill_floor_accepted(self, good_floor: float) -> None:
+        """Boundary values 0.0 and 1.0 are both accepted; mid-range works."""
+        config = AggregationConfig(weighted_fill_floor=good_floor)
+        assert config.weighted_fill_floor == good_floor
