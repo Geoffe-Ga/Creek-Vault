@@ -31,6 +31,9 @@
 # Issue plans are author-private; the directory exists per-package.
 **/git-issues/
 
+# Background-agent worktrees (Claude Code harness isolation directory).
+.claude/worktrees/
+
 # ============================================================
 # DEVELOPMENT ARTIFACTS
 # ============================================================
