@@ -50,6 +50,7 @@ from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
     ReatomizeConfig,
+    bubble_up_weighted,
     classify_reatomize,
 )
 from creek.classify.rules import RuleClassifier
@@ -674,6 +675,13 @@ def _maybe_reatomize_and_persist(
         classifier,
         config=reatomize_config,
     )
+    # Issue #368: when weighted classification is on, bubble each
+    # internal node's ``Fragment.weighted`` up from its children via
+    # the holonic combiner before persisting. The legacy fields on
+    # each fragment are unaffected by this pass — they already
+    # carry the per-node single-pick result from #366's adapter.
+    if classification_config.weighted_classification:
+        tree = bubble_up_weighted(tree)
     _persist_reatomized_children(
         tree=tree,
         root_id=root_fragment.id,
