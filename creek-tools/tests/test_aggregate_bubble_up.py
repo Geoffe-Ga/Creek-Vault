@@ -1,19 +1,4 @@
-"""Tests for the aggregate-path weighted bubble-up (issue #369).
-
-Covers the wiring of :func:`creek.classify.holonic.combine` into
-:func:`creek.atomize.aggregate.aggregate` so chat-style aggregations
-produce parents whose ``weighted`` field reflects the combined
-profile of their (per-message) children. The user's load-bearing
-intent — five terse messages individually classified as
-``unclassified`` aggregate into an exchange whose combined weighted
-profile is non-empty when enough of them carry signal, while five
-hedged-but-divergent messages dampen the parent's confidence — is
-exercised here alongside the conviction-over-length contract.
-
-These tests target :func:`_build_parent` directly via the public
-:func:`aggregate` entry point so the production code path matches
-the test path; building parents by hand would bypass the wiring.
-"""
+"""Tests for the aggregate-path weighted bubble-up."""
 
 from __future__ import annotations
 
@@ -171,8 +156,13 @@ class TestConvictionOverLengthAggregate:
 class TestFillFloorGate:
     """``weighted_fill_floor`` filters thinly-classified aggregations."""
 
-    def test_majority_unweighted_children_produces_none(self) -> None:
-        """3 of 5 children unweighted → parent.weighted is None (default 0.5 floor)."""
+    def test_below_fill_floor_produces_none(self) -> None:
+        """Fill fraction below the default 0.5 floor → parent.weighted is None.
+
+        Two of five children carry ``weighted``; that's 40% fill,
+        below the default ``weighted_fill_floor=0.5``, so the parent
+        stays ``None`` rather than carrying a thinly-sourced profile.
+        """
         children = [
             _message(0, weighted=_wfc(frequencies=((Frequency.F2, 0.8),))),
             _message(1, weighted=_wfc(frequencies=((Frequency.F2, 0.8),))),

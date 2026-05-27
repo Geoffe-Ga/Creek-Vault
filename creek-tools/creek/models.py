@@ -20,10 +20,9 @@ from creek.time import now_la, today_la
 if TYPE_CHECKING:
     # Type-only import to expose :class:`WeightedFragmentClassification`
     # to mypy / IDEs. At runtime the symbol is resolved by the late
-    # import + ``Fragment.model_rebuild`` at the bottom of this module
-    # (issue #365); a runtime import here would re-introduce the
-    # circular import :mod:`creek.classify.weighted` imports back into
-    # :mod:`creek.models`.
+    # import + ``Fragment.model_rebuild`` at the bottom of this module;
+    # a runtime import here would re-introduce the circular import
+    # :mod:`creek.classify.weighted` imports back into :mod:`creek.models`.
     from creek.classify.weighted import WeightedFragmentClassification
 
 CompileTargetKind = Literal["thread", "eddy", "frequency_index"]
@@ -514,14 +513,12 @@ class Fragment(BaseModel):
     child_ids: list[str] = Field(default_factory=list)
     level: FragmentLevel = "document"
     structural_path: list[str] = Field(default_factory=list)
-    # Epic #364: optional weighted-ontology profile parallel to the
-    # legacy ``frequency`` / ``wavelength`` / ``voice`` fields.
-    # ``None`` means "no weighted detection ran" (legacy vaults,
-    # pre-#366 fragments); set by sub-issues #366 / #368 / #369. The
-    # forward reference is resolved at the bottom of this module via a
-    # late import of :mod:`creek.classify.weighted` so the
-    # circular-import risk between models and the classify package
-    # stays contained.
+    # Optional weighted-ontology profile parallel to the legacy
+    # ``frequency`` / ``wavelength`` / ``voice`` fields. ``None``
+    # means "no weighted detection ran" (legacy vaults). The forward
+    # reference is resolved at the bottom of this module via a late
+    # import of :mod:`creek.classify.weighted` so the circular-import
+    # risk between models and the classify package stays contained.
     weighted: "WeightedFragmentClassification | None" = None
 
     # BUG-009: the ``[prop-decorator]`` suppression below is a known
@@ -765,17 +762,11 @@ class CompiledPage(BaseModel):
 
 
 # Late import + ``Fragment.model_rebuild`` to resolve the
-# :attr:`Fragment.weighted` forward reference (epic #364). The import
-# lives at the bottom of the module so every name :mod:`creek.classify.weighted`
-# depends on (the enum types, the legacy classification models, the
-# Fragment class itself) is already defined; the partial-load state
-# is enough for ``weighted.py`` to import successfully and produce a
-# :class:`WeightedFragmentClassification` we can name in the rebuild.
-# The late import below is required to break the cycle between models
-# and the weighted-classification module. ``weighted.py`` needs Fragment
-# and the enum types from this module, so it must load AFTER them; that
-# puts our half of the cycle here at module bottom. The ``noqa: E402``
-# below marks the deliberate placement; a top-level import would fail
+# :attr:`Fragment.weighted` forward reference. ``weighted.py`` needs
+# Fragment and the enum types from this module, so it must load AFTER
+# them; that puts our half of the cycle here at module bottom. The
+# ``noqa: E402`` below marks the deliberate placement; a top-level
+# import would fail
 # with ``ImportError``.
 from creek.classify.weighted import (  # noqa: E402  # wrong-import-position
     WeightedFragmentClassification as _WeightedFragmentClassification,

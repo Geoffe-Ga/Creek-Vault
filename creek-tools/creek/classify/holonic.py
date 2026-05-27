@@ -1,12 +1,9 @@
-"""Holonic combine / decompose math for weighted classifications (#367).
+"""Holonic combine / decompose math for weighted classifications.
 
-This module is the heart of epic #364: the pure-math operators that
-combine a set of children's weighted classifications upward into a
-parent. The split (#368) and aggregate (#369) sub-issues call into
-:func:`combine` from the FEAT-023 reatomize orchestrator and the
-FEAT-022 aggregator respectively; this module performs no IO, no LLM
-calls, no file reads — just numerical aggregation over the dataclasses
-landed by #365.
+Pure-math operators that combine a set of children's weighted
+classifications upward into a parent, and that produce a soft prior
+for atoms decomposed from a parent. No IO, no LLM calls, no file
+reads — just numerical aggregation over weighted dataclasses.
 
 Why not length
 ==============
@@ -35,21 +32,19 @@ Confidence and divergence
 =========================
 
 Parent ``overall_confidence`` = ``confidence_weighted_mean x (1 -
-divergence_penalty x jsd_norm)`` where:
+divergence_penalty x jsd_norm x confidence_weighted_mean)`` where:
 
 - ``confidence_weighted_mean`` = ``sum_i(c_i x c_i) / sum_i(c_i)``.
   Children with higher confidence pull the mean toward themselves —
   a chorus of hedges does not manufacture parent confidence.
 - ``jsd_norm`` = mean Jensen-Shannon divergence across per-dimension
-  distributions, normalised to [0, 1]. Two hedged guesses pointing
-  different ways produce low JSD (they are hedging, not
-  disagreeing); two confident children pointing different ways
-  produce high JSD.
+  distributions, normalised to [0, 1].
+- The extra ``x mean_confidence`` scales the JSD penalty so hedged
+  disagreement dampens less than confident disagreement.
 
-Calibration of raw ``overall_confidence`` (FEAT-017 territory) is out
-of scope here — the combiner assumes the confidences it receives are
-already on a meaningful scale; if they are not, the fix lives in the
-classifier (#366), not the combiner.
+Calibration of the raw ``overall_confidence`` upstream of this module
+is out of scope; the combiner assumes confidences are already on a
+meaningful scale and propagates them faithfully.
 
 Limitations
 ===========
@@ -60,15 +55,16 @@ Limitations
   but unsure about Mode). This module is structured so adding that
   would be a per-dimension change without touching call sites.
 - Choosing the "intelligently sized basic unit" (the holarchy level
-  to surface from a reatomized tree) lives in #368, not here. This
+  to surface from a reatomized tree) is the integrator's job; this
   module returns a single :class:`WeightedFragmentClassification`
-  per ``combine`` call; the tree walk is the integrator's job.
+  per ``combine`` call.
 """
 
 from __future__ import annotations
 
 import math
 from enum import StrEnum
+from itertools import chain
 from typing import TYPE_CHECKING, TypeVar
 
 from creek.classify.weighted import (
@@ -215,16 +211,23 @@ def decompose_prior(
 
     Args:
         parent: The parent profile being decomposed.
-        n_atoms: How many atoms the parent is being split into.
-            Accepted today for forward compatibility; see the
-            limitations section in the module docstring.
+        n_atoms: How many atoms the parent is being split into; must
+            be a positive integer. Accepted today for forward
+            compatibility — see the limitations section in the module
+            docstring.
 
     Returns:
         A :class:`WeightedFragmentClassification` whose per-dimension
         tuples mirror the parent's and whose ``overall_confidence``
         is half the parent's (clamped to ``[0.0, 1.0]``).
+
+    Raises:
+        ValueError: When ``n_atoms`` is less than 1 (decomposing into
+            zero or negative atoms is a caller bug).
     """
-    del n_atoms  # accepted for forward compatibility; see docstring
+    if n_atoms < 1:
+        msg = f"n_atoms must be >= 1, got {n_atoms}"
+        raise ValueError(msg)
     return WeightedFragmentClassification(
         frequencies=parent.frequencies,
         phases=parent.phases,
@@ -352,17 +355,11 @@ def _combine_confidence(
         return _clamp(mean_confidence)
 
     jsd_norm = _mean_normalised_jsd(children, weights)
-    # The penalty is scaled by ``mean_confidence`` so hedged children
-    # disagreeing dampen less than confident children disagreeing
-    # (the user's load-bearing intent on epic #364): two children at
-    # confidence 0.3 pointing different ways are hedging — the
-    # divergence is real but the parent is still entitled to its
-    # already-low mean confidence. Two children at confidence 0.9
-    # pointing different ways are an actual conflict — the parent
-    # should drop further from the mean. Scaling by ``mean_confidence``
-    # gives the dampening factor an interpretation in
-    # ``[1 - divergence_penalty x mean_confidence², 1]``, which is
-    # what the unit tests anchor under ``TestDivergenceDampening``.
+    # Scale the penalty by ``mean_confidence`` so hedged children
+    # disagreeing dampen less than confident children disagreeing:
+    # confidence 0.3 vs 0.3 is hedging (real divergence, low stakes);
+    # confidence 0.9 vs 0.9 pointing different ways is a real conflict
+    # that should drop the parent further from the mean.
     damping_factor = 1.0 - divergence_penalty * jsd_norm * mean_confidence
     return _clamp(mean_confidence * damping_factor)
 
@@ -435,15 +432,12 @@ def _per_dimension_jsd(
 
     # All enum values that appear anywhere — the JSD is computed over
     # this support so each child's distribution is zero-padded
-    # consistently. ``chain.from_iterable`` keeps the nested-iterable
-    # flattening explicit and dodges the FURB179 readability flag.
-    from itertools import (
-        chain,  # locally scoped to keep the import cost off the module hot path
-    )
-
+    # consistently. Build an order map once so sorting is O(K log K)
+    # rather than O(K^2) via per-comparison ``list(enum_type).index``.
+    enum_order = {member: idx for idx, member in enumerate(enum_type)}
     support = sorted(
         set(chain.from_iterable(distributions)),
-        key=lambda v: list(enum_type).index(v),
+        key=enum_order.__getitem__,
     )
     total = sum(contributing_weights)
     mixture: dict[_DimT, float] = {

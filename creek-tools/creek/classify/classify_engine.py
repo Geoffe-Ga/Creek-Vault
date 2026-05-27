@@ -502,8 +502,8 @@ def _classify_one(
         llm: :class:`LLMClassifier` instance when ``method == "llm"``.
         confidence_threshold: Threshold below which the LLM is invoked
             during ``--method llm`` runs.
-        weighted_classification: When ``True`` (issue #366), the LLM
-            path dispatches through
+        weighted_classification: When ``True``, the LLM path
+            dispatches through
             :func:`creek.classify.weighted.classify_weighted`, persists
             the resulting weighted profile to
             :attr:`Fragment.weighted`, and derives the legacy
@@ -511,7 +511,8 @@ def _classify_one(
             :meth:`WeightedFragmentClassification.to_legacy` so
             downstream consumers stay synchronised. Has no effect on
             the rules path or on ``--method llm`` runs where the rule
-            classifier already cleared the confidence floor.
+            classifier already cleared the confidence floor; for those
+            fragments :attr:`Fragment.weighted` stays ``None``.
 
     Returns:
         ``(updated_fragment, skipped, reasoning)``. ``skipped`` is
@@ -543,7 +544,7 @@ def _classify_one_weighted(
     body: str,
     llm_config: LLMConfig,
 ) -> tuple[Fragment, bool, str]:
-    """Dispatch the LLM call through the #366 weighted classifier.
+    """Dispatch the LLM call through the weighted classifier.
 
     Replaces the single-pick LLM path when
     :attr:`ClassificationConfig.weighted_classification` is set.
@@ -675,11 +676,8 @@ def _maybe_reatomize_and_persist(
         classifier,
         config=reatomize_config,
     )
-    # Issue #368: when weighted classification is on, bubble each
-    # internal node's ``Fragment.weighted`` up from its children via
-    # the holonic combiner before persisting. The legacy fields on
-    # each fragment are unaffected by this pass — they already
-    # carry the per-node single-pick result from #366's adapter.
+    # Legacy single-pick fields on each fragment are untouched here;
+    # only ``Fragment.weighted`` is rolled up via the holonic combiner.
     if classification_config.weighted_classification:
         tree = bubble_up_weighted(tree)
     _persist_reatomized_children(

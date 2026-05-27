@@ -550,15 +550,19 @@ class TestDecomposePrior:
 class TestDefensiveBranches:
     """Defensive code paths covering pathological inputs."""
 
-    def test_clamp_handles_nan_confidence(self) -> None:
-        """A NaN per-child confidence produces a finite parent confidence."""
+    def test_nan_confidence_collapses_to_zero(self) -> None:
+        """A NaN per-child confidence does not propagate to the parent."""
         import math
 
         child = _wfc(overall_confidence=float("nan"))
         parent = combine([child, child])
-        # NaN <= 0 is False, so the effective weight stays NaN; the
-        # downstream clamp catches the non-finite value and returns 0.
+        # ``max(0.0, nan) == 0.0`` in CPython (nan > 0.0 is False), so
+        # ``_resolve_weights`` silences the NaN at the door: the
+        # effective weight becomes 0.0, the sum is 0.0, and the
+        # all-zero-weights short-circuit returns a zero-confidence
+        # parent. The clamp is therefore never reached on this path.
         assert math.isfinite(parent.overall_confidence)
+        assert parent.overall_confidence == 0.0
 
     def test_explicit_zero_weights_returns_empty_dimensions(self) -> None:
         """All-zero explicit weights collapse the parent to no signal."""

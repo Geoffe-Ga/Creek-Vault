@@ -265,21 +265,25 @@ class ClassificationConfig(BaseModel):
     """
 
     weighted_classification: bool = False
-    """Opt-in switch for epic-#364 / sub-issue-#366 weighted classification.
+    """Opt-in switch for weighted classification across the holarchy.
 
-    When ``False`` (default) the classify pipeline behaves exactly as
-    it did before #366: a single canonical pick per dimension lands on
+    When ``False`` (default) the classify pipeline writes a single
+    canonical pick per dimension to
     :attr:`Fragment.frequency` / :attr:`Fragment.wavelength` /
-    :attr:`Fragment.voice`, and :attr:`Fragment.weighted` stays
-    ``None``. When ``True``, every LLM-classified fragment also gets a
+    :attr:`Fragment.voice` and leaves :attr:`Fragment.weighted` as
+    ``None``. When ``True``, every fragment whose classification
+    actually reaches the LLM also gets a
     :class:`~creek.classify.weighted.WeightedFragmentClassification`
     persisted to :attr:`Fragment.weighted`; the legacy single-pick
     fields are derived from the top weighted entries via
     :meth:`WeightedFragmentClassification.to_legacy` so downstream
     consumers (lint, compile, voice-skill generation) keep working
-    unchanged. The rule-based classifier path is unaffected — only
-    LLM-classified fragments carry the weighted profile in this
-    sub-issue.
+    unchanged.
+
+    Rule-confident fragments are NOT re-classified —
+    :attr:`Fragment.weighted` stays ``None`` for those even with this
+    flag on. This preserves the FEAT-017 cost gate that already keeps
+    the LLM from re-running over high-confidence rule picks.
     """
 
 
