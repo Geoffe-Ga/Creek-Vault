@@ -777,8 +777,16 @@ class IdeaMiner:
         snap = self._resolve_snapshot(vault_path, snapshot)
         if require_corpus and not snap.fragments:
             return []
+        if limit < 0:
+            # Honour the docstring "negative values clamp to zero":
+            # ``limit == 0`` means "use the default", ``limit < 0``
+            # means "no seeds, full stop" (a caller passing a negative
+            # value almost certainly arrived there by arithmetic that
+            # underflowed, and a silent fallback to the default would
+            # hide the bug).
+            return []
         coverage = _coverage_by_tuple(snap.fragments)
-        effective_limit = DEFAULT_UNEXPLORED_LIMIT if limit <= 0 else limit
+        effective_limit = DEFAULT_UNEXPLORED_LIMIT if limit == 0 else limit
         ranked = _rank_tuples_by_inverse_coverage(coverage, effective_limit)
         return list(itertools.starmap(_seed_from_ontology_tuple, ranked))
 

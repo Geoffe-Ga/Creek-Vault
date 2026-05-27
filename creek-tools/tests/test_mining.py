@@ -1561,12 +1561,12 @@ class TestMineUnexploredOntology:
         seeds = miner.mine_unexplored_ontology(vault, limit=5)
         assert not seeds
 
-    def test_unclassified_only_corpus_returns_no_seeds_by_default(
+    def test_unclassified_only_corpus_surfaces_max_score_seeds(
         self,
         vault: Path,
         miner: IdeaMiner,
     ) -> None:
-        """A vault of only fully-unclassified fragments still surfaces nothing.
+        """A vault of only fully-unclassified fragments still surfaces rarest tuples.
 
         The require_corpus guard cares about the *load* of any fragment
         at all (the user has indeed begun the work), not about how many
@@ -1588,6 +1588,26 @@ class TestMineUnexploredOntology:
         # fragment contributes zero coverage, so the rarest tuples
         # surface at the maximal score.
         assert len(seeds) == 3
+
+    def test_negative_limit_returns_no_seeds(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """``limit < 0`` returns an empty list, matching the docstring.
+
+        The docstring guarantees that negative limits clamp to zero —
+        callers passing a negative value (often from arithmetic that
+        underflowed) get an honest empty result rather than the
+        :data:`DEFAULT_UNEXPLORED_LIMIT` fallback that ``limit == 0``
+        triggers.
+        """
+        seeds = miner.mine_unexplored_ontology(
+            vault,
+            limit=-1,
+            require_corpus=False,
+        )
+        assert seeds == []
 
 
 # ---------------------------------------------------------------------------
