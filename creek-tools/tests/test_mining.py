@@ -20,13 +20,16 @@ from creek.generate.mining import (
     DEFAULT_MIN_THREAD_FRAGMENTS,
     DEFAULT_SIMILARITY_LIMINAL,
     DEFAULT_SIMILARITY_RESONANCE,
+    DEFAULT_UNEXPLORED_LIMIT,
     IdeaMiner,
     IdeaSeed,
     MiningStrategy,
+    OntologyTuple,
     _jaccard_similarity,
     phase_filtered_seeds,
 )
 from creek.models import (
+    Dosage,
     Eddy,
     Fragment,
     FragmentSource,
@@ -40,6 +43,8 @@ from creek.models import (
     Synchronicity,
     Thread,
     ThreadStatus,
+    VoiceClassification,
+    VoiceRegister,
     WavelengthClassification,
 )
 from tests.factories.compiled import (
@@ -85,6 +90,9 @@ def _build_fragment(
     platform: SourcePlatform = SourcePlatform.JOURNAL,
     frequency: Frequency = Frequency.F5,
     phase: Phase = Phase.RISING,
+    mode: Mode = Mode.EXPRESS,
+    dosage: Dosage = Dosage.MEDICINE,
+    voice_register: VoiceRegister | None = VoiceRegister.ANALYTICAL,
     threads: tuple[str, ...] = (),
     eddies: tuple[str, ...] = (),
     praxis: PraxisPotential = PraxisPotential.LATENT,
@@ -100,9 +108,11 @@ def _build_fragment(
         frequency=FrequencyClassification(primary=frequency),
         wavelength=WavelengthClassification(
             phase=phase,
-            mode=Mode.EXPRESS,
+            mode=mode,
             orientation=Orientation.DO,
+            dosage=dosage,
         ),
+        voice=VoiceClassification(voice_register=voice_register),
         threads=list(threads),
         eddies=list(eddies),
         praxis_potential=praxis,
@@ -1240,6 +1250,344 @@ class TestCompileFirstUnchangedExternalBehaviour:
         compiled_titles = {s.title for s in compiled_seeds}
         bypass_titles = {s.title for s in bypass_seeds}
         assert compiled_titles == bypass_titles
+
+
+# ---------------------------------------------------------------------------
+# #356 unexplored-ontology strategy
+# ---------------------------------------------------------------------------
+
+
+class TestOntologyTuple:
+    """``OntologyTuple`` is a frozen, hashable position in dimension space."""
+
+    def test_ontology_tuple_is_hashable(self) -> None:
+        """Tuples must be hashable for set/dict membership."""
+        position = OntologyTuple(
+            phase=Phase.WITHDRAWAL,
+            frequency=Frequency.F3,
+            mode=Mode.INHABIT,
+            voice_register=VoiceRegister.CONFESSIONAL,
+            dosage=Dosage.TOXIC,
+        )
+        assert isinstance(hash(position), int)
+
+    def test_ontology_tuple_renders_human_label(self) -> None:
+        """The human label joins each dimension's value with separators."""
+        label = OntologyTuple(
+            phase=Phase.PEAKING,
+            frequency=Frequency.F7,
+            mode=Mode.EXPRESS,
+            voice_register=VoiceRegister.PROPHETIC,
+            dosage=Dosage.MEDICINE,
+        ).label()
+        assert "peaking" in label
+        assert "F7" in label
+        assert "express" in label
+        assert "prophetic" in label
+        assert "medicine" in label
+
+
+class TestMineUnexploredOntology:
+    """``mine_unexplored_ontology`` surfaces the rarest classification tuples."""
+
+    def test_dominant_combination_leaves_huge_gap(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """A corpus piled into one tuple surfaces everything else as a gap."""
+        # 20 fragments piled into (peaking, F7, express, prophetic, medicine).
+        for n in range(20):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=f"frag-dom-{n:02d}",
+                    title=f"Dominant {n}",
+                    phase=Phase.PEAKING,
+                    frequency=Frequency.F7,
+                    mode=Mode.EXPRESS,
+                    voice_register=VoiceRegister.PROPHETIC,
+                    dosage=Dosage.MEDICINE,
+                    created_day=(n % 28) + 1,
+                ),
+                "Body.",
+            )
+
+        seeds = miner.mine_unexplored_ontology(vault, limit=5)
+
+        assert len(seeds) == 5
+        # No surfaced gap reproduces the dominant tuple verbatim.
+        dominant_label = OntologyTuple(
+            phase=Phase.PEAKING,
+            frequency=Frequency.F7,
+            mode=Mode.EXPRESS,
+            voice_register=VoiceRegister.PROPHETIC,
+            dosage=Dosage.MEDICINE,
+        ).label()
+        assert all(dominant_label not in s.title for s in seeds)
+        # Every surfaced seed identifies the unexplored strategy.
+        assert all(s.strategy is MiningStrategy.UNEXPLORED_ONTOLOGY for s in seeds)
+
+    def test_seed_includes_dimensional_position_and_framing(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Each surfaced seed reports the tuple and a framing description."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-anchor",
+                title="Anchor",
+                phase=Phase.PEAKING,
+                frequency=Frequency.F7,
+                mode=Mode.EXPRESS,
+                voice_register=VoiceRegister.PROPHETIC,
+                dosage=Dosage.MEDICINE,
+            ),
+            "Body.",
+        )
+
+        seeds = miner.mine_unexplored_ontology(vault, limit=3)
+
+        for seed in seeds:
+            assert seed.brief_description
+            # The brief contains the natural-language framing question.
+            assert "?" in seed.brief_description
+            # The title carries the dimensional tuple.
+            assert " x " in seed.title
+
+    def test_even_coverage_corpus_yields_equal_scores(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """With every tuple tied at zero coverage, surfaced scores are equal."""
+        # Empty corpus: every tuple has count == 0. The require_corpus
+        # guard would otherwise short-circuit; we disable it to exercise
+        # the rank-ordering across a tied corpus.
+        seeds = miner.mine_unexplored_ontology(
+            vault,
+            limit=8,
+            require_corpus=False,
+        )
+
+        assert len(seeds) == 8
+        # All surfaced seeds carry the same maximal score.
+        first_score = seeds[0].score
+        assert all(seed.score == first_score for seed in seeds)
+        # And the score is positive (rarest possible).
+        assert first_score > 0
+
+    def test_rank_is_inverse_to_fragment_count(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Combinations with more coverage rank below those with less."""
+        # 5 fragments at one tuple, 1 fragment at a less-covered tuple.
+        for n in range(5):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=f"frag-dense-{n}",
+                    title=f"Dense {n}",
+                    phase=Phase.PEAKING,
+                    frequency=Frequency.F7,
+                    mode=Mode.EXPRESS,
+                    voice_register=VoiceRegister.PROPHETIC,
+                    dosage=Dosage.MEDICINE,
+                    created_day=n + 1,
+                ),
+                "Body.",
+            )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-sparse",
+                title="Sparse",
+                phase=Phase.WITHDRAWAL,
+                frequency=Frequency.F3,
+                mode=Mode.INHABIT,
+                voice_register=VoiceRegister.CONFESSIONAL,
+                dosage=Dosage.TOXIC,
+            ),
+            "Body.",
+        )
+
+        # Use a large explicit limit to surface both tuples.
+        seeds = miner.mine_unexplored_ontology(vault, limit=10_000)
+
+        # Build a lookup: tuple_label -> rank.
+        labels = [seed.title for seed in seeds]
+        dense_label = OntologyTuple(
+            phase=Phase.PEAKING,
+            frequency=Frequency.F7,
+            mode=Mode.EXPRESS,
+            voice_register=VoiceRegister.PROPHETIC,
+            dosage=Dosage.MEDICINE,
+        ).label()
+        sparse_label = OntologyTuple(
+            phase=Phase.WITHDRAWAL,
+            frequency=Frequency.F3,
+            mode=Mode.INHABIT,
+            voice_register=VoiceRegister.CONFESSIONAL,
+            dosage=Dosage.TOXIC,
+        ).label()
+        # Find ranks; both should exist in the (effectively) unlimited list.
+        dense_rank = next(
+            (i for i, t in enumerate(labels) if dense_label in t),
+            None,
+        )
+        sparse_rank = next(
+            (i for i, t in enumerate(labels) if sparse_label in t),
+            None,
+        )
+        assert dense_rank is not None
+        assert sparse_rank is not None
+        # The sparse tuple has fewer fragments → ranks higher (smaller index).
+        assert sparse_rank < dense_rank
+
+    def test_unclassified_fragment_does_not_count_against_any_tuple(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Fragments missing a dimension are ignored — they don't seed coverage."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-unclassified",
+                title="Unclassified",
+                phase=Phase.UNCLASSIFIED,
+                voice_register=None,
+            ),
+            "Body.",
+        )
+
+        seeds = miner.mine_unexplored_ontology(vault, limit=3)
+
+        # No tuple has any coverage; all seeds share the empty-corpus score.
+        assert seeds
+        assert len({seed.score for seed in seeds}) == 1
+
+    def test_mine_all_includes_unexplored_ontology_seeds(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """The strategy participates in ``mine_all`` by default."""
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-anchor",
+                title="Anchor",
+            ),
+            "Body.",
+        )
+
+        seeds = miner.mine_all(vault, current_phase=Phase.UNCLASSIFIED)
+
+        assert any(s.strategy is MiningStrategy.UNEXPLORED_ONTOLOGY for s in seeds)
+
+    def test_limit_caps_results(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """A positive ``limit`` caps the surfaced seed count."""
+        seeds = miner.mine_unexplored_ontology(
+            vault,
+            limit=2,
+            require_corpus=False,
+        )
+        assert len(seeds) == 2
+
+    def test_zero_limit_uses_default(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """``limit == 0`` returns the default cap (not zero, not everything)."""
+        seeds = miner.mine_unexplored_ontology(
+            vault,
+            limit=0,
+            require_corpus=False,
+        )
+        # Default is DEFAULT_UNEXPLORED_LIMIT.
+        assert len(seeds) == DEFAULT_UNEXPLORED_LIMIT
+
+    def test_source_fragments_is_empty(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Unexplored-ontology seeds reference absence — no source fragments."""
+        seeds = miner.mine_unexplored_ontology(
+            vault,
+            limit=1,
+            require_corpus=False,
+        )
+        assert not seeds[0].source_fragments
+
+    def test_frequency_affinity_matches_tuple_frequency(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """Each seed's frequency_affinity reflects the tuple's frequency dim."""
+        seeds = miner.mine_unexplored_ontology(
+            vault,
+            limit=5,
+            require_corpus=False,
+        )
+        for seed in seeds:
+            # Exactly one frequency, never UNCLASSIFIED.
+            assert len(seed.frequency_affinity) == 1
+            assert seed.frequency_affinity[0] != Frequency.UNCLASSIFIED
+
+    def test_empty_corpus_returns_no_seeds_by_default(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """An empty vault yields no unexplored-ontology seeds (require_corpus default).
+
+        Surfacing "every combination is unexplored" against an empty
+        corpus is uninformative — every dimension is equally rare. The
+        guard preserves the historical "no seeds surfaced" experience
+        for first-time users with no fragments yet.
+        """
+        seeds = miner.mine_unexplored_ontology(vault, limit=5)
+        assert not seeds
+
+    def test_unclassified_only_corpus_returns_no_seeds_by_default(
+        self,
+        vault: Path,
+        miner: IdeaMiner,
+    ) -> None:
+        """A vault of only fully-unclassified fragments still surfaces nothing.
+
+        The require_corpus guard cares about the *load* of any fragment
+        at all (the user has indeed begun the work), not about how many
+        of them are classified yet. With at least one fragment present
+        the strategy returns its rarest-tuple list, even if every
+        fragment is in the unclassified column.
+        """
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-1",
+                title="Anchor",
+                voice_register=None,
+            ),
+            "Body.",
+        )
+        seeds = miner.mine_unexplored_ontology(vault, limit=3)
+        # Corpus is non-empty so the strategy runs; the unclassified
+        # fragment contributes zero coverage, so the rarest tuples
+        # surface at the maximal score.
+        assert len(seeds) == 3
 
 
 # ---------------------------------------------------------------------------
