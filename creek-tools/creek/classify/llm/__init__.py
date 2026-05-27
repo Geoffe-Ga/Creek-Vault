@@ -50,7 +50,13 @@ from creek.classify.llm.parsing import (
     _split_reasoning_and_yaml as _split_reasoning_and_yaml,
 )
 from creek.classify.llm.parsing import _strip_code_fences as _strip_code_fences
+from creek.classify.llm.prompts import _COLOR_BLOCK as _COLOR_BLOCK
+from creek.classify.llm.prompts import _FREQUENCY_BLOCK as _FREQUENCY_BLOCK
+from creek.classify.llm.prompts import (
+    _FREQUENCY_COLOR_BLOCK as _FREQUENCY_COLOR_BLOCK,
+)
 from creek.classify.llm.prompts import CLASSIFICATION_PROMPT
+from creek.classify.llm.prompts import _sanitise_for_prompt as _sanitise_for_prompt
 from creek.classify.llm.providers import ANTHROPIC_CLOUD_WARNING, AnthropicProvider
 
 __all__ = [
