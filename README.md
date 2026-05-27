@@ -7,17 +7,17 @@ A Python CLI and pipeline for organizing large volumes of semi-structured person
 The pipeline runs in five stages:
 
 1. **Redaction** — pattern-based scanning for secrets, API keys, and PII *before* anything else touches the data.
-2. **Ingestion** — source-specific parsers (Claude/ChatGPT exports, Discord, Google Drive, markdown, PDF, DOCX, XLSX/CSV, PPTX, code, images via OCR, generic text) normalize everything to UTF-8 markdown with structured YAML frontmatter.
+2. **Ingestion** — eleven source-specific parsers (Claude/ChatGPT exports, Discord, markdown, PDF/DOCX, XLSX/CSV, PPTX, code, images via OCR, Substack, generic text) plus a read-only Google Drive downloader that stages remote files for the matching ingestor. Each ingestor normalises its input to UTF-8 markdown with structured YAML frontmatter.
 3. **Classification** — rule-based pre-classification plus opt-in LLM-assisted tagging across multiple dimensions (topic, voice register, frequency, archetypal phase, privacy tier, confidence).
 4. **Linking** — embedding-based semantic similarity, temporal proximity, and density-based eddy detection surface connections across sources.
 5. **Generation** — index notes, weekly/monthly wavelength reports, the Voice Skill Tree, blog-idea mining, and skill-stack-driven essay drafting.
 
 ## Key capabilities
 
-- **Twelve source platforms** wired into a single registry — Claude, ChatGPT, Discord, Google Drive, code, documents (DOCX/PDF), markdown, spreadsheets (XLSX/CSV), presentations (PPTX), images (OCR), generic text, plus a fallback `other`.
+- **Eleven source ingestors and a Google Drive downloader.** Claude, ChatGPT, Discord, code, documents (DOCX/PDF), markdown, spreadsheets (XLSX/CSV), presentations (PPTX), images (OCR), Substack, and a generic text fallback. `gdrive` is a read-only downloader, not an ingestor — it stages mirrored files locally and dispatches each one to the matching ingestor by extension. (`SourcePlatform.OTHER` is a reserved enum value for downstream-synthesised fragments, not a parser.)
 - **Local-first by default.** Classification runs on Ollama; embeddings on `sentence-transformers`. The Anthropic API path is opt-in.
-- **Privacy-tiered.** `Open` / `Personal` / `Intimate` privacy tiers with consent gating and a full audit trail.
-- **Right-to-be-forgotten.** `creek purge` removes a fragment, source, date range, or the entire vault, scrubbing every reference along the way.
+- **Privacy-tiered with two distinct consent surfaces.** Fragments carry an `Open` / `Personal` / `Intimate` tier. *Ingestion* gates the first run for each source on an explicit consent prompt, logged once to `00-Creek-Meta/Processing-Log/consent-log.json`. *Downstream stages* (generation, mining, drafts, MCP queries) filter or refuse fragments by tier independently. Hash-chained audit logs back the privacy-tier overrides, redactions, and purges.
+- **Right-to-be-forgotten.** `creek purge` deletes a fragment, source, date range, or the entire vault and scrubs every reference along the way: wiki-links by title across every `.md` file, word-boundary fragment-ID mentions in YAML provenance lists (`source_fragments: …` in drafts) and prose body text, plus the matching rows in `00-Creek-Meta/embeddings.parquet` (vault-purge deletes the cache file outright). The hash-chained purge audit log is the only artifact retained for compliance reconstruction.
 - **Deterministic.** Fragment IDs are hashed from `(source, timestamp, content)` so re-processing is idempotent.
 - **Voice-aware generation.** The `creek skills` / `creek mine` / `creek draft` flow turns vault contents into a per-frequency Voice Skill Tree and uses it to draft new essays in your style.
 
@@ -88,7 +88,7 @@ See [`creek-tools/README.md`](creek-tools/README.md) for the full command refere
 
 ## Status
 
-Phase-3 of the implementation plan is complete: full ingestion across twelve source platforms, rule-based and LLM-assisted classification, embeddings + temporal + eddy linking, the Voice Skill Tree, idea mining, draft generation, weekly/monthly reports, redaction, and right-to-be-forgotten purges. Refactor follow-ups (typed parse intermediates, configurable header detection) are tracked in the issue backlog.
+Phase-3 of the implementation plan is complete: eleven registered ingestors plus the Google Drive downloader, rule-based and LLM-assisted classification, embeddings + temporal + eddy linking, the Voice Skill Tree, idea mining, draft generation, weekly/monthly reports, redaction, and right-to-be-forgotten purges (including embedding-cache rows and YAML/body fragment-ID mentions). Refactor follow-ups (typed parse intermediates, configurable header detection) are tracked in the issue backlog.
 
 ## License
 
