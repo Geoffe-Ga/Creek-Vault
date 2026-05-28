@@ -24,8 +24,9 @@ from __future__ import annotations
 import logging
 import operator
 import re
+import sys
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -52,6 +53,14 @@ from creek.generate.dimensional_retrieval import (
     format_dimension_label,
     raise_if_all_empty,
     union_fragment_ids,
+)
+from creek.generate.grounding import (
+    EmbeddingFn,
+    GroundingReport,
+    GroundingThresholds,
+    ParagraphAnnotation,
+    build_grounding_frontmatter,
+    score_draft,
 )
 from creek.generate.twist import (
     OntologyProfile,
@@ -256,6 +265,23 @@ class Draft:
             source profile diverges from the target profile (issue
             #352). Empty when the two profiles match (regression
             baseline) or when twist composition was not requested.
+        derivative_score: Bidirectional grounding guard's derivative
+            metric (issue #355). The maximum paragraph cosine
+            similarity recorded between the draft body and every
+            paragraph of the source fragments that fed the prompt.
+            ``None`` when the guard did not run (no embedding callable
+            wired) so the field reads as "not yet evaluated" rather
+            than "evaluated clean".
+        grounding_score: Bidirectional grounding guard's grounding
+            metric (issue #355). The fraction of draft paragraphs whose
+            ``max_similarity`` cleared
+            :attr:`creek.config.DraftConfig.grounding_lower` against
+            *some* source paragraph. ``None`` when the guard did not
+            run.
+        paragraph_grounding: Per-paragraph annotation list produced by
+            :class:`creek.generate.grounding.GroundingReport`. Each
+            entry carries ``{index, max_similarity, is_derivative,
+            is_grounded}``. Empty when the guard did not run.
     """
 
     title: str
@@ -272,6 +298,9 @@ class Draft:
     source_profile: OntologyProfile | None = None
     target_profile: OntologyProfile | None = None
     twist_dimensions: tuple[str, ...] = ()
+    derivative_score: float | None = None
+    grounding_score: float | None = None
+    paragraph_grounding: tuple[ParagraphAnnotation, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         """Validate draft invariants."""
@@ -490,6 +519,8 @@ class DraftGenerator:
         privacy_override: PrivacyTierOverride | None = None,
         bypass_compiled: bool = False,
         ontology_twist: bool = False,
+        embedding_fn: EmbeddingFn | None = None,
+        grounding_thresholds: GroundingThresholds | None = None,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -514,6 +545,19 @@ class DraftGenerator:
                 fragments. Default ``False`` keeps the legacy
                 composition path (epic #349 gates the flag while in
                 development).
+            embedding_fn: Optional paragraph embedding callable for the
+                issue #355 bidirectional grounding guard. When
+                supplied, every generated draft is scored against its
+                source fragments and the scores are written to the
+                returned :class:`Draft` and the saved frontmatter. When
+                ``None`` (the default) the guard is skipped — existing
+                tests that construct a :class:`DraftGenerator` with a
+                stub LLM continue to work without dragging in the
+                sentence-transformer dependency.
+            grounding_thresholds: Optional resolved guard thresholds.
+                Required only when *embedding_fn* is supplied; ignored
+                otherwise. Callers typically build this with
+                :meth:`creek.generate.grounding.GroundingThresholds.from_config`.
         """
         self._llm = llm
         self.skills_root = skills_root
@@ -521,6 +565,8 @@ class DraftGenerator:
         self.privacy_override = privacy_override
         self.bypass_compiled = bypass_compiled
         self.ontology_twist = ontology_twist
+        self._embedding_fn = embedding_fn
+        self._grounding_thresholds = grounding_thresholds
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -819,6 +865,53 @@ class DraftGenerator:
         )
         return "\n\n".join(parts)
 
+    def _build_guard_report(
+        self,
+        *,
+        body: str,
+        source_fragments: tuple[str, ...],
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> GroundingReport | None:
+        """Run the issue #355 grounding guard, or return ``None`` when disabled.
+
+        The guard runs only when both an embedding callable and a
+        :class:`GroundingThresholds` instance were supplied at
+        construction time. Otherwise the method short-circuits — the
+        legacy test suite constructs :class:`DraftGenerator` with a
+        stub LLM only, and must keep working without dragging in the
+        sentence-transformer dependency.
+
+        The guard also prints a one-line summary to stderr so an
+        operator running ``creek draft`` interactively sees the verdict
+        before the saved-path message appears on stdout.
+
+        Args:
+            body: The generated draft body that just returned from the
+                LLM.
+            source_fragments: Fragment IDs that fed the draft prompt.
+                Looked up in *fragments* to pull each source body for
+                paragraph-level cosine scoring.
+            fragments: Pre-loaded ``{id: (Fragment, body)}`` map (the
+                same one the caller already loaded).
+
+        Returns:
+            A :class:`GroundingReport`, or ``None`` when the guard is
+            not configured on this generator.
+        """
+        if self._embedding_fn is None or self._grounding_thresholds is None:
+            return None
+        source_texts = [
+            fragments[fid][1] for fid in source_fragments if fid in fragments
+        ]
+        report = score_draft(
+            body,
+            source_texts=source_texts,
+            embedding_fn=self._embedding_fn,
+            thresholds=self._grounding_thresholds,
+        )
+        print(report.summary_line(), file=sys.stderr)
+        return report
+
     def generate_draft(
         self,
         idea: IdeaSeed,
@@ -860,6 +953,11 @@ class DraftGenerator:
         if not body:
             msg = "LLM returned an empty draft body"
             raise RuntimeError(msg)
+        guard = self._build_guard_report(
+            body=body,
+            source_fragments=idea.source_fragments,
+            fragments=fragments,
+        )
         return Draft(
             title=idea.title,
             body=body,
@@ -872,6 +970,9 @@ class DraftGenerator:
             ),
             prompt=prompt,
             generated_date=datetime.now(tz=UTC),
+            derivative_score=guard.derivative_score if guard else None,
+            grounding_score=guard.grounding_score if guard else None,
+            paragraph_grounding=_guard_annotations(guard),
         )
 
     def resolve_seed(
@@ -1145,6 +1246,11 @@ class DraftGenerator:
         if not body:
             msg = "LLM returned an empty draft body"
             raise RuntimeError(msg)
+        guard = self._build_guard_report(
+            body=body,
+            source_fragments=idea.source_fragments,
+            fragments=fragments,
+        )
         return Draft(
             title=idea.title,
             body=body,
@@ -1162,6 +1268,9 @@ class DraftGenerator:
             source_profile=twist_payload.source_profile,
             target_profile=twist_payload.target_profile,
             twist_dimensions=twist_payload.dimensions,
+            derivative_score=guard.derivative_score if guard else None,
+            grounding_score=guard.grounding_score if guard else None,
+            paragraph_grounding=_guard_annotations(guard),
         )
 
     def _build_twist_payload(
@@ -1237,6 +1346,13 @@ class DraftGenerator:
             post["target_profile"] = draft.target_profile.as_mapping()
         if draft.twist_dimensions:
             post["twist_dimensions"] = list(draft.twist_dimensions)
+        guard_fields = build_grounding_frontmatter(
+            derivative_score=draft.derivative_score,
+            grounding_score=draft.grounding_score,
+            paragraph_annotations=draft.paragraph_grounding,
+        )
+        for key, value in guard_fields.items():
+            post[key] = value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
@@ -1314,6 +1430,20 @@ def _serialise_seed_spec(spec: SeedSpec) -> dict[str, object]:
     if spec.modes:
         payload["modes"] = [md.value for md in spec.modes]
     return payload
+
+
+def _guard_annotations(
+    report: GroundingReport | None,
+) -> tuple[ParagraphAnnotation, ...]:
+    """Return the per-paragraph annotation tuple for the :class:`Draft` field.
+
+    Returns an empty tuple when *report* is ``None`` (guard disabled)
+    so the dataclass default is preserved and existing tests that
+    construct :class:`Draft` without the guard fields keep working.
+    """
+    if report is None:
+        return ()
+    return tuple(score.to_annotation() for score in report.paragraph_scores)
 
 
 def _serialise_per_dimension_sources(

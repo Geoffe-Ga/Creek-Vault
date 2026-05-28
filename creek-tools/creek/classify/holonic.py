@@ -402,6 +402,32 @@ def _mean_normalised_jsd(
     return sum(divergences) / len(divergences)
 
 
+def _contributing_distributions(
+    per_child_entries: Sequence[tuple[WeightedDimension[_DimT], ...]],
+    weights: Sequence[float],
+) -> tuple[list[dict[_DimT, float]], list[float]]:
+    """Build per-child sum-to-1 distributions, skipping non-contributors.
+
+    A child contributes to the JSD only when it carries a positive
+    effective weight *and* at least one entry on the dimension whose
+    weights sum positively. Children that fail either gate are
+    excluded so the divergence is computed over the actually-comparable
+    distributions rather than diluted by vacuous zeros.
+    """
+    distributions: list[dict[_DimT, float]] = []
+    contributing_weights: list[float] = []
+    for entries, weight in zip(per_child_entries, weights, strict=True):
+        if weight <= 0 or not entries:
+            continue
+        total_entry_weight = sum(entry.weight for entry in entries)
+        if total_entry_weight <= 0:
+            continue
+        dist = {entry.value: entry.weight / total_entry_weight for entry in entries}
+        distributions.append(dist)
+        contributing_weights.append(weight)
+    return distributions, contributing_weights
+
+
 def _per_dimension_jsd(
     per_child_entries: Sequence[tuple[WeightedDimension[_DimT], ...]],
     weights: Sequence[float],
@@ -414,32 +440,17 @@ def _per_dimension_jsd(
     definition, but we want to skip dimensions where no comparison is
     possible rather than dilute the average with vacuous zeros).
     """
-    # Build per-child distributions (sum-to-1 per child, zeros for
-    # values the child did not mention) only for children with at
-    # least one entry on this dimension and a positive effective
-    # weight; the rest do not contribute to the JSD.
-    distributions: list[dict[_DimT, float]] = []
-    contributing_weights: list[float] = []
-    for entries, weight in zip(per_child_entries, weights, strict=True):
-        if weight <= 0 or not entries:
-            continue
-        total_entry_weight = sum(entry.weight for entry in entries)
-        if total_entry_weight <= 0:
-            continue
-        dist = {entry.value: entry.weight / total_entry_weight for entry in entries}
-        distributions.append(dist)
-        contributing_weights.append(weight)
-
+    distributions, contributing_weights = _contributing_distributions(
+        per_child_entries,
+        weights,
+    )
     if len(distributions) < 2:
         return None
 
-    # All enum values that appear anywhere — the JSD is computed over
-    # this support so each child's distribution is zero-padded
-    # consistently. ``chain.from_iterable`` keeps the nested-iterable
-    # flattening explicit and dodges the FURB179 readability flag.
-    from itertools import (
-        chain,  # locally scoped to keep the import cost off the module hot path
-    )
+    # ``chain.from_iterable`` keeps the nested-iterable flattening
+    # explicit and dodges the FURB179 readability flag. Locally scoped
+    # to keep the import cost off the module hot path.
+    from itertools import chain
 
     support = sorted(
         set(chain.from_iterable(distributions)),
