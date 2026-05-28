@@ -399,6 +399,42 @@ def _mean_normalised_jsd(
     return sum(divergences) / len(divergences)
 
 
+def _contributing_distributions(
+    per_child_entries: Sequence[tuple[WeightedDimension[_DimT], ...]],
+    weights: Sequence[float],
+) -> tuple[list[dict[_DimT, float]], list[float]]:
+    """Build per-child probability distributions for the JSD computation.
+
+    Keeps only children with a positive effective weight and at least
+    one entry whose convictions sum above zero; each surviving child's
+    entries are normalised to sum to 1. Pulled out of
+    :func:`_per_dimension_jsd` so that function stays under the
+    cyclomatic-complexity gate.
+
+    Args:
+        per_child_entries: One tuple of weighted entries per child.
+        weights: Per-child effective weight vector, aligned with
+            ``per_child_entries``.
+
+    Returns:
+        ``(distributions, contributing_weights)`` — the normalised
+        per-child distributions and their matching effective weights,
+        both filtered to the contributing children only.
+    """
+    distributions: list[dict[_DimT, float]] = []
+    contributing_weights: list[float] = []
+    for entries, weight in zip(per_child_entries, weights, strict=True):
+        if weight <= 0 or not entries:
+            continue
+        total_entry_weight = sum(entry.weight for entry in entries)
+        if total_entry_weight <= 0:
+            continue
+        dist = {entry.value: entry.weight / total_entry_weight for entry in entries}
+        distributions.append(dist)
+        contributing_weights.append(weight)
+    return distributions, contributing_weights
+
+
 def _per_dimension_jsd(
     per_child_entries: Sequence[tuple[WeightedDimension[_DimT], ...]],
     weights: Sequence[float],
@@ -411,22 +447,10 @@ def _per_dimension_jsd(
     definition, but we want to skip dimensions where no comparison is
     possible rather than dilute the average with vacuous zeros).
     """
-    # Build per-child distributions (sum-to-1 per child, zeros for
-    # values the child did not mention) only for children with at
-    # least one entry on this dimension and a positive effective
-    # weight; the rest do not contribute to the JSD.
-    distributions: list[dict[_DimT, float]] = []
-    contributing_weights: list[float] = []
-    for entries, weight in zip(per_child_entries, weights, strict=True):
-        if weight <= 0 or not entries:
-            continue
-        total_entry_weight = sum(entry.weight for entry in entries)
-        if total_entry_weight <= 0:
-            continue
-        dist = {entry.value: entry.weight / total_entry_weight for entry in entries}
-        distributions.append(dist)
-        contributing_weights.append(weight)
-
+    distributions, contributing_weights = _contributing_distributions(
+        per_child_entries,
+        weights,
+    )
     if len(distributions) < 2:
         return None
 
