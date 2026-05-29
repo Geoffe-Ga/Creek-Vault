@@ -119,6 +119,65 @@ def _write_fragment(
     return target
 
 
+def _write_intimate_note_with_stub(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    stub_relpath: str | None = None,
+    write_stub: bool = True,
+) -> tuple[Path, Path]:
+    """Write an intimate-tier vault note plus its stub body (GAP-012).
+
+    Mirrors what ``creek save`` does for an ``intimate`` answer: a
+    title-only note carrying a ``saved_from.intimate_body_pointer`` and
+    a separate full-body stub under
+    ``10-Liminal/Compost/intimate-stubs/``.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID for the note's frontmatter.
+        title: Note title (also used for the stub filename).
+        stub_relpath: Pointer value to record in the note. Defaults to
+            ``10-Liminal/Compost/intimate-stubs/<title>.md``.
+        write_stub: When ``False``, record the pointer but do not create
+            the stub file on disk (simulates an already-deleted stub).
+
+    Returns:
+        Tuple of ``(note_path, stub_path)``.
+    """
+    pointer = stub_relpath or f"10-Liminal/Compost/intimate-stubs/{title}.md"
+    stub_path = vault / pointer
+    if write_stub:
+        stub_path.parent.mkdir(parents=True, exist_ok=True)
+        stub_post = frontmatter.Post(
+            content="The full intimate body.\n",
+            type="intimate-stub",
+            title=title,
+            privacy_tier="intimate",
+        )
+        stub_path.write_text(frontmatter.dumps(stub_post), encoding="utf-8")
+
+    note_path = vault / "01-Fragments" / "Conversations" / f"{title}.md"
+    note_post = frontmatter.Post(
+        content="(intimate body withheld)\n",
+        id=frag_id,
+        title=title,
+        type="fragment",
+        source={"platform": "claude", "original_file": f"{frag_id}.json"},
+        threads=[],
+        eddies=[],
+        privacy_tier="intimate",
+        saved_from={
+            "source_kind": "answer",
+            "intimate_body_pointer": pointer,
+        },
+    )
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text(frontmatter.dumps(note_post), encoding="utf-8")
+    return note_path, stub_path
+
+
 def _write_thread(
     vault: Path,
     thread_id: str,
@@ -342,6 +401,117 @@ def test_fragment_purge_writes_audit(tmp_path: Path) -> None:
     assert outcome.embeddings_removed == 0
     assert outcome.operator == "human via CLI"
     assert outcome.dry_run is False
+
+
+# ---------------------------------------------------------------------------
+# Engine tests — intimate stub sweep (GAP-012)
+# ---------------------------------------------------------------------------
+
+
+def test_fragment_purge_removes_intimate_stub(tmp_path: Path) -> None:
+    """Purging an intimate note also deletes its pointed-to stub (GAP-012)."""
+    vault = _make_vault(tmp_path)
+    note, stub = _write_intimate_note_with_stub(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 1
+    assert not note.exists()
+    assert not stub.exists()
+
+
+def test_fragment_purge_intimate_stub_dry_run_preserves(tmp_path: Path) -> None:
+    """Dry-run counts the stub it would delete but leaves it on disk."""
+    vault = _make_vault(tmp_path)
+    note, stub = _write_intimate_note_with_stub(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault, dry_run=True)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 1
+    assert note.exists()
+    assert stub.exists()
+
+
+def test_fragment_purge_missing_stub_does_not_raise(tmp_path: Path) -> None:
+    """A pointer at an already-deleted stub is tolerated, not an error."""
+    vault = _make_vault(tmp_path)
+    note, stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        write_stub=False,
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+    assert not stub.exists()
+
+
+def test_fragment_purge_no_pointer_skips_stub_sweep(tmp_path: Path) -> None:
+    """A plain note (no pointer) reports zero intimate stubs removed."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+
+
+def test_source_purge_removes_intimate_stub(tmp_path: Path) -> None:
+    """A scoped source purge sweeps the intimate stub too (GAP-012)."""
+    vault = _make_vault(tmp_path)
+    _note, stub = _write_intimate_note_with_stub(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.intimate_stubs_removed == 1
+    assert not stub.exists()
+
+
+def test_fragment_purge_intimate_stub_audit_records_count(
+    tmp_path: Path,
+) -> None:
+    """The outcome audit entry reports ``intimate_stubs_removed`` (GAP-012)."""
+    vault = _make_vault(tmp_path)
+    _write_intimate_note_with_stub(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    engine.purge_fragment("frag-A")
+
+    entries = PurgeAuditLog(vault).read()
+    intent, outcome = entries
+    assert intent.intimate_stubs_removed == 0
+    assert outcome.intimate_stubs_removed == 1
+
+
+def test_fragment_purge_intimate_stub_outside_vault_skipped(
+    tmp_path: Path,
+) -> None:
+    """A pointer escaping the vault root is ignored, not followed (security)."""
+    vault = _make_vault(tmp_path)
+    outsider = tmp_path / "outside-secret.md"
+    outsider.write_text("not a stub\n", encoding="utf-8")
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath="../outside-secret.md",
+        write_stub=False,
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+    assert outsider.exists()
 
 
 # ---------------------------------------------------------------------------

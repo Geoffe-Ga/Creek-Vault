@@ -164,6 +164,10 @@ class PurgeResult(BaseModel):
             list entries (e.g. ``source_fragments``) and bare body-text
             mentions in every ``.md`` file; the wiki-link count stays
             on :attr:`wikilinks_removed`.
+        intimate_stubs_removed: Number of intimate-body stub files
+            deleted under ``10-Liminal/Compost/intimate-stubs/`` because
+            a purged note carried a ``saved_from.intimate_body_pointer``
+            at them (GAP-012). Counted-only in a dry run.
     """
 
     operation: str
@@ -179,6 +183,7 @@ class PurgeResult(BaseModel):
     classifications_reset: int = 0
     embeddings_removed: int = 0
     provenance_scrubbed: int = 0
+    intimate_stubs_removed: int = 0
 
 
 class PurgeEngine:
@@ -256,6 +261,7 @@ class PurgeEngine:
                 "03-Eddies",
                 eddy_ids,
             )
+            self._purge_intimate_stub(post, result)
             if not self.dry_run:
                 frag_file.unlink()
             result.embeddings_removed = self._purge_cache_for(
@@ -612,8 +618,74 @@ class PurgeEngine:
             "03-Eddies",
             eddy_ids,
         )
+        self._purge_intimate_stub(post, result)
         if not self.dry_run:
             frag_file.unlink()
+
+    def _purge_intimate_stub(
+        self,
+        post: frontmatter.Post,
+        result: PurgeResult,
+    ) -> None:
+        """Sweep the intimate-body stub a purged note points at (GAP-012).
+
+        ``creek save`` of an ``intimate``-tier answer writes a
+        title-only note and routes the full body to a stub file under
+        ``10-Liminal/Compost/intimate-stubs/``, recording the link in
+        the note's ``saved_from.intimate_body_pointer`` frontmatter. A
+        scoped purge that deletes the note must follow that pointer and
+        delete the stub too, or the full intimate body survives the
+        right-to-be-forgotten request.
+
+        The method is defensive: a missing or empty pointer, an
+        already-deleted stub, and a pointer that resolves outside the
+        vault root are all treated as no-ops rather than errors. The
+        last case prevents a hand-edited or malicious pointer
+        (``../../secret``) from steering a delete outside the vault.
+
+        Args:
+            post: Frontmatter of the note being purged.
+            result: Result accumulator; ``intimate_stubs_removed`` is
+                incremented for each stub actually removed (or that
+                would be removed in a dry run).
+        """
+        pointer = self._intimate_pointer(post)
+        if not pointer:
+            return
+        stub_path = (self.vault_path / pointer).resolve()
+        vault_root = self.vault_path.resolve()
+        if not stub_path.is_relative_to(vault_root):
+            logger.warning(
+                "Ignoring intimate_body_pointer %r that resolves outside "
+                "the vault root %s",
+                pointer,
+                vault_root,
+            )
+            return
+        if not stub_path.is_file():
+            return
+        result.intimate_stubs_removed += 1
+        if not self.dry_run:
+            stub_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _intimate_pointer(post: frontmatter.Post) -> str | None:
+        """Extract ``saved_from.intimate_body_pointer`` from a note.
+
+        Args:
+            post: Parsed frontmatter of a vault note.
+
+        Returns:
+            The stub pointer (vault-relative path string), or ``None``
+            when the note carries no usable pointer.
+        """
+        saved_from = post.get("saved_from")
+        if not isinstance(saved_from, dict):
+            return None
+        pointer = saved_from.get("intimate_body_pointer")
+        if isinstance(pointer, str) and pointer.strip():
+            return pointer
+        return None
 
     def _find_fragment_by_id(
         self,
@@ -998,6 +1070,7 @@ class PurgeEngine:
             references_scrubbed=result.wikilinks_removed,
             embeddings_removed=result.embeddings_removed,
             provenance_scrubbed=result.provenance_scrubbed,
+            intimate_stubs_removed=result.intimate_stubs_removed,
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,
