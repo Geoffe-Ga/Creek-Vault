@@ -1086,14 +1086,23 @@ def link(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
 
+    from creek.link import EmbeddingModelUnavailableError
     from creek.link.link_engine import run_link
 
-    summary = run_link(
-        vault_path=vault_path,
-        config=config,
-        method=method,
-        rebuild=rebuild,
-    )
+    try:
+        summary = run_link(
+            vault_path=vault_path,
+            config=config,
+            method=method,
+            rebuild=rebuild,
+        )
+    except EmbeddingModelUnavailableError as exc:
+        # The sentence-transformer model could not be loaded (GAP-008).
+        # The exception message already names the model and spells out
+        # the remediation, so surface it verbatim and exit non-zero
+        # rather than letting the generic handler swallow the guidance.
+        console.print(f"[red]Embedding linker aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
     console.print(_format_link_summary(summary))
 
 

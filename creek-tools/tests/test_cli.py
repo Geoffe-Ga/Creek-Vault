@@ -1127,6 +1127,54 @@ def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None
     assert "embeddings.parquet" in result.output
 
 
+def test_link_embeddings_model_unavailable_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model-load failure aborts ``creek link`` with the remediation.
+
+    When ``sentence_transformers.SentenceTransformer(...)`` cannot be
+    constructed (weights missing offline, corrupt cache, …), the
+    embeddings linker raises ``EmbeddingModelUnavailableError`` whose
+    message names the model and spells out the fix. The CLI must catch
+    that typed error, print its remediation-rich message, and exit
+    non-zero rather than reporting a clean success.
+    """
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+    from tests.helpers import write_fragment_file
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    write_fragment_file(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-00000000000c",
+            title="A fragment to embed",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        ),
+        body="Body text.",
+    )
+
+    def _raise(_model_name: str, _cache_folder: str | None) -> object:
+        msg = "boom"
+        raise OSError(msg)
+
+    monkeypatch.setattr(
+        "creek.link.embeddings._load_sentence_transformer",
+        _raise,
+    )
+
+    result = runner.invoke(
+        app,
+        ["link", "--vault", str(vault), "--method", "embeddings"],
+    )
+    assert result.exit_code != 0
+    normalized = " ".join(_strip_ansi(result.output).split())
+    # The remediation string from EmbeddingModelUnavailableError.
+    assert "run `creek link --method embeddings` once" in normalized
+    assert "network access" in normalized
+
+
 def test_link_eddies_output_phrases_eddies_written(tmp_path: Path) -> None:
     """Eddies CLI output reports both detected and written counts.
 
