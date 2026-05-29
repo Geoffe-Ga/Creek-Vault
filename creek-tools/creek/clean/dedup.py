@@ -175,10 +175,7 @@ class Deduplicator:
         if result.is_duplicate:
             return result
 
-        # Imported lazily to break the import cycle clean.dedup ->
-        # ingest.base -> models -> classify -> generate -> clean.dedup:
-        # a module-level import re-enters ingest.base before
-        # generate_fragment_id is defined.
+        # Lazy import breaks the dedup -> ingest.base cycle (test_import_cycles.py).
         from creek.ingest.base import generate_fragment_id
 
         fragment_id = generate_fragment_id(source, timestamp, content)

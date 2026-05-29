@@ -50,6 +50,7 @@ def test_module_imports_cleanly_in_fresh_interpreter(module_name: str) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
     assert result.returncode == 0, (
         f"importing {module_name!r} in a fresh interpreter failed "
