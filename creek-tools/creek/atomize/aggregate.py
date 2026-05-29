@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
 
+    from creek.classify.weighted import WeightedFragmentClassification
     from creek.models import FragmentLevel
 
 __all__ = ["AggregateLevel", "AggregationConfig", "aggregate"]
@@ -66,6 +67,12 @@ class AggregationConfig:
             strings; required for multi-exchange ``burst`` runs. Injected
             so tests and calibration scripts can stub the
             sentence-transformers dependency.
+        weighted_fill_floor: Minimum fraction of children that must
+            carry a non-``None`` :attr:`Fragment.weighted` before the
+            aggregator calls the holonic combiner. Must be in
+            ``[0.0, 1.0]``; below the floor the parent's ``weighted``
+            stays ``None`` rather than being fabricated from too-thin
+            input.
     """
 
     exchange_max_gap_minutes: int = 30
@@ -73,6 +80,21 @@ class AggregationConfig:
     session_max_gap_minutes: int = 360
     joiner: str = "\n\n"
     embedder: Callable[[list[str]], list[list[float]]] | None = None
+    weighted_fill_floor: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Validate ``weighted_fill_floor`` stays inside ``[0.0, 1.0]``.
+
+        Catches typos (negative floor = combiner always fires; floor >
+        1.0 = combiner never fires) at construction time rather than
+        letting them silently change aggregation behaviour.
+        """
+        if not 0.0 <= self.weighted_fill_floor <= 1.0:
+            msg = (
+                "weighted_fill_floor must be in [0.0, 1.0], "
+                f"got {self.weighted_fill_floor}"
+            )
+            raise ValueError(msg)
 
 
 def aggregate(
@@ -278,6 +300,7 @@ def _build_parent(
     earliest = min(c.created for c in children)
     latest = max(c.created for c in children)
     source_keys = _contributing_source_keys(children) if cross_source else None
+    weighted = _combine_children_weighted(children, config.weighted_fill_floor)
     return Fragment(
         id=parent_id,
         title=title,
@@ -292,7 +315,27 @@ def _build_parent(
             _speakers(children),
             source_keys=source_keys,
         ),
+        weighted=weighted,
     )
+
+
+def _combine_children_weighted(
+    children: list[Fragment],
+    fill_floor: float,
+) -> WeightedFragmentClassification | None:
+    """Return the combined weighted profile, or ``None`` below the fill floor."""
+    # Function-scoped import avoids the models -> classify -> atomize load-time cycle.
+    from creek.classify.holonic import combine
+
+    if not children:
+        return None
+    weighted_children = [c.weighted for c in children if c.weighted is not None]
+    if not weighted_children:
+        return None
+    fraction_with_weighted = len(weighted_children) / len(children)
+    if fraction_with_weighted < fill_floor:
+        return None
+    return combine(weighted_children)
 
 
 def _inherit_source(children: list[Fragment]) -> FragmentSource:

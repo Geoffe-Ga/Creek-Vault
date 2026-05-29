@@ -549,7 +549,7 @@ def _tree_for_parent(
     )
 
 
-# ---- Weighted bubble-up (issue #368) ---------------------------------------
+# ---- Weighted bubble-up ----------------------------------------------------
 
 
 def bubble_up_weighted(tree: ClassificationTree) -> ClassificationTree:
@@ -557,23 +557,22 @@ def bubble_up_weighted(tree: ClassificationTree) -> ClassificationTree:
 
     Walks the tree depth-first, combining each non-leaf node's
     children via :func:`creek.classify.holonic.combine` (which
-    enforces the conviction x confidence contract from #367 — length
-    is never the default mass) and stamping the combined
+    enforces the conviction x confidence contract — length is never
+    the default mass) and stamping the combined
     :class:`~creek.classify.weighted.WeightedFragmentClassification`
     onto the parent fragment's :attr:`weighted` field. Leaves flow
     through unchanged.
 
     Children whose :attr:`Fragment.weighted` is ``None`` are excluded
-    from the combine (zero-confidence pass-through, #367 invariant) —
-    they do not pollute the parent's profile. When every child's
-    weighted is ``None``, the parent's weighted stays ``None`` too
-    (honest "no signal" rather than fabricating one).
+    from the combine; they do not pollute the parent's profile. When
+    every child's weighted is ``None``, the parent's weighted stays
+    ``None`` too (honest "no signal" rather than fabricating one).
 
     Args:
         tree: The classification tree produced by
             :func:`classify_reatomize`. Each leaf is expected to
             already carry a :attr:`Fragment.weighted` populated by
-            #366's classifier; missing ``weighted`` is treated as
+            the LLM classifier; missing ``weighted`` is treated as
             "no signal" and skipped.
 
     Returns:

@@ -1,37 +1,25 @@
-"""Shared weighted-classification model (issue #365).
-
-PR #359 (issue #350) introduced :class:`WeightedDimension` and a
-weighted-tuple-per-dimension schema for free-form essay prompts in
-:mod:`creek.classify.prompt`. This module promotes those primitives —
-the dataclass, the parser helpers, the allowed-top-level-keys set —
-to a shared location so fragment-level callers (atoms in the
-holarchy, sub-issues #366 / #367) can reuse them without inverting
-the dependency graph (epic #364).
+"""Shared weighted-classification model for the holonic classifier holarchy.
 
 Public surface:
 
 - :class:`WeightedDimension` — frozen generic dataclass holding a
   ``(value, weight)`` pair for a single ontology-dimension entry.
 - :class:`WeightedFragmentClassification` — Pydantic model that lives
-  on :class:`creek.models.Fragment.weighted`, mirroring
-  :class:`creek.classify.prompt.PromptOntology` minus the ``prompt``
-  field. Pydantic so it round-trips through vault YAML frontmatter via
+  on :class:`creek.models.Fragment.weighted`. Pydantic so it round-
+  trips through vault YAML frontmatter via
   ``Fragment.model_dump(mode="json")`` / ``Fragment.model_validate``
   without bespoke serialiser plumbing.
 - Parser helpers (:func:`_coerce_weight`, :func:`_parse_enum_value`,
   :func:`_parse_dimension`, :func:`_load_yaml_dict`) and the
-  :data:`_ALLOWED_TOP_LEVEL_KEYS` set are leading-underscore module
-  privates that :mod:`creek.classify.prompt` (and #366's
-  fragment-level classifier) import directly.
+  :data:`_ALLOWED_TOP_LEVEL_KEYS` set are shared between this module
+  and :mod:`creek.classify.prompt`.
 
 The legacy single-pick fields on :class:`creek.models.Fragment`
 (``frequency``, ``wavelength``, ``voice``) remain authoritative for
 downstream consumers (compile, lint, voice-skill generation). When
 ``weighted`` is populated, the two stay synchronised via the
 :meth:`WeightedFragmentClassification.from_single_pick` and
-:meth:`WeightedFragmentClassification.to_legacy` adapters; callers
-that populate ``weighted`` are responsible for keeping the legacy
-fields in sync until the broader epic completes and consumers migrate.
+:meth:`WeightedFragmentClassification.to_legacy` adapters.
 """
 
 from __future__ import annotations
@@ -117,8 +105,10 @@ class WeightedDimension(Generic[_DimT]):
 
 
 # YAML top-level keys accepted by :func:`_load_yaml_dict`. Shared
-# between the prompt-ontology detector (PR #359) and the fragment-level
-# classifier landing in #366 so the schema is enforced from one place.
+# between the prompt-ontology detector and the fragment-level
+# classifier so the schema is enforced from one place. ``reasoning``
+# is populated outside the YAML path (via :func:`_split_reasoning_and_yaml`)
+# and therefore is not a permitted top-level YAML key here.
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     {
         "frequencies",
@@ -253,10 +243,13 @@ def _parse_dimension(
 def _load_yaml_dict(yaml_text: str) -> dict[str, object]:
     """Parse the YAML payload and assert the documented shape.
 
-    Mirrors :func:`creek.classify.llm.parsing.validate_response` but
-    against the weighted-classification schema. Strips markdown fences
-    first so a model that nests its YAML inside ```yaml ... ``` round-
-    trips correctly. Rejects multi-document payloads (a classic
+    Shared schema validator for the weighted-classification YAML
+    surface — used by both the prompt-ontology detector and the
+    fragment-level classifier. Mirrors the role
+    :func:`creek.classify.llm.parsing.validate_response` plays for the
+    single-pick fragment classifier. Strips markdown fences first so
+    a model that nests its YAML inside ```yaml ... ``` round-trips
+    correctly. Rejects multi-document payloads (a classic
     LLM-output-spoofing vector) and any top-level keys outside
     :data:`_ALLOWED_TOP_LEVEL_KEYS`.
 
@@ -307,8 +300,8 @@ class WeightedFragmentClassification(BaseModel):
     heaviest signal sits at index 0.
 
     Lives on :attr:`Fragment.weighted` as ``WeightedFragmentClassification |
-    None``; ``None`` means "no weighted detection ran" (legacy vaults,
-    pre-#366 fragments). When set, the legacy single-pick fields
+    None``; ``None`` means "no weighted detection ran" (legacy
+    fragments). When set, the legacy single-pick fields
     (:attr:`Fragment.frequency`, :attr:`Fragment.wavelength`,
     :attr:`Fragment.voice`) can be derived from the top weighted pick
     per dimension via :meth:`to_legacy`; the reverse widening lives in
@@ -434,9 +427,9 @@ class WeightedFragmentClassification(BaseModel):
 # Canonical frequency → Spiral-Dynamics colour mapping. Mirrored from
 # the prompt-template constants in :mod:`creek.classify.llm.prompts`
 # but kept local here to avoid pulling the whole prompt-building
-# module into adapter code paths. The two must stay in sync; the
-# fragment-level classifier landing in #366 will exercise both, which
-# anchors the contract.
+# module into adapter code paths. ``test_weighted.py`` includes a
+# sync test that asserts the two maps agree, so a rename in one place
+# breaks the build at test time rather than silently drifting.
 _FREQUENCY_TO_COLOR: dict[Frequency, Color] = {
     Frequency.F1: Color.BEIGE,
     Frequency.F2: Color.PURPLE,
@@ -615,7 +608,7 @@ def _top_value_optional(
 # rather than mutually recursive at runtime.
 
 
-# ---- LLM-driven fragment classifier (issue #366) ---------------------------
+# ---- LLM-driven fragment classifier ----------------------------------------
 
 
 WEIGHTED_CLASSIFICATION_TEMPLATE: str = (
@@ -703,7 +696,7 @@ FRAGMENT CONTENT:
     .replace("__COLOR_BLOCK__", _COLOR_BLOCK)
     .replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
 )
-"""LLM prompt template for fragment-level weighted classification (#366).
+"""LLM prompt template for fragment-level weighted classification.
 
 Placeholders:
 
@@ -805,7 +798,7 @@ def classify_weighted(
     fragment: IngestedFragment,
     config: LLMConfig,
 ) -> WeightedFragmentClassification:
-    """Classify a fragment, returning a weighted ontology profile (#366).
+    """Classify a fragment, returning a weighted ontology profile.
 
     Fragment-level twin of
     :func:`creek.classify.prompt.detect_ontology`. Same dispatch path

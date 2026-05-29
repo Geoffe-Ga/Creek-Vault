@@ -25,7 +25,7 @@ Three concerns get exercised here:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
@@ -55,6 +55,7 @@ from creek.models import (
     Confidence,
     Dosage,
     Fragment,
+    FragmentLevel,
     FragmentSource,
     Frequency,
     FrequencyClassification,
@@ -73,12 +74,15 @@ if TYPE_CHECKING:
 # ---- Fixtures --------------------------------------------------------------
 
 
-def _make_fragment(**overrides: object) -> Fragment:
+def _make_fragment(**overrides: Any) -> Fragment:
     """Build a minimal :class:`Fragment` with optional field overrides.
 
     The default fragment is the same shape ``test_minimal_creation``
     uses in :mod:`tests.test_models` so behaviour stays comparable
-    across the test suite.
+    across the test suite. Pydantic validates every keyword at
+    construction time, so the broad ``Any`` typing on ``**overrides``
+    is safe — a wrong field name or value fails fast on the
+    constructor call.
 
     Args:
         **overrides: Field values to splice onto the default Fragment.
@@ -86,13 +90,15 @@ def _make_fragment(**overrides: object) -> Fragment:
     Returns:
         A constructed :class:`Fragment` ready for use in a test body.
     """
-    defaults: dict[str, object] = {
-        "id": "frag-000000000001",
-        "title": "Test Fragment",
-        "source": FragmentSource(platform=SourcePlatform.CLAUDE),
-    }
-    defaults.update(overrides)
-    return Fragment(**defaults)  # type: ignore[arg-type]
+    return Fragment(
+        id=overrides.pop("id", "frag-000000000001"),
+        title=overrides.pop("title", "Test Fragment"),
+        source=overrides.pop(
+            "source",
+            FragmentSource(platform=SourcePlatform.CLAUDE),
+        ),
+        **overrides,
+    )
 
 
 # ---- Public-surface tests --------------------------------------------------
@@ -502,6 +508,21 @@ class TestToLegacy:
         """Every concrete frequency has a colour assignment."""
         assert _FREQUENCY_TO_COLOR[freq] is not Color.UNCLASSIFIED
 
+    def test_color_mapping_matches_canonical_source(self) -> None:
+        """``_FREQUENCY_TO_COLOR`` agrees with ``indexes.FREQUENCY_COLORS``.
+
+        The two maps must stay in sync — a rename in one place that
+        does not reach the other would silently mis-colour a fragment
+        on the boundary between the classify and generate paths.
+        """
+        from creek.generate.indexes import FREQUENCY_COLORS
+
+        # Every key in the classify-side map appears in the
+        # generate-side map and points at the same colour string.
+        assert set(_FREQUENCY_TO_COLOR) == set(FREQUENCY_COLORS)
+        for freq, color in _FREQUENCY_TO_COLOR.items():
+            assert color.value == FREQUENCY_COLORS[freq]
+
 
 class TestRoundTrip:
     """The widening / collapsing pair is inverse on non-unclassified fields."""
@@ -655,7 +676,7 @@ def _make_ingested(
     body: str,
     *,
     title: str = "Test fragment",
-    level: str = "document",
+    level: FragmentLevel = "document",
 ) -> IngestedFragment:
     """Build a minimal :class:`IngestedFragment` for use in classifier tests.
 
@@ -672,7 +693,7 @@ def _make_ingested(
             id="frag-classify00001",
             title=title,
             source=FragmentSource(platform=SourcePlatform.CLAUDE),
-            level=level,  # type: ignore[arg-type]
+            level=level,
         ),
         body=body,
     )
@@ -1001,3 +1022,88 @@ class TestClassifyEngineWiring:
         # And the rest of the contract: not skipped, reasoning carries.
         assert was_skipped is False
         assert "F3 / Red" in reasoning
+
+    def test_rule_confident_short_circuit_leaves_weighted_none(
+        self,
+        llm_config: LLMConfig,
+    ) -> None:
+        """Rule-confident fragments bypass the weighted path entirely.
+
+        When the rule classifier already clears the confidence floor,
+        ``_classify_one`` returns the rule result with
+        ``was_skipped=True`` *before* dispatching to either the legacy
+        or weighted LLM paths. ``Fragment.weighted`` therefore stays
+        ``None`` even when ``weighted_classification`` is on. This
+        preserves the FEAT-017 cost gate.
+        """
+        from creek.classify.classify_engine import _classify_one
+
+        fragment = Fragment(
+            id="frag-conf0000001",
+            title="Confident fragment",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        )
+
+        # Stub the rule classifier so the test does not depend on real
+        # keyword rules. Returns a F3-primary fragment at maximum
+        # confidence, which is the contract the FEAT-017 short-circuit
+        # checks before either LLM path fires.
+        class _ConfidentRules:
+            """Always returns a confident F3 classification."""
+
+            def classify(self, frag: Fragment, content: str = "") -> Fragment:
+                """Return *frag* with frequency.primary forced to F3."""
+                del content
+                return frag.model_copy(
+                    update={
+                        "frequency": FrequencyClassification(
+                            primary=Frequency.F3,
+                        ),
+                    },
+                )
+
+            def confidence_score(
+                self,
+                frag: Fragment,
+                content: str = "",
+            ) -> float:
+                """Always-confident floor that clears any threshold."""
+                del frag, content
+                return 1.0
+
+        class _DispatchedLLM:
+            """Records whether the weighted LLM path was hit."""
+
+            def __init__(self, config: LLMConfig) -> None:
+                """Capture the config and zero the dispatched counter."""
+                self.config = config
+                self.dispatched = False
+
+            def classify_with_reasoning(
+                self,
+                frag: Fragment,
+                content: str = "",
+            ) -> object:
+                """Mark dispatch and raise — must not be invoked here."""
+                del frag, content
+                self.dispatched = True
+                msg = "legacy classify_with_reasoning should not be invoked"
+                raise AssertionError(msg)
+
+        stub_llm = _DispatchedLLM(llm_config)
+        updated, was_skipped, reasoning = _classify_one(
+            fragment=fragment,
+            body="(test body)",
+            method="llm",
+            rules=_ConfidentRules(),  # type: ignore[arg-type]
+            llm=stub_llm,  # type: ignore[arg-type]
+            confidence_threshold=0.5,
+            weighted_classification=True,
+        )
+
+        # The rule path took the fragment; weighted stays None.
+        assert was_skipped is True
+        assert updated.weighted is None
+        assert reasoning == ""
+        # And the weighted LLM stub was never called.
+        assert stub_llm.dispatched is False

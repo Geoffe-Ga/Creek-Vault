@@ -22,6 +22,7 @@ import pytest
 
 from creek.classify.reatomize import (
     ClassificationTree,
+    StopReason,
     bubble_up_weighted,
     choose_intelligent_unit,
 )
@@ -32,6 +33,7 @@ from creek.classify.weighted import (
 from creek.ingest.base import IngestedFragment
 from creek.models import (
     Fragment,
+    FragmentLevel,
     FragmentSource,
     Frequency,
     Phase,
@@ -62,22 +64,22 @@ def _make_node(
     children: tuple[ClassificationTree, ...] = (),
     confidence: float = 0.7,
     depth: int = 0,
-    level: str = "paragraph",
+    level: FragmentLevel = "paragraph",
 ) -> ClassificationTree:
     """Build a :class:`ClassificationTree` node with a fragment + weighted."""
     fragment = Fragment(
         id=fragment_id,
         title=fragment_id,
         source=FragmentSource(platform=SourcePlatform.MARKDOWN),
-        level=level,  # type: ignore[arg-type]
+        level=level,
         weighted=weighted,
     )
     ingested = IngestedFragment(fragment=fragment, body="(test body)")
-    stop = "accepted" if not children else "split"
+    stop: StopReason = "accepted" if not children else "split"
     return ClassificationTree(
         fragment=ingested,
         confidence=confidence,
-        stop_reason=stop,  # type: ignore[arg-type]
+        stop_reason=stop,
         children=children,
         depth=depth,
     )
@@ -307,8 +309,8 @@ class TestChooseIntelligentUnit:
         chosen = choose_intelligent_unit(parent, threshold=0.6)
         assert chosen.fragment.fragment.id == "frag-child0000001"
 
-    def test_parent_materially_beats_child(self) -> None:
-        """When the parent materially exceeds the child, the parent wins."""
+    def test_below_threshold_child_returns_parent(self) -> None:
+        """A child below the threshold yields the parent as the chosen unit."""
         weak_child = _make_node(
             fragment_id="frag-weak00000001",
             weighted=_wfc(overall_confidence=0.5),
@@ -321,6 +323,54 @@ class TestChooseIntelligentUnit:
         chosen = choose_intelligent_unit(strong_parent, threshold=0.6)
         # Child at 0.5 is below threshold; the parent at 0.85 wins.
         assert chosen.fragment.fragment.id == "frag-strong000001"
+
+    def test_parent_materially_beats_above_threshold_child(self) -> None:
+        """Parent that materially outperforms an above-threshold child wins.
+
+        Anchors the ``node_confidence - desc_confidence > material_delta``
+        branch in :func:`_choose_intelligent_unit_recursive`. Both
+        candidates clear the threshold; the parent's confidence is far
+        enough above the child's to count as a material improvement,
+        so the parent is the better grain.
+        """
+        # Child clears threshold (0.6) at 0.65; parent at 0.85.
+        # Delta is 0.20, comfortably above the default material_delta=0.05.
+        clearing_child = _make_node(
+            fragment_id="frag-cclear000001",
+            weighted=_wfc(overall_confidence=0.65),
+        )
+        much_stronger_parent = _make_node(
+            fragment_id="frag-pstrong00001",
+            weighted=_wfc(overall_confidence=0.85),
+            children=(clearing_child,),
+        )
+        chosen = choose_intelligent_unit(much_stronger_parent, threshold=0.6)
+        assert chosen.fragment.fragment.id == "frag-pstrong00001"
+
+    def test_material_delta_tunable_promotes_child(self) -> None:
+        """A larger ``material_delta`` lets the descendant win on the same fixture.
+
+        The previous test pins the parent because the default
+        ``material_delta=0.05`` is much smaller than the parent/child
+        gap. Bumping ``material_delta`` past the gap should flip the
+        outcome: the parent no longer materially beats the child, and
+        the finer-grained descendant wins.
+        """
+        clearing_child = _make_node(
+            fragment_id="frag-cclear000002",
+            weighted=_wfc(overall_confidence=0.65),
+        )
+        parent = _make_node(
+            fragment_id="frag-pgapwide0001",
+            weighted=_wfc(overall_confidence=0.85),
+            children=(clearing_child,),
+        )
+        chosen = choose_intelligent_unit(
+            parent,
+            threshold=0.6,
+            material_delta=0.5,
+        )
+        assert chosen.fragment.fragment.id == "frag-cclear000002"
 
     def test_no_descendant_clears_threshold(self) -> None:
         """When nothing reaches the threshold the root is returned."""

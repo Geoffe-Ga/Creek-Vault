@@ -55,19 +55,17 @@ from creek.classify.llm import (
     _sanitise_for_prompt,
 )
 
-# Promoted in #365: the weighted-tuple primitive and the YAML parser
-# helpers now live in :mod:`creek.classify.weighted` so the
-# fragment-level classifier (#366) and the holonic combiner (#367) can
-# import them without depending on this prompt-detection module.
-# Re-export them here so PR #359's public surface (``from
-# creek.classify.prompt import WeightedDimension, ...``) keeps working
-# unchanged. ``parse_weighted_yaml`` is the shared YAML parser core
-# that both this prompt-detection module and the fragment-level
-# classifier (#366) dispatch through.
-# Underscore-prefixed re-exports preserve the PR #359 import contract
-# (``from creek.classify.prompt import _coerce_weight``, etc.) for
-# tests and downstream callers that still target this module's
-# private namespace. The ``as`` aliases convert the imports into the
+# The weighted-tuple primitive and the YAML parser helpers live in
+# :mod:`creek.classify.weighted` and are re-exported here so callers
+# that imported them from :mod:`creek.classify.prompt` historically
+# keep working unchanged. ``parse_weighted_yaml`` is the shared YAML
+# parser core that both this prompt-detection module and the
+# fragment-level weighted classifier dispatch through.
+# Underscore-prefixed re-exports preserve the original import
+# contract (``from creek.classify.prompt import _coerce_weight``,
+# etc.) for tests and downstream callers that still target this
+# module's private namespace. The ``as`` aliases convert the imports
+# into the
 # re-export form ruff/pylint recognises so they do not trip on
 # unused-import.
 from creek.classify.weighted import (
@@ -290,11 +288,9 @@ def parse_prompt_ontology_response(
         ValueError: When the YAML payload is malformed, multi-document,
             or contains unexpected top-level keys.
     """
-    # The actual parsing lives on
-    # :func:`creek.classify.weighted.parse_weighted_yaml` so the
-    # prompt-level and fragment-level paths share one source of truth
-    # (issue #366). The wrapper here only adds the ``prompt`` echo
-    # onto the resulting dataclass.
+    # Parsing lives on :func:`creek.classify.weighted.parse_weighted_yaml`
+    # so the prompt-level and fragment-level paths share one source of
+    # truth; this wrapper only adds the ``prompt`` echo onto the result.
     parsed = parse_weighted_yaml(response)
     return PromptOntology(
         prompt=prompt,
