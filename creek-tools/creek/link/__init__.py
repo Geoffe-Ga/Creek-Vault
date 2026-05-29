@@ -4,6 +4,8 @@ This package provides the four linking stages of the Creek pipeline.
 
 Public API:
     - ``EmbeddingLinker`` — generate embeddings and find semantic resonances
+    - ``EmbeddingModelUnavailableError`` — typed failure when the
+      sentence-transformer model cannot be loaded
     - ``Resonance`` — hierarchy-aware resonance edge (FEAT-024)
     - ``TemporalLink`` — scored temporal proximity link between two fragments
     - ``TemporalLinker`` — find temporal proximity links across sources
@@ -14,7 +16,11 @@ Public API:
 """
 
 from creek.link.eddies import EddyDetector
-from creek.link.embeddings import EmbeddingLinker, Resonance
+from creek.link.embeddings import (
+    EmbeddingLinker,
+    EmbeddingModelUnavailableError,
+    Resonance,
+)
 from creek.link.linker import LinkingPipeline, LinkingResult
 from creek.link.temporal import TemporalLink, TemporalLinker
 from creek.link.threads import ThreadDetector
@@ -22,6 +28,7 @@ from creek.link.threads import ThreadDetector
 __all__ = [
     "EddyDetector",
     "EmbeddingLinker",
+    "EmbeddingModelUnavailableError",
     "LinkingPipeline",
     "LinkingResult",
     "Resonance",
