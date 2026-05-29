@@ -150,6 +150,36 @@ class TestLoadModelFailure:
         with pytest.raises(EmbeddingModelUnavailableError):
             linker.load_model()
 
+    def test_importerror_from_torch_is_wrapped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ``ImportError`` from the torch import also yields the typed error.
+
+        ``load_model`` and the ``EmbeddingModelUnavailableError`` docstring
+        both list a torch ``ImportError`` (a broken or partial torch install)
+        as a wrapped failure mode; this pins that contract alongside the
+        ``OSError`` and ``RuntimeError`` cases.
+        """
+        from creek.link.embeddings import EmbeddingModelUnavailableError
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            msg = "No module named 'torch'"
+            raise ImportError(msg)
+
+        monkeypatch.setattr(
+            "creek.link.embeddings._load_sentence_transformer",
+            boom,
+        )
+
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        with pytest.raises(EmbeddingModelUnavailableError) as excinfo:
+            linker.load_model()
+
+        # The original ImportError is preserved as __cause__ so the operator
+        # can inspect the underlying failure if needed.
+        assert isinstance(excinfo.value.__cause__, ImportError)
+
     def test_message_mentions_cache_dir_when_configured(
         self,
         monkeypatch: pytest.MonkeyPatch,
