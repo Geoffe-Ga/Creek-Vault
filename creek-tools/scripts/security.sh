@@ -60,11 +60,17 @@ fi
 
 echo "=== Security Checks (Bandit) ==="
 
-# Run Bandit
+# Run Bandit.
+#
+# Severity threshold ``-ll`` (medium-or-above) matches both
+# .github/workflows/ci.yml and the CLAUDE.md §6.1 policy
+# ("Bandit: zero medium-or-above findings"). Aligning local with CI
+# closes the GAP-007 parity gap — a clean ``check-all.sh`` pass means
+# CI agrees on the same severity scope.
 if $VERBOSE; then
-    echo "Running Bandit security scanner..."
+    echo "Running Bandit security scanner (medium-or-above)..."
 fi
-bandit -r creek/ || { echo "✗ Bandit found issues" >&2; exit 1; }
+bandit -r creek/ -ll || { echo "✗ Bandit found issues" >&2; exit 1; }
 
 echo "=== Dependency Vulnerability Check (pip-audit) ==="
 

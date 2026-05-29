@@ -9,6 +9,27 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+### Tooling
+
+- **`./scripts/check-all.sh` now matches CI gate-for-gate (GAP-007).**
+  Three drifts closed:
+  1. **Interrogate** (docstring coverage ≥95%) is now invoked between
+     the tryceratops and unit-tests gates via the new
+     `scripts/lint-interrogate.sh`. CI already runs it; previously a
+     local pass could fail CI on docstring coverage alone.
+  2. **Bandit severity** in `scripts/security.sh` switched from
+     "all severities" to `-ll` (medium-or-above), matching CI and the
+     CLAUDE.md §6.1 policy. The local gate is now no stricter than CI;
+     low-severity findings are intentionally not gated. To audit them
+     anyway, run `bandit -r creek/` directly.
+  3. **`state-budget.sh` removed from `check-all.sh`.** The script
+     silently no-ops when `CREEK_VAULT` is unset (its default state
+     for most developers), so it had been a fake-pass entry on the
+     local gate while CI never invoked it at all. It now ships as a
+     standalone opt-in audit; run `./scripts/state-budget.sh --vault
+     <path>` against a real vault when you want to check report-size
+     budgets.
+
 ### Breaking changes
 
 - **`creek skills` is now a typer subapp** (FEAT-019). Replace existing

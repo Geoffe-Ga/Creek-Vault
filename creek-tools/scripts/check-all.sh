@@ -31,10 +31,16 @@ Runs:
    6. Complexity analysis (Radon)
    7. Refurb (modernisation; STYLE-001)
    8. Tryceratops (exception hygiene; STYLE-001)
-   9. Unit tests
-  10. Coverage report
-  11. Per-file coverage gate
-  12. State report size budget
+   9. Docstring coverage (interrogate; GAP-007 parity)
+  10. Unit tests
+  11. Coverage report
+  12. Per-file coverage gate
+
+This list matches the CI workflow gates (.github/workflows/ci.yml).
+``scripts/state-budget.sh`` is intentionally NOT in this list — it
+requires a vault path and is an opt-in audit, not a per-commit gate.
+Invoke it manually with ``./scripts/state-budget.sh --vault <path>``
+when you want to check a real vault's report-size budget.
 
 OPTIONS:
     --verbose   Show detailed output
@@ -99,10 +105,10 @@ run_check "Security checks" "security.sh"
 run_check "Complexity analysis" "complexity.sh"
 run_check "Refurb (modernisation)" "lint-refurb.sh"
 run_check "Tryceratops (exceptions)" "lint-tryceratops.sh"
+run_check "Docstring coverage (interrogate)" "lint-interrogate.sh"
 run_check "Unit tests" "test.sh" --unit
 run_check "Coverage report" "coverage.sh" --json
 run_check "Per-file coverage gate" "coverage-per-file.sh"
-run_check "State report size budget" "state-budget.sh"
 
 echo "=== Quality Checks Summary ==="
 echo "Passed: ${#PASSED_CHECKS[@]}"
