@@ -960,6 +960,60 @@ class TestClassify:
         mock_call.assert_not_called()
 
     @patch.object(LLMClassifier, "_call_ollama")
+    @patch("creek.classify.llm.time.sleep")
+    def test_5xx_response_returns_unchanged_with_warning(
+        self,
+        mock_sleep: MagicMock,
+        mock_call: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A 500 from the LLM retries then degrades cleanly (GAP-008).
+
+        Pins the existing record-and-continue contract for transport-level
+        failures (cf. `creek/classify/llm/orchestrator.py` retry loop):
+        every retry attempt logs a WARNING with the fragment ID + provider,
+        and after `MAX_RETRIES` the fragment is returned unchanged rather
+        than raising. Distinguished from
+        `test_returns_unchanged_after_all_retries` which uses ConnectError
+        (no HTTP response at all); this test uses ``HTTPStatusError``
+        because a 5xx is qualitatively different — the server reached us
+        and answered, just with an error code — and operators reading the
+        log line need to know that path is also covered.
+        """
+        response = httpx.Response(
+            500,
+            request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+        )
+        mock_call.side_effect = httpx.HTTPStatusError(
+            "Server error",
+            request=response.request,
+            response=response,
+        )
+        config = LLMConfig()
+        classifier = _make_classifier_available(LLMClassifier(config=config))
+        classifier.MAX_RETRIES = 2
+
+        with caplog.at_level(logging.WARNING):
+            frag = _make_fragment(title="5xx Test")
+            result = classifier.classify(frag)
+
+        # Contract: degrade to unchanged after exhausting retries, never raise.
+        assert result.id == frag.id
+        assert result.frequency.primary == Frequency.UNCLASSIFIED
+        # Two attempts because MAX_RETRIES=2 and both failed.
+        assert mock_call.call_count == 2
+        # Each attempt logs a WARNING the operator can grep on.
+        attempt_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "Classify attempt" in r.message
+        ]
+        assert len(attempt_warnings) == 2
+        # Final WARN/ERROR line names "retries exhausted" so the operator
+        # knows to investigate transport health rather than the fragment.
+        assert any("retries exhausted" in r.message.lower() for r in caplog.records)
+
+    @patch.object(LLMClassifier, "_call_ollama")
     def test_classify_preserves_id_and_title(
         self,
         mock_call: MagicMock,

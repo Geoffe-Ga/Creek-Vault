@@ -161,6 +161,19 @@ Pass `--force` if you genuinely want to re-classify everything (for example, aft
 
 The engine also appends each classified fragment ID to `<vault>/00-Creek-Meta/Processing-Log/llm-progress.jsonl` for observability (newline-delimited JSON, one `{"id": ...}` object per line). The file is informational — the per-fragment frontmatter is the source of truth.
 
+## Failure modes and the documented contract (GAP-008)
+
+These are the dynamic failure modes the engine handles, and what each looks like to the operator:
+
+| Failure | Contract | Observable |
+|---------|----------|------------|
+| **Ctrl-C / SIGTERM mid-run** (laptop sleep, container reclamation, manual abort) | Per-fragment frontmatter is fsync-implicit through `Path.write_text`; the progress JSONL line is written atomically (O_APPEND, single short `write`). On exit, every line in `llm-progress.jsonl` is well-formed JSON. | `KeyboardInterrupt` propagates; the next `creek classify --method llm` resumes from where it stopped. Test: `tests/test_classify_engine_interrupt.py`. |
+| **LLM transport failure** (Anthropic 5xx, Ollama connection refused, timeout) | The orchestrator retries up to `MAX_RETRIES` with a `RETRY_DELAY` sleep between attempts, logging a `WARNING` per attempt (`[fragment=<id> path=<source> provider=<provider>] Classify attempt N/M failed for '<title>': <error>`). After the final retry it logs `All N retries exhausted for '<title>' — returning unchanged` at `ERROR` and returns the fragment with its existing (probably `unclassified`) classification. The run continues; the fragment is left in the review queue for re-classification on the next run. | The fragment file on disk is **not** stamped with `classification_method: llm`, so the next run will retry it. The progress JSONL only records successful classifications. Tests: `tests/test_classify.py::TestClassify::test_5xx_response_returns_unchanged_with_warning` and `::test_returns_unchanged_after_all_retries`. |
+| **Embedding model load failure** (first run, no network; corrupt cache; torch import error) | `EmbeddingLinker.load_model` raises `EmbeddingModelUnavailableError` with a message that names the configured model and points at the remediation (`creek link --method embeddings` on a host with network access). The underlying exception is preserved as `__cause__`. | `creek link` exits non-zero with the typed error; the operator sees the model name and the remediation in the error, not a torch stack trace. Tests: `tests/test_embeddings.py::TestLoadModelFailure`. |
+| **Encrypted / corrupt PDF passed to the document ingestor** | The ingestor logs a `WARNING` and skips the file; the run continues. | The file does not appear in the vault; the run summary reports it as skipped. (No GAP-008 test added — covered by existing ingestor-failure-mode coverage in `tests/test_ingest_failure_modes.py`.) |
+
+If you encounter a failure mode not listed here that surfaces as a stack trace rather than an actionable error message, that's a bug — file an issue with the `BUG-*` prefix and the failing command output.
+
 ## LLM provider details
 
 ### Ollama (default, local)

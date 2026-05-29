@@ -32,10 +32,16 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from creek.classify.prompt import PromptOntology
     from creek.config import CreekConfig
     from creek.generate.compost_embedding import CompostExemplar
     from creek.generate.compost_verifier import SupportsVerifyCompost
-    from creek.generate.drafts import DraftLLM, SeedSpec
+    from creek.generate.drafts import (
+        DraftGenerator,
+        DraftLLM,
+        OntologyDetector,
+        SeedSpec,
+    )
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
     from creek.link.link_engine import LinkSummary
@@ -2004,6 +2010,159 @@ def _build_draft_llm() -> DraftLLM:
     return classifier.invoke_prompt
 
 
+def _run_seeded_draft(
+    generator: DraftGenerator,
+    *,
+    seed_spec: SeedSpec,
+    vault_path: Path,
+    current_phase: Phase,
+    override: PrivacyTierOverride | None,
+) -> None:
+    """Run the seeded-draft pipeline and surface errors as typer exits.
+
+    Extracted from :func:`draft` so the CLI command body stays under
+    the cyclomatic-complexity floor. The branches it owns are the two
+    expected error surfaces (``SeedResolutionError`` and
+    ``PluralitySourceError``) plus the happy-path save / audit.
+    """
+    from creek.generate.drafts import SeedResolutionError
+    from creek.generate.twist import PluralitySourceError
+
+    try:
+        draft_obj = generator.generate_seeded_draft(
+            seed_spec,
+            vault_path=vault_path,
+            current_phase=current_phase,
+        )
+    except (SeedResolutionError, PluralitySourceError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="draft",
+        override=override,
+        fragment_ids=list(draft_obj.source_fragments),
+    )
+    saved_path = generator.save_draft(draft_obj, vault_path)
+    console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+
+
+def _read_outline_input(
+    seed_outline: Path | None,
+    seed_outline_text: str | None,
+) -> str | None:
+    """Resolve the outline input from the file/inline flags (issue #354).
+
+    Returns ``None`` when neither flag is set so the caller falls back to
+    the single-topic / mining paths. Exits 2 when both flags are set
+    (mutually exclusive) or when the outline file cannot be read.
+    """
+    if seed_outline is not None and seed_outline_text is not None:
+        console.print(
+            "[red]--seed-outline and --seed-outline-text are mutually "
+            "exclusive; pass only one.[/red]",
+        )
+        raise typer.Exit(code=2)
+    if seed_outline_text is not None:
+        return seed_outline_text
+    if seed_outline is None:
+        return None
+    try:
+        return seed_outline.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]Could not read --seed-outline {seed_outline}: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
+    """Return an :data:`OntologyDetector` bound to the vault's LLM config.
+
+    The returned closure runs :func:`creek.classify.prompt.detect_ontology`
+    against the resolved :class:`~creek.config.LLMConfig` so each outline
+    section's ontology is detected with the same provider the rest of the
+    pipeline uses.
+    """
+    from creek.classify.prompt import detect_ontology
+
+    config = _load_config_for_vault(vault)
+
+    def _detect(prompt: str) -> PromptOntology:
+        return detect_ontology(prompt, config.llm)
+
+    return _detect
+
+
+def _run_outline_draft(
+    generator: DraftGenerator,
+    *,
+    outline_text: str,
+    vault: Path | None,
+    vault_path: Path,
+    current_phase: Phase,
+    override: PrivacyTierOverride | None,
+) -> None:
+    """Run the multi-section outline pipeline and surface errors as exits.
+
+    Extracted from :func:`draft` so the command body stays under the
+    cyclomatic-complexity floor. Owns the outline-parse error surface
+    plus the happy-path save / audit.
+    """
+    from creek.generate.outline import OutlineParseError
+
+    detector = _build_ontology_detector(vault)
+    try:
+        outline_draft = generator.generate_outline_draft(
+            outline_text,
+            vault_path=vault_path,
+            detect_ontology=detector,
+            current_phase=current_phase,
+        )
+    except OutlineParseError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    fragment_ids = [
+        fid for section in outline_draft.sections for fid in section.source_fragments
+    ]
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="draft",
+        override=override,
+        fragment_ids=fragment_ids,
+    )
+    saved_path = generator.save_outline_draft(outline_draft, vault_path)
+    console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+
+
+def _validate_draft_mode(
+    *,
+    outline_text: str | None,
+    seed_spec: SeedSpec | None,
+    ontology_twist: bool,
+) -> None:
+    """Validate the mutually-exclusive draft modes, exiting 2 on conflict.
+
+    The outline path (issue #354) owns the whole composition, so it
+    cannot be combined with the single-topic seed flags. ``--ontology-twist``
+    still requires a single-topic seed because the outline path applies
+    its twist composition per section automatically.
+    """
+    if outline_text is not None and seed_spec is not None:
+        console.print(
+            "[red]--seed-outline / --seed-outline-text cannot be combined "
+            "with --seed-fragment / --seed-topic / --seed-frequency / "
+            "--seed-phase / --seed-mode.[/red]",
+        )
+        raise typer.Exit(code=2)
+    has_seed = outline_text is not None or seed_spec is not None
+    if ontology_twist and not has_seed:
+        console.print(
+            "[red]--ontology-twist requires a seed (use --seed-topic, "
+            "--seed-frequency, --seed-phase, or --seed-mode) or an outline "
+            "(--seed-outline / --seed-outline-text).[/red]",
+        )
+        raise typer.Exit(code=2)
+
+
 @app.command()
 def draft(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
@@ -2080,6 +2239,35 @@ def draft(
             "(inhabit, express, collaborate, integrate, absorb)."
         ),
     ),
+    ontology_twist: bool = typer.Option(
+        False,
+        "--ontology-twist",
+        help=(
+            "Issue #352: enable ontology-twist composition. Computes the "
+            "delta between the retrieved source profile and the operator's "
+            "target profile, names divergent dimensions in the prompt, and "
+            "forbids verbatim paraphrase. Requires >=2 source fragments. "
+            "Gated behind a flag while epic #349 is in development."
+        ),
+    ),
+    seed_outline: Path | None = typer.Option(
+        None,
+        "--seed-outline",
+        help=(
+            "Issue #354: path to a markdown outline file. Each header-rooted "
+            "section is composed independently with its own detected ontology, "
+            "then stitched together with transition-only smoothing. Mutually "
+            "exclusive with --seed-outline-text."
+        ),
+    ),
+    seed_outline_text: str | None = typer.Option(
+        None,
+        "--seed-outline-text",
+        help=(
+            "Issue #354: inline markdown outline (same per-section composition "
+            "as --seed-outline). Mutually exclusive with --seed-outline."
+        ),
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -2096,8 +2284,23 @@ def draft(
     bypassed and the draft is generated from the matching fragments,
     with the seed flags recorded in the draft's frontmatter for
     reproducibility.
+
+    Issue #352: pass ``--ontology-twist`` alongside a seed flag to
+    enable ontology-twist composition — the draft's source / target
+    ontology profiles are recorded in frontmatter, divergent dimensions
+    are named in the prompt, and the LLM is instructed to recombine
+    across the corpus rather than paraphrase any single source.
+    Requires at least two source fragments.
+
+    Issue #354: pass ``--seed-outline <file>`` or ``--seed-outline-text
+    "..."`` to compose a multi-section essay from a markdown outline.
+    Each header-rooted section is detected, retrieved, and composed
+    independently with its own ontology profile, then stitched together
+    with a transition-only smoothing pass. Outline mode is mutually
+    exclusive with the single-topic seed flags; a header-less outline is
+    rejected with a clear error.
     """
-    from creek.generate.drafts import DraftGenerator, SeedResolutionError
+    from creek.generate.drafts import DraftGenerator
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
@@ -2112,6 +2315,12 @@ def draft(
         seed_phase=seed_phase,
         seed_mode=seed_mode,
     )
+    outline_text = _read_outline_input(seed_outline, seed_outline_text)
+    _validate_draft_mode(
+        outline_text=outline_text,
+        seed_spec=seed_spec,
+        ontology_twist=ontology_twist,
+    )
     llm = _build_draft_llm()
     if bypass_compiled:
         _warn_bypass_compiled("draft")
@@ -2122,26 +2331,28 @@ def draft(
         voice_core=voice_text,
         privacy_override=override,
         bypass_compiled=bypass_compiled,
+        ontology_twist=ontology_twist,
     )
 
-    if seed_spec is not None:
-        try:
-            draft_obj = generator.generate_seeded_draft(
-                seed_spec,
-                vault_path=vault_path,
-                current_phase=current_phase,
-            )
-        except SeedResolutionError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(code=1) from exc
-        _audit_privacy_override_if_needed(
+    if outline_text is not None:
+        _run_outline_draft(
+            generator,
+            outline_text=outline_text,
+            vault=vault,
             vault_path=vault_path,
-            command="draft",
+            current_phase=current_phase,
             override=override,
-            fragment_ids=list(draft_obj.source_fragments),
         )
-        saved_path = generator.save_draft(draft_obj, vault_path)
-        console.print(f"[bold green]Draft saved: {saved_path}[/bold green]")
+        return
+
+    if seed_spec is not None:
+        _run_seeded_draft(
+            generator,
+            seed_spec=seed_spec,
+            vault_path=vault_path,
+            current_phase=current_phase,
+            override=override,
+        )
         return
 
     seeds = IdeaMiner(

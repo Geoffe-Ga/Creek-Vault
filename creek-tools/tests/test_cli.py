@@ -2208,6 +2208,174 @@ def test_draft_seed_flags_advertised_in_help() -> None:
         assert flag in output, f"missing {flag} in draft help"
 
 
+def test_draft_outline_flags_advertised_in_help() -> None:
+    """``creek draft --help`` documents the issue #354 outline flags."""
+    result = runner.invoke(app, ["draft", "--help"])
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 0
+    assert "--seed-outline" in output
+    assert "--seed-outline-text" in output
+
+
+def _stub_outline_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the LLM and ontology detector for outline CLI happy-path tests."""
+    from creek import cli as cli_module
+    from creek.classify.prompt import PromptOntology
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda: lambda _p: "Stitched body.",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_ontology_detector",
+        lambda _vault: lambda prompt: PromptOntology(prompt=prompt),
+    )
+
+
+def test_draft_seed_outline_text_happy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-outline-text`` composes a multi-section draft and saves it."""
+    _stub_outline_detector(monkeypatch)
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-outline-text",
+            "# Title\n\n## One\nFirst.\n\n## Two\nSecond.\n",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Draft saved" in result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+
+
+def test_draft_seed_outline_file_happy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--seed-outline <file>`` reads the outline from disk and composes it."""
+    _stub_outline_detector(monkeypatch)
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    outline_file = tmp_path / "outline.md"
+    outline_file.write_text("## Alpha\nA.\n\n## Beta\nB.\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-outline", str(outline_file)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Draft saved" in result.output
+
+
+def test_draft_seed_outline_no_headers_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outline with no markdown headers exits 2 with a clear error."""
+    _stub_outline_detector(monkeypatch)
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-outline-text",
+            "Just a paragraph, no headers.",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "no markdown headers" in result.output
+
+
+def test_draft_seed_outline_mutually_exclusive_inline_and_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing both --seed-outline and --seed-outline-text exits 2."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    outline_file = tmp_path / "outline.md"
+    outline_file.write_text("## H\nB.\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-outline",
+            str(outline_file),
+            "--seed-outline-text",
+            "## H\nB.\n",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
+def test_draft_seed_outline_mutually_exclusive_with_topic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Combining outline mode with --seed-topic exits 2."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-outline-text",
+            "## H\nB.\n",
+            "--seed-topic",
+            "X",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
+
+
+def test_draft_seed_outline_file_read_error_exits_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing outline file exits 2 with a read error."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-outline",
+            str(tmp_path / "does-not-exist.md"),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "Could not read --seed-outline" in result.output
+
+
 def test_draft_seed_fragment_mutually_exclusive_with_topic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2548,3 +2716,121 @@ def test_draft_without_seed_flags_keeps_mining_behaviour(
     result = runner.invoke(app, ["draft", "--vault", str(vault)])
     assert result.exit_code == 0
     assert "No idea seeds surfaced" in result.output
+
+
+# ---- Issue #352: --ontology-twist CLI flag ---------------------------------
+
+
+def test_draft_ontology_twist_advertised_in_help() -> None:
+    """``creek draft --help`` documents ``--ontology-twist``."""
+    result = runner.invoke(app, ["draft", "--help"])
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 0
+    assert "--ontology-twist" in output
+
+
+def test_draft_ontology_twist_without_seed_exits_with_clear_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--ontology-twist`` alone (no seed) exits 2 with a clear hint."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--ontology-twist"],
+    )
+    assert result.exit_code == 2
+    output = _strip_ansi(result.output)
+    assert "--ontology-twist requires a seed" in output
+
+
+def test_draft_ontology_twist_plurality_failure_exits_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-source twist fails fast at the CLI with the plurality error.
+
+    Issue #352 acceptance: "fails loudly if only one source matches".
+    """
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(vault, frag_id="frag-only", primary="F1", phase="peaking")
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-phase",
+            "peaking",
+            "--ontology-twist",
+        ],
+    )
+    assert result.exit_code == 1
+    output = _strip_ansi(result.output)
+    assert "at least two source fragments" in output
+
+
+def test_draft_ontology_twist_happy_path_writes_twist_frontmatter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--ontology-twist`` with a plural source set records twist provenance.
+
+    Two withdrawal-phase fragments are retrieved by the explicit
+    ``--seed-phase withdrawal`` filter; the target profile takes the
+    withdrawal pick from the same flag, so divergence (if any) comes
+    from inspecting both profiles. The acceptance criterion is that the
+    frontmatter records source/target profiles + twist_dimensions.
+    """
+    import frontmatter as fm
+
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda: lambda _p: "Twisted draft body.",
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    # Two withdrawal-phase fragments so the WITHDRAWAL slice is plural;
+    # both also share mode=inhabit so source.mode is deterministic.
+    _write_seed_fragment(
+        vault, frag_id="frag-A", primary="F1", phase="withdrawal", mode="inhabit"
+    )
+    _write_seed_fragment(
+        vault, frag_id="frag-B", primary="F1", phase="withdrawal", mode="inhabit"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-phase",
+            "withdrawal",
+            "--seed-mode",
+            "express",
+            "--ontology-twist",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    post = fm.load(str(drafts[0]))
+    # Frontmatter records both profiles and the divergent dimensions.
+    assert post.metadata["source_profile"]["phase"] == "withdrawal"
+    assert post.metadata["source_profile"]["mode"] == "inhabit"
+    assert post.metadata["target_profile"]["phase"] == "withdrawal"
+    assert post.metadata["target_profile"]["mode"] == "express"
+    # Only mode diverges between source and target.
+    assert post.metadata["twist_dimensions"] == ["mode"]

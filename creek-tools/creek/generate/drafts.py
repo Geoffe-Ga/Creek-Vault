@@ -24,8 +24,9 @@ from __future__ import annotations
 import logging
 import operator
 import re
+import sys
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -52,6 +53,27 @@ from creek.generate.dimensional_retrieval import (
     format_dimension_label,
     raise_if_all_empty,
     union_fragment_ids,
+)
+from creek.generate.grounding import (
+    EmbeddingFn,
+    GroundingReport,
+    GroundingThresholds,
+    ParagraphAnnotation,
+    build_grounding_frontmatter,
+    score_draft,
+)
+from creek.generate.outline import (
+    OutlineSection,
+    build_stitch_prompt,
+    parse_outline,
+)
+from creek.generate.twist import (
+    OntologyProfile,
+    format_twist_directive,
+    require_plural_sources,
+    source_profile_from_fragments,
+    target_profile_from_spec,
+    twist_dimensions,
 )
 from creek.models import (
     CompiledPage,
@@ -88,9 +110,30 @@ _REGISTERS_DIR: str = "registers"
 
 _SLUG_MAX_LENGTH: int = 80
 
+_MIN_TWIST_SOURCES: int = 2
+"""Minimum source fragments before a section composes through the twist path.
+
+Mirrors the plurality floor in :mod:`creek.generate.twist`. A section with
+fewer matched fragments drops the twist directive and composes plainly so
+it still appears in the outline draft (issue #354) rather than aborting
+the whole essay the way the single-topic path does.
+"""
+
 
 DraftLLM = Callable[[str], str]
 """Signature for draft LLM clients: takes a prompt, returns the draft body."""
+
+
+OntologyDetector = Callable[[str], "PromptOntology"]
+"""Signature for prompt-ontology detectors (issue #350).
+
+Takes a section's free-form seed text, returns a
+:class:`~creek.classify.prompt.PromptOntology`. Injected into
+:meth:`DraftGenerator.generate_outline_draft` so the module stays
+deterministic and provider-free — the CLI passes a closure over
+:func:`creek.classify.prompt.detect_ontology` bound to the resolved
+:class:`~creek.config.LLMConfig`.
+"""
 
 
 @dataclass(frozen=True)
@@ -198,6 +241,91 @@ class SeedResolutionError(ValueError):
 
 
 @dataclass(frozen=True)
+class _TwistPayload:
+    """Bundle of twist-composition outputs threaded into :class:`Draft`.
+
+    The default-constructed instance represents "no twist": the
+    directive is empty so :meth:`DraftGenerator._compose_prompt` skips
+    the block, both profiles stay ``None`` so the frontmatter writer
+    omits them, and the dimensions tuple is empty.
+    """
+
+    directive: str = ""
+    source_profile: OntologyProfile | None = None
+    target_profile: OntologyProfile | None = None
+    dimensions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SectionComposition:
+    """One composed outline section with its per-section ontology profiles.
+
+    Attributes:
+        heading: The section header text (``#`` markers stripped).
+        level: The header depth (1-6).
+        body: The LLM-composed section body before the stitch pass.
+        source_profile: Ontology profile aggregated from the section's
+            retrieved source fragments (issue #352). :data:`None` when
+            the section matched no source material.
+        target_profile: Ontology profile asked for by the section's
+            detected :class:`~creek.classify.prompt.PromptOntology`
+            (issue #350). Always populated — the detector runs on every
+            section.
+        twist_dimensions: Ordered dimension names where the section's
+            source profile diverges from its target profile. Empty when
+            the profiles match or no source material was found.
+        source_fragments: Fragment IDs that fed this section's prompt.
+    """
+
+    heading: str
+    level: int
+    body: str
+    target_profile: OntologyProfile
+    source_profile: OntologyProfile | None = None
+    twist_dimensions: tuple[str, ...] = ()
+    source_fragments: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OutlineDraft:
+    """A multi-section draft composed from a markdown outline (issue #354).
+
+    The per-section bodies are composed independently (detect → retrieve
+    → compose) and then stitched into one continuous essay with a
+    transition-only smoothing pass.
+
+    Attributes:
+        title: The draft title (the first section's heading).
+        body: The stitched essay body.
+        sections: The composed sections in document order, each carrying
+            its own ontology profiles for frontmatter provenance.
+        generated_date: When the outline draft was generated.
+        outline_text: The original outline input, recorded verbatim for
+            reproducibility.
+        stitch_prompt: The full stitch-pass prompt sent to the LLM.
+    """
+
+    title: str
+    body: str
+    sections: tuple[SectionComposition, ...]
+    generated_date: datetime
+    outline_text: str
+    stitch_prompt: str
+
+    def __post_init__(self) -> None:
+        """Validate outline-draft invariants."""
+        if not self.title.strip():
+            msg = "OutlineDraft.title must be non-empty"
+            raise ValueError(msg)
+        if not self.body.strip():
+            msg = "OutlineDraft.body must be non-empty"
+            raise ValueError(msg)
+        if not self.sections:
+            msg = "OutlineDraft.sections must be non-empty"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
 class Draft:
     """An LLM-generated essay draft with full provenance.
 
@@ -221,6 +349,34 @@ class Draft:
             section. Empty when the draft used the legacy
             single-dimension path; populated whenever
             :func:`assemble_per_dimension_corpus` ran.
+        source_profile: Ontology profile aggregated from the retrieved
+            source fragments (issue #352). ``None`` when the draft did
+            not pass through the twist composition path.
+        target_profile: Ontology profile asked for by the operator
+            (explicit flags + detected :class:`PromptOntology`). ``None``
+            when the draft did not pass through the twist composition
+            path.
+        twist_dimensions: Ordered tuple of dimension names where the
+            source profile diverges from the target profile (issue
+            #352). Empty when the two profiles match (regression
+            baseline) or when twist composition was not requested.
+        derivative_score: Bidirectional grounding guard's derivative
+            metric (issue #355). The maximum paragraph cosine
+            similarity recorded between the draft body and every
+            paragraph of the source fragments that fed the prompt.
+            ``None`` when the guard did not run (no embedding callable
+            wired) so the field reads as "not yet evaluated" rather
+            than "evaluated clean".
+        grounding_score: Bidirectional grounding guard's grounding
+            metric (issue #355). The fraction of draft paragraphs whose
+            ``max_similarity`` cleared
+            :attr:`creek.config.DraftConfig.grounding_lower` against
+            *some* source paragraph. ``None`` when the guard did not
+            run.
+        paragraph_grounding: Per-paragraph annotation list produced by
+            :class:`creek.generate.grounding.GroundingReport`. Each
+            entry carries ``{index, max_similarity, is_derivative,
+            is_grounded}``. Empty when the guard did not run.
     """
 
     title: str
@@ -234,6 +390,12 @@ class Draft:
     generated_date: datetime
     seed_spec: SeedSpec | None = None
     per_dimension_sources: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    source_profile: OntologyProfile | None = None
+    target_profile: OntologyProfile | None = None
+    twist_dimensions: tuple[str, ...] = ()
+    derivative_score: float | None = None
+    grounding_score: float | None = None
+    paragraph_grounding: tuple[ParagraphAnnotation, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         """Validate draft invariants."""
@@ -451,6 +613,9 @@ class DraftGenerator:
         voice_core: str = "",
         privacy_override: PrivacyTierOverride | None = None,
         bypass_compiled: bool = False,
+        ontology_twist: bool = False,
+        embedding_fn: EmbeddingFn | None = None,
+        grounding_thresholds: GroundingThresholds | None = None,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -468,12 +633,35 @@ class DraftGenerator:
                 step skips the compiled layer and pulls fragments
                 directly. Default ``False`` honours the FEAT-004
                 compile-then-query discipline.
+            ontology_twist: When ``True``, activate the issue #352
+                composition path: compute source/target ontology
+                profiles, name the divergent dimensions in the prompt,
+                forbid verbatim paraphrase, and require ≥2 source
+                fragments. Default ``False`` keeps the legacy
+                composition path (epic #349 gates the flag while in
+                development).
+            embedding_fn: Optional paragraph embedding callable for the
+                issue #355 bidirectional grounding guard. When
+                supplied, every generated draft is scored against its
+                source fragments and the scores are written to the
+                returned :class:`Draft` and the saved frontmatter. When
+                ``None`` (the default) the guard is skipped — existing
+                tests that construct a :class:`DraftGenerator` with a
+                stub LLM continue to work without dragging in the
+                sentence-transformer dependency.
+            grounding_thresholds: Optional resolved guard thresholds.
+                Required only when *embedding_fn* is supplied; ignored
+                otherwise. Callers typically build this with
+                :meth:`creek.generate.grounding.GroundingThresholds.from_config`.
         """
         self._llm = llm
         self.skills_root = skills_root
         self.voice_core = voice_core
         self.privacy_override = privacy_override
         self.bypass_compiled = bypass_compiled
+        self.ontology_twist = ontology_twist
+        self._embedding_fn = embedding_fn
+        self._grounding_thresholds = grounding_thresholds
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -735,6 +923,8 @@ class DraftGenerator:
         source_material: str,
         *,
         per_dimension_material: str = "",
+        twist_directive: str = "",
+        twist_active: bool = False,
     ) -> str:
         """Assemble the LLM prompt from voice-core + skills + source + ask.
 
@@ -744,6 +934,10 @@ class DraftGenerator:
         them. Both blocks may co-exist — the per-dimension block carries
         the dimensional corpus slices, the legacy block still carries
         thread / eddy context for the synthetic IdeaSeed.
+
+        When *twist_directive* is supplied (issue #352), it is inserted
+        immediately before the ``## Ask`` block so the LLM sees the
+        recombination instruction as the last thing before its task.
         """
         parts: list[str] = []
         if self.voice_core:
@@ -755,10 +949,63 @@ class DraftGenerator:
             parts.append(per_dimension_material)
         if source_material:
             parts.append(f"## Source material\n{source_material}")
+        if twist_directive:
+            parts.append(twist_directive)
         parts.append(
-            _compose_ask_section(idea, per_dimension=bool(per_dimension_material)),
+            _compose_ask_section(
+                idea,
+                per_dimension=bool(per_dimension_material),
+                twist=twist_active,
+            ),
         )
         return "\n\n".join(parts)
+
+    def _build_guard_report(
+        self,
+        *,
+        body: str,
+        source_fragments: tuple[str, ...],
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> GroundingReport | None:
+        """Run the issue #355 grounding guard, or return ``None`` when disabled.
+
+        The guard runs only when both an embedding callable and a
+        :class:`GroundingThresholds` instance were supplied at
+        construction time. Otherwise the method short-circuits — the
+        legacy test suite constructs :class:`DraftGenerator` with a
+        stub LLM only, and must keep working without dragging in the
+        sentence-transformer dependency.
+
+        The guard also prints a one-line summary to stderr so an
+        operator running ``creek draft`` interactively sees the verdict
+        before the saved-path message appears on stdout.
+
+        Args:
+            body: The generated draft body that just returned from the
+                LLM.
+            source_fragments: Fragment IDs that fed the draft prompt.
+                Looked up in *fragments* to pull each source body for
+                paragraph-level cosine scoring.
+            fragments: Pre-loaded ``{id: (Fragment, body)}`` map (the
+                same one the caller already loaded).
+
+        Returns:
+            A :class:`GroundingReport`, or ``None`` when the guard is
+            not configured on this generator.
+        """
+        if self._embedding_fn is None or self._grounding_thresholds is None:
+            return None
+        source_texts = [
+            fragments[fid][1] for fid in source_fragments if fid in fragments
+        ]
+        report = score_draft(
+            body,
+            source_texts=source_texts,
+            embedding_fn=self._embedding_fn,
+            thresholds=self._grounding_thresholds,
+        )
+        print(report.summary_line(), file=sys.stderr)
+        return report
 
     def generate_draft(
         self,
@@ -801,6 +1048,11 @@ class DraftGenerator:
         if not body:
             msg = "LLM returned an empty draft body"
             raise RuntimeError(msg)
+        guard = self._build_guard_report(
+            body=body,
+            source_fragments=idea.source_fragments,
+            fragments=fragments,
+        )
         return Draft(
             title=idea.title,
             body=body,
@@ -813,6 +1065,9 @@ class DraftGenerator:
             ),
             prompt=prompt,
             generated_date=datetime.now(tz=UTC),
+            derivative_score=guard.derivative_score if guard else None,
+            grounding_score=guard.grounding_score if guard else None,
+            paragraph_grounding=_guard_annotations(guard),
         )
 
     def resolve_seed(
@@ -1016,6 +1271,16 @@ class DraftGenerator:
         the caller did not pass ``current_phase``, the spec's phase is
         used so the activated phase skill matches the user's request.
 
+        When :attr:`ontology_twist` is enabled (issue #352), the
+        retrieved source material has its dominant ontology profile
+        compared against the operator's target profile; divergent
+        dimensions are named in a ``## Twist directive`` block and the
+        ``## Ask`` is rewritten to forbid verbatim paraphrase. The
+        helper :func:`require_plural_sources` raises
+        :class:`PluralitySourceError` when fewer than two source
+        fragments matched, since recombination requires more than one
+        input.
+
         Args:
             spec: The manual seed specification.
             vault_path: Vault root used for fragment loading, skill
@@ -1024,10 +1289,14 @@ class DraftGenerator:
 
         Returns:
             A :class:`Draft` whose ``seed_spec`` field records the
-            originating manual seed.
+            originating manual seed and (when twist composition is
+            active) whose ``source_profile`` / ``target_profile`` /
+            ``twist_dimensions`` fields record the ontology delta.
 
         Raises:
             SeedResolutionError: Propagated from :meth:`resolve_seed`.
+            PluralitySourceError: When twist composition is requested
+                but fewer than two source fragments matched.
             RuntimeError: When the LLM returns an empty body.
         """
         fragments = _load_fragments_by_id(
@@ -1052,6 +1321,7 @@ class DraftGenerator:
             confidence_threshold=spec.ontology_confidence_threshold,
         )
         per_dimension_material = _render_per_dimension_sections(slices, fragments)
+        twist_payload = self._build_twist_payload(spec, idea, fragments)
         source_material = self.gather_source_material(
             idea,
             vault_path=vault_path,
@@ -1064,11 +1334,18 @@ class DraftGenerator:
             skill_stack,
             source_material,
             per_dimension_material=per_dimension_material,
+            twist_directive=twist_payload.directive,
+            twist_active=bool(twist_payload.dimensions),
         )
         body = self._llm(prompt).strip()
         if not body:
             msg = "LLM returned an empty draft body"
             raise RuntimeError(msg)
+        guard = self._build_guard_report(
+            body=body,
+            source_fragments=idea.source_fragments,
+            fragments=fragments,
+        )
         return Draft(
             title=idea.title,
             body=body,
@@ -1083,7 +1360,341 @@ class DraftGenerator:
             generated_date=datetime.now(tz=UTC),
             seed_spec=spec,
             per_dimension_sources=_slices_as_provenance(slices),
+            source_profile=twist_payload.source_profile,
+            target_profile=twist_payload.target_profile,
+            twist_dimensions=twist_payload.dimensions,
+            derivative_score=guard.derivative_score if guard else None,
+            grounding_score=guard.grounding_score if guard else None,
+            paragraph_grounding=_guard_annotations(guard),
         )
+
+    def _build_twist_payload(
+        self,
+        spec: SeedSpec,
+        idea: IdeaSeed,
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> _TwistPayload:
+        """Build the ontology-twist payload for :meth:`generate_seeded_draft`.
+
+        Returns an empty payload when :attr:`ontology_twist` is off so
+        the legacy composition path is byte-for-byte unchanged.
+        Otherwise enforces the plurality floor, computes source / target
+        profiles, and renders the twist directive block.
+        """
+        if not self.ontology_twist:
+            return _TwistPayload()
+        require_plural_sources(idea.source_fragments)
+        retrieved = [
+            fragments[fid][0] for fid in idea.source_fragments if fid in fragments
+        ]
+        source_profile = source_profile_from_fragments(retrieved)
+        target_profile = target_profile_from_spec(spec)
+        divergent = twist_dimensions(source_profile, target_profile)
+        directive = format_twist_directive(source_profile, target_profile, divergent)
+        return _TwistPayload(
+            directive=directive,
+            source_profile=source_profile,
+            target_profile=target_profile,
+            dimensions=tuple(divergent),
+        )
+
+    def generate_outline_draft(
+        self,
+        outline_text: str,
+        *,
+        vault_path: Path,
+        detect_ontology: OntologyDetector,
+        current_phase: Phase | None = None,
+    ) -> OutlineDraft:
+        """Compose a multi-section draft from a markdown *outline_text* (issue #354).
+
+        Each outline section is composed independently — its ontology is
+        detected (issue #350), its source material is retrieved per
+        dimension (issue #351), and it is voiced through the
+        ontology-twist path (issue #352) when at least two source
+        fragments match. A final stitch pass smooths transitions between
+        the sections without paraphrasing or inventing content
+        (connective tissue only).
+
+        Args:
+            outline_text: The markdown outline (file contents or inline).
+                Must contain at least one ATX header.
+            vault_path: Vault root used for per-section fragment loading,
+                skill resolution, and source-material gathering.
+            detect_ontology: Callable mapping a section's seed text to a
+                :class:`~creek.classify.prompt.PromptOntology`. Injected
+                so the module stays provider-free; the CLI binds it to
+                :func:`creek.classify.prompt.detect_ontology`.
+            current_phase: Optional phase override applied to every
+                section's skill selection.
+
+        Returns:
+            An :class:`OutlineDraft` whose ``sections`` carry per-section
+            ontology profiles and whose ``body`` is the stitched essay.
+
+        Raises:
+            OutlineParseError: When *outline_text* has no markdown
+                headers (surfaced unchanged from
+                :func:`creek.generate.outline.parse_outline`).
+            RuntimeError: When the stitch pass returns an empty body.
+        """
+        parsed = parse_outline(outline_text)
+        fragments = _load_fragments_by_id(
+            vault_path / _FRAGMENTS_SUBDIR,
+            privacy_override=self.privacy_override,
+        )
+        sections = tuple(
+            self._compose_section(
+                section,
+                vault_path=vault_path,
+                detect_ontology=detect_ontology,
+                current_phase=current_phase,
+                fragments=fragments,
+            )
+            for section in parsed
+        )
+        stitch_prompt = build_stitch_prompt(
+            [(section.heading, section.body) for section in sections],
+            voice_core=self.voice_core,
+        )
+        body = self._llm(stitch_prompt).strip()
+        if not body:
+            msg = "LLM returned an empty stitched draft body"
+            raise RuntimeError(msg)
+        return OutlineDraft(
+            title=parsed[0].heading,
+            body=body,
+            sections=sections,
+            generated_date=datetime.now(tz=UTC),
+            outline_text=outline_text,
+            stitch_prompt=stitch_prompt,
+        )
+
+    def _compose_section(
+        self,
+        section: OutlineSection,
+        *,
+        vault_path: Path,
+        detect_ontology: OntologyDetector,
+        current_phase: Phase | None,
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> SectionComposition:
+        """Detect, retrieve, and compose one outline *section* (issue #354).
+
+        The section's ontology is detected from its seed text and folded
+        into a topic-plus-ontology :class:`SeedSpec`. When the spec
+        resolves to source material the section is composed through the
+        seeded-draft pipeline; otherwise it falls back to a bare
+        skill-stack compose so the section still appears in the draft
+        (the #354 acceptance criterion). The target profile is always
+        recorded from the detected ontology.
+        """
+        ontology = detect_ontology(section.seed_text)
+        spec = _section_seed_spec(section, ontology)
+        target_profile = target_profile_from_spec(spec)
+        try:
+            idea = self.resolve_seed(spec, vault_path=vault_path, fragments=fragments)
+        except SeedResolutionError:
+            body = self._compose_bare_section(section, current_phase)
+            return SectionComposition(
+                heading=section.heading,
+                level=section.level,
+                body=body,
+                target_profile=target_profile,
+            )
+        return self._compose_resolved_section(
+            section,
+            spec=spec,
+            idea=idea,
+            target_profile=target_profile,
+            vault_path=vault_path,
+            current_phase=current_phase,
+            fragments=fragments,
+        )
+
+    def _compose_resolved_section(
+        self,
+        section: OutlineSection,
+        *,
+        spec: SeedSpec,
+        idea: IdeaSeed,
+        target_profile: OntologyProfile,
+        vault_path: Path,
+        current_phase: Phase | None,
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> SectionComposition:
+        """Compose a section that resolved to source material.
+
+        Builds the per-dimension prompt and (when at least two source
+        fragments matched) the twist directive, then calls the LLM. A
+        single-source section drops the twist directive rather than
+        failing — a section is a sub-part of the essay, so the
+        plurality floor is relaxed to keep the section in the draft.
+        """
+        twist = self._section_twist_payload(spec, idea, fragments)
+        source_profile = source_profile_from_fragments(
+            [fragments[fid][0] for fid in idea.source_fragments if fid in fragments],
+        )
+        body = self._render_section_body(
+            idea,
+            spec=spec,
+            twist=twist,
+            vault_path=vault_path,
+            current_phase=current_phase,
+            fragments=fragments,
+        )
+        return SectionComposition(
+            heading=section.heading,
+            level=section.level,
+            body=body,
+            target_profile=target_profile,
+            source_profile=source_profile,
+            twist_dimensions=twist.dimensions,
+            source_fragments=idea.source_fragments,
+        )
+
+    def _section_twist_payload(
+        self,
+        spec: SeedSpec,
+        idea: IdeaSeed,
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> _TwistPayload:
+        """Return the twist payload for a section, or empty when not applicable.
+
+        Twist composition needs the flag enabled and at least two source
+        fragments. A single-source section returns an empty payload so it
+        still composes (the plurality floor is a hard error only on the
+        single-topic ``generate_seeded_draft`` path).
+        """
+        if not self.ontology_twist or len(idea.source_fragments) < _MIN_TWIST_SOURCES:
+            return _TwistPayload()
+        retrieved = [
+            fragments[fid][0] for fid in idea.source_fragments if fid in fragments
+        ]
+        source_profile = source_profile_from_fragments(retrieved)
+        target_profile = target_profile_from_spec(spec)
+        divergent = twist_dimensions(source_profile, target_profile)
+        directive = format_twist_directive(source_profile, target_profile, divergent)
+        return _TwistPayload(
+            directive=directive,
+            source_profile=source_profile,
+            target_profile=target_profile,
+            dimensions=tuple(divergent),
+        )
+
+    def _render_section_body(
+        self,
+        idea: IdeaSeed,
+        *,
+        spec: SeedSpec,
+        twist: _TwistPayload,
+        vault_path: Path,
+        current_phase: Phase | None,
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> str:
+        """Build the per-section prompt and return the composed body."""
+        effective_phase = current_phase
+        if effective_phase is None and spec.phases:
+            effective_phase = spec.phases[0]
+        skill_stack = self.select_skill_stack(
+            idea,
+            vault_path=vault_path,
+            current_phase=effective_phase,
+            fragments=fragments,
+        )
+        slices = assemble_per_dimension_corpus(
+            spec,
+            fragments,
+            ontology=spec.ontology,
+            confidence_threshold=spec.ontology_confidence_threshold,
+        )
+        per_dimension_material = _render_per_dimension_sections(slices, fragments)
+        source_material = self.gather_source_material(
+            idea,
+            vault_path=vault_path,
+            fragments=fragments,
+            include_fragments=not slices,
+        )
+        prompt = self._compose_prompt(
+            idea,
+            skill_stack,
+            source_material,
+            per_dimension_material=per_dimension_material,
+            twist_directive=twist.directive,
+            twist_active=bool(twist.dimensions),
+        )
+        return self._invoke_section_llm(prompt)
+
+    def _compose_bare_section(
+        self,
+        section: OutlineSection,
+        current_phase: Phase | None,
+    ) -> str:
+        """Compose a section with no source material from its seed text alone.
+
+        The section still gets the voice core and (when classified) the
+        phase skill, but the ask is built directly from the section's
+        heading and body so the section appears in the draft even when
+        the vault has nothing to retrieve.
+        """
+        parts: list[str] = []
+        if self.voice_core:
+            parts.append(f"## Voice core\n{self.voice_core.strip()}")
+        phase_path = self._phase_skill(current_phase)
+        if phase_path is not None and phase_path.exists():
+            parts.append("## Activated skills\n\n" + _render_skill_section(phase_path))
+        parts.append(
+            "## Ask\n"
+            f'Write the section titled "{section.heading}". '
+            f"{section.body.strip()} "
+            "Write as the human — not as an AI. Honour the activated skills.",
+        )
+        return self._invoke_section_llm("\n\n".join(parts))
+
+    def _invoke_section_llm(self, prompt: str) -> str:
+        """Call the LLM for one section, failing loudly on an empty body."""
+        body = self._llm(prompt).strip()
+        if not body:
+            msg = "LLM returned an empty section body"
+            raise RuntimeError(msg)
+        return body
+
+    def save_outline_draft(
+        self,
+        draft: OutlineDraft,
+        vault_path: Path,
+    ) -> Path:
+        """Write an :class:`OutlineDraft` to ``07-Voice/Drafts/`` (issue #354).
+
+        The frontmatter records each section's heading, level, source
+        fragments, and detected/target ontology profiles so a reader can
+        trace every section back to its ontology and sources.
+
+        Args:
+            draft: The outline draft to persist.
+            vault_path: Vault root under which ``07-Voice/Drafts`` lives.
+
+        Returns:
+            The absolute path of the written markdown file.
+        """
+        drafts_dir = vault_path / DRAFTS_SUBDIR
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        slug = _slugify(draft.title)
+        date_prefix = draft.generated_date.strftime("%Y-%m-%d")
+        target = _next_available_draft_path(drafts_dir, date_prefix, slug)
+        post = frontmatter.Post(
+            content=draft.body.strip() + "\n",
+            type="draft",
+            title=draft.title,
+            status="draft",
+            idea_strategy="seed_outline",
+            generated_date=draft.generated_date.isoformat(),
+            outline=draft.outline_text,
+            stitch_prompt=draft.stitch_prompt,
+            sections=[_serialise_section(section) for section in draft.sections],
+        )
+        target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return target
 
     def save_draft(self, draft: Draft, vault_path: Path) -> Path:
         """Write *draft* to ``07-Voice/Drafts/YYYY-MM-DD-{slug}.md``.
@@ -1122,6 +1733,19 @@ class DraftGenerator:
             post["per_dimension_sources"] = _serialise_per_dimension_sources(
                 draft.per_dimension_sources,
             )
+        if draft.source_profile is not None:
+            post["source_profile"] = draft.source_profile.as_mapping()
+        if draft.target_profile is not None:
+            post["target_profile"] = draft.target_profile.as_mapping()
+        if draft.twist_dimensions:
+            post["twist_dimensions"] = list(draft.twist_dimensions)
+        guard_fields = build_grounding_frontmatter(
+            derivative_score=draft.derivative_score,
+            grounding_score=draft.grounding_score,
+            paragraph_annotations=draft.paragraph_grounding,
+        )
+        for key, value in guard_fields.items():
+            post[key] = value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
@@ -1201,6 +1825,57 @@ def _serialise_seed_spec(spec: SeedSpec) -> dict[str, object]:
     return payload
 
 
+def _section_seed_spec(
+    section: OutlineSection,
+    ontology: PromptOntology,
+) -> SeedSpec:
+    """Build a topic-plus-ontology :class:`SeedSpec` for one outline section.
+
+    The section's seed text becomes the topic so the per-dimension
+    retrieval and the legacy substring fallback both have a phrase to
+    work with, and the detected ontology drives the dimensional blend.
+    """
+    return SeedSpec(topic=section.seed_text, ontology=ontology)
+
+
+def _serialise_section(section: SectionComposition) -> dict[str, object]:
+    """Render a :class:`SectionComposition` as frontmatter-friendly YAML.
+
+    Records the section's heading, level, target ontology profile, and —
+    when source material was found — its source profile, divergent
+    twist dimensions, and source fragment IDs. The target profile is
+    always present (the detector runs on every section), satisfying the
+    #354 acceptance criterion that each section's ontology profile is
+    recorded in frontmatter.
+    """
+    payload: dict[str, object] = {
+        "heading": section.heading,
+        "level": section.level,
+        "target_profile": section.target_profile.as_mapping(),
+    }
+    if section.source_profile is not None:
+        payload["source_profile"] = section.source_profile.as_mapping()
+    if section.twist_dimensions:
+        payload["twist_dimensions"] = list(section.twist_dimensions)
+    if section.source_fragments:
+        payload["source_fragments"] = list(section.source_fragments)
+    return payload
+
+
+def _guard_annotations(
+    report: GroundingReport | None,
+) -> tuple[ParagraphAnnotation, ...]:
+    """Return the per-paragraph annotation tuple for the :class:`Draft` field.
+
+    Returns an empty tuple when *report* is ``None`` (guard disabled)
+    so the dataclass default is preserved and existing tests that
+    construct :class:`Draft` without the guard fields keep working.
+    """
+    if report is None:
+        return ()
+    return tuple(score.to_annotation() for score in report.paragraph_scores)
+
+
 def _serialise_per_dimension_sources(
     entries: tuple[tuple[str, tuple[str, ...]], ...],
 ) -> dict[str, list[str]]:
@@ -1268,15 +1943,34 @@ def _slices_as_provenance(
     )
 
 
-def _compose_ask_section(idea: IdeaSeed, *, per_dimension: bool) -> str:
-    """Return the ``## Ask`` block, switching wording for per-dimension mode.
+def _compose_ask_section(
+    idea: IdeaSeed,
+    *,
+    per_dimension: bool,
+    twist: bool = False,
+) -> str:
+    """Return the ``## Ask`` block, switching wording for per-dimension / twist mode.
 
     When per-dimension material is in play (issue #351), the ask
     explicitly invites the model to weave across the labelled slices
-    rather than treating them as one homogeneous corpus. Otherwise it
-    keeps the original wording so existing tests and mined-idea drafts
+    rather than treating them as one homogeneous corpus. When ontology
+    twist is also on (issue #352), the ask references the twist
+    directive so the LLM treats it as load-bearing. Otherwise it keeps
+    the original wording so existing tests and mined-idea drafts
     continue to compose identically.
     """
+    if twist:
+        return (
+            "## Ask\n"
+            f'Write a draft essay titled "{idea.title}". '
+            f"{idea.brief_description} "
+            "Follow the twist directive above: use the source musings "
+            "as ideas being explored, but voice them through the target "
+            "combination's style. Do not paraphrase any single source "
+            "verbatim — recombine across the corpus. Honour the "
+            "activated skills. Write as the human — not as an AI. "
+            "Cite source fragments by their IDs where relevant."
+        )
     if per_dimension:
         return (
             "## Ask\n"
