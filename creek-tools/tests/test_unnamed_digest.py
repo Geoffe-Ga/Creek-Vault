@@ -18,7 +18,10 @@ import frontmatter
 import pytest
 
 from creek.config import EmbeddingsConfig
-from creek.generate.unnamed import UnnamedDigestGenerator
+from creek.generate.unnamed import (
+    UnnamedDigestGenerator,
+    _render_fragments_section,
+)
 from creek.link.embeddings import EmbeddingLinker
 from creek.models import Fragment, FragmentSource, SourcePlatform
 
@@ -612,3 +615,41 @@ class TestGenerateWeeklyDigest:
         assert second == first
         assert second.stat().st_mtime >= first_mtime
         assert "[[frag-beta]]" in second.read_text(encoding="utf-8")
+
+
+class TestRenderFragmentsSectionBucketsByAuthoredAt:
+    """FEAT-031: the rendered ``Created`` line uses the authored date."""
+
+    def test_rendered_created_uses_authored_at_not_created(self) -> None:
+        """The ``Created`` line reflects ``authored_at`` over ``created``.
+
+        Two fragments share the same wall-clock ``created`` (the moment
+        Creek ingested them) but carry ``authored_at`` values years
+        apart. The "Fragments This Week" listing must render each
+        fragment's *authored* date, not the shared ingest date — the
+        same class of bug FEAT-031 exists to fix on every time-bucketing
+        surface.
+        """
+        ingest_moment = datetime(2026, 5, 20, 14, 0, 0, tzinfo=UTC)
+        authored_dates = [
+            datetime(2024, 1, 1, 9, 0, 0, tzinfo=UTC),
+            datetime(2025, 6, 1, 9, 0, 0, tzinfo=UTC),
+        ]
+        fragments = [
+            Fragment(
+                id=f"frag-feat031-unnamed-{i}",
+                title=f"Unnamed Reflection {i}",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                created=ingest_moment,
+                ingested=ingest_moment,
+                authored_at=authored,
+            )
+            for i, authored in enumerate(authored_dates)
+        ]
+        section = _render_fragments_section(fragments, excerpts={})
+        # Each fragment renders its own authored date, not the shared
+        # ingest date.
+        assert "- Created: 2024-01-01" in section
+        assert "- Created: 2025-06-01" in section
+        # The shared wall-clock ingest date must never leak in.
+        assert ingest_moment.date().isoformat() not in section
