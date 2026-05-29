@@ -39,7 +39,7 @@ import frontmatter
 from pydantic import ValidationError
 
 from creek.models import Fragment
-from creek.time import effective_authored_date
+from creek.time import effective_authored_at, effective_authored_date
 
 if TYPE_CHECKING:
     from datetime import date
@@ -553,7 +553,7 @@ def _render_fragments_section(
         lines.append("No unnamed fragments recorded this week.\n")
         return "\n".join(lines) + "\n"
     for frag in fragments:
-        created = frag.created.date().isoformat()
+        created = effective_authored_at(frag).date().isoformat()
         lines.extend(
             (
                 f"### {frag.title}\n",
