@@ -8,6 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# shellcheck source=scripts/_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
 TEST_TYPE="unit"
 COVERAGE=false
 VERBOSE=false
@@ -74,6 +77,10 @@ EOF
 done
 
 cd "$PROJECT_ROOT"
+
+# Fail fast with an actionable message if the Python toolchain is missing
+# (fresh checkout, never ran dev-setup) rather than an opaque ImportError.
+creek_require_python_toolchain || exit 2
 
 # Set verbosity
 if $VERBOSE; then
