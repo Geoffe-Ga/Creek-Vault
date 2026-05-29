@@ -8,7 +8,12 @@ from typing import Any
 import pytest
 
 from crawdad.history import ConversationHistory
-from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE, PrivacyTierCeiling, ToolInfo
+from crawdad.intents import (
+    ACTIVATE_REGISTER_INTENT_TYPE,
+    RUN_WORKFLOW_INTENT_TYPE,
+    PrivacyTierCeiling,
+    ToolInfo,
+)
 from crawdad.router import (
     IntentRouter,
     RouterParseError,
@@ -282,6 +287,74 @@ def test_build_router_prompt_mentions_register_switch_intent(
     assert ACTIVATE_REGISTER_INTENT_TYPE in prompt
     assert "register" in prompt.lower()
     assert "switch" in prompt.lower() or "activate" in prompt.lower()
+
+
+def test_build_router_prompt_mentions_run_workflow_intent(
+    tools: list[ToolInfo], session_state: SessionState
+) -> None:
+    """ADAPT-003: the prompt explains how to emit the run_workflow intent.
+
+    Without the instruction, Haiku will try to satisfy "run the weekly
+    check-in workflow" by hand-assembling individual MCP tool calls.
+    The prompt must name the client-side intent type explicitly so
+    natural phrasing dispatches the authored walk.
+    """
+    prompt = build_router_prompt(
+        message="give me the weekly wavelength check-in",
+        history=ConversationHistory(),
+        state=session_state,
+        tools=tools,
+    )
+
+    assert RUN_WORKFLOW_INTENT_TYPE in prompt
+    assert "workflow" in prompt.lower()
+
+
+async def test_router_emits_run_workflow_for_natural_language_phrase(
+    tools: list[ToolInfo], session_state: SessionState
+) -> None:
+    """A workflow phrase yields a run_workflow intent.
+
+    With the prompt updated to teach Haiku about the intent type, a
+    well-behaved Haiku reply emits ``crawdad.run_workflow`` with the
+    requested workflow name + inputs. We stub the model so the test
+    pins the parsing path, not the model's behavior.
+    """
+    fake_haiku = _FakeAnthropic(
+        json.dumps(
+            {
+                "intents": [
+                    {
+                        "type": RUN_WORKFLOW_INTENT_TYPE,
+                        "args": {
+                            "name": "phase-transitions",
+                            "inputs": {"topic": "spirals"},
+                        },
+                    }
+                ],
+                "compose": True,
+            }
+        )
+    )
+    router = IntentRouter(
+        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        model="claude-haiku-test",
+        tools=tools,
+    )
+
+    response = await router.extract_intents(
+        message="draft phase-transitions",
+        history=ConversationHistory(),
+        state=session_state,
+    )
+
+    assert len(response.intents) == 1
+    assert response.intents[0].type == RUN_WORKFLOW_INTENT_TYPE
+    assert response.intents[0].args == {
+        "name": "phase-transitions",
+        "inputs": {"topic": "spirals"},
+    }
+    assert response.compose is True
 
 
 async def test_router_emits_activate_register_for_natural_language_phrase(

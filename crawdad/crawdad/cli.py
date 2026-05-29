@@ -110,18 +110,19 @@ def run_bot(config: CrawDadConfig) -> None:
         ttl_seconds=config.consent.pending_batch_ttl_seconds,
     )
     components = _build_agent_components(config=config, tool_details=tool_details)
-    loop_runner = _build_loop_runner(
-        components=components,
-        session_state=session_state,
-        skill_registry=skill_registry,
-        max_rounds=config.max_loop_rounds,
-    )
     workflow_registry = WorkflowRegistry(vault_path=config.vault_path)
     workflow_runner = _build_workflow_runner(
         components=components,
         session_state=session_state,
         skill_registry=skill_registry,
         registry=workflow_registry,
+    )
+    loop_runner = _build_loop_runner(
+        components=components,
+        session_state=session_state,
+        skill_registry=skill_registry,
+        max_rounds=config.max_loop_rounds,
+        workflow_runner=workflow_runner,
     )
     client = CrawDadClient(
         config=config,
@@ -210,6 +211,7 @@ def _build_loop_runner(
     session_state: SessionState | None,
     skill_registry: SkillStackRegistry,
     max_rounds: int,
+    workflow_runner: WorkflowRunner | None = None,
 ) -> LoopRunner | None:
     """Return a closure that runs one loop turn end-to-end.
 
@@ -223,6 +225,10 @@ def _build_loop_runner(
     ``max_rounds`` (FEAT-036) is forwarded to :func:`run_one_turn` so
     the configured cap applies uniformly to free-text turns and slash
     commands.
+
+    ``workflow_runner`` (ADAPT-003) is forwarded to :func:`run_one_turn`
+    so a router-emitted ``crawdad.run_workflow`` intent dispatches to the
+    same workflow walk the ``/crawdad workflow run`` slash command uses.
     """
     if components.router is None or components.composer is None:
         return None
@@ -256,6 +262,7 @@ def _build_loop_runner(
                 skills=skill_registry.stack,
                 skill_registry=skill_registry,
                 max_rounds=max_rounds,
+                workflow_runner=workflow_runner,
             )
             return _truncate_for_discord(outcome.reply)
         except Exception:

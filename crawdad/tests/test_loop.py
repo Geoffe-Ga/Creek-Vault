@@ -619,6 +619,62 @@ async def test_loop_activate_register_unknown_register_soft_errors(
     assert registry.stack is initial
 
 
+async def test_loop_run_workflow_intent_invokes_workflow_runner(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """ADAPT-003: a ``crawdad.run_workflow`` intent drives the workflow runner.
+
+    End-to-end through the loop: the router emits the intent, the
+    dispatcher calls the injected workflow runner with the requested
+    name + inputs, and the composer sees the workflow's reply as a tool
+    result before producing the final user-facing message.
+    """
+    from crawdad.intents import RUN_WORKFLOW_INTENT_TYPE
+
+    runner_calls: list[tuple[str, dict[str, str]]] = []
+
+    async def _workflow_runner(name: str, inputs: dict[str, str]) -> str:
+        runner_calls.append((name, inputs))
+        return f"workflow {name} done"
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=RUN_WORKFLOW_INTENT_TYPE,
+                        args={
+                            "name": "phase-transitions",
+                            "inputs": {"topic": "spirals"},
+                        },
+                    )
+                ]
+            ),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+    composer = _ScriptedComposer("composed reply")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(_ScriptedSession()),  # type: ignore[arg-type]
+        known_tools=(),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+        workflow_runner=_workflow_runner,
+    )
+
+    outcome = await loop.run("draft phase-transitions")
+
+    assert outcome.kind == "composed"
+    assert runner_calls == [("phase-transitions", {"topic": "spirals"})]
+    tool_results = composer.calls[0]["tool_results"]
+    assert len(tool_results) == 1
+    assert tool_results[0].intent_type == RUN_WORKFLOW_INTENT_TYPE
+    assert tool_results[0].body == "workflow phase-transitions done"
+
+
 async def test_loop_records_user_and_assistant_turns(
     state: SessionState, skills: VoiceSkillStack
 ) -> None:
