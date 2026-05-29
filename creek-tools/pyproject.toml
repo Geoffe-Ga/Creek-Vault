@@ -86,20 +86,33 @@ dev = [
     "pytest-timeout>=2.1.0",
     "pytest-xdist>=3.3.0",
     "hypothesis>=6.92.0",
-    "ruff>=0.1.0",
+    # Pinned to the same major.minor as uv.lock and
+    # .pre-commit-config.yaml's ruff-pre-commit rev so the three install
+    # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
+    # ruff version. Bumping requires updating all three together
+    # (issues #206, #409).
+    "ruff>=0.15.13,<0.16",
     # Pinned to the same major.minor as uv.lock and
     # .pre-commit-config.yaml's mirrors-mypy rev so the three install
     # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
     # mypy version. Bumping requires updating all three together.
     "mypy>=2.1.0,<2.2.0",
     "pylint>=3.0.0",
-    "bandit>=1.7.5",
+    # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
+    # PyCQA/bandit rev so the three install paths run the same bandit
+    # version. Bumping requires updating all three together
+    # (issues #206, #409).
+    "bandit>=1.9.4,<2",
     "pip-audit>=2.6.0",
     "radon>=6.0.0",
     "xenon>=0.9.0",
     "interrogate>=1.7.0",
     "refurb>=2.0.0",
-    "tryceratops>=2.0.0",
+    # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
+    # tryceratops rev so the three install paths run the same tryceratops
+    # version. Bumping requires updating all three together
+    # (issues #206, #409).
+    "tryceratops>=2.4.1,<3",
     "vulture>=2.10",
     "detect-secrets>=1.5.0",
     "pre-commit>=3.4.0",
