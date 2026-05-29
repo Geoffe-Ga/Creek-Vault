@@ -9,6 +9,7 @@ corpora per test.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -2321,9 +2322,34 @@ def test_fragment_purge_does_not_match_id_as_substring(tmp_path: Path) -> None:
     # Two "frag-A" occurrences (YAML list + body) both get scrubbed.
     assert "[purged]" in text
     # Plain "frag-A" with a trailing word boundary should not appear.
-    import re
-
     assert not re.search(r"\bfrag-A\b", text)
+
+
+def test_fragment_purge_does_not_match_id_as_hyphen_suffix(tmp_path: Path) -> None:
+    """ID scrub treats ``-`` as ID continuation so suffixed IDs survive.
+
+    A bare ``\\b`` word boundary would match ``frag-01`` inside
+    ``frag-01-extended`` (``1`` → ``-`` is a word/non-word boundary).
+    The tightened lookaround treats a trailing hyphen as part of a
+    longer ID and leaves the suffixed sibling untouched.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-01", "Alpha")
+    sibling = _write_derived_note(
+        vault,
+        subfolder="07-Voice/Drafts",
+        name="d3",
+        body="The fragments frag-01 and frag-01-extended are different.",
+        metadata={"source_fragments": ["frag-01", "frag-01-extended"]},
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-01")
+
+    text = sibling.read_text(encoding="utf-8")
+    assert "frag-01-extended" in text  # hyphen-suffixed sibling survives
+    assert "[purged]" in text  # the exact ID is still scrubbed
+    # No standalone frag-01 (not followed by a hyphen-continuation) remains.
+    assert not re.search(r"(?<![\w-])frag-01(?![\w-])", text)
 
 
 def test_fragment_purge_leaves_audit_log_untouched(tmp_path: Path) -> None:
@@ -2423,4 +2449,80 @@ def test_source_purge_scrubs_provenance_for_each_fragment(tmp_path: Path) -> Non
     text = derived.read_text(encoding="utf-8")
     assert "frag-A" not in text
     assert "frag-B" not in text
-    assert text.count("[purged]") == 4  # 2 YAML + 2 body
+    # 2 YAML list entries + 2 body mentions. Use >= rather than == because
+    # the exact count depends on whether frontmatter.dumps serialises the
+    # list in flow ([a, b]) or block style — robust today, brittle if the
+    # serialiser ever switches.
+    assert text.count("[purged]") >= 4
+
+
+def test_purged_marker_reparses_as_nested_list_in_yaml(tmp_path: Path) -> None:
+    """Pin the documented YAML-flow-list side-effect of ``[purged]``.
+
+    ``[purged]`` is bracket-flavoured, so a flow-sequence entry like
+    ``source_fragments: [frag-A, frag-B]`` becomes
+    ``[[purged], frag-B]`` after the text-level substitution. A YAML
+    parser then re-reads the scrubbed entry as a one-element nested
+    list (``["purged"]``) rather than a flat string. This test locks
+    the trade-off in place: a future "quietly switch the marker" PR has
+    to update both this assertion and the :data:`PURGED_MARKER`
+    docstring together.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    note = _write_derived_note(
+        vault,
+        subfolder="04-Praxis",
+        name="p1",
+        body="A praxis note.",
+        metadata={"source_fragments": ["frag-A", "frag-B"]},
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    reloaded = frontmatter.load(str(note))
+    source_fragments = reloaded.get("source_fragments")
+    assert source_fragments == [["purged"], "frag-B"]
+    # The surviving sibling stays a flat string; only the scrubbed entry nests.
+    assert isinstance(source_fragments, list)
+    assert source_fragments[0] == ["purged"]
+    assert source_fragments[1] == "frag-B"
+
+
+def test_purge_single_walks_vault_once_per_fragment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wiki-link + provenance scrubs share a single vault walk per fragment.
+
+    ``_purge_single`` used to invoke ``_list_vault_md_files`` twice (once
+    for wiki-links, once for provenance). The combined single-walk scrub
+    must call it at most once per purged fragment.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    _write_fragment(vault, "frag-B", "Bravo", platform="claude")
+    _write_derived_note(
+        vault,
+        subfolder="04-Praxis",
+        name="p1",
+        body="Built from frag-A and frag-B.",
+        metadata={"source_fragments": ["frag-A", "frag-B"]},
+    )
+
+    engine = PurgeEngine(vault)
+    # The test deliberately wraps the private walk helper to count calls.
+    original = engine._list_vault_md_files
+    calls = 0
+
+    def _counting_walk() -> list[Path]:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(engine, "_list_vault_md_files", _counting_walk)
+
+    engine.purge_source("claude")
+
+    # Two fragments purged → at most one walk each.
+    assert calls <= 2

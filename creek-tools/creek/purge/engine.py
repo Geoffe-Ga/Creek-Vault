@@ -98,11 +98,30 @@ must be classified explicitly here — defaulting unknown operations to
 PURGED_MARKER = "[purged]"
 """GAP-004 replacement string for scrubbed fragment-ID references.
 
-Used by :meth:`PurgeEngine._scrub_provenance` for both YAML frontmatter
+Used by :meth:`PurgeEngine._scrub_references` for both YAML frontmatter
 list entries (e.g. ``source_fragments: [...]`` in drafts) and bare
 fragment-ID mentions in body text. A literal placeholder leaves a
 forensic trail — the user can see *that* a reference existed — without
 exposing the original ID, satisfying the RTBF contract.
+
+YAML flow-list side-effect (caveat): the marker is bracket-flavoured,
+which is YAML-meaningful inside a flow sequence. A text-level
+substitution turns ``source_fragments: [frag-A, frag-B]`` into
+``source_fragments: [[purged], frag-B]``. A YAML parser then re-reads
+the scrubbed entry as a one-element nested list (``["purged"]``),
+yielding a ``list[str | list[str]]`` rather than the original flat
+``list[str]``. The grep-based forensic intent is satisfied, but a
+purged draft's ``source_fragments`` is therefore **not safe to
+round-trip** through code that expects a flat string list. Today's
+readers do not rely on that flat shape — the mining strategies build
+``source_fragments`` from compiled-page provenance and raw-fragment
+membership rather than re-reading a purged draft's frontmatter, and
+the compiled-page loader validates provenance through a typed model.
+If a future reader does parse purged ``source_fragments`` directly it
+must tolerate nested-list entries (or skip purged drafts). The
+regression test ``test_purged_marker_reparses_as_nested_list_in_yaml``
+pins this trade-off so a future marker swap has to update the test and
+this docstring together.
 """
 
 
@@ -221,14 +240,14 @@ class PurgeEngine:
             result.deleted_files.append(str(frag_file))
             result.affected_fragment_ids.append(fragment_id)
             result.fragments_affected = 1
-            result.wikilinks_removed = self._scrub_wikilinks(
-                title,
+            # One vault walk applies both the wiki-link and provenance scrubs.
+            wiki_count, prov_count = self._scrub_references(
+                title=title,
+                fragment_id=fragment_id,
                 exclude=frag_file,
             )
-            result.provenance_scrubbed += self._scrub_provenance(
-                fragment_id,
-                exclude=frag_file,
-            )
+            result.wikilinks_removed = wiki_count
+            result.provenance_scrubbed += prov_count
             result.threads_updated = self._decrement_counts(
                 "02-Threads",
                 thread_ids,
@@ -571,19 +590,20 @@ class PurgeEngine:
         eddy_ids = _str_list(post.get("eddies"))
 
         result.deleted_files.append(str(frag_file))
+        # ``frontmatter.Post.get`` returns ``Any``, so the id may be a
+        # non-string; only a real string is a scrubbable fragment ID.
         frag_id = post.get("id")
         if isinstance(frag_id, str):
             result.affected_fragment_ids.append(frag_id)
         result.fragments_affected += 1
-        result.wikilinks_removed += self._scrub_wikilinks(
-            title,
+        # One vault walk applies both the wiki-link and provenance scrubs.
+        wiki_count, prov_count = self._scrub_references(
+            title=title,
+            fragment_id=frag_id if isinstance(frag_id, str) else "",
             exclude=frag_file,
         )
-        if isinstance(frag_id, str):
-            result.provenance_scrubbed += self._scrub_provenance(
-                frag_id,
-                exclude=frag_file,
-            )
+        result.wikilinks_removed += wiki_count
+        result.provenance_scrubbed += prov_count
         result.threads_updated += self._decrement_counts(
             "02-Threads",
             thread_ids,
@@ -700,89 +720,97 @@ class PurgeEngine:
             logger.debug("Unable to parse frontmatter in %s", path)
             return None
 
-    def _scrub_wikilinks(self, title: str, *, exclude: Path) -> int:
-        """Remove all ``[[title]]`` wiki-links from every vault file.
+    def _scrub_references(
+        self,
+        *,
+        title: str,
+        fragment_id: str,
+        exclude: Path,
+    ) -> tuple[int, int]:
+        """Scrub wiki-links and fragment-ID provenance in a single vault walk.
 
-        Args:
-            title: The target title whose links should be removed.
-            exclude: Path to skip (typically the file being deleted).
+        Walks every ``.md`` file in the vault exactly once (instead of
+        once per scrub type) and applies both substitutions in-memory
+        before writing:
 
-        Returns:
-            Total number of wiki-link occurrences removed.
-        """
-        if not title:
-            return 0
-        pattern = _build_wikilink_pattern(title)
-        total_removed = 0
-        for md_file in self._list_vault_md_files():
-            if md_file == exclude:
-                continue
-            total_removed += self._scrub_file(md_file, pattern)
-        return total_removed
+        * Wiki-links pointing at the deleted fragment's *title*
+          (``[[title]]`` / ``[[title|alias]]``) are removed. They match
+          by name, not by ID, so the title-based pass is still needed.
+        * Bare fragment-ID occurrences are replaced with the
+          :data:`PURGED_MARKER` placeholder. This catches YAML
+          provenance list entries (``source_fragments: [frag-…]`` in
+          drafts and mining ideas) and prose mentions of the ID in the
+          body in the same pass.
 
-    def _scrub_file(self, md_file: Path, pattern: re.Pattern[str]) -> int:
-        """Remove wiki-link occurrences from a single file.
-
-        Args:
-            md_file: File to modify.
-            pattern: Regex pattern matching the wiki-link.
-
-        Returns:
-            Number of occurrences removed in this file.
-        """
-        try:
-            text = md_file.read_text(encoding="utf-8")
-        except OSError:
-            return 0
-        new_text, count = pattern.subn("", text)
-        if count and not self.dry_run:
-            md_file.write_text(new_text, encoding="utf-8")
-        return count
-
-    def _scrub_provenance(self, fragment_id: str, *, exclude: Path) -> int:
-        """Replace word-boundary ``fragment_id`` mentions with ``[purged]`` (GAP-004).
-
-        Walks every ``.md`` file in the vault — derived content under
-        ``04-Praxis``, ``05-Wavelength``, ``07-Voice/Drafts``,
-        ``08-Decisions``, the deployed skill tree under
-        ``00-Creek-Meta/Skills``, etc. — and replaces bare
-        fragment-ID occurrences with the :data:`PURGED_MARKER`
-        placeholder. Catches both YAML provenance list entries
-        (``source_fragments: [frag-…]`` in drafts and mining ideas)
-        and prose mentions of the ID in the body in a single pass.
-
-        The compliance audit log at
-        ``00-Creek-Meta/audit/purge.jsonl`` is a JSONL file (not
+        The walk covers all ``.md`` files in the vault, including
+        derived content under ``04-Praxis``, ``05-Wavelength``,
+        ``07-Voice/Drafts``, ``08-Decisions``, and the deployed skill
+        tree under ``00-Creek-Meta/Skills``. The compliance audit log
+        at ``00-Creek-Meta/audit/purge.jsonl`` is a JSONL file (not
         Markdown) so the recursive walk naturally excludes it — the
         audit's ``affected_fragments`` list keeps the real ID for
         compliance reconstruction.
 
-        Wiki-links to the fragment's *title* are still scrubbed by
-        :meth:`_scrub_wikilinks` because they match by name, not by ID.
-
         Args:
-            fragment_id: The exact fragment ID to scrub.
+            title: The fragment title whose wiki-links should be removed
+                (empty string skips the wiki-link pass).
+            fragment_id: The exact fragment ID to scrub (empty string
+                skips the provenance pass).
             exclude: Path to skip (the file currently being deleted).
 
         Returns:
-            Total number of replacements across the vault.
+            A ``(wikilinks_removed, provenance_scrubbed)`` count pair.
         """
-        if not fragment_id:
-            return 0
-        pattern = re.compile(rf"\b{re.escape(fragment_id)}\b")
-        total_removed = 0
+        wiki_pattern = _build_wikilink_pattern(title) if title else None
+        prov_pattern = _build_provenance_pattern(fragment_id) if fragment_id else None
+        if wiki_pattern is None is prov_pattern:
+            return 0, 0
+        wiki_total = 0
+        prov_total = 0
         for md_file in self._list_vault_md_files():
             if md_file == exclude:
                 continue
-            try:
-                text = md_file.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            new_text, count = pattern.subn(PURGED_MARKER, text)
-            if count and not self.dry_run:
-                md_file.write_text(new_text, encoding="utf-8")
-            total_removed += count
-        return total_removed
+            wiki_count, prov_count = self._scrub_one_file(
+                md_file,
+                wiki_pattern,
+                prov_pattern,
+            )
+            wiki_total += wiki_count
+            prov_total += prov_count
+        return wiki_total, prov_total
+
+    def _scrub_one_file(
+        self,
+        md_file: Path,
+        wiki_pattern: re.Pattern[str] | None,
+        prov_pattern: re.Pattern[str] | None,
+    ) -> tuple[int, int]:
+        """Apply the wiki-link and provenance scrubs to a single file.
+
+        Args:
+            md_file: Markdown file to scrub.
+            wiki_pattern: Wiki-link regex, or ``None`` to skip that pass.
+            prov_pattern: Fragment-ID regex, or ``None`` to skip that pass.
+
+        Returns:
+            A ``(wikilinks_removed, provenance_scrubbed)`` count pair for
+            this file. ``(0, 0)`` when the file cannot be read.
+        """
+        try:
+            text = md_file.read_text(encoding="utf-8")
+        except OSError:
+            return 0, 0
+        wiki_count = prov_count = 0
+        if wiki_pattern is not None:
+            text, wiki_count = wiki_pattern.subn("", text)
+        if prov_pattern is not None:
+            # NOTE: PURGED_MARKER is bracket-flavoured, so substituting it
+            # inside a YAML flow sequence (source_fragments: [a, b]) nests
+            # the scrubbed entry on re-parse — see PURGED_MARKER.
+            text, prov_count = prov_pattern.subn(PURGED_MARKER, text)
+        if (wiki_count or prov_count) and not self.dry_run:
+            md_file.write_text(text, encoding="utf-8")
+        return wiki_count, prov_count
 
     def _decrement_counts(
         self,
@@ -1128,6 +1156,25 @@ def _build_wikilink_pattern(title: str) -> re.Pattern[str]:
     """
     escaped = re.escape(title)
     return re.compile(rf"\[\[{escaped}(?:\|[^\]]*)?\]\]")
+
+
+def _build_provenance_pattern(fragment_id: str) -> re.Pattern[str]:
+    """Build a regex matching a bare ``fragment_id`` but not hyphen-suffixed IDs.
+
+    A plain ``\\b`` word boundary treats the hyphen as a word/non-word
+    boundary, so ``\\bfrag-01\\b`` would match the ``frag-01`` prefix
+    inside ``frag-01-extended``. The lookarounds below treat both
+    word characters *and* ``-`` as ID continuation, so a trailing or
+    leading hyphen marks a longer ID and is left untouched.
+
+    Args:
+        fragment_id: The exact fragment ID to match.
+
+    Returns:
+        A compiled regex pattern.
+    """
+    escaped = re.escape(fragment_id)
+    return re.compile(rf"(?<![\w-]){escaped}(?![\w-])")
 
 
 def _coerce_date(value: object) -> date | None:
