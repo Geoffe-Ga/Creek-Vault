@@ -721,14 +721,22 @@ class DraftConfig(BaseModel):
     * **Too derivative** — at least one draft paragraph paraphrases a
       source-fragment paragraph closely (cosine similarity above
       :attr:`derivative_upper`).
-    * **Too ungrounded** — fewer than :attr:`grounding_lower` fraction of
-      draft paragraphs share *any* similarity with a source paragraph
-      above the same lower bound, i.e. the draft is conceptually
-      invented.
+    * **Too ungrounded** — fewer than :attr:`grounding_fraction_lower` of
+      the draft's paragraphs clear the per-paragraph :attr:`grounding_lower`
+      similarity floor against *any* source paragraph, i.e. the draft is
+      conceptually invented.
 
-    Defaults are deliberately lenient (0.85 / 0.30); operators tighten
-    once they have a calibration set for their own corpus. Both
-    thresholds are cosine similarities and so must live in ``[0.0, 1.0]``.
+    The two grounding knobs are independent: :attr:`grounding_lower`
+    decides whether a single paragraph counts as grounded, while
+    :attr:`grounding_fraction_lower` decides what share of the draft's
+    paragraphs must be grounded for the draft to pass. An operator can
+    demand a strict per-paragraph anchor (e.g. 0.4) while tolerating a
+    lenient grounded fraction (e.g. 0.2), or the reverse.
+
+    Defaults are deliberately lenient (0.85 / 0.30 / 0.30); operators
+    tighten once they have a calibration set for their own corpus. All
+    three knobs are cosine similarities or fractions and so must live in
+    ``[0.0, 1.0]``.
     """
 
     derivative_upper: float = Field(default=0.85, ge=0.0, le=1.0)
@@ -737,10 +745,16 @@ class DraftConfig(BaseModel):
     flagged ``too derivative``."""
 
     grounding_lower: float = Field(default=0.30, ge=0.0, le=1.0)
-    """Cosine-similarity floor a draft paragraph must clear against
-    *some* source paragraph to count as grounded. Doubles as the
-    minimum acceptable fraction of grounded paragraphs: drafts whose
-    grounded fraction sits below this value are flagged ``too ungrounded``."""
+    """Per-paragraph cosine-similarity floor a draft paragraph must clear
+    against *some* source paragraph to count as grounded. Independent of
+    :attr:`grounding_fraction_lower`, which governs the whole-draft
+    grounded fraction."""
+
+    grounding_fraction_lower: float = Field(default=0.30, ge=0.0, le=1.0)
+    """Minimum acceptable fraction of grounded paragraphs across the whole
+    draft. A draft whose grounded fraction sits below this value is
+    flagged ``too ungrounded``, even when every grounded paragraph
+    individually cleared :attr:`grounding_lower`."""
 
     max_tokens: int | None = Field(default=None, gt=0)
     """Default ``max_tokens`` ceiling for the draft LLM call.

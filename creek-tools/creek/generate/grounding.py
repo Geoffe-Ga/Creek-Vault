@@ -1,4 +1,4 @@
-"""Bidirectional grounding guard for ``creek draft`` (issue #355).
+"""Bidirectional grounding guard for ``creek draft``.
 
 A draft has two opposite failure modes that the guard surfaces after
 composition:
@@ -48,7 +48,7 @@ class ParagraphAnnotation(TypedDict):
     (which lives in the draft body itself). Declaring this as a
     ``TypedDict`` lets ``mypy --strict`` flag key typos and missing
     fields at the call site instead of waiting for a YAML-decode
-    failure downstream — see PR #380 review feedback.
+    failure downstream.
     """
 
     index: int
@@ -90,14 +90,19 @@ class GroundingThresholds:
     Attributes:
         derivative_upper: Cosine-similarity ceiling above which a draft
             paragraph is flagged as a paraphrase.
-        grounding_lower: Cosine-similarity floor a draft paragraph must
-            clear against *some* source paragraph to count as grounded.
-            The same value gates the grounded-fraction summary: drafts
-            whose grounded fraction sits below this value are flagged.
+        grounding_lower: Per-paragraph cosine-similarity floor a draft
+            paragraph must clear against *some* source paragraph to count
+            as grounded.
+        grounding_fraction_lower: Minimum acceptable fraction of grounded
+            paragraphs across the whole draft. Independent of
+            :attr:`grounding_lower`: the former decides whether one
+            paragraph is grounded, the latter how many grounded
+            paragraphs the draft as a whole must reach.
     """
 
     derivative_upper: float
     grounding_lower: float
+    grounding_fraction_lower: float
 
     def __post_init__(self) -> None:
         """Reject thresholds outside ``[0.0, 1.0]`` at construction time."""
@@ -107,6 +112,12 @@ class GroundingThresholds:
         if not 0.0 <= self.grounding_lower <= 1.0:
             msg = f"grounding_lower must be in [0.0, 1.0]; got {self.grounding_lower}"
             raise ValueError(msg)
+        if not 0.0 <= self.grounding_fraction_lower <= 1.0:
+            msg = (
+                "grounding_fraction_lower must be in [0.0, 1.0]; "
+                f"got {self.grounding_fraction_lower}"
+            )
+            raise ValueError(msg)
 
     @classmethod
     def from_config(cls, config: DraftConfig) -> GroundingThresholds:
@@ -114,6 +125,7 @@ class GroundingThresholds:
         return cls(
             derivative_upper=config.derivative_upper,
             grounding_lower=config.grounding_lower,
+            grounding_fraction_lower=config.grounding_fraction_lower,
         )
 
 
@@ -173,7 +185,9 @@ class GroundingReport:
             across the draft. ``0.0`` when the draft has no paragraphs.
         grounding_score: Fraction of paragraphs whose ``max_similarity``
             cleared :attr:`GroundingThresholds.grounding_lower`. ``0.0``
-            when the draft has no paragraphs.
+            when the draft has no paragraphs. Compared against
+            :attr:`GroundingThresholds.grounding_fraction_lower` to set
+            the grounding flag.
         paragraph_scores: One :class:`ParagraphScore` per draft
             paragraph, in document order.
         thresholds: Echo of the thresholds the scores were computed
@@ -194,7 +208,13 @@ class GroundingReport:
 
     @property
     def is_flagged_grounding(self) -> bool:
-        """``True`` when the grounded fraction fell below the lower bound.
+        """``True`` when the grounded fraction fell below the fraction floor.
+
+        Compares :attr:`grounding_score` against
+        :attr:`GroundingThresholds.grounding_fraction_lower`, the
+        whole-draft knob — distinct from the per-paragraph
+        :attr:`GroundingThresholds.grounding_lower` that decided which
+        paragraphs counted as grounded in the first place.
 
         Empty drafts (no paragraph scores) cannot be evaluated and so
         are never flagged — a paragraph-less body indicates an upstream
@@ -202,7 +222,7 @@ class GroundingReport:
         """
         if not self.paragraph_scores:
             return False
-        return self.grounding_score < self.thresholds.grounding_lower
+        return self.grounding_score < self.thresholds.grounding_fraction_lower
 
     @property
     def is_flagged(self) -> bool:
@@ -231,7 +251,7 @@ class GroundingReport:
             f"grounding guard: derivative={self.derivative_score:.2f} "
             f"(upper {self.thresholds.derivative_upper:.2f}), "
             f"grounding={self.grounding_score:.2f} "
-            f"(lower {self.thresholds.grounding_lower:.2f}) — {verdict}"
+            f"(lower {self.thresholds.grounding_fraction_lower:.2f}) — {verdict}"
         )
 
     def to_frontmatter(self) -> dict[str, object]:
@@ -314,19 +334,49 @@ def split_paragraphs(body: str) -> list[str]:
     return [p for p in paragraphs if p]
 
 
+_NORM_EPSILON = 1e-12
+"""Norm floor below which a vector is treated as zero-norm.
+
+An exact-zero check (``norm == 0.0``) only catches an all-zeros vector;
+a degenerate near-zero embedding (sum-of-squares ≈ 1e-30) would slip
+through and divide into a large but finite — and meaningless — cosine.
+Collapsing any sub-epsilon norm to "no resonance" keeps the guard's
+output bounded for every embedding the public :data:`EmbeddingFn`
+injection point might produce."""
+
+
+class GroundingDimensionError(ValueError):
+    """Raised when draft and source embeddings have mismatched dimensions.
+
+    The guard compares draft-paragraph vectors against source-paragraph
+    vectors with :func:`cosine_similarity`, which requires equal-length
+    inputs. A length mismatch means the injected :data:`EmbeddingFn`
+    returned vectors of different sizes for different texts — almost
+    always two different embedding models on the two code paths. Catching
+    the low-level length error here and re-raising this subclass turns a
+    bare ``Vector length mismatch: 384 vs 768`` into an actionable
+    message at the guard boundary instead of a raw traceback from deep in
+    the scoring loop.
+    """
+
+
 def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     """Return cosine similarity in ``[-1.0, 1.0]`` for two equal-length vectors.
 
-    Zero-norm vectors collapse to ``0.0`` rather than raising — the
-    guard treats an embedding-less paragraph as "no resonance with
-    anything" without aborting the score for the whole draft.
+    Vectors whose norm falls below :data:`_NORM_EPSILON` collapse to
+    ``0.0`` rather than raising or dividing — the guard treats an
+    embedding-less (or degenerate near-zero) paragraph as "no resonance
+    with anything" without aborting the score for the whole draft.
+
+    Raises:
+        GroundingDimensionError: When *a* and *b* have different lengths.
     """
     if len(a) != len(b):
         msg = f"Vector length mismatch: {len(a)} vs {len(b)}"
-        raise ValueError(msg)
+        raise GroundingDimensionError(msg)
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
-    if 0.0 in (norm_a, norm_b):
+    if norm_a < _NORM_EPSILON or norm_b < _NORM_EPSILON:
         return 0.0
     dot = sum(x * y for x, y in zip(a, b, strict=True))
     return dot / (norm_a * norm_b)
@@ -394,6 +444,12 @@ def score_draft(
         A populated :class:`GroundingReport`. When *draft_body* contains
         no paragraphs the scores collapse to ``0.0`` and no flags fire
         — there is nothing to evaluate.
+
+    Raises:
+        GroundingDimensionError: When the injected ``embedding_fn``
+            returns vectors of differing lengths for draft and source
+            paragraphs — surfaced as a clean message rather than a raw
+            length-mismatch traceback from inside the scoring loop.
     """
     draft_paragraphs = split_paragraphs(draft_body)
     if not draft_paragraphs:
@@ -409,16 +465,25 @@ def score_draft(
         source_paragraphs.extend(split_paragraphs(text))
     source_vectors = [embedding_fn(p) for p in source_paragraphs]
 
-    scores = tuple(
-        _score_one_paragraph(
-            paragraph,
-            source_vectors,
-            embedding_fn=embedding_fn,
-            thresholds=thresholds,
-            index=index,
+    try:
+        scores = tuple(
+            _score_one_paragraph(
+                paragraph,
+                source_vectors,
+                embedding_fn=embedding_fn,
+                thresholds=thresholds,
+                index=index,
+            )
+            for index, paragraph in enumerate(draft_paragraphs)
         )
-        for index, paragraph in enumerate(draft_paragraphs)
-    )
+    except GroundingDimensionError as exc:
+        msg = (
+            "grounding guard could not score the draft: the embedding "
+            "function returned vectors of differing lengths for draft and "
+            "source paragraphs. This usually means two different embedding "
+            f"models were used on the same run ({exc})."
+        )
+        raise GroundingDimensionError(msg) from exc
 
     derivative = max((s.max_similarity for s in scores), default=0.0)
     grounded_count = sum(1 for s in scores if s.is_grounded)

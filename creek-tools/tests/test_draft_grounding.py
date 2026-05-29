@@ -31,6 +31,7 @@ from creek.generate.grounding import (
     GROUNDING_FRONTMATTER_KEY,
     PARAGRAPH_ANNOTATIONS_KEY,
     EmbeddingFn,
+    GroundingDimensionError,
     GroundingReport,
     GroundingThresholds,
     ParagraphScore,
@@ -170,6 +171,25 @@ class TestCosineSimilarity:
         assert cosine_similarity(zeros, other) == 0.0
         assert cosine_similarity(other, zeros) == 0.0
 
+    def test_near_zero_vector_returns_zero(self) -> None:
+        """A near-zero (norm ~1e-30) vector collapses to 0.0, not a huge cosine.
+
+        An exact-zero check would let a sum-of-squares ≈ 1e-30 vector
+        divide into an enormous but finite cosine; the epsilon floor
+        treats it as "no resonance" instead.
+        """
+        # Norm = sqrt(_VECTOR_DIM) * 1e-30 ≈ 5.7e-30, far below the
+        # 1e-12 epsilon — but emphatically not exactly zero.
+        tiny = [1e-30] * _VECTOR_DIM
+        unit = _hashed_vector("a normal paragraph")
+        assert cosine_similarity(tiny, unit) == 0.0
+        assert cosine_similarity(unit, tiny) == 0.0
+
+    def test_length_mismatch_raises_clean_error(self) -> None:
+        """Unequal-length vectors raise :class:`GroundingDimensionError`."""
+        with pytest.raises(GroundingDimensionError, match="length mismatch"):
+            cosine_similarity([1.0, 0.0], [1.0, 0.0, 0.0])
+
 
 # ---------------------------------------------------------------------------
 # DraftConfig wiring
@@ -180,10 +200,11 @@ class TestDraftConfig:
     """Thresholds must be configurable through the ``draft:`` YAML section."""
 
     def test_defaults_match_issue(self) -> None:
-        """The defaults pinned in issue #355 are 0.85 and 0.30."""
+        """The defaults are 0.85 / 0.30 / 0.30 (backwards-compatible)."""
         cfg = DraftConfig()
         assert cfg.derivative_upper == pytest.approx(0.85)
         assert cfg.grounding_lower == pytest.approx(0.30)
+        assert cfg.grounding_fraction_lower == pytest.approx(0.30)
 
     def test_thresholds_are_clamped_to_unit_interval(self) -> None:
         """Cosine-similarity thresholds must stay in [0.0, 1.0]."""
@@ -191,12 +212,25 @@ class TestDraftConfig:
             DraftConfig(derivative_upper=1.5)
         with pytest.raises(ValueError, match="grounding_lower"):
             DraftConfig(grounding_lower=-0.1)
+        with pytest.raises(ValueError, match="grounding_fraction_lower"):
+            DraftConfig(grounding_fraction_lower=1.1)
 
     def test_thresholds_can_be_overridden(self) -> None:
-        """Operators must be able to tighten or loosen both knobs."""
-        cfg = DraftConfig(derivative_upper=0.9, grounding_lower=0.5)
+        """Operators must be able to tighten or loosen all three knobs."""
+        cfg = DraftConfig(
+            derivative_upper=0.9,
+            grounding_lower=0.5,
+            grounding_fraction_lower=0.2,
+        )
         assert cfg.derivative_upper == pytest.approx(0.9)
         assert cfg.grounding_lower == pytest.approx(0.5)
+        assert cfg.grounding_fraction_lower == pytest.approx(0.2)
+
+    def test_grounding_knobs_are_independent(self) -> None:
+        """The per-paragraph floor and the fraction floor set independently."""
+        cfg = DraftConfig(grounding_lower=0.4, grounding_fraction_lower=0.2)
+        assert cfg.grounding_lower == pytest.approx(0.4)
+        assert cfg.grounding_fraction_lower == pytest.approx(0.2)
 
     def test_max_tokens_defaults_to_none(self) -> None:
         """``max_tokens`` defaults to None so the provider default is kept."""
@@ -222,10 +256,15 @@ class TestDraftConfig:
     def test_thresholds_from_config(self) -> None:
         """``GroundingThresholds.from_config`` mirrors the :class:`DraftConfig`."""
         thresholds = GroundingThresholds.from_config(
-            DraftConfig(derivative_upper=0.72, grounding_lower=0.45),
+            DraftConfig(
+                derivative_upper=0.72,
+                grounding_lower=0.45,
+                grounding_fraction_lower=0.25,
+            ),
         )
         assert thresholds.derivative_upper == pytest.approx(0.72)
         assert thresholds.grounding_lower == pytest.approx(0.45)
+        assert thresholds.grounding_fraction_lower == pytest.approx(0.25)
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +272,11 @@ class TestDraftConfig:
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_THRESHOLDS = GroundingThresholds(derivative_upper=0.85, grounding_lower=0.30)
+_DEFAULT_THRESHOLDS = GroundingThresholds(
+    derivative_upper=0.85,
+    grounding_lower=0.30,
+    grounding_fraction_lower=0.30,
+)
 
 
 class TestScoreDraftDerivative:
@@ -338,8 +381,120 @@ class TestScoreDraftGrounding:
         )
         # One of two paragraphs is grounded → fraction = 0.5.
         assert report.grounding_score == pytest.approx(0.5, abs=1e-6)
-        # 0.5 is above the 0.30 lower → no grounding flag.
+        # 0.5 is above the 0.30 fraction floor → no grounding flag.
         assert report.is_flagged_grounding is False
+
+
+class TestGroundingKnobIndependence:
+    """The per-paragraph floor and the fraction floor act independently."""
+
+    def _half_grounded_report(
+        self,
+        thresholds: GroundingThresholds,
+    ) -> GroundingReport:
+        """Score a two-paragraph draft where exactly one paragraph is grounded.
+
+        The close paragraph blends 80% toward its source (cosine well
+        above 0.30 yet below 0.85); the far paragraph is orthogonal. So
+        the grounded *fraction* is exactly 0.5 regardless of the
+        fraction floor under test.
+        """
+        anchored_source = "Anchored source paragraph for independence"
+        close = "Mostly the anchored source paragraph for independence"
+        far = "Totally unrelated independence content"
+        table = {
+            anchored_source: _hashed_vector(anchored_source),
+            close: _blended_vector([anchored_source, close], [0.8, 0.2]),
+            far: _hashed_vector(far),
+        }
+        return score_draft(
+            f"{close}\n\n{far}",
+            source_texts=[anchored_source],
+            embedding_fn=_fixture_embedder(table),
+            thresholds=thresholds,
+        )
+
+    def test_fraction_floor_flags_when_per_paragraph_floor_passes(self) -> None:
+        """Every grounded paragraph clears the per-paragraph floor, yet the
+        grounded fraction (0.5) sits below a strict fraction floor (0.6) → flag."""
+        thresholds = GroundingThresholds(
+            derivative_upper=0.85,
+            grounding_lower=0.30,
+            grounding_fraction_lower=0.60,
+        )
+        report = self._half_grounded_report(thresholds)
+        assert report.grounding_score == pytest.approx(0.5, abs=1e-6)
+        # 0.5 < 0.60 fraction floor → flagged even though the grounded
+        # paragraph individually cleared the 0.30 per-paragraph floor.
+        assert report.is_flagged_grounding is True
+
+    def test_lenient_fraction_floor_passes_same_draft(self) -> None:
+        """The identical 0.5-grounded draft passes under a lenient fraction floor.
+
+        Holding the per-paragraph floor fixed and only loosening the
+        fraction floor flips the verdict — proving the fraction knob is
+        what drives the flag, independent of the per-paragraph knob.
+        """
+        thresholds = GroundingThresholds(
+            derivative_upper=0.85,
+            grounding_lower=0.30,
+            grounding_fraction_lower=0.40,
+        )
+        report = self._half_grounded_report(thresholds)
+        assert report.grounding_score == pytest.approx(0.5, abs=1e-6)
+        # 0.5 ≥ 0.40 fraction floor → not flagged.
+        assert report.is_flagged_grounding is False
+
+    def test_per_paragraph_floor_changes_fraction_independently(self) -> None:
+        """Tightening only the per-paragraph floor drops a paragraph out of
+        the grounded set, flipping the verdict while the fraction floor holds."""
+        # With grounding_lower=0.30 the close paragraph (cosine ~0.97) is
+        # grounded → fraction 0.5 ≥ 0.40 → not flagged.
+        lenient_para = GroundingThresholds(
+            derivative_upper=0.99,
+            grounding_lower=0.30,
+            grounding_fraction_lower=0.40,
+        )
+        assert self._half_grounded_report(lenient_para).is_flagged_grounding is False
+        # Raising the per-paragraph floor above the close paragraph's
+        # cosine (~0.97) un-grounds it → fraction 0.0 < 0.40 → flagged,
+        # even though the fraction floor never moved.
+        strict_para = GroundingThresholds(
+            derivative_upper=0.99,
+            grounding_lower=0.98,
+            grounding_fraction_lower=0.40,
+        )
+        strict_report = self._half_grounded_report(strict_para)
+        assert strict_report.grounding_score == pytest.approx(0.0, abs=1e-6)
+        assert strict_report.is_flagged_grounding is True
+
+
+class TestScoreDraftDimensionMismatch:
+    """A mismatched embedding callable surfaces a clean guard error."""
+
+    def test_dimension_mismatch_raises_clean_grounding_error(self) -> None:
+        """Vectors of differing lengths abort with an actionable message.
+
+        Simulates two embedding models on one run: source paragraphs get
+        a 4-dim vector, draft paragraphs a 3-dim vector. Rather than a
+        raw ``Vector length mismatch`` traceback from deep in the loop,
+        the guard raises :class:`GroundingDimensionError` with a message
+        an operator can act on.
+        """
+
+        def _ragged_embed(text: str) -> list[float]:
+            return [1.0, 0.0, 0.0, 0.0] if text == "src para" else [1.0, 0.0, 0.0]
+
+        with pytest.raises(GroundingDimensionError) as excinfo:
+            score_draft(
+                "draft para",
+                source_texts=["src para"],
+                embedding_fn=_ragged_embed,
+                thresholds=_DEFAULT_THRESHOLDS,
+            )
+        message = str(excinfo.value)
+        assert "differing lengths" in message
+        assert "embedding" in message.lower()
 
 
 class TestScoreDraftBalanced:

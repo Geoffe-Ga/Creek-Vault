@@ -5,7 +5,8 @@ The :mod:`creek.generate.grounding` guard runs synchronously during
 ``derivative_score`` / ``grounding_score`` / ``paragraph_grounding``.
 This lint check is the audit pass that asks the operator to revisit
 any draft whose stored scores fall outside the configured
-``draft.derivative_upper`` / ``draft.grounding_lower`` thresholds.
+``draft.derivative_upper`` / ``draft.grounding_fraction_lower``
+thresholds.
 
 Drafts written before issue #355 (and any markdown file that simply
 lacks the scores) are skipped silently — re-running ``creek draft``
@@ -72,9 +73,9 @@ def _scan_draft(path: Path, draft_config: DraftConfig) -> str | None:
         failures.append(
             f"derivative={derivative:.2f} ≥ {draft_config.derivative_upper:.2f}",
         )
-    if grounding < draft_config.grounding_lower:
+    if grounding < draft_config.grounding_fraction_lower:
         failures.append(
-            f"grounding={grounding:.2f} < {draft_config.grounding_lower:.2f}",
+            f"grounding={grounding:.2f} < {draft_config.grounding_fraction_lower:.2f}",
         )
     if not failures:
         return None
@@ -107,6 +108,6 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     summary = (
         f"{scanned} draft(s) scanned; {len(findings)} outside "
         f"derivative_upper={draft_config.derivative_upper:.2f} / "
-        f"grounding_lower={draft_config.grounding_lower:.2f}"
+        f"grounding_fraction_lower={draft_config.grounding_fraction_lower:.2f}"
     )
     return CheckResult(name="draft-grounding", summary=summary, findings=findings)
