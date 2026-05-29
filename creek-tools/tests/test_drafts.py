@@ -2595,3 +2595,288 @@ class TestOntologyTwistComposition:
         assert "Use the provided source musings" in prompt
         assert "Do not paraphrase any single source verbatim" in prompt
         assert "Recombine across the corpus" in prompt
+
+
+# ---- Issue #354: --seed-outline multi-section composition -------------------
+
+
+def _ontology_detector_by_phase(
+    phase_by_keyword: dict[str, Phase],
+    *,
+    default_phase: Phase = Phase.PEAKING,
+    weight: float = 0.9,
+) -> Callable[[str], object]:
+    """Return a deterministic detector keyed on a section's text.
+
+    Maps a substring keyword to a detected :class:`Phase` so a test can
+    give different sections different ontologies without any LLM. Every
+    other dimension is left empty so the target profile is driven by the
+    phase pick alone.
+    """
+    from creek.classify.prompt import PromptOntology, WeightedDimension
+
+    def _detect(prompt: str) -> object:
+        lowered = prompt.lower()
+        chosen = default_phase
+        for keyword, phase in phase_by_keyword.items():
+            if keyword.lower() in lowered:
+                chosen = phase
+                break
+        return PromptOntology(
+            prompt=prompt,
+            phases=(WeightedDimension(value=chosen, weight=weight),),
+        )
+
+    return _detect
+
+
+def _empty_detector() -> Callable[[str], object]:
+    """Return a detector that always reports an empty ontology."""
+    from creek.classify.prompt import PromptOntology
+
+    def _detect(prompt: str) -> object:
+        return PromptOntology(prompt=prompt)
+
+    return _detect
+
+
+class TestGenerateOutlineDraft:
+    """``generate_outline_draft`` composes each section, then stitches."""
+
+    def test_two_section_outline_sections_appear_in_order(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance: each outline section appears in the draft, in order."""
+        outline = (
+            "## Alpha claim\nThe first movement.\n\n"
+            "## Omega claim\nThe closing movement.\n"
+        )
+
+        def llm(prompt: str) -> str:
+            # Section composition echoes the heading so we can assert
+            # order; the stitch pass returns its input unchanged.
+            if "Alpha claim" in prompt and "Omega claim" in prompt:
+                return prompt  # stitch pass — keep both bodies
+            if "Alpha claim" in prompt:
+                return "BODY-ALPHA"
+            return "BODY-OMEGA"
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+
+        assert len(draft.sections) == 2
+        assert [s.heading for s in draft.sections] == ["Alpha claim", "Omega claim"]
+        # Both composed bodies survive into the stitched draft, in order.
+        alpha_at = draft.body.index("BODY-ALPHA")
+        omega_at = draft.body.index("BODY-OMEGA")
+        assert alpha_at < omega_at
+
+    def test_five_section_outline(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance: a five-section outline yields five ordered sections."""
+        outline = "\n\n".join(f"## Section {n}\nBody {n}." for n in range(1, 6))
+
+        def llm(prompt: str) -> str:
+            return prompt  # echo so each body and the stitch survive
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+
+        assert len(draft.sections) == 5
+        assert [s.heading for s in draft.sections] == [
+            f"Section {n}" for n in range(1, 6)
+        ]
+
+    def test_mixed_ontologies_recorded_per_section(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance: each section records its own detected ontology profile.
+
+        Two sections detect different phases; the per-section target
+        profiles must differ accordingly.
+        """
+        # Source material so each section can retrieve real fragments.
+        for frag_id, phase in (
+            ("frag-rise-1", Phase.RISING),
+            ("frag-rise-2", Phase.RISING),
+            ("frag-with-1", Phase.WITHDRAWAL),
+            ("frag-with-2", Phase.WITHDRAWAL),
+        ):
+            _write_fragment(
+                vault,
+                _build_fragment(
+                    frag_id=frag_id,
+                    primary=Frequency.F7,
+                    phase=phase,
+                    mode=Mode.INHABIT,
+                ),
+                f"{frag_id} body about the work.",
+            )
+        outline = (
+            "## The ascent\nThe rising movement of the work.\n\n"
+            "## The retreat\nThe withdrawal that follows.\n"
+        )
+        detector = _ontology_detector_by_phase(
+            {"ascent": Phase.RISING, "retreat": Phase.WITHDRAWAL},
+        )
+
+        gen = DraftGenerator(llm=lambda p: p, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=detector,
+        )
+
+        assert draft.sections[0].target_profile is not None
+        assert draft.sections[1].target_profile is not None
+        assert draft.sections[0].target_profile.phase == "rising"
+        assert draft.sections[1].target_profile.phase == "withdrawal"
+
+    def test_section_with_no_source_material_still_appears(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A section that matches no fragments is still composed and kept."""
+        outline = "## Lonely section\nNothing in the vault matches this.\n"
+
+        gen = DraftGenerator(llm=lambda _p: "FALLBACK BODY", skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+
+        assert len(draft.sections) == 1
+        assert draft.sections[0].heading == "Lonely section"
+        assert "FALLBACK BODY" in draft.body
+
+    def test_no_header_outline_rejected(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance: a header-less outline is rejected with a clear error."""
+        from creek.generate.outline import OutlineParseError
+
+        gen = DraftGenerator(llm=lambda _p: "x", skills_root=skills_root)
+        with pytest.raises(OutlineParseError, match="no markdown headers"):
+            gen.generate_outline_draft(
+                "Just a paragraph, no headers at all.\n",
+                vault_path=vault,
+                detect_ontology=_empty_detector(),
+            )
+
+    def test_stitch_pass_receives_connective_tissue_directive(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance: the stitch directive forbids paraphrase / invention."""
+        outline = "## One\nFirst.\n\n## Two\nSecond.\n"
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            if "Stitch directive" in prompt:
+                captured["stitch"] = prompt
+                return prompt
+            return "section body"
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+
+        stitch = captured["stitch"]
+        lowered = stitch.lower()
+        assert "transition" in lowered
+        assert "do not" in lowered
+        assert "invent" in lowered
+
+    def test_empty_llm_body_raises(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """An empty stitched body fails loudly rather than saving a blank draft."""
+        outline = "## One\nFirst.\n"
+
+        gen = DraftGenerator(llm=lambda _p: "   ", skills_root=skills_root)
+        with pytest.raises(RuntimeError, match="empty"):
+            gen.generate_outline_draft(
+                outline,
+                vault_path=vault,
+                detect_ontology=_empty_detector(),
+            )
+
+
+class TestSaveOutlineDraft:
+    """``save_outline_draft`` records per-section profiles in frontmatter."""
+
+    def test_frontmatter_records_per_section_profiles(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Acceptance: per-section ontology profiles land in frontmatter."""
+        outline = (
+            "## The ascent\nThe rising movement.\n\n"
+            "## The retreat\nThe withdrawal that follows.\n"
+        )
+        detector = _ontology_detector_by_phase(
+            {"ascent": Phase.RISING, "retreat": Phase.WITHDRAWAL},
+        )
+
+        gen = DraftGenerator(llm=lambda p: p, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=detector,
+        )
+        path = gen.save_outline_draft(draft, vault)
+
+        post = frontmatter.load(str(path))
+        sections_meta = post.metadata["sections"]
+        assert isinstance(sections_meta, list)
+        assert len(sections_meta) == 2
+        assert sections_meta[0]["heading"] == "The ascent"
+        assert sections_meta[0]["target_profile"]["phase"] == "rising"
+        assert sections_meta[1]["target_profile"]["phase"] == "withdrawal"
+
+    def test_saved_draft_is_typed_and_titled(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The saved file carries the draft type and the outline title."""
+        outline = "# My Essay Title\n\n## Body\nContent here.\n"
+
+        gen = DraftGenerator(llm=lambda _p: "stitched body", skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+        path = gen.save_outline_draft(draft, vault)
+
+        post = frontmatter.load(str(path))
+        assert post.metadata["type"] == "draft"
+        assert post.metadata["title"] == "My Essay Title"
+        assert (vault / DRAFTS_SUBDIR) in path.parents
