@@ -28,6 +28,7 @@ itself raises :class:`PytesseractUnavailableError` at OCR time.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -131,6 +132,39 @@ class PytesseractUnavailableError(RuntimeError):
     """Raised when an OCR call is made but pytesseract is not installed."""
 
 
+_TESSERACT_BINARY_MISSING_MSG: str = (
+    "The `tesseract` system binary was not found on PATH. The pytesseract "
+    "Python package is a thin wrapper that shells out to it, so OCR cannot "
+    "run without it. Install Tesseract via your OS package manager (e.g. "
+    "`brew install tesseract`, `apt-get install tesseract-ocr`, or see "
+    "https://github.com/tesseract-ocr/tesseract) and ensure it is on PATH "
+    "(or set `pytesseract.pytesseract.tesseract_cmd` to its location)."
+)
+"""Actionable remediation message for the missing-binary case (GAP-015)."""
+
+
+def _tesseract_binary_available(pytesseract: Any) -> bool:
+    """Return ``True`` when the configured ``tesseract`` binary is runnable.
+
+    ``pytesseract`` is only a wrapper around the ``tesseract`` system
+    binary; importing the Python package succeeds even when the binary
+    is absent. We honour any configured command path
+    (``pytesseract.pytesseract.tesseract_cmd``, which defaults to
+    ``"tesseract"``) and resolve it via :func:`shutil.which`, falling
+    back to :func:`pytesseract.get_tesseract_version` when ``which``
+    cannot resolve it (e.g. an absolute ``tesseract_cmd`` path that is
+    on PATH-lookup-immune but still executable).
+    """
+    cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
+    if shutil.which(cmd) is not None:
+        return True
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:  # pytesseract raises TesseractNotFoundError and others here
+        return False
+    return True
+
+
 # ---- Default OCR engine --------------------------------------------------
 
 
@@ -155,13 +189,20 @@ class PytesseractOcrEngine:
         self.language = language
 
     def is_available(self) -> bool:
-        """Return ``True`` when both pytesseract and Pillow import cleanly."""
+        """Return ``True`` when OCR can actually run right now.
+
+        Both the Python packages (``pytesseract``, ``Pillow``) **and**
+        the ``tesseract`` system binary they wrap must be present.
+        Importing ``pytesseract`` succeeds even when the binary is
+        missing (GAP-015), so the import guard alone would wrongly
+        report availability; we additionally probe the binary.
+        """
         try:
-            import pytesseract  # noqa: F401
+            import pytesseract
             from PIL import Image  # noqa: F401
         except ImportError:
             return False
-        return True
+        return _tesseract_binary_available(pytesseract)
 
     def extract_text(self, image_path: Path) -> OcrResult:
         """Run OCR on *image_path* and return the resulting text.
@@ -175,7 +216,8 @@ class PytesseractOcrEngine:
 
         Raises:
             PytesseractUnavailableError: When ``pytesseract`` or
-                ``Pillow`` cannot be imported.
+                ``Pillow`` cannot be imported, or when the ``tesseract``
+                system binary they wrap is not installed (GAP-015).
         """
         try:
             import pytesseract
@@ -208,7 +250,9 @@ class PytesseractOcrEngine:
 
         Raises:
             PytesseractUnavailableError: When ``pdf2image``,
-                ``pytesseract``, or ``Pillow`` cannot be imported.
+                ``pytesseract``, or ``Pillow`` cannot be imported, or
+                when the ``tesseract`` system binary is not installed
+                (GAP-015).
         """
         try:
             import pytesseract
@@ -221,7 +265,14 @@ class PytesseractOcrEngine:
             )
             raise PytesseractUnavailableError(msg) from exc
 
-        pages = convert_from_path(str(pdf_path))
+        return self._ocr_pdf_pages(pytesseract, convert_from_path(str(pdf_path)))
+
+    def _ocr_pdf_pages(
+        self,
+        pytesseract: Any,
+        pages: list[Any],
+    ) -> list[OcrResult]:
+        """OCR each pre-rendered PDF page image into an :class:`OcrResult`."""
         results: list[OcrResult] = []
         for index, page_image in enumerate(pages, start=1):
             preprocessed = self._preprocess(page_image)
@@ -250,13 +301,25 @@ class PytesseractOcrEngine:
         return ImageEnhance.Contrast(image.convert("RGB")).enhance(2.0)
 
     def _ocr_image(self, pytesseract: Any, image: Any) -> tuple[str, float]:
-        """Run tesseract on a preprocessed image, returning ``(text, confidence)``."""
-        text = pytesseract.image_to_string(image, lang=self.language)
-        data = pytesseract.image_to_data(
-            image,
-            lang=self.language,
-            output_type=pytesseract.Output.DICT,
-        )
+        """Run tesseract on a preprocessed image, returning ``(text, confidence)``.
+
+        Translates the raw ``pytesseract.TesseractNotFoundError`` (raised
+        when the ``tesseract`` system binary is absent — distinct from the
+        ``ImportError`` raised when the Python package is missing) into the
+        curated :class:`PytesseractUnavailableError` carrying the
+        install-the-binary remediation message (GAP-015). This is the single
+        choke point both :meth:`extract_text` and :meth:`extract_pdf_pages`
+        funnel through, so neither leaks the raw error.
+        """
+        try:
+            text = pytesseract.image_to_string(image, lang=self.language)
+            data = pytesseract.image_to_data(
+                image,
+                lang=self.language,
+                output_type=pytesseract.Output.DICT,
+            )
+        except pytesseract.TesseractNotFoundError as exc:
+            raise PytesseractUnavailableError(_TESSERACT_BINARY_MISSING_MSG) from exc
         confidence = _average_confidence(data.get("conf", []))
         return text.strip(), confidence
 
