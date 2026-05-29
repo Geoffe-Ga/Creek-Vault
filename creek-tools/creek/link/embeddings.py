@@ -54,6 +54,19 @@ EMBEDDINGS_CACHE_DIR: Final[str] = "00-Creek-Meta"
 """Vault subdirectory that holds the embeddings cache."""
 
 
+class EmbeddingModelUnavailableError(RuntimeError):
+    """The configured sentence-transformer model could not be loaded (GAP-008).
+
+    Raised by :meth:`EmbeddingLinker.load_model` when the underlying
+    ``sentence_transformers.SentenceTransformer(...)`` call fails — most
+    commonly because the model weights have not been downloaded and the
+    host has no network access, but also covers torch/transformers
+    import-time failures or a corrupt cache directory. The exception
+    message names the requested model so the operator can act without
+    rummaging through a stack trace deep inside torch.
+    """
+
+
 class Resonance(BaseModel):
     """A semantic resonance edge between two fragments (FEAT-024).
 
@@ -405,13 +418,44 @@ class EmbeddingLinker:
 
         Returns:
             The loaded SentenceTransformer model instance.
+
+        Raises:
+            EmbeddingModelUnavailableError: When the underlying
+                ``sentence_transformers.SentenceTransformer(...)`` call
+                fails (model weights missing and no network, corrupt
+                cache, torch import error, …). The message names the
+                model and points at the remediation so the operator does
+                not have to read a torch stack trace (GAP-008).
         """
         if self._model is None:
             logger.info("Loading embedding model '%s'", self.config.model)
-            self._model = _load_sentence_transformer(
-                self.config.model,
-                self.config.cache_dir,
-            )
+            try:
+                self._model = _load_sentence_transformer(
+                    self.config.model,
+                    self.config.cache_dir,
+                )
+            except Exception as exc:
+                # GAP-008: any underlying-library failure (OSError,
+                # RuntimeError, ImportError from torch, …) becomes a
+                # typed error so callers can branch on identity rather
+                # than parsing third-party messages.
+                cache_hint = (
+                    f"cache directory {self.config.cache_dir!r}"
+                    if self.config.cache_dir
+                    else "the default sentence-transformers cache directory"
+                )
+                msg = (
+                    f"sentence-transformers could not load embedding model "
+                    f"{self.config.model!r}. The model weights are usually "
+                    f"downloaded automatically on first use; this failure "
+                    f"typically means the host has no network access on the "
+                    f"first run, or the weights in {cache_hint} are corrupt. "
+                    f"Remediation: run `creek link --method embeddings` once "
+                    f"on a machine with network access to populate the cache, "
+                    f"then copy the cache directory to the offline host. "
+                    f"Underlying error: {exc!s}"
+                )
+                raise EmbeddingModelUnavailableError(msg) from exc
         return self._model
 
     def generate_embedding(self, text: str) -> list[float]:
