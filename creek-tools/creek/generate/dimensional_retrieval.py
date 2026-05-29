@@ -1,4 +1,4 @@
-"""Per-dimension corpus retrieval for draft generation (issue #351).
+"""Per-dimension corpus retrieval for draft generation.
 
 The fragment classifier hands :mod:`creek.generate.drafts` one canonical
 ontology pick per dimension. The original draft pipeline ANDed those
@@ -223,7 +223,7 @@ def assemble_per_dimension_corpus(
     ontology: PromptOntology | None = None,
     confidence_threshold: float = 0.0,
 ) -> dict[DimensionKey, DimensionSlice]:
-    """Return one corpus slice per active dimension (issue #351).
+    """Return one corpus slice per active dimension.
 
     Each active dimension — explicit CLI flag or above-threshold
     :class:`~creek.classify.prompt.PromptOntology` entry — fetches its

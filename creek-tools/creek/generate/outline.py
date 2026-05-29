@@ -1,12 +1,12 @@
-"""Markdown outline parsing for multi-section drafts (issue #354).
+"""Markdown outline parsing for multi-section drafts.
 
 ``creek draft --seed-topic`` accepts a single phrase. Larger essays carry
-structure — an introduction, a few claims, a synthesis. Issue #354 lets
-the operator hand that structure in directly via ``--seed-outline`` (a
-file path) or ``--seed-outline-text`` (inline), and composes each section
-independently with its own detected ontology profile (issue #350),
-per-dimension retrieval (issue #351), and ontology-twist composition
-(issue #352), then stitches the sections together with a transition-only
+structure — an introduction, a few claims, a synthesis. The
+``--seed-outline`` (a file path) and ``--seed-outline-text`` (inline)
+flags let the operator hand that structure in directly, and the draft
+pipeline composes each section independently with its own detected
+ontology profile, per-dimension retrieval, and ontology-twist
+composition, then stitches the sections together with a transition-only
 smoothing pass.
 
 This module is the pure, LLM-free half of that feature:
