@@ -23,8 +23,6 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from creek.ingest.base import generate_fragment_id
-
 _MANIFEST_RELATIVE = Path("00-Creek-Meta") / "dedup-manifest.json"
 """Relative path from vault root to the deduplication manifest file."""
 
@@ -176,6 +174,12 @@ class Deduplicator:
         result = self._check_hashes(exact_hash, normalized_hash)
         if result.is_duplicate:
             return result
+
+        # Imported lazily to break the import cycle clean.dedup ->
+        # ingest.base -> models -> classify -> generate -> clean.dedup:
+        # a module-level import re-enters ingest.base before
+        # generate_fragment_id is defined.
+        from creek.ingest.base import generate_fragment_id
 
         fragment_id = generate_fragment_id(source, timestamp, content)
         self._exact_index[exact_hash] = fragment_id
