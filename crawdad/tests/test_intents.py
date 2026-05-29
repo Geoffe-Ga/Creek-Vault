@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from crawdad.intents import (
     ACTIVATE_REGISTER_INTENT_TYPE,
+    RUN_WORKFLOW_INTENT_TYPE,
     Intent,
     PrivacyTierCeiling,
     RouterResponse,
@@ -124,17 +125,20 @@ def test_build_intents_schema_lists_each_tool() -> None:
 
 
 def test_build_intents_schema_empty_tool_list() -> None:
-    """Empty tool list still permits the client-side activate_register intent.
+    """Empty tool list still permits the client-side intents.
 
-    The FEAT-029 activate_register intent is handled locally by the
-    dispatcher — it doesn't require an MCP tool — so its type must
-    appear in the schema's ``enum`` regardless of which tools the MCP
-    server advertises.
+    The FEAT-029 activate_register and ADAPT-003 run_workflow intents
+    are handled locally by the dispatcher — they don't require an MCP
+    tool — so their types must appear in the schema's ``enum``
+    regardless of which tools the MCP server advertises.
     """
     schema = build_intents_schema([])
 
     intent_item = schema["properties"]["intents"]["items"]
-    assert intent_item["properties"]["type"]["enum"] == [ACTIVATE_REGISTER_INTENT_TYPE]
+    assert intent_item["properties"]["type"]["enum"] == [
+        ACTIVATE_REGISTER_INTENT_TYPE,
+        RUN_WORKFLOW_INTENT_TYPE,
+    ]
 
 
 def test_build_intents_schema_includes_activate_register_intent_type() -> None:
@@ -163,3 +167,31 @@ def test_activate_register_intent_type_constant_value() -> None:
     """
     assert ACTIVATE_REGISTER_INTENT_TYPE == "crawdad.activate_register"
     assert ACTIVATE_REGISTER_INTENT_TYPE.startswith("crawdad.")
+
+
+def test_build_intents_schema_includes_run_workflow_intent_type() -> None:
+    """ADAPT-003: the schema enumerates the client-side run-workflow intent."""
+    tools = [
+        ToolInfo(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    ]
+
+    schema = build_intents_schema(tools)
+
+    enum = schema["properties"]["intents"]["items"]["properties"]["type"]["enum"]
+    assert RUN_WORKFLOW_INTENT_TYPE in enum
+    assert "creek.state.read" in enum
+
+
+def test_run_workflow_intent_type_constant_value() -> None:
+    """The constant uses the ``crawdad.`` prefix, mirroring activate_register.
+
+    MCP tools are namespaced ``creek.*`` so the prefix flip makes this
+    intent visually distinct in router output and immune to a future
+    MCP tool collision.
+    """
+    assert RUN_WORKFLOW_INTENT_TYPE == "crawdad.run_workflow"
+    assert RUN_WORKFLOW_INTENT_TYPE.startswith("crawdad.")

@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from crawdad.composer import SonnetComposer
+    from crawdad.dispatcher import WorkflowDispatchRunner
     from crawdad.history import ConversationHistory
     from crawdad.mcp_client import MCPClient
     from crawdad.router import IntentRouter
@@ -129,6 +130,7 @@ class AgentLoop:
         skills: VoiceSkillStack,
         skill_registry: SkillStackRegistry | None = None,
         max_rounds: int = MAX_LOOP_ROUNDS,
+        workflow_runner: WorkflowDispatchRunner | None = None,
     ) -> None:
         """Cache injected components for the per-turn :meth:`run` call.
 
@@ -138,6 +140,11 @@ class AgentLoop:
         hands its ``activate_register`` method to the dispatcher so
         register switches persist across turns. Without it the loop
         falls back to the static ``skills`` argument.
+
+        ``workflow_runner`` (ADAPT-003) is the async callback backing
+        ``crawdad.run_workflow`` intents. When supplied, the loop hands
+        it to the dispatcher so natural-language phrasing can drive an
+        authored workflow walk. Without it those intents soft-error.
         """
         self._router = router
         self._composer = composer
@@ -148,6 +155,7 @@ class AgentLoop:
         self._skills = skills
         self._skill_registry = skill_registry
         self._max_rounds = max_rounds
+        self._workflow_runner = workflow_runner
 
     async def run(self, message: str) -> LoopOutcome:
         """Execute one user-turn loop end-to-end."""
@@ -215,6 +223,7 @@ class AgentLoop:
                 session=session,
                 known_tools=self._known_tools,
                 register_switcher=self._register_switcher(),
+                workflow_runner=self._workflow_runner,
             )
             return await dispatcher.dispatch(response)
 
@@ -303,6 +312,7 @@ async def run_one_turn(
     skills: VoiceSkillStack,
     skill_registry: SkillStackRegistry | None = None,
     max_rounds: int = MAX_LOOP_ROUNDS,
+    workflow_runner: WorkflowDispatchRunner | None = None,
 ) -> LoopOutcome:
     """Convenience wrapper the bot handler calls.
 
@@ -319,6 +329,10 @@ async def run_one_turn(
     :class:`AgentLoop`. Defaults to :data:`MAX_LOOP_ROUNDS` so callers
     that do not thread the config value preserve the pre-FEAT-036
     behaviour.
+
+    ``workflow_runner`` (ADAPT-003) — when supplied, the loop hands it
+    to the dispatcher so ``crawdad.run_workflow`` intents drive an
+    authored workflow walk instead of soft-erroring.
     """
     loop = AgentLoop(
         router=router,
@@ -330,5 +344,6 @@ async def run_one_turn(
         skills=skills,
         skill_registry=skill_registry,
         max_rounds=max_rounds,
+        workflow_runner=workflow_runner,
     )
     return await loop.run(message)

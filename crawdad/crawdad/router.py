@@ -36,6 +36,7 @@ from pydantic import ValidationError
 
 from crawdad.intents import (
     ACTIVATE_REGISTER_INTENT_TYPE,
+    RUN_WORKFLOW_INTENT_TYPE,
     RouterResponse,
     ToolInfo,
     build_intents_schema,
@@ -126,6 +127,16 @@ def build_router_prompt(
         "Use the lowercase, hyphenated register name (e.g. "
         "`confessional`, `praxis`, `analytic`). Do NOT call any MCP tool "
         "for register switches — the dispatcher handles them locally.\n\n"
+        "Workflow detection (ADAPT-003): when the user asks to run a "
+        "named, multi-step workflow — phrases like "
+        '"/draft phase-transitions", "run the substack-draft workflow", '
+        '"give me the weekly wavelength check-in" — emit a single intent '
+        f'with type "{RUN_WORKFLOW_INTENT_TYPE}" and '
+        '`args: {"name": "<workflow-name>", "inputs": {...}}` BEFORE '
+        "setting `compose: true`. Use the workflow's lowercase, hyphenated "
+        "name; put any free-text the workflow needs under `inputs`. Do NOT "
+        "call individual MCP tools to emulate a workflow — the dispatcher "
+        "drives the authored walk locally.\n\n"
         f"{phase_hint}\n\n"
         f"{wavelength_block}\n\n"
         f"{history_block}\n\n"

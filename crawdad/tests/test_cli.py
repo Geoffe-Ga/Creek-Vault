@@ -438,6 +438,54 @@ async def test_loop_runner_forwards_max_rounds_into_run_one_turn(
     assert captured["max_rounds"] == 17
 
 
+async def test_loop_runner_forwards_workflow_runner_into_run_one_turn(
+    patched_config: CrawDadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ADAPT-003: ``_build_loop_runner`` threads ``workflow_runner`` through.
+
+    The router can emit ``crawdad.run_workflow`` during a free-text
+    turn, so the loop must receive the same workflow runner closure the
+    slash-command surface uses.
+    """
+    from crawdad.loop import LoopOutcome
+    from crawdad.mcp_client import ToolDetails
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read latest.md",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(
+        config=patched_config, tool_details=details
+    )
+    captured: dict[str, Any] = {}
+
+    async def _capture(**kwargs: Any) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(kind="composed", reply="ok")
+
+    monkeypatch.setattr(cli, "run_one_turn", _capture)
+
+    async def _workflow_runner(_name: str, _inputs: dict[str, str]) -> str:
+        return "ran"
+
+    runner = cli._build_loop_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        max_rounds=5,
+        workflow_runner=_workflow_runner,
+    )
+
+    assert runner is not None
+    await runner("anything")
+    assert captured["workflow_runner"] is _workflow_runner
+
+
 def test_run_bot_wires_skill_registry_and_register_switcher(
     patched_config: CrawDadConfig,
     monkeypatch: pytest.MonkeyPatch,

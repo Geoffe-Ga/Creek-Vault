@@ -18,10 +18,14 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
-from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE, PrivacyTierCeiling
+from crawdad.intents import (
+    ACTIVATE_REGISTER_INTENT_TYPE,
+    RUN_WORKFLOW_INTENT_TYPE,
+    PrivacyTierCeiling,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from crawdad.intents import Intent, RouterResponse
     from crawdad.mcp_client import MCPSession
@@ -32,6 +36,15 @@ if TYPE_CHECKING:
     # the underlying :class:`SkillStackRegistry` and passes its
     # ``activate_register`` method down to the dispatcher.
     RegisterSwitcher = Callable[[str], bool]
+
+    # ADAPT-003: async callable that runs a named workflow end-to-end and
+    # returns the composed user-facing reply. Mirrors the slash-command
+    # ``crawdad.slash_commands.WorkflowRunner`` shape so the CLI can hand
+    # the same closure (built by ``crawdad.cli._build_workflow_runner``)
+    # to both the slash-command surface and the dispatcher. Receives the
+    # workflow ``name`` plus an ``inputs`` mapping for ``{{input.<key>}}``
+    # interpolation.
+    WorkflowDispatchRunner = Callable[[str, dict[str, str]], Awaitable[str]]
 
 _LOGGER = logging.getLogger("crawdad.dispatcher")
 
@@ -69,6 +82,7 @@ class IntentDispatcher:
         session: MCPSession,
         known_tools: Iterable[str],
         register_switcher: RegisterSwitcher | None = None,
+        workflow_runner: WorkflowDispatchRunner | None = None,
     ) -> None:
         """Cache the advertised tools so unknown intents fail fast.
 
@@ -83,10 +97,17 @@ class IntentDispatcher:
                 ``crawdad.activate_register`` intents to soft-error
                 rather than mutate the skill stack — useful in tests
                 and when the registry isn't wired (no vault layout).
+            workflow_runner: ADAPT-003 async callback that walks an
+                authored workflow by name and returns the composed
+                reply. ``None`` causes ``crawdad.run_workflow`` intents
+                to soft-error rather than crash — useful in tests and
+                when the workflow surface isn't wired (no composer /
+                no MCP tools advertised).
         """
         self._session = session
         self._known_tools = frozenset(known_tools)
         self._register_switcher = register_switcher
+        self._workflow_runner = workflow_runner
 
     async def dispatch(self, response: RouterResponse) -> list[ToolResult]:
         """Invoke each intent in order; collect the textual tool results.
@@ -107,6 +128,9 @@ class IntentDispatcher:
         for intent in response.intents:
             if intent.type == ACTIVATE_REGISTER_INTENT_TYPE:
                 results.append(self._handle_activate_register(intent))
+                continue
+            if intent.type == RUN_WORKFLOW_INTENT_TYPE:
+                results.append(await self._handle_run_workflow(intent))
                 continue
             if intent.type not in self._known_tools:
                 msg = (
@@ -156,6 +180,50 @@ class IntentDispatcher:
             body=body,
             privacy_tier_ceiling=intent.privacy_tier_ceiling,
         )
+
+    async def _handle_run_workflow(self, intent: Intent) -> ToolResult:
+        """Run the ADAPT-003 workflow walk for ``crawdad.run_workflow``.
+
+        The result body is the composer's user-facing reply (or a short
+        status line when the workflow surface is unavailable / the
+        intent is malformed). The privacy ceiling on the result mirrors
+        the intent's declared ceiling so downstream consumers see a
+        faithful echo of the router's authorisation.
+        """
+        name = intent.args.get("name")
+        if not isinstance(name, str) or not name:
+            _LOGGER.info("run_workflow intent missing 'name' arg")
+            body = "could not run workflow: no workflow name was provided"
+        elif self._workflow_runner is None:
+            _LOGGER.info("run_workflow intent for %r but no runner is wired", name)
+            body = (
+                f"workflow running is unavailable in this session; "
+                f"ignoring request to run {name!r}"
+            )
+        else:
+            inputs = _extract_workflow_inputs(intent.args.get("inputs"))
+            _LOGGER.info("running workflow %r with inputs %r", name, inputs)
+            body = await self._workflow_runner(name, inputs)
+        return ToolResult(
+            intent_type=intent.type,
+            body=body,
+            privacy_tier_ceiling=intent.privacy_tier_ceiling,
+        )
+
+
+def _extract_workflow_inputs(raw: object) -> dict[str, str]:
+    """Coerce a router-supplied ``inputs`` arg into a ``{str: str}`` mapping.
+
+    Haiku emits ``inputs`` as a free-form object; the workflow walker's
+    ``{{input.<key>}}`` interpolation only handles string values, so we
+    stringify every value and drop non-mapping payloads entirely. A
+    missing or malformed ``inputs`` arg yields an empty dict rather than
+    raising — required inputs are still enforced downstream by the
+    walker's constraint check.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
 
 
 def _build_arguments(intent: Intent) -> dict[str, object]:

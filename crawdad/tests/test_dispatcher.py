@@ -11,7 +11,12 @@ from crawdad.dispatcher import (
     ToolResult,
     UnknownIntentError,
 )
-from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE, Intent, RouterResponse
+from crawdad.intents import (
+    ACTIVATE_REGISTER_INTENT_TYPE,
+    RUN_WORKFLOW_INTENT_TYPE,
+    Intent,
+    RouterResponse,
+)
 from crawdad.mcp_client import MCPUnavailableError
 
 
@@ -263,3 +268,204 @@ async def test_dispatcher_intent_ceiling_overrides_conflicting_args() -> None:
     )
 
     assert session.calls[0][1]["privacy_tier_ceiling"] == "personal"
+
+
+async def test_dispatcher_routes_run_workflow_to_runner() -> None:
+    """ADAPT-003: ``run_workflow`` intents bypass MCP and call the runner.
+
+    The dispatcher hands the requested workflow name + inputs to the
+    injected ``workflow_runner`` callable and emits a
+    :class:`ToolResult` carrying the composed reply. No MCP call is
+    made.
+    """
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    async def _runner(name: str, inputs: dict[str, str]) -> str:
+        calls.append((name, inputs))
+        return f"ran {name}"
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=("creek.state.read",),
+        workflow_runner=_runner,
+    )
+
+    results = await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=RUN_WORKFLOW_INTENT_TYPE,
+                    args={
+                        "name": "phase-transitions",
+                        "inputs": {"topic": "spirals"},
+                    },
+                )
+            ]
+        )
+    )
+
+    assert calls == [("phase-transitions", {"topic": "spirals"})]
+    assert session.calls == []
+    assert len(results) == 1
+    assert results[0].intent_type == RUN_WORKFLOW_INTENT_TYPE
+    assert results[0].body == "ran phase-transitions"
+
+
+async def test_dispatcher_run_workflow_defaults_inputs_to_empty() -> None:
+    """A run_workflow intent without ``inputs`` runs with an empty mapping."""
+    captured: dict[str, dict[str, str]] = {}
+
+    async def _runner(name: str, inputs: dict[str, str]) -> str:
+        captured[name] = inputs
+        return "ok"
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        workflow_runner=_runner,
+    )
+
+    await dispatcher.dispatch(
+        RouterResponse(
+            intents=[Intent(type=RUN_WORKFLOW_INTENT_TYPE, args={"name": "weekly"})]
+        )
+    )
+
+    assert captured == {"weekly": {}}
+
+
+async def test_dispatcher_run_workflow_coerces_non_string_inputs() -> None:
+    """Non-string ``inputs`` values are stringified for the walker."""
+    captured: dict[str, str] = {}
+
+    async def _runner(_name: str, inputs: dict[str, str]) -> str:
+        captured.update(inputs)
+        return "ok"
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        workflow_runner=_runner,
+    )
+
+    await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=RUN_WORKFLOW_INTENT_TYPE,
+                    args={"name": "weekly", "inputs": {"count": 3}},
+                )
+            ]
+        )
+    )
+
+    assert captured == {"count": "3"}
+
+
+async def test_dispatcher_run_workflow_ignores_non_mapping_inputs() -> None:
+    """A malformed ``inputs`` arg (not an object) degrades to an empty dict."""
+    captured: dict[str, dict[str, str]] = {}
+
+    async def _runner(name: str, inputs: dict[str, str]) -> str:
+        captured[name] = inputs
+        return "ok"
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        workflow_runner=_runner,
+    )
+
+    await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=RUN_WORKFLOW_INTENT_TYPE,
+                    args={"name": "weekly", "inputs": "not-a-mapping"},
+                )
+            ]
+        )
+    )
+
+    assert captured == {"weekly": {}}
+
+
+async def test_dispatcher_run_workflow_without_runner_soft_errors() -> None:
+    """If no runner is wired the dispatcher still produces a soft result.
+
+    Without the soft-fail path a ``run_workflow`` intent emitted by
+    Haiku in a test or misconfigured runtime would crash the loop.
+    """
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(session=session, known_tools=())
+
+    results = await dispatcher.dispatch(
+        RouterResponse(
+            intents=[Intent(type=RUN_WORKFLOW_INTENT_TYPE, args={"name": "weekly"})]
+        )
+    )
+
+    assert len(results) == 1
+    assert "weekly" in results[0].body
+    assert session.calls == []
+
+
+async def test_dispatcher_run_workflow_missing_name_arg_soft_errors() -> None:
+    """A malformed run_workflow intent (no ``name`` arg) soft-errors.
+
+    Defensive: Haiku could emit the intent type without filling the
+    expected ``args["name"]`` slot. The dispatcher must not raise and
+    must not invoke the runner.
+    """
+    invoked: list[str] = []
+
+    async def _runner(name: str, _inputs: dict[str, str]) -> str:
+        invoked.append(name)
+        return "ok"
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        workflow_runner=_runner,
+    )
+
+    results = await dispatcher.dispatch(
+        RouterResponse(intents=[Intent(type=RUN_WORKFLOW_INTENT_TYPE)])
+    )
+
+    assert invoked == []
+    assert len(results) == 1
+    assert "workflow" in results[0].body.lower()
+
+
+async def test_dispatcher_run_workflow_preserves_privacy_tier_ceiling() -> None:
+    """The result echoes the intent's declared privacy tier ceiling."""
+
+    async def _runner(_name: str, _inputs: dict[str, str]) -> str:
+        return "ok"
+
+    session: Any = _FakeSession()
+    dispatcher = IntentDispatcher(
+        session=session,
+        known_tools=(),
+        workflow_runner=_runner,
+    )
+
+    results = await dispatcher.dispatch(
+        RouterResponse(
+            intents=[
+                Intent(
+                    type=RUN_WORKFLOW_INTENT_TYPE,
+                    privacy_tier_ceiling="personal",
+                    args={"name": "weekly"},
+                )
+            ]
+        )
+    )
+
+    assert results[0].privacy_tier_ceiling == "personal"

@@ -28,6 +28,15 @@ from pydantic import BaseModel, ConfigDict, Field
 # from MCP ``creek.*`` tools and immune to a future MCP-side collision.
 ACTIVATE_REGISTER_INTENT_TYPE: str = "crawdad.activate_register"
 
+# ADAPT-003: client-side intent for running an authored workflow. Like
+# ``crawdad.activate_register`` the dispatcher recognises this type
+# *before* the MCP known-tools check and routes it to the workflow
+# walker (:func:`crawdad.workflows.run_workflow_and_compose`) instead of
+# an MCP tool call. The ``crawdad.`` namespace prefix keeps it visually
+# distinct from MCP ``creek.*`` tools and immune to a future MCP-side
+# collision.
+RUN_WORKFLOW_INTENT_TYPE: str = "crawdad.run_workflow"
+
 
 class PrivacyTierCeiling(StrEnum):
     """Per-intent privacy tier ceiling.
@@ -91,7 +100,11 @@ def build_intents_schema(tools: list[ToolInfo]) -> dict[str, Any]:
         verbatim and that a downstream JSON parser can validate against.
     """
     tool_names = [tool.name for tool in tools]
-    allowed_types = [*tool_names, ACTIVATE_REGISTER_INTENT_TYPE]
+    allowed_types = [
+        *tool_names,
+        ACTIVATE_REGISTER_INTENT_TYPE,
+        RUN_WORKFLOW_INTENT_TYPE,
+    ]
     return {
         "type": "object",
         "properties": {
@@ -104,9 +117,11 @@ def build_intents_schema(tools: list[ToolInfo]) -> dict[str, Any]:
                             "type": "string",
                             "enum": allowed_types,
                             "description": (
-                                "MCP tool name to invoke, or the client-side "
-                                f"intent {ACTIVATE_REGISTER_INTENT_TYPE!r} to "
-                                "switch the active voice register mid-session."
+                                "MCP tool name to invoke, or a client-side "
+                                f"intent: {ACTIVATE_REGISTER_INTENT_TYPE!r} to "
+                                "switch the active voice register mid-session, "
+                                f"or {RUN_WORKFLOW_INTENT_TYPE!r} to run an "
+                                "authored workflow by name."
                             ),
                         },
                         "privacy_tier_ceiling": {
