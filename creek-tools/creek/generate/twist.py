@@ -1,9 +1,9 @@
-"""Ontology-twist composition for ``creek draft`` (issue #352).
+"""Ontology-twist composition for ``creek draft``.
 
 The default composition path retrieves source material per-dimension
-(issue #351) and asks the LLM to weave it. That is enough when the
-operator wants a faithful synthesis of their own voice, but the epic
-goal (#349) is **"your ideas with a twist"** — drafts whose conceptual
+and asks the LLM to weave it. That is enough when the operator wants a
+faithful synthesis of their own voice, but the goal here is **"your
+ideas with a twist"** — drafts whose conceptual
 content comes from the user's vault but whose voice signatures (phase,
 mode, frequency, dosage, register) honour a *target* combination the
 operator has asked for.
@@ -163,7 +163,7 @@ def source_profile_from_fragments(
 
     Args:
         fragments: The retrieved source fragments. Typically the union
-            of the per-dimension slices from issue #351.
+            of the per-dimension corpus slices.
 
     Returns:
         A frozen :class:`OntologyProfile` reflecting the corpus's

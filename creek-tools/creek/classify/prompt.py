@@ -1,4 +1,4 @@
-"""Prompt-level ontology detection (issue #350).
+"""Prompt-level ontology detection.
 
 The fragment classifier in :mod:`creek.classify` answers
 *what ontology dimensions does this **fragment** sit on?* Each
@@ -227,8 +227,8 @@ Placeholders:
 
 The Frequency / Colour / Frequency→Colour blocks are pulled directly
 from :mod:`creek.classify.llm.prompts` to honour the
-single-source-of-truth principle (issue #350 acceptance criterion).
-Re-naming a frequency or re-mapping a colour in the canonical prompt
+single-source-of-truth principle. Re-naming a frequency or re-mapping a
+colour in the canonical prompt
 reaches this template automatically.
 """
 
