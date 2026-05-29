@@ -198,6 +198,19 @@ class TestDraftConfig:
         assert cfg.derivative_upper == pytest.approx(0.9)
         assert cfg.grounding_lower == pytest.approx(0.5)
 
+    def test_max_tokens_defaults_to_none(self) -> None:
+        """``max_tokens`` defaults to None so the provider default is kept."""
+        assert DraftConfig().max_tokens is None
+
+    def test_max_tokens_must_be_positive(self) -> None:
+        """A non-positive ``max_tokens`` is rejected at config-parse time."""
+        with pytest.raises(ValueError, match="max_tokens"):
+            DraftConfig(max_tokens=0)
+
+    def test_max_tokens_can_be_set(self) -> None:
+        """Operators may pin a default token ceiling for longer drafts."""
+        assert DraftConfig(max_tokens=4096).max_tokens == 4096
+
     def test_creekconfig_exposes_draft_section(self) -> None:
         """The top-level ``draft:`` section must hang off ``CreekConfig``."""
         from creek.config import CreekConfig

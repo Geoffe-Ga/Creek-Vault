@@ -27,6 +27,7 @@ from creek.classify.llm.parsing import (
 from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
     ANTHROPIC_CLOUD_WARNING,
+    AnthropicCompletion,
     AnthropicProvider,
     call_ollama,
     check_ollama_available,
@@ -185,6 +186,40 @@ class LLMClassifier:
             Raw response text from the provider.
         """
         return self._invoke_llm(prompt)
+
+    def invoke_prompt_with_metadata(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+    ) -> AnthropicCompletion:
+        """Dispatch a prompt and return its text plus stop reason.
+
+        The draft pipeline routes through this method so it can detect a
+        ``max_tokens`` truncation and warn the operator instead of saving
+        a silently cut-off essay. The classification path keeps calling
+        :meth:`invoke_prompt`, which discards the stop reason.
+
+        Ollama does not expose a stop reason, so its responses default to
+        ``"end_turn"``; only the Anthropic provider can report
+        ``"max_tokens"``.
+
+        Args:
+            prompt: The fully-formatted prompt.
+            max_tokens: Maximum tokens to request from the Anthropic
+                provider. ``None`` keeps the provider's default ceiling.
+                Ignored by the Ollama path.
+
+        Returns:
+            An :class:`AnthropicCompletion` with the response text and the
+            stop reason.
+        """
+        if self.config.provider == self.ANTHROPIC_PROVIDER:
+            return self._get_anthropic_provider().call_with_metadata(
+                prompt,
+                max_tokens=max_tokens,
+            )
+        return AnthropicCompletion(text=self._call_ollama(prompt))
 
     def _build_prompt(
         self,

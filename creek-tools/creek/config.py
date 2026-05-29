@@ -712,10 +712,11 @@ class MiningConfig(BaseModel):
 
 
 class DraftConfig(BaseModel):
-    """Configuration for the ``creek draft`` grounding guard (issue #355).
+    """Configuration for the ``creek draft`` command.
 
-    The bidirectional grounding guard surfaces two failure modes after a
-    draft is generated:
+    Carries the bidirectional grounding-guard thresholds and the default
+    LLM ``max_tokens`` ceiling. The grounding guard surfaces two failure
+    modes after a draft is generated:
 
     * **Too derivative** — at least one draft paragraph paraphrases a
       source-fragment paragraph closely (cosine similarity above
@@ -740,6 +741,15 @@ class DraftConfig(BaseModel):
     *some* source paragraph to count as grounded. Doubles as the
     minimum acceptable fraction of grounded paragraphs: drafts whose
     grounded fraction sits below this value are flagged ``too ungrounded``."""
+
+    max_tokens: int | None = Field(default=None, gt=0)
+    """Default ``max_tokens`` ceiling for the draft LLM call.
+
+    ``None`` keeps the provider's built-in default (1024 for the
+    Anthropic provider). Operators who routinely want longer essays set
+    this so they don't have to pass ``--max-tokens`` on every run; the
+    CLI flag overrides it per invocation. A draft cut off at this ceiling
+    is flagged ``truncated`` in frontmatter and warned about on stderr."""
 
 
 class LintConfig(BaseModel):

@@ -1981,25 +1981,43 @@ def _build_seed_spec(
     )
 
 
-def _build_draft_llm() -> DraftLLM:
+def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
     """Construct a :data:`DraftLLM` callable from the configured LLM provider.
 
     Uses the Ollama/Anthropic adapter already wired up for classification.
     Reads the vault-resolved config via :func:`load_config` so the helper
-    keeps a stable zero-arg signature; the ``draft`` command pre-warms
+    keeps a stable signature; the ``draft`` command pre-warms
     ``CREEK_CONFIG`` resolution by calling :func:`_load_config_for_vault`
-    upstream (issue #322).
+    upstream.
+
+    The returned callable yields a
+    :class:`~creek.generate.drafts.DraftLLMResponse` so the draft
+    generator can detect a ``max_tokens`` truncation via the provider's
+    stop reason instead of saving a silently cut-off essay.
+
+    Args:
+        max_tokens: Explicit per-invocation token ceiling (the
+            ``--max-tokens`` flag). ``None`` falls back to the loaded
+            ``draft.max_tokens`` config, then to the provider's built-in
+            default. The Ollama path ignores it.
 
     Returns:
-        A callable ``(prompt) -> response`` ready to feed to
+        A callable ``(prompt) -> DraftLLMResponse`` ready to feed to
         :class:`DraftGenerator`.
 
     Raises:
         typer.Exit: If the configured LLM provider is not reachable.
     """
     from creek.classify.llm import LLMClassifier
+    from creek.generate.drafts import DraftLLMResponse
 
     config = load_config()
+    # The explicit flag wins; otherwise honour the config default. Both
+    # the provider settings and this ceiling come from the same loaded
+    # config so they cannot diverge.
+    effective_max_tokens = (
+        max_tokens if max_tokens is not None else config.draft.max_tokens
+    )
     classifier = LLMClassifier(config.llm)
     if not classifier.available:
         console.print(
@@ -2007,7 +2025,18 @@ def _build_draft_llm() -> DraftLLM:
             "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
         )
         raise typer.Exit(code=1)
-    return classifier.invoke_prompt
+
+    def _invoke(prompt: str) -> DraftLLMResponse:
+        completion = classifier.invoke_prompt_with_metadata(
+            prompt,
+            max_tokens=effective_max_tokens,
+        )
+        return DraftLLMResponse(
+            text=completion.text,
+            stop_reason=completion.stop_reason,
+        )
+
+    return _invoke
 
 
 def _run_seeded_draft(
@@ -2021,9 +2050,10 @@ def _run_seeded_draft(
     """Run the seeded-draft pipeline and surface errors as typer exits.
 
     Extracted from :func:`draft` so the CLI command body stays under
-    the cyclomatic-complexity floor. The branches it owns are the two
-    expected error surfaces (``SeedResolutionError`` and
-    ``PluralitySourceError``) plus the happy-path save / audit.
+    the cyclomatic-complexity floor. The branches it owns are the
+    expected error surfaces (``SeedResolutionError``,
+    ``PluralitySourceError``, and a ``RuntimeError`` from an empty LLM
+    body) plus the happy-path save / audit.
     """
     from creek.generate.drafts import SeedResolutionError
     from creek.generate.twist import PluralitySourceError
@@ -2034,7 +2064,7 @@ def _run_seeded_draft(
             vault_path=vault_path,
             current_phase=current_phase,
         )
-    except (SeedResolutionError, PluralitySourceError) as exc:
+    except (SeedResolutionError, PluralitySourceError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
     _audit_privacy_override_if_needed(
@@ -2105,7 +2135,9 @@ def _run_outline_draft(
 
     Extracted from :func:`draft` so the command body stays under the
     cyclomatic-complexity floor. Owns the outline-parse error surface
-    plus the happy-path save / audit.
+    (exit 2, a malformed-input error) and the empty-LLM-body
+    ``RuntimeError`` surface (exit 1, a runtime failure), plus the
+    happy-path save / audit.
     """
     from creek.generate.outline import OutlineParseError
 
@@ -2120,6 +2152,9 @@ def _run_outline_draft(
     except OutlineParseError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     fragment_ids = [
         fid for section in outline_draft.sections for fid in section.source_fragments
     ]
@@ -2243,18 +2278,17 @@ def draft(
         False,
         "--ontology-twist",
         help=(
-            "Issue #352: enable ontology-twist composition. Computes the "
+            "Enable ontology-twist composition. Computes the "
             "delta between the retrieved source profile and the operator's "
             "target profile, names divergent dimensions in the prompt, and "
-            "forbids verbatim paraphrase. Requires >=2 source fragments. "
-            "Gated behind a flag while epic #349 is in development."
+            "forbids verbatim paraphrase. Requires >=2 source fragments."
         ),
     ),
     seed_outline: Path | None = typer.Option(
         None,
         "--seed-outline",
         help=(
-            "Issue #354: path to a markdown outline file. Each header-rooted "
+            "Path to a markdown outline file. Each header-rooted "
             "section is composed independently with its own detected ontology, "
             "then stitched together with transition-only smoothing. Mutually "
             "exclusive with --seed-outline-text."
@@ -2264,8 +2298,19 @@ def draft(
         None,
         "--seed-outline-text",
         help=(
-            "Issue #354: inline markdown outline (same per-section composition "
+            "Inline markdown outline (same per-section composition "
             "as --seed-outline). Mutually exclusive with --seed-outline."
+        ),
+    ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        min=1,
+        help=(
+            "Maximum tokens the draft LLM may generate. Raise this for longer "
+            "essays. Defaults to the vault's draft.max_tokens config (or the "
+            "provider default when unset). A draft cut off at this ceiling is "
+            "flagged truncated in frontmatter and warned about on stderr."
         ),
     ),
 ) -> None:
@@ -2285,20 +2330,24 @@ def draft(
     with the seed flags recorded in the draft's frontmatter for
     reproducibility.
 
-    Issue #352: pass ``--ontology-twist`` alongside a seed flag to
-    enable ontology-twist composition — the draft's source / target
-    ontology profiles are recorded in frontmatter, divergent dimensions
-    are named in the prompt, and the LLM is instructed to recombine
-    across the corpus rather than paraphrase any single source.
-    Requires at least two source fragments.
+    Pass ``--ontology-twist`` alongside a seed flag to enable
+    ontology-twist composition — the draft's source / target ontology
+    profiles are recorded in frontmatter, divergent dimensions are named
+    in the prompt, and the LLM is instructed to recombine across the
+    corpus rather than paraphrase any single source. Requires at least
+    two source fragments.
 
-    Issue #354: pass ``--seed-outline <file>`` or ``--seed-outline-text
-    "..."`` to compose a multi-section essay from a markdown outline.
-    Each header-rooted section is detected, retrieved, and composed
+    Pass ``--seed-outline <file>`` or ``--seed-outline-text "..."`` to
+    compose a multi-section essay from a markdown outline. Each
+    header-rooted section is detected, retrieved, and composed
     independently with its own ontology profile, then stitched together
     with a transition-only smoothing pass. Outline mode is mutually
     exclusive with the single-topic seed flags; a header-less outline is
     rejected with a clear error.
+
+    Pass ``--max-tokens`` to raise the draft LLM's output ceiling for
+    longer essays; a draft cut off at the ceiling is flagged
+    ``truncated`` in frontmatter and warned about on stderr.
     """
     from creek.generate.drafts import DraftGenerator
     from creek.generate.mining import IdeaMiner
@@ -2321,7 +2370,7 @@ def draft(
         seed_spec=seed_spec,
         ontology_twist=ontology_twist,
     )
-    llm = _build_draft_llm()
+    llm = _build_draft_llm(max_tokens)
     if bypass_compiled:
         _warn_bypass_compiled("draft")
 

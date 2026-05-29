@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
 import pytest
+import yaml
 
 from creek.generate.drafts import (
     DRAFTS_SUBDIR,
@@ -2880,3 +2882,296 @@ class TestSaveOutlineDraft:
         assert post.metadata["type"] == "draft"
         assert post.metadata["title"] == "My Essay Title"
         assert (vault / DRAFTS_SUBDIR) in path.parents
+
+
+class TestDraftTruncation:
+    """Drafts surface a ``max_tokens`` cutoff instead of truncating silently."""
+
+    def _seed_one_fragment(self, vault: Path) -> Fragment:
+        """Seed and return a single fragment for the single-topic draft path."""
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line.")
+        return fragment
+
+    def test_truncated_response_flags_draft(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A ``max_tokens`` stop reason marks the returned draft truncated."""
+        from creek.generate.drafts import DraftLLMResponse
+
+        self._seed_one_fragment(vault)
+        gen = DraftGenerator(
+            llm=lambda _p: DraftLLMResponse(
+                text="Cut off here", stop_reason="max_tokens"
+            ),
+            skills_root=skills_root,
+        )
+        seed = _build_seed()
+        draft = gen.generate_draft(seed, vault_path=vault)
+        assert draft.truncated is True
+
+    def test_clean_response_is_not_truncated(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A clean ``end_turn`` completion leaves the draft un-flagged."""
+        from creek.generate.drafts import DraftLLMResponse
+
+        self._seed_one_fragment(vault)
+        gen = DraftGenerator(
+            llm=lambda _p: DraftLLMResponse(text="All done.", stop_reason="end_turn"),
+            skills_root=skills_root,
+        )
+        draft = gen.generate_draft(_build_seed(), vault_path=vault)
+        assert draft.truncated is False
+
+    def test_plain_string_response_defaults_to_not_truncated(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A legacy ``str`` return is treated as a clean completion."""
+        self._seed_one_fragment(vault)
+        gen = DraftGenerator(llm=lambda _p: "Plain body.", skills_root=skills_root)
+        draft = gen.generate_draft(_build_seed(), vault_path=vault)
+        assert draft.truncated is False
+
+    def test_truncation_warns_on_stderr(
+        self,
+        vault: Path,
+        skills_root: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A truncated draft prints a clear warning to stderr."""
+        from creek.generate.drafts import DraftLLMResponse
+
+        self._seed_one_fragment(vault)
+        gen = DraftGenerator(
+            llm=lambda _p: DraftLLMResponse(text="Cut", stop_reason="max_tokens"),
+            skills_root=skills_root,
+        )
+        gen.generate_draft(_build_seed(), vault_path=vault)
+        captured = capsys.readouterr()
+        assert "truncated at max_tokens" in captured.err
+        assert "--max-tokens" in captured.err
+
+    def test_saved_draft_records_truncation_and_footer(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A truncated draft writes ``truncated: true`` plus a body footer."""
+        from creek.generate.drafts import DraftLLMResponse
+
+        self._seed_one_fragment(vault)
+        gen = DraftGenerator(
+            llm=lambda _p: DraftLLMResponse(text="Cut off", stop_reason="max_tokens"),
+            skills_root=skills_root,
+        )
+        draft = gen.generate_draft(_build_seed(), vault_path=vault)
+        path = gen.save_draft(draft, vault)
+        post = frontmatter.load(str(path))
+        assert post.metadata["truncated"] is True
+        assert "truncated — see frontmatter" in post.content
+
+    def test_saved_clean_draft_has_no_footer(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A clean draft records ``truncated: false`` and no footer."""
+        self._seed_one_fragment(vault)
+        gen = DraftGenerator(llm=lambda _p: "All done.", skills_root=skills_root)
+        draft = gen.generate_draft(_build_seed(), vault_path=vault)
+        path = gen.save_draft(draft, vault)
+        post = frontmatter.load(str(path))
+        assert post.metadata["truncated"] is False
+        assert "truncated — see frontmatter" not in post.content
+
+    def test_outline_draft_truncation_propagates(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A truncated stitch pass flags the whole outline draft."""
+        from creek.generate.drafts import DraftLLMResponse
+
+        outline = "## One\nFirst.\n"
+
+        def llm(prompt: str) -> DraftLLMResponse:
+            if "Stitch directive" in prompt:
+                return DraftLLMResponse(text="Stitched", stop_reason="max_tokens")
+            return DraftLLMResponse(text="section body")
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+        assert draft.truncated is True
+        path = gen.save_outline_draft(draft, vault)
+        post = frontmatter.load(str(path))
+        assert post.metadata["truncated"] is True
+        assert "truncated — see frontmatter" in post.content
+
+    def test_outline_section_truncation_propagates(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A truncated section body flags the outline draft even if stitch is clean."""
+        from creek.generate.drafts import DraftLLMResponse
+
+        outline = "## One\nFirst.\n"
+
+        def llm(prompt: str) -> DraftLLMResponse:
+            if "Stitch directive" in prompt:
+                return DraftLLMResponse(text="Stitched", stop_reason="end_turn")
+            return DraftLLMResponse(text="section body", stop_reason="max_tokens")
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+        assert draft.truncated is True
+        assert draft.sections[0].truncated is True
+
+
+class TestStitchPromptNotPersistedVerbatim:
+    """``save_outline_draft`` stores a stitch-prompt hash, not the full text."""
+
+    def test_frontmatter_size_independent_of_body_word_count(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """Frontmatter size does not grow with section-body length."""
+        outline = "## One\nFirst.\n\n## Two\nSecond.\n"
+
+        def _frontmatter_size(section_words: int) -> int:
+            body = " ".join(["word"] * section_words)
+
+            def llm(prompt: str) -> str:
+                if "Stitch directive" in prompt:
+                    return "stitched essay body"
+                return body
+
+            gen = DraftGenerator(llm=llm, skills_root=skills_root)
+            draft = gen.generate_outline_draft(
+                outline,
+                vault_path=vault,
+                detect_ontology=_empty_detector(),
+            )
+            path = gen.save_outline_draft(draft, vault)
+            post = frontmatter.load(str(path))
+            # Re-dump only the metadata so body length is excluded.
+            return len(yaml.safe_dump(post.metadata))
+
+        small = _frontmatter_size(5)
+        large = _frontmatter_size(5000)
+        assert small == large
+
+    def test_stitch_prompt_stored_as_hash(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The full stitch prompt is not persisted; only its sha256 hash is."""
+        outline = "## One\nFirst.\n"
+
+        def llm(prompt: str) -> str:
+            if "Stitch directive" in prompt:
+                return "stitched"
+            return "section body"
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        draft = gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+        path = gen.save_outline_draft(draft, vault)
+        post = frontmatter.load(str(path))
+        assert "stitch_prompt" not in post.metadata
+        digest = post.metadata["stitch_prompt_sha256"]
+        assert (
+            digest
+            == hashlib.sha256(
+                draft.stitch_prompt.encode("utf-8"),
+            ).hexdigest()
+        )
+
+
+class TestSourceProfileComputedOncePerSection:
+    """A resolved section aggregates its source profile exactly once."""
+
+    def test_source_profile_not_recomputed_under_twist(
+        self,
+        vault: Path,
+        skills_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``source_profile_from_fragments`` runs once per resolved section."""
+        import creek.generate.drafts as drafts_module
+
+        # A header-only section makes its seed text just the heading, so
+        # the per-dimension topic-substring filter has a phrase that the
+        # fragment bodies contain — the section then resolves to source
+        # material and reaches the deduplicated profile aggregation.
+        topic = "peaking inhabit"
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-A",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            f"A {topic} body about integration.",
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-B",
+                primary=Frequency.F7,
+                phase=Phase.PEAKING,
+                mode=Mode.INHABIT,
+                dosage=Dosage.MEDICINE,
+            ),
+            f"A {topic} body about empathy.",
+        )
+
+        real = drafts_module.source_profile_from_fragments
+        calls = {"n": 0}
+
+        def _counting(fragments: object) -> object:
+            calls["n"] += 1
+            return real(fragments)
+
+        monkeypatch.setattr(
+            drafts_module,
+            "source_profile_from_fragments",
+            _counting,
+        )
+
+        # One header-only section (no body) so seed_text == heading.
+        outline = "## peaking inhabit\n"
+        detector = _ontology_detector_by_phase({"peaking": Phase.PEAKING})
+        gen = DraftGenerator(
+            llm=lambda _p: "body",
+            skills_root=skills_root,
+            ontology_twist=True,
+        )
+        gen.generate_outline_draft(
+            outline,
+            vault_path=vault,
+            detect_ontology=detector,
+        )
+        assert calls["n"] == 1
