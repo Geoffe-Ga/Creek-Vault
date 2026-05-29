@@ -407,9 +407,7 @@ def _contributing_distributions(
 
     Keeps only children with a positive effective weight and at least
     one entry whose convictions sum above zero; each surviving child's
-    entries are normalised to sum to 1. Pulled out of
-    :func:`_per_dimension_jsd` so that function stays under the
-    cyclomatic-complexity gate.
+    entries are normalised to sum to 1.
 
     Args:
         per_child_entries: One tuple of weighted entries per child.
