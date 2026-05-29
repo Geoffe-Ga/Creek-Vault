@@ -942,6 +942,9 @@ class TestClassify:
         result = classifier.classify(frag)
         assert result.frequency.primary == Frequency.UNCLASSIFIED
         assert mock_call.call_count == 2
+        # One sleep between the two attempts; none after the final failure.
+        # Guards the `time.sleep(self.RETRY_DELAY)` backoff against removal.
+        assert mock_sleep.call_count == classifier.MAX_RETRIES - 1
 
     @patch.object(LLMClassifier, "_call_ollama")
     def test_logs_warning_when_unavailable(
@@ -1012,6 +1015,9 @@ class TestClassify:
         # Final WARN/ERROR line names "retries exhausted" so the operator
         # knows to investigate transport health rather than the fragment.
         assert any("retries exhausted" in r.message.lower() for r in caplog.records)
+        # One sleep between the two attempts; none after the final failure.
+        # Guards the `time.sleep(self.RETRY_DELAY)` backoff against removal.
+        assert mock_sleep.call_count == classifier.MAX_RETRIES - 1
 
     @patch.object(LLMClassifier, "_call_ollama")
     def test_classify_preserves_id_and_title(

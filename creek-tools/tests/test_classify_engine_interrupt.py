@@ -2,20 +2,26 @@
 
 The OPS-001 progress file at
 ``<vault>/00-Creek-Meta/Processing-Log/llm-progress.jsonl`` is what
-makes resume-after-crash a reliable contract. If a SIGINT (Ctrl-C),
-SIGTERM (laptop sleep / container reclamation), or a thrown exception
-catches the engine mid-write, the resulting file must still be
-line-by-line valid JSON — half-written lines would either corrupt
-``json.loads`` on resume or silently re-classify the partially-written
-fragment.
+makes resume-after-crash a reliable contract. If a ``KeyboardInterrupt``
+(SIGINT / Ctrl-C) or any other thrown exception catches the engine
+mid-write, the resulting file must still be line-by-line valid JSON —
+half-written lines would either corrupt ``json.loads`` on resume or
+silently re-classify the partially-written fragment. These exception
+paths are what the tests below pin directly.
 
-The per-line write in ``_record_llm_progress`` opens the file in
-append mode and writes ``{id} + \\n`` as a single ``handle.write``
-call. POSIX guarantees that an O_APPEND write of < ``PIPE_BUF`` bytes
-(typically 4096) is atomic across processes, and a per-fragment JSON
-line is ~30 bytes. So the file's invariant — every non-empty line
-parses as JSON — must survive any interruption between two write
-calls. This test pins that invariant explicitly.
+SIGTERM (laptop sleep / container reclamation) is a different case:
+Python does not raise ``KeyboardInterrupt`` — or anything else — into
+the interpreter on SIGTERM by default; the process simply terminates.
+So the SIGTERM guarantee is not test-pinned. It rests instead on the
+OS-level atomicity described below: the per-line write in
+``_record_llm_progress`` opens the file in append mode and writes
+``{id} + \\n`` as a single ``handle.write`` call. POSIX guarantees
+that an O_APPEND write of < ``PIPE_BUF`` bytes (typically 4096) is
+atomic across processes, and a per-fragment JSON line is ~30 bytes.
+So the file's invariant — every non-empty line parses as JSON —
+survives a hard SIGTERM between two write calls by construction, and
+the exception-path tests below additionally pin it for interruptions
+that *do* raise into Python.
 """
 
 from __future__ import annotations
