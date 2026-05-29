@@ -1533,6 +1533,37 @@ class TestAnthropicProviderCall:
             provider.call("p2")
         assert mock_ctor.call_count == 1
 
+    def test_call_with_metadata_surfaces_stop_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """call_with_metadata returns the response text and its stop reason."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client("hello body")
+        mock_client.messages.create.return_value.stop_reason = "max_tokens"
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            completion = provider.call_with_metadata("prompt", max_tokens=2048)
+        assert completion.text == "hello body"
+        assert completion.stop_reason == "max_tokens"
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 2048
+
+    def test_call_with_metadata_defaults_stop_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A missing stop_reason defaults to end_turn and keeps MAX_TOKENS."""
+        _set_anthropic_env(monkeypatch)
+        mock_client = _make_mock_anthropic_client("body")
+        mock_client.messages.create.return_value.stop_reason = None
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            completion = provider.call_with_metadata("prompt")
+        assert completion.stop_reason == "end_turn"
+        kwargs = mock_client.messages.create.call_args.kwargs
+        assert kwargs["max_tokens"] == AnthropicProvider.MAX_TOKENS
+
 
 # ---- LLMClassifier with Anthropic provider ----
 
@@ -2553,3 +2584,45 @@ class TestUnclassifiedBias:
         assert "mode" in _BIASED_DIMENSIONS
         assert "orientation" in _BIASED_DIMENSIONS
         assert "dosage" in _BIASED_DIMENSIONS
+
+
+class TestInvokePromptWithMetadata:
+    """``LLMClassifier.invoke_prompt_with_metadata`` surfaces the stop reason."""
+
+    def test_ollama_path_defaults_to_end_turn(self) -> None:
+        """The Ollama path has no stop reason, so it defaults to end_turn."""
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        with patch.object(LLMClassifier, "_call_ollama", return_value="body text"):
+            completion = classifier.invoke_prompt_with_metadata("prompt")
+        assert completion.text == "body text"
+        assert completion.stop_reason == "end_turn"
+
+    def test_anthropic_path_threads_max_tokens(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The Anthropic path forwards max_tokens and returns the stop reason."""
+        from creek.classify.llm.providers import AnthropicCompletion
+
+        _set_anthropic_env(monkeypatch)
+        classifier = LLMClassifier(config=LLMConfig(provider="anthropic"))
+
+        class _StubProvider:
+            def call_with_metadata(
+                self,
+                prompt: str,
+                *,
+                max_tokens: int | None = None,
+            ) -> AnthropicCompletion:
+                assert max_tokens == 512
+                assert prompt == "prompt"
+                return AnthropicCompletion(text="cut", stop_reason="max_tokens")
+
+        monkeypatch.setattr(
+            classifier,
+            "_get_anthropic_provider",
+            _StubProvider,
+        )
+        completion = classifier.invoke_prompt_with_metadata("prompt", max_tokens=512)
+        assert completion.text == "cut"
+        assert completion.stop_reason == "max_tokens"

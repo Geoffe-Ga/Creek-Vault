@@ -1897,7 +1897,9 @@ def test_draft_command_no_seeds(
     """Test that draft on an empty vault reports no seeds and exits 0."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     vault.mkdir()
     result = runner.invoke(app, ["draft", "--vault", str(vault)])
@@ -1933,7 +1935,7 @@ def test_draft_command_happy_path(
     monkeypatch.setattr(
         cli_module,
         "_build_draft_llm",
-        lambda: lambda _p: "Generated draft body.",
+        lambda *_a, **_k: lambda _p: "Generated draft body.",
     )
 
     def _stub_mine_all(
@@ -2182,7 +2184,9 @@ def test_draft_seed_empty_topic_falls_back_to_mining(
     """``--seed-topic ''`` is a no-op; mining behaviour is preserved."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2225,7 +2229,7 @@ def _stub_outline_detector(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_module,
         "_build_draft_llm",
-        lambda: lambda _p: "Stitched body.",
+        lambda *_a, **_k: lambda _p: "Stitched body.",
     )
     monkeypatch.setattr(
         cli_module,
@@ -2305,7 +2309,9 @@ def test_draft_seed_outline_mutually_exclusive_inline_and_file(
     """Passing both --seed-outline and --seed-outline-text exits 2."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     outline_file = tmp_path / "outline.md"
@@ -2333,7 +2339,9 @@ def test_draft_seed_outline_mutually_exclusive_with_topic(
     """Combining outline mode with --seed-topic exits 2."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2359,7 +2367,9 @@ def test_draft_seed_outline_file_read_error_exits_two(
     """A missing outline file exits 2 with a read error."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2383,7 +2393,9 @@ def test_draft_seed_fragment_mutually_exclusive_with_topic(
     """``--seed-fragment`` plus ``--seed-topic`` exits 2 with a clear message."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2409,7 +2421,9 @@ def test_draft_seed_fragment_mutually_exclusive_with_frequency(
     """``--seed-fragment`` plus ``--seed-frequency`` exits 2."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2435,7 +2449,9 @@ def test_draft_seed_invalid_frequency_lists_options(
     """An unknown ``--seed-frequency`` exits 2 and lists valid codes + labels."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2461,7 +2477,9 @@ def test_draft_seed_invalid_phase_lists_options(
     """An unknown ``--seed-phase`` exits 2 with the valid phases listed."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2485,7 +2503,9 @@ def test_draft_seed_invalid_mode_lists_options(
     """An unknown ``--seed-mode`` exits 2 with the valid stances listed."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2514,7 +2534,7 @@ def test_draft_seed_fragment_happy_path(
     monkeypatch.setattr(
         cli_module,
         "_build_draft_llm",
-        lambda: lambda _p: "Body composed from frag-keep.",
+        lambda *_a, **_k: lambda _p: "Body composed from frag-keep.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2543,7 +2563,9 @@ def test_draft_seed_unknown_fragment_errors_cleanly(
     """An unknown ``--seed-fragment`` exits 1 with an honest message."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2572,7 +2594,7 @@ def test_draft_seed_dimensional_filters_combine(
     monkeypatch.setattr(
         cli_module,
         "_build_draft_llm",
-        lambda: lambda _p: "Composed from the per-dimension blend.",
+        lambda *_a, **_k: lambda _p: "Composed from the per-dimension blend.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2635,7 +2657,9 @@ def test_draft_seed_zero_match_exits_with_honest_message(
     """
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     _write_seed_fragment(vault, frag_id="frag-A", primary="F1")
@@ -2663,7 +2687,9 @@ def test_draft_seed_topic_with_frequency_filters_candidates(
 
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "Draft.")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "Draft."
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     _write_seed_fragment(
@@ -2710,7 +2736,9 @@ def test_draft_without_seed_flags_keeps_mining_behaviour(
     """Default behaviour is unchanged when no seed flags are passed."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(app, ["draft", "--vault", str(vault)])
@@ -2736,7 +2764,9 @@ def test_draft_ontology_twist_without_seed_exits_with_clear_message(
     """``--ontology-twist`` alone (no seed) exits 2 with a clear hint."""
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     result = runner.invoke(
@@ -2758,7 +2788,9 @@ def test_draft_ontology_twist_plurality_failure_exits_cleanly(
     """
     from creek import cli as cli_module
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", lambda: lambda _p: "body")
+    monkeypatch.setattr(
+        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+    )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
     _write_seed_fragment(vault, frag_id="frag-only", primary="F1", phase="peaking")
@@ -2797,7 +2829,7 @@ def test_draft_ontology_twist_happy_path_writes_twist_frontmatter(
     monkeypatch.setattr(
         cli_module,
         "_build_draft_llm",
-        lambda: lambda _p: "Twisted draft body.",
+        lambda *_a, **_k: lambda _p: "Twisted draft body.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2834,3 +2866,161 @@ def test_draft_ontology_twist_happy_path_writes_twist_frontmatter(
     assert post.metadata["target_profile"]["mode"] == "express"
     # Only mode diverges between source and target.
     assert post.metadata["twist_dimensions"] == ["mode"]
+
+
+def test_draft_max_tokens_flag_advertised_in_help() -> None:
+    """``creek draft --help`` documents the --max-tokens flag."""
+    result = runner.invoke(app, ["draft", "--help"])
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 0
+    assert "--max-tokens" in output
+
+
+def test_draft_seed_empty_body_exits_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seeded draft whose LLM returns an empty body exits 1 (no traceback)."""
+    from creek import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda *_a, **_k: lambda _p: "   ",
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    _write_seed_fragment(vault, frag_id="frag-X", title="Topic seed", body="seedable")
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-topic", "seedable"],
+    )
+    assert result.exit_code == 1, result.output
+    assert "empty" in _strip_ansi(result.output).lower()
+
+
+def test_draft_outline_empty_section_body_exits_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outline section with an empty LLM body exits 1 with a readable message."""
+    from creek import cli as cli_module
+    from creek.classify.prompt import PromptOntology
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda *_a, **_k: lambda _p: "   ",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_ontology_detector",
+        lambda _vault: lambda prompt: PromptOntology(prompt=prompt),
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        [
+            "draft",
+            "--vault",
+            str(vault),
+            "--seed-outline-text",
+            "## One\nFirst.\n",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    output = _strip_ansi(result.output).lower()
+    assert "empty" in output
+    assert "traceback" not in output
+
+
+def test_draft_max_tokens_threaded_to_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--max-tokens`` is forwarded to the draft-LLM factory."""
+    from creek import cli as cli_module
+    from creek.generate.drafts import DraftLLMResponse
+
+    captured: dict[str, object] = {}
+
+    def _fake_builder(max_tokens: int | None = None) -> object:
+        captured["max_tokens"] = max_tokens
+        return lambda _p: DraftLLMResponse(text="Generated draft body.")
+
+    monkeypatch.setattr(cli_module, "_build_draft_llm", _fake_builder)
+
+    def _stub_mine_all(
+        _self: object,
+        _vault: object,
+        *,
+        current_phase: object,
+    ) -> list[object]:
+        del current_phase
+        from creek.generate.mining import IdeaSeed, MiningStrategy
+
+        return [
+            IdeaSeed(
+                strategy=MiningStrategy.RESONANCE_CHAIN,
+                title="An idea",
+                source_fragments=(),
+                threads=(),
+                eddies=(),
+                frequency_affinity=(),
+                brief_description="A draftable idea.",
+                score=0.5,
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "creek.generate.mining.IdeaMiner.mine_all",
+        _stub_mine_all,
+    )
+    vault = tmp_path / "vault"
+    _seed_test_vault(vault)
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--max-tokens", "4096"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["max_tokens"] == 4096
+
+
+def test_build_draft_llm_falls_back_to_config_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no flag, _build_draft_llm uses the loaded config's draft.max_tokens."""
+    from creek import cli as cli_module
+    from creek.classify.llm.providers import AnthropicCompletion
+    from creek.config import CreekConfig, DraftConfig
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_a, **_k: CreekConfig(draft=DraftConfig(max_tokens=2048)),
+    )
+
+    class _Classifier:
+        available = True
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def invoke_prompt_with_metadata(
+            self,
+            prompt: str,
+            *,
+            max_tokens: int | None = None,
+        ) -> AnthropicCompletion:
+            captured["max_tokens"] = max_tokens
+            del prompt
+            return AnthropicCompletion(text="body")
+
+    monkeypatch.setattr("creek.classify.llm.LLMClassifier", _Classifier)
+
+    llm = cli_module._build_draft_llm()
+    llm("a prompt")
+    assert captured["max_tokens"] == 2048

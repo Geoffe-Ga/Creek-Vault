@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import httpx
@@ -27,6 +28,24 @@ if TYPE_CHECKING:
     from creek.config import LLMConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AnthropicCompletion:
+    """An Anthropic completion paired with its stop reason.
+
+    The classification path discards the stop reason; the draft path
+    needs it so a ``max_tokens`` ceiling can be surfaced instead of
+    truncating the essay mid-sentence without warning.
+
+    Attributes:
+        text: The concatenated textual content of the response.
+        stop_reason: The reason the model stopped generating. ``"end_turn"``
+            on a clean completion; ``"max_tokens"`` when the ceiling was hit.
+    """
+
+    text: str
+    stop_reason: str = "end_turn"
 
 
 ANTHROPIC_CLOUD_WARNING: str = (
@@ -138,18 +157,53 @@ class AnthropicProvider:
                 original exception is re-raised as ``RuntimeError`` with
                 its type name to avoid leaking sensitive request state.
         """
+        return self.call_with_metadata(prompt).text
+
+    def call_with_metadata(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+    ) -> AnthropicCompletion:
+        """Send a prompt and return its text alongside the stop reason.
+
+        The draft pipeline needs the ``stop_reason`` so it can detect a
+        ``max_tokens`` truncation; the classification path discards it by
+        calling :meth:`call` instead.
+
+        Args:
+            prompt: The fully-formatted prompt.
+            max_tokens: Maximum tokens to request. ``None`` (the default)
+                keeps the historical :attr:`MAX_TOKENS` ceiling so the
+                classification path is unchanged.
+
+        Returns:
+            An :class:`AnthropicCompletion` carrying the concatenated text
+            and the response ``stop_reason`` (``"end_turn"`` when the SDK
+            omits one).
+
+        Raises:
+            RuntimeError: If the SDK raises any ``AnthropicError``; the
+                original exception is re-raised as ``RuntimeError`` with
+                its type name to avoid leaking sensitive request state.
+        """
         import anthropic
 
+        ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=self.MAX_TOKENS,
+                max_tokens=ceiling,
                 messages=[{"role": "user", "content": prompt}],
             )
         except anthropic.AnthropicError as exc:
             msg = f"Anthropic API call failed: {type(exc).__name__}"
             raise RuntimeError(msg) from None
-        return _extract_anthropic_text(response)
+        stop_reason = getattr(response, "stop_reason", None) or "end_turn"
+        return AnthropicCompletion(
+            text=_extract_anthropic_text(response),
+            stop_reason=str(stop_reason),
+        )
 
 
 def _extract_anthropic_text(response: object) -> str:
