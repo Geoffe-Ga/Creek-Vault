@@ -56,7 +56,8 @@ Semantic (run when `--since` or an explicit `--check` is passed):
 
 - `paradox` — contradictions routed to `10-Liminal/Paradoxes/`.
 - `synchronicity` — surprising cross-source resonances already on disk.
-- `unnamed` — fragments sitting in `10-Liminal/Unnamed/`.
+- `unnamed` — fragments whose primary frequency is `unclassified`,
+  wherever they live, plus anything physically under `10-Liminal/Unnamed/`.
 
 ## Output
 

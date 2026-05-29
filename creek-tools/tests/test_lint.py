@@ -90,6 +90,7 @@ def _write_fragment(
     tags: list[str] | None = None,
     created: datetime | None = None,
     links: list[str] | None = None,
+    primary_frequency: str = "F1",
 ) -> Path:
     """Write a minimal fragment markdown file with optional wiki-links."""
     when = created or datetime(2026, 5, 1, tzinfo=UTC)
@@ -100,7 +101,7 @@ def _write_fragment(
         "created": when.isoformat(),
         "ingested": when.isoformat(),
         "source": {"platform": "journal", "author": "self"},
-        "frequency": {"primary": "F1", "secondary": []},
+        "frequency": {"primary": primary_frequency, "secondary": []},
         "tags": tags or [],
     }
     link_text = "\n".join(f"[[{target}]]" for target in (links or []))
@@ -436,18 +437,40 @@ class TestSemanticWrappers:
         result = paradox_check.run(tmp_path)
         assert len(result.findings) == 1
 
-    def test_unnamed_reports_zero_when_folder_missing(self, tmp_path: Path) -> None:
-        """Vault without an Unnamed folder reports zero, not an error."""
-        # Note: not calling _seed_vault — the Unnamed folder is absent.
+    def test_unnamed_reports_zero_for_empty_vault(self, tmp_path: Path) -> None:
+        """A vault with no unclassified fragments reports zero, not an error."""
+        # Note: not calling _seed_vault — nothing to surface.
         result = unnamed_check.run(tmp_path)
         assert result.findings == []
-        assert "no Unnamed folder" in result.summary
+        assert "0 fragment(s)" in result.summary
+
+    def test_unnamed_surfaces_unclassified_fragment_in_fragments_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An ``unclassified`` fragment under ``01-Fragments/`` is surfaced."""
+        _seed_vault(tmp_path)
+        _write_fragment(tmp_path, frag_id="51b", primary_frequency="unclassified")
+        result = unnamed_check.run(tmp_path)
+        assert any("51b" in line for line in result.findings)
+        assert "1 fragment(s)" in result.summary
+
+    def test_unnamed_ignores_classified_fragments(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A fragment with a real frequency is not surfaced as unnamed."""
+        _seed_vault(tmp_path)
+        _write_fragment(tmp_path, frag_id="named", primary_frequency="F1")
+        result = unnamed_check.run(tmp_path)
+        assert not any("named" in line for line in result.findings)
+        assert "0 fragment(s)" in result.summary
 
     def test_unnamed_counts_fragments_in_unnamed_folder(
         self,
         tmp_path: Path,
     ) -> None:
-        """Unnamed wrapper finds real fragments under ``10-Liminal/Unnamed``."""
+        """Files physically under ``10-Liminal/Unnamed`` are still surfaced."""
         _seed_vault(tmp_path)
         (tmp_path / "10-Liminal" / "Unnamed" / "lonely.md").write_text(
             "---\nid: lonely\n---\nbody",
@@ -461,6 +484,31 @@ class TestSemanticWrappers:
         result = unnamed_check.run(tmp_path)
         assert any("lonely" in line for line in result.findings)
         assert not any("Digests" in line for line in result.findings)
+
+    def test_unnamed_deduplicates_unclassified_fragment_in_unnamed_folder(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An unclassified fragment living in Unnamed is reported once."""
+        _seed_vault(tmp_path)
+        unnamed_dir = tmp_path / "10-Liminal" / "Unnamed"
+        meta = {
+            "type": "fragment",
+            "id": "drifting",
+            "title": "A note",
+            "created": "2026-05-01T00:00:00+00:00",
+            "ingested": "2026-05-01T00:00:00+00:00",
+            "source": {"platform": "journal", "author": "self"},
+            "frequency": {"primary": "unclassified", "secondary": []},
+            "tags": [],
+        }
+        (unnamed_dir / "drifting.md").write_text(
+            frontmatter.dumps(frontmatter.Post(content="body", **meta)),
+            encoding="utf-8",
+        )
+        result = unnamed_check.run(tmp_path)
+        assert sum("drifting" in line for line in result.findings) == 1
+        assert "1 fragment(s)" in result.summary
 
     def test_synchronicity_reads_recorded_notes(self, tmp_path: Path) -> None:
         """Synchronicity wrapper surfaces notes already on disk."""
