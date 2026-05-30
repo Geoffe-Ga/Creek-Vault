@@ -72,6 +72,7 @@ creek clean report --vault ~/Obsidian/Creek-Vault
 2. **Records an audit entry** by appending one JSONL line to `<vault>/00-Creek-Meta/audit/purge.jsonl` with the criteria, the affected fragment IDs, and the operator. The file is hash-chained — see [Audit trail](#audit-trail) for the integrity guarantees.
 3. **Scrubs every reference** — wiki-links pointing at the deleted fragment(s) are removed from every other `.md` file in the vault (matched by title), and every word-boundary mention of the deleted fragment ID is replaced with the `[purged]` placeholder across YAML frontmatter (e.g. `source_fragments: […]` in drafts and mining ideas) and body text. The walk covers all `.md` files in the vault, including `04-Praxis/`, `05-Wavelength/`, `06-Frequencies/`, `07-Voice/Drafts/`, `08-Decisions/`, `09-Reference/`, `10-Liminal/`, and `00-Creek-Meta/Skills/` (deployed skill tree) — treat this list as illustrative, not exhaustive, when doing a post-purge audit. The compliance audit log itself (`00-Creek-Meta/audit/purge.jsonl`) is JSONL, not Markdown, and is intentionally excluded — `affected_fragments` in audit entries keeps the real ID for forensic reconstruction (GAP-004).
 4. **Removes embeddings** from `<vault>/00-Creek-Meta/embeddings.parquet` (GAP-001). Per-fragment / per-source / per-date-range purges drop matching rows; `creek purge vault` deletes the file outright.
+5. **Sweeps the intimate-body stub** (GAP-012). `creek save` of an `intimate`-tier answer writes a title-only note and routes the full body to a stub under `10-Liminal/Compost/intimate-stubs/`, recording the link in the note's `saved_from.intimate_body_pointer`. Whenever a scoped purge (`fragment` / `source` / `daterange`) deletes a note carrying that pointer, it now follows the pointer and deletes the stub too, so the full intimate body does not survive the request. The pointer is resolved relative to the vault root; a missing/empty pointer, an already-deleted stub, or a pointer that resolves outside the vault are all tolerated as no-ops. The count of stubs removed is reported in the audit `outcome` entry as `intimate_stubs_removed`. (`creek purge vault` already removes the stub by wiping all of `10-Liminal/`.)
 
 ### `creek purge fragment`
 
@@ -224,6 +225,13 @@ The outcome line's `embeddings_removed` is the real number of rows dropped from
   reports `embeddings_removed: 0` even though `fragments_deleted: 1`.
 - For `creek purge vault`, this counts every row that was in the
   cache file the engine just deleted outright.
+
+The outcome line also carries `intimate_stubs_removed` (GAP-012): the
+number of intimate-body stub files under
+`10-Liminal/Compost/intimate-stubs/` that the engine deleted because a
+purged note pointed at them via `saved_from.intimate_body_pointer`.
+Zero for notes that carry no pointer; a dry-run reports what *would* be
+removed without touching disk.
 
 `creek redact --apply` writes alongside it at `<vault>/00-Creek-Meta/audit/redact.jsonl`. Privacy-tier overrides (e.g. `creek mine --include-tier intimate`) write to `<vault>/00-Creek-Meta/audit/privacy.jsonl`. Operational provenance from ingestion stays at `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl` (separate location: not compliance-grade, allowed to be lossy).
 

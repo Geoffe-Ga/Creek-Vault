@@ -2869,6 +2869,10 @@ def _render_purge_result(result: PurgeResult) -> None:
         console.print(
             f"Classifications reset: {result.classifications_reset}",
         )
+    if result.intimate_stubs_removed:
+        console.print(
+            f"Intimate stubs removed: {result.intimate_stubs_removed}",
+        )
 
     if result.deleted_files:
         table = Table(title="Deleted files")
@@ -2932,6 +2936,9 @@ def purge_fragment(
     mentions of the fragment ID replaced with ``[purged]`` across
     01-Fragments through 10-Liminal and the deployed Skills tree.
     Embedding-cache rows for the fragment are also dropped (GAP-001).
+    If the note carries a ``saved_from.intimate_body_pointer``, the
+    pointed-to intimate-body stub under
+    ``10-Liminal/Compost/intimate-stubs/`` is deleted too (GAP-012).
     """
     engine = _build_engine(vault, dry_run=dry_run)
     if not dry_run and not _confirm(
@@ -3002,7 +3009,9 @@ def purge_source(
     The two are mutually exclusive; pass exactly one. Reference
     scrubbing (GAP-004) runs for every matched fragment: wiki-links
     by title plus word-boundary ID mentions replaced with
-    ``[purged]`` across the whole vault.
+    ``[purged]`` across the whole vault. Any matched note carrying a
+    ``saved_from.intimate_body_pointer`` also has its intimate-body
+    stub under ``10-Liminal/Compost/intimate-stubs/`` deleted (GAP-012).
     """
     if (source_type is None) == (source_path is None):
         console.print(
@@ -3090,7 +3099,12 @@ def purge_daterange(
         help="Skip interactive confirmation",
     ),
 ) -> None:
-    """Delete fragments created within a date range."""
+    """Delete fragments created within a date range.
+
+    Any deleted note carrying a ``saved_from.intimate_body_pointer``
+    also has its intimate-body stub under
+    ``10-Liminal/Compost/intimate-stubs/`` deleted (GAP-012).
+    """
     from datetime import date as _date
 
     try:

@@ -83,6 +83,12 @@ class PurgeAuditEntry(BaseModel):
             Counts YAML provenance lists (e.g. ``source_fragments`` in
             drafts) plus body-text mentions of the ID. Wiki-link
             removals stay on ``references_scrubbed``.
+        intimate_stubs_removed: Number of intimate-body stub files
+            deleted under ``10-Liminal/Compost/intimate-stubs/`` because
+            a purged note pointed at them via
+            ``saved_from.intimate_body_pointer`` (GAP-012). Zero for
+            notes that carry no pointer, dry-runs count what *would* be
+            removed, and an already-missing stub does not increment it.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before
@@ -112,6 +118,7 @@ class PurgeAuditEntry(BaseModel):
     references_scrubbed: int = 0
     embeddings_removed: int = 0
     provenance_scrubbed: int = 0
+    intimate_stubs_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
@@ -144,6 +151,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("references_scrubbed", 0)
     upgraded.setdefault("embeddings_removed", 0)
     upgraded.setdefault("provenance_scrubbed", 0)
+    upgraded.setdefault("intimate_stubs_removed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
     # absent, so we leave them out here rather than fabricating a
     # phase / operation_id that doesn't correspond to anything on disk.
@@ -311,6 +319,7 @@ class PurgeAuditLog:
             "references_scrubbed": 0,
             "embeddings_removed": 0,
             "provenance_scrubbed": 0,
+            "intimate_stubs_removed": 0,
             "operator": "system",
             "dry_run": False,
             "migrated_entries": migrated_count,
