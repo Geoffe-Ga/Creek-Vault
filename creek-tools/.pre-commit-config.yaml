@@ -32,7 +32,7 @@ repos:
     - --branch
     - main
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.2.0
+  rev: v0.15.13
   hooks:
   - id: ruff
     args:
@@ -61,7 +61,7 @@ repos:
     args:
     - --strict
 - repo: https://github.com/PyCQA/bandit
-  rev: 1.7.7
+  rev: 1.9.4
   hooks:
   - id: bandit
     args:
@@ -96,7 +96,7 @@ repos:
     - --remove-duplicate-keys
     - --ignore-init-module-imports
 - repo: https://github.com/guilatrova/tryceratops
-  rev: v2.3.2
+  rev: v2.4.1
   hooks:
   - id: tryceratops
 - repo: https://github.com/dosisod/refurb
