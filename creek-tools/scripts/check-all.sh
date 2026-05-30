@@ -7,6 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# shellcheck source=scripts/_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
 VERBOSE=false
 
 # Parse command line arguments
@@ -65,6 +68,11 @@ EOF
 done
 
 cd "$PROJECT_ROOT"
+
+# Fail fast (before churning through every gate) with an actionable message
+# if the Python toolchain is missing. The whole toolchain lives in the same
+# environment, so the pytest import probe is a sufficient proxy for it.
+creek_require_python_toolchain || exit 2
 
 # Set verbosity
 VERBOSE_FLAG=""
