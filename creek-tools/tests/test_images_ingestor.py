@@ -222,6 +222,19 @@ def _write_image(path: Path) -> None:
     path.write_bytes(b"\x89PNG\r\n\x1a\n")
 
 
+def _write_real_png(path: Path) -> None:
+    """Write a genuine 1x1 PNG that ``PIL.Image.open`` can decode.
+
+    The :func:`_write_image` placeholder only carries the PNG signature
+    and cannot be opened; tests that exercise the real
+    :class:`PytesseractOcrEngine` OCR path (mocking only the
+    ``image_to_*`` calls, not ``Image.open``) need a decodable file.
+    """
+    from PIL import Image
+
+    Image.new("RGB", (1, 1), color=(255, 255, 255)).save(path, format="PNG")
+
+
 class TestParseAndIngest:
     """Parse runs OCR and produces a ParsedFragment with body + metadata."""
 
@@ -655,6 +668,121 @@ class TestPytesseractOcrEngine:
         engine = PytesseractOcrEngine()
         with pytest.raises(PytesseractUnavailableError):
             engine.extract_pdf_pages(pdf_path)
+
+    def test_is_available_returns_false_when_binary_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """pytesseract present but tesseract binary absent → unavailable (GAP-015)."""
+        import shutil as shutil_module
+
+        import pytesseract
+
+        monkeypatch.setattr(shutil_module, "which", lambda _cmd: None)
+
+        def _raise_version() -> object:
+            raise pytesseract.TesseractNotFoundError
+
+        monkeypatch.setattr(pytesseract, "get_tesseract_version", _raise_version)
+        engine = PytesseractOcrEngine()
+        assert not engine.is_available()
+
+    def test_is_available_true_when_binary_on_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When shutil.which resolves the configured binary, the engine is available."""
+        import shutil as shutil_module
+
+        monkeypatch.setattr(shutil_module, "which", lambda _cmd: "/usr/bin/tesseract")
+        engine = PytesseractOcrEngine()
+        assert engine.is_available()
+
+    def test_is_available_true_when_version_probe_succeeds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``which`` misses but ``get_tesseract_version`` succeeds, stay available.
+
+        Covers a configured absolute ``tesseract_cmd`` that ``shutil.which``
+        cannot resolve but pytesseract can still execute.
+        """
+        import shutil as shutil_module
+
+        import pytesseract
+
+        monkeypatch.setattr(shutil_module, "which", lambda _cmd: None)
+        monkeypatch.setattr(pytesseract, "get_tesseract_version", lambda: "5.3.0")
+        engine = PytesseractOcrEngine()
+        assert engine.is_available()
+
+    def test_is_available_honours_configured_tesseract_cmd(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The probe resolves the configured ``tesseract_cmd``, not a fixed name."""
+        import shutil as shutil_module
+
+        import pytesseract
+
+        seen: list[str] = []
+
+        def _which(cmd: str) -> str | None:
+            seen.append(cmd)
+            return "/opt/tess/mytess" if cmd == "/opt/tess/mytess" else None
+
+        monkeypatch.setattr(shutil_module, "which", _which)
+        monkeypatch.setattr(
+            pytesseract.pytesseract,
+            "tesseract_cmd",
+            "/opt/tess/mytess",
+        )
+        engine = PytesseractOcrEngine()
+        assert engine.is_available()
+        assert seen == ["/opt/tess/mytess"]
+
+    def test_extract_text_maps_binary_missing_to_curated_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A raw TesseractNotFoundError becomes the curated install-the-binary error."""
+        import pytesseract
+
+        def _raise(*_args: object, **_kwargs: object) -> str:
+            raise pytesseract.TesseractNotFoundError
+
+        monkeypatch.setattr(pytesseract, "image_to_string", _raise)
+        image_path = tmp_path / "x.png"
+        _write_real_png(image_path)
+        engine = PytesseractOcrEngine()
+        with pytest.raises(PytesseractUnavailableError, match="tesseract"):
+            engine.extract_text(image_path)
+
+    def test_extract_text_returns_result_when_all_present(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression: with deps and binary present, extract_text returns OCR'd text."""
+        import pytesseract
+
+        monkeypatch.setattr(
+            pytesseract,
+            "image_to_string",
+            lambda *_a, **_k: "decoded body",
+        )
+        monkeypatch.setattr(
+            pytesseract,
+            "image_to_data",
+            lambda *_a, **_k: {"conf": [90, 95]},
+        )
+        image_path = tmp_path / "screenshot.png"
+        _write_real_png(image_path)
+        engine = PytesseractOcrEngine()
+        result = engine.extract_text(image_path)
+        assert result.text == "decoded body"
+        assert result.confidence == pytest.approx(0.925)
 
 
 # ---- Helper function unit tests ---------------------------------------
