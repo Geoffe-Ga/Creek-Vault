@@ -22,7 +22,7 @@ from creek.generate.ai_style.tells import get_tells
 
 if TYPE_CHECKING:
     from creek.config import AIStyleConfig
-    from creek.generate.ai_style.model import VoiceFingerprint
+    from creek.generate.ai_style.model import Direction, VoiceFingerprint
     from creek.generate.ai_style.tells import Tell
 
 _EXCERPT_PAD = 24
@@ -81,11 +81,12 @@ def _findings_for(
     *,
     draft_rate: float,
     user_rate: float,
-    direction: str,
+    direction: Direction,
 ) -> list[Finding]:
     """Build findings for a tell that diverged past its margin.
 
-    Locates occurrence spans via the tell; when it reports none, emits a
+    Locates occurrence spans via the tell; when it reports none (always
+    the case for ``under``-use, which has no specific location), emits a
     single document-level finding so the divergence is still surfaced.
 
     Args:
@@ -115,7 +116,7 @@ def _findings_for(
             excerpt=_excerpt(text, span) if span.end > span.start else "",
             draft_rate=draft_rate,
             user_rate=user_rate,
-            direction=direction,  # type: ignore[arg-type]  # validated by caller
+            direction=direction,
             message=message,
         )
         for span in spans
@@ -184,7 +185,7 @@ def scan(
         )
         margin = config.default_margin if tell.margin is None else tell.margin
         if magnitude > margin:
-            direction = "over" if tell.polarity == "avoid" else "under"
+            direction: Direction = "over" if tell.polarity == "avoid" else "under"
             findings.extend(
                 _findings_for(
                     tell,
