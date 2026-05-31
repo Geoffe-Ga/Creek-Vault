@@ -20,6 +20,7 @@ _PLAIN = VoiceFingerprint(
         "ai_vocab_density": FeatureStat(rate=0.0, support=50),
         "marketing_verb_ratio": FeatureStat(rate=0.0, support=50),
         "transition_opener_rate": FeatureStat(rate=0.0, support=50),
+        "concrete_rate": FeatureStat(rate=0.0, support=50),
     },
     fragment_count=50,
 )
@@ -29,6 +30,7 @@ _ORNATE = VoiceFingerprint(
         "ai_vocab_density": FeatureStat(rate=900.0, support=50),
         "marketing_verb_ratio": FeatureStat(rate=0.99, support=50),
         "transition_opener_rate": FeatureStat(rate=900.0, support=50),
+        "concrete_rate": FeatureStat(rate=900.0, support=50),
     },
     fragment_count=50,
 )
@@ -108,7 +110,7 @@ class TestConcreteContext:
         assert not _fired(report, "concrete_comment")
 
     def test_fires_in_comment(self) -> None:
-        """'concrete' fires in comment context."""
+        """'concrete' fires in comment context for a user who avoids it."""
         report = scan(
             "Without concrete evidence and concrete examples, this fails.",
             fingerprint=_PLAIN,
@@ -116,6 +118,16 @@ class TestConcreteContext:
             context="comment",
         )
         assert _fired(report, "concrete_comment")
+
+    def test_suppressed_for_concrete_using_user(self) -> None:
+        """The same comment is suppressed when the user's baseline is high."""
+        report = scan(
+            "Without concrete evidence and concrete examples, this fails.",
+            fingerprint=_ORNATE,
+            config=_CONFIG,
+            context="comment",
+        )
+        assert not _fired(report, "concrete_comment")
 
 
 class TestLocators:

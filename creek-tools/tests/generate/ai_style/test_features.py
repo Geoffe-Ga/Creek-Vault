@@ -7,6 +7,7 @@ import pytest
 from creek.generate.ai_style.features import (
     FINGERPRINT_FEATURES,
     ai_vocab_density,
+    concrete_density,
     curly_quote_density,
     em_dash_density,
     marketing_verb_ratio,
@@ -73,8 +74,15 @@ def test_rule_of_three_rate_detects_triads() -> None:
     assert rule_of_three_rate("salt and pepper") == 0.0
 
 
+def test_concrete_density_counts_the_word() -> None:
+    """ "concrete" is counted; absent text scores zero."""
+    assert concrete_density("no concrete evidence and concrete examples") > 0.0
+    assert concrete_density("a plain sentence") == 0.0
+
+
 def test_registry_exposes_all_extractors() -> None:
     """Every extractor is registered under a stable key."""
     assert "em_dash_density" in FINGERPRINT_FEATURES
     assert FINGERPRINT_FEATURES["ai_vocab_density"] is ai_vocab_density
-    assert len(FINGERPRINT_FEATURES) == 7
+    assert FINGERPRINT_FEATURES["concrete_rate"] is concrete_density
+    assert len(FINGERPRINT_FEATURES) == 8

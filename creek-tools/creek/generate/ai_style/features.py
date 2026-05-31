@@ -49,10 +49,10 @@ TRANSITION_OPENERS = (
     "consequently",
 )
 
-# A small, era-spanning sample of the AI-vocabulary list. The full,
-# tunable catalog lands with the lexical detector (FEAT-040.5); the
-# fingerprint only needs a consistent measure of how often the user
-# reaches for these words.
+# A small, era-spanning sample of the AI-vocabulary list, shared with the
+# lexical detector. It is intentionally a representative sample (not an
+# exhaustive catalog); the fingerprint only needs a consistent measure of
+# how often the user reaches for these words.
 AI_VOCAB = (
     "delve",
     "tapestry",
@@ -65,6 +65,8 @@ AI_VOCAB = (
     "leverage",
     "robust",
 )
+
+CONCRETE_RE = re.compile(r"\bconcrete\b", re.IGNORECASE)
 
 # Baseline heuristic: matches single-word triads ("red, white, and blue")
 # but not multi-word items ("a vivid red, a soft white, and a deep blue").
@@ -168,6 +170,22 @@ def rule_of_three_rate(text: str) -> float:
     return rate_per_kwords(len(_TRIAD_RE.findall(text)), text)
 
 
+def concrete_density(text: str) -> float:
+    """Return occurrences of the word "concrete" per 1000 words.
+
+    Fingerprinted so the "concrete" tell (a comment-context AI tell) is
+    vault-relative: a writer who routinely says "concrete evidence" or
+    "concrete slab" has a high baseline and is not flagged for it.
+
+    Args:
+        text: The body to scan.
+
+    Returns:
+        Occurrences of "concrete" per 1000 words.
+    """
+    return rate_per_kwords(len(CONCRETE_RE.findall(text)), text)
+
+
 FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "em_dash_density": em_dash_density,
     "curly_quote_density": curly_quote_density,
@@ -176,6 +194,7 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "sentence_length_mean": sentence_length_mean,
     "transition_opener_rate": transition_opener_rate,
     "rule_of_three_rate": rule_of_three_rate,
+    "concrete_rate": concrete_density,
 }
 """The feature_key -> extractor map the fingerprint measures over the
 user's corpus. Detector tells (FEAT-040.3 through .7) query these same

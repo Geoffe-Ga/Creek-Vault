@@ -16,7 +16,7 @@ import re
 
 from creek.generate.ai_style import features
 from creek.generate.ai_style.model import Span
-from creek.generate.ai_style.tells import Tell, rate_per_kwords, register
+from creek.generate.ai_style.tells import Tell, register
 
 
 def _word_alt(words: tuple[str, ...]) -> re.Pattern[str]:
@@ -28,12 +28,12 @@ def _word_alt(words: tuple[str, ...]) -> re.Pattern[str]:
 _AI_VOCAB_RE = _word_alt(features.AI_VOCAB)
 _MARKETING_RE = _word_alt(features.MARKETING_VERBS)
 # Sentence-initial transition word (start of text or after a terminator).
+# Uses ``[.!?]+`` to match transition_opener_rate's sentence splitter, so the
+# locator finds exactly what the measurer counts (e.g. after "Done!!").
 _TRANSITION_RE = re.compile(
-    r"(?:^|[.!?]\s+)(" + "|".join(features.TRANSITION_OPENERS) + r")\b",
+    r"(?:^|[.!?]+\s+)(" + "|".join(features.TRANSITION_OPENERS) + r")\b",
     re.IGNORECASE | re.MULTILINE,
 )
-# "concrete" as the WP:CONCRETE comment tell ("concrete evidence/examples").
-_CONCRETE_RE = re.compile(r"\bconcrete\b", re.IGNORECASE)
 
 
 def _spans(pattern: re.Pattern[str], text: str, *, group: int = 0) -> list[Span]:
@@ -58,12 +58,7 @@ def _locate_transitions(text: str) -> list[Span]:
 
 def _locate_concrete(text: str) -> list[Span]:
     """Locate occurrences of the word "concrete"."""
-    return _spans(_CONCRETE_RE, text)
-
-
-def _measure_concrete(text: str) -> float:
-    """Return occurrences of "concrete" per 1000 words."""
-    return rate_per_kwords(len(_CONCRETE_RE.findall(text)), text)
+    return _spans(features.CONCRETE_RE, text)
 
 
 AI_VOCABULARY = register(
@@ -130,7 +125,7 @@ CONCRETE_COMMENT = register(
         description='Overuse of "concrete" (concrete evidence/examples) in comments.',
         caveat="Comment context only; the material/literal senses of 'concrete' "
         "are not the target.",
-        measure=_measure_concrete,
+        measure=features.concrete_density,
         locate=_locate_concrete,
         contexts=frozenset({"comment"}),
     ),
