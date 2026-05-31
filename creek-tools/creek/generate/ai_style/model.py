@@ -71,6 +71,16 @@ class VoiceFingerprint:
     features: dict[str, FeatureStat] = field(default_factory=dict)
     fragment_count: int = 0
 
+    def __post_init__(self) -> None:
+        """Defensively copy ``features`` so the fingerprint is not aliased.
+
+        ``frozen=True`` blocks attribute reassignment but not mutation of a
+        shared dict. The profiler (issue #419) builds a fresh dict, but a
+        caller could pass a live one; copying on construction guarantees the
+        fingerprint cannot change underneath a scan.
+        """
+        object.__setattr__(self, "features", self.features.copy())
+
     def rate_for(self, feature_key: str) -> float | None:
         """Return the user's measured rate for *feature_key*, or ``None``.
 

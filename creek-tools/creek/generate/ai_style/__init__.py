@@ -15,6 +15,13 @@ from creek.generate.ai_style.distance import (
     bad_direction_magnitude,
     voice_distance,
 )
+from creek.generate.ai_style.features import FINGERPRINT_FEATURES
+from creek.generate.ai_style.fingerprint import (
+    build_fingerprint,
+    extract_user_turns,
+    load_fingerprint,
+    save_fingerprint,
+)
 from creek.generate.ai_style.model import (
     Category,
     Direction,
@@ -35,6 +42,7 @@ from creek.generate.ai_style.tells import (
 )
 
 __all__ = [
+    "FINGERPRINT_FEATURES",
     "TELL_REGISTRY",
     "Category",
     "Direction",
@@ -46,9 +54,13 @@ __all__ = [
     "Tell",
     "VoiceFingerprint",
     "bad_direction_magnitude",
+    "build_fingerprint",
+    "extract_user_turns",
     "get_tells",
+    "load_fingerprint",
     "rate_per_kwords",
     "register",
+    "save_fingerprint",
     "scan",
     "voice_distance",
     "word_count",
