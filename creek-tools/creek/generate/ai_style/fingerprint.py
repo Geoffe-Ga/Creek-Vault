@@ -15,10 +15,12 @@ values), and writes a single JSON artifact under the vault.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 
 from creek.generate.ai_style.features import FINGERPRINT_FEATURES
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
@@ -27,6 +29,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.config import AIStyleConfig
+
+logger = logging.getLogger(__name__)
 
 FINGERPRINT_VERSION = 1
 """Schema version stamped into the persisted fingerprint JSON."""
@@ -127,7 +131,11 @@ def _eligible_texts(
     if not fragments_root.exists():
         return out
     for md_file in sorted(fragments_root.rglob("*.md")):
-        post = frontmatter.load(str(md_file))
+        try:
+            post = frontmatter.load(str(md_file))
+        except (OSError, yaml.YAMLError):
+            logger.warning("Skipping unreadable fragment: %s", md_file)
+            continue
         source = post.metadata.get("source", {})
         if not isinstance(source, dict) or source.get("author") != _SELF:
             continue
@@ -224,7 +232,24 @@ def load_fingerprint(vault_path: Path, config: AIStyleConfig) -> VoiceFingerprin
     path = vault_path / config.fingerprint_path
     if not path.exists():
         return VoiceFingerprint(features={}, fragment_count=0)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning(
+            "Voice fingerprint at %s is unreadable; ignoring it. "
+            "Re-run `creek report --type fingerprint` to rebuild.",
+            path,
+        )
+        return VoiceFingerprint(features={}, fragment_count=0)
+    if data.get("version") != FINGERPRINT_VERSION:
+        logger.warning(
+            "Voice fingerprint at %s is schema v%s (expected v%s); ignoring "
+            "it. Re-run `creek report --type fingerprint` to rebuild.",
+            path,
+            data.get("version"),
+            FINGERPRINT_VERSION,
+        )
+        return VoiceFingerprint(features={}, fragment_count=0)
     features = {
         key: FeatureStat(rate=float(value["rate"]), support=int(value["support"]))
         for key, value in data.get("features", {}).items()

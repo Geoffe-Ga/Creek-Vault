@@ -161,6 +161,41 @@ class TestPersistence:
         assert loaded.fragment_count == 0
         assert loaded.features == {}
 
+    def test_load_corrupted_json_returns_empty(self, tmp_path: Path) -> None:
+        """A corrupted fingerprint file is ignored, not raised on."""
+        path = tmp_path / _CONFIG.fingerprint_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not valid json", encoding="utf-8")
+        loaded = load_fingerprint(tmp_path, _CONFIG)
+        assert loaded.fragment_count == 0
+        assert loaded.features == {}
+
+    def test_load_version_mismatch_returns_empty(self, tmp_path: Path) -> None:
+        """A stale-schema fingerprint is ignored so a rebuild is triggered."""
+        import json
+
+        path = tmp_path / _CONFIG.fingerprint_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"version": 999, "fragment_count": 3, "features": {}}),
+            encoding="utf-8",
+        )
+        assert load_fingerprint(tmp_path, _CONFIG).fragment_count == 0
+
+
+def test_build_skips_malformed_frontmatter(tmp_path: Path) -> None:
+    """A fragment with broken YAML frontmatter is skipped, not fatal."""
+    good = tmp_path / "01-Fragments" / "good.md"
+    good.parent.mkdir(parents=True, exist_ok=True)
+    good.write_text(
+        "---\nsource:\n  author: self\n  platform: markdown\n---\nclean note\n",
+        encoding="utf-8",
+    )
+    bad = tmp_path / "01-Fragments" / "bad.md"
+    bad.write_text("---\nsource: {unbalanced: [\n---\nbody\n", encoding="utf-8")
+    fp = build_fingerprint(tmp_path, _CONFIG)
+    assert fp.fragment_count == 1
+
 
 def test_fingerprint_defensively_copies_features() -> None:
     """Mutating the source dict after construction does not alter the fp."""

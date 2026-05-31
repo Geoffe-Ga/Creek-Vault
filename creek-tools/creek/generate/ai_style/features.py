@@ -27,6 +27,10 @@ _CURLY_RE = re.compile("[\u2018\u2019\u201c\u201d]")  # curly quotes / apostroph
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?]+(?:\s+|$)")
 _WORD_RE = re.compile(r"\b\w+\b")
 
+# NOTE: substring matching means "features" also hits the noun ("three
+# killer features"), which can inflate the ratio in personal writing.
+# FEAT-040.5 (the lexical detector) narrows these to verb context; the
+# fingerprint only needs a consistent, if slightly noisy, baseline.
 _MARKETING_VERBS = (
     "serves as",
     "stands as",
@@ -62,6 +66,9 @@ _AI_VOCAB = (
     "robust",
 )
 
+# Baseline heuristic: matches single-word triads ("red, white, and blue")
+# but not multi-word items ("a vivid red, a soft white, and a deep blue").
+# Good enough for a rate baseline; FEAT-040.7 can broaden it if needed.
 _TRIAD_RE = re.compile(
     r"\b\w+,\s+\w+,?\s+(?:and|or)\s+\w+\b",
 )
