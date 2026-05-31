@@ -7,7 +7,8 @@ What remains are the meaning-preserving structural tells:
 
 * a whole-body fenced code block wrapping the essay (an LLM "here is your
   article" artifact),
-* a thematic break (``---`` / ``***``) sitting directly above a heading,
+* a thematic break (``---`` / ``***`` / ``___``) sitting directly above a
+  heading,
 * canned ``- **Header:** text`` vertical lists (the bold-colon is mechanical
   emphasis the user did not add),
 * decorative leading emoji on headings and bullets,
@@ -37,6 +38,9 @@ _WHOLE_FENCE_RE = re.compile(
 # blank line (or start of document) is REQUIRED so this never matches a
 # setext heading underline (``Title\n---``), which would silently demote a
 # real heading to a paragraph. The boundary is captured and preserved.
+# Known limitation: two consecutive breaks before a heading
+# (``---\n---\n## H``) are not fully repaired, since the lookahead needs a
+# heading immediately after the consumed break. LLMs rarely emit those.
 _BREAK_BEFORE_HEADING_RE = re.compile(
     r"(?P<lead>\A|\n\n)(?:-{3,}|\*{3,}|_{3,})[ \t]*\n(?=#{1,6}[ \t])",
 )
@@ -115,10 +119,13 @@ def flatten_inline_header_lists(body: str) -> str:
     Returns:
         The body with inline-header bold removed.
     """
-    return _INLINE_HEADER_RE.sub(
+    flattened = _INLINE_HEADER_RE.sub(
         lambda m: f"{m.group('marker')}{m.group('header').rstrip(':').rstrip()}: ",
         body,
     )
+    # tidy so a header with no following text ("- **Note:**") does not leak a
+    # trailing space when this is called standalone (not just in the pipeline).
+    return tidy_whitespace(flattened)
 
 
 def strip_leading_emoji(body: str) -> str:

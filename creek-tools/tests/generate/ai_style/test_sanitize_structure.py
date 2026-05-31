@@ -52,6 +52,12 @@ class TestThematicBreaks:
         out = strip_breaks_before_headings("Intro.\n\n----\n## H\n\nx")
         assert out == "Intro.\n\n## H\n\nx"
 
+    def test_break_at_document_start_removed(self) -> None:
+        """A break opening the document (the \\A branch) is removed."""
+        out = strip_breaks_before_headings("---\n## Opening\n\nText.")
+        assert "---" not in out
+        assert "## Opening" in out
+
 
 class TestInlineHeaderLists:
     """Canned bold-colon list items are flattened."""
@@ -70,6 +76,10 @@ class TestInlineHeaderLists:
         """Mid-sentence bold (not a list-item header) is left alone."""
         body = "This is **important** to me."
         assert flatten_inline_header_lists(body) == body
+
+    def test_header_with_no_following_text_no_trailing_space(self) -> None:
+        """`- **Note:**` with nothing after leaves no trailing space."""
+        assert flatten_inline_header_lists("- **Note:**") == "- Note:"
 
 
 class TestEmoji:
