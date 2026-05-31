@@ -42,6 +42,16 @@ class TestThematicBreaks:
         body = "Section one.\n\n---\n\nSection two prose, no heading."
         assert strip_breaks_before_headings(body) == body
 
+    def test_setext_heading_not_destroyed(self) -> None:
+        """A setext underline (Title\\n---) above a heading is left intact."""
+        body = "My Section Title\n---\n## Subsection\n\nText."
+        assert strip_breaks_before_headings(body) == body
+
+    def test_blank_line_preserved_after_removal(self) -> None:
+        """Removing the break keeps the blank line separating prose/heading."""
+        out = strip_breaks_before_headings("Intro.\n\n----\n## H\n\nx")
+        assert out == "Intro.\n\n## H\n\nx"
+
 
 class TestInlineHeaderLists:
     """Canned bold-colon list items are flattened."""
@@ -94,6 +104,16 @@ class TestPlaceholders:
         out = strip_placeholders("dated 2025-xx-xx by [Your Name] today")
         assert "2025-xx-xx" not in out
         assert "Your Name" not in out
+
+    def test_describe_placeholder_removed(self) -> None:
+        """A [Describe ...] mad-lib placeholder is removed."""
+        out = strip_placeholders("For [Describe the specific section] here.")
+        assert "[Describe" not in out
+
+    def test_return_arrow_removed(self) -> None:
+        """The footnote return arrow is removed."""
+        out = strip_placeholders("See footnote 1. ↩")
+        assert "↩" not in out
 
 
 class TestSanitizeStructure:

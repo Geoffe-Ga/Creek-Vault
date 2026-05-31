@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from creek.generate.ai_style._text import tidy_whitespace
 from creek.generate.ai_style.sanitize_structure import sanitize_structure
 
 if TYPE_CHECKING:
@@ -78,9 +79,6 @@ def _strip_utm(match: re.Match[str]) -> str:
     return ""
 
 
-_MULTISPACE_RE = re.compile(r"[ \t]{2,}")
-_TRAILING_WS_RE = re.compile(r"[ \t]+$", re.MULTILINE)
-
 # --- typography ------------------------------------------------------------
 _CURLY_TO_STRAIGHT = {
     0x2018: "'",
@@ -119,8 +117,7 @@ def strip_markup_artifacts(body: str) -> str:
     for pattern in _ARTIFACT_PATTERNS:
         body = pattern.sub("", body)
     body = _UTM_RE.sub(_strip_utm, body)
-    body = _MULTISPACE_RE.sub(" ", body)
-    return _TRAILING_WS_RE.sub("", body)
+    return tidy_whitespace(body)
 
 
 def _uses_feature(
@@ -182,11 +179,11 @@ def sanitize(
     fingerprint: VoiceFingerprint,
     config: AIStyleConfig,
 ) -> str:
-    """Frontmatter-safe, idempotent typography + artifact sanitizer.
+    """Frontmatter-safe, idempotent sanitizer: artifacts, structure, typography.
 
-    Splits off any YAML frontmatter, strips markup artifacts, normalises
-    typography against the fingerprint, and recombines. (Issue #421 extends
-    this aggregator with the Markdown-structure stage.)
+    Splits off any YAML frontmatter, strips markup artifacts and structural
+    LLM tells, normalises typography against the voice fingerprint, and
+    recombines.
 
     Args:
         text: The full text (body, optionally with frontmatter).

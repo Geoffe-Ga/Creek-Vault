@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import re
 
+from creek.generate.ai_style._text import tidy_whitespace
+
 # Whole-body fenced code block: ``` or ```lang ... ``` spanning the entire
 # text (optionally with surrounding blank lines).
 _WHOLE_FENCE_RE = re.compile(
@@ -31,16 +33,19 @@ _WHOLE_FENCE_RE = re.compile(
     re.DOTALL,
 )
 
-# A thematic break line immediately followed by an ATX heading.
+# A thematic break line immediately followed by an ATX heading. The leading
+# blank line (or start of document) is REQUIRED so this never matches a
+# setext heading underline (``Title\n---``), which would silently demote a
+# real heading to a paragraph. The boundary is captured and preserved.
 _BREAK_BEFORE_HEADING_RE = re.compile(
-    r"^(?:-{3,}|\*{3,}|_{3,})[ \t]*\n(?=#{1,6}[ \t])",
-    re.MULTILINE,
+    r"(?P<lead>\A|\n\n)(?:-{3,}|\*{3,}|_{3,})[ \t]*\n(?=#{1,6}[ \t])",
 )
 
 # Canned inline-header list item: "- **Header:** text" or "1. **Header**: text".
+# A colon after the bold is optionally consumed but not captured; the
+# replacement re-adds a single normalised colon from the header text.
 _INLINE_HEADER_RE = re.compile(
-    r"^(?P<marker>[ \t]*(?:[-*+]|\d+\.)[ \t]+)"
-    r"\*\*(?P<header>[^*\n]+?)\*\*(?P<colon>:?)[ \t]*",
+    r"^(?P<marker>[ \t]*(?:[-*+]|\d+\.)[ \t]+)\*\*(?P<header>[^*\n]+?)\*\*:?[ \t]*",
     re.MULTILINE,
 )
 
@@ -64,9 +69,6 @@ _PLACEHOLDER_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\[Describe[^\]]*\]"),
     re.compile(r"↩"),
 )
-
-_MULTISPACE_RE = re.compile(r"[ \t]{2,}")
-_TRAILING_WS_RE = re.compile(r"[ \t]+$", re.MULTILINE)
 
 
 def unwrap_code_fence(body: str) -> str:
@@ -94,9 +96,10 @@ def strip_breaks_before_headings(body: str) -> str:
 
     Returns:
         The body without ``---`` / ``***`` / ``___`` lines that precede a
-        heading (a Markdown-output AI habit).
+        heading (a Markdown-output AI habit). The preceding blank line is
+        preserved; setext heading underlines are left untouched.
     """
-    return _BREAK_BEFORE_HEADING_RE.sub("", body)
+    return _BREAK_BEFORE_HEADING_RE.sub(r"\g<lead>", body)
 
 
 def flatten_inline_header_lists(body: str) -> str:
@@ -142,8 +145,7 @@ def strip_placeholders(body: str) -> str:
     """
     for pattern in _PLACEHOLDER_RES:
         body = pattern.sub("", body)
-    body = _MULTISPACE_RE.sub(" ", body)
-    return _TRAILING_WS_RE.sub("", body)
+    return tidy_whitespace(body)
 
 
 def sanitize_structure(body: str) -> str:
