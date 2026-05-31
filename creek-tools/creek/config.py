@@ -766,6 +766,44 @@ class DraftConfig(BaseModel):
     is flagged ``truncated`` in frontmatter and warned about on stderr."""
 
 
+AIStyleCategory = Literal[
+    "mechanical",
+    "lexical",
+    "rhetorical",
+    "discourse",
+    "citation",
+]
+"""The five FEAT-040 tell families. Defined here (rather than in the
+``ai_style`` package) so :class:`AIStyleConfig` can validate config values
+against it at parse time without importing that package — which would
+create an import cycle, since ``ai_style`` imports this module. The
+``ai_style`` model re-exports this as ``Category``."""
+
+
+def _default_enabled_categories() -> list[AIStyleCategory]:
+    """Return the default set of enabled tell categories (all five)."""
+    categories: list[AIStyleCategory] = [
+        "mechanical",
+        "lexical",
+        "rhetorical",
+        "discourse",
+        "citation",
+    ]
+    return categories
+
+
+def _default_category_weights() -> dict[AIStyleCategory, float]:
+    """Return the default per-category divergence weights."""
+    weights: dict[AIStyleCategory, float] = {
+        "mechanical": 0.5,
+        "lexical": 1.0,
+        "rhetorical": 1.0,
+        "discourse": 1.0,
+        "citation": 0.5,
+    }
+    return weights
+
+
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
 
@@ -782,9 +820,11 @@ class AIStyleConfig(BaseModel):
     enabled: bool = True
     """Master switch. When ``False`` the scanner returns an empty report."""
 
-    voice_distance_upper: float = Field(default=0.35, ge=0.0)
+    voice_distance_upper: float = Field(default=0.35, ge=0.0, le=1.0)
     """Distance above which a draft is considered to diverge from the
-    user's voice enough to warrant a rewrite pass / lint finding."""
+    user's voice enough to warrant a rewrite pass / lint finding. Capped at
+    1.0 because ``voice_distance`` is always ``< 1.0``; a higher threshold
+    would silently disable the check."""
 
     default_margin: float = Field(default=0.5, ge=0.0)
     """Default divergence margin, in absolute rate units, a feature must
@@ -808,26 +848,16 @@ class AIStyleConfig(BaseModel):
     """Maximum acceptable false-positive rate on the user's own writing
     during calibration. Above this, :func:`calibrate` reports failure."""
 
-    enabled_categories: list[str] = Field(
-        default_factory=lambda: [
-            "mechanical",
-            "lexical",
-            "rhetorical",
-            "discourse",
-            "citation",
-        ],
+    enabled_categories: list[AIStyleCategory] = Field(
+        default_factory=_default_enabled_categories,
     )
     """Tell categories the scanner runs. Trimming this disables a whole
-    family of detectors without touching the registry."""
+    family of detectors without touching the registry. Typed against
+    :data:`AIStyleCategory` so a typo in YAML/JSON config is rejected at
+    parse time rather than silently producing an empty tell list."""
 
-    category_weights: dict[str, float] = Field(
-        default_factory=lambda: {
-            "mechanical": 0.5,
-            "lexical": 1.0,
-            "rhetorical": 1.0,
-            "discourse": 1.0,
-            "citation": 0.5,
-        },
+    category_weights: dict[AIStyleCategory, float] = Field(
+        default_factory=_default_category_weights,
     )
     """Per-category weight applied to each feature's divergence when
     summing ``voice_distance``. Mechanical tells are down-weighted because
@@ -854,7 +884,12 @@ class AIStyleConfig(BaseModel):
         """
         if feature_key in self.feature_weights:
             return self.feature_weights[feature_key]
-        return self.category_weights.get(category, 1.0)
+        # `category` is a plain str (the caller may pass an unknown value);
+        # compare against the validated Literal keys without a cast.
+        for key, weight in self.category_weights.items():
+            if key == category:
+                return weight
+        return 1.0
 
 
 class LintConfig(BaseModel):

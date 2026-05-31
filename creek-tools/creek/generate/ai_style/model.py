@@ -17,8 +17,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-Category = Literal["mechanical", "lexical", "rhetorical", "discourse", "citation"]
-"""The five tell families catalogued by the Wikipedia field guide."""
+from creek.config import AIStyleCategory
+
+Category = AIStyleCategory
+"""The five tell families catalogued by the Wikipedia field guide.
+
+Re-exported from :data:`creek.config.AIStyleCategory` so the config layer
+and the detector framework share a single definition (and config can
+validate against it without importing this package)."""
 
 Direction = Literal["over", "under"]
 """Whether the draft over-uses a feature the user avoids (``over``) or

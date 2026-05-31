@@ -105,6 +105,8 @@ def _findings_for(
     )
     spans = tell.locate(text) if direction == "over" else []
     if not spans:
+        # No located occurrence (always so for under-use, which has no
+        # specific site): emit one doc-level finding so it still surfaces.
         spans = [Span(0, 0)]
     return [
         Finding(

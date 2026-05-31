@@ -48,6 +48,7 @@ class TestCalibrate:
         )
         assert report.false_positive_rate > 0.0
         assert report.passed is False
+        assert "FAIL" in report.summary()
 
     def test_empty_user_set_passes_vacuously(self) -> None:
         """No user texts ⇒ zero false-positive rate, passes."""
