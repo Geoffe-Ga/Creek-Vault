@@ -31,6 +31,11 @@ from creek.generate.ai_style.model import (
     Span,
     VoiceFingerprint,
 )
+from creek.generate.ai_style.sanitize_typography import (
+    normalize_typography,
+    sanitize,
+    strip_markup_artifacts,
+)
 from creek.generate.ai_style.scanner import scan
 from creek.generate.ai_style.tells import (
     TELL_REGISTRY,
@@ -58,10 +63,13 @@ __all__ = [
     "extract_user_turns",
     "get_tells",
     "load_fingerprint",
+    "normalize_typography",
     "rate_per_kwords",
     "register",
+    "sanitize",
     "save_fingerprint",
     "scan",
+    "strip_markup_artifacts",
     "voice_distance",
     "word_count",
 ]
