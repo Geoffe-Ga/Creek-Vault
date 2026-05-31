@@ -69,6 +69,32 @@ class TestStripMarkupArtifacts:
         text = "I will search the river bank tomorrow morning."
         assert strip_markup_artifacts(text) == text
 
+    def test_negative_contentreference_identifier_untouched(self) -> None:
+        """The word 'contentReference' in real prose is not stripped."""
+        text = "The DOM contentReference API is deprecated now."
+        assert strip_markup_artifacts(text) == text
+
+    def test_utm_first_param_keeps_valid_url(self) -> None:
+        """Stripping a first-position utm param leaves a valid query string."""
+        out = strip_markup_artifacts(
+            "see https://example.com/p?utm_source=chatgpt.com&id=7 ok",
+        )
+        assert "utm_source" not in out
+        assert "https://example.com/p?id=7" in out
+        assert "?&" not in out
+
+    def test_utm_only_param_drops_trailing_qmark(self) -> None:
+        """A utm param that is the only query param leaves no dangling '?'."""
+        out = strip_markup_artifacts(
+            "link https://example.com/p?utm_source=openai.com here",
+        )
+        assert "https://example.com/p here" in out
+
+    def test_grok_close_tag_removed(self) -> None:
+        """Both the opening and closing grok-card tags are stripped."""
+        out = strip_markup_artifacts('x <grok-card data-id="a">y</grok-card> z')
+        assert "grok-card" not in out
+
 
 class TestVaultAwareTypography:
     """Typography is normalised only against the user's grain."""

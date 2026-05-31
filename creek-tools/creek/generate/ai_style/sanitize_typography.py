@@ -34,20 +34,47 @@ _ARTIFACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r" ?:contentReference\[oaicite:\d+\]\{index=\d+\}"),
     re.compile(r" ?\[oai_citation:[^\]]*\]\([^)]*\)"),
     re.compile(r" ?oai_citation:\d+\u2021\S*"),
-    re.compile(r" ?contentReference"),
+    # Colon-prefixed only, so it never fires inside legitimate identifiers
+    # like a DOM "contentReference" API mentioned in prose.
+    re.compile(r" ?:contentReference\b"),
     re.compile(r" ?(?:cite)?turn\d+(?:search|image|news|file|view)\d+"),
     re.compile(r" ?\u3010[^\u3011]*\u3011"),  # lenticular brackets
     re.compile(r" ?\[(?:attached_file|web):\d+\]"),
+    # grok-card tags self-close in practice; strip both forms defensively.
     re.compile(r" ?<grok-card\b[^>]*>"),
+    re.compile(r" ?</grok-card>"),
     re.compile(r" ?\[\]\(grok_render_citation_card_json=[^)]*\)"),
     re.compile(r" ?grok_render_citation_card_json=\{[^}]*\}"),
     re.compile(r' ?\(\{"attribution":.*?\}\)'),
 )
 
-_UTM_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"[?&]utm_source=(?:chatgpt\.com|openai|copilot\.com)\b"),
-    re.compile(r"[?&]referrer=grok\.com\b"),
+# AI tracking params. Captures the leading separator and any following "&"
+# so the param can be removed from any position without corrupting the URL
+# (see _strip_utm). ``openai`` is matched with or without a TLD.
+_UTM_RE = re.compile(
+    r"([?&])(?:utm_source=(?:chatgpt\.com|openai(?:\.com)?|copilot\.com)"
+    r"|referrer=grok\.com)\b(&)?",
 )
+
+
+def _strip_utm(match: re.Match[str]) -> str:
+    """Return the replacement for a matched AI tracking param.
+
+    Preserves a valid query string regardless of the param's position:
+    a first param keeps the ``?`` (dropping the following ``&``); a
+    middle/last/only param is removed separator and all.
+
+    Args:
+        match: A match of :data:`_UTM_RE`.
+
+    Returns:
+        ``"?"`` when the param was first of several, else ``""``.
+    """
+    leading, following_amp = match.group(1), match.group(2)
+    if leading == "?" and following_amp:
+        return "?"
+    return ""
+
 
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _TRAILING_WS_RE = re.compile(r"[ \t]+$", re.MULTILINE)
@@ -60,7 +87,6 @@ _CURLY_TO_STRAIGHT = {
     0x201D: '"',
 }
 _SPACED_EM_DASH_RE = re.compile(r"\s\u2014\s")  # the formulaic spaced em-dash
-_EPSILON = 1e-9
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
@@ -90,8 +116,7 @@ def strip_markup_artifacts(body: str) -> str:
     """
     for pattern in _ARTIFACT_PATTERNS:
         body = pattern.sub("", body)
-    for pattern in _UTM_PATTERNS:
-        body = pattern.sub("", body)
+    body = _UTM_RE.sub(_strip_utm, body)
     body = _MULTISPACE_RE.sub(" ", body)
     return _TRAILING_WS_RE.sub("", body)
 
@@ -118,7 +143,7 @@ def _uses_feature(
     if fingerprint.is_thin(config.min_fingerprint_fragments):
         return False
     rate = fingerprint.rate_for(feature_key)
-    return rate is not None and rate > _EPSILON
+    return rate is not None and rate > 0.0
 
 
 def normalize_typography(
