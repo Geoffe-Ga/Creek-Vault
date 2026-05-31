@@ -31,7 +31,7 @@ _WORD_RE = re.compile(r"\b\w+\b")
 # killer features"), which can inflate the ratio in personal writing.
 # FEAT-040.5 (the lexical detector) narrows these to verb context; the
 # fingerprint only needs a consistent, if slightly noisy, baseline.
-_MARKETING_VERBS = (
+MARKETING_VERBS = (
     "serves as",
     "stands as",
     "boasts",
@@ -41,7 +41,7 @@ _MARKETING_VERBS = (
 )
 _COPULAS = (" is ", " are ", " was ", " were ", " has ", " have ")
 
-_TRANSITION_OPENERS = (
+TRANSITION_OPENERS = (
     "additionally",
     "moreover",
     "furthermore",
@@ -53,7 +53,7 @@ _TRANSITION_OPENERS = (
 # tunable catalog lands with the lexical detector (FEAT-040.5); the
 # fingerprint only needs a consistent measure of how often the user
 # reaches for these words.
-_AI_VOCAB = (
+AI_VOCAB = (
     "delve",
     "tapestry",
     "underscore",
@@ -101,7 +101,7 @@ def curly_quote_density(text: str) -> float:
 def ai_vocab_density(text: str) -> float:
     """Return AI-vocabulary word occurrences per 1000 words."""
     lowered = text.lower()
-    hits = sum(len(re.findall(rf"\b{re.escape(w)}\b", lowered)) for w in _AI_VOCAB)
+    hits = sum(len(re.findall(rf"\b{re.escape(w)}\b", lowered)) for w in AI_VOCAB)
     return rate_per_kwords(hits, text)
 
 
@@ -119,7 +119,7 @@ def marketing_verb_ratio(text: str) -> float:
         ``marketing / (marketing + copula)`` in ``[0, 1]``; ``0.0`` when the
         denominator is zero.
     """
-    marketing = _count_phrases(text, _MARKETING_VERBS)
+    marketing = _count_phrases(text, MARKETING_VERBS)
     copula = _count_phrases(text, _COPULAS)
     denom = marketing + copula
     return marketing / denom if denom else 0.0
@@ -158,7 +158,7 @@ def transition_opener_rate(text: str) -> float:
     hits = 0
     for sentence in sentences:
         first = _WORD_RE.findall(sentence)
-        if first and first[0].lower() in _TRANSITION_OPENERS:
+        if first and first[0].lower() in TRANSITION_OPENERS:
             hits += 1
     return rate_per_kwords(hits, text)
 
