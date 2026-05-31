@@ -6,6 +6,7 @@ from creek.config import AIStyleConfig
 from creek.generate.ai_style import scan
 from creek.generate.ai_style.lexical import (
     _locate_ai_vocab,
+    _locate_concrete,
     _locate_marketing,
     _locate_transitions,
 )
@@ -139,8 +140,18 @@ class TestLocators:
         assert len(spans) == 2
 
     def test_locate_marketing(self) -> None:
-        """Marketing verbs are located."""
-        assert _locate_marketing("it boasts and serves as") != []
+        """Each marketing verb phrase is located at its exact span."""
+        text = "it boasts and serves as"
+        spans = _locate_marketing(text)
+        located = sorted(text[s.start : s.end].lower() for s in spans)
+        assert located == ["boasts", "serves as"]
+
+    def test_locate_concrete(self) -> None:
+        """Each "concrete" occurrence is located."""
+        text = "concrete evidence and concrete examples"
+        spans = _locate_concrete(text)
+        assert len(spans) == 2
+        assert text[spans[0].start : spans[0].end] == "concrete"
 
     def test_locate_transitions_sentence_initial_only(self) -> None:
         """Only sentence-initial transitions are located."""

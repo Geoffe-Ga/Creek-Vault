@@ -28,9 +28,10 @@ _SENTENCE_SPLIT_RE = re.compile(r"[.!?]+(?:\s+|$)")
 _WORD_RE = re.compile(r"\b\w+\b")
 
 # NOTE: substring matching means "features" also hits the noun ("three
-# killer features"), which can inflate the ratio in personal writing.
-# FEAT-040.5 (the lexical detector) narrows these to verb context; the
-# fingerprint only needs a consistent, if slightly noisy, baseline.
+# killer features"), which can inflate the ratio in personal writing. Both
+# the fingerprint and the lexical detector share this list and tolerate the
+# noise: it is vault-relative, so a noun-heavy writer's own baseline rises
+# with them. Verb-context narrowing is possible future work, not yet done.
 MARKETING_VERBS = (
     "serves as",
     "stands as",

@@ -128,5 +128,9 @@ CONCRETE_COMMENT = register(
         measure=features.concrete_density,
         locate=_locate_concrete,
         contexts=frozenset({"comment"}),
+        # Default per-1000-words margin: one stray "concrete" over the user's
+        # baseline is tolerated; a cluster ("concrete evidence ... concrete
+        # examples") in a comment is the tell.
+        margin=2.0,
     ),
 )
