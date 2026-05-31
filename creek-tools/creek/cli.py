@@ -1272,10 +1272,41 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
     )
 
 
+def _report_fingerprint(vault_path: Path) -> None:
+    """Build and persist the voice fingerprint (FEAT-040.2)."""
+    from creek.config import load_config
+    from creek.generate.ai_style.fingerprint import (
+        build_fingerprint,
+        save_fingerprint,
+    )
+
+    config = load_config().ai_style
+    fingerprint = build_fingerprint(vault_path, config)
+    if fingerprint.fragment_count == 0:
+        console.print(
+            "[yellow]No voice fingerprint built: no self-authored "
+            "fragments found in the vault.[/yellow]",
+        )
+        return
+    path = save_fingerprint(fingerprint, vault_path, config)
+    thin = (
+        " [dim](thin — flagging will be softened)[/dim]"
+        if (fingerprint.fragment_count < config.min_fingerprint_fragments)
+        else ""
+    )
+    console.print(
+        f"[bold green]Voice fingerprint built from "
+        f"{fingerprint.fragment_count} self-authored fragment(s) "
+        f"across {len(fingerprint.features)} features → {path}"
+        f"[/bold green]{thin}",
+    )
+
+
 _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "tags": _report_tags,
     "unnamed": _report_unnamed,
     "voice": _report_voice,
+    "fingerprint": _report_fingerprint,
 }
 
 

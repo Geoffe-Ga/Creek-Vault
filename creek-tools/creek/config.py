@@ -804,6 +804,25 @@ def _default_category_weights() -> dict[AIStyleCategory, float]:
     return weights
 
 
+def _default_authorship_weights() -> dict[str, float]:
+    """Return default per-platform weights for fingerprint aggregation.
+
+    Purely user-authored sources are weighted highest; conversation
+    platforms lower because only their user-turn portion is fingerprinted
+    and that text is noisier.
+    """
+    return {
+        "journal": 1.0,
+        "markdown": 1.0,
+        "substack": 1.0,
+        "essay": 1.0,
+        "email": 0.8,
+        "chatgpt": 0.5,
+        "claude": 0.5,
+        "discord": 0.6,
+    }
+
+
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
 
@@ -867,6 +886,22 @@ class AIStyleConfig(BaseModel):
     feature_weights: dict[str, float] = Field(default_factory=dict)
     """Optional per-``feature_key`` weight overrides. A key present here
     wins over its category weight."""
+
+    authorship_weights: dict[str, float] = Field(
+        default_factory=_default_authorship_weights,
+    )
+    """Per-source-platform weight used when aggregating the voice
+    fingerprint (FEAT-040.2). Genuinely user-authored sources (journal,
+    markdown, substack) are weighted highest; conversation platforms
+    (chatgpt, claude) lower, because only their user-turn survives the
+    authorship filter and that text is noisier."""
+
+    authorship_default_weight: float = Field(default=0.75, ge=0.0)
+    """Weight for a source platform not listed in
+    :attr:`authorship_weights`."""
+
+    fingerprint_path: str = "00-Creek-Meta/voice-fingerprint.json"
+    """Vault-relative path where the voice fingerprint is persisted."""
 
     def weight_for(self, *, category: str, feature_key: str) -> float:
         """Resolve the divergence weight for a feature.
