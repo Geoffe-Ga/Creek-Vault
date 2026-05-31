@@ -766,6 +766,132 @@ class DraftConfig(BaseModel):
     is flagged ``truncated`` in frontmatter and warned about on stderr."""
 
 
+AIStyleCategory = Literal[
+    "mechanical",
+    "lexical",
+    "rhetorical",
+    "discourse",
+    "citation",
+]
+"""The five FEAT-040 tell families. Defined here (rather than in the
+``ai_style`` package) so :class:`AIStyleConfig` can validate config values
+against it at parse time without importing that package — which would
+create an import cycle, since ``ai_style`` imports this module. The
+``ai_style`` model re-exports this as ``Category``."""
+
+
+def _default_enabled_categories() -> list[AIStyleCategory]:
+    """Return the default set of enabled tell categories (all five)."""
+    categories: list[AIStyleCategory] = [
+        "mechanical",
+        "lexical",
+        "rhetorical",
+        "discourse",
+        "citation",
+    ]
+    return categories
+
+
+def _default_category_weights() -> dict[AIStyleCategory, float]:
+    """Return the default per-category divergence weights."""
+    weights: dict[AIStyleCategory, float] = {
+        "mechanical": 0.5,
+        "lexical": 1.0,
+        "rhetorical": 1.0,
+        "discourse": 1.0,
+        "citation": 0.5,
+    }
+    return weights
+
+
+class AIStyleConfig(BaseModel):
+    """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
+
+    The subsystem measures how far generated text diverges from the
+    user's own writing (their *voice fingerprint*) rather than from a
+    generic baseline. A "tell" fires for a feature only when the draft's
+    measured rate differs from the user's stored rate by more than
+    :attr:`default_margin` (or a per-feature override). The scalar
+    ``voice_distance`` aggregates those divergences, weighted by
+    category. Everything here is intentionally conservative: the headline
+    correctness property is that the user's *own* writing must not flag.
+    """
+
+    enabled: bool = True
+    """Master switch. When ``False`` the scanner returns an empty report."""
+
+    voice_distance_upper: float = Field(default=0.35, ge=0.0, le=1.0)
+    """Distance above which a draft is considered to diverge from the
+    user's voice enough to warrant a rewrite pass / lint finding. Capped at
+    1.0 because ``voice_distance`` is always ``< 1.0``; a higher threshold
+    would silently disable the check."""
+
+    default_margin: float = Field(default=0.5, ge=0.0)
+    """Default divergence margin, in absolute rate units, a feature must
+    exceed before it produces a :class:`~creek.generate.ai_style.model.Finding`.
+    Rates are per-1000-words, so ``0.5`` means "half an occurrence per
+    thousand words above the user's own rate"."""
+
+    min_fingerprint_fragments: int = Field(default=5, ge=1)
+    """Below this many user-authored fragments the fingerprint is treated
+    as thin: divergence contributions are softened toward the generic
+    prior and reports carry a ``thin_fingerprint`` flag rather than
+    flagging aggressively."""
+
+    thin_fingerprint_softening: float = Field(default=0.25, ge=0.0, le=1.0)
+    """Multiplier applied to distance contributions when the fingerprint
+    is thin (see :attr:`min_fingerprint_fragments`). ``0.25`` keeps a
+    quarter of the signal so obvious tells still surface while the
+    measurement is unreliable."""
+
+    calibration_fp_floor: float = Field(default=0.05, ge=0.0, le=1.0)
+    """Maximum acceptable false-positive rate on the user's own writing
+    during calibration. Above this, :func:`calibrate` reports failure."""
+
+    enabled_categories: list[AIStyleCategory] = Field(
+        default_factory=_default_enabled_categories,
+    )
+    """Tell categories the scanner runs. Trimming this disables a whole
+    family of detectors without touching the registry. Typed against
+    :data:`AIStyleCategory` so a typo in YAML/JSON config is rejected at
+    parse time rather than silently producing an empty tell list."""
+
+    category_weights: dict[AIStyleCategory, float] = Field(
+        default_factory=_default_category_weights,
+    )
+    """Per-category weight applied to each feature's divergence when
+    summing ``voice_distance``. Mechanical tells are down-weighted because
+    they are auto-repaired and should not dominate the human-vs-voice
+    score."""
+
+    feature_weights: dict[str, float] = Field(default_factory=dict)
+    """Optional per-``feature_key`` weight overrides. A key present here
+    wins over its category weight."""
+
+    def weight_for(self, *, category: str, feature_key: str) -> float:
+        """Resolve the divergence weight for a feature.
+
+        A per-feature override in :attr:`feature_weights` wins; otherwise
+        the feature inherits its :attr:`category_weights` entry, defaulting
+        to ``1.0`` when the category is unlisted.
+
+        Args:
+            category: The tell's category.
+            feature_key: The tell's ``feature_key``.
+
+        Returns:
+            The weight to apply to this feature's divergence.
+        """
+        if feature_key in self.feature_weights:
+            return self.feature_weights[feature_key]
+        # `category` is a plain str (the caller may pass an unknown value);
+        # compare against the validated Literal keys without a cast.
+        for key, weight in self.category_weights.items():
+            if key == category:
+                return weight
+        return 1.0
+
+
 class LintConfig(BaseModel):
     """Configuration for ``creek lint`` checks (FEAT-008, FEAT-025).
 
@@ -879,6 +1005,9 @@ class CreekConfig(BaseSettings):
 
     draft: DraftConfig = Field(default_factory=DraftConfig)
     """Bidirectional grounding-guard thresholds (issue #355)."""
+
+    ai_style: AIStyleConfig = Field(default_factory=AIStyleConfig)
+    """AI-style / voice-fidelity thresholds and weights (FEAT-040)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
