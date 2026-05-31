@@ -1,0 +1,55 @@
+"""FEAT-040 AI-style / voice-fidelity subsystem.
+
+Measures how far generated text diverges from the *user's own* writing
+(their voice fingerprint) rather than from a generic baseline, and scores
+that divergence as a bounded ``voice_distance``. This package ships the
+framework (model, tell registry, scan engine, distance score, calibration
+harness) plus a single seed tell; later FEAT-040 issues register the real
+catalogs and add the sanitizer, prompt prevention, guard, and lint check.
+"""
+
+from __future__ import annotations
+
+from creek.generate.ai_style.distance import (
+    FeatureContribution,
+    bad_direction_magnitude,
+    voice_distance,
+)
+from creek.generate.ai_style.model import (
+    Category,
+    Direction,
+    FeatureStat,
+    Finding,
+    ScanReport,
+    Span,
+    VoiceFingerprint,
+)
+from creek.generate.ai_style.scanner import scan
+from creek.generate.ai_style.tells import (
+    TELL_REGISTRY,
+    Tell,
+    get_tells,
+    rate_per_kwords,
+    register,
+    word_count,
+)
+
+__all__ = [
+    "TELL_REGISTRY",
+    "Category",
+    "Direction",
+    "FeatureContribution",
+    "FeatureStat",
+    "Finding",
+    "ScanReport",
+    "Span",
+    "Tell",
+    "VoiceFingerprint",
+    "bad_direction_magnitude",
+    "get_tells",
+    "rate_per_kwords",
+    "register",
+    "scan",
+    "voice_distance",
+    "word_count",
+]
