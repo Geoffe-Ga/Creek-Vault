@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from creek.generate.ai_style.sanitize_structure import sanitize_structure
+
 if TYPE_CHECKING:
     from creek.config import AIStyleConfig
     from creek.generate.ai_style.model import VoiceFingerprint
@@ -196,5 +198,6 @@ def sanitize(
     """
     front, body = _split_frontmatter(text)
     body = strip_markup_artifacts(body)
+    body = sanitize_structure(body)
     body = normalize_typography(body, fingerprint=fingerprint, config=config)
     return front + body
