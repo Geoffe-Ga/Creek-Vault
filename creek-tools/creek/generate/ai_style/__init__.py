@@ -31,6 +31,7 @@ from creek.generate.ai_style.model import (
     Span,
     VoiceFingerprint,
 )
+from creek.generate.ai_style.sanitize_structure import sanitize_structure
 from creek.generate.ai_style.sanitize_typography import (
     normalize_typography,
     sanitize,
@@ -67,6 +68,7 @@ __all__ = [
     "rate_per_kwords",
     "register",
     "sanitize",
+    "sanitize_structure",
     "save_fingerprint",
     "scan",
     "strip_markup_artifacts",
