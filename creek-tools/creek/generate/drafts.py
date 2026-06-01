@@ -1869,6 +1869,10 @@ class DraftGenerator:
         the draft below its grounding floor — so voice fidelity is never
         bought at the cost of grounding.
         """
+        if not source_fragments:
+            # Nothing to ground against (e.g. the outline-draft path): skip the
+            # vault scan rather than build a trivially-passing no-op veto.
+            return None
         if self._embedding_fn is None or self._grounding_thresholds is None:
             return None
         fragments = _load_fragments_by_id(
