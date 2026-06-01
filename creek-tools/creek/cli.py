@@ -2277,7 +2277,7 @@ def draft(
         None,
         "--seed-fragment",
         help=(
-            "FEAT-032: draft a follow-up to one specific fragment ID. "
+            "Draft a follow-up to one specific fragment ID. "
             "Mutually exclusive with --seed-topic and the dimensional filters."
         ),
     ),
@@ -2285,7 +2285,7 @@ def draft(
         None,
         "--seed-topic",
         help=(
-            "FEAT-032: free-form topic phrase. Combinable with dimensional "
+            "Free-form topic phrase. Combinable with dimensional "
             "filters to narrow source material."
         ),
     ),
@@ -2293,7 +2293,7 @@ def draft(
         None,
         "--seed-frequency",
         help=(
-            "FEAT-032: restrict source material to fragments with the named "
+            "Restrict source material to fragments with the named "
             "primary frequency. Accepts F1..F10 codes or APTITUDE labels "
             "(agency, receptivity, self-love, ...)."
         ),
@@ -2302,7 +2302,7 @@ def draft(
         None,
         "--seed-phase",
         help=(
-            "FEAT-032: restrict source material to the named wavelength phase "
+            "Restrict source material to the named wavelength phase "
             "(rising, peaking, withdrawal, diminishing, bottoming_out, restoration)."
         ),
     ),
@@ -2310,7 +2310,7 @@ def draft(
         None,
         "--seed-mode",
         help=(
-            "FEAT-032: restrict source material to the named stance "
+            "Restrict source material to the named stance "
             "(inhabit, express, collaborate, integrate, absorb)."
         ),
     ),
@@ -2357,9 +2357,9 @@ def draft(
         False,
         "--no-llm",
         help=(
-            "FEAT-040.9: run the voice-fidelity guard in measure-only mode — "
-            "sanitize and score the draft against your voice fingerprint, but "
-            "skip the LLM rewrite pass (no extra network hop)."
+            "Run the voice-fidelity guard in measure-only mode — sanitize and "
+            "score the draft against your voice fingerprint, but skip the LLM "
+            "rewrite pass (no extra network hop)."
         ),
     ),
 ) -> None:
@@ -2370,7 +2370,7 @@ def draft(
     material, asks the LLM to generate a draft, and saves it to
     ``07-Voice/Drafts/`` with full provenance.
 
-    FEAT-032 manual seeding: pass any of ``--seed-fragment``,
+    Manual seeding: pass any of ``--seed-fragment``,
     ``--seed-topic``, ``--seed-frequency``, ``--seed-phase``, or
     ``--seed-mode`` to direct composition. ``--seed-fragment`` is
     mutually exclusive with the others; topic and dimensional filters
