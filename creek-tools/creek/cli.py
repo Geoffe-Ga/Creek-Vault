@@ -2357,9 +2357,9 @@ def draft(
         False,
         "--no-llm",
         help=(
-            "FEAT-040.9: run the voice-fidelity guard in measure-only mode — "
-            "sanitize and score the draft against your voice fingerprint, but "
-            "skip the LLM rewrite pass (no extra network hop)."
+            "Run the voice-fidelity guard in measure-only mode — sanitize and "
+            "score the draft against your voice fingerprint, but skip the LLM "
+            "rewrite pass (no extra network hop)."
         ),
     ),
 ) -> None:
