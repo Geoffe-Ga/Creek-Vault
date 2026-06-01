@@ -169,14 +169,16 @@ def test_draft_help_mentions_include_tier() -> None:
     assert "--include-tier" in _plain(result.output)
 
 
-def test_draft_help_no_llm_omits_internal_issue_tag() -> None:
-    """``creek draft --help`` advertises ``--no-llm`` without leaking a FEAT tag."""
+def test_draft_help_omits_internal_issue_tags() -> None:
+    """``creek draft --help`` advertises its flags without leaking any FEAT tag."""
     result = runner.invoke(app, ["draft", "--help"])
     assert result.exit_code == 0
     plain = _plain(result.output)
     assert "--no-llm" in plain
-    # Internal issue references belong in docstrings/commits, not user --help.
-    assert "FEAT-040" not in plain
+    assert "--seed-fragment" in plain
+    # Internal issue references belong in docstrings/commits, not user --help —
+    # guard the whole class (FEAT-040, FEAT-032, …), not just one tag.
+    assert "FEAT-" not in plain
 
 
 def test_report_help_mentions_include_tier() -> None:
