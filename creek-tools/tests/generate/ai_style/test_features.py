@@ -85,4 +85,4 @@ def test_registry_exposes_all_extractors() -> None:
     assert "em_dash_density" in FINGERPRINT_FEATURES
     assert FINGERPRINT_FEATURES["ai_vocab_density"] is ai_vocab_density
     assert FINGERPRINT_FEATURES["concrete_density"] is concrete_density
-    assert len(FINGERPRINT_FEATURES) == 12
+    assert len(FINGERPRINT_FEATURES) == 18
