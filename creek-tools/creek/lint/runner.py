@@ -36,6 +36,9 @@ from creek.lint.checks import (
 from creek.lint.checks import (
     unnamed as unnamed_check,
 )
+from creek.lint.checks import (
+    voice_fidelity as voice_fidelity_check,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -66,6 +69,7 @@ DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "tags",
     "compost",
     "draft-grounding",
+    "voice-fidelity",
 )
 """Cheap checks that always run by default (link graph + frontmatter only)."""
 
@@ -85,6 +89,7 @@ _REGISTRY: dict[str, _CheckCallable] = {
     "tags": tags_check.run,
     "compost": compost_check.run,
     "draft-grounding": draft_grounding_check.run,
+    "voice-fidelity": voice_fidelity_check.run,
     "paradox": paradox_check.run,
     "synchronicity": synchronicity_check.run,
     "unnamed": unnamed_check.run,
