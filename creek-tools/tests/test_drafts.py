@@ -10,6 +10,8 @@ import frontmatter
 import pytest
 import yaml
 
+from creek.config import AIStyleConfig
+from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 from creek.generate.drafts import (
     DRAFTS_SUBDIR,
     Draft,
@@ -3255,3 +3257,137 @@ class TestStylePreambleInjection:
         # Section bodies survive intact through the stitch pass.
         assert "First section." in prompt
         assert prompt.index("## Voice core") < prompt.index("## Voice targets")
+
+
+_TROPEY_BODY = (
+    "Additionally, this delves into the rich tapestry of the subject. "
+    "Moreover, it is important to note the vibrant and multifaceted nuances. "
+    "Furthermore, the landscape stands as a testament to its significance."
+)
+
+
+def _voice_fingerprint() -> VoiceFingerprint:
+    """A non-thin fingerprint with near-zero AI-ish rates."""
+    return VoiceFingerprint(
+        features={"em_dash_density": FeatureStat(rate=0.0, support=20)},
+        fragment_count=20,
+    )
+
+
+def _eager_ai_style(**overrides: object) -> AIStyleConfig:
+    """AI-style config that wants to rewrite almost any divergence."""
+    base: dict[str, object] = {"voice_distance_upper": 0.001, "max_revision_passes": 1}
+    base.update(overrides)
+    return AIStyleConfig(**base)
+
+
+def _tropey_draft() -> Draft:
+    """A draft whose body is dense with AI tells."""
+    return Draft(
+        title="On the tapestry",
+        body=_TROPEY_BODY,
+        idea_strategy=MiningStrategy.THREAD_TERMINUS.value,
+        source_fragments=(),
+        threads=(),
+        eddies=(),
+        skill_stack=(),
+        prompt="p",
+        generated_date=datetime(2026, 4, 20, tzinfo=UTC),
+    )
+
+
+class TestVoiceFidelityGuardWiring:
+    """The FEAT-040.9 guard runs at save time and stamps frontmatter."""
+
+    def test_save_draft_stamps_voice_fields(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """A guarded save records voice_distance and voice_findings."""
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=_eager_ai_style(),
+            voice_guard_no_llm=True,
+        )
+        path = gen.save_draft(_tropey_draft(), vault)
+        meta = frontmatter.load(str(path)).metadata
+        assert isinstance(meta["voice_distance"], float)
+        assert meta["voice_distance"] > 0.0
+        assert isinstance(meta["voice_findings"], list)
+        assert meta["voice_findings"]
+
+    def test_save_draft_without_config_stamps_nothing(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """No fingerprint/config means the guard is skipped entirely."""
+        gen = DraftGenerator(llm=llm_echo, skills_root=skills_root)
+        path = gen.save_draft(_tropey_draft(), vault)
+        meta = frontmatter.load(str(path)).metadata
+        assert "voice_distance" not in meta
+        assert "voice_findings" not in meta
+
+    def test_save_draft_disabled_subsystem_stamps_nothing(
+        self,
+        vault: Path,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """An explicitly disabled subsystem stamps no voice fields."""
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=AIStyleConfig(enabled=False),
+        )
+        path = gen.save_draft(_tropey_draft(), vault)
+        assert "voice_distance" not in frontmatter.load(str(path)).metadata
+
+    def test_save_draft_rewrites_body_toward_voice(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A lower-distance rewrite replaces the saved body."""
+        plain = "The cat sat by the window. Rain fell. I made tea and read."
+        gen = DraftGenerator(
+            llm=lambda _p: plain,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=_eager_ai_style(),
+        )
+        path = gen.save_draft(_tropey_draft(), vault)
+        content = frontmatter.load(str(path)).content
+        assert "tapestry" not in content
+        assert "cat sat" in content
+
+    def test_save_draft_no_llm_keeps_body_but_measures(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """``--no-llm`` measures and stamps but does not rewrite the body."""
+        called = {"n": 0}
+
+        def _llm(_prompt: str) -> str:
+            called["n"] += 1
+            return "should not be used"
+
+        gen = DraftGenerator(
+            llm=_llm,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=_eager_ai_style(),
+            voice_guard_no_llm=True,
+        )
+        path = gen.save_draft(_tropey_draft(), vault)
+        post = frontmatter.load(str(path))
+        assert called["n"] == 0
+        assert "tapestry" in post.content
+        assert isinstance(post.metadata["voice_distance"], float)

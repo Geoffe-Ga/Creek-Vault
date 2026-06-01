@@ -2353,6 +2353,15 @@ def draft(
             "flagged truncated in frontmatter and warned about on stderr."
         ),
     ),
+    no_llm: bool = typer.Option(
+        False,
+        "--no-llm",
+        help=(
+            "FEAT-040.9: run the voice-fidelity guard in measure-only mode — "
+            "sanitize and score the draft against your voice fingerprint, but "
+            "skip the LLM rewrite pass (no extra network hop)."
+        ),
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -2399,10 +2408,8 @@ def draft(
     current_phase = _parse_phase(phase)
     voice_text = _read_voice_core(voice_core)
     ai_style = _load_config_for_vault(vault).ai_style
-    style_preamble = build_style_preamble(
-        load_fingerprint(vault_path, ai_style),
-        ai_style,
-    )
+    fingerprint = load_fingerprint(vault_path, ai_style)
+    style_preamble = build_style_preamble(fingerprint, ai_style)
     override = _parse_include_tier(include_tier)
     seed_spec = _build_seed_spec(
         seed_fragment=seed_fragment,
@@ -2429,6 +2436,9 @@ def draft(
         privacy_override=override,
         bypass_compiled=bypass_compiled,
         ontology_twist=ontology_twist,
+        fingerprint=fingerprint,
+        ai_style_config=ai_style,
+        voice_guard_no_llm=no_llm,
     )
 
     if outline_text is not None:
