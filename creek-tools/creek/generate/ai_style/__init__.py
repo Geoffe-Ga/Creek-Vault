@@ -22,6 +22,12 @@ from creek.generate.ai_style.fingerprint import (
     load_fingerprint,
     save_fingerprint,
 )
+from creek.generate.ai_style.lexical import (
+    AI_VOCABULARY,
+    CONCRETE_COMMENT,
+    COPULATIVE_AVOIDANCE,
+    TRANSITION_OPENER,
+)
 from creek.generate.ai_style.model import (
     Category,
     Direction,
@@ -48,8 +54,12 @@ from creek.generate.ai_style.tells import (
 )
 
 __all__ = [
+    "AI_VOCABULARY",
+    "CONCRETE_COMMENT",
+    "COPULATIVE_AVOIDANCE",
     "FINGERPRINT_FEATURES",
     "TELL_REGISTRY",
+    "TRANSITION_OPENER",
     "Category",
     "Direction",
     "FeatureContribution",
