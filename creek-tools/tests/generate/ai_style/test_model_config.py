@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from creek.config import AIStyleConfig, CreekConfig
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 
@@ -66,3 +69,15 @@ class TestAIStyleConfig:
         data = CreekConfig().model_dump(mode="json")
         assert "ai_style" in data
         assert data["ai_style"]["enabled"] is True
+
+    def test_prompt_prevention_defaults(self) -> None:
+        """FEAT-040.8 prevention is on by default with a sane length cap."""
+        config = AIStyleConfig()
+        assert config.prevent_in_prompt is True
+        assert config.include_measured_targets is True
+        assert config.preamble_max_chars == 1200
+
+    def test_preamble_max_chars_rejects_negative(self) -> None:
+        """The length cap is constrained to be non-negative."""
+        with pytest.raises(ValidationError):
+            AIStyleConfig(preamble_max_chars=-1)

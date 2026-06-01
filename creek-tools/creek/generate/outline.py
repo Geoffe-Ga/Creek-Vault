@@ -186,6 +186,7 @@ def build_stitch_prompt(
     sections: list[tuple[str, str]],
     *,
     voice_core: str,
+    voice_targets: str = "",
 ) -> str:
     """Assemble the stitch-pass prompt from per-section bodies.
 
@@ -195,14 +196,19 @@ def build_stitch_prompt(
             unchanged save for added transitions.
         voice_core: Optional voice-core description prepended to the
             prompt; empty string to omit.
+        voice_targets: Optional FEAT-040.8 ``## Voice targets`` preamble
+            inserted after the voice core so the smoothing pass keeps to the
+            user's measured voice; empty string to omit.
 
     Returns:
-        The full stitch prompt: voice core (if any), the directive, the
-        labelled section bodies, and the ask.
+        The full stitch prompt: voice core (if any), the voice targets (if
+        any), the directive, the labelled section bodies, and the ask.
     """
     parts: list[str] = []
     if voice_core.strip():
         parts.append(f"## Voice core\n{voice_core.strip()}")
+    if voice_targets.strip():
+        parts.append(voice_targets.strip())
     parts.append(format_stitch_directive(len(sections)))
     rendered = "\n\n".join(
         f"### {heading}\n{body.strip()}" for heading, body in sections

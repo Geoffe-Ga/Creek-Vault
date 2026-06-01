@@ -2389,6 +2389,8 @@ def draft(
     longer essays; a draft cut off at the ceiling is flagged
     ``truncated`` in frontmatter and warned about on stderr.
     """
+    from creek.generate.ai_style.fingerprint import load_fingerprint
+    from creek.generate.ai_style.preamble import build_style_preamble
     from creek.generate.drafts import DraftGenerator
     from creek.generate.mining import IdeaMiner
 
@@ -2396,6 +2398,11 @@ def draft(
     skills_dir = skills_root if skills_root is not None else vault_path / "creek-skills"
     current_phase = _parse_phase(phase)
     voice_text = _read_voice_core(voice_core)
+    ai_style = _load_config_for_vault(vault).ai_style
+    style_preamble = build_style_preamble(
+        load_fingerprint(vault_path, ai_style),
+        ai_style,
+    )
     override = _parse_include_tier(include_tier)
     seed_spec = _build_seed_spec(
         seed_fragment=seed_fragment,
@@ -2418,6 +2425,7 @@ def draft(
         llm=llm,
         skills_root=skills_dir,
         voice_core=voice_text,
+        style_preamble=style_preamble,
         privacy_override=override,
         bypass_compiled=bypass_compiled,
         ontology_twist=ontology_twist,

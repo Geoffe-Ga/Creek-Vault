@@ -704,6 +704,9 @@ class DraftGenerator:
     Attributes:
         skills_root: Directory containing the SKILL.md tree.
         voice_core: Optional voice-core description prepended to prompts.
+        style_preamble: Optional FEAT-040.8 ``## Voice targets`` preamble
+            (the user's measured voice as positive targets plus a
+            personalised avoid-list) injected after the voice core.
     """
 
     def __init__(
@@ -712,6 +715,7 @@ class DraftGenerator:
         llm: DraftLLM,
         skills_root: Path,
         voice_core: str = "",
+        style_preamble: str = "",
         privacy_override: PrivacyTierOverride | None = None,
         bypass_compiled: bool = False,
         ontology_twist: bool = False,
@@ -727,6 +731,11 @@ class DraftGenerator:
             voice_core: Optional voice-core description the prompt will
                 open with (e.g. a paragraph describing the human's
                 baseline voice).
+            style_preamble: Optional ``## Voice targets`` preamble built by
+                :func:`creek.generate.ai_style.preamble.build_style_preamble`.
+                Injected after the voice core in every prompt path (single,
+                bare-section, and stitch) to steer generation toward the
+                user's measured voice. Empty string (the default) omits it.
             privacy_override: Optional ``--include-tier`` value applied
                 when scanning vault fragments for skill inference and
                 source material gathering.
@@ -757,6 +766,7 @@ class DraftGenerator:
         self._llm = llm
         self.skills_root = skills_root
         self.voice_core = voice_core
+        self.style_preamble = style_preamble
         self.privacy_override = privacy_override
         self.bypass_compiled = bypass_compiled
         self.ontology_twist = ontology_twist
@@ -1042,6 +1052,8 @@ class DraftGenerator:
         parts: list[str] = []
         if self.voice_core:
             parts.append(f"## Voice core\n{self.voice_core.strip()}")
+        if self.style_preamble:
+            parts.append(self.style_preamble)
         if skill_stack:
             skill_sections = [_render_skill_section(path) for path in skill_stack]
             parts.append("## Activated skills\n\n" + "\n\n".join(skill_sections))
@@ -1587,6 +1599,7 @@ class DraftGenerator:
         stitch_prompt = build_stitch_prompt(
             [(section.heading, section.body) for section in sections],
             voice_core=self.voice_core,
+            voice_targets=self.style_preamble,
         )
         body, stitch_truncated = self._invoke_draft_llm(
             stitch_prompt,
@@ -1787,6 +1800,8 @@ class DraftGenerator:
         parts: list[str] = []
         if self.voice_core:
             parts.append(f"## Voice core\n{self.voice_core.strip()}")
+        if self.style_preamble:
+            parts.append(self.style_preamble)
         phase_path = self._phase_skill(current_phase)
         if phase_path is not None and phase_path.exists():
             parts.append("## Activated skills\n\n" + _render_skill_section(phase_path))
