@@ -194,6 +194,69 @@ def concrete_density(text: str) -> float:
     return rate_per_kwords(len(CONCRETE_RE.findall(text)), text)
 
 
+# --- rhetorical features (FEAT-040.6) --------------------------------------
+# Public compiled patterns, shared by the fingerprint measurers below and the
+# rhetorical-detector locators, so each side counts/locates the same spans.
+
+SIGNIFICANCE_RE = re.compile(
+    r"\b(?:"
+    r"pivotal moment|significant shift|enduring legacy|lasting legacy|"
+    r"indelible mark|rich tapestry|stands as a testament|"
+    r"contributing to the broader|represents a (?:significant|major|profound)|"
+    r"marking a (?:pivotal|significant|key|crucial)|"
+    r"plays? a (?:vital|crucial|key|pivotal|significant) role|"
+    r"underscor\w+ (?:the|its) (?:importance|significance)|"
+    r"broader (?:movement|context|history|narrative|trend)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SUPERFICIAL_ING_RE = re.compile(
+    r",\s+(?:highlight|underscor|emphasiz|reflect|symboliz|showcas|"
+    r"demonstrat|illustrat|reinforc|cement|contribut|solidif|foster|"
+    r"enhanc|ensur)\w*ing\b"
+    r"|\b(?:generat\w+|sparr?\w+|prompt\w+) (?:debate|discussion|reflection) about\b",
+    re.IGNORECASE,
+)
+
+PEACOCK_RE = re.compile(
+    r"\b(?:boasts|vibrant|nestled|breathtaking|renowned|bustling|stunning|"
+    r"picturesque|charming|idyllic)\b"
+    r"|in the heart of|rich cultural heritage|natural beauty",
+    re.IGNORECASE,
+)
+
+VAGUE_ATTRIBUTION_RE = re.compile(
+    r"\b(?:observers have (?:cited|noted|argued)|experts (?:argue|say|note|believe)|"
+    r"critics (?:argue|say|note)|some (?:critics|scholars|observers|sources)|"
+    r"several (?:sources|publications|scholars)|industry reports|"
+    r"studies (?:show|suggest|indicate)|"
+    r"it is widely (?:believed|held|regarded|considered)|"
+    r"many (?:believe|argue|consider))\b",
+    re.IGNORECASE,
+)
+
+
+def significance_phrase_density(text: str) -> float:
+    """Return significance/legacy/broader-trend phrases per 1000 words."""
+    return rate_per_kwords(len(SIGNIFICANCE_RE.findall(text)), text)
+
+
+def superficial_ing_density(text: str) -> float:
+    """Return trailing ``-ing`` analysis clauses per 1000 words."""
+    return rate_per_kwords(len(SUPERFICIAL_ING_RE.findall(text)), text)
+
+
+def peacock_density(text: str) -> float:
+    """Return promotional / peacock terms per 1000 words."""
+    return rate_per_kwords(len(PEACOCK_RE.findall(text)), text)
+
+
+def vague_attribution_density(text: str) -> float:
+    """Return vague-attribution / weasel phrases per 1000 words."""
+    return rate_per_kwords(len(VAGUE_ATTRIBUTION_RE.findall(text)), text)
+
+
 FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "em_dash_density": em_dash_density,
     "curly_quote_density": curly_quote_density,
@@ -203,6 +266,10 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "transition_opener_rate": transition_opener_rate,
     "rule_of_three_rate": rule_of_three_rate,
     "concrete_density": concrete_density,
+    "significance_phrase_density": significance_phrase_density,
+    "superficial_ing_density": superficial_ing_density,
+    "peacock_density": peacock_density,
+    "vague_attribution_density": vague_attribution_density,
 }
 """The feature_key -> extractor map the fingerprint measures over the
 user's corpus. Detector tells (FEAT-040.3 through .7) query these same

@@ -37,6 +37,12 @@ from creek.generate.ai_style.model import (
     Span,
     VoiceFingerprint,
 )
+from creek.generate.ai_style.rhetorical import (
+    PEACOCK,
+    SIGNIFICANCE,
+    SUPERFICIAL_ING,
+    VAGUE_ATTRIBUTION,
+)
 from creek.generate.ai_style.sanitize_structure import sanitize_structure
 from creek.generate.ai_style.sanitize_typography import (
     normalize_typography,
@@ -58,8 +64,12 @@ __all__ = [
     "CONCRETE_COMMENT",
     "COPULATIVE_AVOIDANCE",
     "FINGERPRINT_FEATURES",
+    "PEACOCK",
+    "SIGNIFICANCE",
+    "SUPERFICIAL_ING",
     "TELL_REGISTRY",
     "TRANSITION_OPENER",
+    "VAGUE_ATTRIBUTION",
     "Category",
     "Direction",
     "FeatureContribution",
