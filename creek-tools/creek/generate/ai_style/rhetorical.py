@@ -30,7 +30,9 @@ def _spans(pattern: re.Pattern[str], text: str) -> list[Span]:
     return [Span(m.start(), m.end()) for m in pattern.finditer(text)]
 
 
-# A single phrase over the user's baseline is normal; a cluster is the tell.
+# Additive margin, in phrases per 1000 words: a tell fires only when the
+# draft's measured rate exceeds the user's own baseline rate by more than
+# this. A single phrase over baseline is normal; a cluster is the tell.
 _PHRASE_MARGIN = 1.5
 
 SIGNIFICANCE = register(
