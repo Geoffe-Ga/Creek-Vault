@@ -78,8 +78,9 @@ CONCRETE_RE = re.compile(r"\bconcrete\b", re.IGNORECASE)
 
 # Baseline heuristic: matches single-word triads ("red, white, and blue")
 # but not multi-word items ("a vivid red, a soft white, and a deep blue").
-# Good enough for a rate baseline; FEAT-040.7 can broaden it if needed.
-_TRIAD_RE = re.compile(
+# Good enough for a rate baseline. Public so the FEAT-040.7 rule-of-three
+# tell locates exactly the triads the fingerprint counted.
+TRIAD_RE = re.compile(
     r"\b\w+,\s+\w+,?\s+(?:and|or)\s+\w+\b",
 )
 
@@ -175,7 +176,7 @@ def transition_opener_rate(text: str) -> float:
 
 def rule_of_three_rate(text: str) -> float:
     """Return ``a, b, and c`` triads per 1000 words (a padding heuristic)."""
-    return rate_per_kwords(len(_TRIAD_RE.findall(text)), text)
+    return rate_per_kwords(len(TRIAD_RE.findall(text)), text)
 
 
 def concrete_density(text: str) -> float:
@@ -257,6 +258,104 @@ def vague_attribution_density(text: str) -> float:
     return rate_per_kwords(len(VAGUE_ATTRIBUTION_RE.findall(text)), text)
 
 
+# --- discourse / structure features (FEAT-040.7) ---------------------------
+# Public compiled patterns, shared by the fingerprint measurers below and the
+# discourse-detector locators, so each side counts/locates the same spans.
+# Each pattern matches the offending phrase as group 0 (no lead-in capture)
+# unless noted, so a plain ``finditer`` span is the thing to surface.
+
+NEGATIVE_PARALLELISM_RE = re.compile(
+    r"\bnot only\b[^.!?\n]{1,80}?\bbut(?: also)?\b"
+    r"|\bit'?s not (?:just |merely |only )?[^.!?\n]{1,60}?,\s*it'?s\b"
+    r"|\bno [a-z]+, no [a-z]+,?\s+(?:just|but)\b",
+    re.IGNORECASE,
+)
+
+CHALLENGES_SECTION_RE = re.compile(
+    r"\bdespite its\b[^.!?\n]{0,80}?\bfaces\b[^.!?\n]{0,40}?\bchallenges\b",
+    re.IGNORECASE,
+)
+
+# Group 1 is the phrase; the line-start anchor is not part of the surfaced span.
+LIST_TITLE_LEAD_RE = re.compile(
+    r"^(?P<phrase>(?:the )?list of [^.\n]{1,80}? is (?:a|an)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+KNOWLEDGE_CUTOFF_RE = re.compile(
+    r"\bas of my (?:last )?(?:knowledge update|knowledge cutoff|update)\b"
+    r"|\bwhile specific details are limited in the available sources\b"
+    r"|\blikely supports\b"
+    r"|\bmaintains a low profile\b",
+    re.IGNORECASE,
+)
+
+DIDACTIC_DISCLAIMER_RE = re.compile(
+    r"\bit'?s important to note\b"
+    r"|\bimportant to note that\b"
+    r"|\b(?:it'?s|it is) worth noting\b"
+    r"|\bworth noting that\b"
+    r"|\bit should be noted\b"
+    r"|\bmay vary\b",
+    re.IGNORECASE,
+)
+
+# Group 1 is the phrase; a preceding sentence terminator / line start anchors
+# it to a section boundary but is not part of the surfaced span.
+SECTION_SUMMARY_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?P<phrase>(?:in summary|in conclusion|overall|"
+    r"to summarize|to sum up|all in all)),",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+COMM_BOILERPLATE_RE = re.compile(
+    r"\bi hope this helps\b"
+    r"|\bwould you like (?:me )?to\b"
+    r"|\bcertainly!"
+    r"|\blet me know if\b"
+    r"|\bfeel free to\b"
+    r"|\barticles for creation\b"
+    r"|\bsubmitting (?:this|the) (?:draft|article)\b"
+    r"|^subject:",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def negative_parallelism_density(text: str) -> float:
+    """Return negative-parallelism constructions per 1000 words."""
+    return rate_per_kwords(len(NEGATIVE_PARALLELISM_RE.findall(text)), text)
+
+
+def challenges_section_density(text: str) -> float:
+    """Return ``Despite its X, Y faces challenges`` formulas per 1000 words."""
+    return rate_per_kwords(len(CHALLENGES_SECTION_RE.findall(text)), text)
+
+
+def list_title_lead_density(text: str) -> float:
+    """Return list/non-proper-noun-title-as-entity leads per 1000 words."""
+    return rate_per_kwords(len(LIST_TITLE_LEAD_RE.findall(text)), text)
+
+
+def knowledge_cutoff_density(text: str) -> float:
+    """Return knowledge-cutoff / not-documented disclaimers per 1000 words."""
+    return rate_per_kwords(len(KNOWLEDGE_CUTOFF_RE.findall(text)), text)
+
+
+def didactic_disclaimer_density(text: str) -> float:
+    """Return didactic disclaimers (important to note, may vary) per 1000 words."""
+    return rate_per_kwords(len(DIDACTIC_DISCLAIMER_RE.findall(text)), text)
+
+
+def section_summary_density(text: str) -> float:
+    """Return sentence-initial section summaries per 1000 words."""
+    return rate_per_kwords(len(SECTION_SUMMARY_RE.findall(text)), text)
+
+
+def comm_boilerplate_density(text: str) -> float:
+    """Return collaborative-comm boilerplate phrases per 1000 words."""
+    return rate_per_kwords(len(COMM_BOILERPLATE_RE.findall(text)), text)
+
+
 FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "em_dash_density": em_dash_density,
     "curly_quote_density": curly_quote_density,
@@ -270,6 +369,12 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "superficial_ing_density": superficial_ing_density,
     "peacock_density": peacock_density,
     "vague_attribution_density": vague_attribution_density,
+    "negative_parallelism_density": negative_parallelism_density,
+    "challenges_section_density": challenges_section_density,
+    "list_title_lead_density": list_title_lead_density,
+    "didactic_disclaimer_density": didactic_disclaimer_density,
+    "section_summary_density": section_summary_density,
+    "comm_boilerplate_density": comm_boilerplate_density,
 }
 """The feature_key -> extractor map the fingerprint measures over the
 user's corpus. Detector tells (FEAT-040.3 through .7) query these same

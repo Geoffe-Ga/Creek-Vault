@@ -10,6 +10,16 @@ catalogs and add the sanitizer, prompt prevention, guard, and lint check.
 
 from __future__ import annotations
 
+from creek.generate.ai_style.discourse import (
+    CHALLENGES_SECTION,
+    COMM_BOILERPLATE,
+    DIDACTIC_DISCLAIMER,
+    KNOWLEDGE_CUTOFF,
+    LIST_TITLE_LEAD,
+    NEGATIVE_PARALLELISM,
+    RULE_OF_THREE_PADDING,
+    SECTION_SUMMARY,
+)
 from creek.generate.ai_style.distance import (
     FeatureContribution,
     bad_direction_magnitude,
@@ -61,10 +71,18 @@ from creek.generate.ai_style.tells import (
 
 __all__ = [
     "AI_VOCABULARY",
+    "CHALLENGES_SECTION",
+    "COMM_BOILERPLATE",
     "CONCRETE_COMMENT",
     "COPULATIVE_AVOIDANCE",
+    "DIDACTIC_DISCLAIMER",
     "FINGERPRINT_FEATURES",
+    "KNOWLEDGE_CUTOFF",
+    "LIST_TITLE_LEAD",
+    "NEGATIVE_PARALLELISM",
     "PEACOCK",
+    "RULE_OF_THREE_PADDING",
+    "SECTION_SUMMARY",
     "SIGNIFICANCE",
     "SUPERFICIAL_ING",
     "TELL_REGISTRY",
