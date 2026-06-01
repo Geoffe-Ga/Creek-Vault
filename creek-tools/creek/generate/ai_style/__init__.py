@@ -47,6 +47,7 @@ from creek.generate.ai_style.model import (
     Span,
     VoiceFingerprint,
 )
+from creek.generate.ai_style.preamble import build_style_preamble
 from creek.generate.ai_style.rhetorical import (
     PEACOCK,
     SIGNIFICANCE,
@@ -99,6 +100,7 @@ __all__ = [
     "VoiceFingerprint",
     "bad_direction_magnitude",
     "build_fingerprint",
+    "build_style_preamble",
     "extract_user_turns",
     "get_tells",
     "load_fingerprint",

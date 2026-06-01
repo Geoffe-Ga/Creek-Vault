@@ -903,6 +903,25 @@ class AIStyleConfig(BaseModel):
     fingerprint_path: str = "00-Creek-Meta/voice-fingerprint.json"
     """Vault-relative path where the voice fingerprint is persisted."""
 
+    prevent_in_prompt: bool = True
+    """Master switch for FEAT-040.8 prompt prevention. When ``True`` a
+    ``## Voice targets`` preamble (the user's measured voice as positive
+    targets plus a personalised avoid-list) is injected into draft prompts.
+    Prevention is the primary lever — it is cheaper and more faithful than
+    repairing AI-voice after the fact."""
+
+    include_measured_targets: bool = True
+    """Whether the preamble states the user's *measured* habits as positive
+    targets (e.g. "uses em-dashes freely (~4.2 per 1000 words)"). When
+    ``False`` the preamble keeps only the personalised avoid-list. Disabling
+    is useful before the fingerprint is trustworthy."""
+
+    preamble_max_chars: int = Field(default=1200, ge=0)
+    """Length cap for the injected preamble, in characters. The avoid-list is
+    trimmed to fit (the measured targets are always kept) so an overlong
+    avoid-list never induces the stilted "evasion" voice we are escaping.
+    ``0`` disables the cap."""
+
     def weight_for(self, *, category: str, feature_key: str) -> float:
         """Resolve the divergence weight for a feature.
 

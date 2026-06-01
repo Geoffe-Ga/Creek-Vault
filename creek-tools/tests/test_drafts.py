@@ -18,6 +18,7 @@ from creek.generate.drafts import (
     SeedSpec,
 )
 from creek.generate.mining import IdeaSeed, MiningStrategy
+from creek.generate.outline import OutlineSection, build_stitch_prompt
 from creek.models import (
     Confidence,
     Dosage,
@@ -3175,3 +3176,82 @@ class TestSourceProfileComputedOncePerSection:
             detect_ontology=detector,
         )
         assert calls["n"] == 1
+
+
+_PREAMBLE = "## Voice targets\nThis writer's voice: uses em-dashes freely"
+
+
+class TestStylePreambleInjection:
+    """The FEAT-040.8 preamble reaches all three prompt paths intact."""
+
+    def test_compose_prompt_injects_after_voice_core(
+        self,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """The single-prompt path keeps voice core, preamble, and source."""
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            voice_core="My baseline voice.",
+            style_preamble=_PREAMBLE,
+        )
+        prompt = gen._compose_prompt(_build_seed(), [], "A source paragraph.")
+        assert "## Voice core" in prompt
+        assert "## Voice targets" in prompt
+        # No FEAT-032 regression: the source material survives unchanged.
+        assert "A source paragraph." in prompt
+        assert (
+            prompt.index("## Voice core")
+            < prompt.index("## Voice targets")
+            < prompt.index("## Source material")
+        )
+
+    def test_compose_prompt_omits_preamble_when_empty(
+        self,
+        skills_root: Path,
+        llm_echo: Callable[[str], str],
+    ) -> None:
+        """With no preamble the prompt is unchanged from the legacy shape."""
+        gen = DraftGenerator(
+            llm=llm_echo,
+            skills_root=skills_root,
+            voice_core="My baseline voice.",
+        )
+        prompt = gen._compose_prompt(_build_seed(), [], "A source paragraph.")
+        assert "## Voice targets" not in prompt
+
+    def test_bare_section_injects_preamble(
+        self,
+        skills_root: Path,
+    ) -> None:
+        """The source-less bare-section path also carries the preamble."""
+        captured: dict[str, str] = {}
+
+        def _capture(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "Section body."
+
+        gen = DraftGenerator(
+            llm=_capture,
+            skills_root=skills_root,
+            voice_core="My baseline voice.",
+            style_preamble=_PREAMBLE,
+        )
+        section = OutlineSection(heading="A heading", level=2, body="A directive.")
+        gen._compose_bare_section(section, None)
+        assert "## Voice core" in captured["prompt"]
+        assert "## Voice targets" in captured["prompt"]
+
+    def test_stitch_prompt_injects_preamble(self) -> None:
+        """The stitch smoothing pass carries the preamble after voice core."""
+        prompt = build_stitch_prompt(
+            [("One", "First section."), ("Two", "Second section.")],
+            voice_core="My baseline voice.",
+            voice_targets=_PREAMBLE,
+        )
+        assert "## Voice core" in prompt
+        assert "## Voice targets" in prompt
+        # Section bodies survive intact through the stitch pass.
+        assert "First section." in prompt
+        assert prompt.index("## Voice core") < prompt.index("## Voice targets")
