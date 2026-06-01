@@ -17,9 +17,11 @@ from creek.config import AIStyleConfig
 from creek.generate.ai_style.guard import (
     VoiceFidelityReport,
     build_voice_fidelity_frontmatter,
+    build_voice_rewrite_prompt,
     run_voice_fidelity_guard,
 )
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
+from creek.generate.ai_style.scanner import scan
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -235,3 +237,34 @@ def test_frontmatter_stamps_distance_and_findings() -> None:
 def test_build_frontmatter_skips_empty() -> None:
     """A clean run with no distance/findings stamps nothing misleading."""
     assert build_voice_fidelity_frontmatter(voice_distance=None, findings=()) == {}
+
+
+def test_rewrite_prompt_orders_targets_divergences_ask_draft() -> None:
+    """The rewrite prompt carries targets, divergences, ask, and draft in order."""
+    report = scan(_TROPEY, fingerprint=_fingerprint(), config=AIStyleConfig())
+    assert report.findings  # the tropey body must surface divergences to repair
+    preamble = "## Voice targets\nuses em-dashes freely"
+    prompt = build_voice_rewrite_prompt(_TROPEY, report, style_preamble=preamble)
+    assert preamble in prompt
+    assert "## Voice divergences to repair" in prompt
+    assert "## Ask" in prompt
+    assert f"## Draft\n{_TROPEY}" in prompt
+    # The rewrite must move toward voice without fabricating or dropping content.
+    assert "Do not invent facts" in prompt
+    assert (
+        prompt.index(preamble)
+        < prompt.index("## Voice divergences to repair")
+        < prompt.index("## Ask")
+        < prompt.index("## Draft")
+    )
+
+
+def test_rewrite_prompt_omits_empty_blocks() -> None:
+    """With no preamble and no findings, only the ask + draft remain."""
+    report = scan(_PLAIN, fingerprint=_fingerprint(), config=AIStyleConfig())
+    assert not report.findings
+    prompt = build_voice_rewrite_prompt(_PLAIN, report)
+    assert "## Voice targets" not in prompt
+    assert "## Voice divergences to repair" not in prompt
+    assert prompt.startswith("## Ask")
+    assert f"## Draft\n{_PLAIN}" in prompt
