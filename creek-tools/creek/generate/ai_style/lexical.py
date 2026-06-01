@@ -26,13 +26,16 @@ def _word_alt(words: tuple[str, ...]) -> re.Pattern[str]:
 
 
 _AI_VOCAB_RE = _word_alt(features.AI_VOCAB)
-_MARKETING_RE = _word_alt(features.MARKETING_VERBS)
+# Shared with the measurer (features.MARKETING_RE) so locator and measurer
+# agree on exactly which marketing-verb occurrences exist.
+_MARKETING_RE = features.MARKETING_RE
 # Sentence-initial transition word (start of text or after a terminator).
-# Uses ``[.!?]+`` to match transition_opener_rate's sentence splitter, so the
-# locator finds exactly what the measurer counts (e.g. after "Done!!").
+# Uses ``[.!?]+`` to match transition_opener_rate's sentence splitter, and
+# NOT re.MULTILINE: the measurer never treats a bare newline as a sentence
+# boundary, so the locator must not either (else it over-locates in lists).
 _TRANSITION_RE = re.compile(
     r"(?:^|[.!?]+\s+)(" + "|".join(features.TRANSITION_OPENERS) + r")\b",
-    re.IGNORECASE | re.MULTILINE,
+    re.IGNORECASE,
 )
 
 
@@ -119,7 +122,7 @@ CONCRETE_COMMENT = register(
     Tell(
         id="concrete_comment",
         category="lexical",
-        feature_key="concrete_rate",
+        feature_key="concrete_density",
         handling="surface",
         polarity="avoid",
         description='Overuse of "concrete" (concrete evidence/examples) in comments.',

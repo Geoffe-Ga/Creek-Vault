@@ -21,7 +21,7 @@ _PLAIN = VoiceFingerprint(
         "ai_vocab_density": FeatureStat(rate=0.0, support=50),
         "marketing_verb_ratio": FeatureStat(rate=0.0, support=50),
         "transition_opener_rate": FeatureStat(rate=0.0, support=50),
-        "concrete_rate": FeatureStat(rate=0.0, support=50),
+        "concrete_density": FeatureStat(rate=0.0, support=50),
     },
     fragment_count=50,
 )
@@ -31,7 +31,7 @@ _ORNATE = VoiceFingerprint(
         "ai_vocab_density": FeatureStat(rate=900.0, support=50),
         "marketing_verb_ratio": FeatureStat(rate=0.99, support=50),
         "transition_opener_rate": FeatureStat(rate=900.0, support=50),
-        "concrete_rate": FeatureStat(rate=900.0, support=50),
+        "concrete_density": FeatureStat(rate=900.0, support=50),
     },
     fragment_count=50,
 )
@@ -160,8 +160,24 @@ class TestLocators:
         text = "Additionally, yes. I add moreover mid-sentence."
         assert text[spans[0].start : spans[0].end].lower() == "additionally"
 
+    def test_locate_transitions_not_at_bare_line_start(self) -> None:
+        """A list item without a terminator is NOT a located transition.
+
+        The measurer never counts a bare newline as a sentence boundary, so
+        (with re.MULTILINE dropped) the locator must not either.
+        """
+        spans = _locate_transitions("- item one\n- Moreover, item two")
+        assert spans == []
+
 
 def test_one_ai_vocab_word_below_margin_no_false_positive() -> None:
     """A single AI-vocab word in a long human text stays under the margin."""
     text = "robust " + " ".join(["plain"] * 999)
     assert not _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "ai_vocabulary")
+
+
+def test_one_concrete_word_below_margin_no_false_positive() -> None:
+    """A single "concrete" in a long comment stays under the margin."""
+    text = "concrete " + " ".join(["plain"] * 999)
+    report = scan(text, fingerprint=_PLAIN, config=_CONFIG, context="comment")
+    assert not _fired(report, "concrete_comment")

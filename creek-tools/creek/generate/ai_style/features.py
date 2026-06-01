@@ -40,6 +40,13 @@ MARKETING_VERBS = (
     "offers",
     "maintains",
 )
+# Word-bounded marketing-verb matcher, shared by the measurer below and the
+# lexical locator, so both count/locate the same occurrences (e.g. neither
+# matches "features" inside "misfeatures").
+MARKETING_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(v) for v in MARKETING_VERBS) + r")\b",
+    re.IGNORECASE,
+)
 _COPULAS = (" is ", " are ", " was ", " were ", " has ", " have ")
 
 TRANSITION_OPENERS = (
@@ -122,7 +129,7 @@ def marketing_verb_ratio(text: str) -> float:
         ``marketing / (marketing + copula)`` in ``[0, 1]``; ``0.0`` when the
         denominator is zero.
     """
-    marketing = _count_phrases(text, MARKETING_VERBS)
+    marketing = len(MARKETING_RE.findall(text))
     copula = _count_phrases(text, _COPULAS)
     denom = marketing + copula
     return marketing / denom if denom else 0.0
@@ -195,7 +202,7 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "sentence_length_mean": sentence_length_mean,
     "transition_opener_rate": transition_opener_rate,
     "rule_of_three_rate": rule_of_three_rate,
-    "concrete_rate": concrete_density,
+    "concrete_density": concrete_density,
 }
 """The feature_key -> extractor map the fingerprint measures over the
 user's corpus. Detector tells (FEAT-040.3 through .7) query these same
