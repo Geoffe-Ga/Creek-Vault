@@ -51,6 +51,11 @@ Deterministic (always run by default):
   enforces ≤3000 words on root `AGENTS.md`.
 - `tags` — single-use tags surfaced as orphans (never auto-deleted).
 - `compost` — counts of recorded compost notes under `10-Liminal/Compost/`.
+- `draft-grounding` — drafts whose stamped grounding scores
+  (`derivative_score` / `grounding_score`) fall outside the configured
+  `draft.derivative_upper` / `draft.grounding_fraction_lower` bounds.
+- `voice-fidelity` — drafts whose distance from your *measured voice*
+  exceeds `ai_style.voice_distance_upper` (see below).
 
 Semantic (run when `--since` or an explicit `--check` is passed):
 
@@ -58,6 +63,28 @@ Semantic (run when `--since` or an explicit `--check` is passed):
 - `synchronicity` — surprising cross-source resonances already on disk.
 - `unnamed` — fragments whose primary frequency is `unclassified`,
   wherever they live, plus anything physically under `10-Liminal/Unnamed/`.
+
+### Voice fidelity (FEAT-040)
+
+The `voice-fidelity` check walks `07-Voice/Drafts/`, reads the
+`voice_distance` / `voice_findings` frontmatter stamped by the
+generation-time guard (and re-scans any draft that lacks the stamp against
+your voice fingerprint), and surfaces one finding per draft whose
+`voice_distance` exceeds `ai_style.voice_distance_upper` (default `0.35`).
+Each finding names the top over- and under-used features and a remediation
+hint — re-run `creek draft` or revise toward your voice. It runs by default,
+or on demand with `creek lint --check voice-fidelity`. If no fingerprint
+exists yet it emits a single informational finding (run the profiler first)
+rather than failing. Like every lint check it only **reads** — it never
+rewrites or deletes a draft.
+
+> **This is not an AI detector.** Voice distance is a *probabilistic,
+> vault-relative* signal: it measures how far a draft sits from **your own
+> measured writing**, not whether text "is AI". A high distance means "this
+> reads less like you than your baseline" — a prompt to revise toward your
+> voice, never proof of authorship and never an accusation. Humans and tools
+> are unreliable at AI detection; this check exists to surface drafts for
+> *your* review, not to convict. Do not use it to accuse anyone of using AI.
 
 ## Output
 

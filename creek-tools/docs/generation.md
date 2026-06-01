@@ -195,6 +195,16 @@ draft:
 
 This means every draft can be **re-run** later from the same seed and skill stack — useful for tracking how the same idea drafts differently as the vault grows.
 
+### Voice fidelity (FEAT-040)
+
+The goal of generation is text that sounds like **you**, measured from your own writing — not text that merely avoids a generic "AI" checklist. Three pieces make that vault-relative:
+
+- **The fingerprint.** `creek report --type fingerprint` profiles your genuinely-authored vault content into a `VoiceFingerprint` (`00-Creek-Meta/voice-fingerprint.json`): a per-feature rate (em-dash density, transition-opener rate, AI-vocabulary rate, triad rate, …) plus the fragment support behind each. An **authorship filter** weights sources by how much of the text is really yours — journal and long-form markdown count fully; only the *your-turn* side of chat exports survives, and at a lower weight — so the baseline reflects you, not the assistants you talked to.
+- **The guard.** During `creek draft`, after composition the draft is sanitized, scored for **voice distance** against the fingerprint, and — when distance exceeds `ai_style.voice_distance_upper` — rewritten *toward* your measured voice (bounded, regression-guarded, and never at the cost of grounding). Pass `--no-llm` to sanitize and measure only, with no rewrite hop.
+- **The stamp.** The final `voice_distance` and the residual `voice_findings` are written into the draft's frontmatter, so the `voice-fidelity` lint check (and you) can later see how far each draft sits from your voice without re-measuring.
+
+> **Voice distance is not an AI detector.** It is a *probabilistic, vault-relative* signal — how far a draft sits from **your own measured writing**, not whether text "is AI". A high distance is a prompt to revise toward your voice, never proof of authorship. Humans and tools are unreliable at AI detection; these scores are for *your* review, never an accusation.
+
 ## Local-first ergonomics
 
 All generation flows (`mine`, `draft`, `report`, `skills`) respect the privacy tier configuration via the shared filter in `creek/classify/privacy_filter.py`. By default:
