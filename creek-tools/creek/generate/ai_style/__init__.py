@@ -32,6 +32,11 @@ from creek.generate.ai_style.fingerprint import (
     load_fingerprint,
     save_fingerprint,
 )
+from creek.generate.ai_style.guard import (
+    VoiceFidelityReport,
+    build_voice_fidelity_frontmatter,
+    run_voice_fidelity_guard,
+)
 from creek.generate.ai_style.lexical import (
     AI_VOCABULARY,
     CONCRETE_COMMENT,
@@ -97,16 +102,19 @@ __all__ = [
     "ScanReport",
     "Span",
     "Tell",
+    "VoiceFidelityReport",
     "VoiceFingerprint",
     "bad_direction_magnitude",
     "build_fingerprint",
     "build_style_preamble",
+    "build_voice_fidelity_frontmatter",
     "extract_user_turns",
     "get_tells",
     "load_fingerprint",
     "normalize_typography",
     "rate_per_kwords",
     "register",
+    "run_voice_fidelity_guard",
     "sanitize",
     "sanitize_structure",
     "save_fingerprint",

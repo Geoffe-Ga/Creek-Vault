@@ -39,6 +39,7 @@ from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
 )
+from creek.generate.ai_style.guard import run_voice_fidelity_guard
 from creek.generate.compile_routing import (
     CompiledPageIndex,
     empty_index,
@@ -90,6 +91,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.classify.prompt import PromptOntology
+    from creek.config import AIStyleConfig
+    from creek.generate.ai_style.guard import GroundingCheck
+    from creek.generate.ai_style.model import VoiceFingerprint
     from creek.generate.mining import IdeaSeed
 
 
@@ -721,6 +725,9 @@ class DraftGenerator:
         ontology_twist: bool = False,
         embedding_fn: EmbeddingFn | None = None,
         grounding_thresholds: GroundingThresholds | None = None,
+        fingerprint: VoiceFingerprint | None = None,
+        ai_style_config: AIStyleConfig | None = None,
+        voice_guard_no_llm: bool = False,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -762,6 +769,17 @@ class DraftGenerator:
                 Required only when *embedding_fn* is supplied; ignored
                 otherwise. Callers typically build this with
                 :meth:`creek.generate.grounding.GroundingThresholds.from_config`.
+            fingerprint: The user's voice fingerprint (FEAT-040.2). When
+                supplied alongside *ai_style_config* the FEAT-040.9
+                voice-fidelity guard runs at save time: sanitize, measure
+                distance, and bounded-rewrite toward the user's voice. When
+                ``None`` the guard is skipped.
+            ai_style_config: The AI-style configuration. Required for the
+                voice-fidelity guard; when ``None`` (or ``enabled`` is
+                ``False``) the guard is skipped.
+            voice_guard_no_llm: When ``True`` the voice-fidelity guard
+                sanitizes and measures only — no rewrite hop (honours the
+                ``creek draft --no-llm`` flag).
         """
         self._llm = llm
         self.skills_root = skills_root
@@ -772,6 +790,9 @@ class DraftGenerator:
         self.ontology_twist = ontology_twist
         self._embedding_fn = embedding_fn
         self._grounding_thresholds = grounding_thresholds
+        self._fingerprint = fingerprint
+        self._ai_style_config = ai_style_config
+        self._voice_guard_no_llm = voice_guard_no_llm
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -1824,6 +1845,84 @@ class DraftGenerator:
             empty_message="LLM returned an empty section body",
         )
 
+    def _voice_rewrite_llm(self) -> Callable[[str], str]:
+        """Adapt the draft LLM to the guard's ``(prompt) -> body`` signature."""
+
+        def _rewrite(prompt: str) -> str:
+            body, _ = self._invoke_draft_llm(
+                prompt,
+                empty_message="LLM returned an empty voice rewrite",
+            )
+            return body
+
+        return _rewrite
+
+    def _voice_grounding_check(
+        self,
+        vault_path: Path,
+        source_fragments: tuple[str, ...],
+    ) -> GroundingCheck | None:
+        """Build the grounding veto, or ``None`` when grounding is not wired.
+
+        The check re-scores a candidate rewrite against the same source
+        fragments the grounding guard uses and rejects any rewrite that drops
+        the draft below its grounding floor — so voice fidelity is never
+        bought at the cost of grounding.
+        """
+        if self._embedding_fn is None or self._grounding_thresholds is None:
+            return None
+        fragments = _load_fragments_by_id(
+            vault_path / _FRAGMENTS_SUBDIR,
+            privacy_override=self.privacy_override,
+        )
+        source_texts = tuple(
+            fragments[fid][1] for fid in source_fragments if fid in fragments
+        )
+        embedding_fn = self._embedding_fn
+        thresholds = self._grounding_thresholds
+
+        def _still_grounded(body: str) -> bool:
+            report = score_draft(
+                body,
+                source_texts=source_texts,
+                embedding_fn=embedding_fn,
+                thresholds=thresholds,
+            )
+            return not report.is_flagged_grounding
+
+        return _still_grounded
+
+    def _apply_voice_fidelity(
+        self,
+        body: str,
+        *,
+        vault_path: Path,
+        source_fragments: tuple[str, ...],
+    ) -> tuple[str, dict[str, object]]:
+        """Run the voice-fidelity guard, returning ``(body, frontmatter)``.
+
+        A no-op (returns *body* unchanged and an empty payload) when the
+        fingerprint or AI-style config is absent or the subsystem is
+        disabled. Otherwise sanitizes, measures, and bounded-rewrites *body*
+        toward the user's voice, prints the guard's summary to stderr, and
+        returns the guarded body plus its frontmatter fields.
+        """
+        config = self._ai_style_config
+        fingerprint = self._fingerprint
+        if config is None or fingerprint is None or not config.enabled:
+            return body, {}
+        report = run_voice_fidelity_guard(
+            body,
+            fingerprint=fingerprint,
+            config=config,
+            llm=self._voice_rewrite_llm(),
+            no_llm=self._voice_guard_no_llm,
+            style_preamble=self.style_preamble,
+            grounding_check=self._voice_grounding_check(vault_path, source_fragments),
+        )
+        print(report.summary_line(), file=sys.stderr)
+        return report.body, report.to_frontmatter()
+
     def save_outline_draft(
         self,
         draft: OutlineDraft,
@@ -1854,8 +1953,13 @@ class DraftGenerator:
         slug = _slugify(draft.title)
         date_prefix = draft.generated_date.strftime("%Y-%m-%d")
         target = _next_available_draft_path(drafts_dir, date_prefix, slug)
+        body, voice_fields = self._apply_voice_fidelity(
+            draft.body,
+            vault_path=vault_path,
+            source_fragments=(),
+        )
         post = frontmatter.Post(
-            content=_draft_file_body(draft.body, truncated=draft.truncated),
+            content=_draft_file_body(body, truncated=draft.truncated),
             type="draft",
             title=draft.title,
             status="draft",
@@ -1866,6 +1970,8 @@ class DraftGenerator:
             truncated=draft.truncated,
             sections=[_serialise_section(section) for section in draft.sections],
         )
+        for key, value in voice_fields.items():
+            post[key] = value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target
 
@@ -1887,8 +1993,13 @@ class DraftGenerator:
         slug = _slugify(draft.title)
         date_prefix = draft.generated_date.strftime("%Y-%m-%d")
         target = _next_available_draft_path(drafts_dir, date_prefix, slug)
+        body, voice_fields = self._apply_voice_fidelity(
+            draft.body,
+            vault_path=vault_path,
+            source_fragments=draft.source_fragments,
+        )
         post = frontmatter.Post(
-            content=_draft_file_body(draft.body, truncated=draft.truncated),
+            content=_draft_file_body(body, truncated=draft.truncated),
             type="draft",
             title=draft.title,
             status="draft",
@@ -1919,6 +2030,8 @@ class DraftGenerator:
             paragraph_annotations=draft.paragraph_grounding,
         )
         for key, value in guard_fields.items():
+            post[key] = value
+        for key, value in voice_fields.items():
             post[key] = value
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return target

@@ -922,6 +922,15 @@ class AIStyleConfig(BaseModel):
     avoid-list never induces the stilted "evasion" voice we are escaping.
     ``0`` disables the cap."""
 
+    max_revision_passes: int = Field(default=1, ge=0)
+    """Maximum FEAT-040.9 voice-fidelity rewrite passes after composition.
+    Each pass measures voice distance, rewrites toward the user's measured
+    voice, then re-measures; the loop stops early once distance falls under
+    :attr:`voice_distance_upper` or a pass fails to improve. ``0`` disables
+    the rewrite loop (sanitize + measure only). Kept small (default ``1``)
+    because rewriting is bounded and regression-guarded, not iterative
+    polishing."""
+
     def weight_for(self, *, category: str, feature_key: str) -> float:
         """Resolve the divergence weight for a feature.
 
