@@ -3391,3 +3391,28 @@ class TestVoiceFidelityGuardWiring:
         assert called["n"] == 0
         assert "tapestry" in post.content
         assert isinstance(post.metadata["voice_distance"], float)
+
+    def test_save_outline_draft_stamps_voice_fields(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """The symmetric ``save_outline_draft`` path also runs the guard."""
+        gen = DraftGenerator(
+            llm=lambda _p: _TROPEY_BODY,
+            skills_root=skills_root,
+            fingerprint=_voice_fingerprint(),
+            ai_style_config=_eager_ai_style(),
+            voice_guard_no_llm=True,
+        )
+        draft = gen.generate_outline_draft(
+            "## One\nFirst section.\n\n## Two\nSecond section.\n",
+            vault_path=vault,
+            detect_ontology=_empty_detector(),
+        )
+        path = gen.save_outline_draft(draft, vault)
+        meta = frontmatter.load(str(path)).metadata
+        assert isinstance(meta["voice_distance"], float)
+        assert meta["voice_distance"] > 0.0
+        assert isinstance(meta["voice_findings"], list)
+        assert meta["voice_findings"]
