@@ -215,14 +215,14 @@ SUPERFICIAL_ING_RE = re.compile(
     r",\s+(?:highlight|underscor|emphasiz|reflect|symboliz|showcas|"
     r"demonstrat|illustrat|reinforc|cement|contribut|solidif|foster|"
     r"enhanc|ensur)\w*ing\b"
-    r"|\b(?:generat\w+|sparr?\w+|prompt\w+) (?:debate|discussion|reflection) about\b",
+    r"|\b(?:generat\w+|spark\w*|prompt\w+) (?:debate|discussion|reflection) about\b",
     re.IGNORECASE,
 )
 
 PEACOCK_RE = re.compile(
     r"\b(?:boasts|vibrant|nestled|breathtaking|renowned|bustling|stunning|"
     r"picturesque|charming|idyllic)\b"
-    r"|in the heart of|rich cultural heritage|natural beauty",
+    r"|\bin the heart of\b|\brich cultural heritage\b|\bnatural beauty\b",
     re.IGNORECASE,
 )
 

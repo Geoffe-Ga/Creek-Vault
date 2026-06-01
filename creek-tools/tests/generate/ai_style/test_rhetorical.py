@@ -93,6 +93,22 @@ class TestVaultRelative:
         )
 
 
+def test_superficial_ing_matches_spark_family() -> None:
+    """The 'sparked/generated/prompted debate about' variant is detected."""
+    from creek.generate.ai_style.features import superficial_ing_density
+
+    assert superficial_ing_density("It sparked debate about the future.") > 0.0
+    assert superficial_ing_density("It generated discussion about it.") > 0.0
+
+
+def test_peacock_phrase_respects_word_boundary() -> None:
+    """'natural beauty' inside 'supernatural beauty' is not a false positive."""
+    from creek.generate.ai_style.features import peacock_density
+
+    assert peacock_density("the natural beauty of it") > 0.0
+    assert peacock_density("a supernatural beauty pageant") == 0.0
+
+
 def test_single_significance_phrase_below_margin_no_false_positive() -> None:
     """One significance phrase in a long human text stays under the margin."""
     text = "This was a pivotal moment. " + " ".join(["plain"] * 999)
