@@ -34,6 +34,9 @@
 # Background-agent worktrees (Claude Code harness isolation directory).
 .claude/worktrees/
 
+# Harness runtime lock (live PID/session; never source).
+.claude/scheduled_tasks.lock
+
 # ============================================================
 # DEVELOPMENT ARTIFACTS
 # ============================================================
