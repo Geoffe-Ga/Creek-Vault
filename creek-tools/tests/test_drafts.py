@@ -19,6 +19,7 @@ from creek.generate.drafts import (
     SeedResolutionError,
     SeedSpec,
 )
+from creek.generate.grounding import GroundingThresholds
 from creek.generate.mining import IdeaSeed, MiningStrategy
 from creek.generate.outline import OutlineSection, build_stitch_prompt
 from creek.models import (
@@ -3416,3 +3417,36 @@ class TestVoiceFidelityGuardWiring:
         assert meta["voice_distance"] > 0.0
         assert isinstance(meta["voice_findings"], list)
         assert meta["voice_findings"]
+
+    def test_grounding_check_short_circuits_on_empty_fragments(
+        self,
+        vault: Path,
+        skills_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Empty source fragments skip the vault scan and yield no grounding veto."""
+        called = {"n": 0}
+
+        def _fake_loader(*_args: object, **_kwargs: object) -> dict[str, object]:
+            called["n"] += 1
+            return {}
+
+        monkeypatch.setattr(
+            "creek.generate.drafts._load_fragments_by_id",
+            _fake_loader,
+        )
+        gen = DraftGenerator(
+            llm=lambda _p: "x",
+            skills_root=skills_root,
+            embedding_fn=lambda _t: [1.0, 0.0],
+            grounding_thresholds=GroundingThresholds(
+                derivative_upper=0.85,
+                grounding_lower=0.3,
+                grounding_fraction_lower=0.3,
+            ),
+        )
+        # Even with grounding fully wired, an empty source list means there is
+        # nothing to ground against — so no vault scan and no veto closure.
+        result = gen._voice_grounding_check(vault, ())
+        assert result is None
+        assert called["n"] == 0
