@@ -11,6 +11,7 @@ import pytest
 
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.author import author_tool
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.lint import lint_tool
 from creek_mcp.tools.mine import mine_tool
@@ -394,3 +395,54 @@ def test_draft_refuses_for_out_of_range_index(
     assert result["status"] == "refused"
     assert result["tool"] == "creek.draft"
     assert "out of range" in result["reason"]
+
+
+def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
+    """``creek.author`` returns a typed stub draft (verdict + provenance)."""
+    result = author_tool(
+        vault_path=vault,
+        query="What is F6 Pluralism?",
+        medium="research",
+        consumer="test",
+    )
+    assert result["status"] == "ok"
+    assert result["tool"] == "creek.author"
+    assert result["medium"] == "research"
+    assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
+    assert isinstance(result["provenance"], list)
+    assert result["provenance"]  # non-empty mock provenance
+    assert result["body"].strip()
+    assert result["dry_run"] is False
+
+
+def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
+    """An unsupported medium returns a structured error, not a draft."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="book-report",
+        consumer="test",
+    )
+    assert result["status"] == "error"
+    assert result["tool"] == "creek.author"
+    assert "research" in result["reason"]
+
+
+def test_author_tool_echoes_dry_run_flag(vault: Path) -> None:
+    """The ``dry_run`` arg is accepted for CLI parity and echoed back."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        dry_run=True,
+        consumer="test",
+    )
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+
+
+def test_author_tool_writes_audit_entry(vault: Path) -> None:
+    """The tool appends an audit entry recording the call."""
+    author_tool(vault_path=vault, query="q", medium="research", consumer="test")
+    audit = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    assert "creek.author" in audit

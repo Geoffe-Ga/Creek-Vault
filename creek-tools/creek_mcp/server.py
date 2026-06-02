@@ -23,6 +23,7 @@ from mcp.server.fastmcp import FastMCP
 from creek.config import CONFIG_PATH_ENV_VAR, load_config
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import (
+    author_tool,
     classify_tool,
     compile_tool,
     ingest_tool,
@@ -185,6 +186,25 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.author")
+    def _author(
+        query: str,
+        medium: str = "research",
+        max_rounds: int | None = None,
+        dry_run: bool = False,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Author a draft for a query via the Writing Desk (stub shape)."""
+        return author_tool(
+            vault_path=vault,
+            query=query,
+            medium=medium,
+            max_rounds=max_rounds,
+            dry_run=dry_run,
+            privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )
 

@@ -21,6 +21,7 @@ EXPECTED_TOOLS = {
     "creek.lint",
     "creek.mine",
     "creek.draft",
+    "creek.author",
     "creek.save",
     "creek.ingest",
     "creek.redact.scan",
