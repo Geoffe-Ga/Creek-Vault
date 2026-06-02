@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from creek.author.skills import (
     find_phase_skill,
+    find_register_skill,
     find_voice_core,
     read_skill,
 )
@@ -158,16 +159,16 @@ def _split_voice_prompt(
 
 
 def _skill_sections(vault: Path, evidence: EvidenceBundle) -> list[str]:
-    """Return the voice-core and phase skill sections, in order.
+    """Return the voice-core, phase, and register skill sections, in order.
 
     Missing skill files are skipped silently. The phase is taken from the
-    synthesized ontology's dominant phase when present. Register selection is
-    deferred — the synthesized ontology carries no dominant voice register yet
-    (tracked as #502; the ``find_register_skill`` seam is ready for it).
+    synthesized ontology's dominant phase, and the register from its dominant
+    voice register, when present (#502).
     """
     paths = [
         find_voice_core(vault),
         find_phase_skill(vault, _dominant_phase(evidence)),
+        find_register_skill(vault, _dominant_register(evidence)),
     ]
     sections: list[str] = []
     for path in paths:
@@ -185,6 +186,14 @@ def _dominant_phase(evidence: EvidenceBundle) -> str | None:
     if ontology is None or not ontology.phases:
         return None
     return ontology.phases[0].value.value
+
+
+def _dominant_register(evidence: EvidenceBundle) -> str | None:
+    """Return the dominant voice-register slug from the ontology, if any."""
+    ontology = evidence.ontology
+    if ontology is None or not ontology.voice_registers:
+        return None
+    return ontology.voice_registers[0].value.value
 
 
 def _evidence_section(evidence: EvidenceBundle) -> str:

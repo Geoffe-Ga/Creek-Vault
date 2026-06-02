@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from creek.classify.weighted import WeightedDimension
 from creek.compile.provenance import ProvenanceEntry
-from creek.models import Dosage, Frequency, Mode, Phase
+from creek.models import Dosage, Frequency, Mode, Phase, VoiceRegister
 
 #: Mediums the author desk can produce. ``research``/``chat``/``essay``/
 #: ``research-piece``/``book-report``/``how-to`` are all wired — ``how-to``
@@ -144,6 +144,8 @@ class OntologyAnalysis(BaseModel):
         phases: Weighted Archetypal Wavelength phases.
         modes: Weighted engagement modes.
         dosages: Weighted dosage framings (medicine/toxic/ambiguous).
+        voice_registers: Weighted voice registers the corpus speaks in
+            (confessional/analytical/playful/…).
         paradoxes: Surfaced contradictions across fragments.
         overall_confidence: Aggregate confidence in ``[0.0, 1.0]``.
     """
@@ -154,6 +156,7 @@ class OntologyAnalysis(BaseModel):
     phases: tuple[WeightedDimension[Phase], ...] = ()
     modes: tuple[WeightedDimension[Mode], ...] = ()
     dosages: tuple[WeightedDimension[Dosage], ...] = ()
+    voice_registers: tuple[WeightedDimension[VoiceRegister], ...] = ()
     paradoxes: tuple[OntologyParadox, ...] = ()
     overall_confidence: float = 0.0
 

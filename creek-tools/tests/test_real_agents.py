@@ -31,7 +31,7 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
-from creek.models import Frequency, Phase
+from creek.models import Frequency, Phase, VoiceRegister
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -216,6 +216,25 @@ _F6_BODY = "community empathy harmony inclusion caring sharing equality consensu
 _F3_BODY = "power dominance control conquest force aggression warrior rebellion"
 _RISING_BODY = "emerging building growing momentum ascending intensifying gathering"
 _DIMINISHING_BODY = "diminishing declining waning subsiding settling calming quieting"
+# Dense with analytical voice-register signals (VOICE_REGISTER_SIGNALS) so the
+# rule classifier resolves the fragment's register to ANALYTICAL deterministically.
+_ANALYTICAL_BODY = (
+    "analyze examine consider therefore evidence hypothesis framework "
+    "systematically data observe"
+)
+
+
+def test_ontology_surfaces_dominant_voice_register(tmp_path: Path) -> None:
+    """The Ontology agent aggregates a weighted, non-empty voice register."""
+    _write_classified(
+        tmp_path, "frag-an", "Analytical examination", body=_ANALYTICAL_BODY
+    )
+
+    bundle = OntologySpecialist().gather("analysis", tmp_path)
+
+    assert bundle.ontology is not None
+    assert bundle.ontology.voice_registers  # a register was surfaced
+    assert bundle.ontology.voice_registers[0].value is VoiceRegister.ANALYTICAL
 
 
 def test_ontology_returns_canonical_taxonomy(tmp_path: Path) -> None:
