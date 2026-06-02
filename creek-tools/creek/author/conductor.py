@@ -268,6 +268,8 @@ class Conductor:
             ``(ai_style_config, fingerprint)``. The fingerprint is ``None`` when
             absent/empty; both are ``None`` when config loading failed.
         """
+        from pydantic import ValidationError
+
         from creek.config import load_config, resolve_config_path
         from creek.generate.ai_style import load_fingerprint
 
@@ -275,7 +277,10 @@ class Conductor:
             config = load_config(
                 resolve_config_path(vault, None), warn_on_missing=False
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, ValidationError):
+            # A malformed config must not crash the desk: voice-fidelity simply
+            # stays dormant. ``ValidationError`` is not a ``ValueError`` subclass
+            # in Pydantic v2, so it is named explicitly (#506 review).
             return (None, None)
         ai_style = config.ai_style
         fingerprint = load_fingerprint(vault, ai_style)

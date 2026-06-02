@@ -28,6 +28,8 @@ from creek.generate.ai_style import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
     from creek.author.models import EvidenceBundle, Medium
     from creek.models import MediumContract
 
@@ -170,3 +172,28 @@ def test_load_voice_inputs_returns_none_fingerprint_when_absent(tmp_path: Path) 
 
     assert isinstance(config, AIStyleConfig)
     assert fingerprint is None
+
+
+def test_load_voice_inputs_degrades_on_malformed_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config that fails Pydantic validation degrades to ``(None, None)``.
+
+    `ValidationError` is not a `ValueError` subclass in Pydantic v2, so the desk
+    must name it explicitly; otherwise a malformed `creek_config.yaml` would
+    crash the conductor (#506 review).
+    """
+    config_path = tmp_path / "00-Creek-Meta" / "creek_config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    # ``max_author_rounds`` is bound [1, 10]; 99 fails validation.
+    config_path.write_text("author:\n  max_author_rounds: 99\n", encoding="utf-8")
+    # Pin the config path so a leaked CREEK_CONFIG can't shadow this fixture.
+    monkeypatch.setenv("CREEK_CONFIG", str(config_path))
+    conductor = Conductor(
+        specialists=[],
+        voice=VoiceAgent(),
+        reflection=ReflectionNode(),
+        max_rounds=1,
+    )
+
+    assert conductor._load_voice_inputs(tmp_path) == (None, None)
