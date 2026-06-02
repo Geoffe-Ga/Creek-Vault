@@ -12,8 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from creek.author import AuthoredDraft, Medium
-from creek.author.conductor import _require_supported_medium
+from creek.author import AuthoredDraft, Medium, require_supported_medium
 from creek.compile.provenance import ProvenanceEntry
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling
@@ -100,7 +99,7 @@ def author_tool(
     try:
         # Reuse the conductor's single source of truth for medium validation
         # rather than re-implementing the membership check and cast here.
-        validated = _require_supported_medium(medium)
+        validated = require_supported_medium(medium)
     except ValueError as exc:
         return {
             "status": "error",

@@ -415,6 +415,7 @@ def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
     assert result["provenance"]  # non-empty mock provenance
     assert result["body"].strip()
     assert result["dry_run"] is False
+    assert result["rounds"] == 1  # stub always reports a single round
 
 
 def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
@@ -427,6 +428,7 @@ def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
     )
     assert result["status"] == "error"
     assert result["tool"] == "creek.author"
+    assert result["tier_ceiling"] == "open"  # ceiling echoed on the error path
     assert "research" in result["reason"]
 
 
