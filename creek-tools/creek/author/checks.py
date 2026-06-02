@@ -98,16 +98,18 @@ def _resolve_cited_tiers(
         A mapping of cited fragment id to its tier and stored body. Fragments
         not found in the vault are omitted.
 
-    The scan is lazy and exits as soon as every cited fragment is resolved, so
-    a draft citing a handful of fragments does not pay an O(vault) cost on every
-    ``review`` call inside the retry loop.
+    The walk is lazy — ``rglob`` is iterated directly (not materialised) and
+    exits as soon as every cited fragment is resolved, so a draft citing a
+    handful of fragments stops early instead of parsing the whole vault on every
+    ``review`` call inside the retry loop. Iteration order is therefore the
+    filesystem's; that is irrelevant here since results are keyed by fragment id.
     """
     cited = set(evidence.all_source_fragments())
     resolved: dict[str, tuple[PrivacyTier, str]] = {}
     fragments_root = vault / "01-Fragments"
     if not cited or not fragments_root.is_dir():
         return resolved
-    for md_file in sorted(fragments_root.rglob("*.md")):
+    for md_file in fragments_root.rglob("*.md"):
         try:
             record = try_load_fragment(md_file)
         except (OSError, ValueError, yaml.YAMLError):
@@ -296,7 +298,14 @@ def check_attribution_correctness(
 
     A claim carrying an ``author_slug`` (drawn from ``11-Other-Authors/``)
     must be attributed in the body: if neither the slug nor its de-slugged
-    name appears, the borrowed idea is uncredited.
+    full name appears (on a word boundary), the borrowed idea is uncredited.
+
+    Limitation: only the slug and its full de-slugged form are recognised — an
+    attribution by partial name alone (e.g. surname-only "Ravikant" for
+    ``naval-ravikant``) is not matched and would still flag. Tightening this to
+    accept partial-name attribution is a semantic concern for the LLM judge
+    (#474); the deterministic check intentionally errs toward demanding the full
+    name a borrowed-author folder is keyed on.
 
     Args:
         body: The drafted prose under review.
