@@ -104,6 +104,30 @@ def test_harness_rejects_missing_rubric_keys() -> None:
         assert_contract_conformant(bad)
 
 
+def test_harness_rejects_empty_specialist_weights() -> None:
+    """An empty specialist-weight map is non-conformant."""
+    bad = MediumContract(
+        medium="bad",
+        structure=["reply"],
+        specialist_weights={},
+        reflection_rubric={
+            "ontological_accuracy": 0.34,
+            "citation_completeness": 0.33,
+            "voice_fidelity": 0.33,
+        },
+    )
+    with pytest.raises(ContractConformanceError, match="specialist_weights is empty"):
+        assert_contract_conformant(bad)
+
+
+def test_rendered_text_is_serialized(tmp_path: Path) -> None:
+    """``rendered_text`` is a computed field present in ``model_dump`` output."""
+    draft = run_author(medium="chat", query="hey", vault=tmp_path)
+
+    dumped = draft.model_dump()
+    assert dumped["rendered_text"] == draft.body
+
+
 def test_chat_produces_short_reply(tmp_path: Path) -> None:
     """``run_author(medium='chat')`` returns a short voiced reply."""
     reply = run_author(

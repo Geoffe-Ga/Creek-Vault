@@ -27,7 +27,10 @@ MEDIUMS_TEMPLATE_DIR = SKILLS_TEMPLATE_DIR / "mediums"
 #: Deployed location of medium contracts within a vault.
 _VAULT_MEDIUMS_SUBDIR = ("00-Creek-Meta", "Skills", "mediums")
 
-#: Soft ceiling on a ``chat`` medium's rendered reply length (FEAT-041 §5).
+#: Soft ceiling on a ``chat`` reply length, in *characters* (FEAT-041 §5).
+#: Distinct from the contract's ``≤1500 tokens`` template budget (an upstream
+#: generation budget): this is a post-generation gate on the reply that reaches
+#: the caller — ~2000 chars ≈ 500 tokens at 4 chars/token.
 CHAT_MAX_CHARS: int = 2000
 
 #: Reflection-rubric dimensions every medium contract must weight (SPEC §8).

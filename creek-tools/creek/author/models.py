@@ -9,7 +9,7 @@ shapes in later FEAT-041 issues; the skeleton populates them with mock data.
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from creek.compile.provenance import ProvenanceEntry
 
@@ -84,7 +84,13 @@ class AuthoredDraft(BaseModel):
     verdict: ReflectionVerdict
     rounds: int = Field(ge=1)
 
+    # BUG-009: the ``[prop-decorator]`` suppression is the known mypy /
+    # Pydantic-v2 limitation when stacking ``@computed_field`` over
+    # ``@property`` — see https://github.com/pydantic/pydantic/issues/6710.
+    # Serializing the alias is correct; mypy just can't model the descriptor
+    # stack. Matches the existing carve-out on ``Fragment.voice_proxy_eligible``.
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def rendered_text(self) -> str:
-        """The rendered draft text (alias for :attr:`body`)."""
+        """The rendered draft text (alias for :attr:`body`), included in dumps."""
         return self.body
