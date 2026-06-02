@@ -810,6 +810,7 @@ class CrawDadClient(discord.Client):
             # ``test_register_wires_every_command_onto_tree`` test.
             register_slash_commands(
                 cast("Any", self.tree),
+                config=config,
                 loop_runner=loop_runner,
                 register_switcher=register_switcher,
                 workflow_lister=workflow_lister,
