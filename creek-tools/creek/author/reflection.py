@@ -16,20 +16,29 @@ if TYPE_CHECKING:
 class ReflectionNode:
     """Stub Reflection node that judges a draft against its evidence."""
 
-    def review(self, body: str, evidence: EvidenceBundle) -> ReflectionVerdict:
+    def review(
+        self,
+        body: str,
+        evidence: EvidenceBundle,
+        rubric: dict[str, float] | None = None,
+    ) -> ReflectionVerdict:
         """Return a verdict for *body* given its *evidence*.
 
         The stub heuristic: a non-empty body grounded in at least one claim
         passes; anything else escalates. It never returns ``REVISE`` — the
-        real reflection logic (issue #473) owns the revise/retry loop.
+        real reflection logic (issue #473) owns the revise/retry loop and will
+        score against *rubric*, which the medium contract supplies (FEAT-041).
 
         Args:
             body: The drafted prose under review.
             evidence: The evidence the draft was rendered from.
+            rubric: The medium's per-dimension reflection weights (§8); the
+                stub accepts but does not yet score against it.
 
         Returns:
             ``"PASS"`` when grounded and non-empty, else ``"ESCALATE"``.
         """
+        del rubric  # scored by the real reflection node (#473)
         if body.strip() and evidence.claims:
             return "PASS"
         return "ESCALATE"
