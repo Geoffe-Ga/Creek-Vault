@@ -408,7 +408,9 @@ def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
     assert result["status"] == "ok"
     assert result["tool"] == "creek.author"
     assert result["medium"] == "research"
-    assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
+    # Deterministic stub: the verdict is exactly PASS, not merely a member of
+    # the verdict set (a membership check would be vacuous here).
+    assert result["verdict"] == "PASS"
     assert isinstance(result["provenance"], list)
     assert result["provenance"]  # non-empty mock provenance
     assert result["body"].strip()
@@ -426,6 +428,48 @@ def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
     assert result["status"] == "error"
     assert result["tool"] == "creek.author"
     assert "research" in result["reason"]
+
+
+def test_author_tool_error_envelope_includes_dry_run(vault: Path) -> None:
+    """The error envelope carries ``dry_run`` so the shape matches success."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="book-report",
+        dry_run=True,
+        consumer="test",
+    )
+    assert result["status"] == "error"
+    assert result["dry_run"] is True
+
+
+def test_author_tool_echoes_non_default_ceiling(vault: Path) -> None:
+    """A non-default privacy ceiling is echoed on the success path."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+        consumer="test",
+    )
+    assert result["status"] == "ok"
+    assert result["tier_ceiling"] == "personal"
+
+
+def test_author_tool_records_max_rounds_in_audit(vault: Path) -> None:
+    """A non-``None`` ``max_rounds`` is captured in the audit entry."""
+    author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        max_rounds=5,
+        consumer="test",
+    )
+    entry = json.loads(
+        (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert entry["tool"] == "creek.author"
+    assert entry["args_summary"]["max_rounds"] == 5
 
 
 def test_author_tool_echoes_dry_run_flag(vault: Path) -> None:

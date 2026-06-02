@@ -10,9 +10,10 @@ stub with a real ``run_author`` call. Existing MCP verbs are untouched.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-from creek.author import SUPPORTED_MEDIUMS, AuthoredDraft, Medium
+from creek.author import AuthoredDraft, Medium
+from creek.author.conductor import _require_supported_medium
 from creek.compile.provenance import ProvenanceEntry
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling
@@ -88,7 +89,7 @@ def author_tool(
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={
-            "query": {"len": len(query)},
+            "query": query,
             "medium": medium,
             "dry_run": dry_run,
             "max_rounds": max_rounds,
@@ -96,17 +97,22 @@ def author_tool(
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
     )
-    if medium not in SUPPORTED_MEDIUMS:
+    try:
+        # Reuse the conductor's single source of truth for medium validation
+        # rather than re-implementing the membership check and cast here.
+        validated = _require_supported_medium(medium)
+    except ValueError as exc:
         return {
             "status": "error",
             "tool": TOOL_NAME,
             "tier_ceiling": privacy_tier_ceiling.value,
-            "reason": (
-                f"Unsupported medium {medium!r}; only the 'research' medium is "
-                "wired in the Writing Desk skeleton (FEAT-041)."
-            ),
+            "dry_run": dry_run,
+            "reason": str(exc),
         }
-    draft = _stub_draft(cast("Medium", medium), query)
+    # The stub always reports ``rounds=1``; ``max_rounds`` is accepted for CLI
+    # parity and recorded in the audit log, but the real round count arrives
+    # when #460 wires the verb to the conductor.
+    draft = _stub_draft(validated, query)
     return {
         "status": "ok",
         "tool": TOOL_NAME,
