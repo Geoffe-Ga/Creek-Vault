@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING
 
 from creek.author.models import ReflectionFinding
 from creek.generate.ai_style.scanner import scan
+
+# The legacy-alias maps are module-private in creek.models; importing them here
+# reuses the single canonical INC-019 source rather than duplicating the alias
+# vocabulary (kept private as they are an internal taxonomy detail). Promote to
+# a public constant if a third consumer appears.
 from creek.models import (
     _FREQUENCY_LEGACY_ALIASES,
     _MODE_LEGACY_ALIASES,
@@ -136,6 +141,9 @@ def check_privacy_compliance(
     for frag_id, (raw_tier, frag_body) in _resolve_cited_tiers(evidence, vault).items():
         tier = PrivacyTier(raw_tier)
         protected = frag_body.strip()
+        # Deterministic scope: this catches verbatim leakage of the protected
+        # body. A paraphrase of over-tier content is NOT caught here — that
+        # needs the semantic LLM judge tracked under #474.
         if _TIER_RANK[tier] > ceiling and protected and protected in body:
             findings.append(
                 ReflectionFinding(
@@ -164,6 +172,10 @@ def check_ontological_accuracy(body: str) -> list[ReflectionFinding]:
         One ``MID`` finding per legacy alias used, dimension
         ``"ontological_accuracy"``.
     """
+    # Caveat: a few alias keys are ordinary English words (e.g. "origins"), so
+    # this word-boundary match can false-positive on non-ontological prose. It
+    # is a MID (soft) finding, so a false hit costs at most one revise round,
+    # not a hard block; semantic disambiguation is deferred to #474.
     return [
         ReflectionFinding(
             dimension="ontological_accuracy",

@@ -27,6 +27,17 @@ ReflectionVerdict = Literal["PASS", "REVISE", "ESCALATE"]
 #: breach (citation/privacy), ``MID`` a softer rubric divergence, ``LOW`` a hint.
 FindingSeverity = Literal["LOW", "MID", "HIGH"]
 
+#: The six research-rubric dimensions a reflection finding can fire on (#473).
+#: Typed so strict mypy catches a mistyped dimension at the construction site.
+FindingDimension = Literal[
+    "voice_fidelity",
+    "ontological_accuracy",
+    "citation_completeness",
+    "privacy_compliance",
+    "paradox_preservation",
+    "attribution_correctness",
+]
+
 
 class ReflectionFinding(BaseModel):
     """One scored defect the reflection node found in a drafted body (#473).
@@ -41,7 +52,7 @@ class ReflectionFinding(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    dimension: str
+    dimension: FindingDimension
     severity: FindingSeverity
     message: str
 
