@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
 from creek.author.agents import Specialist, default_specialists
-from creek.author.contracts import load_medium_contract
+from creek.author.contracts import CHAT_MAX_CHARS, load_medium_contract
 from creek.author.models import (
     AuthoredDraft,
     EvidenceBundle,
@@ -262,6 +262,26 @@ def run_author(
     require_supported_medium(medium)
     contract = load_medium_contract(medium, vault)
     rounds = max_rounds if max_rounds is not None else AuthorConfig().max_author_rounds
-    return build_default_conductor(max_rounds=rounds, contract=contract).run(
+    draft = build_default_conductor(max_rounds=rounds, contract=contract).run(
         medium=medium, query=query, vault=vault
     )
+    return _enforce_chat_ceiling(draft)
+
+
+def _enforce_chat_ceiling(draft: AuthoredDraft) -> AuthoredDraft:
+    """Truncate an over-length ``chat`` reply to :data:`CHAT_MAX_CHARS`.
+
+    The chat medium's post-generation gate (FEAT-041 §5): a reply that reaches
+    the caller must stay under the character ceiling. Other mediums pass
+    through unchanged.
+
+    Args:
+        draft: The freshly authored draft.
+
+    Returns:
+        *draft* unchanged, or a copy with its body truncated to the ceiling.
+    """
+    if draft.medium != "chat" or len(draft.body) <= CHAT_MAX_CHARS:
+        return draft
+    truncated = draft.body[: CHAT_MAX_CHARS - 1].rstrip() + "…"
+    return draft.model_copy(update={"body": truncated})

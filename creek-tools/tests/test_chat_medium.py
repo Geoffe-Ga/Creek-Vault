@@ -141,6 +141,36 @@ def test_chat_produces_short_reply(tmp_path: Path) -> None:
     assert 0 < len(reply.rendered_text) < CHAT_MAX_CHARS
 
 
+def test_run_author_enforces_chat_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An over-length chat reply is truncated to ``CHAT_MAX_CHARS``."""
+    from creek.author import voice
+
+    monkeypatch.setattr(
+        voice.VoiceAgent, "render", lambda self, q, e: "x" * (CHAT_MAX_CHARS + 500)
+    )
+
+    reply = run_author(medium="chat", query="q", vault=tmp_path)
+
+    assert len(reply.rendered_text) <= CHAT_MAX_CHARS
+
+
+def test_run_author_does_not_truncate_research(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chat ceiling never truncates a non-chat medium."""
+    from creek.author import voice
+
+    monkeypatch.setattr(
+        voice.VoiceAgent, "render", lambda self, q, e: "x" * (CHAT_MAX_CHARS + 500)
+    )
+
+    draft = run_author(medium="research", query="q", vault=tmp_path)
+
+    assert len(draft.body) > CHAT_MAX_CHARS
+
+
 def test_research_still_runs(tmp_path: Path) -> None:
     """The research medium is unaffected by adding chat (tracer invariant)."""
     draft = run_author(medium="research", query="What is F6?", vault=tmp_path)
