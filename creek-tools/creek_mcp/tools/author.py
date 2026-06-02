@@ -34,6 +34,9 @@ def _draft_response(
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": tier_ceiling.value,
+        # Explicit so callers never mistake the echo for enforcement; flips to
+        # True when tier-filtered retrieval lands with the real specialists (#463).
+        "tier_ceiling_enforced": False,
         "dry_run": False,
         "medium": draft.medium,
         "query": draft.query,
@@ -110,6 +113,7 @@ def author_tool(
             "status": "ok",
             "tool": TOOL_NAME,
             "tier_ceiling": privacy_tier_ceiling.value,
+            "tier_ceiling_enforced": False,
             "dry_run": True,
             "medium": medium,
             "query": query,

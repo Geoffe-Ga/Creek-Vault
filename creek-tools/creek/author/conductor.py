@@ -11,7 +11,7 @@ behind these same seams.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 from creek.author.agents import Specialist, default_specialists
 from creek.author.contracts import CHAT_MAX_CHARS, load_medium_contract
@@ -268,7 +268,19 @@ def run_author(
     return _enforce_chat_ceiling(draft)
 
 
-def plan_author(*, medium: str, query: str, vault: Path) -> dict[str, object]:
+class AuthorPlan(TypedDict):
+    """The dry-run preview returned by :func:`plan_author` (FEAT-041 #460).
+
+    Attributes:
+        plan: Ordered pipeline step names.
+        evidence: Counts of synthesized ``claims`` and ``source_fragments``.
+    """
+
+    plan: list[str]
+    evidence: dict[str, int]
+
+
+def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
     """Return the pipeline plan + evidence summary without authoring (dry run).
 
     A lightweight preview for ``creek author --dry-run`` and the MCP verb's
@@ -281,7 +293,7 @@ def plan_author(*, medium: str, query: str, vault: Path) -> dict[str, object]:
         vault: The vault to gather evidence from.
 
     Returns:
-        ``{"plan": [...], "evidence": {"claims": N, "source_fragments": M}}``.
+        An :class:`AuthorPlan` with the step plan and evidence counts.
 
     Raises:
         ValueError: When *medium* is unsupported.
