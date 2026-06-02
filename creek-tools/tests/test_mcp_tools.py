@@ -492,3 +492,34 @@ def test_author_tool_writes_audit_entry(vault: Path) -> None:
     author_tool(vault_path=vault, query="q", medium="research", consumer="test")
     audit = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
     assert "creek.author" in audit
+
+
+def test_author_tool_returns_real_cited_draft(vault: Path) -> None:
+    """``creek.author`` delegates to the real desk: cited claims + verdict (#460)."""
+    result = author_tool(
+        vault_path=vault,
+        query="F6 medicine vs toxic",
+        medium="research",
+        consumer="test",
+    )
+
+    assert result["status"] == "ok"
+    assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
+    assert result["claims"]  # non-empty
+    assert all(claim["source_fragments"] for claim in result["claims"])
+
+
+def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
+    """``dry_run`` returns the pipeline plan + evidence summary, not a draft."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        dry_run=True,
+        consumer="test",
+    )
+
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+    assert result["plan"]
+    assert result["evidence"]["claims"] >= 1

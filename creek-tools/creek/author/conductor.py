@@ -268,6 +268,37 @@ def run_author(
     return _enforce_chat_ceiling(draft)
 
 
+def plan_author(*, medium: str, query: str, vault: Path) -> dict[str, object]:
+    """Return the pipeline plan + evidence summary without authoring (dry run).
+
+    A lightweight preview for ``creek author --dry-run`` and the MCP verb's
+    ``dry_run``: it runs the specialists and synthesize step but skips the
+    voice/reflect loop, so no draft is produced.
+
+    Args:
+        medium: The requested medium.
+        query: The user query.
+        vault: The vault to gather evidence from.
+
+    Returns:
+        ``{"plan": [...], "evidence": {"claims": N, "source_fragments": M}}``.
+
+    Raises:
+        ValueError: When *medium* is unsupported.
+    """
+    require_supported_medium(medium)
+    contract = load_medium_contract(medium, vault)
+    conductor = build_default_conductor(max_rounds=1, contract=contract)
+    evidence = conductor.gather_evidence(query, vault)
+    return {
+        "plan": conductor.plan(),
+        "evidence": {
+            "claims": len(evidence.claims),
+            "source_fragments": len(evidence.all_source_fragments()),
+        },
+    }
+
+
 def _enforce_chat_ceiling(draft: AuthoredDraft) -> AuthoredDraft:
     """Truncate an over-length ``chat`` reply to :data:`CHAT_MAX_CHARS`.
 

@@ -15,6 +15,7 @@ from creek.author.conductor import (
     SUPPORTED_MEDIUMS,
     Conductor,
     build_default_conductor,
+    plan_author,
     require_supported_medium,
     run_author,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "assert_contract_conformant",
     "build_default_conductor",
     "load_medium_contract",
+    "plan_author",
     "require_supported_medium",
     "run_author",
 ]
