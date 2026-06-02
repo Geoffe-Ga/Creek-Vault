@@ -16,9 +16,9 @@ from creek.compile.provenance import ProvenanceEntry
 from creek.models import Dosage, Frequency, Mode, Phase
 
 #: Mediums the author desk can produce. ``research``/``chat``/``essay``/
-#: ``research-piece``/``book-report`` are wired; the others (how-to) arrive in
-#: later issues.
-Medium = Literal["research", "chat", "essay", "research-piece", "book-report"]
+#: ``research-piece``/``book-report``/``how-to`` are all wired — ``how-to``
+#: completes the medium set.
+Medium = Literal["research", "chat", "essay", "research-piece", "book-report", "how-to"]
 
 #: The reflection node's bounded verdict over a drafted body.
 ReflectionVerdict = Literal["PASS", "REVISE", "ESCALATE"]
