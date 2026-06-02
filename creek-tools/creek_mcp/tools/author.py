@@ -120,9 +120,10 @@ def author_tool(
             str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
         )
 
-    # Any desk failure (bad config, provider error, missing contract) must
-    # surface as a structured envelope, never an unhandled exception across
-    # the MCP boundary.
+    # Any desk failure (bad config, provider error, missing contract, a
+    # downstream validation error, ...) must surface as a structured envelope,
+    # never an unhandled exception across the MCP boundary. This mirrors the
+    # broad boundary catch the other MCP write tools use (e.g. purge).
     try:
         if dry_run:
             plan = plan_author(medium=medium, query=query, vault=vault_path)
@@ -140,7 +141,7 @@ def author_tool(
         draft = run_author(
             medium=medium, query=query, vault=vault_path, max_rounds=max_rounds
         )
-    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+    except Exception as exc:
         return _error_response(
             str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
         )
