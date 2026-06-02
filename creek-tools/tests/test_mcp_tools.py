@@ -553,3 +553,24 @@ def test_author_tool_forwards_max_rounds(
     )
 
     assert captured["max_rounds"] == 7
+
+
+def test_author_tool_wraps_desk_errors(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A desk failure surfaces as a structured envelope, not an exception."""
+
+    def boom(**_kwargs: object) -> object:
+        msg = "provider unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("creek_mcp.tools.author.run_author", boom)
+
+    result = author_tool(
+        vault_path=vault, query="q", medium="research", consumer="test"
+    )
+
+    assert result["status"] == "error"
+    assert result["tool"] == "creek.author"
+    assert result["tier_ceiling_enforced"] is False
+    assert "provider unavailable" in result["reason"]

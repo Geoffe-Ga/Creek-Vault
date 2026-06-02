@@ -13,6 +13,7 @@ from __future__ import annotations
 from creek.author.client import AuthorLLMClient
 from creek.author.conductor import (
     SUPPORTED_MEDIUMS,
+    AuthorPlan,
     Conductor,
     build_default_conductor,
     plan_author,
@@ -37,6 +38,7 @@ __all__ = [
     "CHAT_MAX_CHARS",
     "SUPPORTED_MEDIUMS",
     "AuthorLLMClient",
+    "AuthorPlan",
     "AuthoredDraft",
     "Conductor",
     "ContractConformanceError",

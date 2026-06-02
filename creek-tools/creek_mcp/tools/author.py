@@ -24,6 +24,23 @@ if TYPE_CHECKING:
 TOOL_NAME = "creek.author"
 
 
+def _error_response(
+    reason: str,
+    *,
+    tier_ceiling: TierCeiling,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Render a structured error envelope (used on every failure path)."""
+    return {
+        "status": "error",
+        "tool": TOOL_NAME,
+        "tier_ceiling": tier_ceiling.value,
+        "tier_ceiling_enforced": False,
+        "dry_run": dry_run,
+        "reason": reason,
+    }
+
+
 def _draft_response(
     draft: AuthoredDraft,
     *,
@@ -99,30 +116,32 @@ def author_tool(
     try:
         require_supported_medium(medium)
     except ValueError as exc:
-        return {
-            "status": "error",
-            "tool": TOOL_NAME,
-            "tier_ceiling": privacy_tier_ceiling.value,
-            "tier_ceiling_enforced": False,
-            "dry_run": dry_run,
-            "reason": str(exc),
-        }
+        return _error_response(
+            str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
+        )
 
-    if dry_run:
-        plan = plan_author(medium=medium, query=query, vault=vault_path)
-        return {
-            "status": "ok",
-            "tool": TOOL_NAME,
-            "tier_ceiling": privacy_tier_ceiling.value,
-            "tier_ceiling_enforced": False,
-            "dry_run": True,
-            "medium": medium,
-            "query": query,
-            "plan": plan["plan"],
-            "evidence": plan["evidence"],
-        }
-
-    draft = run_author(
-        medium=medium, query=query, vault=vault_path, max_rounds=max_rounds
-    )
+    # Any desk failure (bad config, provider error, missing contract) must
+    # surface as a structured envelope, never an unhandled exception across
+    # the MCP boundary.
+    try:
+        if dry_run:
+            plan = plan_author(medium=medium, query=query, vault=vault_path)
+            return {
+                "status": "ok",
+                "tool": TOOL_NAME,
+                "tier_ceiling": privacy_tier_ceiling.value,
+                "tier_ceiling_enforced": False,
+                "dry_run": True,
+                "medium": medium,
+                "query": query,
+                "plan": plan["plan"],
+                "evidence": plan["evidence"],
+            }
+        draft = run_author(
+            medium=medium, query=query, vault=vault_path, max_rounds=max_rounds
+        )
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        return _error_response(
+            str(exc), tier_ceiling=privacy_tier_ceiling, dry_run=dry_run
+        )
     return _draft_response(draft, tier_ceiling=privacy_tier_ceiling)
