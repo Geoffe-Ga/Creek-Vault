@@ -11,7 +11,7 @@ behind these same seams.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from creek.author.agents import Specialist, default_specialists
 from creek.author.models import (
@@ -75,7 +75,9 @@ def _require_supported_medium(medium: str) -> Medium:
             "wired in the Writing Desk skeleton (FEAT-041)."
         )
         raise ValueError(msg)
-    return "research"
+    # Echo back the validated medium rather than a hard-coded literal so that
+    # adding a medium to SUPPORTED_MEDIUMS cannot silently mislabel a draft.
+    return cast("Medium", medium)
 
 
 def _claims_to_provenance(claims: Sequence[EvidenceClaim]) -> list[ProvenanceEntry]:
@@ -133,7 +135,7 @@ class Conductor:
         return [s.name for s in self.specialists] + list(_DOWNSTREAM_STEPS)
 
     def gather_evidence(self, query: str, vault: Path) -> EvidenceBundle:
-        """Merge every specialist's evidence into one bundle.
+        """Run the specialist roster then the synthesize step.
 
         Args:
             query: The user query.
@@ -142,9 +144,21 @@ class Conductor:
         Returns:
             The synthesized :class:`EvidenceBundle`.
         """
+        bundles = [specialist.gather(query, vault) for specialist in self.specialists]
+        return self.synthesize(bundles)
+
+    def synthesize(self, bundles: Sequence[EvidenceBundle]) -> EvidenceBundle:
+        """Merge per-specialist *bundles* into one (the ``synthesize`` step).
+
+        Args:
+            bundles: One evidence bundle per specialist.
+
+        Returns:
+            A single :class:`EvidenceBundle` carrying every claim.
+        """
         claims: list[EvidenceClaim] = []
-        for specialist in self.specialists:
-            claims.extend(specialist.gather(query, vault).claims)
+        for bundle in bundles:
+            claims.extend(bundle.claims)
         return EvidenceBundle(claims=claims)
 
     def run(self, *, medium: str, query: str, vault: Path) -> AuthoredDraft:

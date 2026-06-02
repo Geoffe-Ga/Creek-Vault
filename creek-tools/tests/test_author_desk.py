@@ -129,6 +129,39 @@ def test_evidence_bundle_dedups_source_fragments() -> None:
     assert bundle.all_source_fragments() == ["f1", "f2", "f3"]
 
 
+def test_conductor_synthesize_merges_bundles(tmp_path: Path) -> None:
+    """The ``synthesize`` step merges every specialist bundle into one."""
+    conductor = build_default_conductor(max_rounds=1)
+    bundles = [s.gather("q", tmp_path) for s in conductor.specialists]
+
+    merged = conductor.synthesize(bundles)
+
+    expected = sum(len(b.claims) for b in bundles)
+    assert len(merged.claims) == expected
+    assert merged.claims  # non-empty
+
+
+def test_plan_steps_each_correspond_to_a_real_call(tmp_path: Path) -> None:
+    """Every advertised plan step is exercised by a real run (no ghost steps)."""
+    conductor = build_default_conductor(max_rounds=1)
+    # ``synthesize`` must exist and run, not just appear in ``plan()``.
+    assert "synthesize" in conductor.plan()
+    evidence = conductor.gather_evidence("q", tmp_path)
+    assert evidence.claims  # gather_evidence runs the synthesize step
+
+
+def test_require_supported_medium_returns_validated_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation echoes back the *requested* medium, not a hard-coded literal."""
+    from creek.author import conductor as conductor_mod
+
+    monkeypatch.setattr(
+        conductor_mod, "SUPPORTED_MEDIUMS", frozenset({"research", "essay"})
+    )
+    assert conductor_mod._require_supported_medium("essay") == "essay"
+
+
 def test_run_author_rejects_unknown_medium(tmp_path: Path) -> None:
     """Only the ``research`` medium is wired; others raise a clear error."""
     with pytest.raises(ValueError, match="research"):
