@@ -41,8 +41,8 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger("crawdad.slash_commands")
 
-# Issue #468: the documented soft-error shown when the desk / creek-tools
-# MCP surface is unreachable. Mirrors ``crawdad.loop._MCP_UNAVAILABLE_REPLY``
+# The documented soft-error shown when the desk / creek-tools MCP surface is
+# unreachable. Mirrors ``crawdad.loop._MCP_UNAVAILABLE_REPLY``
 # so the author routes degrade with the same wording as the agent loop.
 _MCP_UNAVAILABLE_REPLY = "creek-tools is unreachable; try again in a moment."
 
@@ -179,8 +179,8 @@ async def _run_and_reply(
 ) -> None:
     """Drive the loop runner and reply, degrading softly on MCP failure.
 
-    Issue #468: the author routes (`ask`/`draft`) own a resilience
-    contract — if the injected ``loop_runner`` ever lets an
+    The author routes (`ask`/`draft`) own a resilience contract — if the
+    injected ``loop_runner`` ever lets an
     :class:`~crawdad.mcp_client.MCPUnavailableError` escape (the loop
     normally converts it to a soft-reply string, but defense-in-depth
     keeps Discord from ever seeing a stack trace), reply with the
@@ -406,8 +406,8 @@ async def handle_help(replier: Replier) -> None:
 def _interaction_allowed(interaction: Any, config: CrawDadConfig) -> bool:
     """Return True when the interaction's user AND channel are allowlisted.
 
-    Issue #468: the author slash callbacks (`ask`/`draft`) must honour
-    CrawDad's personal-use allowlist (FEAT-013) the same way free-text
+    The author slash callbacks (`ask`/`draft`) must honour CrawDad's
+    personal-use allowlist (FEAT-013) the same way free-text
     messages do in :func:`crawdad.bot._passes_allowlist`. Delegates to
     :meth:`crawdad.config.CrawDadConfig.is_allowed` so the AND-gate
     semantics live in exactly one place.
@@ -452,8 +452,8 @@ def register(
     default to ``None`` (e.g. tests / no-tool-surface sessions); in
     that case the workflow command soft-errors instead of crashing.
 
-    ``config`` (issue #468) supplies the personal-use allowlist. The
-    author callbacks (`ask`/`draft`) gate on it BEFORE deferring so a
+    ``config`` supplies the personal-use allowlist. The author callbacks
+    (`ask`/`draft`) gate on it BEFORE deferring so a
     non-allowlisted user / channel gets no response at all (silent
     ignore, matching :func:`crawdad.bot._passes_allowlist`). The other
     callbacks are intentionally left ungated in this change (scope
@@ -521,8 +521,8 @@ def _register_draft(
         user fills it in. The runtime empty-string guard in
         :func:`handle_draft` stays as defense-in-depth.
 
-        Issue #468: a non-allowlisted user / channel is silently ignored
-        (no defer, no followup) BEFORE the interaction is deferred.
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
         """
         if not _interaction_allowed(interaction, config):
             return
@@ -546,8 +546,8 @@ def _register_ask(
         user fills it in. The runtime empty-string guard in
         :func:`handle_ask` stays as defense-in-depth.
 
-        Issue #468: a non-allowlisted user / channel is silently ignored
-        (no defer, no followup) BEFORE the interaction is deferred.
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
         """
         if not _interaction_allowed(interaction, config):
             return

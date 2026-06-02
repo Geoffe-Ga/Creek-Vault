@@ -728,7 +728,7 @@ async def test_workflow_callback_soft_errors_when_unwired() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Issue #468: allowlist gate + graceful degradation on the author routes.
+# Allowlist gate + graceful degradation on the author routes.
 # -----------------------------------------------------------------------------
 
 
