@@ -8,8 +8,9 @@ other-author attribution, and degrade gracefully on a thin/offline vault.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,9 +18,19 @@ from creek.author.agents import (
     GraphSpecialist,
     OntologySpecialist,
     RetrievalSpecialist,
+    _build_link_graph,
+    _load_config,
+    _load_corpus,
 )
 from creek.author.models import EvidenceBundle
-from creek.link.embeddings import EmbeddingModelUnavailableError
+from creek.link.embeddings import (
+    CachedEmbedding,
+    EmbeddingLinker,
+    EmbeddingModelUnavailableError,
+    content_hash_for_text,
+    embeddings_cache_path,
+    fragment_embedding_text,
+)
 from creek.models import Frequency, Phase
 
 if TYPE_CHECKING:
@@ -296,3 +307,178 @@ def test_ontology_unclassified_corpus_still_grounds_claim(tmp_path: Path) -> Non
     assert bundle.claims
     cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
     assert cited == {"frag-a", "frag-b"}
+
+
+def test_retrieval_reuses_linker_across_gather_calls(
+    tmp_path: Path, mock_sentence_transformer: MagicMock
+) -> None:
+    """One ``RetrievalSpecialist`` instance loads the model at most once.
+
+    A long-lived specialist reused across two ``gather()`` calls must not
+    re-instantiate the sentence-transformer — the per-instance lazy linker
+    holds the loaded model, so the underlying loader fires exactly once.
+    """
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha")
+    _write(tmp_path, "01-Fragments/Notes", "frag-b", "Beta")
+
+    specialist = RetrievalSpecialist()
+    specialist.gather("alpha", tmp_path)
+    specialist.gather("beta", tmp_path)
+
+    assert mock_sentence_transformer.call_count == 1
+
+
+def _seed_embeddings_cache(vault: Path, frag_ids: list[str]) -> None:
+    """Persist a real parquet cache covering *frag_ids* with fresh hashes.
+
+    These are UNIT tests, not integration: the vectors come from the autouse
+    ``mock_sentence_transformer`` fixture (deterministic mock embeddings), so
+    both this seeding step and the agent under test use the same mock model and
+    never load the real sentence-transformer. That is why the cache vector for a
+    fragment equals the vector the agent would compute live — and why no
+    ``@pytest.mark.integration`` marker is needed.
+    """
+    corpus = _load_corpus(vault)
+    by_id = {fragment.id: fragment for fragment, _ in corpus}
+    config = _load_config(vault)
+    linker = EmbeddingLinker(config.embeddings)
+    entries = {
+        fid: CachedEmbedding(
+            fragment_id=fid,
+            content_hash=content_hash_for_text(
+                fragment_embedding_text(by_id[fid]),
+            ),
+            model_name=config.embeddings.model,
+            vector=linker.generate_embedding(
+                fragment_embedding_text(by_id[fid]),
+            ),
+            computed_at=datetime.now(tz=UTC),
+        )
+        for fid in frag_ids
+    }
+    path = embeddings_cache_path(vault)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(entries, path)
+
+
+def test_retrieval_cache_hit_avoids_re_embedding(tmp_path: Path) -> None:
+    """A warm cache embeds only the query, never the cached fragments.
+
+    With a persisted parquet cache whose content hashes match the current
+    fragment text, ``gather`` reuses the cached vectors; the only
+    ``generate_embedding`` call is for the query itself.
+    """
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha")
+    _write(tmp_path, "01-Fragments/Notes", "frag-b", "Beta")
+    _seed_embeddings_cache(tmp_path, ["frag-a", "frag-b"])
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.generate_embedding",
+        autospec=True,
+        side_effect=EmbeddingLinker.generate_embedding,
+    ) as spy:
+        RetrievalSpecialist().gather("alpha", tmp_path)
+
+    embedded_texts = [call.args[1] for call in spy.call_args_list]
+    assert embedded_texts == ["alpha"]
+
+
+def test_retrieval_loads_cache_once_across_gather_calls(tmp_path: Path) -> None:
+    """The parquet cache is read once per instance + vault, not every gather()."""
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha")
+    _seed_embeddings_cache(tmp_path, ["frag-a"])
+    specialist = RetrievalSpecialist()
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.load_cache",
+        autospec=True,
+        side_effect=EmbeddingLinker.load_cache,
+    ) as spy:
+        specialist.gather("alpha", tmp_path)
+        specialist.gather("beta", tmp_path)
+
+    assert spy.call_count == 1
+
+
+def test_retrieval_cache_is_pure_optimization(tmp_path: Path) -> None:
+    """Warm-cache ranking equals cold ranking — the cache changes nothing.
+
+    The cached vector for a fragment is the same deterministic vector the
+    mock produces on the embed path, so ids and order must be identical with
+    and without a cache file present.
+    """
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Pluralism and F6")
+    _write(tmp_path, "01-Fragments/Notes", "frag-b", "Agency and F1")
+    _write(tmp_path, "01-Fragments/Notes", "frag-c", "Leverage and scale")
+
+    cold = RetrievalSpecialist().gather("What is F6 Pluralism?", tmp_path)
+    _seed_embeddings_cache(tmp_path, ["frag-a", "frag-b", "frag-c"])
+    warm = RetrievalSpecialist().gather("What is F6 Pluralism?", tmp_path)
+
+    assert cold == warm
+
+
+def test_retrieval_stale_cache_entry_is_recomputed(tmp_path: Path) -> None:
+    """A cache entry whose hash no longer matches falls back to a live embed.
+
+    Freshness is keyed on the SHA-256 of the current
+    ``fragment_embedding_text``; a stale hash must not be trusted, so the
+    fragment is re-embedded rather than served from the cache.
+    """
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha")
+    corpus = _load_corpus(tmp_path)
+    by_id = {fragment.id: fragment for fragment, _ in corpus}
+    config = _load_config(tmp_path)
+    linker = EmbeddingLinker(config.embeddings)
+    stale = {
+        "frag-a": CachedEmbedding(
+            fragment_id="frag-a",
+            content_hash=content_hash_for_text("a different, stale title"),
+            model_name=config.embeddings.model,
+            vector=linker.generate_embedding(
+                fragment_embedding_text(by_id["frag-a"]),
+            ),
+            computed_at=datetime.now(tz=UTC),
+        )
+    }
+    path = embeddings_cache_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(stale, path)
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.generate_embedding",
+        autospec=True,
+        side_effect=EmbeddingLinker.generate_embedding,
+    ) as spy:
+        RetrievalSpecialist().gather("alpha", tmp_path)
+
+    embedded_texts = [call.args[1] for call in spy.call_args_list]
+    # Exactly the query plus the one stale fragment, re-embedded live (computed
+    # via fragment_embedding_text so the assertion survives a shape change and
+    # still proves the stale cache entry was NOT served).
+    assert embedded_texts == ["alpha", fragment_embedding_text(by_id["frag-a"])]
+
+
+def test_build_link_graph_duplicate_title_is_last_wins(tmp_path: Path) -> None:
+    """Duplicate titles resolve a wikilink to the LAST fragment in corpus order.
+
+    ``_build_link_graph`` builds its ``by_title`` map last-wins, so a wikilink
+    to a shared title targets the final fragment declaring that title; ids are
+    always preferred over titles when both could match.
+    """
+    _write(tmp_path, "01-Fragments/Notes", "frag-dup-1", "Shared Title")
+    _write(tmp_path, "01-Fragments/Notes", "frag-dup-2", "Shared Title")
+    _write(
+        tmp_path,
+        "01-Fragments/Notes",
+        "frag-link",
+        "Linker",
+        body="[[Shared Title]]",
+    )
+
+    corpus = sorted(_load_corpus(tmp_path), key=lambda rec: rec[0].id)
+    graph = _build_link_graph(corpus)
+
+    # corpus order is frag-dup-1, frag-dup-2, frag-link; last-wins -> dup-2.
+    assert "frag-dup-2" in graph["frag-link"]
+    assert "frag-dup-1" not in graph["frag-link"]
