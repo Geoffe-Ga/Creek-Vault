@@ -2,10 +2,12 @@
 
 The conductor drives the end-to-end flow: each specialist gathers structured
 evidence, the bundles are synthesized, the voice agent renders a draft, and the
-reflection node judges it — looping on ``REVISE`` up to ``max_rounds`` before
-returning a shaped :class:`~creek.author.models.AuthoredDraft`. In the skeleton
-every collaborator is a typed stub; later issues swap in real implementations
-behind these same seams.
+reflection node judges it — looping on ``REVISE`` up to ``max_rounds``. A draft
+still in ``REVISE`` once the round budget is exhausted is escalated to a human
+(``ESCALATE``) rather than shipped (#473), then returned as a shaped
+:class:`~creek.author.models.AuthoredDraft`. The reflection node is a real
+deterministic judge; the remaining collaborators are typed stubs that later
+issues swap behind these same seams.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
     Medium,
+    ReflectionFinding,
+    ReflectionResult,
     ReflectionVerdict,
 )
 from creek.author.reflection import ReflectionNode
@@ -74,8 +78,11 @@ class Reflector(Protocol):
         body: str,
         evidence: EvidenceBundle,
         rubric: dict[str, float] | None = None,
-    ) -> ReflectionVerdict:
-        """Return a verdict for *body* given *evidence* and the medium *rubric*."""
+        *,
+        contract: MediumContract | None = None,
+        vault: Path | None = None,
+    ) -> ReflectionResult:
+        """Return a structured result for *body* given *evidence* and *rubric*."""
         ...
 
 
@@ -149,7 +156,17 @@ class Conductor:
         llm_client: AuthorLLMClient | None = None,
         contract: MediumContract | None = None,
     ) -> None:
-        """Store collaborators, the round bound, and the medium contract."""
+        """Store collaborators, the round bound, and the medium contract.
+
+        Raises:
+            ValueError: When *max_rounds* is below 1 — the voice/reflect loop
+                must run at least once, otherwise ``run`` could not produce a
+                judged draft (``AuthorConfig.max_author_rounds`` is bound
+                ``[1, 10]``; this guards a direct construction with ``0``).
+        """
+        if max_rounds < 1:
+            msg = f"max_rounds must be >= 1, got {max_rounds}"
+            raise ValueError(msg)
         self.specialists = list(specialists)
         self.voice = voice
         self.reflection = reflection
@@ -228,7 +245,9 @@ class Conductor:
             vault: The vault to author from.
 
         Returns:
-            The :class:`AuthoredDraft` with mock provenance and a verdict.
+            The :class:`AuthoredDraft` with mock provenance and a verdict. A
+            draft that never cleared ``REVISE`` within ``max_rounds`` carries
+            an ``ESCALATE`` verdict rather than the sub-threshold ``REVISE``.
 
         Raises:
             ValueError: When *medium* is unsupported.
@@ -239,15 +258,35 @@ class Conductor:
 
         body = ""
         verdict: ReflectionVerdict = "ESCALATE"
+        findings: list[ReflectionFinding] = []
         rounds = 0
         for attempt in range(1, self.max_rounds + 1):
             rounds = attempt
             body = self.voice.render(
                 query, evidence, vault, medium=validated, contract=self.contract
             )
-            verdict = self.reflection.review(body, evidence, rubric)
+            # voice_fidelity is implemented in the reflection node but stays
+            # dormant here: the owner's fingerprint + AIStyleConfig are not yet
+            # threaded into the desk. Wiring them (and an e2e voice test) is
+            # tracked as #506.
+            result = self.reflection.review(
+                body, evidence, rubric, contract=self.contract, vault=vault
+            )
+            verdict = result.decision
+            findings = result.findings
             if verdict != "REVISE":
                 break
+
+        # Never ship a sub-threshold draft: a still-REVISE verdict after the
+        # round budget is exhausted escalates to a human (#473). Carry the
+        # findings on the draft (and log them) so the escalation is actionable.
+        if verdict == "REVISE":
+            logger.warning(
+                "Escalating draft after %d round(s); unresolved dimensions: %s",
+                rounds,
+                sorted({finding.dimension for finding in findings}),
+            )
+            verdict = "ESCALATE"
 
         return AuthoredDraft(
             medium=validated,
@@ -256,6 +295,7 @@ class Conductor:
             provenance=_claims_to_provenance(evidence.claims),
             verdict=verdict,
             rounds=rounds,
+            findings=findings,
         )
 
 

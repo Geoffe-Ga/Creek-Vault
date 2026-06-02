@@ -31,6 +31,8 @@ from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
     Medium,
+    ReflectionFinding,
+    ReflectionResult,
     ReflectionVerdict,
 )
 
@@ -45,6 +47,8 @@ __all__ = [
     "EvidenceBundle",
     "EvidenceClaim",
     "Medium",
+    "ReflectionFinding",
+    "ReflectionResult",
     "ReflectionVerdict",
     "assert_contract_conformant",
     "build_default_conductor",
