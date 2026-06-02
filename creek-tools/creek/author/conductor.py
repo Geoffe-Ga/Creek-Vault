@@ -11,7 +11,7 @@ behind these same seams.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 from creek.author.agents import Specialist, default_specialists
 from creek.author.contracts import CHAT_MAX_CHARS, load_medium_contract
@@ -266,6 +266,49 @@ def run_author(
         medium=medium, query=query, vault=vault
     )
     return _enforce_chat_ceiling(draft)
+
+
+class AuthorPlan(TypedDict):
+    """The dry-run preview returned by :func:`plan_author` (FEAT-041 #460).
+
+    Attributes:
+        plan: Ordered pipeline step names.
+        evidence: Counts of synthesized ``claims`` and ``source_fragments``.
+    """
+
+    plan: list[str]
+    evidence: dict[str, int]
+
+
+def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
+    """Return the pipeline plan + evidence summary without authoring (dry run).
+
+    A lightweight preview for ``creek author --dry-run`` and the MCP verb's
+    ``dry_run``: it runs the specialists and synthesize step but skips the
+    voice/reflect loop, so no draft is produced.
+
+    Args:
+        medium: The requested medium.
+        query: The user query.
+        vault: The vault to gather evidence from.
+
+    Returns:
+        An :class:`AuthorPlan` with the step plan and evidence counts.
+
+    Raises:
+        ValueError: When *medium* is unsupported.
+    """
+    require_supported_medium(medium)
+    contract = load_medium_contract(medium, vault)
+    conductor = build_default_conductor(max_rounds=1, contract=contract)
+    evidence = conductor.gather_evidence(query, vault)
+    return {
+        "plan": conductor.plan(),
+        "evidence": {
+            "claims": len(evidence.claims),
+            "source_fragments": len(evidence.all_source_fragments()),
+        },
+    }
 
 
 def _enforce_chat_ceiling(draft: AuthoredDraft) -> AuthoredDraft:

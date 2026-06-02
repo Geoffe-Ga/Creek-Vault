@@ -397,8 +397,8 @@ def test_draft_refuses_for_out_of_range_index(
     assert "out of range" in result["reason"]
 
 
-def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
-    """``creek.author`` returns a typed stub draft (verdict + provenance)."""
+def test_author_tool_returns_draft_envelope(vault: Path) -> None:
+    """``creek.author`` returns the full draft envelope from the real desk."""
     result = author_tool(
         vault_path=vault,
         query="What is F6 Pluralism?",
@@ -408,14 +408,16 @@ def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
     assert result["status"] == "ok"
     assert result["tool"] == "creek.author"
     assert result["medium"] == "research"
-    # Deterministic stub: the verdict is exactly PASS, not merely a member of
-    # the verdict set (a membership check would be vacuous here).
-    assert result["verdict"] == "PASS"
+    assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
     assert isinstance(result["provenance"], list)
-    assert result["provenance"]  # non-empty mock provenance
+    assert result["provenance"]  # non-empty
+    assert result["claims"]  # cited claims envelope key
+    assert all(claim["source_fragments"] for claim in result["claims"])
     assert result["body"].strip()
     assert result["dry_run"] is False
-    assert result["rounds"] == 1  # stub always reports a single round
+    assert result["rounds"] >= 1
+    # The echo is explicitly marked non-enforcing until #463 lands.
+    assert result["tier_ceiling_enforced"] is False
 
 
 def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
@@ -429,6 +431,7 @@ def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
     assert result["status"] == "error"
     assert result["tool"] == "creek.author"
     assert result["tier_ceiling"] == "open"  # ceiling echoed on the error path
+    assert result["tier_ceiling_enforced"] is False  # key present on every envelope
     assert "research" in result["reason"]
 
 
@@ -492,3 +495,82 @@ def test_author_tool_writes_audit_entry(vault: Path) -> None:
     author_tool(vault_path=vault, query="q", medium="research", consumer="test")
     audit = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
     assert "creek.author" in audit
+
+
+def test_author_tool_returns_real_cited_draft(vault: Path) -> None:
+    """``creek.author`` delegates to the real desk: cited claims + verdict (#460)."""
+    result = author_tool(
+        vault_path=vault,
+        query="F6 medicine vs toxic",
+        medium="research",
+        consumer="test",
+    )
+
+    assert result["status"] == "ok"
+    assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
+    assert result["claims"]  # non-empty
+    assert all(claim["source_fragments"] for claim in result["claims"])
+    # NOTE (#463): the claim *count* and verdict here reflect the stub
+    # specialists (which emit fixed mock claims, ignoring vault content). When
+    # #463 wires the real Graph/Retrieval agents, strengthen this to seed real
+    # fragments and assert the claims trace back to them.
+
+
+def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
+    """``dry_run`` returns the pipeline plan + evidence summary, not a draft."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        dry_run=True,
+        consumer="test",
+    )
+
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+    assert result["plan"]
+    assert result["evidence"]["claims"] >= 1
+    # NOTE (#463): evidence counts reflect the stub specialists; revisit to
+    # assert against seeded fragments once the real specialists land.
+
+
+def test_author_tool_forwards_max_rounds(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``max_rounds`` is now forwarded to the real desk (was a no-op in the stub)."""
+    from creek.author import run_author as real_run_author
+
+    captured: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_run_author(**kwargs)
+
+    monkeypatch.setattr("creek_mcp.tools.author.run_author", spy)
+
+    author_tool(
+        vault_path=vault, query="q", medium="research", max_rounds=7, consumer="test"
+    )
+
+    assert captured["max_rounds"] == 7
+
+
+def test_author_tool_wraps_desk_errors(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A desk failure surfaces as a structured envelope, not an exception."""
+
+    def boom(**_kwargs: object) -> object:
+        msg = "provider unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("creek_mcp.tools.author.run_author", boom)
+
+    result = author_tool(
+        vault_path=vault, query="q", medium="research", consumer="test"
+    )
+
+    assert result["status"] == "error"
+    assert result["tool"] == "creek.author"
+    assert result["tier_ceiling_enforced"] is False
+    assert "provider unavailable" in result["reason"]
