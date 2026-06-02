@@ -34,6 +34,22 @@ def test_legacy_fragment_gets_native_defaults() -> None:
     assert fragment.source.author_slug is None
 
 
+def test_bad_voice_weight_fails_closed() -> None:
+    """A non-numeric or out-of-range ``voice_weight`` fails closed to 1.0."""
+    garbage = {**_LEGACY_FRONTMATTER, "voice_weight": "banana"}
+    out_of_range = {**_LEGACY_FRONTMATTER, "voice_weight": 5.0}
+
+    assert Fragment.model_validate(garbage).voice_weight == 1.0
+    assert Fragment.model_validate(out_of_range).voice_weight == 1.0
+
+
+def test_bad_representativeness_fails_closed() -> None:
+    """An unrecognised ``representativeness`` fails closed to ``self``."""
+    bad = {**_LEGACY_FRONTMATTER, "representativeness": "vibes"}
+
+    assert Fragment.model_validate(bad).representativeness == "self"
+
+
 def _other_author_fragment() -> Fragment:
     """Build an other-author fragment with the new attribution fields set."""
     return Fragment(
