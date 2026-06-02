@@ -76,6 +76,22 @@ def test_harness_rejects_bad_weight_sum() -> None:
         assert_contract_conformant(bad)
 
 
+def test_harness_rejects_out_of_range_weight() -> None:
+    """A weight outside [0, 1] is non-conformant even when the sum is ~1.0."""
+    bad = MediumContract(
+        medium="bad",
+        structure=["reply"],
+        specialist_weights={"voice": 1.5, "graph": -0.5},  # sums to 1.0
+        reflection_rubric={
+            "ontological_accuracy": 0.34,
+            "citation_completeness": 0.33,
+            "voice_fidelity": 0.33,
+        },
+    )
+    with pytest.raises(ContractConformanceError, match="outside"):
+        assert_contract_conformant(bad)
+
+
 def test_harness_rejects_missing_rubric_keys() -> None:
     """A rubric missing a required dimension is non-conformant."""
     bad = MediumContract(

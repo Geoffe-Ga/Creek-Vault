@@ -13,8 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from creek.compile.provenance import ProvenanceEntry
 
-#: Mediums the author desk can produce. Only ``research`` is wired in the
-#: skeleton; the others (chat/essay/book-report/how-to) arrive in later issues.
+#: Mediums the author desk can produce. ``research`` and ``chat`` are wired;
+#: the others (essay/research-piece/book-report/how-to) arrive in later issues.
 Medium = Literal["research", "chat"]
 
 #: The reflection node's bounded verdict over a drafted body.
