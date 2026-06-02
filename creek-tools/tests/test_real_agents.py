@@ -13,9 +13,14 @@ from unittest.mock import patch
 
 import pytest
 
-from creek.author.agents import GraphSpecialist, RetrievalSpecialist
+from creek.author.agents import (
+    GraphSpecialist,
+    OntologySpecialist,
+    RetrievalSpecialist,
+)
 from creek.author.models import EvidenceBundle
 from creek.link.embeddings import EmbeddingModelUnavailableError
+from creek.models import Frequency, Phase
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -174,3 +179,120 @@ def test_graph_empty_vault_returns_empty_with_stats(tmp_path: Path) -> None:
     assert bundle.claims == []
     assert bundle.walk_stats is not None
     assert bundle.walk_stats.fragments_visited == 0
+
+
+def _write_classified(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    body: str,
+    frontmatter: str = "",
+) -> None:
+    """Write a fragment carrying optional pre-classified frontmatter blocks."""
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"source:\n  platform: journal\n  author: self\n{frontmatter}---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+# Bodies dense with rule-classifier signal keywords (creek/classify/rules.py)
+# so deterministic keyword classification fires without any LLM.
+_F6_BODY = "community empathy harmony inclusion caring sharing equality consensus"
+_F3_BODY = "power dominance control conquest force aggression warrior rebellion"
+_RISING_BODY = "emerging building growing momentum ascending intensifying gathering"
+_DIMINISHING_BODY = "diminishing declining waning subsiding settling calming quieting"
+
+
+def test_ontology_returns_canonical_taxonomy(tmp_path: Path) -> None:
+    """The Ontology agent emits only canonical F1-F10 frequencies and phases."""
+    _write_classified(tmp_path, "frag-f6", "Community and belonging", body=_F6_BODY)
+    _write_classified(tmp_path, "frag-rise", "Emerging momentum", body=_RISING_BODY)
+
+    bundle = OntologySpecialist().gather("community", tmp_path)
+
+    assert bundle.ontology is not None
+    canonical_freqs = {f"F{i}" for i in range(1, 11)}
+    assert bundle.ontology.frequencies  # F6 detected
+    for entry in bundle.ontology.frequencies:
+        assert isinstance(entry.value, Frequency)
+        assert entry.value.value in canonical_freqs
+    assert any(e.value is Frequency.F6 for e in bundle.ontology.frequencies)
+    canonical_phases = {p for p in Phase if p is not Phase.UNCLASSIFIED}
+    for entry in bundle.ontology.phases:
+        assert entry.value in canonical_phases
+    assert any(e.value is Phase.RISING for e in bundle.ontology.phases)
+    # Claims are grounded in the scanned fragments.
+    assert bundle.claims
+    assert all(claim.source_fragments for claim in bundle.claims)
+    cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
+    assert cited == {"frag-f6", "frag-rise"}
+
+
+def test_ontology_surfaces_dosage_paradox_without_resolving(tmp_path: Path) -> None:
+    """Same frequency marked medicine vs toxic surfaces a paradox, both kept."""
+    _write_classified(
+        tmp_path,
+        "frag-med",
+        "Power as medicine",
+        body=_F3_BODY,
+        frontmatter="frequency:\n  primary: F3\nwavelength:\n  dosage: medicine\n",
+    )
+    _write_classified(
+        tmp_path,
+        "frag-tox",
+        "Power as toxic",
+        body=_F3_BODY,
+        frontmatter="frequency:\n  primary: F3\nwavelength:\n  dosage: toxic\n",
+    )
+
+    bundle = OntologySpecialist().gather("power", tmp_path)
+
+    assert bundle.ontology is not None
+    dosage_paradoxes = [p for p in bundle.ontology.paradoxes if p.kind == "dosage"]
+    assert dosage_paradoxes, "dosage contradiction must be surfaced"
+    paradox = dosage_paradoxes[0]
+    assert set(paradox.fragment_ids) == {"frag-med", "frag-tox"}
+    # The contradiction is preserved, not flattened to one dosage.
+    dosage_values = {e.value.value for e in bundle.ontology.dosages}
+    assert {"medicine", "toxic"} <= dosage_values
+
+
+def test_ontology_surfaces_phase_paradox_without_resolving(tmp_path: Path) -> None:
+    """Opposite phases across fragments surface a phase paradox, both kept."""
+    _write_classified(tmp_path, "frag-rise", "Rising tide", body=_RISING_BODY)
+    _write_classified(tmp_path, "frag-fall", "Falling away", body=_DIMINISHING_BODY)
+
+    bundle = OntologySpecialist().gather("tide", tmp_path)
+
+    assert bundle.ontology is not None
+    phase_paradoxes = [p for p in bundle.ontology.paradoxes if p.kind == "phase"]
+    assert phase_paradoxes, "phase contradiction must be surfaced"
+    assert set(phase_paradoxes[0].fragment_ids) == {"frag-rise", "frag-fall"}
+    phase_values = {e.value for e in bundle.ontology.phases}
+    assert {Phase.RISING, Phase.DIMINISHING} <= phase_values
+
+
+def test_ontology_empty_vault_returns_empty_bundle(tmp_path: Path) -> None:
+    """An empty corpus yields an empty bundle with no ontology and no crash."""
+    bundle = OntologySpecialist().gather("q", tmp_path)
+
+    assert bundle == EvidenceBundle()
+    assert bundle.ontology is None
+    assert bundle.claims == []
+
+
+def test_ontology_unclassified_corpus_still_grounds_claim(tmp_path: Path) -> None:
+    """Even an all-unclassified corpus emits a fragment-grounded claim."""
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha note about q")
+    _write(tmp_path, "01-Fragments/Notes", "frag-b", "Beta note")
+
+    bundle = OntologySpecialist().gather("q", tmp_path)
+
+    assert bundle.ontology is not None
+    assert bundle.claims
+    cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
+    assert cited == {"frag-a", "frag-b"}
