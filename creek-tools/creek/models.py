@@ -6,16 +6,19 @@ It also provides supporting enums and nested classification models used
 for the APTITUDE frequency framework and Archetypal Wavelength mapping.
 """
 
+import logging
 import uuid
 import warnings
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from creek.compile.provenance import CompileMethod, ProvenanceEntry
 from creek.time import now_la, today_la
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Type-only import to expose :class:`WeightedFragmentClassification`
@@ -421,6 +424,108 @@ def _generate_wave_id() -> str:
 def _generate_sync_id() -> str:
     """Generate a unique synchronicity ID with prefix 'sync-'."""
     return f"sync-{uuid.uuid4().hex[:8]}"
+
+
+# ---- Author attribution (FEAT-041 §7.2) ----
+
+AuthorKind = Literal["human_source", "ai_as_user", "collaborator"]
+"""Who an other-author is: an external human, AI output the owner endorses as
+their own interests, or a co-author."""
+
+Representativeness = Literal["self", "endorsed", "aspirational", "reference"]
+"""How closely an author's material stands for the vault owner's own views."""
+
+_AUTHOR_KINDS: frozenset[str] = frozenset(
+    {"human_source", "ai_as_user", "collaborator"}
+)
+_REPRESENTATIVENESS: frozenset[str] = frozenset(
+    {"self", "endorsed", "aspirational", "reference"}
+)
+
+
+def _safe_float(value: object) -> float | None:
+    """Return *value* as a float, or ``None`` when it is not a real number.
+
+    ``bool`` is rejected (it is a misleading ``int`` subclass); strings are
+    parsed leniently so a hand-typed manifest still loads.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+class AuthorManifest(BaseModel):
+    """Attribution manifest for an ``11-Other-Authors/<slug>/`` entry (FEAT-041 §7.2).
+
+    Parsed from an ``_author.md`` frontmatter block. Every attribution field
+    *fails closed*: a malformed value resolves to the most conservative
+    default (no voice influence, attribution required) rather than raising, so
+    a hand-edited manifest can never crash the pipeline.
+
+    Attributes:
+        author_slug: Identity key; the loader sets this from the folder name.
+        display_name: Human-readable name for citations.
+        author_kind: External human, AI-as-user, or collaborator.
+        voice_weight: Allowed voice influence in ``[0.0, 1.0]``; 0.0 by default.
+        representativeness: How closely this stands for the owner's views.
+        default_privacy_tier: Default tier for this author's captured content.
+        attribution_required: Whether output drawing on this author must cite it.
+        notes: Free-form capture rationale.
+    """
+
+    model_config = ConfigDict(use_enum_values=True, extra="ignore")
+
+    author_slug: str
+    display_name: str = ""
+    author_kind: AuthorKind = "human_source"
+    voice_weight: float = 0.0
+    representativeness: Representativeness = "reference"
+    default_privacy_tier: PrivacyTier = PrivacyTier.OPEN
+    attribution_required: bool = True
+    notes: str = ""
+
+    @field_validator("author_kind", mode="before")
+    @classmethod
+    def _coerce_author_kind(cls, value: object) -> str:
+        """Fail closed to ``human_source`` for an unrecognised author kind."""
+        if isinstance(value, str) and value in _AUTHOR_KINDS:
+            return value
+        logger.warning(
+            "Author kind %r unrecognised; failing closed to 'human_source'.", value
+        )
+        return "human_source"
+
+    @field_validator("representativeness", mode="before")
+    @classmethod
+    def _coerce_representativeness(cls, value: object) -> str:
+        """Fail closed to ``reference`` for an unrecognised representativeness."""
+        if isinstance(value, str) and value in _REPRESENTATIVENESS:
+            return value
+        logger.warning(
+            "Representativeness %r unrecognised; failing closed to 'reference'.", value
+        )
+        return "reference"
+
+    @field_validator("voice_weight", mode="before")
+    @classmethod
+    def _coerce_voice_weight(cls, value: object) -> float:
+        """Fail closed to 0.0 for a non-numeric or out-of-range voice weight."""
+        weight = _safe_float(value)
+        if weight is None or not 0.0 <= weight <= 1.0:
+            logger.warning(
+                "Author voice_weight %r invalid or out of [0, 1]; failing closed "
+                "to 0.0.",
+                value,
+            )
+            return 0.0
+        return weight
 
 
 # ---- Nested Models ----
