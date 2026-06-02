@@ -832,6 +832,18 @@ class AuthorConfig(BaseModel):
     times; model ids for the desk's LLM calls come from the ``llm`` section,
     never hard-coded."""
 
+    graph_breadth_bound: int = Field(default=25, ge=1)
+    """Max fragments the Graph agent's backlink walk expands at each depth
+    level (FEAT-041 #463, open question #4). Config-bounded, not hard-coded."""
+
+    graph_depth_bound: int = Field(default=2, ge=0)
+    """Max backlink hops the Graph agent walks from its seed (``0`` = seed
+    only). Config-bounded, not hard-coded (FEAT-041 #463)."""
+
+    retrieval_top_k: int = Field(default=5, ge=1)
+    """How many top-ranked fragments the Retrieval agent surfaces as evidence
+    (FEAT-041 #463)."""
+
 
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
