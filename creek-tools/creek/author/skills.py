@@ -112,6 +112,8 @@ def read_skill(path: Path) -> str:
     """
     try:
         return path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A locked/unreadable file or a vault-authored SKILL.md with non-UTF-8
+        # bytes must skip silently rather than crash the voice render (#501).
         logger.warning("Could not read voice-skill file %s; skipping.", path)
         return ""

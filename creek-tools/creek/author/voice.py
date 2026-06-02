@@ -144,6 +144,9 @@ def _skill_sections(vault: Path, evidence: EvidenceBundle) -> list[str]:
     paths = [
         find_voice_core(vault),
         find_phase_skill(vault, _dominant_phase(evidence)),
+        # Register is not yet wired — the synthesized ontology carries no
+        # dominant voice register to select from. The discovery seam is kept
+        # so register selection is a one-line change once #502 lands.
         find_register_skill(vault, None),
     ]
     sections: list[str] = []
