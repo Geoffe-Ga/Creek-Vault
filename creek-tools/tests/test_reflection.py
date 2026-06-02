@@ -138,6 +138,23 @@ def test_privacy_skips_cited_fragment_absent_from_vault(tmp_path: Path) -> None:
     assert not any(f.dimension == "privacy_compliance" for f in result.findings)
 
 
+def test_legacy_alias_maps_have_no_key_collisions() -> None:
+    """The merged alias map keeps every key — no phase/mode/frequency collision."""
+    from creek.author.checks import _LEGACY_ALIASES
+    from creek.models import (
+        FREQUENCY_LEGACY_ALIASES,
+        MODE_LEGACY_ALIASES,
+        PHASE_LEGACY_ALIASES,
+    )
+
+    expected = (
+        len(PHASE_LEGACY_ALIASES)
+        + len(MODE_LEGACY_ALIASES)
+        + len(FREQUENCY_LEGACY_ALIASES)
+    )
+    assert len(_LEGACY_ALIASES) == expected
+
+
 def test_paradox_bare_conjunction_off_topic_is_flattened() -> None:
     """A contrast cue unrelated to the paradox's vocabulary does not preserve it.
 

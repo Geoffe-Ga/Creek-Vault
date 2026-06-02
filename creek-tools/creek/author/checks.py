@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+import yaml
+
 from creek.author.models import ReflectionFinding
 from creek.generate.ai_style.scanner import scan
 
@@ -30,7 +32,7 @@ from creek.models import (
     PHASE_LEGACY_ALIASES,
     PrivacyTier,
 )
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import try_load_fragment
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -95,13 +97,28 @@ def _resolve_cited_tiers(
     Returns:
         A mapping of cited fragment id to its tier and stored body. Fragments
         not found in the vault are omitted.
+
+    The scan is lazy and exits as soon as every cited fragment is resolved, so
+    a draft citing a handful of fragments does not pay an O(vault) cost on every
+    ``review`` call inside the retry loop.
     """
     cited = set(evidence.all_source_fragments())
-    fragments_root = vault / "01-Fragments"
     resolved: dict[str, tuple[PrivacyTier, str]] = {}
-    for _path, fragment, body, _raw in iter_vault_fragments(fragments_root):
+    fragments_root = vault / "01-Fragments"
+    if not cited or not fragments_root.is_dir():
+        return resolved
+    for md_file in sorted(fragments_root.rglob("*.md")):
+        try:
+            record = try_load_fragment(md_file)
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+        if record is None:
+            continue
+        fragment, body, _raw = record
         if fragment.id in cited:
             resolved[fragment.id] = (fragment.privacy_tier, body)
+            if len(resolved) == len(cited):
+                break  # every cited fragment found — stop scanning the vault
     return resolved
 
 
@@ -295,8 +312,15 @@ def check_attribution_correctness(
         slug = claim.author_slug
         if slug is None:
             continue
+        # Word-boundary match (not substring) so a slug appearing inside a
+        # longer word — e.g. "naval" within "navalny" — is not mistaken for an
+        # attribution, mirroring check_ontological_accuracy.
         name = slug.replace("-", " ").lower()
-        if slug.lower() not in lowered and name not in lowered:
+        attributed = any(
+            re.search(rf"\b{re.escape(token)}\b", lowered)
+            for token in (slug.lower(), name)
+        )
+        if not attributed:
             findings.append(
                 ReflectionFinding(
                     dimension="attribution_correctness",
