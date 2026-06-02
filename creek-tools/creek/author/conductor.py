@@ -33,9 +33,12 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.models import MediumContract
 
-#: Mediums the conductor will run. ``research``/``chat``/``essay`` are wired;
-#: the remaining mediums (research-piece/book-report/how-to) arrive later.
-SUPPORTED_MEDIUMS: frozenset[str] = frozenset({"research", "chat", "essay"})
+#: Mediums the conductor will run. ``research``/``chat``/``essay``/
+#: ``research-piece`` are wired; the remaining mediums (book-report/how-to)
+#: arrive later.
+SUPPORTED_MEDIUMS: frozenset[str] = frozenset(
+    {"research", "chat", "essay", "research-piece"}
+)
 
 #: Fixed pipeline steps that follow the specialist roster, in order.
 _DOWNSTREAM_STEPS: tuple[str, ...] = ("synthesize", "voice", "reflect")
