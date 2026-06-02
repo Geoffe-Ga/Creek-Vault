@@ -163,6 +163,23 @@ def test_attribution_required_false_is_preserved(tmp_path: Path) -> None:
     assert load_author_manifest(path).attribution_required is False
 
 
+def test_null_privacy_tier_fails_closed(tmp_path: Path) -> None:
+    """An explicit ``null`` ``default_privacy_tier`` fails closed to OPEN."""
+    body = _FULL_MANIFEST.replace(
+        "default_privacy_tier: open", "default_privacy_tier: null"
+    )
+    path = _write_manifest(tmp_path, "null-tier", body)
+
+    assert load_author_manifest(path).default_privacy_tier == PrivacyTier.OPEN
+
+
+def test_loader_is_exported_from_vault_package() -> None:
+    """``load_author_manifest`` is reachable from the ``creek.vault`` surface."""
+    from creek.vault import load_author_manifest as exported
+
+    assert exported is load_author_manifest
+
+
 def test_missing_file_raises(tmp_path: Path) -> None:
     """A missing manifest path raises a clear ``FileNotFoundError``."""
     missing = tmp_path / "11-Other-Authors" / "ghost" / "_author.md"

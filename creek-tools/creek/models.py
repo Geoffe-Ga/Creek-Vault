@@ -9,6 +9,7 @@ for the APTITUDE frequency framework and Archetypal Wavelength mapping.
 import logging
 import uuid
 import warnings
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, TypeVar, get_args
@@ -441,16 +442,26 @@ _AUTHOR_KINDS: frozenset[str] = frozenset(get_args(AuthorKind))
 _REPRESENTATIVENESS: frozenset[str] = frozenset(get_args(Representativeness))
 
 
-def _warn_fail_closed(field: str, value: object, fallback: str) -> None:
-    """Log a fail-closed warning, distinguishing a null value from an invalid one."""
+def _warn_fail_closed(
+    field: str,
+    value: object,
+    fallback: str,
+    *,
+    reason: str = "is not a recognised value",
+) -> None:
+    """Log a fail-closed warning, distinguishing a null value from an invalid one.
+
+    Args:
+        field: The manifest field being coerced.
+        value: The offending input value.
+        fallback: The safe default the field resolves to.
+        reason: Why a non-null *value* was rejected.
+    """
     if value is None:
         logger.warning("'%s' is null; failing closed to %r.", field, fallback)
     else:
         logger.warning(
-            "%s %r is not a recognised value; failing closed to %r.",
-            field,
-            value,
-            fallback,
+            "%s %r %s; failing closed to %r.", field, value, reason, fallback
         )
 
 
@@ -526,13 +537,9 @@ class AuthorManifest(BaseModel):
         """Fail closed to 0.0 for a non-numeric or out-of-range voice weight."""
         weight = _safe_float(value)
         if weight is None or not 0.0 <= weight <= 1.0:
-            if value is None:
-                logger.warning("'voice_weight' is null; failing closed to 0.0.")
-            else:
-                logger.warning(
-                    "voice_weight %r is not a number in [0, 1]; failing closed to 0.0.",
-                    value,
-                )
+            _warn_fail_closed(
+                "voice_weight", value, "0.0", reason="is not a number in [0, 1]"
+            )
             return 0.0
         return weight
 
@@ -543,12 +550,9 @@ class AuthorManifest(BaseModel):
         if isinstance(value, PrivacyTier):
             return value
         if isinstance(value, str):
-            try:
+            with suppress(ValueError):
                 return PrivacyTier(value)
-            except ValueError:
-                _warn_fail_closed("default_privacy_tier", value, "open")
-        elif value is not None:
-            _warn_fail_closed("default_privacy_tier", value, "open")
+        _warn_fail_closed("default_privacy_tier", value, "open")
         return PrivacyTier.OPEN
 
     @field_validator("attribution_required", mode="before")
@@ -557,8 +561,8 @@ class AuthorManifest(BaseModel):
         """Fail closed to ``True`` (require attribution) for a non-boolean value."""
         if isinstance(value, bool):
             return value
-        logger.warning(
-            "attribution_required %r is not a boolean; failing closed to True.", value
+        _warn_fail_closed(
+            "attribution_required", value, "True", reason="is not a boolean"
         )
         return True
 
