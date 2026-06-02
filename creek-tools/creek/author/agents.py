@@ -189,6 +189,8 @@ class RetrievalSpecialist:
                 first :meth:`gather` and cached on the instance.
         """
         self._linker = linker
+        self._cache: dict[str, CachedEmbedding] | None = None
+        self._cache_vault: Path | None = None
 
     def _get_linker(self, config: CreekConfig) -> EmbeddingLinker:
         """Return the instance's linker, creating and caching it on first use.
@@ -203,6 +205,33 @@ class RetrievalSpecialist:
             self._linker = EmbeddingLinker(config.embeddings)
         return self._linker
 
+    def _get_cache(
+        self,
+        linker: EmbeddingLinker,
+        vault: Path,
+    ) -> dict[str, CachedEmbedding]:
+        """Return the persisted embeddings cache, read once per instance + vault.
+
+        The parquet is loaded on first use for a given vault and reused across
+        later :meth:`gather` calls so the desk does not re-read it every call.
+        Staleness is harmless: ``_fragment_vector`` validates each entry's
+        ``content_hash`` against the fragment's current text, so a fragment
+        re-embedded into the parquet after this instance cached the dict simply
+        falls back to a live embed — never a wrong vector. A different *vault*
+        reloads.
+
+        Args:
+            linker: The reused linker whose ``load_cache`` reads the parquet.
+            vault: The vault whose embeddings cache is read.
+
+        Returns:
+            The fragment-id keyed embedding cache (empty when absent).
+        """
+        if self._cache is None or self._cache_vault != vault:
+            self._cache = linker.load_cache(embeddings_cache_path(vault))
+            self._cache_vault = vault
+        return self._cache
+
     def gather(self, query: str, vault: Path) -> EvidenceBundle:
         """Return the top-``retrieval_top_k`` fragments most relevant to *query*.
 
@@ -216,7 +245,7 @@ class RetrievalSpecialist:
         if not corpus:
             return EvidenceBundle()
         linker = self._get_linker(config)
-        cache = linker.load_cache(embeddings_cache_path(vault))
+        cache = self._get_cache(linker, vault)
         try:
             ranked = _rank_fragments(query, corpus, linker, cache)
         except EmbeddingModelUnavailableError:

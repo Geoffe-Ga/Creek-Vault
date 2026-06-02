@@ -329,7 +329,15 @@ def test_retrieval_reuses_linker_across_gather_calls(
 
 
 def _seed_embeddings_cache(vault: Path, frag_ids: list[str]) -> None:
-    """Persist a real parquet cache covering *frag_ids* with fresh hashes."""
+    """Persist a real parquet cache covering *frag_ids* with fresh hashes.
+
+    These are UNIT tests, not integration: the vectors come from the autouse
+    ``mock_sentence_transformer`` fixture (deterministic mock embeddings), so
+    both this seeding step and the agent under test use the same mock model and
+    never load the real sentence-transformer. That is why the cache vector for a
+    fragment equals the vector the agent would compute live — and why no
+    ``@pytest.mark.integration`` marker is needed.
+    """
     corpus = _load_corpus(vault)
     by_id = {fragment.id: fragment for fragment, _ in corpus}
     config = _load_config(vault)
@@ -373,6 +381,23 @@ def test_retrieval_cache_hit_avoids_re_embedding(tmp_path: Path) -> None:
 
     embedded_texts = [call.args[1] for call in spy.call_args_list]
     assert embedded_texts == ["alpha"]
+
+
+def test_retrieval_loads_cache_once_across_gather_calls(tmp_path: Path) -> None:
+    """The parquet cache is read once per instance + vault, not every gather()."""
+    _write(tmp_path, "01-Fragments/Notes", "frag-a", "Alpha")
+    _seed_embeddings_cache(tmp_path, ["frag-a"])
+    specialist = RetrievalSpecialist()
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.load_cache",
+        autospec=True,
+        side_effect=EmbeddingLinker.load_cache,
+    ) as spy:
+        specialist.gather("alpha", tmp_path)
+        specialist.gather("beta", tmp_path)
+
+    assert spy.call_count == 1
 
 
 def test_retrieval_cache_is_pure_optimization(tmp_path: Path) -> None:
