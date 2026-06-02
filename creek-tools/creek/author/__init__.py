@@ -15,6 +15,7 @@ from creek.author.conductor import (
     SUPPORTED_MEDIUMS,
     Conductor,
     build_default_conductor,
+    require_supported_medium,
     run_author,
 )
 from creek.author.models import (
@@ -35,5 +36,6 @@ __all__ = [
     "Medium",
     "ReflectionVerdict",
     "build_default_conductor",
+    "require_supported_medium",
     "run_author",
 ]

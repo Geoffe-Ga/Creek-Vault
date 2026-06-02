@@ -57,7 +57,7 @@ class Reflector(Protocol):
         ...
 
 
-def _require_supported_medium(medium: str) -> Medium:
+def require_supported_medium(medium: str) -> Medium:
     """Validate *medium* and return it as a :data:`Medium` literal.
 
     Args:
@@ -175,7 +175,7 @@ class Conductor:
         Raises:
             ValueError: When *medium* is unsupported.
         """
-        validated = _require_supported_medium(medium)
+        validated = require_supported_medium(medium)
         evidence = self.gather_evidence(query, vault)
 
         body = ""

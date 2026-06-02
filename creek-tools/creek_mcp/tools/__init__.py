@@ -1,5 +1,6 @@
 """MCP tool implementations exposed by ``creek_mcp.server`` (FEAT-010/011/012)."""
 
+from creek_mcp.tools.author import author_tool
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.compile import compile_tool
 from creek_mcp.tools.draft import draft_tool
@@ -22,6 +23,7 @@ from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
 
 __all__ = [
+    "author_tool",
     "classify_tool",
     "compile_tool",
     "draft_tool",

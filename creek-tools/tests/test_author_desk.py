@@ -159,7 +159,7 @@ def test_require_supported_medium_returns_validated_value(
     monkeypatch.setattr(
         conductor_mod, "SUPPORTED_MEDIUMS", frozenset({"research", "essay"})
     )
-    assert conductor_mod._require_supported_medium("essay") == "essay"
+    assert conductor_mod.require_supported_medium("essay") == "essay"
 
 
 def test_run_author_rejects_unknown_medium(tmp_path: Path) -> None:

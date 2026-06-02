@@ -11,6 +11,7 @@ import pytest
 
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.author import author_tool
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.lint import lint_tool
 from creek_mcp.tools.mine import mine_tool
@@ -394,3 +395,100 @@ def test_draft_refuses_for_out_of_range_index(
     assert result["status"] == "refused"
     assert result["tool"] == "creek.draft"
     assert "out of range" in result["reason"]
+
+
+def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
+    """``creek.author`` returns a typed stub draft (verdict + provenance)."""
+    result = author_tool(
+        vault_path=vault,
+        query="What is F6 Pluralism?",
+        medium="research",
+        consumer="test",
+    )
+    assert result["status"] == "ok"
+    assert result["tool"] == "creek.author"
+    assert result["medium"] == "research"
+    # Deterministic stub: the verdict is exactly PASS, not merely a member of
+    # the verdict set (a membership check would be vacuous here).
+    assert result["verdict"] == "PASS"
+    assert isinstance(result["provenance"], list)
+    assert result["provenance"]  # non-empty mock provenance
+    assert result["body"].strip()
+    assert result["dry_run"] is False
+    assert result["rounds"] == 1  # stub always reports a single round
+
+
+def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
+    """An unsupported medium returns a structured error, not a draft."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="book-report",
+        consumer="test",
+    )
+    assert result["status"] == "error"
+    assert result["tool"] == "creek.author"
+    assert result["tier_ceiling"] == "open"  # ceiling echoed on the error path
+    assert "research" in result["reason"]
+
+
+def test_author_tool_error_envelope_includes_dry_run(vault: Path) -> None:
+    """The error envelope carries ``dry_run`` so the shape matches success."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="book-report",
+        dry_run=True,
+        consumer="test",
+    )
+    assert result["status"] == "error"
+    assert result["dry_run"] is True
+
+
+def test_author_tool_echoes_non_default_ceiling(vault: Path) -> None:
+    """A non-default privacy ceiling is echoed on the success path."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+        consumer="test",
+    )
+    assert result["status"] == "ok"
+    assert result["tier_ceiling"] == "personal"
+
+
+def test_author_tool_records_max_rounds_in_audit(vault: Path) -> None:
+    """A non-``None`` ``max_rounds`` is captured in the audit entry."""
+    author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        max_rounds=5,
+        consumer="test",
+    )
+    entry = json.loads(
+        (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert entry["tool"] == "creek.author"
+    assert entry["args_summary"]["max_rounds"] == 5
+
+
+def test_author_tool_echoes_dry_run_flag(vault: Path) -> None:
+    """The ``dry_run`` arg is accepted for CLI parity and echoed back."""
+    result = author_tool(
+        vault_path=vault,
+        query="q",
+        medium="research",
+        dry_run=True,
+        consumer="test",
+    )
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+
+
+def test_author_tool_writes_audit_entry(vault: Path) -> None:
+    """The tool appends an audit entry recording the call."""
+    author_tool(vault_path=vault, query="q", medium="research", consumer="test")
+    audit = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    assert "creek.author" in audit

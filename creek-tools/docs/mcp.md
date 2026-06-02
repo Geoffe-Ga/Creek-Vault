@@ -27,6 +27,19 @@ interactively will appear to hang, which is correct.
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
 
+### Author tools (FEAT-041)
+
+| Tool           | Inputs                                                                  | Purpose                                                                       |
+|----------------|------------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| `creek.author` | `query`, `medium?` (default `research`), `max_rounds?`, `dry_run?`      | Author a draft for a query via the Creek Writing Desk.                         |
+
+Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
+`medium`, `query`, `body`, `provenance` (a list of provenance entries),
+`verdict` (one of `PASS` / `REVISE` / `ESCALATE`), and `rounds`. The response
+is a typed **stub** today (the skeleton from #456); issue #460 wires it to the
+real desk. Only the `research` medium is wired — any other `medium` returns
+`status: error`.
+
 ### Write tools (FEAT-011)
 
 | Tool                    | Inputs                                                      | Write-side tier rule                                              |
