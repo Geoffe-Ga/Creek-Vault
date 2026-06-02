@@ -2641,13 +2641,80 @@ def _resolve_save_tier(
     return PrivacyTier.OPEN
 
 
+def _validate_author_inputs(
+    medium: str, query: str | None, work: Path | None, supported: frozenset[str]
+) -> None:
+    """Validate the ``author`` command's medium/query/work combination.
+
+    Enforces the per-medium input contract: a known medium, ``--work`` required
+    for ``book-report``, and ``--query`` required for every other medium.
+
+    Args:
+        medium: The requested output medium.
+        query: The optional ``--query`` value.
+        work: The optional ``--work`` path (book-report only).
+        supported: The set of wired mediums.
+
+    Raises:
+        typer.Exit: With code 2 when the combination is invalid.
+    """
+    if medium not in supported:
+        wired = ", ".join(repr(m) for m in sorted(supported))
+        console.print(
+            f"[red]Unsupported --medium {medium!r}; wired mediums are {wired} "
+            "(FEAT-041).[/red]",
+        )
+        raise typer.Exit(code=2)
+    if medium == "book-report" and work is None:
+        console.print(
+            "[red]--work is required for --medium book-report: pass the "
+            "11-Other-Authors/<author>/<work> path to report on.[/red]",
+        )
+        raise typer.Exit(code=2)
+    if medium != "book-report" and query is None:
+        console.print(
+            f"[red]--query is required for --medium {medium}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+
+def _compose_author_query(query: str | None, work: Path | None) -> str:
+    """Compose the effective query string the conductor receives.
+
+    For ``book-report`` the query is derived from the ``--work`` path (so
+    ``--work`` is a CLI-layer convenience and the conductor signature is
+    unchanged), with any explicit ``--query`` appended. Otherwise the validated
+    ``--query`` is used verbatim.
+
+    Args:
+        query: The optional ``--query`` value.
+        work: The optional ``--work`` path (book-report only).
+
+    Returns:
+        The effective query string to author from.
+    """
+    if work is not None:
+        derived = f"Report on the work at {work}, relating it to my threads and eddies."
+        return f"{derived} {query}" if query else derived
+    # Validation guarantees a non-None query for non-book-report mediums.
+    return query or ""
+
+
 @app.command()
 def author(
-    query: str = typer.Option(..., "--query", help="What to author about."),
+    query: str | None = typer.Option(None, "--query", help="What to author about."),
     medium: str = typer.Option(
         "research",
         "--medium",
-        help="Output medium. Only 'research' is wired in the skeleton (FEAT-041).",
+        help=(
+            "Output medium: research, chat, essay, research-piece, or "
+            "book-report (FEAT-041)."
+        ),
+    ),
+    work: Path | None = typer.Option(
+        None,
+        "--work",
+        help="For book-report: the 11-Other-Authors/<author>/<work> path to report on.",
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     dry_run: bool = typer.Option(
@@ -2671,17 +2738,14 @@ def author(
     Drives an end-to-end author desk — stub Graph/Retrieval/Ontology
     specialists, a stub Voice agent, and a stub Reflection node — and prints a
     shaped :class:`~creek.author.models.AuthoredDraft`. ``--dry-run`` prints the
-    plan and a stub evidence summary instead. Only the ``research`` medium is
-    wired; real retrieval/synthesis/voicing arrive in later FEAT-041 issues.
+    plan and a stub evidence summary instead. ``book-report`` takes ``--work``
+    (the 11-Other-Authors path) instead of ``--query``; every other medium
+    requires ``--query``.
     """
     from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
 
-    if medium not in SUPPORTED_MEDIUMS:
-        console.print(
-            f"[red]Unsupported --medium {medium!r}; only 'research' is wired "
-            "in the Writing Desk skeleton (FEAT-041).[/red]",
-        )
-        raise typer.Exit(code=2)
+    _validate_author_inputs(medium, query, work, SUPPORTED_MEDIUMS)
+    effective_query = _compose_author_query(query, work)
 
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
@@ -2689,7 +2753,7 @@ def author(
     conductor = build_default_conductor(max_rounds=rounds)
 
     if dry_run:
-        evidence = conductor.gather_evidence(query, vault_path)
+        evidence = conductor.gather_evidence(effective_query, vault_path)
         console.print(f"PLAN: {' → '.join(conductor.plan())}")
         console.print(
             f"EVIDENCE (stub): {len(evidence.claims)} claims, "
@@ -2697,7 +2761,7 @@ def author(
         )
         return
 
-    draft_result = conductor.run(medium=medium, query=query, vault=vault_path)
+    draft_result = conductor.run(medium=medium, query=effective_query, vault=vault_path)
     console.print(
         f"medium={draft_result.medium} verdict={draft_result.verdict} "
         f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",
