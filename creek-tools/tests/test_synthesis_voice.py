@@ -43,6 +43,32 @@ def _seed_voice_core(vault: Path, sentinel: str) -> None:
     (core / "SKILL.md").write_text(sentinel, encoding="utf-8")
 
 
+def _seed_register_skill(vault: Path, register: str, sentinel: str) -> None:
+    """Seed ``creek-skills/registers/<register>.SKILL.md`` with a sentinel."""
+    registers = vault / "creek-skills" / "registers"
+    registers.mkdir(parents=True, exist_ok=True)
+    (registers / f"{register}.SKILL.md").write_text(sentinel, encoding="utf-8")
+
+
+# Dense with analytical voice-register signals (VOICE_REGISTER_SIGNALS) so the
+# real Ontology specialist resolves a dominant ``analytical`` register.
+_ANALYTICAL_BODY = (
+    "analyze examine consider therefore evidence hypothesis framework "
+    "systematically data observe"
+)
+
+
+def _seed_classified_fragment(vault: Path, frag_id: str, title: str, body: str) -> None:
+    """Write a fragment whose body carries dense rule-classifier signal."""
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"source:\n  platform: journal\n  author: self\n---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
 def _mock_client(text: str) -> tuple[AuthorLLMClient, MagicMock]:
     """Return a client over a mock provider returning *text*, and the provider."""
     from creek.classify.llm.providers import AnthropicCompletion
@@ -139,6 +165,45 @@ def test_voice_prompt_includes_voice_core_sentinel(tmp_path: Path) -> None:
     # The static voice-skill prefix is the cached ``system`` block now.
     assert sentinel in provider.call_with_metadata.call_args.kwargs["system"]
     assert sentinel in _sent_prompt(provider)
+
+
+def test_voice_prompt_includes_register_skill_sentinel(tmp_path: Path) -> None:
+    """The register SKILL.md selected from the ontology reaches the voice prompt."""
+    from creek.author.agents import OntologySpecialist
+
+    sentinel = "ANALYTICAL-REGISTER-SENTINEL-XYZ"
+    _seed_classified_fragment(
+        tmp_path, "frag-an", "Analytical examination", _ANALYTICAL_BODY
+    )
+    _seed_register_skill(tmp_path, "analytical", sentinel)
+    evidence = OntologySpecialist().gather("analysis", tmp_path)
+    # Precondition: the ontology surfaced the analytical register the skill keys on.
+    assert evidence.ontology is not None
+    assert evidence.ontology.voice_registers[0].value.value == "analytical"
+    client, provider = _mock_client("voiced output")
+
+    VoiceAgent(llm_client=client).render(
+        "analysis", evidence, tmp_path, medium="research"
+    )
+
+    assert sentinel in provider.call_with_metadata.call_args.kwargs["system"]
+    assert sentinel in _sent_prompt(provider)
+
+
+def test_voice_prompt_without_register_skips_register_skill(tmp_path: Path) -> None:
+    """Evidence with no ontology resolves no register and still builds a prompt."""
+    _seed_register_skill(tmp_path, "analytical", "UNWANTED-REGISTER-SENTINEL")
+    client, provider = _mock_client("voiced output")
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a grounded claim", source_fragments=["f1"])]
+    )
+
+    body = VoiceAgent(llm_client=client).render(
+        "q", evidence, tmp_path, medium="research"
+    )
+
+    assert body == "voiced output"
+    assert "UNWANTED-REGISTER-SENTINEL" not in _sent_prompt(provider)
 
 
 def test_voice_prompt_honours_contract_structure(tmp_path: Path) -> None:

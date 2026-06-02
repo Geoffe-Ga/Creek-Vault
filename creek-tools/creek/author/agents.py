@@ -35,7 +35,7 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
-from creek.models import Dosage, Frequency, Mode, Phase
+from creek.models import Dosage, Frequency, Mode, Phase, VoiceRegister
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -369,7 +369,7 @@ class GraphSpecialist:
 
 def _aggregate_dimension(
     picks: list[_DimT],
-    unclassified: _DimT,
+    unclassified: _DimT | None,
 ) -> tuple[WeightedDimension[_DimT], ...]:
     """Aggregate per-fragment canonical *picks* into weighted dimensions.
 
@@ -381,7 +381,9 @@ def _aggregate_dimension(
     Args:
         picks: One canonical enum pick per fragment (may include the
             ``unclassified`` sentinel, which is dropped).
-        unclassified: The dimension's ``UNCLASSIFIED`` sentinel.
+        unclassified: The dimension's ``UNCLASSIFIED`` sentinel, or ``None``
+            for dimensions whose enum has no such member (the caller has
+            already dropped the absent picks; nothing further is filtered).
 
     Returns:
         A weight-descending tuple of :class:`WeightedDimension` entries.
@@ -398,18 +400,42 @@ def _aggregate_dimension(
     return tuple(entries)
 
 
+def _aggregate_optional(
+    picks: list[_DimT | None],
+) -> tuple[WeightedDimension[_DimT], ...]:
+    """Aggregate per-fragment *picks* whose unclassified sentinel is ``None``.
+
+    Sibling of :func:`_aggregate_dimension` for dimensions (e.g. voice register)
+    whose enum has no ``UNCLASSIFIED`` member and signals an absent
+    classification with ``None``. ``None`` picks are dropped, then the present
+    values are aggregated with a ``None`` sentinel (which matches nothing
+    real), so the weighting/sorting stay identical to the other axes.
+
+    Args:
+        picks: One canonical enum pick per fragment, or ``None`` when the
+            fragment carried no classification for this dimension.
+
+    Returns:
+        A weight-descending tuple of :class:`WeightedDimension` entries.
+    """
+    present = [pick for pick in picks if pick is not None]
+    return _aggregate_dimension(present, None)
+
+
 class _FragmentSignal:
     """The canonical ontology signal a single corpus fragment carries."""
 
-    __slots__ = ("dosage", "frequency", "mode", "phase")
+    __slots__ = ("dosage", "frequency", "mode", "phase", "voice_register")
 
     def __init__(self, fragment: Fragment, body: str) -> None:
         """Classify *fragment* deterministically, keeping any frontmatter dosage.
 
-        The rule classifier supplies frequency, phase, and mode from
-        ``title + body`` keyword signal; the rule classifier does not detect
-        dosage, so dosage is read from the fragment's existing frontmatter
-        (``wavelength.dosage``) instead.
+        The rule classifier supplies frequency, phase, mode, and voice
+        register from ``title + body`` keyword signal; the rule classifier
+        does not detect dosage, so dosage is read from the fragment's existing
+        frontmatter (``wavelength.dosage``) instead. ``voice_register`` is
+        ``None`` when no register keyword fired (the enum has no
+        ``UNCLASSIFIED`` member).
 
         Args:
             fragment: The corpus fragment to scan.
@@ -422,6 +448,13 @@ class _FragmentSignal:
         self.phase: Phase = Phase(classified.wavelength.phase)
         self.mode: Mode = Mode(classified.wavelength.mode)
         self.dosage: Dosage = Dosage(fragment.wavelength.dosage)
+        register = classified.voice.voice_register
+        # ``use_enum_values=True`` on ``VoiceClassification`` surfaces the
+        # register as its plain ``str`` value (or ``None``); rewrap it into the
+        # canonical enum so aggregation sorts on ``.value`` like the other axes.
+        self.voice_register: VoiceRegister | None = (
+            VoiceRegister(register) if register is not None else None
+        )
 
 
 def _detect_dosage_paradoxes(
@@ -529,14 +562,54 @@ def _ontology_claim(
     return EvidenceClaim(claim=summary, source_fragments=fragment_ids.copy())
 
 
+def _build_analysis(
+    signals: list[tuple[str, _FragmentSignal]],
+) -> OntologyAnalysis:
+    """Aggregate classified *signals* into a canonical :class:`OntologyAnalysis`.
+
+    Each axis is aggregated independently: frequency / phase / mode / dosage
+    drop their ``UNCLASSIFIED`` sentinel, while voice register (no such
+    sentinel) drops the ``None`` picks via :func:`_aggregate_optional`. Dosage
+    and phase contradictions are surfaced — never resolved.
+
+    Args:
+        signals: ``(fragment_id, signal)`` pairs for the classified corpus.
+
+    Returns:
+        The aggregated analysis with full confidence when any signal is present.
+    """
+    return OntologyAnalysis(
+        frequencies=_aggregate_dimension(
+            [sig.frequency for _id, sig in signals], Frequency.UNCLASSIFIED
+        ),
+        phases=_aggregate_dimension(
+            [sig.phase for _id, sig in signals], Phase.UNCLASSIFIED
+        ),
+        modes=_aggregate_dimension(
+            [sig.mode for _id, sig in signals], Mode.UNCLASSIFIED
+        ),
+        dosages=_aggregate_dimension(
+            [sig.dosage for _id, sig in signals], Dosage.UNCLASSIFIED
+        ),
+        voice_registers=_aggregate_optional(
+            [sig.voice_register for _id, sig in signals]
+        ),
+        paradoxes=tuple(
+            _detect_dosage_paradoxes(signals) + _detect_phase_paradoxes(signals)
+        ),
+        overall_confidence=1.0 if signals else 0.0,
+    )
+
+
 class OntologySpecialist:
     """Ontology specialist — deterministic APTITUDE analytics over the corpus.
 
     Classifies every corpus fragment with the deterministic
     :class:`~creek.classify.rules.RuleClassifier` (no LLM, no embeddings),
-    aggregates canonical frequencies / phases / modes / dosages into weighted
-    dimensions, and surfaces — never resolves — the dosage and phase
-    contradictions it finds (Ontology §10.2; INC-019 canonical taxonomy only).
+    aggregates canonical frequencies / phases / modes / dosages / voice
+    registers into weighted dimensions, and surfaces — never resolves — the
+    dosage and phase contradictions it finds (Ontology §10.2; INC-019 canonical
+    taxonomy only).
     """
 
     name = "ontology"
@@ -562,24 +635,7 @@ class OntologySpecialist:
         signals = [
             (fragment.id, _FragmentSignal(fragment, body)) for fragment, body in corpus
         ]
-        analysis = OntologyAnalysis(
-            frequencies=_aggregate_dimension(
-                [sig.frequency for _id, sig in signals], Frequency.UNCLASSIFIED
-            ),
-            phases=_aggregate_dimension(
-                [sig.phase for _id, sig in signals], Phase.UNCLASSIFIED
-            ),
-            modes=_aggregate_dimension(
-                [sig.mode for _id, sig in signals], Mode.UNCLASSIFIED
-            ),
-            dosages=_aggregate_dimension(
-                [sig.dosage for _id, sig in signals], Dosage.UNCLASSIFIED
-            ),
-            paradoxes=tuple(
-                _detect_dosage_paradoxes(signals) + _detect_phase_paradoxes(signals)
-            ),
-            overall_confidence=1.0 if signals else 0.0,
-        )
+        analysis = _build_analysis(signals)
         fragment_ids = [fid for fid, _sig in signals]
         return EvidenceBundle(
             claims=[_ontology_claim(analysis, fragment_ids)],
