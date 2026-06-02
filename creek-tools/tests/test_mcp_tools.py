@@ -397,8 +397,8 @@ def test_draft_refuses_for_out_of_range_index(
     assert "out of range" in result["reason"]
 
 
-def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
-    """``creek.author`` returns a typed stub draft (verdict + provenance)."""
+def test_author_tool_returns_draft_envelope(vault: Path) -> None:
+    """``creek.author`` returns the full draft envelope from the real desk."""
     result = author_tool(
         vault_path=vault,
         query="What is F6 Pluralism?",
@@ -408,14 +408,14 @@ def test_author_tool_returns_stub_draft_with_verdict(vault: Path) -> None:
     assert result["status"] == "ok"
     assert result["tool"] == "creek.author"
     assert result["medium"] == "research"
-    # Deterministic stub: the verdict is exactly PASS, not merely a member of
-    # the verdict set (a membership check would be vacuous here).
-    assert result["verdict"] == "PASS"
+    assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
     assert isinstance(result["provenance"], list)
-    assert result["provenance"]  # non-empty mock provenance
+    assert result["provenance"]  # non-empty
+    assert result["claims"]  # cited claims envelope key
+    assert all(claim["source_fragments"] for claim in result["claims"])
     assert result["body"].strip()
     assert result["dry_run"] is False
-    assert result["rounds"] == 1  # stub always reports a single round
+    assert result["rounds"] >= 1
 
 
 def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
