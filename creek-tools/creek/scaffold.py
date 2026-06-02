@@ -81,7 +81,10 @@ def scaffold_vault(vault: Path) -> int:
 
 
 def deploy_skills(vault: Path) -> int:
-    """Copy every canonical ``*.SKILL.md`` into ``<vault>/00-Creek-Meta/Skills/``.
+    """Copy the canonical skill tree into ``<vault>/00-Creek-Meta/Skills/``.
+
+    Deploys both the flat schema skills (``*.SKILL.md``) and the medium
+    contracts under ``mediums/`` (``*.MEDIUM.md``, FEAT-041 §5).
 
     Args:
         vault: Target vault root.
@@ -95,6 +98,13 @@ def deploy_skills(vault: Path) -> int:
     for skill in sorted(SKILLS_TEMPLATE_DIR.glob("*.SKILL.md")):
         shutil.copy2(skill, target / skill.name)
         written += 1
+    mediums_src = SKILLS_TEMPLATE_DIR / "mediums"
+    if mediums_src.is_dir():
+        mediums_target = target / "mediums"
+        mediums_target.mkdir(parents=True, exist_ok=True)
+        for contract in sorted(mediums_src.glob("*.MEDIUM.md")):
+            shutil.copy2(contract, mediums_target / contract.name)
+            written += 1
     return written
 
 

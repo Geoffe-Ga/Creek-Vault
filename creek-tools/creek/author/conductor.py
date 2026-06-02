@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
 from creek.author.agents import Specialist, default_specialists
+from creek.author.contracts import load_medium_contract
 from creek.author.models import (
     AuthoredDraft,
     EvidenceBundle,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author.client import AuthorLLMClient
+    from creek.models import MediumContract
 
 #: Mediums the conductor will run. Only ``research`` is wired in the skeleton.
 SUPPORTED_MEDIUMS: frozenset[str] = frozenset({"research"})
@@ -52,8 +54,13 @@ class VoiceRenderer(Protocol):
 class Reflector(Protocol):
     """Anything that judges a draft body against its evidence."""
 
-    def review(self, body: str, evidence: EvidenceBundle) -> ReflectionVerdict:
-        """Return a verdict for *body* given *evidence*."""
+    def review(
+        self,
+        body: str,
+        evidence: EvidenceBundle,
+        rubric: dict[str, float] | None = None,
+    ) -> ReflectionVerdict:
+        """Return a verdict for *body* given *evidence* and the medium *rubric*."""
         ...
 
 
@@ -112,6 +119,8 @@ class Conductor:
         max_rounds: Upper bound on voice/reflect rounds.
         llm_client: Optional network seam; unused by the stub collaborators
             but injected here so issue #460 can wire real LLM calls.
+        contract: The medium contract driving this run; its reflection rubric
+            is exposed to the reflection node (FEAT-041 #459).
     """
 
     def __init__(
@@ -122,13 +131,15 @@ class Conductor:
         *,
         max_rounds: int,
         llm_client: AuthorLLMClient | None = None,
+        contract: MediumContract | None = None,
     ) -> None:
-        """Store collaborators and the round bound."""
+        """Store collaborators, the round bound, and the medium contract."""
         self.specialists = list(specialists)
         self.voice = voice
         self.reflection = reflection
         self.max_rounds = max_rounds
         self.llm_client = llm_client
+        self.contract = contract
 
     def plan(self) -> list[str]:
         """Return the ordered pipeline step names for display/dry-run."""
@@ -177,6 +188,7 @@ class Conductor:
         """
         validated = require_supported_medium(medium)
         evidence = self.gather_evidence(query, vault)
+        rubric = self.contract.reflection_rubric if self.contract else None
 
         body = ""
         verdict: ReflectionVerdict = "ESCALATE"
@@ -184,7 +196,7 @@ class Conductor:
         for attempt in range(1, self.max_rounds + 1):
             rounds = attempt
             body = self.voice.render(query, evidence)
-            verdict = self.reflection.review(body, evidence)
+            verdict = self.reflection.review(body, evidence, rubric)
             if verdict != "REVISE":
                 break
 
@@ -202,12 +214,14 @@ def build_default_conductor(
     *,
     max_rounds: int,
     llm_client: AuthorLLMClient | None = None,
+    contract: MediumContract | None = None,
 ) -> Conductor:
     """Build a conductor wired with the default stub collaborators.
 
     Args:
         max_rounds: Upper bound on voice/reflect rounds.
         llm_client: Optional network seam passed through to the conductor.
+        contract: Optional medium contract passed through to the conductor.
 
     Returns:
         A ready-to-run :class:`Conductor`.
@@ -218,6 +232,7 @@ def build_default_conductor(
         reflection=ReflectionNode(),
         max_rounds=max_rounds,
         llm_client=llm_client,
+        contract=contract,
     )
 
 
@@ -242,7 +257,9 @@ def run_author(
     """
     from creek.config import AuthorConfig
 
+    require_supported_medium(medium)
+    contract = load_medium_contract(medium, vault)
     rounds = max_rounds if max_rounds is not None else AuthorConfig().max_author_rounds
-    return build_default_conductor(max_rounds=rounds).run(
+    return build_default_conductor(max_rounds=rounds, contract=contract).run(
         medium=medium, query=query, vault=vault
     )

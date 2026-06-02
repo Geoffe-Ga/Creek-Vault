@@ -567,6 +567,42 @@ class AuthorManifest(BaseModel):
         return True
 
 
+# ---- Medium contracts (FEAT-041 §5) ----
+
+CitationNorm = Literal["every-claim", "light", "none"]
+"""How strictly a medium requires claims to be cited."""
+
+
+class MediumContract(BaseModel):
+    """A medium contract loaded from a ``<medium>.MEDIUM.md`` skill file (FEAT-041 §5).
+
+    The Conductor loads one of these to drive structure, specialist weighting,
+    the citation norm, the default privacy tier, and the reflection rubric for
+    an authoring run.
+
+    Attributes:
+        medium: The medium slug (e.g. ``research``).
+        structure: Ordered section names the draft should follow.
+        specialist_weights: Relative weight per specialist (``graph``,
+            ``retrieval``, ``ontology``, ``voice``); higher means more
+            influence on the synthesized draft.
+        citation_norm: How strictly claims must be cited.
+        default_privacy_tier: The privacy tier a draft defaults to.
+        reflection_rubric: Per-dimension weights (§8) the reflection node
+            scores against — e.g. ``ontological_accuracy``,
+            ``citation_completeness``, ``voice_fidelity``.
+    """
+
+    model_config = ConfigDict(use_enum_values=True, extra="ignore")
+
+    medium: str
+    structure: list[str] = Field(default_factory=list)
+    specialist_weights: dict[str, float] = Field(default_factory=dict)
+    citation_norm: CitationNorm = "light"
+    default_privacy_tier: PrivacyTier = PrivacyTier.OPEN
+    reflection_rubric: dict[str, float] = Field(default_factory=dict)
+
+
 # ---- Nested Models ----
 
 

@@ -38,7 +38,13 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     findings: list[str] = []
     skills_dir = vault_path.joinpath(*_SKILLS_DIR)
     if skills_dir.is_dir():
-        for skill in sorted(skills_dir.glob("*.SKILL.md")):
+        # Schema skills (``*.SKILL.md``) and medium contracts
+        # (``mediums/*.MEDIUM.md``) share the same per-file budget (FEAT-041 §5).
+        skill_files = [
+            *skills_dir.glob("*.SKILL.md"),
+            *skills_dir.glob("mediums/*.MEDIUM.md"),
+        ]
+        for skill in sorted(skill_files):
             words = _word_count(skill)
             if words > SKILL_BUDGET_WORDS:
                 findings.append(
