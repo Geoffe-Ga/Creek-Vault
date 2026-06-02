@@ -507,6 +507,10 @@ def test_author_tool_returns_real_cited_draft(vault: Path) -> None:
     assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
     assert result["claims"]  # non-empty
     assert all(claim["source_fragments"] for claim in result["claims"])
+    # NOTE (#463): the claim *count* and verdict here reflect the stub
+    # specialists (which emit fixed mock claims, ignoring vault content). When
+    # #463 wires the real Graph/Retrieval agents, strengthen this to seed real
+    # fragments and assert the claims trace back to them.
 
 
 def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
@@ -523,6 +527,8 @@ def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
     assert result["dry_run"] is True
     assert result["plan"]
     assert result["evidence"]["claims"] >= 1
+    # NOTE (#463): evidence counts reflect the stub specialists; revisit to
+    # assert against seeded fragments once the real specialists land.
 
 
 def test_author_tool_forwards_max_rounds(
