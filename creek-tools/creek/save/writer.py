@@ -26,7 +26,16 @@ from typing import TYPE_CHECKING, Any
 import frontmatter
 
 from creek.classify.privacy_filter import pre_save_filter
-from creek.models import Eddy, Praxis, PrivacyTier, Thread
+from creek.models import (
+    Authorship,
+    Eddy,
+    Fragment,
+    FragmentSource,
+    Praxis,
+    PrivacyTier,
+    SourcePlatform,
+    Thread,
+)
 from creek.save._slug import slugify_filename
 from creek.save.router import SaveTarget, target_directory
 
@@ -126,7 +135,9 @@ def _compose_metadata(
 ) -> dict[str, Any]:
     """Build the frontmatter dict for *request*."""
     metadata = _shape_for_target(request)
-    metadata["type"] = request.target.value
+    # Most targets are typed by their target name; ``ai-as-user`` shapes a real
+    # fragment and supplies its own ``type: fragment`` — don't clobber it.
+    metadata.setdefault("type", request.target.value)
     metadata["privacy_tier"] = effective_tier.value
     metadata["saved_from"] = _saved_from_block(
         request,
@@ -150,10 +161,36 @@ def _shape_for_target(request: SaveRequest) -> dict[str, Any]:
         return Eddy(title=title).model_dump(mode="json")
     if request.target == SaveTarget.PRAXIS:
         return Praxis(title=title).model_dump(mode="json")
+    if request.target == SaveTarget.AI_AS_USER:
+        return _shape_ai_as_user_fragment(title)
     return {
         "title": title,
         "tags": [request.target.value],
     }
+
+
+def _shape_ai_as_user_fragment(title: str) -> dict[str, Any]:
+    """Shape kept AI output as an AI-attributed, voice-neutral fragment.
+
+    The note is a real :class:`~creek.models.Fragment` (round-trippable through
+    the vault reader so the Retrieval specialist can cite it) carrying the
+    FEAT-041 §7 attribution: ``author=ai`` from the ``ai-as-user`` other-author
+    folder, ``voice_weight=0.0`` so it never colours the owner's generated
+    voice, and ``representativeness=endorsed`` because the owner kept it on
+    purpose.
+    """
+    slug = slugify_filename(title, max_length=_MAX_FILENAME_LENGTH) or "untitled"
+    return Fragment(
+        id=f"{SaveTarget.AI_AS_USER.value}-{slug}",
+        title=title,
+        source=FragmentSource(
+            platform=SourcePlatform.CLAUDE,
+            author=Authorship.AI,
+            author_slug=SaveTarget.AI_AS_USER.value,
+        ),
+        voice_weight=0.0,
+        representativeness="endorsed",
+    ).model_dump(mode="json")
 
 
 def _saved_from_block(

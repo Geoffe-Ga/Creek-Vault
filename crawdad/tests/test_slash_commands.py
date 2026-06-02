@@ -8,6 +8,7 @@ import pytest
 
 from crawdad.slash_commands import (
     CRAWDAD_COMMANDS,
+    handle_ask,
     handle_checkin,
     handle_draft,
     handle_help,
@@ -42,6 +43,7 @@ def test_crawdad_commands_lists_the_documented_names() -> None:
         "checkin",
         "surface",
         "draft",
+        "ask",
         "save",
         "register",
         "workflow",
@@ -95,6 +97,35 @@ async def test_handle_draft_passes_topic_to_loop() -> None:
     assert "phase transitions" in replier.sent[0]
 
 
+async def test_handle_draft_routes_through_author_essay() -> None:
+    """``/crawdad draft`` routes through creek.author with the essay medium."""
+    replier = _FakeReplier()
+
+    await handle_draft(
+        replier, topic="phase transitions", loop_runner=_fake_loop_runner
+    )
+
+    body = replier.sent[0]
+    assert "creek.author" in body
+    assert "essay" in body
+    # The old creek.mine / creek.draft routing is gone.
+    assert "creek.mine" not in body
+    assert "creek.draft" not in body
+
+
+async def test_handle_draft_includes_save_attribution_path() -> None:
+    """``/crawdad draft`` names the keep→save path to ai-as-user."""
+    replier = _FakeReplier()
+
+    await handle_draft(
+        replier, topic="phase transitions", loop_runner=_fake_loop_runner
+    )
+
+    body = replier.sent[0]
+    assert "creek.save" in body
+    assert "ai-as-user" in body
+
+
 async def test_handle_draft_refuses_empty_topic() -> None:
     """An empty draft topic gets a help reply, not a stack trace."""
     replier = _FakeReplier()
@@ -103,6 +134,56 @@ async def test_handle_draft_refuses_empty_topic() -> None:
 
     assert len(replier.sent) == 1
     assert "topic" in replier.sent[0].lower()
+
+
+async def test_handle_ask_passes_question_to_author_research() -> None:
+    """``/crawdad ask <question>`` routes via creek.author research medium."""
+    replier = _FakeReplier()
+
+    await handle_ask(
+        replier,
+        question="what is the relationship between drift and emergence?",
+        loop_runner=_fake_loop_runner,
+    )
+
+    assert len(replier.sent) == 1
+    body = replier.sent[0]
+    assert "what is the relationship between drift and emergence?" in body
+    assert "creek.author" in body
+    assert "research" in body
+
+
+async def test_handle_ask_includes_save_attribution_path() -> None:
+    """``/crawdad ask`` names the keep→save path to ai-as-user."""
+    replier = _FakeReplier()
+
+    await handle_ask(
+        replier,
+        question="why does the creek meander?",
+        loop_runner=_fake_loop_runner,
+    )
+
+    body = replier.sent[0]
+    assert "creek.save" in body
+    assert "ai-as-user" in body
+
+
+async def test_handle_ask_refuses_empty_question() -> None:
+    """A blank question gets a help reply and never calls the loop."""
+    loop_calls = 0
+
+    async def _counting_loop(_message: str) -> str:
+        nonlocal loop_calls
+        loop_calls += 1
+        return "should not be reached"
+
+    replier = _FakeReplier()
+
+    await handle_ask(replier, question="   ", loop_runner=_counting_loop)
+
+    assert loop_calls == 0
+    assert len(replier.sent) == 1
+    assert "question" in replier.sent[0].lower()
 
 
 async def test_handle_save_passes_content_to_loop() -> None:
@@ -360,7 +441,7 @@ async def test_handle_workflow_unknown_action_returns_help() -> None:
 
 
 async def test_handle_help_lists_every_command() -> None:
-    """``/crawdad help`` (or any unknown subcommand) lists the six commands."""
+    """``/crawdad help`` (or any unknown subcommand) lists every command."""
     replier = _FakeReplier()
 
     await handle_help(replier)
@@ -368,6 +449,7 @@ async def test_handle_help_lists_every_command() -> None:
     body = replier.sent[0]
     for name in CRAWDAD_COMMANDS:
         assert name in body
+    assert "ask" in body
 
 
 async def test_handle_workflow_list_skips_loop_runner() -> None:
@@ -408,7 +490,7 @@ class _FakeTree:
 
 
 def test_register_wires_every_command_onto_tree() -> None:
-    """``register`` adds all six commands to a discord ``CommandTree``-like object."""
+    """``register`` adds every command to a discord ``CommandTree``-like object."""
     tree = _FakeTree()
 
     register(tree, loop_runner=_fake_loop_runner)
@@ -465,6 +547,7 @@ class _FakeInteraction:
         ("checkin", {}),
         ("surface", {}),
         ("draft", {"topic": "phase transitions"}),
+        ("ask", {"question": "what is emergence?"}),
         ("save", {"content": "a fragment to file"}),
     ],
 )

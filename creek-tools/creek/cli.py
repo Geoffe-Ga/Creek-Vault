@@ -2502,8 +2502,9 @@ def draft(
 
 
 _SAVE_TARGET_HELP = (
-    "Destination type: thread, eddy, praxis, paradox, unnamed, or draft. "
-    "Paradox always routes to 10-Liminal/Paradoxes/ regardless of other inputs."
+    "Destination type: thread, eddy, praxis, paradox, unnamed, draft, or "
+    "ai-as-user. Paradox always routes to 10-Liminal/Paradoxes/ regardless of "
+    "other inputs; ai-as-user files kept AI output to 11-Other-Authors/ai-as-user/."
 )
 _SAVE_TIER_HELP = (
     "Privacy tier (open|personal|intimate). Required when stdin is the body "
