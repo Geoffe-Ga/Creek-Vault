@@ -92,7 +92,11 @@ def test_save_writes_note_under_correct_directory(
     assert path.parent == expected_dir
     assert path.suffix == ".md"
     post = frontmatter.load(str(path))
-    assert post["type"] == target.value
+    # AI-as-user saves are real fragments (so the retrieval corpus can read
+    # them back), not notes typed by their target name — see the dedicated
+    # ``test_ai_as_user_*`` cases below.
+    expected_type = "fragment" if target is SaveTarget.AI_AS_USER else target.value
+    assert post["type"] == expected_type
     assert post["title"]
     saved_from = post["saved_from"]
     assert saved_from["source_kind"] == "manual"
@@ -128,6 +132,46 @@ def test_praxis_save_carries_praxis_model_fields(vault: Path) -> None:
     assert post["type"] == "praxis"
     assert post["praxis_type"] == "insight"
     assert post["status"] == "proposed"
+
+
+# ---- AI-as-user (FEAT-041 §7) ----
+
+
+def test_ai_as_user_save_lands_attributed_fragment(vault: Path) -> None:
+    """An ``ai-as-user`` save files an AI-attributed fragment under 11-Other-Authors."""
+    path = save_to_vault(
+        _make_request(SaveTarget.AI_AS_USER, title="On leverage and luck"),
+        vault_path=vault,
+    )
+    assert path.parent == vault / "11-Other-Authors" / "ai-as-user"
+    post = frontmatter.load(str(path))
+    # The note is a real fragment so the Retrieval specialist can read it back.
+    assert post["type"] == "fragment"
+    assert post["source"]["author"] == "ai"
+    assert post["source"]["author_slug"] == "ai-as-user"
+    # Borrowed AI voice: it must never bleed into the owner's generated voice,
+    # but it is an endorsed stand-in for the owner's views (kept on purpose).
+    assert post["voice_weight"] == 0.0
+    assert post["representativeness"] == "endorsed"
+
+
+def test_ai_as_user_save_round_trips_through_the_fragment_reader(vault: Path) -> None:
+    """The saved note loads as a valid Fragment via the vault reader."""
+    from creek.vault.reader import try_load_fragment
+
+    path = save_to_vault(
+        _make_request(SaveTarget.AI_AS_USER, title="Compounding attention"),
+        vault_path=vault,
+    )
+
+    record = try_load_fragment(path)
+
+    assert record is not None
+    fragment, _body, _raw = record
+    assert fragment.source.author == "ai"
+    assert fragment.source.author_slug == "ai-as-user"
+    assert fragment.voice_weight == 0.0
+    assert fragment.representativeness == "endorsed"
 
 
 # ---- Paradox routing regression ----
@@ -311,7 +355,7 @@ def _scaffold_vault(root: Path) -> Path:
 
 
 def test_cli_save_help_lists_targets() -> None:
-    """``creek save --help`` advertises the six target types."""
+    """``creek save --help`` advertises every target type."""
     result = runner.invoke(app, ["save", "--help"])
     assert result.exit_code == 0
     for target in SaveTarget:

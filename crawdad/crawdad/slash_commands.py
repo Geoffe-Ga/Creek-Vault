@@ -68,6 +68,7 @@ CRAWDAD_COMMANDS: tuple[str, ...] = (
     "checkin",
     "surface",
     "draft",
+    "ask",
     "save",
     "register",
     "workflow",
@@ -77,7 +78,8 @@ _COMMAND_DESCRIPTIONS: dict[str, str] = {
     "reflect": "Open reflective conversation mode (FEAT-015 loop).",
     "checkin": "Wavelength check-in — read the current phase + dosage state.",
     "surface": "Surface paradoxes, liminal content, or emerging themes.",
-    "draft": "Draft an essay on a topic (routes through creek.mine + creek.draft).",
+    "draft": "Draft an essay on a topic (routes through creek.author, essay medium).",
+    "ask": "Ask a question; get a cited, voiced answer (routes through creek.author).",
     "save": "File the supplied content back to the vault via creek.save.",
     "register": "Switch the active voice register (FEAT-029).",
     "workflow": "List or run named workflows (ADAPT-003).",
@@ -165,7 +167,7 @@ async def handle_surface(replier: Replier, *, loop_runner: LoopRunner) -> None:
 async def handle_draft(
     replier: Replier, *, topic: str, loop_runner: LoopRunner
 ) -> None:
-    """``/crawdad draft <topic>`` — mine + draft on the supplied topic."""
+    """``/crawdad draft <topic>`` — author an essay on the supplied topic."""
     cleaned = topic.strip()
     if not cleaned:
         await replier(
@@ -175,9 +177,37 @@ async def handle_draft(
         return
     prompt = (
         f"Draft an essay on the following topic: {cleaned}.\n\n"
-        "Route through creek.mine to surface relevant seeds first, then "
-        "creek.draft to generate the essay. Voice fidelity is owned by "
-        "creek.draft's skill stack — don't re-draft inline."
+        "Call creek.author with medium: essay to generate the essay in my "
+        "voice. Voice fidelity is owned by creek.author's skill stack — "
+        "don't re-draft inline. If I choose to keep the result, file it via "
+        "creek.save with target ai-as-user into 11-Other-Authors/ai-as-user/ "
+        "(AI-authored attribution: author=ai, representativeness=endorsed, "
+        "voice_weight=0.0)."
+    )
+    reply = await loop_runner(prompt)
+    await replier(reply)
+
+
+async def handle_ask(
+    replier: Replier, *, question: str, loop_runner: LoopRunner
+) -> None:
+    """``/crawdad ask <question>`` — answer the question, cited and voiced."""
+    cleaned = question.strip()
+    if not cleaned:
+        await replier(
+            "I need a question to answer. Try `/crawdad ask <question>` — for "
+            "example, `/crawdad ask how do phase transitions show up in my "
+            "writing?`."
+        )
+        return
+    prompt = (
+        f"Answer the following question: {cleaned}.\n\n"
+        "Call creek.author with medium: research to produce a cited answer "
+        "grounded in my vault and voiced in my register. Return that answer. "
+        "If I choose to keep it, file it via creek.save with target "
+        "ai-as-user into 11-Other-Authors/ai-as-user/ (AI-authored "
+        "attribution: author=ai, representativeness=endorsed, "
+        "voice_weight=0.0)."
     )
     reply = await loop_runner(prompt)
     await replier(reply)
@@ -373,6 +403,7 @@ def register(
     _register_checkin(tree, loop_runner=loop_runner)
     _register_surface(tree, loop_runner=loop_runner)
     _register_draft(tree, loop_runner=loop_runner)
+    _register_ask(tree, loop_runner=loop_runner)
     _register_save(tree, loop_runner=loop_runner)
     _register_register(tree, register_switcher=register_switcher)
     _register_workflow(
@@ -426,6 +457,24 @@ def _register_draft(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
         await interaction.response.defer()
         await handle_draft(
             interaction.followup.send, topic=topic, loop_runner=loop_runner
+        )
+
+
+def _register_ask(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+    """Wire the ``/crawdad ask`` Discord callback onto *tree*."""
+
+    @tree.command(name="ask", description=_COMMAND_DESCRIPTIONS["ask"])
+    async def _callback(interaction: Any, question: str) -> None:
+        """Discord callback for ``/crawdad ask <question>`` (deferred).
+
+        ``question`` has no default value so Discord's autocomplete UI
+        marks the parameter as required and disables submit until the
+        user fills it in. The runtime empty-string guard in
+        :func:`handle_ask` stays as defense-in-depth.
+        """
+        await interaction.response.defer()
+        await handle_ask(
+            interaction.followup.send, question=question, loop_runner=loop_runner
         )
 
 

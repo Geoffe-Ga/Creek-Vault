@@ -26,7 +26,13 @@ __all__ = [
 
 
 class SaveTarget(StrEnum):
-    """The six target types ``creek save --target`` accepts."""
+    """The target types ``creek save --target`` accepts.
+
+    ``ai-as-user`` (FEAT-041 §7) is special: it files AI-authored output the
+    owner chose to keep into ``11-Other-Authors/ai-as-user/`` as a real,
+    AI-attributed fragment, so the Retrieval specialist can read it back
+    without it ever counting as the owner's own voice.
+    """
 
     THREAD = "thread"
     EDDY = "eddy"
@@ -34,6 +40,7 @@ class SaveTarget(StrEnum):
     PARADOX = "paradox"
     UNNAMED = "unnamed"
     DRAFT = "draft"
+    AI_AS_USER = "ai-as-user"
 
 
 TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
@@ -43,6 +50,7 @@ TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
     SaveTarget.PARADOX: ("10-Liminal", "Paradoxes"),
     SaveTarget.UNNAMED: ("10-Liminal", "Unnamed"),
     SaveTarget.DRAFT: ("07-Voice", "Drafts"),
+    SaveTarget.AI_AS_USER: ("11-Other-Authors", "ai-as-user"),
 }
 """Canonical mapping of save targets to vault subdirectories.
 

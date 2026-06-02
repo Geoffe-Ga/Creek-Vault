@@ -655,7 +655,7 @@ async def test_handle_message_without_loop_components_uses_stub_reply(
 def test_crawdad_client_registers_slash_commands_when_loop_runner_provided(
     config: CrawDadConfig, session_state: SessionState
 ) -> None:
-    """FEAT-016: providing a ``loop_runner`` registers the six /crawdad commands."""
+    """FEAT-016: providing a ``loop_runner`` registers the /crawdad commands."""
     from crawdad.bot import CrawDadClient
     from crawdad.slash_commands import CRAWDAD_COMMANDS
 
