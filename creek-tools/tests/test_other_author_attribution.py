@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter as fm_mod
 import pytest
+from pydantic import ValidationError
 
 from creek.models import (
     Fragment,
@@ -254,3 +255,43 @@ class TestOtherAuthorAttribution:
         assert post["source"]["author_slug"] is None
         assert post["voice_weight"] == 1.0
         assert post["representativeness"] == "self"
+
+
+class TestAuthorSlugPathSafety:
+    """``FragmentSource.author_slug`` is interpolated into vault paths (#470).
+
+    A slug carrying path separators or ``..`` could escape
+    ``11-Other-Authors/`` (path traversal), so the model rejects anything that
+    is not a single safe path segment at the data boundary.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_slug",
+        [
+            "../evil",
+            "../../etc/passwd",
+            "naval/../../escape",
+            "nested/slug",
+            "back\\slash",
+            "/absolute",
+            "..",
+            ".",
+            "",
+            "   ",
+        ],
+    )
+    def test_unsafe_author_slug_is_rejected(self, bad_slug: str) -> None:
+        """A traversal / multi-segment author_slug raises ValidationError."""
+        with pytest.raises(ValidationError):
+            FragmentSource(platform=SourcePlatform.SUBSTACK, author_slug=bad_slug)
+
+    @pytest.mark.parametrize("good_slug", ["naval-ravikant", "ai-as-user", "a_b.c1"])
+    def test_safe_author_slug_is_accepted(self, good_slug: str) -> None:
+        """A normal single-segment slug is accepted unchanged."""
+        source = FragmentSource(platform=SourcePlatform.SUBSTACK, author_slug=good_slug)
+        assert source.author_slug == good_slug
+
+    def test_none_author_slug_is_accepted(self) -> None:
+        """``None`` (a native fragment) is always valid."""
+        source = FragmentSource(platform=SourcePlatform.CLAUDE)
+        assert source.author_slug is None

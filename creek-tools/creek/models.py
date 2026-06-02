@@ -624,6 +624,31 @@ class FragmentSource(BaseModel):
     # ``author`` (the self|ai|other|collaborative axis), which is unchanged.
     author_slug: str | None = None
 
+    @field_validator("author_slug")
+    @classmethod
+    def _reject_unsafe_author_slug(cls, value: str | None) -> str | None:
+        """Reject an ``author_slug`` that is not a single safe path segment.
+
+        ``author_slug`` names an ``11-Other-Authors/<slug>/`` folder and is
+        interpolated into vault paths by the writer and the manifest loader, so
+        a value carrying a path separator or a ``.``/``..`` traversal token
+        could escape the vault. Such a value is rejected at the data boundary
+        (#470). ``None`` (a native fragment) is always valid; the vault reader
+        skips any on-disk fragment whose frontmatter fails this check.
+        """
+        if value is None:
+            return None
+        if (
+            value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or "\x00" in value
+            or not value.strip()
+        ):
+            msg = f"author_slug must be a single safe path segment, got {value!r}"
+            raise ValueError(msg)
+        return value
+
 
 class FrequencyClassification(BaseModel):
     """APTITUDE frequency classification with primary and secondary frequencies."""
