@@ -399,6 +399,8 @@ def test_draft_refuses_for_out_of_range_index(
 
 def test_author_tool_returns_draft_envelope(vault: Path) -> None:
     """``creek.author`` returns the full draft envelope from the real desk."""
+    _write_fragment(vault, frag_id="frag-a", title="F6 Pluralism and community")
+    _write_fragment(vault, frag_id="frag-b", title="Agency and momentum")
     result = author_tool(
         vault_path=vault,
         query="What is F6 Pluralism?",
@@ -499,6 +501,8 @@ def test_author_tool_writes_audit_entry(vault: Path) -> None:
 
 def test_author_tool_returns_real_cited_draft(vault: Path) -> None:
     """``creek.author`` delegates to the real desk: cited claims + verdict (#460)."""
+    _write_fragment(vault, frag_id="frag-med", title="Power as medicine")
+    _write_fragment(vault, frag_id="frag-tox", title="Power as toxic")
     result = author_tool(
         vault_path=vault,
         query="F6 medicine vs toxic",
@@ -510,14 +514,15 @@ def test_author_tool_returns_real_cited_draft(vault: Path) -> None:
     assert result["verdict"] in {"PASS", "REVISE", "ESCALATE"}
     assert result["claims"]  # non-empty
     assert all(claim["source_fragments"] for claim in result["claims"])
-    # NOTE (#463): the claim *count* and verdict here reflect the stub
-    # specialists (which emit fixed mock claims, ignoring vault content). When
-    # #463 wires the real Graph/Retrieval agents, strengthen this to seed real
-    # fragments and assert the claims trace back to them.
+    # With the real specialists (#463/#467) every cited fragment is one the
+    # desk actually scanned in the seeded corpus.
+    cited = {fid for claim in result["claims"] for fid in claim["source_fragments"]}
+    assert cited <= {"frag-med", "frag-tox"}
 
 
 def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
     """``dry_run`` returns the pipeline plan + evidence summary, not a draft."""
+    _write_fragment(vault, frag_id="frag-a", title="Alpha note about q")
     result = author_tool(
         vault_path=vault,
         query="q",
@@ -529,9 +534,8 @@ def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
     assert result["status"] == "ok"
     assert result["dry_run"] is True
     assert result["plan"]
+    # The real specialists (#463/#467) ground evidence in the seeded corpus.
     assert result["evidence"]["claims"] >= 1
-    # NOTE (#463): evidence counts reflect the stub specialists; revisit to
-    # assert against seeded fragments once the real specialists land.
 
 
 def test_author_tool_forwards_max_rounds(

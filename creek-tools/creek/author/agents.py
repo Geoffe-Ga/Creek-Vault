@@ -1,9 +1,11 @@
 """Specialist agents for the Creek Writing Desk.
 
-The Graph and Retrieval specialists are real: Graph walks a bounded
-backlink graph over the vault; Retrieval ranks fragments by semantic similarity
-to the query, reusing :mod:`creek.link.embeddings`. The Ontology specialist
-remains a stub. Every specialist returns structured,
+The Graph, Retrieval, and Ontology specialists are real: Graph walks a
+bounded backlink graph over the vault; Retrieval ranks fragments by semantic
+similarity to the query, reusing :mod:`creek.link.embeddings`; Ontology runs
+the deterministic rule classifier over the corpus and aggregates canonical
+APTITUDE frequencies / phases / modes / dosages, surfacing — never resolving —
+the paradoxes it finds. Every specialist returns structured,
 provenance-tracked :class:`~creek.author.models.EvidenceBundle`s — claims paired
 with their ``source_fragments`` (and an ``author_slug`` for borrowed evidence).
 """
@@ -11,23 +13,37 @@ with their ``source_fragments`` (and an ``author_slug`` for borrowed evidence).
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections import Counter
+from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
 
-from creek.author.models import EvidenceBundle, EvidenceClaim, WalkStats
+from creek.author.models import (
+    EvidenceBundle,
+    EvidenceClaim,
+    OntologyAnalysis,
+    OntologyParadox,
+    WalkStats,
+)
+from creek.classify.rules import RuleClassifier
+from creek.classify.weighted import WeightedDimension
+from creek.generate.paradox import OPPOSITE_PHASE_PAIRS
 from creek.link.embeddings import (
     EmbeddingLinker,
     EmbeddingModelUnavailableError,
     fragment_embedding_text,
 )
+from creek.models import Dosage, Frequency, Mode, Phase
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
+    from enum import StrEnum
     from pathlib import Path
 
     from creek.config import CreekConfig, EmbeddingsConfig
     from creek.models import Fragment
+
+_DimT = TypeVar("_DimT", bound="StrEnum")
 
 #: Vault subtrees the specialists draw evidence from.
 _CORPUS_SUBDIRS: tuple[str, ...] = ("01-Fragments", "09-Reference", "11-Other-Authors")
@@ -240,20 +256,223 @@ class GraphSpecialist:
         )
 
 
+def _aggregate_dimension(
+    picks: list[_DimT],
+    unclassified: _DimT,
+) -> tuple[WeightedDimension[_DimT], ...]:
+    """Aggregate per-fragment canonical *picks* into weighted dimensions.
+
+    Counts each canonical value's occurrences across the corpus, drops the
+    ``unclassified`` sentinel, normalises counts into weights in ``[0.0, 1.0]``
+    (the most frequent value reaching weight 1.0), and sorts weight-descending
+    with the canonical value as a stable tie-break.
+
+    Args:
+        picks: One canonical enum pick per fragment (may include the
+            ``unclassified`` sentinel, which is dropped).
+        unclassified: The dimension's ``UNCLASSIFIED`` sentinel.
+
+    Returns:
+        A weight-descending tuple of :class:`WeightedDimension` entries.
+    """
+    counts = Counter(pick for pick in picks if pick is not unclassified)
+    if not counts:
+        return ()
+    top = max(counts.values())
+    entries = [
+        WeightedDimension(value=value, weight=count / top)
+        for value, count in counts.items()
+    ]
+    entries.sort(key=lambda wd: (-wd.weight, wd.value.value))
+    return tuple(entries)
+
+
+class _FragmentSignal:
+    """The canonical ontology signal a single corpus fragment carries."""
+
+    __slots__ = ("dosage", "frequency", "mode", "phase")
+
+    def __init__(self, fragment: Fragment, body: str) -> None:
+        """Classify *fragment* deterministically, keeping any frontmatter dosage.
+
+        The rule classifier supplies frequency, phase, and mode from
+        ``title + body`` keyword signal; the rule classifier does not detect
+        dosage, so dosage is read from the fragment's existing frontmatter
+        (``wavelength.dosage``) instead.
+
+        Args:
+            fragment: The corpus fragment to scan.
+            body: The fragment's markdown body.
+        """
+        classified = RuleClassifier().classify(
+            fragment, content=body, title=fragment.title
+        )
+        self.frequency: Frequency = Frequency(classified.frequency.primary)
+        self.phase: Phase = Phase(classified.wavelength.phase)
+        self.mode: Mode = Mode(classified.wavelength.mode)
+        self.dosage: Dosage = Dosage(fragment.wavelength.dosage)
+
+
+def _detect_dosage_paradoxes(
+    signals: list[tuple[str, _FragmentSignal]],
+) -> list[OntologyParadox]:
+    """Surface same-frequency medicine-vs-toxic contradictions across fragments.
+
+    Args:
+        signals: ``(fragment_id, signal)`` pairs for the classified corpus.
+
+    Returns:
+        One :class:`OntologyParadox` per frequency held as both medicine and
+        toxic; the contradiction is named, never resolved.
+    """
+    by_freq: dict[Frequency, dict[Dosage, str]] = {}
+    for fid, sig in signals:
+        if sig.frequency is Frequency.UNCLASSIFIED or sig.dosage not in (
+            Dosage.MEDICINE,
+            Dosage.TOXIC,
+        ):
+            continue
+        by_freq.setdefault(sig.frequency, {}).setdefault(sig.dosage, fid)
+    paradoxes: list[OntologyParadox] = []
+    for freq, seen in sorted(by_freq.items(), key=lambda item: item[0].value):
+        if Dosage.MEDICINE in seen and Dosage.TOXIC in seen:
+            ids = (seen[Dosage.MEDICINE], seen[Dosage.TOXIC])
+            paradoxes.append(
+                OntologyParadox(
+                    kind="dosage",
+                    fragment_ids=ids,
+                    description=(
+                        f"{freq.value} is held as medicine in one fragment "
+                        "and as toxic in another."
+                    ),
+                )
+            )
+    return paradoxes
+
+
+def _detect_phase_paradoxes(
+    signals: list[tuple[str, _FragmentSignal]],
+) -> list[OntologyParadox]:
+    """Surface opposite-phase contradictions across fragments.
+
+    Reuses the canonical opposite-phase pairs from
+    :data:`creek.generate.paradox.OPPOSITE_PHASE_PAIRS`.
+
+    Args:
+        signals: ``(fragment_id, signal)`` pairs for the classified corpus.
+
+    Returns:
+        One :class:`OntologyParadox` per opposite-phase pair present in the
+        corpus; the contradiction is named, never resolved.
+    """
+    first_for_phase: dict[Phase, str] = {}
+    for fid, sig in signals:
+        if sig.phase is not Phase.UNCLASSIFIED:
+            first_for_phase.setdefault(sig.phase, fid)
+    paradoxes: list[OntologyParadox] = []
+    for pair in sorted(OPPOSITE_PHASE_PAIRS, key=sorted):
+        phases = [Phase(value) for value in pair]
+        if all(phase in first_for_phase for phase in phases):
+            lo, hi = sorted(phases, key=lambda p: p.value)
+            paradoxes.append(
+                OntologyParadox(
+                    kind="phase",
+                    fragment_ids=(first_for_phase[lo], first_for_phase[hi]),
+                    description=(
+                        f"The topic sits on opposite phases — {lo.value} in one "
+                        f"fragment and {hi.value} in another."
+                    ),
+                )
+            )
+    return paradoxes
+
+
+def _ontology_claim(
+    analysis: OntologyAnalysis,
+    fragment_ids: list[str],
+) -> EvidenceClaim:
+    """Render a grounded, single-sentence summary claim from *analysis*.
+
+    The claim always traces to every scanned fragment so the desk's
+    fragment-grounding invariant holds even on an all-unclassified corpus.
+
+    Args:
+        analysis: The aggregated ontological analysis.
+        fragment_ids: Every scanned fragment id.
+
+    Returns:
+        One :class:`EvidenceClaim` summarising the dominant signal.
+    """
+    count = len(fragment_ids)
+    if analysis.frequencies:
+        freq = analysis.frequencies[0].value.value
+        phase = analysis.phases[0].value.value if analysis.phases else "no clear phase"
+        summary = (
+            f"Ontological scan of {count} fragments: dominant frequency {freq}, "
+            f"phase {phase}."
+        )
+    else:
+        summary = (
+            f"Ontological scan of {count} fragments; no dominant frequency detected."
+        )
+    return EvidenceClaim(claim=summary, source_fragments=fragment_ids.copy())
+
+
 class OntologySpecialist:
-    """Stub Ontology specialist — would ground claims in the APTITUDE model."""
+    """Ontology specialist — deterministic APTITUDE analytics over the corpus.
+
+    Classifies every corpus fragment with the deterministic
+    :class:`~creek.classify.rules.RuleClassifier` (no LLM, no embeddings),
+    aggregates canonical frequencies / phases / modes / dosages into weighted
+    dimensions, and surfaces — never resolves — the dosage and phase
+    contradictions it finds (Ontology §10.2; INC-019 canonical taxonomy only).
+    """
 
     name = "ontology"
 
     def gather(self, query: str, vault: Path) -> EvidenceBundle:
-        """Return a mock ontology-derived claim (stub)."""
+        """Return canonical ontological analysis grounded in corpus fragments.
+
+        Degrades to an empty bundle when the corpus is empty so the desk never
+        crashes on a thin vault. When the corpus is non-empty it always emits
+        at least one claim, traced to the scanned fragments.
+
+        Args:
+            query: The user query (unused — analysis is corpus-wide).
+            vault: The vault to scan.
+
+        Returns:
+            An :class:`EvidenceBundle` carrying the analysis and a grounded
+            summary claim, or an empty bundle for an empty corpus.
+        """
+        corpus = _load_corpus(vault)
+        if not corpus:
+            return EvidenceBundle()
+        signals = [
+            (fragment.id, _FragmentSignal(fragment, body)) for fragment, body in corpus
+        ]
+        analysis = OntologyAnalysis(
+            frequencies=_aggregate_dimension(
+                [sig.frequency for _id, sig in signals], Frequency.UNCLASSIFIED
+            ),
+            phases=_aggregate_dimension(
+                [sig.phase for _id, sig in signals], Phase.UNCLASSIFIED
+            ),
+            modes=_aggregate_dimension(
+                [sig.mode for _id, sig in signals], Mode.UNCLASSIFIED
+            ),
+            dosages=_aggregate_dimension(
+                [sig.dosage for _id, sig in signals], Dosage.UNCLASSIFIED
+            ),
+            paradoxes=tuple(
+                _detect_dosage_paradoxes(signals) + _detect_phase_paradoxes(signals)
+            ),
+            overall_confidence=1.0 if signals else 0.0,
+        )
+        fragment_ids = [fid for fid, _sig in signals]
         return EvidenceBundle(
-            claims=[
-                EvidenceClaim(
-                    claim=f"Ontology framing for {query!r} (stub).",
-                    source_fragments=["frag-ontology-0001"],
-                )
-            ]
+            claims=[_ontology_claim(analysis, fragment_ids)],
+            ontology=analysis,
         )
 
 

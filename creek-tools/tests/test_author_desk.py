@@ -39,6 +39,8 @@ from creek.author.voice import VoiceAgent
 
 def test_run_author_returns_shaped_draft(tmp_path: Path) -> None:
     """``run_author`` returns an ``AuthoredDraft`` with mock provenance + verdict."""
+    _seed_fragment(tmp_path, "frag-a", "F6 Pluralism and community")
+    _seed_fragment(tmp_path, "frag-b", "Agency and momentum")
     draft = run_author(medium="research", query="What is F6 Pluralism?", vault=tmp_path)
 
     assert isinstance(draft, AuthoredDraft)
@@ -149,6 +151,8 @@ def test_evidence_bundle_dedups_source_fragments() -> None:
 
 def test_conductor_synthesize_merges_bundles(tmp_path: Path) -> None:
     """The ``synthesize`` step merges every specialist bundle into one."""
+    _seed_fragment(tmp_path, "frag-a", "Alpha note about q")
+    _seed_fragment(tmp_path, "frag-b", "Beta note")
     conductor = build_default_conductor(max_rounds=1)
     bundles = [s.gather("q", tmp_path) for s in conductor.specialists]
 
@@ -161,6 +165,7 @@ def test_conductor_synthesize_merges_bundles(tmp_path: Path) -> None:
 
 def test_plan_steps_each_correspond_to_a_real_call(tmp_path: Path) -> None:
     """Every advertised plan step is exercised by a real run (no ghost steps)."""
+    _seed_fragment(tmp_path, "frag-a", "Alpha note about q")
     conductor = build_default_conductor(max_rounds=1)
     # ``synthesize`` must exist and run, not just appear in ``plan()``.
     assert "synthesize" in conductor.plan()

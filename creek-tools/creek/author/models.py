@@ -11,7 +11,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
+from creek.classify.weighted import WeightedDimension
 from creek.compile.provenance import ProvenanceEntry
+from creek.models import Dosage, Frequency, Mode, Phase
 
 #: Mediums the author desk can produce. ``research``/``chat``/``essay``/
 #: ``research-piece`` are wired; the others (book-report/how-to) arrive in later
@@ -56,18 +58,71 @@ class WalkStats(BaseModel):
     fragments_visited: int = 0
 
 
+class OntologyParadox(BaseModel):
+    """A surfaced (never resolved) contradiction across two fragments.
+
+    The Ontology specialist *names* a tension rather than collapsing it: a
+    paradox carries the contributing fragment ids and a neutral, canonical
+    description of the contradiction so downstream voicing keeps both
+    conflicting signals visible (FEAT-041 §6; Ontology §10.2).
+
+    Attributes:
+        kind: Which contradiction fired — ``"dosage"``, ``"phase"``, or
+            ``"confidence"``.
+        fragment_ids: The fragment ids in tension, in stable order.
+        description: A neutral one-sentence statement of the contradiction;
+            it names the tension, never resolves it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["dosage", "phase", "confidence"]
+    fragment_ids: tuple[str, ...] = ()
+    description: str = ""
+
+
+class OntologyAnalysis(BaseModel):
+    """Structured ontological analysis from the Ontology specialist (FEAT-041 §4.1).
+
+    Each axis is a weight-descending tuple of canonical
+    :class:`~creek.classify.weighted.WeightedDimension` entries (canonical
+    taxonomy only — no aliases, INC-019). Paradoxes are surfaced, not
+    resolved.
+
+    Attributes:
+        frequencies: Weighted APTITUDE frequencies (F1-F10) the corpus
+            resonates with.
+        phases: Weighted Archetypal Wavelength phases.
+        modes: Weighted engagement modes.
+        dosages: Weighted dosage framings (medicine/toxic/ambiguous).
+        paradoxes: Surfaced contradictions across fragments.
+        overall_confidence: Aggregate confidence in ``[0.0, 1.0]``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    frequencies: tuple[WeightedDimension[Frequency], ...] = ()
+    phases: tuple[WeightedDimension[Phase], ...] = ()
+    modes: tuple[WeightedDimension[Mode], ...] = ()
+    dosages: tuple[WeightedDimension[Dosage], ...] = ()
+    paradoxes: tuple[OntologyParadox, ...] = ()
+    overall_confidence: float = 0.0
+
+
 class EvidenceBundle(BaseModel):
     """The aggregated evidence the conductor hands to the voice agent.
 
     Attributes:
         claims: Every :class:`EvidenceClaim` gathered across specialists.
         walk_stats: Set by the Graph agent — the bounds its backlink walk hit.
+        ontology: Set by the Ontology agent — structured ontological analysis.
     """
 
     model_config = ConfigDict(frozen=True)
 
     claims: list[EvidenceClaim] = Field(default_factory=list)
     walk_stats: WalkStats | None = None
+    ontology: OntologyAnalysis | None = None
 
     def all_source_fragments(self) -> list[str]:
         """Return the order-preserving, deduplicated union of claim fragments.

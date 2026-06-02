@@ -170,12 +170,16 @@ class Conductor:
             bundles: One evidence bundle per specialist.
 
         Returns:
-            A single :class:`EvidenceBundle` carrying every claim.
+            A single :class:`EvidenceBundle` carrying every claim and the
+            first ontological analysis any specialist produced.
         """
         claims: list[EvidenceClaim] = []
+        ontology = None
         for bundle in bundles:
             claims.extend(bundle.claims)
-        return EvidenceBundle(claims=claims)
+            if ontology is None and bundle.ontology is not None:
+                ontology = bundle.ontology
+        return EvidenceBundle(claims=claims, ontology=ontology)
 
     def run(self, *, medium: str, query: str, vault: Path) -> AuthoredDraft:
         """Run the full author pipeline and return a shaped draft.

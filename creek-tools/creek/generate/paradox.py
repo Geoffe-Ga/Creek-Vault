@@ -67,7 +67,7 @@ _EXCERPT_MAX_CHARS: int = 280
 """Maximum excerpt length written into a paradox note."""
 
 
-_OPPOSITE_PHASE_PAIRS: frozenset[frozenset[str]] = frozenset(
+OPPOSITE_PHASE_PAIRS: frozenset[frozenset[str]] = frozenset(
     {
         frozenset({Phase.RISING.value, Phase.DIMINISHING.value}),
         frozenset({Phase.RISING.value, Phase.BOTTOMING_OUT.value}),
@@ -413,7 +413,7 @@ class ParadoxDetector:
         phase_b = str(b.wavelength.phase)
         if not phase_a or not phase_b:
             return False
-        return frozenset({phase_a, phase_b}) in _OPPOSITE_PHASE_PAIRS
+        return frozenset({phase_a, phase_b}) in OPPOSITE_PHASE_PAIRS
 
     @staticmethod
     def _opposite_confidences(a: Fragment, b: Fragment) -> bool:
