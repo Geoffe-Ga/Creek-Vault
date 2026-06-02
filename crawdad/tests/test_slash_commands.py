@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from crawdad.config import CrawDadConfig
+from crawdad.mcp_client import MCPUnavailableError
 from crawdad.slash_commands import (
     CRAWDAD_COMMANDS,
+    _interaction_allowed,
     handle_ask,
     handle_checkin,
     handle_draft,
@@ -19,6 +23,22 @@ from crawdad.slash_commands import (
     handle_workflow,
     register,
 )
+
+_ALLOWED_USER_ID = 11
+_ALLOWED_CHANNEL_ID = 22
+_DENIED_USER_ID = 99
+_DENIED_CHANNEL_ID = 88
+
+
+def _make_config() -> CrawDadConfig:
+    """Build a minimal allowlisted config for slash-command gate tests."""
+    return CrawDadConfig(
+        discord_bot_token="t",
+        anthropic_api_key="k",
+        vault_path=Path("vault"),
+        allowed_user_ids=(_ALLOWED_USER_ID,),
+        allowed_channel_ids=(_ALLOWED_CHANNEL_ID,),
+    )
 
 
 class _FakeReplier:
@@ -493,7 +513,7 @@ def test_register_wires_every_command_onto_tree() -> None:
     """``register`` adds every command to a discord ``CommandTree``-like object."""
     tree = _FakeTree()
 
-    register(tree, loop_runner=_fake_loop_runner)
+    register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
 
     assert set(tree.registered) == set(CRAWDAD_COMMANDS)
     for name, entry in tree.registered.items():
@@ -505,7 +525,7 @@ def test_register_returns_command_count() -> None:
     """``register`` returns the number of wired commands for sanity checks."""
     tree = _FakeTree()
 
-    count = register(tree, loop_runner=_fake_loop_runner)
+    count = register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
 
     assert count == len(CRAWDAD_COMMANDS)
 
@@ -532,12 +552,31 @@ class _FakeResponse:
         self.deferred += 1
 
 
-class _FakeInteraction:
-    """``discord.Interaction``-shaped fake with the minimal surface we use."""
+class _FakeUser:
+    """``discord.Interaction.user``-shaped fake exposing just ``id``."""
 
-    def __init__(self) -> None:
+    def __init__(self, user_id: int) -> None:
+        self.id = user_id
+
+
+class _FakeInteraction:
+    """``discord.Interaction``-shaped fake with the minimal surface we use.
+
+    ``user_id`` and ``channel_id`` default to the allowlisted ids so the
+    pre-existing callback tests keep exercising the happy path without
+    change; the allowlist tests pass denied ids explicitly.
+    """
+
+    def __init__(
+        self,
+        *,
+        user_id: int = _ALLOWED_USER_ID,
+        channel_id: int = _ALLOWED_CHANNEL_ID,
+    ) -> None:
         self.response = _FakeResponse()
         self.followup = _FakeFollowup()
+        self.user = _FakeUser(user_id)
+        self.channel_id = channel_id
 
 
 @pytest.mark.parametrize(
@@ -561,7 +600,7 @@ async def test_every_loop_routed_callback_defers_and_replies(
     unreached so per-file coverage on slash_commands.py sat at 89.80%.
     """
     tree = _FakeTree()
-    register(tree, loop_runner=_fake_loop_runner)
+    register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
     interaction = _FakeInteraction()
 
     await tree.registered[command_name]["callback"](interaction, **callback_kwargs)
@@ -581,7 +620,12 @@ async def test_register_callback_defers_and_invokes_switcher() -> None:
         return True
 
     tree = _FakeTree()
-    register(tree, loop_runner=_fake_loop_runner, register_switcher=_switcher)
+    register(
+        tree,
+        config=_make_config(),
+        loop_runner=_fake_loop_runner,
+        register_switcher=_switcher,
+    )
     interaction = _FakeInteraction()
 
     await tree.registered["register"]["callback"](interaction, name="praxis")
@@ -595,7 +639,7 @@ async def test_register_callback_defers_and_invokes_switcher() -> None:
 async def test_register_callback_without_switcher_replies_softly() -> None:
     """When no switcher is wired the callback still replies — does not crash."""
     tree = _FakeTree()
-    register(tree, loop_runner=_fake_loop_runner)
+    register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
     interaction = _FakeInteraction()
 
     await tree.registered["register"]["callback"](interaction, name="praxis")
@@ -615,6 +659,7 @@ async def test_workflow_callback_defers_and_lists_when_wired() -> None:
     tree = _FakeTree()
     register(
         tree,
+        config=_make_config(),
         loop_runner=_spy_runner,
         workflow_lister=lambda: ["wavelength-checkin"],
         workflow_runner=None,
@@ -643,6 +688,7 @@ async def test_workflow_callback_runs_workflow_and_replies() -> None:
     tree = _FakeTree()
     register(
         tree,
+        config=_make_config(),
         loop_runner=_loop,
         workflow_lister=lambda: ["foo"],
         workflow_runner=_runner,
@@ -669,7 +715,7 @@ async def test_workflow_callback_soft_errors_when_unwired() -> None:
         return "should not be reached"
 
     tree = _FakeTree()
-    register(tree, loop_runner=_loop)
+    register(tree, config=_make_config(), loop_runner=_loop)
     interaction = _FakeInteraction()
 
     await tree.registered["workflow"]["callback"](interaction)
@@ -679,3 +725,122 @@ async def test_workflow_callback_soft_errors_when_unwired() -> None:
     body = interaction.followup.sent[0].lower()
     assert "registry" in body
     assert "walker" not in body
+
+
+# -----------------------------------------------------------------------------
+# Issue #468: allowlist gate + graceful degradation on the author routes.
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("user_id", "channel_id", "expected"),
+    [
+        (_ALLOWED_USER_ID, _ALLOWED_CHANNEL_ID, True),
+        (_DENIED_USER_ID, _ALLOWED_CHANNEL_ID, False),
+        (_ALLOWED_USER_ID, _DENIED_CHANNEL_ID, False),
+        (_DENIED_USER_ID, _DENIED_CHANNEL_ID, False),
+    ],
+)
+def test_interaction_allowed_gates_by_user_and_channel(
+    user_id: int, channel_id: int, expected: bool
+) -> None:
+    """``_interaction_allowed`` mirrors ``CrawDadConfig.is_allowed`` (AND gate)."""
+    interaction = _FakeInteraction(user_id=user_id, channel_id=channel_id)
+
+    assert _interaction_allowed(interaction, _make_config()) is expected
+
+
+@pytest.mark.parametrize("command_name", ["ask", "draft"])
+@pytest.mark.parametrize(
+    ("user_id", "channel_id"),
+    [
+        (_DENIED_USER_ID, _ALLOWED_CHANNEL_ID),
+        (_ALLOWED_USER_ID, _DENIED_CHANNEL_ID),
+    ],
+)
+async def test_author_callback_denies_non_allowlisted_silently(
+    command_name: str, user_id: int, channel_id: int
+) -> None:
+    """A non-allowlisted user/channel gets NO response: no defer, no followup."""
+    kwargs = {"ask": {"question": "q"}, "draft": {"topic": "t"}}[command_name]
+    tree = _FakeTree()
+    register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
+    interaction = _FakeInteraction(user_id=user_id, channel_id=channel_id)
+
+    await tree.registered[command_name]["callback"](interaction, **kwargs)
+
+    assert interaction.response.deferred == 0
+    assert interaction.followup.sent == []
+
+
+@pytest.mark.parametrize(
+    ("command_name", "kwargs"),
+    [("ask", {"question": "what is emergence?"}), ("draft", {"topic": "phase"})],
+)
+async def test_author_callback_allows_allowlisted_interaction(
+    command_name: str, kwargs: dict[str, Any]
+) -> None:
+    """An allowlisted interaction defers and the handler runs (one reply)."""
+    tree = _FakeTree()
+    register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
+    interaction = _FakeInteraction()
+
+    await tree.registered[command_name]["callback"](interaction, **kwargs)
+
+    assert interaction.response.deferred == 1
+    assert len(interaction.followup.sent) == 1
+    assert "composer received:" in interaction.followup.sent[0]
+
+
+async def _raising_loop_runner(_message: str) -> str:
+    """Loop runner that raises ``MCPUnavailableError`` to test degradation."""
+    msg = "creek-tools subprocess died"
+    raise MCPUnavailableError(msg)
+
+
+async def test_handle_ask_degrades_softly_when_runner_raises() -> None:
+    """``handle_ask`` maps an escaped ``MCPUnavailableError`` to a soft reply."""
+    replier = _FakeReplier()
+
+    await handle_ask(replier, question="why?", loop_runner=_raising_loop_runner)
+
+    assert len(replier.sent) == 1
+    assert "unreachable" in replier.sent[0].lower()
+
+
+async def test_handle_draft_degrades_softly_when_runner_raises() -> None:
+    """``handle_draft`` maps an escaped ``MCPUnavailableError`` to a soft reply."""
+    replier = _FakeReplier()
+
+    await handle_draft(replier, topic="drift", loop_runner=_raising_loop_runner)
+
+    assert len(replier.sent) == 1
+    assert "unreachable" in replier.sent[0].lower()
+
+
+async def test_handle_ask_relays_soft_error_string_from_runner() -> None:
+    """When the runner RETURNS a soft-error string, ``handle_ask`` relays it."""
+    soft = "creek-tools is unreachable; try again in a moment."
+
+    async def _soft_runner(_message: str) -> str:
+        return soft
+
+    replier = _FakeReplier()
+
+    await handle_ask(replier, question="why?", loop_runner=_soft_runner)
+
+    assert replier.sent == [soft]
+
+
+async def test_handle_draft_relays_soft_error_string_from_runner() -> None:
+    """When the runner RETURNS a soft-error string, ``handle_draft`` relays it."""
+    soft = "creek-tools is unreachable; try again in a moment."
+
+    async def _soft_runner(_message: str) -> str:
+        return soft
+
+    replier = _FakeReplier()
+
+    await handle_draft(replier, topic="drift", loop_runner=_soft_runner)
+
+    assert replier.sent == [soft]

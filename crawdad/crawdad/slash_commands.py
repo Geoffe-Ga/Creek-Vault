@@ -32,9 +32,19 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+from crawdad.mcp_client import MCPUnavailableError
+
+if TYPE_CHECKING:
+    from crawdad.config import CrawDadConfig
 
 _LOGGER = logging.getLogger("crawdad.slash_commands")
+
+# Issue #468: the documented soft-error shown when the desk / creek-tools
+# MCP surface is unreachable. Mirrors ``crawdad.loop._MCP_UNAVAILABLE_REPLY``
+# so the author routes degrade with the same wording as the agent loop.
+_MCP_UNAVAILABLE_REPLY = "creek-tools is unreachable; try again in a moment."
 
 # A callable that drives one turn of the FEAT-015 loop and returns the
 # user-facing reply string. The CLI builds one by closing over the
@@ -164,6 +174,32 @@ async def handle_surface(replier: Replier, *, loop_runner: LoopRunner) -> None:
     await replier(reply)
 
 
+async def _run_and_reply(
+    replier: Replier, loop_runner: LoopRunner, prompt: str
+) -> None:
+    """Drive the loop runner and reply, degrading softly on MCP failure.
+
+    Issue #468: the author routes (`ask`/`draft`) own a resilience
+    contract — if the injected ``loop_runner`` ever lets an
+    :class:`~crawdad.mcp_client.MCPUnavailableError` escape (the loop
+    normally converts it to a soft-reply string, but defense-in-depth
+    keeps Discord from ever seeing a stack trace), reply with the
+    documented soft error instead of propagating.
+
+    Args:
+        replier: Async callable that posts the reply back to Discord.
+        loop_runner: The FEAT-015 agent-loop driver.
+        prompt: The pre-baked user message to run through the loop.
+    """
+    try:
+        reply = await loop_runner(prompt)
+    except MCPUnavailableError as exc:
+        _LOGGER.warning("author route degraded: %s", exc)
+        await replier(_MCP_UNAVAILABLE_REPLY)
+        return
+    await replier(reply)
+
+
 async def handle_draft(
     replier: Replier, *, topic: str, loop_runner: LoopRunner
 ) -> None:
@@ -184,8 +220,7 @@ async def handle_draft(
         "(AI-authored attribution: author=ai, representativeness=endorsed, "
         "voice_weight=0.0)."
     )
-    reply = await loop_runner(prompt)
-    await replier(reply)
+    await _run_and_reply(replier, loop_runner, prompt)
 
 
 async def handle_ask(
@@ -209,8 +244,7 @@ async def handle_ask(
         "attribution: author=ai, representativeness=endorsed, "
         "voice_weight=0.0)."
     )
-    reply = await loop_runner(prompt)
-    await replier(reply)
+    await _run_and_reply(replier, loop_runner, prompt)
 
 
 async def handle_save(
@@ -369,9 +403,33 @@ async def handle_help(replier: Replier) -> None:
 # -----------------------------------------------------------------------------
 
 
+def _interaction_allowed(interaction: Any, config: CrawDadConfig) -> bool:
+    """Return True when the interaction's user AND channel are allowlisted.
+
+    Issue #468: the author slash callbacks (`ask`/`draft`) must honour
+    CrawDad's personal-use allowlist (FEAT-013) the same way free-text
+    messages do in :func:`crawdad.bot._passes_allowlist`. Delegates to
+    :meth:`crawdad.config.CrawDadConfig.is_allowed` so the AND-gate
+    semantics live in exactly one place.
+
+    Args:
+        interaction: A ``discord.Interaction``-shaped object exposing
+            ``user.id`` and ``channel_id``.
+        config: The runtime config carrying the user / channel allowlists.
+
+    Returns:
+        ``True`` when the callback should proceed; ``False`` when it must
+        silently ignore the interaction (no defer, no reply).
+    """
+    return config.is_allowed(
+        user_id=interaction.user.id, channel_id=interaction.channel_id
+    )
+
+
 def register(
     tree: _TreeLike,
     *,
+    config: CrawDadConfig,
     loop_runner: LoopRunner,
     register_switcher: RegisterSwitcher | None = None,
     workflow_lister: Callable[[], list[str]] | None = None,
@@ -394,6 +452,13 @@ def register(
     default to ``None`` (e.g. tests / no-tool-surface sessions); in
     that case the workflow command soft-errors instead of crashing.
 
+    ``config`` (issue #468) supplies the personal-use allowlist. The
+    author callbacks (`ask`/`draft`) gate on it BEFORE deferring so a
+    non-allowlisted user / channel gets no response at all (silent
+    ignore, matching :func:`crawdad.bot._passes_allowlist`). The other
+    callbacks are intentionally left ungated in this change (scope
+    fence); the broader gap is tracked separately.
+
     Returns the count of advertised commands (always
     ``len(CRAWDAD_COMMANDS)`` since the registration helpers don't
     fail). The return value is a sanity-check signal callers can pin
@@ -402,8 +467,8 @@ def register(
     _register_reflect(tree, loop_runner=loop_runner)
     _register_checkin(tree, loop_runner=loop_runner)
     _register_surface(tree, loop_runner=loop_runner)
-    _register_draft(tree, loop_runner=loop_runner)
-    _register_ask(tree, loop_runner=loop_runner)
+    _register_draft(tree, config=config, loop_runner=loop_runner)
+    _register_ask(tree, config=config, loop_runner=loop_runner)
     _register_save(tree, loop_runner=loop_runner)
     _register_register(tree, register_switcher=register_switcher)
     _register_workflow(
@@ -442,7 +507,9 @@ def _register_surface(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
         await handle_surface(interaction.followup.send, loop_runner=loop_runner)
 
 
-def _register_draft(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+def _register_draft(
+    tree: _TreeLike, *, config: CrawDadConfig, loop_runner: LoopRunner
+) -> None:
     """Wire the ``/crawdad draft`` Discord callback onto *tree*."""
 
     @tree.command(name="draft", description=_COMMAND_DESCRIPTIONS["draft"])
@@ -453,14 +520,21 @@ def _register_draft(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
         marks the parameter as required and disables submit until the
         user fills it in. The runtime empty-string guard in
         :func:`handle_draft` stays as defense-in-depth.
+
+        Issue #468: a non-allowlisted user / channel is silently ignored
+        (no defer, no followup) BEFORE the interaction is deferred.
         """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_draft(
             interaction.followup.send, topic=topic, loop_runner=loop_runner
         )
 
 
-def _register_ask(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+def _register_ask(
+    tree: _TreeLike, *, config: CrawDadConfig, loop_runner: LoopRunner
+) -> None:
     """Wire the ``/crawdad ask`` Discord callback onto *tree*."""
 
     @tree.command(name="ask", description=_COMMAND_DESCRIPTIONS["ask"])
@@ -471,7 +545,12 @@ def _register_ask(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
         marks the parameter as required and disables submit until the
         user fills it in. The runtime empty-string guard in
         :func:`handle_ask` stays as defense-in-depth.
+
+        Issue #468: a non-allowlisted user / channel is silently ignored
+        (no defer, no followup) BEFORE the interaction is deferred.
         """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_ask(
             interaction.followup.send, question=question, loop_runner=loop_runner
