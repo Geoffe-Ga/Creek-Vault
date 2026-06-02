@@ -66,6 +66,14 @@ DEFAULT_MIN_PER_REGISTER: int = 5
 _FRAGMENTS_SUBDIR: str = "01-Fragments"
 """Vault subdirectory scanned for fragment markdown files."""
 
+_OTHER_AUTHORS_SEGMENT: str = "11-Other-Authors"
+"""Vault path segment holding borrowed / AI-authored content (Issue #466).
+
+Any fragment whose source path contains this segment is excluded from the
+voice corpus regardless of its ``voice_weight``, as a defensive backstop
+against voice drift.
+"""
+
 _SAMPLES_SUBPATH: tuple[str, str] = ("07-Voice", "Register-Samples")
 """Vault path where ranked exemplars are persisted."""
 
@@ -139,6 +147,26 @@ def _word_count(body: str) -> int:
     return len(body.split())
 
 
+def _is_other_authors_path(md_file: Path) -> bool:
+    """Return whether *md_file* lives under an ``11-Other-Authors`` segment.
+
+    Borrowed and AI-authored content is captured under
+    ``11-Other-Authors/`` and must never seed the voice corpus (Issue
+    #466). The check matches whole path *segments* (via ``Path.parts``)
+    rather than a substring of the full path, so a folder merely
+    *containing* the text — e.g. ``my-11-Other-Authors-notes`` — does not
+    trigger a false exclusion.
+
+    Args:
+        md_file: Path to a candidate fragment markdown file.
+
+    Returns:
+        ``True`` when any path component equals the
+        ``11-Other-Authors`` segment, otherwise ``False``.
+    """
+    return _OTHER_AUTHORS_SEGMENT in md_file.parts
+
+
 def _eligible_register(
     fragment: Fragment,
     *,
@@ -153,9 +181,15 @@ def _eligible_register(
 
     Returns:
         The canonical register string when the fragment has qualifying
-        confidence, allowed privacy tier, and a canonical register;
-        otherwise ``None``.
+        confidence, a positive ``voice_weight``, allowed privacy tier,
+        and a canonical register; otherwise ``None``.
     """
+    # Voice-fidelity fail-closed gate (Issue #466): borrowed / AI-authored
+    # text (notably ``ai-as-user`` content with ``voice_weight=0.0``) must
+    # never train the voice proxy. ``voice_weight`` is already coerced to a
+    # float in ``[0, 1]`` by the model, so a plain comparison is safe.
+    if fragment.voice_weight <= 0:
+        return None
     if _confidence_value(fragment) not in _QUALIFYING_CONFIDENCE:
         return None
     if not allow_intimate and str(fragment.privacy_tier) == PrivacyTier.INTIMATE.value:
@@ -346,6 +380,12 @@ class VoiceExemplarCollector:
             return buckets
 
         for md_file in sorted(fragments_dir.rglob("*.md")):
+            # Defensive path gate (Issue #466): skip borrowed / AI-authored
+            # content under ``11-Other-Authors`` before parsing, so it never
+            # reaches the voice corpus even if symlinked or the scan root
+            # later broadens.
+            if _is_other_authors_path(md_file):
+                continue
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
@@ -1651,6 +1691,11 @@ class VoiceProfileGenerator:
     ) -> None:
         """Walk *fragments_dir* and append eligible exemplars to JSONL files."""
         for md_file in sorted(fragments_dir.rglob("*.md")):
+            # Defensive path gate (Issue #466): skip borrowed / AI-authored
+            # content under ``11-Other-Authors`` so it never reaches the
+            # streaming voice-profile corpus, mirroring ``collect_exemplars``.
+            if _is_other_authors_path(md_file):
+                continue
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
