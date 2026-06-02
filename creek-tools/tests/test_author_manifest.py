@@ -8,11 +8,11 @@ hand-edited manifest can never crash the pipeline.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 import pytest
 
-from creek.models import AuthorManifest, PrivacyTier
+from creek.models import AuthorKind, AuthorManifest, PrivacyTier, Representativeness
 from creek.vault.authors import load_author_manifest
 
 if TYPE_CHECKING:
@@ -139,6 +139,40 @@ def test_missing_file_raises(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError, match="Author manifest not found"):
         load_author_manifest(missing)
+
+
+def test_every_literal_author_kind_is_accepted() -> None:
+    """All declared ``AuthorKind`` values round-trip (guards frozenset drift)."""
+    for kind in get_args(AuthorKind):
+        manifest = AuthorManifest.model_validate(
+            {"author_slug": "x", "author_kind": kind}
+        )
+        assert manifest.author_kind == kind
+
+
+def test_every_literal_representativeness_is_accepted() -> None:
+    """All declared ``Representativeness`` values round-trip (guards drift)."""
+    for value in get_args(Representativeness):
+        manifest = AuthorManifest.model_validate(
+            {"author_slug": "x", "representativeness": value}
+        )
+        assert manifest.representativeness == value
+
+
+def test_null_fields_fail_closed() -> None:
+    """Explicit ``null`` attribution values fail closed to safe defaults."""
+    manifest = AuthorManifest.model_validate(
+        {
+            "author_slug": "x",
+            "author_kind": None,
+            "voice_weight": None,
+            "representativeness": None,
+        }
+    )
+
+    assert manifest.author_kind == "human_source"
+    assert manifest.voice_weight == 0.0
+    assert manifest.representativeness == "reference"
 
 
 def test_model_validate_coerces_directly() -> None:

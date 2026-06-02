@@ -11,7 +11,7 @@ import uuid
 import warnings
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
@@ -435,12 +435,23 @@ their own interests, or a co-author."""
 Representativeness = Literal["self", "endorsed", "aspirational", "reference"]
 """How closely an author's material stands for the vault owner's own views."""
 
-_AUTHOR_KINDS: frozenset[str] = frozenset(
-    {"human_source", "ai_as_user", "collaborator"}
-)
-_REPRESENTATIVENESS: frozenset[str] = frozenset(
-    {"self", "endorsed", "aspirational", "reference"}
-)
+# Derive the allowed-value sets from the Literal types so they can never drift
+# out of sync when a new kind/representativeness is added.
+_AUTHOR_KINDS: frozenset[str] = frozenset(get_args(AuthorKind))
+_REPRESENTATIVENESS: frozenset[str] = frozenset(get_args(Representativeness))
+
+
+def _warn_fail_closed(field: str, value: object, fallback: str) -> None:
+    """Log a fail-closed warning, distinguishing a null value from an invalid one."""
+    if value is None:
+        logger.warning("'%s' is null; failing closed to %r.", field, fallback)
+    else:
+        logger.warning(
+            "%s %r is not a recognised value; failing closed to %r.",
+            field,
+            value,
+            fallback,
+        )
 
 
 def _safe_float(value: object) -> float | None:
@@ -497,9 +508,7 @@ class AuthorManifest(BaseModel):
         """Fail closed to ``human_source`` for an unrecognised author kind."""
         if isinstance(value, str) and value in _AUTHOR_KINDS:
             return value
-        logger.warning(
-            "Author kind %r unrecognised; failing closed to 'human_source'.", value
-        )
+        _warn_fail_closed("author_kind", value, "human_source")
         return "human_source"
 
     @field_validator("representativeness", mode="before")
@@ -508,9 +517,7 @@ class AuthorManifest(BaseModel):
         """Fail closed to ``reference`` for an unrecognised representativeness."""
         if isinstance(value, str) and value in _REPRESENTATIVENESS:
             return value
-        logger.warning(
-            "Representativeness %r unrecognised; failing closed to 'reference'.", value
-        )
+        _warn_fail_closed("representativeness", value, "reference")
         return "reference"
 
     @field_validator("voice_weight", mode="before")
@@ -519,11 +526,13 @@ class AuthorManifest(BaseModel):
         """Fail closed to 0.0 for a non-numeric or out-of-range voice weight."""
         weight = _safe_float(value)
         if weight is None or not 0.0 <= weight <= 1.0:
-            logger.warning(
-                "Author voice_weight %r invalid or out of [0, 1]; failing closed "
-                "to 0.0.",
-                value,
-            )
+            if value is None:
+                logger.warning("'voice_weight' is null; failing closed to 0.0.")
+            else:
+                logger.warning(
+                    "voice_weight %r is not a number in [0, 1]; failing closed to 0.0.",
+                    value,
+                )
             return 0.0
         return weight
 
