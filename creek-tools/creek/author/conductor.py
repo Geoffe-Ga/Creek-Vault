@@ -10,6 +10,7 @@ behind these same seams.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.models import MediumContract
 
+logger = logging.getLogger(__name__)
+
 #: Mediums the conductor will run. ``research``/``chat``/``essay``/
 #: ``research-piece``/``book-report`` are wired; the remaining mediums (how-to)
 #: arrive later.
@@ -50,8 +53,16 @@ _EXCERPT_LEN: int = 80
 class VoiceRenderer(Protocol):
     """Anything that renders evidence into a draft body."""
 
-    def render(self, query: str, evidence: EvidenceBundle) -> str:
-        """Return draft prose for *query* from *evidence*."""
+    def render(
+        self,
+        query: str,
+        evidence: EvidenceBundle,
+        vault: Path | None = None,
+        *,
+        medium: Medium | None = None,
+        contract: MediumContract | None = None,
+    ) -> str:
+        """Return draft prose for *query* from *evidence* (in the owner's voice)."""
         ...
 
 
@@ -164,22 +175,49 @@ class Conductor:
         return self.synthesize(bundles)
 
     def synthesize(self, bundles: Sequence[EvidenceBundle]) -> EvidenceBundle:
-        """Merge per-specialist *bundles* into one (the ``synthesize`` step).
+        """Merge per-specialist *bundles* into one GROUNDED bundle.
+
+        Every retained claim must trace to at least one source fragment: a
+        claim with empty ``source_fragments`` is dropped (and logged), never
+        fabricated. The retained claims keep their stable specialist/insertion
+        order; when ``self.contract`` is present that order is the documented
+        assembly order honouring the contract's ``structure`` (the load-bearing
+        invariant is grounding, not per-section placement). The first non-None
+        ontology any specialist produced is carried through.
 
         Args:
             bundles: One evidence bundle per specialist.
 
         Returns:
-            A single :class:`EvidenceBundle` carrying every claim and the
-            first ontological analysis any specialist produced.
+            A single :class:`EvidenceBundle` of grounded claims plus the first
+            ontological analysis any specialist produced.
         """
         claims: list[EvidenceClaim] = []
         ontology = None
         for bundle in bundles:
-            claims.extend(bundle.claims)
+            claims.extend(self._grounded_claims(bundle))
             if ontology is None and bundle.ontology is not None:
                 ontology = bundle.ontology
         return EvidenceBundle(claims=claims, ontology=ontology)
+
+    @staticmethod
+    def _grounded_claims(bundle: EvidenceBundle) -> list[EvidenceClaim]:
+        """Return *bundle*'s claims that trace to a fragment, logging drops.
+
+        A claim with no ``source_fragments`` cannot be grounded, so it is
+        dropped here rather than passed to the voice agent where it could be
+        presented as fact without provenance.
+        """
+        kept: list[EvidenceClaim] = []
+        for claim in bundle.claims:
+            if claim.source_fragments:
+                kept.append(claim)
+            else:
+                logger.warning(
+                    "Dropping ungrounded claim (no source fragments): %r",
+                    claim.claim,
+                )
+        return kept
 
     def run(self, *, medium: str, query: str, vault: Path) -> AuthoredDraft:
         """Run the full author pipeline and return a shaped draft.
@@ -204,7 +242,9 @@ class Conductor:
         rounds = 0
         for attempt in range(1, self.max_rounds + 1):
             rounds = attempt
-            body = self.voice.render(query, evidence)
+            body = self.voice.render(
+                query, evidence, vault, medium=validated, contract=self.contract
+            )
             verdict = self.reflection.review(body, evidence, rubric)
             if verdict != "REVISE":
                 break

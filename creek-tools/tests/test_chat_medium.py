@@ -148,7 +148,9 @@ def test_run_author_enforces_chat_ceiling(
     from creek.author import voice
 
     monkeypatch.setattr(
-        voice.VoiceAgent, "render", lambda self, q, e: "x" * (CHAT_MAX_CHARS + 500)
+        voice.VoiceAgent,
+        "render",
+        lambda self, q, e, *a, **kw: "x" * (CHAT_MAX_CHARS + 500),
     )
 
     reply = run_author(medium="chat", query="q", vault=tmp_path)
@@ -163,7 +165,9 @@ def test_run_author_does_not_truncate_research(
     from creek.author import voice
 
     monkeypatch.setattr(
-        voice.VoiceAgent, "render", lambda self, q, e: "x" * (CHAT_MAX_CHARS + 500)
+        voice.VoiceAgent,
+        "render",
+        lambda self, q, e, *a, **kw: "x" * (CHAT_MAX_CHARS + 500),
     )
 
     draft = run_author(medium="research", query="q", vault=tmp_path)
