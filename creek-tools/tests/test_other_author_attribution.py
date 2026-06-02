@@ -213,6 +213,26 @@ class TestOtherAuthorAttribution:
         assert post["voice_weight"] == 0.0
         assert post["source"]["author"] == "other"
 
+    def test_malformed_yaml_manifest_fails_closed_to_zero_weight(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+    ) -> None:
+        """An _author.md with unparseable YAML fails closed, not crashes (#470)."""
+        # Unbalanced flow sequence -> yaml.YAMLError during frontmatter parse,
+        # raised before the model's per-field fail-closed validators run.
+        malformed = "---\nvoice_weight: [0.0\ndisplay_name: broken\n---\n# x\n"
+        _write_manifest(vault_path, "malformed", malformed)
+        frag = _classified_borrowed_fragment("malformed", "frag-malformed01")
+
+        result = writer.write_fragment(frag)
+
+        post = fm_mod.load(str(result))
+        assert post["voice_weight"] == 0.0
+        assert post["source"]["author"] == "other"
+        assert post["source"]["author_slug"] == "malformed"
+        assert post["representativeness"] == "reference"
+
     def test_native_write_is_unchanged(
         self,
         writer: VaultWriter,

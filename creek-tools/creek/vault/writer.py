@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 
 from creek.audit import AuditLog
 from creek.models import (
@@ -824,7 +825,10 @@ class VaultWriter:
         for md_file in target_dir.glob("*.md"):
             try:
                 post = frontmatter.load(str(md_file))
-            except (OSError, ValueError):
+            except (OSError, ValueError, yaml.YAMLError):
+                # A non-fragment or unparseable sibling (e.g. a corrupt
+                # ``_author.md`` manifest) must not crash the index rebuild —
+                # it simply has no fragment id to index (#470).
                 continue
             mid = post.get("id")
             if isinstance(mid, str):
