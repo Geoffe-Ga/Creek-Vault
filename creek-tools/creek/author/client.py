@@ -88,7 +88,6 @@ class AuthorLLMClient:
         prompt: str,
         *,
         system: str | None = None,
-        cache_control: dict[str, str] | None = None,
         max_tokens: int | None = None,
     ) -> AnthropicCompletion:
         """Return the full completion (text + token usage) for *prompt*.
@@ -96,13 +95,11 @@ class AuthorLLMClient:
         Unlike :meth:`complete` (which yields only the text and is kept stable
         for existing callers), this exposes the SDK's token usage so the desk
         can surface a run's cost and cache-hit rate. A static *system* prefix is
-        sent as a cached block (#474).
+        sent as an ephemeral cached block by the provider (#474).
 
         Args:
             prompt: The dynamic user prompt.
             system: Optional static system prefix to cache.
-            cache_control: Cache directive for the system block; defaults to
-                ephemeral inside the provider when *system* is set.
             max_tokens: Optional output-token ceiling.
 
         Returns:
@@ -112,6 +109,5 @@ class AuthorLLMClient:
         return self._provider.call_with_metadata(
             prompt,
             system=system,
-            cache_control=cache_control,
             max_tokens=max_tokens,
         )

@@ -88,13 +88,14 @@ class VoiceAgent:
             present and the model returns text; otherwise the deterministic
             body (also the fallback when the LLM returns empty text).
         """
+        # Reset first so a deterministic render never leaks a prior LLM call's
+        # usage if this agent instance is reused (#474 review).
+        self.last_usage = None
         deterministic = _deterministic_body(query, evidence)
         if self.llm_client is None or vault is None:
             return deterministic
         static, dynamic = _split_voice_prompt(query, evidence, vault, medium, contract)
-        completion = self.llm_client.complete_with_usage(
-            dynamic, system=static, cache_control={"type": "ephemeral"}
-        )
+        completion = self.llm_client.complete_with_usage(dynamic, system=static)
         self.last_usage = completion.usage
         voiced = completion.text.strip()
         return voiced or deterministic

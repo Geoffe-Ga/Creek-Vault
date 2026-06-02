@@ -123,9 +123,7 @@ def test_complete_with_usage_returns_text_and_usage() -> None:
     )
 
     client = AuthorLLMClient(provider)
-    completion = client.complete_with_usage(
-        "ask", system="static", cache_control={"type": "ephemeral"}
-    )
+    completion = client.complete_with_usage("ask", system="static")
 
     assert isinstance(completion, AnthropicCompletion)
     assert completion.text == "hi"
@@ -133,7 +131,6 @@ def test_complete_with_usage_returns_text_and_usage() -> None:
     provider.call_with_metadata.assert_called_once_with(
         "ask",
         system="static",
-        cache_control={"type": "ephemeral"},
         max_tokens=None,
     )
 
@@ -161,8 +158,29 @@ def test_voice_render_splits_static_and_dynamic(tmp_path: Path) -> None:
     assert "VOICE-CORE-PREFIX" in static
     assert "VOICE-CORE-PREFIX" not in dynamic
     assert "a grounded claim" in dynamic
-    assert call.kwargs["cache_control"] == {"type": "ephemeral"}
     assert agent.last_usage == {"cache_read_input_tokens": 0}
+
+
+def test_voice_render_resets_last_usage_on_deterministic_path(tmp_path: Path) -> None:
+    """A deterministic render after an LLM render must not leak stale usage (#474)."""
+    core = tmp_path / "creek-skills" / "voice-core" / "SKILL.md"
+    core.parent.mkdir(parents=True, exist_ok=True)
+    core.write_text("PREFIX", encoding="utf-8")
+    client = MagicMock()
+    client.complete_with_usage.return_value = AnthropicCompletion(
+        text="voiced", usage={"cache_read_input_tokens": 7}
+    )
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["f1"])]
+    )
+    agent = VoiceAgent(llm_client=client)
+
+    agent.render("q", evidence, tmp_path, medium="research")
+    assert agent.last_usage == {"cache_read_input_tokens": 7}
+
+    # Reuse the same agent on the deterministic path (no vault) — usage clears.
+    agent.render("q", evidence, vault=None, medium="research")
+    assert agent.last_usage is None
 
 
 def test_voice_render_returns_str_and_last_usage_none_offline() -> None:

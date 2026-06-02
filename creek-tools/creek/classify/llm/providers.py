@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -172,7 +172,6 @@ class AnthropicProvider:
         *,
         max_tokens: int | None = None,
         system: str | None = None,
-        cache_control: dict[str, str] | None = None,
     ) -> AnthropicCompletion:
         """Send a prompt and return its text, stop reason, and token usage.
 
@@ -192,10 +191,9 @@ class AnthropicProvider:
             max_tokens: Maximum tokens to request. ``None`` (the default)
                 keeps the historical :attr:`MAX_TOKENS` ceiling so the
                 classification path is unchanged.
-            system: Optional static system prefix to send as a cached block.
-                ``None`` (the default) preserves the legacy behaviour.
-            cache_control: Cache directive for the system block; defaults to
-                ``{"type": "ephemeral"}`` when *system* is provided.
+            system: Optional static system prefix to send as an ephemeral
+                cached block. ``None`` (the default) preserves the legacy
+                behaviour.
 
         Returns:
             An :class:`AnthropicCompletion` carrying the concatenated text, the
@@ -211,7 +209,7 @@ class AnthropicProvider:
 
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
-            response = self._create_message(prompt, ceiling, system, cache_control)
+            response = self._create_message(prompt, ceiling, system)
         except anthropic.AnthropicError as exc:
             msg = f"Anthropic API call failed: {type(exc).__name__}"
             raise RuntimeError(msg) from None
@@ -227,20 +225,20 @@ class AnthropicProvider:
         prompt: str,
         ceiling: int,
         system: str | None,
-        cache_control: dict[str, str] | None,
     ) -> object:
         """Call ``messages.create``, adding a cached system block when given.
 
         The two branches keep the SDK call typed: when *system* is ``None`` the
         request is the historical single-user shape (no ``system`` argument);
-        otherwise the static prefix is sent as a single cache-controlled text
-        block so it is billed once and re-read cheaply (#474).
+        otherwise the static prefix is sent as a single ephemeral
+        cache-controlled text block so it is billed once and re-read cheaply
+        (#474). The desk only ever uses ephemeral caching, so the directive is
+        a typed literal here rather than a caller-supplied dict.
 
         Args:
             prompt: The dynamic user prompt.
             ceiling: The resolved ``max_tokens`` value.
             system: Optional static system prefix to cache, or ``None``.
-            cache_control: Cache directive for the system block.
 
         Returns:
             The raw ``messages.create`` response object.
@@ -251,11 +249,7 @@ class AnthropicProvider:
                 max_tokens=ceiling,
                 messages=[{"role": "user", "content": prompt}],
             )
-        cache: anthropic.types.CacheControlEphemeralParam = (
-            {"type": "ephemeral"}
-            if cache_control is None
-            else cast("anthropic.types.CacheControlEphemeralParam", cache_control)
-        )
+        cache: anthropic.types.CacheControlEphemeralParam = {"type": "ephemeral"}
         return self.client.messages.create(
             model=self.model,
             max_tokens=ceiling,
