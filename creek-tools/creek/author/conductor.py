@@ -2,10 +2,12 @@
 
 The conductor drives the end-to-end flow: each specialist gathers structured
 evidence, the bundles are synthesized, the voice agent renders a draft, and the
-reflection node judges it — looping on ``REVISE`` up to ``max_rounds`` before
-returning a shaped :class:`~creek.author.models.AuthoredDraft`. In the skeleton
-every collaborator is a typed stub; later issues swap in real implementations
-behind these same seams.
+reflection node judges it — looping on ``REVISE`` up to ``max_rounds``. A draft
+still in ``REVISE`` once the round budget is exhausted is escalated to a human
+(``ESCALATE``) rather than shipped (#473), then returned as a shaped
+:class:`~creek.author.models.AuthoredDraft`. The reflection node is a real
+deterministic judge; the remaining collaborators are typed stubs that later
+issues swap behind these same seams.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
     Medium,
+    ReflectionResult,
     ReflectionVerdict,
 )
 from creek.author.reflection import ReflectionNode
@@ -74,8 +77,11 @@ class Reflector(Protocol):
         body: str,
         evidence: EvidenceBundle,
         rubric: dict[str, float] | None = None,
-    ) -> ReflectionVerdict:
-        """Return a verdict for *body* given *evidence* and the medium *rubric*."""
+        *,
+        contract: MediumContract | None = None,
+        vault: Path | None = None,
+    ) -> ReflectionResult:
+        """Return a structured result for *body* given *evidence* and *rubric*."""
         ...
 
 
@@ -228,7 +234,9 @@ class Conductor:
             vault: The vault to author from.
 
         Returns:
-            The :class:`AuthoredDraft` with mock provenance and a verdict.
+            The :class:`AuthoredDraft` with mock provenance and a verdict. A
+            draft that never cleared ``REVISE`` within ``max_rounds`` carries
+            an ``ESCALATE`` verdict rather than the sub-threshold ``REVISE``.
 
         Raises:
             ValueError: When *medium* is unsupported.
@@ -245,9 +253,17 @@ class Conductor:
             body = self.voice.render(
                 query, evidence, vault, medium=validated, contract=self.contract
             )
-            verdict = self.reflection.review(body, evidence, rubric)
+            result = self.reflection.review(
+                body, evidence, rubric, contract=self.contract, vault=vault
+            )
+            verdict = result.decision
             if verdict != "REVISE":
                 break
+
+        # Never ship a sub-threshold draft: a still-REVISE verdict after the
+        # round budget is exhausted escalates to a human (#473).
+        if verdict == "REVISE":
+            verdict = "ESCALATE"
 
         return AuthoredDraft(
             medium=validated,

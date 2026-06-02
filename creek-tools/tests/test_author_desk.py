@@ -32,7 +32,7 @@ from creek.author.agents import (
     OntologySpecialist,
     RetrievalSpecialist,
 )
-from creek.author.models import EvidenceClaim
+from creek.author.models import EvidenceClaim, ReflectionResult
 from creek.author.reflection import ReflectionNode
 from creek.author.voice import VoiceAgent
 
@@ -109,20 +109,20 @@ def test_voice_stub_renders_body_from_evidence() -> None:
 
 
 def test_reflection_passes_grounded_and_escalates_ungrounded() -> None:
-    """The stub reflection node passes grounded drafts and escalates empty ones."""
+    """The reflection node passes a clean grounded draft and escalates no-draft."""
     evidence = EvidenceBundle(
         claims=[EvidenceClaim(claim="a claim", source_fragments=["f1"])]
     )
 
-    assert ReflectionNode().review("a real body", evidence) == "PASS"
-    assert ReflectionNode().review("   ", evidence) == "ESCALATE"
-    assert ReflectionNode().review("body", EvidenceBundle()) == "ESCALATE"
+    assert ReflectionNode().review("a real body", evidence).decision == "PASS"
+    assert ReflectionNode().review("   ", evidence).decision == "ESCALATE"
+    assert ReflectionNode().review("body", EvidenceBundle()).decision == "ESCALATE"
 
 
 def test_conductor_respects_max_rounds(tmp_path: Path) -> None:
-    """A REVISE verdict loops up to ``max_rounds`` then returns that verdict."""
+    """REVISE loops up to ``max_rounds``; exhaustion escalates, never ships REVISE."""
     revising = MagicMock()
-    revising.review.return_value = "REVISE"
+    revising.review.return_value = ReflectionResult(decision="REVISE")
     conductor = Conductor(
         specialists=[GraphSpecialist()],
         voice=VoiceAgent(),
@@ -133,7 +133,9 @@ def test_conductor_respects_max_rounds(tmp_path: Path) -> None:
     draft = conductor.run(medium="research", query="q", vault=tmp_path)
 
     assert draft.rounds == 2
-    assert draft.verdict == "REVISE"
+    # New contract (#473): a still-REVISE draft after exhausting the round
+    # budget escalates to a human rather than shipping sub-threshold.
+    assert draft.verdict == "ESCALATE"
     assert revising.review.call_count == 2
 
 

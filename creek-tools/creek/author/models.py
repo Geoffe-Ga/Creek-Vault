@@ -23,6 +23,44 @@ Medium = Literal["research", "chat", "essay", "research-piece", "book-report", "
 #: The reflection node's bounded verdict over a drafted body.
 ReflectionVerdict = Literal["PASS", "REVISE", "ESCALATE"]
 
+#: Severity of a single reflection finding (#473). ``HIGH`` marks a hard-gate
+#: breach (citation/privacy), ``MID`` a softer rubric divergence, ``LOW`` a hint.
+FindingSeverity = Literal["LOW", "MID", "HIGH"]
+
+
+class ReflectionFinding(BaseModel):
+    """One scored defect the reflection node found in a drafted body (#473).
+
+    Attributes:
+        dimension: Which of the six rubric dimensions fired (e.g.
+            ``"citation_completeness"``).
+        severity: How serious the defect is — ``HIGH`` for a hard-gate
+            breach, ``MID`` for a rubric divergence, ``LOW`` for a hint.
+        message: A human-readable explanation naming the concrete defect.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    dimension: str
+    severity: FindingSeverity
+    message: str
+
+
+class ReflectionResult(BaseModel):
+    """The structured outcome of judging one drafted body (#473).
+
+    Attributes:
+        decision: The bounded verdict — ``PASS`` (ship), ``REVISE`` (one or
+            more findings; retry), or ``ESCALATE`` (cannot author at all).
+        findings: Every :class:`ReflectionFinding` the checks raised; empty
+            on a clean ``PASS``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    decision: ReflectionVerdict
+    findings: list[ReflectionFinding] = Field(default_factory=list)
+
 
 class EvidenceClaim(BaseModel):
     """A single structured claim from a specialist, traced to fragments.

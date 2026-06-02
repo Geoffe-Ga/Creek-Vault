@@ -16,6 +16,7 @@ import pytest
 from creek.author.agents import GraphSpecialist
 from creek.author.conductor import Conductor
 from creek.author.contracts import load_medium_contract
+from creek.author.models import ReflectionResult
 from creek.author.voice import VoiceAgent
 from creek.lint.checks import skill_size_budget
 from creek.models import MediumContract, PrivacyTier
@@ -100,7 +101,7 @@ def test_conductor_exposes_rubric_to_reflection(tmp_path: Path) -> None:
     """The Conductor passes the contract's reflection rubric to the reflection node."""
     contract = MediumContract(medium="research", reflection_rubric={"accuracy": 1.0})
     reflection = MagicMock()
-    reflection.review.return_value = "PASS"
+    reflection.review.return_value = ReflectionResult(decision="PASS")
     conductor = Conductor(
         specialists=[GraphSpecialist()],
         voice=VoiceAgent(),
