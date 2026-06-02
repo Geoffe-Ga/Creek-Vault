@@ -2640,6 +2640,70 @@ def _resolve_save_tier(
     return PrivacyTier.OPEN
 
 
+@app.command()
+def author(
+    query: str = typer.Option(..., "--query", help="What to author about."),
+    medium: str = typer.Option(
+        "research",
+        "--medium",
+        help="Output medium. Only 'research' is wired in the skeleton (FEAT-041).",
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the pipeline plan and stub evidence summary without authoring.",
+    ),
+    max_rounds: int | None = typer.Option(
+        None,
+        "--max-rounds",
+        min=1,
+        max=10,
+        help=(
+            "Override the Conductor's voice/reflect round bound. Defaults to "
+            "the vault's author.max_author_rounds config (3)."
+        ),
+    ),
+) -> None:
+    """Author a piece with the Creek Writing Desk (FEAT-041 stub skeleton).
+
+    Drives an end-to-end author desk — stub Graph/Retrieval/Ontology
+    specialists, a stub Voice agent, and a stub Reflection node — and prints a
+    shaped :class:`~creek.author.models.AuthoredDraft`. ``--dry-run`` prints the
+    plan and a stub evidence summary instead. Only the ``research`` medium is
+    wired; real retrieval/synthesis/voicing arrive in later FEAT-041 issues.
+    """
+    from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
+
+    if medium not in SUPPORTED_MEDIUMS:
+        console.print(
+            f"[red]Unsupported --medium {medium!r}; only 'research' is wired "
+            "in the Writing Desk skeleton (FEAT-041).[/red]",
+        )
+        raise typer.Exit(code=2)
+
+    config = _load_config_for_vault(vault)
+    vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
+    rounds = max_rounds if max_rounds is not None else config.author.max_author_rounds
+    conductor = build_default_conductor(max_rounds=rounds)
+
+    if dry_run:
+        evidence = conductor.gather_evidence(query, vault_path)
+        console.print(f"PLAN: {' → '.join(conductor.plan())}")
+        console.print(
+            f"EVIDENCE (stub): {len(evidence.claims)} claims, "
+            f"{len(evidence.all_source_fragments())} source_fragments",
+        )
+        return
+
+    draft_result = conductor.run(medium=medium, query=query, vault=vault_path)
+    console.print(
+        f"medium={draft_result.medium} verdict={draft_result.verdict} "
+        f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",
+    )
+    console.print(draft_result.body)
+
+
 @app.command(name="save")
 def save_cmd(
     target: str = typer.Option(

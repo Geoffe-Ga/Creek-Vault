@@ -823,6 +823,16 @@ def _default_authorship_weights() -> dict[str, float]:
     }
 
 
+class AuthorConfig(BaseModel):
+    """Configuration for the FEAT-041 Creek Writing Desk author subsystem."""
+
+    max_author_rounds: int = Field(default=3, ge=1, le=10)
+    """Maximum Conductor voice/reflect rounds before escalation (bounded
+    ``[1, 10]``). The Conductor loops on a ``REVISE`` verdict up to this many
+    times; model ids for the desk's LLM calls come from the ``llm`` section,
+    never hard-coded."""
+
+
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
 
@@ -1071,6 +1081,9 @@ class CreekConfig(BaseSettings):
 
     ai_style: AIStyleConfig = Field(default_factory=AIStyleConfig)
     """AI-style / voice-fidelity thresholds and weights (FEAT-040)."""
+
+    author: AuthorConfig = Field(default_factory=AuthorConfig)
+    """Creek Writing Desk author-subsystem settings (FEAT-041)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
