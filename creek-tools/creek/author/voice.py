@@ -57,6 +57,10 @@ class VoiceAgent:
                 path on every render.
         """
         self.llm_client = llm_client
+        #: Token usage from the most recent LLM render, or ``None`` when the
+        #: deterministic/no-client path ran. The conductor reads this to
+        #: surface a run's cost and cache-hit rate (#474).
+        self.last_usage: dict[str, int] | None = None
 
     def render(
         self,
@@ -87,8 +91,12 @@ class VoiceAgent:
         deterministic = _deterministic_body(query, evidence)
         if self.llm_client is None or vault is None:
             return deterministic
-        prompt = _build_voice_prompt(query, evidence, vault, medium, contract)
-        voiced = self.llm_client.complete(prompt).strip()
+        static, dynamic = _split_voice_prompt(query, evidence, vault, medium, contract)
+        completion = self.llm_client.complete_with_usage(
+            dynamic, system=static, cache_control={"type": "ephemeral"}
+        )
+        self.last_usage = completion.usage
+        voiced = completion.text.strip()
         return voiced or deterministic
 
 
@@ -118,20 +126,34 @@ def _deterministic_body(query: str, evidence: EvidenceBundle) -> str:
     return "\n".join(lines)
 
 
-def _build_voice_prompt(
+def _split_voice_prompt(
     query: str,
     evidence: EvidenceBundle,
     vault: Path,
     medium: Medium | None,
     contract: MediumContract | None,
-) -> str:
-    """Assemble the owner-voice LLM prompt from skills + evidence + ask."""
-    parts: list[str] = [
-        *_skill_sections(vault, evidence),
-        _evidence_section(evidence),
-        _ask_section(query, medium, contract),
-    ]
-    return "\n\n".join(part for part in parts if part)
+) -> tuple[str, str]:
+    """Split the owner-voice prompt into its static and dynamic halves.
+
+    Prompt caching (#474) bills the static prefix once and re-reads it cheaply
+    on repeat runs. The ``creek-skills`` voice-skill sections are identical
+    across queries for a given vault, so they form the cached *static* block;
+    the per-query evidence and ask form the *dynamic* user prompt. Splitting
+    here changes no content the model sees — the union of static + dynamic is
+    the same material the single-string prompt carried — only how it is billed.
+
+    Returns:
+        A ``(static, dynamic)`` pair. ``static`` is the joined skill sections
+        (``""`` when the vault carries none); ``dynamic`` is the evidence block
+        followed by the ask block.
+    """
+    static = "\n\n".join(part for part in _skill_sections(vault, evidence) if part)
+    dynamic = "\n\n".join(
+        part
+        for part in (_evidence_section(evidence), _ask_section(query, medium, contract))
+        if part
+    )
+    return static, dynamic
 
 
 def _skill_sections(vault: Path, evidence: EvidenceBundle) -> list[str]:

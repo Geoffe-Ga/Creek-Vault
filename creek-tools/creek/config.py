@@ -843,6 +843,25 @@ class AuthorConfig(BaseModel):
     retrieval_top_k: int = Field(default=5, ge=1)
     """How many top-ranked fragments the Retrieval agent surfaces as evidence."""
 
+    voice_model: str | None = None
+    """Per-agent model override for the voice call (#474). ``None`` (default)
+    falls back to the shared ``llm.model`` so no model id is hard-coded in the
+    desk; set it to point the owner-voice render at a stronger/cheaper tier than
+    the rest of the pipeline."""
+
+    synthesis_model: str | None = None
+    """Reserved per-agent model override for the synthesis step (#474).
+    Synthesis is deterministic today (it merges grounded claims with no LLM
+    call), so this is documented-but-dormant: ``None`` falls back to
+    ``llm.model`` and nothing reads it yet. Reserved so a future LLM synthesis
+    can be tiered without a config migration."""
+
+    reflection_model: str | None = None
+    """Reserved per-agent model override for the reflection step (#474). The
+    reflection node is a deterministic judge today, so like
+    :attr:`synthesis_model` this is reserved-and-dormant: ``None`` falls back to
+    ``llm.model``."""
+
 
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.

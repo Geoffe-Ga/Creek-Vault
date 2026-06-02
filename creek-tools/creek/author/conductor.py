@@ -57,6 +57,11 @@ _EXCERPT_LEN: int = 80
 class VoiceRenderer(Protocol):
     """Anything that renders evidence into a draft body."""
 
+    #: Token usage from the most recent render, or ``None`` when no LLM call
+    #: was made (the deterministic path). The conductor reads this to surface a
+    #: run's cost and cache-hit rate on the draft (#474).
+    last_usage: dict[str, int] | None
+
     def render(
         self,
         query: str,
@@ -296,6 +301,7 @@ class Conductor:
             verdict=verdict,
             rounds=rounds,
             findings=findings,
+            usage=self.voice.last_usage,
         )
 
 

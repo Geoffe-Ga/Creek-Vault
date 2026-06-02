@@ -45,10 +45,14 @@ def _seed_voice_core(vault: Path, sentinel: str) -> None:
 
 def _mock_client(text: str) -> tuple[AuthorLLMClient, MagicMock]:
     """Return a client over a mock provider returning *text*, and the provider."""
+    from creek.classify.llm.providers import AnthropicCompletion
+
     provider = MagicMock()
-    completion = MagicMock()
-    completion.text = text
-    provider.call_with_metadata.return_value = completion
+    # Return a real completion (not a MagicMock) so ``usage`` is a plain
+    # dict|None that ``AuthoredDraft`` accepts — caching surfaces usage now (#474).
+    provider.call_with_metadata.return_value = AnthropicCompletion(
+        text=text, usage={"input_tokens": 1, "cache_read_input_tokens": 0}
+    )
     return AuthorLLMClient(provider), provider
 
 
@@ -108,6 +112,19 @@ def test_run_grounded_and_voiced_end_to_end(tmp_path: Path) -> None:
     provider.call_with_metadata.assert_called_once()
 
 
+def _sent_prompt(provider: MagicMock) -> str:
+    """Return the full material the model saw: the cached system block + prompt.
+
+    Caching (#474) splits the voice prompt into a static ``system`` prefix and a
+    dynamic user prompt. The *content* the model sees is the union of both, so
+    these assertions check the union — agnostic to which block carries a piece.
+    """
+    call = provider.call_with_metadata.call_args
+    static = call.kwargs.get("system") or ""
+    dynamic = call.args[0]
+    return f"{static}\n\n{dynamic}"
+
+
 def test_voice_prompt_includes_voice_core_sentinel(tmp_path: Path) -> None:
     """The voice-core SKILL.md content is loaded into the LLM voice prompt."""
     sentinel = "OWNER-VOICE-SENTINEL-XYZ"
@@ -119,8 +136,9 @@ def test_voice_prompt_includes_voice_core_sentinel(tmp_path: Path) -> None:
 
     VoiceAgent(llm_client=client).render("q", evidence, tmp_path, medium="research")
 
-    prompt = provider.call_with_metadata.call_args.args[0]
-    assert sentinel in prompt
+    # The static voice-skill prefix is the cached ``system`` block now.
+    assert sentinel in provider.call_with_metadata.call_args.kwargs["system"]
+    assert sentinel in _sent_prompt(provider)
 
 
 def test_voice_prompt_honours_contract_structure(tmp_path: Path) -> None:
@@ -135,8 +153,7 @@ def test_voice_prompt_honours_contract_structure(tmp_path: Path) -> None:
         "q", evidence, tmp_path, medium="research", contract=contract
     )
 
-    prompt = provider.call_with_metadata.call_args.args[0]
-    assert " → ".join(contract.structure) in prompt
+    assert " → ".join(contract.structure) in _sent_prompt(provider)
 
 
 def test_voice_excludes_borrowed_authors_from_owner_material(tmp_path: Path) -> None:
@@ -152,7 +169,7 @@ def test_voice_excludes_borrowed_authors_from_owner_material(tmp_path: Path) -> 
 
     VoiceAgent(llm_client=client).render("q", evidence, tmp_path, medium="research")
 
-    prompt = provider.call_with_metadata.call_args.args[0]
+    prompt = _sent_prompt(provider)
     assert "my own observation" in prompt
     assert "a borrowed maxim" not in prompt
 

@@ -10,7 +10,7 @@ same seams.
 
 from __future__ import annotations
 
-from creek.author.client import AuthorLLMClient
+from creek.author.client import AuthorLLMClient, resolve_voice_model
 from creek.author.conductor import (
     SUPPORTED_MEDIUMS,
     AuthorPlan,
@@ -55,5 +55,6 @@ __all__ = [
     "load_medium_contract",
     "plan_author",
     "require_supported_medium",
+    "resolve_voice_model",
     "run_author",
 ]

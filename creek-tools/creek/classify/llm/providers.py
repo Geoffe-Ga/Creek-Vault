@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import httpx
 
@@ -42,10 +42,17 @@ class AnthropicCompletion:
         text: The concatenated textual content of the response.
         stop_reason: The reason the model stopped generating. ``"end_turn"``
             on a clean completion; ``"max_tokens"`` when the ceiling was hit.
+        usage: Token-usage counts from the SDK response, when available
+            (``input_tokens``, ``output_tokens`` and, when prompt caching is
+            active, ``cache_creation_input_tokens`` / ``cache_read_input_tokens``).
+            ``None`` when the SDK omitted usage. The author desk surfaces this on
+            :class:`~creek.author.models.AuthoredDraft` so a run's cost — and
+            cache-hit rate — is observable (#474).
     """
 
     text: str
     stop_reason: str = "end_turn"
+    usage: dict[str, int] | None = None
 
 
 ANTHROPIC_CLOUD_WARNING: str = (
@@ -164,23 +171,36 @@ class AnthropicProvider:
         prompt: str,
         *,
         max_tokens: int | None = None,
+        system: str | None = None,
+        cache_control: dict[str, str] | None = None,
     ) -> AnthropicCompletion:
-        """Send a prompt and return its text alongside the stop reason.
+        """Send a prompt and return its text, stop reason, and token usage.
 
         The draft pipeline needs the ``stop_reason`` so it can detect a
         ``max_tokens`` truncation; the classification path discards it by
         calling :meth:`call` instead.
 
+        When *system* is supplied it is sent as a cached ``system`` content
+        block (prompt caching, #474): the static prefix is billed once and
+        re-read cheaply on subsequent calls while *prompt* stays the dynamic
+        user content. When *system* is ``None`` the call is byte-for-byte the
+        historical single-user-string shape, so every existing caller is
+        unchanged.
+
         Args:
-            prompt: The fully-formatted prompt.
+            prompt: The dynamic, fully-formatted user prompt.
             max_tokens: Maximum tokens to request. ``None`` (the default)
                 keeps the historical :attr:`MAX_TOKENS` ceiling so the
                 classification path is unchanged.
+            system: Optional static system prefix to send as a cached block.
+                ``None`` (the default) preserves the legacy behaviour.
+            cache_control: Cache directive for the system block; defaults to
+                ``{"type": "ephemeral"}`` when *system* is provided.
 
         Returns:
-            An :class:`AnthropicCompletion` carrying the concatenated text
-            and the response ``stop_reason`` (``"end_turn"`` when the SDK
-            omits one).
+            An :class:`AnthropicCompletion` carrying the concatenated text, the
+            response ``stop_reason`` (``"end_turn"`` when the SDK omits one),
+            and the SDK's token :attr:`~AnthropicCompletion.usage` when present.
 
         Raises:
             RuntimeError: If the SDK raises any ``AnthropicError``; the
@@ -191,11 +211,7 @@ class AnthropicProvider:
 
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=ceiling,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            response = self._create_message(prompt, ceiling, system, cache_control)
         except anthropic.AnthropicError as exc:
             msg = f"Anthropic API call failed: {type(exc).__name__}"
             raise RuntimeError(msg) from None
@@ -203,6 +219,48 @@ class AnthropicProvider:
         return AnthropicCompletion(
             text=_extract_anthropic_text(response),
             stop_reason=str(stop_reason),
+            usage=_extract_anthropic_usage(response),
+        )
+
+    def _create_message(
+        self,
+        prompt: str,
+        ceiling: int,
+        system: str | None,
+        cache_control: dict[str, str] | None,
+    ) -> object:
+        """Call ``messages.create``, adding a cached system block when given.
+
+        The two branches keep the SDK call typed: when *system* is ``None`` the
+        request is the historical single-user shape (no ``system`` argument);
+        otherwise the static prefix is sent as a single cache-controlled text
+        block so it is billed once and re-read cheaply (#474).
+
+        Args:
+            prompt: The dynamic user prompt.
+            ceiling: The resolved ``max_tokens`` value.
+            system: Optional static system prefix to cache, or ``None``.
+            cache_control: Cache directive for the system block.
+
+        Returns:
+            The raw ``messages.create`` response object.
+        """
+        if system is None:
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=ceiling,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        cache: anthropic.types.CacheControlEphemeralParam = (
+            {"type": "ephemeral"}
+            if cache_control is None
+            else cast("anthropic.types.CacheControlEphemeralParam", cache_control)
+        )
+        return self.client.messages.create(
+            model=self.model,
+            max_tokens=ceiling,
+            messages=[{"role": "user", "content": prompt}],
+            system=[{"type": "text", "text": system, "cache_control": cache}],
         )
 
 
@@ -222,6 +280,39 @@ def _extract_anthropic_text(response: object) -> str:
         if isinstance(text, str):
             parts.append(text)
     return "".join(parts)
+
+
+#: SDK ``response.usage`` fields the author desk surfaces for cost tracking.
+#: ``cache_*`` appear only when prompt caching is active; absent fields are
+#: simply omitted rather than zero-filled.
+_USAGE_FIELDS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def _extract_anthropic_usage(response: object) -> dict[str, int] | None:
+    """Extract integer token-usage counts from an Anthropic response.
+
+    Args:
+        response: A ``messages.create`` response object.
+
+    Returns:
+        A plain dict of the present :data:`_USAGE_FIELDS`, or ``None`` when the
+        SDK omitted usage entirely. Non-integer or missing fields are skipped
+        so a partial usage object never raises.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    counts: dict[str, int] = {}
+    for field in _USAGE_FIELDS:
+        value = getattr(usage, field, None)
+        if isinstance(value, int):
+            counts[field] = value
+    return counts or None
 
 
 def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
