@@ -20,6 +20,7 @@ from creek.generate.voice import (
     DEFAULT_MIN_PER_REGISTER,
     VOICE_REGISTERS,
     VoiceExemplarCollector,
+    _is_other_authors_path,
 )
 from creek.models import (
     Confidence,
@@ -70,6 +71,7 @@ def _build_fragment(
     confidence: Confidence | None,
     privacy: PrivacyTier = PrivacyTier.PERSONAL,
     fully_classified: bool = True,
+    voice_weight: float = 1.0,
 ) -> Fragment:
     """Build a Fragment with the desired voice / privacy / classification state."""
     if fully_classified:
@@ -91,6 +93,7 @@ def _build_fragment(
         wavelength=wavelength,
         voice=VoiceClassification(voice_register=register, confidence=confidence),
         privacy_tier=privacy,
+        voice_weight=voice_weight,
     )
 
 
@@ -106,6 +109,7 @@ def _write_fragment(
     data = fragment.model_dump(mode="json")
     post = frontmatter.Post(content=body, **data)
     target = vault_path / "01-Fragments" / subfolder / f"{fragment.id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
 
@@ -305,6 +309,131 @@ class TestCollectExemplars:
         _write_fragment(vault, good, body_words=400)
         exemplars = collector.collect_exemplars(vault)
         assert [f.id for f in exemplars["confessional"]] == ["frag-good"]
+
+
+class TestVoiceCorpusExcludesBorrowedContent:
+    """Issue #466: borrowed / AI-authored text must never reach the voice corpus.
+
+    Two additive gates protect voice fidelity, mirroring the privacy
+    fail-closed rule:
+
+    1. ``voice_weight > 0`` — a fragment with ``voice_weight <= 0`` (the
+       ``ai-as-user`` analogue with ``voice_weight=0.0``) is ineligible.
+    2. ``11-Other-Authors/`` path exclusion — any fragment whose source
+       path contains that segment is skipped regardless of weight.
+    """
+
+    def test_excludes_zero_voice_weight_and_other_authors_path(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """Only native, positive-weight fragments outside 11-Other-Authors survive."""
+        native = _build_fragment(
+            frag_id="frag-native",
+            title="Native voice",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+        )
+        borrowed = _build_fragment(
+            frag_id="frag-ai-as-user",
+            title="AI as user",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            voice_weight=0.0,
+        )
+        other_author = _build_fragment(
+            frag_id="frag-other-author",
+            title="Borrowed by path",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+        )
+        _write_fragment(vault, native, body_words=400)
+        # Weight gate: ai-as-user content sits in the scanned corpus.
+        _write_fragment(vault, borrowed, body_words=400)
+        # Path gate: a full-weight fragment nested under an
+        # ``11-Other-Authors`` segment inside the scanned tree.
+        _write_fragment(
+            vault,
+            other_author,
+            body_words=400,
+            subfolder="11-Other-Authors/some-author",
+        )
+
+        exemplars = collector.collect_exemplars(vault)
+        ids = {f.id for f in exemplars["confessional"]}
+        assert ids == {"frag-native"}
+        assert "frag-ai-as-user" not in ids
+        assert "frag-other-author" not in ids
+
+    def test_zero_voice_weight_excluded(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """An ai-as-user-style fragment (voice_weight=0.0) is dropped by the gate."""
+        borrowed = _build_fragment(
+            frag_id="frag-zero",
+            title="Zero weight",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.CONVICTION,
+            voice_weight=0.0,
+        )
+        _write_fragment(vault, borrowed, body_words=400)
+        exemplars = collector.collect_exemplars(vault)
+        assert exemplars["analytical"] == []
+
+    def test_positive_voice_weight_is_kept(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """A reduced-but-positive voice_weight still qualifies for the corpus."""
+        weighted = _build_fragment(
+            frag_id="frag-half",
+            title="Half weight",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.SETTLED,
+            voice_weight=0.5,
+        )
+        _write_fragment(vault, weighted, body_words=400)
+        exemplars = collector.collect_exemplars(vault)
+        assert [f.id for f in exemplars["analytical"]] == ["frag-half"]
+
+    def test_path_helper_rejects_other_authors_segment(self, tmp_path: Path) -> None:
+        """The path-exclusion helper rejects an 11-Other-Authors path segment."""
+        other = tmp_path / "01-Fragments" / "11-Other-Authors" / "x" / "f.md"
+        native = tmp_path / "01-Fragments" / "Journal" / "f.md"
+        assert _is_other_authors_path(other) is True
+        assert _is_other_authors_path(native) is False
+
+    def test_path_helper_no_substring_false_positive(self, tmp_path: Path) -> None:
+        """A folder merely containing the text is not excluded (segment match only)."""
+        lookalike = tmp_path / "01-Fragments" / "my-11-Other-Authors-notes" / "f.md"
+        assert _is_other_authors_path(lookalike) is False
+
+    def test_tracer_invariant_no_other_authors_unchanged(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """A vault with no 11-Other-Authors and default weights behaves as before."""
+        a = _build_fragment(
+            frag_id="frag-a",
+            title="Native A",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+        )
+        b = _build_fragment(
+            frag_id="frag-b",
+            title="Native B",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, a, body_words=400)
+        _write_fragment(vault, b, body_words=400)
+        exemplars = collector.collect_exemplars(vault)
+        assert {f.id for f in exemplars["confessional"]} == {"frag-a", "frag-b"}
 
 
 # ---- rank_exemplars ----
