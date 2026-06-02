@@ -49,6 +49,17 @@ def test_run_author_returns_shaped_draft(tmp_path: Path) -> None:
     assert draft.rounds >= 1
 
 
+def _seed_fragment(vault: Path, frag_id: str, title: str) -> None:
+    """Write a minimal fragment file so the real specialists have a corpus."""
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.parametrize(
     "specialist",
     [GraphSpecialist(), RetrievalSpecialist(), OntologySpecialist()],
@@ -57,7 +68,10 @@ def test_each_specialist_returns_structured_evidence(
     specialist: GraphSpecialist | RetrievalSpecialist | OntologySpecialist,
     tmp_path: Path,
 ) -> None:
-    """Each stub specialist returns structured evidence, never free prose."""
+    """Each specialist returns structured evidence, never free prose."""
+    _seed_fragment(tmp_path, "frag-a", "Alpha note about q")
+    _seed_fragment(tmp_path, "frag-b", "Beta note")
+
     bundle = specialist.gather("q", tmp_path)
 
     assert isinstance(bundle, EvidenceBundle)
@@ -81,18 +95,22 @@ def test_conductor_plan_lists_pipeline() -> None:
     ]
 
 
-def test_voice_stub_renders_body_from_evidence(tmp_path: Path) -> None:
+def test_voice_stub_renders_body_from_evidence() -> None:
     """The stub voice agent renders a non-empty body from the evidence."""
-    evidence = GraphSpecialist().gather("q", tmp_path)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["f1"])]
+    )
 
     body = VoiceAgent().render("q", evidence)
 
     assert body.strip()
 
 
-def test_reflection_passes_grounded_and_escalates_ungrounded(tmp_path: Path) -> None:
+def test_reflection_passes_grounded_and_escalates_ungrounded() -> None:
     """The stub reflection node passes grounded drafts and escalates empty ones."""
-    evidence = GraphSpecialist().gather("q", tmp_path)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["f1"])]
+    )
 
     assert ReflectionNode().review("a real body", evidence) == "PASS"
     assert ReflectionNode().review("   ", evidence) == "ESCALATE"

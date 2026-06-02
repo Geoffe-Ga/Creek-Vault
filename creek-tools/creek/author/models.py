@@ -36,6 +36,23 @@ class EvidenceClaim(BaseModel):
 
     claim: str
     source_fragments: list[str] = Field(default_factory=list)
+    # When a claim is drawn from `11-Other-Authors/`, the author slug travels
+    # with it so downstream citation can attribute it correctly.
+    author_slug: str | None = None
+
+
+class WalkStats(BaseModel):
+    """Bounds-tracking stats for a Graph agent's backlink walk.
+
+    Attributes:
+        max_depth: The deepest hop reached from the seed (``0`` = seed only).
+        fragments_visited: How many fragments the bounded walk visited.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    max_depth: int = 0
+    fragments_visited: int = 0
 
 
 class EvidenceBundle(BaseModel):
@@ -43,11 +60,13 @@ class EvidenceBundle(BaseModel):
 
     Attributes:
         claims: Every :class:`EvidenceClaim` gathered across specialists.
+        walk_stats: Set by the Graph agent — the bounds its backlink walk hit.
     """
 
     model_config = ConfigDict(frozen=True)
 
     claims: list[EvidenceClaim] = Field(default_factory=list)
+    walk_stats: WalkStats | None = None
 
     def all_source_fragments(self) -> list[str]:
         """Return the order-preserving, deduplicated union of claim fragments.
