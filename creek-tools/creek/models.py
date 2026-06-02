@@ -619,6 +619,10 @@ class FragmentSource(BaseModel):
     channel: str | None = None
     interlocutor: str | None = None
     author: Authorship = Authorship.SELF
+    # FEAT-041 §7.4: the `11-Other-Authors/<slug>/` folder this fragment came
+    # from, or ``None`` for a native self/owner fragment. Distinct from
+    # ``author`` (the self|ai|other|collaborative axis), which is unchanged.
+    author_slug: str | None = None
 
 
 class FrequencyClassification(BaseModel):
@@ -668,6 +672,13 @@ class Fragment(BaseModel):
     id: str
     title: str
     source: FragmentSource
+    # Two-axis attribution (FEAT-041 §7.4). ``voice_weight`` is how much this
+    # fragment may influence generated voice (1.0 = full weight);
+    # ``representativeness`` is how closely it stands for the owner's own views.
+    # The defaults make every pre-FEAT-041 fragment behave as a full-weight,
+    # self-authored fragment — a purely additive, backward-compatible change.
+    voice_weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    representativeness: Representativeness = "self"
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
     # Timestamp the source itself records (a Substack post's publish
