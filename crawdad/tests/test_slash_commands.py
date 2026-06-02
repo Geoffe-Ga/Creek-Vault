@@ -750,7 +750,23 @@ def test_interaction_allowed_gates_by_user_and_channel(
     assert _interaction_allowed(interaction, _make_config()) is expected
 
 
-@pytest.mark.parametrize("command_name", ["ask", "draft"])
+# Every gated command name mapped to the kwargs its callback requires. All
+# eight ``/crawdad`` commands must honour the personal-use allowlist (the two
+# author routes plus the six non-author commands); a denied user / channel gets
+# no response at all (no defer, no followup).
+_GATED_CALLBACK_KWARGS: dict[str, dict[str, Any]] = {
+    "reflect": {},
+    "checkin": {},
+    "surface": {},
+    "draft": {"topic": "t"},
+    "ask": {"question": "q"},
+    "save": {"content": "c"},
+    "register": {"name": "praxis"},
+    "workflow": {},
+}
+
+
+@pytest.mark.parametrize("command_name", sorted(_GATED_CALLBACK_KWARGS))
 @pytest.mark.parametrize(
     ("user_id", "channel_id"),
     [
@@ -758,19 +774,38 @@ def test_interaction_allowed_gates_by_user_and_channel(
         (_ALLOWED_USER_ID, _DENIED_CHANNEL_ID),
     ],
 )
-async def test_author_callback_denies_non_allowlisted_silently(
+async def test_callback_denies_non_allowlisted_silently(
     command_name: str, user_id: int, channel_id: int
 ) -> None:
-    """A non-allowlisted user/channel gets NO response: no defer, no followup."""
-    kwargs = {"ask": {"question": "q"}, "draft": {"topic": "t"}}[command_name]
+    """Every gated callback gives NO response when denied: no defer, no followup.
+
+    A non-allowlisted user OR channel is silently ignored for all eight
+    ``/crawdad`` commands. ``register`` and ``workflow`` carry extra deps,
+    so this proves the allowlist gate fires before any handler / dependency
+    is touched — the interaction is dropped entirely.
+    """
+    kwargs = _GATED_CALLBACK_KWARGS[command_name]
     tree = _FakeTree()
-    register(tree, config=_make_config(), loop_runner=_fake_loop_runner)
+    register(
+        tree,
+        config=_make_config(),
+        loop_runner=_fake_loop_runner,
+        register_switcher=lambda _name: True,
+        workflow_lister=lambda: ["wavelength-checkin"],
+        workflow_runner=_unreached_workflow_runner,
+    )
     interaction = _FakeInteraction(user_id=user_id, channel_id=channel_id)
 
     await tree.registered[command_name]["callback"](interaction, **kwargs)
 
     assert interaction.response.deferred == 0
     assert interaction.followup.sent == []
+
+
+async def _unreached_workflow_runner(_name: str, _inputs: dict[str, str]) -> str:
+    """Workflow runner that must never be called under a denied interaction."""
+    msg = "workflow runner reached despite denied allowlist"
+    raise AssertionError(msg)
 
 
 @pytest.mark.parametrize(
@@ -790,6 +825,54 @@ async def test_author_callback_allows_allowlisted_interaction(
     assert interaction.response.deferred == 1
     assert len(interaction.followup.sent) == 1
     assert "composer received:" in interaction.followup.sent[0]
+
+
+async def test_register_callback_allowlisted_reaches_switcher() -> None:
+    """An allowlisted ``/crawdad register`` is NOT dropped by the gate.
+
+    ``register`` carries the extra ``register_switcher`` dep; this pins that
+    an allowlisted interaction defers and the switcher actually runs (the
+    allowlist gate lets the handler through rather than silently ignoring).
+    """
+    switched: list[str] = []
+    tree = _FakeTree()
+    register(
+        tree,
+        config=_make_config(),
+        loop_runner=_fake_loop_runner,
+        register_switcher=lambda name: bool(switched.append(name)) or True,
+    )
+    interaction = _FakeInteraction()
+
+    await tree.registered["register"]["callback"](interaction, name="praxis")
+
+    assert interaction.response.deferred == 1
+    assert switched == ["praxis"]
+    assert len(interaction.followup.sent) == 1
+
+
+async def test_workflow_callback_allowlisted_reaches_lister() -> None:
+    """An allowlisted ``/crawdad workflow`` is NOT dropped by the gate.
+
+    ``workflow`` carries the extra lister / runner deps; this pins that an
+    allowlisted interaction defers and the lister actually runs (the
+    allowlist gate lets the handler through rather than silently ignoring).
+    """
+    listed: list[bool] = []
+    tree = _FakeTree()
+    register(
+        tree,
+        config=_make_config(),
+        loop_runner=_fake_loop_runner,
+        workflow_lister=lambda: listed.append(True) or ["wavelength-checkin"],
+    )
+    interaction = _FakeInteraction()
+
+    await tree.registered["workflow"]["callback"](interaction)
+
+    assert interaction.response.deferred == 1
+    assert listed == [True]
+    assert "wavelength-checkin" in interaction.followup.sent[0]
 
 
 async def _raising_loop_runner(_message: str) -> str:

@@ -452,57 +452,83 @@ def register(
     default to ``None`` (e.g. tests / no-tool-surface sessions); in
     that case the workflow command soft-errors instead of crashing.
 
-    ``config`` supplies the personal-use allowlist. The author callbacks
-    (`ask`/`draft`) gate on it BEFORE deferring so a
-    non-allowlisted user / channel gets no response at all (silent
-    ignore, matching :func:`crawdad.bot._passes_allowlist`). The other
-    callbacks are intentionally left ungated in this change (scope
-    fence); the broader gap is tracked separately.
+    ``config`` supplies the personal-use allowlist. Every callback gates
+    on it BEFORE deferring so a non-allowlisted user / channel gets no
+    response at all (silent ignore, matching
+    :func:`crawdad.bot._passes_allowlist`). All eight ``/crawdad``
+    commands honour the gate.
 
     Returns the count of advertised commands (always
     ``len(CRAWDAD_COMMANDS)`` since the registration helpers don't
     fail). The return value is a sanity-check signal callers can pin
     in tests to catch silent additions or removals.
     """
-    _register_reflect(tree, loop_runner=loop_runner)
-    _register_checkin(tree, loop_runner=loop_runner)
-    _register_surface(tree, loop_runner=loop_runner)
+    _register_reflect(tree, config=config, loop_runner=loop_runner)
+    _register_checkin(tree, config=config, loop_runner=loop_runner)
+    _register_surface(tree, config=config, loop_runner=loop_runner)
     _register_draft(tree, config=config, loop_runner=loop_runner)
     _register_ask(tree, config=config, loop_runner=loop_runner)
-    _register_save(tree, loop_runner=loop_runner)
-    _register_register(tree, register_switcher=register_switcher)
+    _register_save(tree, config=config, loop_runner=loop_runner)
+    _register_register(tree, config=config, register_switcher=register_switcher)
     _register_workflow(
-        tree, workflow_lister=workflow_lister, workflow_runner=workflow_runner
+        tree,
+        config=config,
+        workflow_lister=workflow_lister,
+        workflow_runner=workflow_runner,
     )
     return len(CRAWDAD_COMMANDS)
 
 
-def _register_reflect(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+def _register_reflect(
+    tree: _TreeLike, *, config: CrawDadConfig, loop_runner: LoopRunner
+) -> None:
     """Wire the ``/crawdad reflect`` Discord callback onto *tree*."""
 
     @tree.command(name="reflect", description=_COMMAND_DESCRIPTIONS["reflect"])
     async def _callback(interaction: Any) -> None:
-        """Discord callback for ``/crawdad reflect`` (deferred)."""
+        """Discord callback for ``/crawdad reflect`` (deferred).
+
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
+        """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_reflect(interaction.followup.send, loop_runner=loop_runner)
 
 
-def _register_checkin(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+def _register_checkin(
+    tree: _TreeLike, *, config: CrawDadConfig, loop_runner: LoopRunner
+) -> None:
     """Wire the ``/crawdad checkin`` Discord callback onto *tree*."""
 
     @tree.command(name="checkin", description=_COMMAND_DESCRIPTIONS["checkin"])
     async def _callback(interaction: Any) -> None:
-        """Discord callback for ``/crawdad checkin`` (deferred)."""
+        """Discord callback for ``/crawdad checkin`` (deferred).
+
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
+        """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_checkin(interaction.followup.send, loop_runner=loop_runner)
 
 
-def _register_surface(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+def _register_surface(
+    tree: _TreeLike, *, config: CrawDadConfig, loop_runner: LoopRunner
+) -> None:
     """Wire the ``/crawdad surface`` Discord callback onto *tree*."""
 
     @tree.command(name="surface", description=_COMMAND_DESCRIPTIONS["surface"])
     async def _callback(interaction: Any) -> None:
-        """Discord callback for ``/crawdad surface`` (deferred)."""
+        """Discord callback for ``/crawdad surface`` (deferred).
+
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
+        """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_surface(interaction.followup.send, loop_runner=loop_runner)
 
@@ -557,7 +583,9 @@ def _register_ask(
         )
 
 
-def _register_save(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
+def _register_save(
+    tree: _TreeLike, *, config: CrawDadConfig, loop_runner: LoopRunner
+) -> None:
     """Wire the ``/crawdad save`` Discord callback onto *tree*."""
 
     @tree.command(name="save", description=_COMMAND_DESCRIPTIONS["save"])
@@ -567,7 +595,12 @@ def _register_save(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
         ``content`` has no default; Discord marks the parameter as
         required in the slash-command UI. Runtime guard in
         :func:`handle_save` stays as defense-in-depth.
+
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
         """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_save(
             interaction.followup.send, content=content, loop_runner=loop_runner
@@ -575,13 +608,22 @@ def _register_save(tree: _TreeLike, *, loop_runner: LoopRunner) -> None:
 
 
 def _register_register(
-    tree: _TreeLike, *, register_switcher: RegisterSwitcher | None
+    tree: _TreeLike,
+    *,
+    config: CrawDadConfig,
+    register_switcher: RegisterSwitcher | None,
 ) -> None:
     """Wire the ``/crawdad register`` Discord callback onto *tree* (FEAT-029)."""
 
     @tree.command(name="register", description=_COMMAND_DESCRIPTIONS["register"])
     async def _callback(interaction: Any, name: str) -> None:
-        """Discord callback for ``/crawdad register <name>`` (deferred)."""
+        """Discord callback for ``/crawdad register <name>`` (deferred).
+
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
+        """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_register(
             interaction.followup.send,
@@ -593,6 +635,7 @@ def _register_register(
 def _register_workflow(
     tree: _TreeLike,
     *,
+    config: CrawDadConfig,
     workflow_lister: Callable[[], list[str]] | None,
     workflow_runner: WorkflowRunner | None,
 ) -> None:
@@ -600,7 +643,13 @@ def _register_workflow(
 
     @tree.command(name="workflow", description=_COMMAND_DESCRIPTIONS["workflow"])
     async def _callback(interaction: Any, action: str = "list", name: str = "") -> None:
-        """Discord callback for ``/crawdad workflow [action] [name]`` (deferred)."""
+        """Discord callback for ``/crawdad workflow [action] [name]`` (deferred).
+
+        A non-allowlisted user / channel is silently ignored (no defer, no
+        followup) BEFORE the interaction is deferred.
+        """
+        if not _interaction_allowed(interaction, config):
+            return
         await interaction.response.defer()
         await handle_workflow(
             interaction.followup.send,
