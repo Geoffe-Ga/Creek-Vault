@@ -619,6 +619,10 @@ class FragmentSource(BaseModel):
     channel: str | None = None
     interlocutor: str | None = None
     author: Authorship = Authorship.SELF
+    # FEAT-041 §7.4: the `11-Other-Authors/<slug>/` folder this fragment came
+    # from, or ``None`` for a native self/owner fragment. Distinct from
+    # ``author`` (the self|ai|other|collaborative axis), which is unchanged.
+    author_slug: str | None = None
 
 
 class FrequencyClassification(BaseModel):
@@ -660,6 +664,18 @@ class Fragment(BaseModel):
 
     Fragments are ingested from various sources and classified along
     frequency, wavelength, and voice dimensions.
+
+    Attributes:
+        voice_weight: How much this fragment may influence generated voice,
+            in ``[0, 1]``. ``1.0`` (the default) is a native, full-weight
+            self-authored fragment; a borrowed fragment is weighted lower.
+            Fails closed to ``1.0`` on a malformed value (FEAT-041 §7.4).
+        representativeness: How closely the fragment stands for the owner's
+            own views — ``self`` / ``endorsed`` / ``aspirational`` /
+            ``reference``. Defaults to ``self``; fails closed to ``self``.
+        source: Source metadata. Its ``author_slug`` names the
+            ``11-Other-Authors/<slug>/`` folder a borrowed fragment came from
+            (``None`` for a native fragment), distinct from ``source.author``.
     """
 
     model_config = ConfigDict(use_enum_values=True)
@@ -668,6 +684,15 @@ class Fragment(BaseModel):
     id: str
     title: str
     source: FragmentSource
+    # Two-axis attribution (FEAT-041 §7.4). ``voice_weight`` is how much this
+    # fragment may influence generated voice (1.0 = full weight);
+    # ``representativeness`` is how closely it stands for the owner's own views.
+    # The defaults make every pre-FEAT-041 fragment behave as a full-weight,
+    # self-authored fragment — a purely additive, backward-compatible change.
+    # Both fail closed to those native defaults so a hand-corrupted fragment
+    # never crashes a vault scan (matching :class:`AuthorManifest`).
+    voice_weight: float = 1.0
+    representativeness: Representativeness = "self"
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
     # Timestamp the source itself records (a Substack post's publish
@@ -700,6 +725,30 @@ class Fragment(BaseModel):
     # import of :mod:`creek.classify.weighted` so the circular-import
     # risk between models and the classify package stays contained.
     weighted: "WeightedFragmentClassification | None" = None
+
+    @field_validator("voice_weight", mode="before")
+    @classmethod
+    def _coerce_voice_weight(cls, value: object) -> float:
+        """Fail closed to the native 1.0 weight for a bad ``voice_weight``."""
+        weight = _safe_float(value)
+        if weight is None or not 0.0 <= weight <= 1.0:
+            _warn_fail_closed(
+                "Fragment voice_weight",
+                value,
+                "1.0",
+                reason="is not a number in [0, 1]",
+            )
+            return 1.0
+        return weight
+
+    @field_validator("representativeness", mode="before")
+    @classmethod
+    def _coerce_representativeness(cls, value: object) -> str:
+        """Fail closed to ``self`` for an unrecognised ``representativeness``."""
+        if isinstance(value, str) and value in _REPRESENTATIVENESS:
+            return value
+        _warn_fail_closed("Fragment representativeness", value, "self")
+        return "self"
 
     # BUG-009: the ``[prop-decorator]`` suppression below is a known
     # mypy / Pydantic-v2 limitation when stacking ``@computed_field``
