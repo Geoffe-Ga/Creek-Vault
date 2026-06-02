@@ -2707,8 +2707,8 @@ def author(
         "research",
         "--medium",
         help=(
-            "Output medium: research, chat, essay, research-piece, or "
-            "book-report (FEAT-041)."
+            "Output medium: research, chat, essay, research-piece, "
+            "book-report, or how-to (FEAT-041)."
         ),
     ),
     work: Path | None = typer.Option(

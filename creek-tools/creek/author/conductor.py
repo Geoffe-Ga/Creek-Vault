@@ -37,10 +37,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: Mediums the conductor will run. ``research``/``chat``/``essay``/
-#: ``research-piece``/``book-report`` are wired; the remaining mediums (how-to)
-#: arrive later.
+#: ``research-piece``/``book-report``/``how-to`` are all wired — ``how-to``
+#: completes the medium set.
 SUPPORTED_MEDIUMS: frozenset[str] = frozenset(
-    {"research", "chat", "essay", "research-piece", "book-report"}
+    {"research", "chat", "essay", "research-piece", "book-report", "how-to"}
 )
 
 #: Fixed pipeline steps that follow the specialist roster, in order.
