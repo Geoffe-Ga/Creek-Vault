@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author.client import AuthorLLMClient
+    from creek.config import AIStyleConfig
+    from creek.generate.ai_style.model import VoiceFingerprint
     from creek.models import MediumContract
 
 logger = logging.getLogger(__name__)
@@ -86,6 +88,8 @@ class Reflector(Protocol):
         *,
         contract: MediumContract | None = None,
         vault: Path | None = None,
+        fingerprint: VoiceFingerprint | None = None,
+        ai_style_config: AIStyleConfig | None = None,
     ) -> ReflectionResult:
         """Return a structured result for *body* given *evidence* and *rubric*."""
         ...
@@ -241,6 +245,49 @@ class Conductor:
                 )
         return kept
 
+    @staticmethod
+    def _load_voice_inputs(
+        vault: Path,
+    ) -> tuple[AIStyleConfig | None, VoiceFingerprint | None]:
+        """Load the owner's AI-style config and persisted voice fingerprint.
+
+        Threads the voice-fidelity inputs the reflection node needs (#506).
+        Loads the vault's :class:`~creek.config.CreekConfig`, takes its
+        ``ai_style`` block, and loads the persisted fingerprint from
+        ``config.ai_style.fingerprint_path``. An EMPTY fingerprint (one that was
+        never built — ``fragment_count == 0``) is returned as ``None`` so the
+        voice check stays dormant on a vault with no built fingerprint, leaving
+        behaviour identical to before the check was wired. Loading is
+        best-effort: any error (a thin/offline/malformed vault) degrades to
+        ``(None, None)`` so the desk never crashes.
+
+        Args:
+            vault: The vault to load voice inputs from.
+
+        Returns:
+            ``(ai_style_config, fingerprint)``. The fingerprint is ``None`` when
+            absent/empty; both are ``None`` when config loading failed.
+        """
+        from pydantic import ValidationError
+
+        from creek.config import load_config, resolve_config_path
+        from creek.generate.ai_style import load_fingerprint
+
+        try:
+            config = load_config(
+                resolve_config_path(vault, None), warn_on_missing=False
+            )
+        except (OSError, ValueError, ValidationError):
+            # A malformed config must not crash the desk: voice-fidelity simply
+            # stays dormant. ``ValidationError`` is not a ``ValueError`` subclass
+            # in Pydantic v2, so it is named explicitly (#506 review).
+            return (None, None)
+        ai_style = config.ai_style
+        fingerprint = load_fingerprint(vault, ai_style)
+        if fingerprint.fragment_count == 0:
+            return (ai_style, None)
+        return (ai_style, fingerprint)
+
     def run(self, *, medium: str, query: str, vault: Path) -> AuthoredDraft:
         """Run the full author pipeline and return a shaped draft.
 
@@ -260,6 +307,11 @@ class Conductor:
         validated = require_supported_medium(medium)
         evidence = self.gather_evidence(query, vault)
         rubric = self.contract.reflection_rubric if self.contract else None
+        # Voice-fidelity is wired from the owner's persisted fingerprint (#506):
+        # loaded once before the loop. When no fingerprint has been built the
+        # fingerprint is ``None``, so the reflection node's voice check stays
+        # dormant — behaviour identical to a vault with no fingerprint.
+        ai_style_config, fingerprint = self._load_voice_inputs(vault)
 
         body = ""
         verdict: ReflectionVerdict = "ESCALATE"
@@ -270,12 +322,14 @@ class Conductor:
             body = self.voice.render(
                 query, evidence, vault, medium=validated, contract=self.contract
             )
-            # voice_fidelity is implemented in the reflection node but stays
-            # dormant here: the owner's fingerprint + AIStyleConfig are not yet
-            # threaded into the desk. Wiring them (and an e2e voice test) is
-            # tracked as #506.
             result = self.reflection.review(
-                body, evidence, rubric, contract=self.contract, vault=vault
+                body,
+                evidence,
+                rubric,
+                contract=self.contract,
+                vault=vault,
+                fingerprint=fingerprint,
+                ai_style_config=ai_style_config,
             )
             verdict = result.decision
             findings = result.findings
