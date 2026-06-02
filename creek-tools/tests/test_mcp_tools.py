@@ -523,3 +523,24 @@ def test_author_tool_dry_run_returns_plan(vault: Path) -> None:
     assert result["dry_run"] is True
     assert result["plan"]
     assert result["evidence"]["claims"] >= 1
+
+
+def test_author_tool_forwards_max_rounds(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``max_rounds`` is now forwarded to the real desk (was a no-op in the stub)."""
+    from creek.author import run_author as real_run_author
+
+    captured: dict[str, object] = {}
+
+    def spy(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_run_author(**kwargs)
+
+    monkeypatch.setattr("creek_mcp.tools.author.run_author", spy)
+
+    author_tool(
+        vault_path=vault, query="q", medium="research", max_rounds=7, consumer="test"
+    )
+
+    assert captured["max_rounds"] == 7

@@ -79,6 +79,9 @@ def author_tool(
         ``claims``) or — for ``dry_run`` — the plan + evidence summary. An
         unsupported medium yields ``status: error`` with a ``reason``.
     """
+    # Privacy gap (#463): the ceiling is recorded and echoed across the
+    # boundary, but the current stub specialists do not yet tier-filter
+    # retrieval. Real enforcement lands with the real Graph/Retrieval agents.
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={
@@ -110,7 +113,8 @@ def author_tool(
             "dry_run": True,
             "medium": medium,
             "query": query,
-            **plan,
+            "plan": plan["plan"],
+            "evidence": plan["evidence"],
         }
 
     draft = run_author(
