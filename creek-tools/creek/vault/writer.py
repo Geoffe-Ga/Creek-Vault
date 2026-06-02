@@ -31,9 +31,14 @@ import frontmatter
 
 from creek.audit import AuditLog
 from creek.models import (
+    Authorship,
     DecisionStatus,
     PraxisType,
     SourcePlatform,
+)
+from creek.vault.authors import (
+    OTHER_AUTHORS_DIR,
+    load_author_manifest_or_default,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +47,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
     from creek.models import (
+        AuthorManifest,
         Decision,
         Eddy,
         Fragment,
@@ -69,6 +75,15 @@ _PLATFORM_SUBFOLDER: dict[str, str] = {
     SourcePlatform.PRESENTATION: "Decks",
     SourcePlatform.IMAGE_OCR: "Images",
     SourcePlatform.OTHER: "Unsorted",
+}
+
+# Map an AuthorManifest.author_kind -> the fragment's Authorship axis (#470).
+# Any unrecognised kind (the manifest already fails closed to ``human_source``)
+# resolves to OTHER via ``.get(..., Authorship.OTHER)`` at the call site.
+_AUTHOR_KIND_TO_AUTHORSHIP: dict[str, Authorship] = {
+    "ai_as_user": Authorship.AI,
+    "collaborator": Authorship.COLLABORATIVE,
+    "human_source": Authorship.OTHER,
 }
 
 # Map praxis type -> 04-Praxis subfolder
@@ -371,6 +386,41 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 tmp_path.unlink()
 
 
+def _apply_other_author_attribution(
+    fragment: Fragment,
+    manifest: AuthorManifest,
+) -> None:
+    """Stamp borrowed-author attribution from *manifest* onto *fragment* (#470).
+
+    Mutates *fragment* in place (``Fragment``/``FragmentSource`` are mutable
+    Pydantic models, not frozen). Only the *attribution* axis changes — the
+    fragment's frequency / wavelength / voice (its IDEAS classification, set
+    upstream) is left untouched:
+
+    * ``source.author_slug`` ← the manifest slug (the folder name).
+    * ``source.author`` ← per :data:`_AUTHOR_KIND_TO_AUTHORSHIP`
+      (``ai_as_user`` → AI, ``collaborator`` → COLLABORATIVE, otherwise OTHER).
+    * ``representativeness`` ← ``"endorsed"`` forced for ``ai_as_user``,
+      otherwise the manifest's ``representativeness`` (default ``"reference"``).
+    * ``voice_weight`` ← the manifest's ``voice_weight`` (default ``0.0``, and
+      ``0.0`` when the manifest was loaded fail-closed from a missing file).
+
+    Args:
+        fragment: The fragment to stamp (mutated in place).
+        manifest: The governing ``11-Other-Authors/<slug>/`` manifest.
+    """
+    fragment.source.author_slug = manifest.author_slug
+    fragment.source.author = _AUTHOR_KIND_TO_AUTHORSHIP.get(
+        manifest.author_kind,
+        Authorship.OTHER,
+    )
+    if manifest.author_kind == "ai_as_user":
+        fragment.representativeness = "endorsed"
+    else:
+        fragment.representativeness = manifest.representativeness
+    fragment.voice_weight = manifest.voice_weight
+
+
 class VaultWriter:
     """Write Creek ontological primitives to an Obsidian vault.
 
@@ -443,13 +493,23 @@ class VaultWriter:
         )
 
     def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
-        """Write a Fragment to the appropriate 01-Fragments/ subfolder.
+        """Write a Fragment to the correct vault folder, stamping attribution.
 
-        Maps the fragment's source platform to a subfolder via the total
-        ``_PLATFORM_SUBFOLDER`` mapping. The ``body`` parameter holds the
-        converted markdown content, which is written below the YAML
-        frontmatter — without it the fragment file would contain only
-        metadata (the historical bug).
+        A *native* fragment (``source.author_slug`` is ``None``/empty) routes by
+        source platform via the total ``_PLATFORM_SUBFOLDER`` mapping into
+        ``01-Fragments/<subfolder>/``, unchanged.
+
+        A *borrowed* fragment (``source.author_slug`` set) is other-author
+        content (#470): it routes into ``11-Other-Authors/<slug>/`` instead, and
+        its ATTRIBUTION (author / author_slug / representativeness / voice_weight)
+        is stamped from that slug's ``_author.md`` manifest via a fail-closed
+        loader — a missing/corrupt manifest yields ``voice_weight=0.0``. The
+        fragment's IDEAS classification (frequency / wavelength / voice, set
+        upstream) is never touched.
+
+        The ``body`` parameter holds the converted markdown content, which is
+        written below the YAML frontmatter — without it the fragment file would
+        contain only metadata (the historical bug).
 
         Args:
             fragment: The Fragment model to write.
@@ -461,6 +521,12 @@ class VaultWriter:
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
+        slug = fragment.source.author_slug
+        if slug:
+            manifest = load_author_manifest_or_default(self.vault_path, slug)
+            _apply_other_author_attribution(fragment, manifest)
+            target_dir = self.vault_path / OTHER_AUTHORS_DIR / slug
+            return self._write_model(fragment, target_dir, body=body)
         platform = fragment.source.platform
         subfolder = _PLATFORM_SUBFOLDER[str(platform)]
         target_dir = self.vault_path / "01-Fragments" / subfolder

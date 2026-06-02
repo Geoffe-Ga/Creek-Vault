@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING, get_args
 import pytest
 
 from creek.models import AuthorKind, AuthorManifest, PrivacyTier, Representativeness
-from creek.vault.authors import load_author_manifest
+from creek.vault.authors import (
+    load_author_manifest,
+    load_author_manifest_or_default,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -230,4 +233,24 @@ def test_model_validate_coerces_directly() -> None:
 
     assert manifest.voice_weight == 0.0
     assert manifest.author_kind == "human_source"
+    assert manifest.representativeness == "reference"
+
+
+def test_load_or_default_returns_parsed_manifest(tmp_path: Path) -> None:
+    """``load_author_manifest_or_default`` returns the parsed manifest when present."""
+    _write_manifest(tmp_path, "naval-ravikant", _FULL_MANIFEST)
+
+    manifest = load_author_manifest_or_default(tmp_path, "naval-ravikant")
+
+    assert manifest.author_slug == "naval-ravikant"
+    assert manifest.display_name == "Naval Ravikant"
+
+
+def test_load_or_default_fails_closed_when_missing(tmp_path: Path) -> None:
+    """A missing ``_author.md`` yields a safe default manifest, not a raise."""
+    manifest = load_author_manifest_or_default(tmp_path, "ghost-author")
+
+    assert manifest.author_slug == "ghost-author"
+    assert manifest.author_kind == "human_source"
+    assert manifest.voice_weight == 0.0
     assert manifest.representativeness == "reference"

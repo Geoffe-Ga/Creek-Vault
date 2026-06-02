@@ -8,14 +8,17 @@ author's slug is its folder name, not the frontmatter value).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import logging
+from pathlib import Path
 
 import frontmatter
 
 from creek.models import AuthorManifest
 
-if TYPE_CHECKING:
-    from pathlib import Path
+logger = logging.getLogger(__name__)
+
+OTHER_AUTHORS_DIR = "11-Other-Authors"
+"""Top-level vault folder governing borrowed, non-owner author content."""
 
 
 def load_author_manifest(path: Path) -> AuthorManifest:
@@ -43,3 +46,41 @@ def load_author_manifest(path: Path) -> AuthorManifest:
     # Slug authority: the folder name is the identity key (FEAT-041 §7.1).
     data["author_slug"] = path.parent.name
     return AuthorManifest.model_validate(data)
+
+
+def load_author_manifest_or_default(vault_path: Path, slug: str) -> AuthorManifest:
+    """Load ``<vault>/11-Other-Authors/<slug>/_author.md``, failing closed (#470).
+
+    Resolves the manifest governing borrowed content under *slug*. When the
+    ``_author.md`` file is missing or cannot be parsed/validated, this returns a
+    default :class:`~creek.models.AuthorManifest` for *slug* — which already
+    defaults to ``human_source`` / ``voice_weight=0.0`` /
+    ``representativeness="reference"`` — so a borrowed fragment can never inherit
+    voice influence from an absent or corrupt manifest (fail-closed to 0.0).
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        slug: The ``11-Other-Authors/<slug>/`` folder name.
+
+    Returns:
+        The parsed manifest, or a safe default manifest for *slug*.
+    """
+    path = Path(vault_path) / OTHER_AUTHORS_DIR / slug / "_author.md"
+    try:
+        return load_author_manifest(path)
+    except FileNotFoundError:
+        logger.warning(
+            "Author manifest missing for slug %r at %s; "
+            "failing closed to voice_weight=0.0 / human_source.",
+            slug,
+            path,
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Author manifest unreadable for slug %r at %s (%s); "
+            "failing closed to voice_weight=0.0 / human_source.",
+            slug,
+            path,
+            exc,
+        )
+    return AuthorManifest(author_slug=slug)
