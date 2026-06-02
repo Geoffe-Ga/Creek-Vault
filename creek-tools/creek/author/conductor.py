@@ -33,8 +33,9 @@ if TYPE_CHECKING:
     from creek.author.client import AuthorLLMClient
     from creek.models import MediumContract
 
-#: Mediums the conductor will run. Only ``research`` is wired in the skeleton.
-SUPPORTED_MEDIUMS: frozenset[str] = frozenset({"research"})
+#: Mediums the conductor will run. ``research`` and ``chat`` are wired; the
+#: remaining mediums (essay/research-piece/book-report/how-to) arrive later.
+SUPPORTED_MEDIUMS: frozenset[str] = frozenset({"research", "chat"})
 
 #: Fixed pipeline steps that follow the specialist roster, in order.
 _DOWNSTREAM_STEPS: tuple[str, ...] = ("synthesize", "voice", "reflect")
@@ -77,9 +78,10 @@ def require_supported_medium(medium: str) -> Medium:
         ValueError: When *medium* is not wired in the skeleton.
     """
     if medium not in SUPPORTED_MEDIUMS:
+        wired = ", ".join(repr(m) for m in sorted(SUPPORTED_MEDIUMS))
         msg = (
-            f"Unsupported medium {medium!r}; only the 'research' medium is "
-            "wired in the Writing Desk skeleton (FEAT-041)."
+            f"Unsupported medium {medium!r}; only {wired} "
+            "are wired in the Writing Desk (FEAT-041)."
         )
         raise ValueError(msg)
     # Echo back the validated medium rather than a hard-coded literal so that

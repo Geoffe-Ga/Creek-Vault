@@ -15,7 +15,7 @@ from creek.compile.provenance import ProvenanceEntry
 
 #: Mediums the author desk can produce. Only ``research`` is wired in the
 #: skeleton; the others (chat/essay/book-report/how-to) arrive in later issues.
-Medium = Literal["research"]
+Medium = Literal["research", "chat"]
 
 #: The reflection node's bounded verdict over a drafted body.
 ReflectionVerdict = Literal["PASS", "REVISE", "ESCALATE"]
@@ -83,3 +83,8 @@ class AuthoredDraft(BaseModel):
     provenance: list[ProvenanceEntry] = Field(default_factory=list)
     verdict: ReflectionVerdict
     rounds: int = Field(ge=1)
+
+    @property
+    def rendered_text(self) -> str:
+        """The rendered draft text (alias for :attr:`body`)."""
+        return self.body
