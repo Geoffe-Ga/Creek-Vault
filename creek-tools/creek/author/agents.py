@@ -31,6 +31,8 @@ from creek.generate.paradox import OPPOSITE_PHASE_PAIRS
 from creek.link.embeddings import (
     EmbeddingLinker,
     EmbeddingModelUnavailableError,
+    content_hash_for_text,
+    embeddings_cache_path,
     fragment_embedding_text,
 )
 from creek.models import Dosage, Frequency, Mode, Phase
@@ -40,7 +42,8 @@ if TYPE_CHECKING:
     from enum import StrEnum
     from pathlib import Path
 
-    from creek.config import CreekConfig, EmbeddingsConfig
+    from creek.config import CreekConfig
+    from creek.link.embeddings import CachedEmbedding
     from creek.models import Fragment
 
 _DimT = TypeVar("_DimT", bound="StrEnum")
@@ -103,47 +106,119 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return float(a @ b / denom) if denom else 0.0
 
 
+def _fragment_vector(
+    fragment: Fragment,
+    linker: EmbeddingLinker,
+    cache: dict[str, CachedEmbedding],
+) -> list[float]:
+    """Return *fragment*'s embedding, reusing a fresh cached vector when present.
+
+    A cached vector is trusted only when the fragment id is in *cache* and its
+    stored ``content_hash`` still equals the SHA-256 of the fragment's current
+    :func:`fragment_embedding_text` — the exact freshness key
+    :meth:`EmbeddingLinker.build_cache_entries` writes. A miss or a stale hash
+    falls back to a live :meth:`EmbeddingLinker.generate_embedding`, so the
+    result is identical to embedding from scratch.
+
+    Args:
+        fragment: The corpus fragment to embed.
+        linker: The reused embedding linker (live-embed fallback).
+        cache: Persisted, model-filtered cache keyed by fragment id.
+
+    Returns:
+        The fragment's embedding vector.
+    """
+    text = fragment_embedding_text(fragment)
+    cached = cache.get(fragment.id)
+    if cached is not None and cached.content_hash == content_hash_for_text(text):
+        return cached.vector
+    return linker.generate_embedding(text)
+
+
 def _rank_fragments(
     query: str,
     corpus: list[tuple[Fragment, str]],
-    config: EmbeddingsConfig,
+    linker: EmbeddingLinker,
+    cache: dict[str, CachedEmbedding],
 ) -> list[Fragment]:
     """Rank *corpus* fragments by semantic similarity to *query* (descending).
 
-    Reuses :class:`EmbeddingLinker`. Ties break by fragment id for
-    determinism. Raises :class:`EmbeddingModelUnavailableError` when the
-    embedding model cannot load.
+    Embeds the query once with the reused *linker* and scores each fragment
+    against it, drawing fresh cached vectors from *cache* to avoid re-embedding
+    unchanged fragments (the cache is a pure optimisation — a hit yields the
+    same vector a live embed would). Ties break by fragment id for determinism.
+    Raises :class:`EmbeddingModelUnavailableError` when the embedding model
+    cannot load.
+
+    Args:
+        query: The user query to rank fragments against.
+        corpus: ``(fragment, body)`` records to score.
+        linker: The reused embedding linker.
+        cache: Persisted, model-filtered embedding cache keyed by fragment id.
+
+    Returns:
+        Fragments ordered by cosine similarity descending, id tie-break.
     """
-    # Perf: this builds a linker per call and re-embeds the corpus. Reusing a
-    # process-cached linker + the persisted embeddings cache is a tracked
-    # follow-up; correctness, not interactive latency, is the goal here.
-    linker = EmbeddingLinker(config)
     query_vec = linker.generate_embedding(query)
     scored: list[tuple[float, str, Fragment]] = []
     for fragment, _body in corpus:
-        vec = linker.generate_embedding(fragment_embedding_text(fragment))
+        vec = _fragment_vector(fragment, linker, cache)
         scored.append((_cosine(query_vec, vec), fragment.id, fragment))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [fragment for _score, _id, fragment in scored]
 
 
 class RetrievalSpecialist:
-    """Semantic-retrieval specialist over raw, reference, and other-author text."""
+    """Semantic-retrieval specialist over raw, reference, and other-author text.
+
+    Holds a lazily-created :class:`EmbeddingLinker` on the instance so a
+    long-lived specialist reused across :meth:`gather` calls loads the
+    sentence-transformer model only once. The linker is instance-level (never a
+    module global) so a fresh ``RetrievalSpecialist()`` per test starts cold and
+    the conftest model mock cannot leak across tests.
+    """
 
     name = "retrieval"
+
+    def __init__(self, *, linker: EmbeddingLinker | None = None) -> None:
+        """Initialise the specialist with an optional pre-built linker.
+
+        Args:
+            linker: An embedding linker to reuse; when ``None`` (the default,
+                as in :func:`default_specialists`) one is created lazily on
+                first :meth:`gather` and cached on the instance.
+        """
+        self._linker = linker
+
+    def _get_linker(self, config: CreekConfig) -> EmbeddingLinker:
+        """Return the instance's linker, creating and caching it on first use.
+
+        Args:
+            config: The loaded vault config supplying embeddings settings.
+
+        Returns:
+            The reused :class:`EmbeddingLinker` for this specialist instance.
+        """
+        if self._linker is None:
+            self._linker = EmbeddingLinker(config.embeddings)
+        return self._linker
 
     def gather(self, query: str, vault: Path) -> EvidenceBundle:
         """Return the top-``retrieval_top_k`` fragments most relevant to *query*.
 
         Degrades to an empty bundle when the corpus is empty or the embedding
         model is unavailable, so the desk never crashes on a thin/offline vault.
+        The persisted embeddings cache is loaded once and used to skip
+        re-embedding fragments whose text is unchanged.
         """
         config = _load_config(vault)
         corpus = _load_corpus(vault)
         if not corpus:
             return EvidenceBundle()
+        linker = self._get_linker(config)
+        cache = linker.load_cache(embeddings_cache_path(vault))
         try:
-            ranked = _rank_fragments(query, corpus, config.embeddings)
+            ranked = _rank_fragments(query, corpus, linker, cache)
         except EmbeddingModelUnavailableError:
             return EvidenceBundle()
         top = ranked[: config.author.retrieval_top_k]
@@ -183,8 +258,15 @@ def _build_link_graph(corpus: list[tuple[Fragment, str]]) -> dict[str, set[str]]
 
     Wikilink targets are resolved to fragment ids by id or by title; unresolved
     targets are dropped. Edges are bidirectional so the walk follows backlinks.
+
+    Duplicate-title resolution is **last-wins**: when two corpus fragments share
+    a title, the ``by_title`` map maps that title to the id of the *last*
+    fragment in corpus order, so a ``[[Shared Title]]`` wikilink targets it.
+    Ids are always preferred over titles — :func:`_wikilink_targets` checks
+    ``by_id`` first — so an exact-id link never falls through to title lookup.
     """
     by_id = {fragment.id for fragment, _ in corpus}
+    # Last-wins on duplicate titles (the comprehension keeps the final entry).
     by_title = {fragment.title: fragment.id for fragment, _ in corpus}
     graph: dict[str, set[str]] = {fragment.id: set() for fragment, _ in corpus}
     for fragment, body in corpus:
