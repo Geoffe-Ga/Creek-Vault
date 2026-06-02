@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 
 from creek.author.skills import (
     find_phase_skill,
-    find_register_skill,
     find_voice_core,
     read_skill,
 )
@@ -129,25 +128,23 @@ def _build_voice_prompt(
     """Assemble the owner-voice LLM prompt from skills + evidence + ask."""
     parts: list[str] = [
         *_skill_sections(vault, evidence),
-        _evidence_section(evidence, contract),
-        _ask_section(query, medium),
+        _evidence_section(evidence),
+        _ask_section(query, medium, contract),
     ]
     return "\n\n".join(part for part in parts if part)
 
 
 def _skill_sections(vault: Path, evidence: EvidenceBundle) -> list[str]:
-    """Return the voice-core / phase / register skill sections, in order.
+    """Return the voice-core and phase skill sections, in order.
 
     Missing skill files are skipped silently. The phase is taken from the
-    synthesized ontology's dominant phase when present.
+    synthesized ontology's dominant phase when present. Register selection is
+    deferred — the synthesized ontology carries no dominant voice register yet
+    (tracked as #502; the ``find_register_skill`` seam is ready for it).
     """
     paths = [
         find_voice_core(vault),
         find_phase_skill(vault, _dominant_phase(evidence)),
-        # Register is not yet wired — the synthesized ontology carries no
-        # dominant voice register to select from. The discovery seam is kept
-        # so register selection is a one-line change once #502 lands.
-        find_register_skill(vault, None),
     ]
     sections: list[str] = []
     for path in paths:
@@ -167,41 +164,31 @@ def _dominant_phase(evidence: EvidenceBundle) -> str | None:
     return ontology.phases[0].value.value
 
 
-def _ordered_owner_claims(
-    evidence: EvidenceBundle,
-    contract: MediumContract | None,
-) -> list[EvidenceClaim]:
-    """Return owner claims honouring the contract's ``structure`` ordering.
-
-    The contract structure (e.g. ``[thesis, evidence, synthesis, citations]``)
-    documents the section order; the desk's grounding contract is the load-
-    bearing invariant, so claims keep their stable insertion order — the
-    structure presence is recorded but does not reshuffle grounded claims.
-    """
-    del contract  # structure honoured via stable insertion order (see docstring)
-    return _owner_claims(evidence)
-
-
-def _evidence_section(
-    evidence: EvidenceBundle,
-    contract: MediumContract | None,
-) -> str:
+def _evidence_section(evidence: EvidenceBundle) -> str:
     """Return the grounded ``## Evidence`` block for the voice prompt.
 
     Each line pairs a grounded claim with its source fragment ids so the model
     can trace every statement; borrowed-author claims are already excluded.
     """
-    claims = _ordered_owner_claims(evidence, contract)
     lines = [
         f"- {claim.claim} [fragments: {', '.join(claim.source_fragments)}]"
-        for claim in claims
+        for claim in _owner_claims(evidence)
     ]
     body = "\n".join(lines) if lines else "(no grounded evidence)"
     return f"## Evidence (grounded)\n{body}"
 
 
-def _ask_section(query: str, medium: Medium | None) -> str:
-    """Return the grounding-preserving ``## Ask`` block for the voice prompt."""
+def _ask_section(
+    query: str,
+    medium: Medium | None,
+    contract: MediumContract | None,
+) -> str:
+    """Return the grounding-preserving ``## Ask`` block for the voice prompt.
+
+    When a *contract* is present its ``structure`` is passed to the model as
+    the section order to organise the draft into, so the medium's contract
+    shapes the output rather than just documenting an intent.
+    """
     lines = [
         "## Ask",
         f"Render the evidence below as a draft answering: {query}",
@@ -210,6 +197,9 @@ def _ask_section(query: str, medium: Medium | None) -> str:
         "invent facts and do not add claims.",
         "Do not quote borrowed authors as my own words.",
     ]
+    if contract is not None and contract.structure:
+        order = " → ".join(contract.structure)
+        lines.append(f"Organise the draft into these sections, in order: {order}.")
     if medium in _LIGHT_VOICING_MEDIUMS:
         lines.append(_LIGHT_TOUCH_NOTE)
     return "\n".join(lines)

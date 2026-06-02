@@ -18,6 +18,7 @@ from creek.author.conductor import Conductor, build_default_conductor
 from creek.author.contracts import load_medium_contract
 from creek.author.models import EvidenceBundle, EvidenceClaim
 from creek.author.reflection import ReflectionNode
+from creek.author.skills import read_skill
 from creek.author.voice import VoiceAgent
 
 if TYPE_CHECKING:
@@ -122,6 +123,22 @@ def test_voice_prompt_includes_voice_core_sentinel(tmp_path: Path) -> None:
     assert sentinel in prompt
 
 
+def test_voice_prompt_honours_contract_structure(tmp_path: Path) -> None:
+    """The medium contract's section order is passed to the model (#471)."""
+    contract = load_medium_contract("research", tmp_path)
+    client, provider = _mock_client("voiced output")
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a grounded claim", source_fragments=["f1"])]
+    )
+
+    VoiceAgent(llm_client=client).render(
+        "q", evidence, tmp_path, medium="research", contract=contract
+    )
+
+    prompt = provider.call_with_metadata.call_args.args[0]
+    assert " → ".join(contract.structure) in prompt
+
+
 def test_voice_excludes_borrowed_authors_from_owner_material(tmp_path: Path) -> None:
     """A borrowed (``author_slug``) claim is not voiced as the owner's words."""
     client, provider = _mock_client("voiced output")
@@ -166,8 +183,6 @@ def test_voice_falls_back_when_client_returns_empty(tmp_path: Path) -> None:
 
 def test_read_skill_skips_non_utf8_bytes(tmp_path: Path) -> None:
     """A SKILL.md with non-UTF-8 bytes is skipped (returns ""), never crashes."""
-    from creek.author.skills import read_skill
-
     skill = tmp_path / "voice-core.SKILL.md"
     skill.write_bytes(b"\xff\xfe not valid utf-8 \x80")
 
@@ -176,12 +191,6 @@ def test_read_skill_skips_non_utf8_bytes(tmp_path: Path) -> None:
 
 def test_voice_render_survives_non_utf8_voice_core(tmp_path: Path) -> None:
     """A non-UTF-8 voice-core does not crash the LLM voice render (#501)."""
-    from unittest.mock import MagicMock
-
-    from creek.author.client import AuthorLLMClient
-    from creek.author.models import EvidenceBundle, EvidenceClaim
-    from creek.author.voice import VoiceAgent
-
     core = tmp_path / "creek-skills" / "voice-core" / "SKILL.md"
     core.parent.mkdir(parents=True, exist_ok=True)
     core.write_bytes(b"\xff\xfe\x80 bad bytes")
