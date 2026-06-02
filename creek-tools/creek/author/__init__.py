@@ -18,6 +18,12 @@ from creek.author.conductor import (
     require_supported_medium,
     run_author,
 )
+from creek.author.contracts import (
+    CHAT_MAX_CHARS,
+    ContractConformanceError,
+    assert_contract_conformant,
+    load_medium_contract,
+)
 from creek.author.models import (
     AuthoredDraft,
     EvidenceBundle,
@@ -27,15 +33,19 @@ from creek.author.models import (
 )
 
 __all__ = [
+    "CHAT_MAX_CHARS",
     "SUPPORTED_MEDIUMS",
     "AuthorLLMClient",
     "AuthoredDraft",
     "Conductor",
+    "ContractConformanceError",
     "EvidenceBundle",
     "EvidenceClaim",
     "Medium",
     "ReflectionVerdict",
+    "assert_contract_conformant",
     "build_default_conductor",
+    "load_medium_contract",
     "require_supported_medium",
     "run_author",
 ]
