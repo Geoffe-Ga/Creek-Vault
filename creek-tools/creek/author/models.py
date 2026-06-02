@@ -13,9 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from creek.compile.provenance import ProvenanceEntry
 
-#: Mediums the author desk can produce. ``research``/``chat``/``essay`` are
-#: wired; the others (research-piece/book-report/how-to) arrive in later issues.
-Medium = Literal["research", "chat", "essay"]
+#: Mediums the author desk can produce. ``research``/``chat``/``essay``/
+#: ``research-piece`` are wired; the others (book-report/how-to) arrive in later
+#: issues.
+Medium = Literal["research", "chat", "essay", "research-piece"]
 
 #: The reflection node's bounded verdict over a drafted body.
 ReflectionVerdict = Literal["PASS", "REVISE", "ESCALATE"]
