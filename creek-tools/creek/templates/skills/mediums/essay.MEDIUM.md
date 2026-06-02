@@ -58,5 +58,10 @@ The reflection node weights **voice fidelity** highest (0.45) — register drift
 AI tells, or phase-inappropriate tone are the cardinal failures here. Narrative
 coherence is judged as part of voice fidelity (does the piece hold together and
 *turn*?). Ontological accuracy (0.2) and privacy compliance (0.15) follow;
-citation completeness is light (0.1). A voice-broken or incoherent draft →
-`REVISE`; exhausting the round budget → `ESCALATE`.
+citation completeness is light (0.1). The two small weights still bind:
+**paradox preservation** (0.05) means contradictions surfaced from
+`10-Liminal/` are kept, not tidied away; **attribution correctness** (0.05)
+means any borrowed idea is credited to its `11-Other-Authors/` source and the
+owner's voice never claims a `reference`-weighted idea as its own. A
+voice-broken or incoherent draft → `REVISE`; exhausting the round budget →
+`ESCALATE`.
