@@ -453,7 +453,10 @@ def test_retrieval_stale_cache_entry_is_recomputed(tmp_path: Path) -> None:
         RetrievalSpecialist().gather("alpha", tmp_path)
 
     embedded_texts = [call.args[1] for call in spy.call_args_list]
-    assert "Alpha" in embedded_texts  # stale entry forced a live recompute
+    # Exactly the query plus the one stale fragment, re-embedded live (computed
+    # via fragment_embedding_text so the assertion survives a shape change and
+    # still proves the stale cache entry was NOT served).
+    assert embedded_texts == ["alpha", fragment_embedding_text(by_id["frag-a"])]
 
 
 def test_build_link_graph_duplicate_title_is_last_wins(tmp_path: Path) -> None:
