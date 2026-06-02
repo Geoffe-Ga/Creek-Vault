@@ -1,9 +1,9 @@
-"""Specialist agents for the Creek Writing Desk (FEAT-041).
+"""Specialist agents for the Creek Writing Desk.
 
-The Graph and Retrieval specialists are real (#463): Graph walks a bounded
+The Graph and Retrieval specialists are real: Graph walks a bounded
 backlink graph over the vault; Retrieval ranks fragments by semantic similarity
 to the query, reusing :mod:`creek.link.embeddings`. The Ontology specialist
-remains a stub (its real logic is #467). Every specialist returns structured,
+remains a stub. Every specialist returns structured,
 provenance-tracked :class:`~creek.author.models.EvidenceBundle`s — claims paired
 with their ``source_fragments`` (and an ``author_slug`` for borrowed evidence).
 """
@@ -238,12 +238,12 @@ class GraphSpecialist:
 
 
 class OntologySpecialist:
-    """Stub Ontology specialist — would ground claims in the APTITUDE model (#467)."""
+    """Stub Ontology specialist — would ground claims in the APTITUDE model."""
 
     name = "ontology"
 
     def gather(self, query: str, vault: Path) -> EvidenceBundle:
-        """Return a mock ontology-derived claim (stub; real logic is #467)."""
+        """Return a mock ontology-derived claim (stub)."""
         return EvidenceBundle(
             claims=[
                 EvidenceClaim(

@@ -36,13 +36,13 @@ class EvidenceClaim(BaseModel):
 
     claim: str
     source_fragments: list[str] = Field(default_factory=list)
-    # FEAT-041 #463: when a claim is drawn from `11-Other-Authors/`, the author
-    # slug travels with it so downstream citation can attribute it correctly.
+    # When a claim is drawn from `11-Other-Authors/`, the author slug travels
+    # with it so downstream citation can attribute it correctly.
     author_slug: str | None = None
 
 
 class WalkStats(BaseModel):
-    """Bounds-tracking stats for a Graph agent's backlink walk (FEAT-041 #463).
+    """Bounds-tracking stats for a Graph agent's backlink walk.
 
     Attributes:
         max_depth: The deepest hop reached from the seed (``0`` = seed only).
