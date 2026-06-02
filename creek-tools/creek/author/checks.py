@@ -21,14 +21,13 @@ from typing import TYPE_CHECKING
 from creek.author.models import ReflectionFinding
 from creek.generate.ai_style.scanner import scan
 
-# The legacy-alias maps are module-private in creek.models; importing them here
-# reuses the single canonical INC-019 source rather than duplicating the alias
-# vocabulary. This is the second consumer across the module boundary, so
-# promoting them to a public constant is tracked as #507.
+# Reuse the canonical INC-019 alias vocabulary (public constants) rather than
+# duplicating it, so the ontological-accuracy check and the model validators
+# stay in sync.
 from creek.models import (
-    _FREQUENCY_LEGACY_ALIASES,
-    _MODE_LEGACY_ALIASES,
-    _PHASE_LEGACY_ALIASES,
+    FREQUENCY_LEGACY_ALIASES,
+    MODE_LEGACY_ALIASES,
+    PHASE_LEGACY_ALIASES,
     PrivacyTier,
 )
 from creek.vault.reader import iter_vault_fragments
@@ -54,7 +53,7 @@ _TIER_RANK: dict[PrivacyTier, int] = {
 #: Legacy alias keys whose presence in a body signals non-canonical taxonomy
 #: (INC-019). Maps each deprecated alias to its canonical replacement.
 _LEGACY_ALIASES: dict[str, str] = (
-    _PHASE_LEGACY_ALIASES | _MODE_LEGACY_ALIASES | _FREQUENCY_LEGACY_ALIASES
+    PHASE_LEGACY_ALIASES | MODE_LEGACY_ALIASES | FREQUENCY_LEGACY_ALIASES
 )
 
 
@@ -196,12 +195,18 @@ def check_ontological_accuracy(body: str) -> list[ReflectionFinding]:
 def _paradox_is_preserved(body: str, description: str) -> bool:
     """Return whether *body* keeps the tension of a paradox *description*.
 
-    Deterministic heuristic: the paradox is preserved iff the draft body
-    carries a contrast/tension cue — either an explicit contrast marker
-    (``but``, ``yet``, ``however``, ``while``, ``although``, ``tension``,
-    ``paradox``, ``both``) or every significant (>=4-char) word of the
-    paradox description. A body that surfaces only one side, with no contrast,
-    has flattened the tension.
+    Deterministic heuristic: the paradox is preserved iff the body engages the
+    paradox's own vocabulary in a both-sides way — either (a) it carries a
+    contrast/tension cue (``but``, ``yet``, ``however``, ``while``,
+    ``although``, ``tension``, ``paradox``, ``both``) AND mentions at least one
+    significant (>=4-char) word of the paradox description, or (b) it mentions
+    every significant word of the description. Requiring topical overlap
+    alongside the contrast cue closes the bare-conjunction bypass — a stray
+    "but" elsewhere in the draft no longer counts as preserving *this* tension.
+
+    This is a deterministic approximation; genuine semantic both-sides
+    detection is deferred to the LLM judge (#474). It can still miss a paraphrase
+    that reframes the tension without the description's words.
 
     Args:
         body: The drafted prose under review.
@@ -211,6 +216,10 @@ def _paradox_is_preserved(body: str, description: str) -> bool:
         ``True`` when the tension is preserved, ``False`` when flattened.
     """
     lowered = body.lower()
+    key_terms = re.findall(r"[a-z]{4,}", description.lower())
+    if not key_terms:
+        return True  # no vocabulary to check against — don't flag spuriously
+    mentions_topic = any(term in lowered for term in key_terms)
     contrast_cues = (
         "but",
         "yet",
@@ -221,10 +230,10 @@ def _paradox_is_preserved(body: str, description: str) -> bool:
         "paradox",
         "both",
     )
-    if any(re.search(rf"\b{cue}\b", lowered) for cue in contrast_cues):
+    has_contrast = any(re.search(rf"\b{cue}\b", lowered) for cue in contrast_cues)
+    if has_contrast and mentions_topic:
         return True
-    key_terms = re.findall(r"[a-z]{4,}", description.lower())
-    return bool(key_terms) and all(term in lowered for term in key_terms)
+    return all(term in lowered for term in key_terms)
 
 
 def check_paradox_preservation(

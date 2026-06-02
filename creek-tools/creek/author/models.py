@@ -197,6 +197,10 @@ class AuthoredDraft(BaseModel):
             :class:`~creek.compile.provenance.ProvenanceEntry` shape.
         verdict: The reflection node's verdict for this draft.
         rounds: How many voice/reflect rounds ran (``>= 1``).
+        findings: The reflection findings from the final round. Carried so an
+            ``ESCALATE`` (or ``REVISE``) verdict is actionable — a human can see
+            exactly which dimensions failed rather than being told only that the
+            draft was escalated.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -207,6 +211,7 @@ class AuthoredDraft(BaseModel):
     provenance: list[ProvenanceEntry] = Field(default_factory=list)
     verdict: ReflectionVerdict
     rounds: int = Field(ge=1)
+    findings: list[ReflectionFinding] = Field(default_factory=list)
 
     # BUG-009: the ``[prop-decorator]`` suppression is the known mypy /
     # Pydantic-v2 limitation when stacking ``@computed_field`` over

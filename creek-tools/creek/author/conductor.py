@@ -23,6 +23,7 @@ from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
     Medium,
+    ReflectionFinding,
     ReflectionResult,
     ReflectionVerdict,
 )
@@ -257,6 +258,7 @@ class Conductor:
 
         body = ""
         verdict: ReflectionVerdict = "ESCALATE"
+        findings: list[ReflectionFinding] = []
         rounds = 0
         for attempt in range(1, self.max_rounds + 1):
             rounds = attempt
@@ -271,12 +273,19 @@ class Conductor:
                 body, evidence, rubric, contract=self.contract, vault=vault
             )
             verdict = result.decision
+            findings = result.findings
             if verdict != "REVISE":
                 break
 
         # Never ship a sub-threshold draft: a still-REVISE verdict after the
-        # round budget is exhausted escalates to a human (#473).
+        # round budget is exhausted escalates to a human (#473). Carry the
+        # findings on the draft (and log them) so the escalation is actionable.
         if verdict == "REVISE":
+            logger.warning(
+                "Escalating draft after %d round(s); unresolved dimensions: %s",
+                rounds,
+                sorted({finding.dimension for finding in findings}),
+            )
             verdict = "ESCALATE"
 
         return AuthoredDraft(
@@ -286,6 +295,7 @@ class Conductor:
             provenance=_claims_to_provenance(evidence.claims),
             verdict=verdict,
             rounds=rounds,
+            findings=findings,
         )
 
 

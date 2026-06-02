@@ -68,21 +68,21 @@ def _utc_now() -> datetime:
 
 
 # INC-019 one-release migration aliases — see the INC doc for context.
-_PHASE_LEGACY_ALIASES = {
+PHASE_LEGACY_ALIASES = {
     "origins": "rising",
     "cresting": "withdrawal",
     "receding": "diminishing",
     "composting": "restoration",
 }
 
-_MODE_LEGACY_ALIASES = {
+MODE_LEGACY_ALIASES = {
     "solo": "inhabit",
     "dialogue": "express",
     "reflective": "integrate",
     "analytic": "collaborate",
 }
 
-_FREQUENCY_LEGACY_ALIASES = {
+FREQUENCY_LEGACY_ALIASES = {
     "amplitude": "F1",
     "pitch": "F2",
 }
@@ -130,7 +130,7 @@ class Frequency(StrEnum):
     @classmethod
     def _missing_(cls, value: object) -> "Frequency | None":
         """Map legacy INC-019 wave-physics strings to canonical F-codes."""
-        return _legacy_alias_lookup(cls, value, _FREQUENCY_LEGACY_ALIASES)
+        return _legacy_alias_lookup(cls, value, FREQUENCY_LEGACY_ALIASES)
 
 
 class Phase(StrEnum):
@@ -147,7 +147,7 @@ class Phase(StrEnum):
     @classmethod
     def _missing_(cls, value: object) -> "Phase | None":
         """Map legacy INC-019 drift phase strings to canonical phases."""
-        return _legacy_alias_lookup(cls, value, _PHASE_LEGACY_ALIASES)
+        return _legacy_alias_lookup(cls, value, PHASE_LEGACY_ALIASES)
 
 
 class Mode(StrEnum):
@@ -163,7 +163,7 @@ class Mode(StrEnum):
     @classmethod
     def _missing_(cls, value: object) -> "Mode | None":
         """Map legacy INC-019 drift mode strings to canonical modes."""
-        return _legacy_alias_lookup(cls, value, _MODE_LEGACY_ALIASES)
+        return _legacy_alias_lookup(cls, value, MODE_LEGACY_ALIASES)
 
 
 class Orientation(StrEnum):

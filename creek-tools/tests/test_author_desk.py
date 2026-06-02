@@ -32,7 +32,7 @@ from creek.author.agents import (
     OntologySpecialist,
     RetrievalSpecialist,
 )
-from creek.author.models import EvidenceClaim, ReflectionResult
+from creek.author.models import EvidenceClaim, ReflectionFinding, ReflectionResult
 from creek.author.reflection import ReflectionNode
 from creek.author.voice import VoiceAgent
 
@@ -122,7 +122,16 @@ def test_reflection_passes_grounded_and_escalates_ungrounded() -> None:
 def test_conductor_respects_max_rounds(tmp_path: Path) -> None:
     """REVISE loops up to ``max_rounds``; exhaustion escalates, never ships REVISE."""
     revising = MagicMock()
-    revising.review.return_value = ReflectionResult(decision="REVISE")
+    revising.review.return_value = ReflectionResult(
+        decision="REVISE",
+        findings=[
+            ReflectionFinding(
+                dimension="citation_completeness",
+                severity="HIGH",
+                message="uncited",
+            )
+        ],
+    )
     conductor = Conductor(
         specialists=[GraphSpecialist()],
         voice=VoiceAgent(),
@@ -137,6 +146,9 @@ def test_conductor_respects_max_rounds(tmp_path: Path) -> None:
     # budget escalates to a human rather than shipping sub-threshold.
     assert draft.verdict == "ESCALATE"
     assert revising.review.call_count == 2
+    # The escalation must be actionable: the final round's findings are carried
+    # on the draft so a human can see which dimensions failed (#505 review).
+    assert [f.dimension for f in draft.findings] == ["citation_completeness"]
 
 
 def test_conductor_rejects_zero_max_rounds() -> None:

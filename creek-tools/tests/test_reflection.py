@@ -138,6 +138,32 @@ def test_privacy_skips_cited_fragment_absent_from_vault(tmp_path: Path) -> None:
     assert not any(f.dimension == "privacy_compliance" for f in result.findings)
 
 
+def test_paradox_bare_conjunction_off_topic_is_flattened() -> None:
+    """A contrast cue unrelated to the paradox's vocabulary does not preserve it.
+
+    Closes the bare-conjunction bypass (#505 review): a stray "but" with no
+    topical overlap is treated as a flattened tension, not a preserved one.
+    """
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])],
+        ontology=OntologyAnalysis(
+            paradoxes=(
+                OntologyParadox(
+                    kind="dosage",
+                    fragment_ids=("frag-a",),
+                    description="solitude nourishes while crowds drain",
+                ),
+            )
+        ),
+    )
+    body = "I went to the store but forgot the milk."
+
+    result = ReflectionNode().review(body, evidence)
+
+    assert result.decision == "REVISE"
+    assert any(f.dimension == "paradox_preservation" for f in result.findings)
+
+
 def test_resolved_paradox_revises_with_paradox_finding() -> None:
     """A flattened paradox (no contrast cue) → REVISE + paradox_preservation."""
     evidence = EvidenceBundle(
