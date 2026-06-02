@@ -103,6 +103,7 @@ def author_tool(
             "status": "error",
             "tool": TOOL_NAME,
             "tier_ceiling": privacy_tier_ceiling.value,
+            "tier_ceiling_enforced": False,
             "dry_run": dry_run,
             "reason": str(exc),
         }

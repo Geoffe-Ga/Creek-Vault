@@ -431,6 +431,7 @@ def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
     assert result["status"] == "error"
     assert result["tool"] == "creek.author"
     assert result["tier_ceiling"] == "open"  # ceiling echoed on the error path
+    assert result["tier_ceiling_enforced"] is False  # key present on every envelope
     assert "research" in result["reason"]
 
 
