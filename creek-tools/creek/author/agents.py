@@ -98,6 +98,9 @@ def _rank_fragments(
     determinism. Raises :class:`EmbeddingModelUnavailableError` when the
     embedding model cannot load.
     """
+    # Perf: this builds a linker per call and re-embeds the corpus. Reusing a
+    # process-cached linker + the persisted embeddings cache is a tracked
+    # follow-up; correctness, not interactive latency, is the goal here.
     linker = EmbeddingLinker(config)
     query_vec = linker.generate_embedding(query)
     scored: list[tuple[float, str, Fragment]] = []
