@@ -234,6 +234,24 @@ class TestOtherAuthorAttribution:
         assert post["source"]["author_slug"] == "malformed"
         assert post["representativeness"] == "reference"
 
+    def test_write_does_not_mutate_caller_fragment(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+    ) -> None:
+        """Stamping attribution must not mutate the caller's Fragment (#470)."""
+        _write_manifest(vault_path, "mentor", _ASPIRATIONAL_MANIFEST)
+        frag = _classified_borrowed_fragment("mentor", "frag-nomutate01")
+
+        writer.write_fragment(frag)
+
+        # The caller's object keeps its pre-call (native-default) attribution —
+        # only the written file carries the stamped manifest values.
+        assert frag.voice_weight == 1.0
+        assert frag.representativeness == "self"
+        assert frag.source.author == "self"
+        assert frag.source.author_slug == "mentor"
+
     def test_native_write_is_unchanged(
         self,
         writer: VaultWriter,
@@ -278,6 +296,7 @@ class TestAuthorSlugPathSafety:
             ".",
             "",
             "   ",
+            "embedded space",
         ],
     )
     def test_unsafe_author_slug_is_rejected(self, bad_slug: str) -> None:

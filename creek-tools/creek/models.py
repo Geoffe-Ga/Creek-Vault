@@ -639,11 +639,12 @@ class FragmentSource(BaseModel):
         if value is None:
             return None
         if (
-            value in {".", ".."}
+            not value
+            or value in {".", ".."}
             or "/" in value
             or "\\" in value
             or "\x00" in value
-            or not value.strip()
+            or any(ch.isspace() for ch in value)
         ):
             msg = f"author_slug must be a single safe path segment, got {value!r}"
             raise ValueError(msg)

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import frontmatter
 import yaml
+from pydantic import ValidationError
 
 from creek.models import AuthorManifest
 
@@ -76,7 +77,7 @@ def load_author_manifest_or_default(vault_path: Path, slug: str) -> AuthorManife
             slug,
             path,
         )
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError, ValidationError, yaml.YAMLError) as exc:
         logger.warning(
             "Author manifest unreadable for slug %r at %s (%s); "
             "failing closed to voice_weight=0.0 / human_source.",

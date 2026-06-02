@@ -524,10 +524,13 @@ class VaultWriter:
         """
         slug = fragment.source.author_slug
         if slug:
+            # Stamp on a deep copy so the caller's Fragment is never mutated —
+            # only the written file carries the manifest attribution (#470).
+            stamped = fragment.model_copy(deep=True)
             manifest = load_author_manifest_or_default(self.vault_path, slug)
-            _apply_other_author_attribution(fragment, manifest)
+            _apply_other_author_attribution(stamped, manifest)
             target_dir = self.vault_path / OTHER_AUTHORS_DIR / slug
-            return self._write_model(fragment, target_dir, body=body)
+            return self._write_model(stamped, target_dir, body=body)
         platform = fragment.source.platform
         subfolder = _PLATFORM_SUBFOLDER[str(platform)]
         target_dir = self.vault_path / "01-Fragments" / subfolder
