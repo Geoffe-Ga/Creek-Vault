@@ -201,6 +201,10 @@ class AuthoredDraft(BaseModel):
             ``ESCALATE`` (or ``REVISE``) verdict is actionable — a human can see
             exactly which dimensions failed rather than being told only that the
             draft was escalated.
+        usage: Token-usage counts from the voice LLM call (``input_tokens``,
+            ``output_tokens`` and, with prompt caching, the ``cache_*`` reads),
+            or ``None`` when the run took the deterministic/offline path. Lets a
+            caller observe a run's cost and cache-hit rate (#474).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -212,6 +216,7 @@ class AuthoredDraft(BaseModel):
     verdict: ReflectionVerdict
     rounds: int = Field(ge=1)
     findings: list[ReflectionFinding] = Field(default_factory=list)
+    usage: dict[str, int] | None = None
 
     # BUG-009: the ``[prop-decorator]`` suppression is the known mypy /
     # Pydantic-v2 limitation when stacking ``@computed_field`` over
