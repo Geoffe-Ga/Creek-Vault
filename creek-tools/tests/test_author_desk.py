@@ -139,6 +139,17 @@ def test_conductor_respects_max_rounds(tmp_path: Path) -> None:
     assert revising.review.call_count == 2
 
 
+def test_conductor_rejects_zero_max_rounds() -> None:
+    """``max_rounds`` below 1 is rejected — the voice/reflect loop must run (#473)."""
+    with pytest.raises(ValueError, match="max_rounds must be >= 1"):
+        Conductor(
+            specialists=[GraphSpecialist()],
+            voice=VoiceAgent(),
+            reflection=ReflectionNode(),
+            max_rounds=0,
+        )
+
+
 def test_evidence_bundle_dedups_source_fragments() -> None:
     """``all_source_fragments`` is an order-preserving, deduplicated union."""
     bundle = EvidenceBundle(

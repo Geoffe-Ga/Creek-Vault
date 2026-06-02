@@ -155,7 +155,17 @@ class Conductor:
         llm_client: AuthorLLMClient | None = None,
         contract: MediumContract | None = None,
     ) -> None:
-        """Store collaborators, the round bound, and the medium contract."""
+        """Store collaborators, the round bound, and the medium contract.
+
+        Raises:
+            ValueError: When *max_rounds* is below 1 — the voice/reflect loop
+                must run at least once, otherwise ``run`` could not produce a
+                judged draft (``AuthorConfig.max_author_rounds`` is bound
+                ``[1, 10]``; this guards a direct construction with ``0``).
+        """
+        if max_rounds < 1:
+            msg = f"max_rounds must be >= 1, got {max_rounds}"
+            raise ValueError(msg)
         self.specialists = list(specialists)
         self.voice = voice
         self.reflection = reflection
@@ -253,6 +263,10 @@ class Conductor:
             body = self.voice.render(
                 query, evidence, vault, medium=validated, contract=self.contract
             )
+            # voice_fidelity is implemented in the reflection node but stays
+            # dormant here: the owner's fingerprint + AIStyleConfig are not yet
+            # threaded into the desk. Wiring them (and an e2e voice test) is
+            # tracked as #506.
             result = self.reflection.review(
                 body, evidence, rubric, contract=self.contract, vault=vault
             )
