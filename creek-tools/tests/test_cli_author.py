@@ -64,7 +64,7 @@ def test_author_rejects_unknown_medium(tmp_path: Path) -> None:
         [
             "author",
             "--medium",
-            "book-report",
+            "not-a-medium",
             "--query",
             "q",
             "--vault",
@@ -73,7 +73,63 @@ def test_author_rejects_unknown_medium(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "research" in result.output
+    assert "not-a-medium" in result.output
+
+
+def test_author_book_report_requires_work(tmp_path: Path) -> None:
+    """``--medium book-report`` without ``--work`` exits 2 with a clear error."""
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "book-report",
+            "--vault",
+            str(_vault(tmp_path)),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--work" in result.output
+
+
+def test_author_non_book_report_requires_query(tmp_path: Path) -> None:
+    """A non-book-report medium without ``--query`` exits 2 with a clear error."""
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "essay",
+            "--vault",
+            str(_vault(tmp_path)),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--query" in result.output
+
+
+def test_author_book_report_runs_from_work_without_query(tmp_path: Path) -> None:
+    """``--medium book-report --work <path>`` (no ``--query``) prints a draft."""
+    vault = _vault(tmp_path)
+    work = vault / "11-Other-Authors" / "naval-ravikant" / "on-leverage"
+    work.mkdir(parents=True)
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "book-report",
+            "--work",
+            str(work),
+            "--vault",
+            str(vault),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "verdict=" in result.output
 
 
 def test_author_max_rounds_out_of_range(tmp_path: Path) -> None:

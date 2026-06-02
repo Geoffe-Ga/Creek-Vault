@@ -427,7 +427,7 @@ def test_author_tool_rejects_unknown_medium(vault: Path) -> None:
     result = author_tool(
         vault_path=vault,
         query="q",
-        medium="book-report",
+        medium="not-a-medium",
         consumer="test",
     )
     assert result["status"] == "error"
@@ -442,7 +442,7 @@ def test_author_tool_error_envelope_includes_dry_run(vault: Path) -> None:
     result = author_tool(
         vault_path=vault,
         query="q",
-        medium="book-report",
+        medium="not-a-medium",
         dry_run=True,
         consumer="test",
     )

@@ -34,10 +34,10 @@ if TYPE_CHECKING:
     from creek.models import MediumContract
 
 #: Mediums the conductor will run. ``research``/``chat``/``essay``/
-#: ``research-piece`` are wired; the remaining mediums (book-report/how-to)
+#: ``research-piece``/``book-report`` are wired; the remaining mediums (how-to)
 #: arrive later.
 SUPPORTED_MEDIUMS: frozenset[str] = frozenset(
-    {"research", "chat", "essay", "research-piece"}
+    {"research", "chat", "essay", "research-piece", "book-report"}
 )
 
 #: Fixed pipeline steps that follow the specialist roster, in order.

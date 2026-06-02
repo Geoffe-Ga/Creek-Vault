@@ -186,9 +186,9 @@ def test_require_supported_medium_returns_validated_value(
 
 
 def test_run_author_rejects_unknown_medium(tmp_path: Path) -> None:
-    """Only the ``research`` medium is wired; others raise a clear error."""
+    """An unwired medium raises a clear error naming the wired set."""
     with pytest.raises(ValueError, match="research"):
-        run_author(medium="book-report", query="q", vault=tmp_path)
+        run_author(medium="not-a-medium", query="q", vault=tmp_path)
 
 
 def test_author_llm_client_delegates_to_provider() -> None:
