@@ -23,8 +23,8 @@ from creek.generate.ai_style.scanner import scan
 
 # The legacy-alias maps are module-private in creek.models; importing them here
 # reuses the single canonical INC-019 source rather than duplicating the alias
-# vocabulary (kept private as they are an internal taxonomy detail). Promote to
-# a public constant if a third consumer appears.
+# vocabulary. This is the second consumer across the module boundary, so
+# promoting them to a public constant is tracked as #507.
 from creek.models import (
     _FREQUENCY_LEGACY_ALIASES,
     _MODE_LEGACY_ALIASES,
@@ -118,7 +118,9 @@ def check_privacy_compliance(
     contract's ``default_privacy_tier``, the draft breaches privacy iff the body
     still contains that fragment's protected text. The check is deterministic;
     when *vault* or *contract* is ``None`` there is nothing to resolve against,
-    so no finding is raised.
+    so no finding is raised. A cited fragment id with no matching file in the
+    vault is unresolvable (its tier cannot be known) and is skipped rather than
+    guessed — the hard citation gate still requires every claim to carry an id.
 
     Args:
         body: The drafted prose under review.
@@ -165,6 +167,11 @@ def check_ontological_accuracy(body: str) -> list[ReflectionFinding]:
     A word-boundary regex match of any deprecated phase/mode/frequency alias
     key in the body raises a ``MID`` finding naming the canonical replacement.
 
+    Caveat: a few alias keys are ordinary English words (e.g. ``"origins"``),
+    so this word-boundary match can false-positive on non-ontological prose. It
+    is a ``MID`` (soft) finding, so a false hit costs at most one revise round,
+    not a hard block; semantic disambiguation is deferred to #474.
+
     Args:
         body: The drafted prose under review.
 
@@ -172,10 +179,6 @@ def check_ontological_accuracy(body: str) -> list[ReflectionFinding]:
         One ``MID`` finding per legacy alias used, dimension
         ``"ontological_accuracy"``.
     """
-    # Caveat: a few alias keys are ordinary English words (e.g. "origins"), so
-    # this word-boundary match can false-positive on non-ontological prose. It
-    # is a MID (soft) finding, so a false hit costs at most one revise round,
-    # not a hard block; semantic disambiguation is deferred to #474.
     return [
         ReflectionFinding(
             dimension="ontological_accuracy",

@@ -116,6 +116,28 @@ def test_privacy_open_fragment_passes(tmp_path: Path) -> None:
     assert result.findings == []
 
 
+def test_privacy_skips_cited_fragment_absent_from_vault(tmp_path: Path) -> None:
+    """A claim citing a fragment id not present in the vault raises no privacy finding.
+
+    The privacy check can only resolve the tier of fragments it can load; a
+    cited id with no matching vault file is unresolvable, so it is skipped
+    rather than guessed (no crash, no fabricated finding). The claim still
+    carries a source-fragment id, so the hard citation gate is satisfied.
+    """
+    (tmp_path / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-missing"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    result = ReflectionNode().review(
+        "a body with no leak", evidence, contract=contract, vault=tmp_path
+    )
+
+    assert result.decision == "PASS"
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
 def test_resolved_paradox_revises_with_paradox_finding() -> None:
     """A flattened paradox (no contrast cue) → REVISE + paradox_preservation."""
     evidence = EvidenceBundle(
