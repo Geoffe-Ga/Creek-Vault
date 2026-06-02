@@ -133,6 +133,36 @@ def test_default_privacy_tier_parses(tmp_path: Path) -> None:
     assert load_author_manifest(path).default_privacy_tier == PrivacyTier.OPEN
 
 
+def test_default_privacy_tier_fails_closed_on_garbage(tmp_path: Path) -> None:
+    """An unrecognised ``default_privacy_tier`` fails closed to OPEN, not raising."""
+    body = _FULL_MANIFEST.replace(
+        "default_privacy_tier: open", "default_privacy_tier: banana"
+    )
+    path = _write_manifest(tmp_path, "bad-tier", body)
+
+    assert load_author_manifest(path).default_privacy_tier == PrivacyTier.OPEN
+
+
+def test_attribution_required_fails_closed_on_non_bool(tmp_path: Path) -> None:
+    """A non-boolean ``attribution_required`` fails closed to True (require it)."""
+    body = _FULL_MANIFEST.replace(
+        "attribution_required: true", "attribution_required: maybe"
+    )
+    path = _write_manifest(tmp_path, "bad-attr", body)
+
+    assert load_author_manifest(path).attribution_required is True
+
+
+def test_attribution_required_false_is_preserved(tmp_path: Path) -> None:
+    """A genuine ``false`` for ``attribution_required`` is kept, not forced True."""
+    body = _FULL_MANIFEST.replace(
+        "attribution_required: true", "attribution_required: false"
+    )
+    path = _write_manifest(tmp_path, "attr-false", body)
+
+    assert load_author_manifest(path).attribution_required is False
+
+
 def test_missing_file_raises(tmp_path: Path) -> None:
     """A missing manifest path raises a clear ``FileNotFoundError``."""
     missing = tmp_path / "11-Other-Authors" / "ghost" / "_author.md"

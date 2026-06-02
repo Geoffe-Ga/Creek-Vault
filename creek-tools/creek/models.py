@@ -475,10 +475,10 @@ def _safe_float(value: object) -> float | None:
 class AuthorManifest(BaseModel):
     """Attribution manifest for an ``11-Other-Authors/<slug>/`` entry (FEAT-041 §7.2).
 
-    Parsed from an ``_author.md`` frontmatter block. Every attribution field
-    *fails closed*: a malformed value resolves to the most conservative
-    default (no voice influence, attribution required) rather than raising, so
-    a hand-edited manifest can never crash the pipeline.
+    Parsed from an ``_author.md`` frontmatter block. Every field *fails
+    closed*: a malformed value resolves to a safe default (no voice influence,
+    attribution required, the default OPEN privacy tier) rather than raising,
+    so a hand-edited manifest can never crash the pipeline.
 
     Attributes:
         author_slug: Identity key; the loader sets this from the folder name.
@@ -535,6 +535,32 @@ class AuthorManifest(BaseModel):
                 )
             return 0.0
         return weight
+
+    @field_validator("default_privacy_tier", mode="before")
+    @classmethod
+    def _coerce_privacy_tier(cls, value: object) -> PrivacyTier:
+        """Fail closed to the default OPEN tier for an unrecognised privacy tier."""
+        if isinstance(value, PrivacyTier):
+            return value
+        if isinstance(value, str):
+            try:
+                return PrivacyTier(value)
+            except ValueError:
+                _warn_fail_closed("default_privacy_tier", value, "open")
+        elif value is not None:
+            _warn_fail_closed("default_privacy_tier", value, "open")
+        return PrivacyTier.OPEN
+
+    @field_validator("attribution_required", mode="before")
+    @classmethod
+    def _coerce_attribution_required(cls, value: object) -> bool:
+        """Fail closed to ``True`` (require attribution) for a non-boolean value."""
+        if isinstance(value, bool):
+            return value
+        logger.warning(
+            "attribution_required %r is not a boolean; failing closed to True.", value
+        )
+        return True
 
 
 # ---- Nested Models ----
