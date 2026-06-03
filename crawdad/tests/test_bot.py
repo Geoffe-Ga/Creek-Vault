@@ -440,9 +440,11 @@ async def test_handle_message_runs_full_loop(
 
     assert len(channel.sent) == 1
     assert channel.sent[0] == "voice-faithful reply"
-    # History records the user turn and the assistant reply.
+    # History records the user turn, the round-1 tool result fed back to
+    # the router (#526), and the assistant reply.
     entries = history.as_list()
-    assert [e.role for e in entries] == ["user", "assistant"]
+    assert [e.role for e in entries] == ["user", "tool", "assistant"]
+    assert "state body" in entries[1].content
 
 
 async def test_handle_message_router_parse_error_uses_soft_reply(

@@ -800,3 +800,97 @@ async def test_run_one_turn_default_max_rounds_uses_module_constant(
 
     assert outcome.kind == "too_deep"
     assert len(router.calls) == MAX_LOOP_ROUNDS
+
+
+class _ConvergingRouter:
+    """A deterministic router that converges once it sees tool results.
+
+    Models the real Haiku router's documented contract (#526): it keeps
+    asking for the same tool until it observes that round's results
+    threaded back into the conversation history, then sets
+    ``compose=true``. If the loop never feeds tool results into the
+    router's context, this router loops forever — exactly the bug.
+    """
+
+    def __init__(self, *, tool: str) -> None:
+        """Record the tool to request until results land in history."""
+        self._tool = tool
+        self.calls: list[dict[str, Any]] = []
+
+    async def extract_intents(self, **kwargs: Any) -> RouterResponse:
+        """Compose once the requested tool's body appears in history."""
+        self.calls.append(kwargs)
+        history: ConversationHistory = kwargs["history"]
+        seen_results = any(
+            self._tool in entry.content
+            for entry in history.as_list()
+            if entry.role not in {"user", "assistant"}
+        )
+        if seen_results:
+            return RouterResponse(intents=[], compose=True)
+        return RouterResponse(intents=[Intent(type=self._tool)])
+
+
+async def test_loop_converges_when_tool_results_feed_back_to_router(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """#526: round-1 tool results reach the router so round 2 composes.
+
+    A deterministic router that only composes after it observes the
+    dispatched tool's results in history must converge to a composed
+    reply — not exhaust the round cap and fall back to ``too_deep``.
+    """
+    router = _ConvergingRouter(tool="creek.state.read")
+    session = _ScriptedSession(replies={"creek.state.read": "state body"})
+    composer = _ScriptedComposer("converged reply")
+    history = ConversationHistory()
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(session),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=history,
+        session_state=state,
+        skills=skills,
+    )
+
+    outcome = await loop.run("what's my state?")
+
+    assert outcome.kind == "composed"
+    assert outcome.reply == "converged reply"
+    # Round 1 dispatched the tool; round 2 saw the result and composed.
+    assert len(router.calls) == 2
+    # Round 2's router pass observed round 1's tool result in history.
+    round_two_history = router.calls[1]["history"].as_list()
+    assert any(
+        "state body" in entry.content and entry.role not in {"user", "assistant"}
+        for entry in round_two_history
+    )
+    # The composer still received the aggregated results exactly once.
+    assert {r.intent_type for r in composer.calls[0]["tool_results"]} == {
+        "creek.state.read"
+    }
+
+
+def test_record_tool_round_skips_empty_results(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """An empty dispatch round records nothing in the router's history.
+
+    Guards against polluting the transcript (and the next router pass)
+    with an empty ``tool`` turn when a round produced no results.
+    """
+    history = ConversationHistory()
+    loop = AgentLoop(
+        router=_ScriptedRouter([]),  # type: ignore[arg-type]
+        composer=_ScriptedComposer("unused"),  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(_ScriptedSession()),  # type: ignore[arg-type]
+        known_tools=(),
+        history=history,
+        session_state=state,
+        skills=skills,
+    )
+
+    loop._record_tool_round([])
+
+    assert history.as_list() == []
