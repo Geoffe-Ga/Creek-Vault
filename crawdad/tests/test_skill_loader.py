@@ -36,7 +36,7 @@ def vault_with_voice_tree(tmp_path: Path) -> Path:
     (skills / "phases" / "rising.SKILL.md").write_text(
         "# Rising\nAct on energy; mine and draft are welcome.", encoding="utf-8"
     )
-    (skills / "phases" / "bottoming-out.SKILL.md").write_text(
+    (skills / "phases" / "bottoming_out.SKILL.md").write_text(
         "# Bottoming Out\nCompost; never urge action.", encoding="utf-8"
     )
     (skills / "registers").mkdir()
@@ -67,14 +67,24 @@ def test_load_skills_returns_voice_core_phase_and_register(
 def test_load_skills_picks_phase_matching_wavelength(
     vault_with_voice_tree: Path,
 ) -> None:
-    """A Bottoming-Out wavelength loads ``bottoming-out.SKILL.md``."""
-    state = _make_state("bottoming-out")
+    """A ``bottoming_out`` wavelength loads ``bottoming_out.SKILL.md`` (#528).
+
+    The canonical phase enum value is ``bottoming_out`` with an
+    underscore (see the Creek ontology + ``creek.models.Phase``), and
+    the wavelength snapshot renders that value verbatim. The phase
+    regex must capture the full underscored slug so the loader resolves
+    ``phases/bottoming_out.SKILL.md`` instead of silently dropping the
+    phase skill — a voice-fidelity regression with no error surfaced.
+    """
+    state = _make_state("bottoming_out")
 
     stack = load_skills_for_session(vault_path=vault_with_voice_tree, state=state)
 
     bodies = stack.bodies()
     assert any("Bottoming Out" in body for body in bodies)
     assert not any("Rising" in body for body in bodies)
+    # The phase skill is tagged with the intact underscored slug.
+    assert "phase:bottoming_out" in stack.names()
 
 
 def test_load_skills_supports_extra_registers(

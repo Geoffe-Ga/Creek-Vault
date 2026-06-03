@@ -353,6 +353,26 @@ def test_resolve_phase_from_session_state(vault_with_state: Path) -> None:
     assert resolve_phase(state) == "rising"
 
 
+def test_resolve_phase_keeps_underscore_in_bottoming_out() -> None:
+    """``resolve_phase`` keeps the underscore in ``bottoming_out`` (#528).
+
+    The canonical phase enum value is ``bottoming_out`` and the
+    wavelength snapshot renders it verbatim. If the phase regex drops
+    the underscore, ``{{state.phase}}`` interpolates to ``bottoming``
+    and the loader (and any phase-aware workflow) silently misfires.
+    """
+    state = SessionState(
+        raw_markdown="",
+        wavelength_snapshot=(
+            "## Wavelength snapshot\n- Phase: **bottoming_out** (confidence 0.71)"
+        ),
+        eddies=(),
+        threads=(),
+        suggested_questions=(),
+    )
+    assert resolve_phase(state) == "bottoming_out"
+
+
 def test_resolve_phase_returns_none_on_missing_state() -> None:
     """No session state ⇒ no phase."""
     assert resolve_phase(None) is None
@@ -717,7 +737,7 @@ async def test_walker_refuses_phase_aware_with_disallowed_phase(
         known_tools=("creek.state.read", "creek.mine"),
     )
     wf = _simple_workflow(
-        phase_aware=True, allowed_phases=("bottoming-out", "withdrawal")
+        phase_aware=True, allowed_phases=("bottoming_out", "withdrawal")
     )
 
     with pytest.raises(WorkflowConstraintError, match="refuses to run in phase"):
