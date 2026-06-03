@@ -3298,7 +3298,8 @@ def test_voice_check_missing_fingerprint_is_graceful(
         ["voice-check", str(target), "--vault", str(vault)],
     )
 
-    assert result.exception is None or isinstance(result.exception, SystemExit)
+    # fail-open: an un-profiled vault must not block (exit 0, not 1/2).
+    assert result.exit_code == 0, result.output
     plain = _strip_ansi(result.output).lower()
     assert "fingerprint" in plain
     assert "report --type fingerprint" in plain
@@ -3351,6 +3352,64 @@ def test_voice_check_json_flag_emits_machine_output(
     assert "voice_distance" in payload
     assert payload["in_voice"] is True
     assert payload["max_distance"] == pytest.approx(0.35)
+
+
+def test_voice_check_json_survives_square_brackets_in_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--json`` stays valid JSON when a finding message contains ``[...]``.
+
+    Rich treats ``[...]`` as console markup; emitting the JSON through Rich
+    would mangle a finding message such as ``"saw [link] markup"``. The
+    output must be raw so ``json.loads`` round-trips the brackets intact.
+    """
+    import json
+
+    from creek.generate.ai_style.model import Finding, ScanReport, Span
+
+    bracketed = "over-used [citation] and [link] markup tells"
+    crafted = ScanReport(
+        findings=[
+            Finding(
+                tell_id="t1",
+                category="rhetorical",
+                feature_key="brackets",
+                span=Span(0, 0),
+                line=3,
+                excerpt="",
+                draft_rate=1.0,
+                user_rate=0.0,
+                direction="over",
+                message=bracketed,
+            ),
+        ],
+        deltas={},
+        voice_distance=0.99,
+        thin_fingerprint=False,
+    )
+    monkeypatch.setattr(
+        "creek.generate.ai_style.scanner.scan",
+        lambda *_args, **_kwargs: crafted,
+    )
+
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    target = tmp_path / "bracketed.md"
+    target.write_text("body with [brackets] in it\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault), "--json"],
+    )
+
+    # Diverging file exits 1, but the JSON body must still parse cleanly.
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["findings"][0]["message"] == bracketed
 
 
 def test_voice_check_builds_fingerprint_when_not_persisted(

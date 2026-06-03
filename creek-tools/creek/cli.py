@@ -20,7 +20,7 @@ from creek.classify.privacy_filter import (
     parse_include_tier,
     record_privacy_override,
 )
-from creek.config import load_config, resolve_config_path
+from creek.config import AIStyleConfig, load_config, resolve_config_path
 from creek.consent import ConsentManager
 from creek.models import PrivacyTier
 from creek.pipeline import Pipeline, RedactionRequiredError
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from creek.classify.prompt import PromptOntology
-    from creek.config import AIStyleConfig, CreekConfig
+    from creek.config import CreekConfig
     from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
     from creek.generate.compost_embedding import CompostExemplar
     from creek.generate.compost_verifier import SupportsVerifyCompost
@@ -1303,24 +1303,13 @@ def _report_fingerprint(vault_path: Path) -> None:
     )
 
 
-def _default_voice_max_distance() -> float:
-    """Return the default ``voice-check`` distance ceiling from config.
+_DEFAULT_VOICE_MAX_DISTANCE: float = AIStyleConfig().voice_distance_upper
+"""Default ``--max-distance`` for ``creek voice-check`` (config-sourced).
 
-    Sources the threshold from
-    :attr:`creek.config.AIStyleConfig.voice_distance_upper` rather than
-    hard-coding a magic number, so the CLI default tracks the same
-    constant the draft guard and the lint check use.
-
-    Returns:
-        The configured ``voice_distance_upper`` default.
-    """
-    from creek.config import AIStyleConfig
-
-    return AIStyleConfig().voice_distance_upper
-
-
-_DEFAULT_VOICE_MAX_DISTANCE: float = _default_voice_max_distance()
-"""Default ``--max-distance`` for ``creek voice-check`` (config-sourced)."""
+Sourced directly from
+:attr:`creek.config.AIStyleConfig.voice_distance_upper` so the CLI default
+tracks the same constant the draft guard and the lint check use.
+"""
 
 
 def _resolve_voice_fingerprint(
@@ -1420,7 +1409,9 @@ def _emit_voice_check_json(
             for finding in report.findings
         ],
     }
-    console.print(json.dumps(payload, indent=2))
+    # Emit raw so Rich never interprets ``[...]`` in the content as markup
+    # and mangles the JSON (e.g. a finding message containing brackets).
+    typer.echo(json.dumps(payload, indent=2))
 
 
 @app.command(name="voice-check")
