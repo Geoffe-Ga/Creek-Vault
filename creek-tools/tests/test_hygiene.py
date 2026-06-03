@@ -353,6 +353,68 @@ class TestBrokenLinkScanner:
         result = scanner.scan(vault)
         assert result.total_broken == 3
 
+    def test_long_absolute_image_url_with_title_not_broken(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A long absolute image URL with a title does not crash or report (#543)."""
+        vault = _make_vault(tmp_path)
+        long_url = "https://substackcdn.com/image/fetch/" + "a" * 4000 + ".png"
+        _write_fragment(
+            vault,
+            "substack-image",
+            content=f'![alt text]({long_url} "an image title")',
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_protocol_relative_url_ignored(self, tmp_path: Path) -> None:
+        """Protocol-relative (``//host/...``) URLs are not treated as local (#543)."""
+        vault = _make_vault(tmp_path)
+        long_target = "//substackcdn.com/image/" + "b" * 5000 + ".png"
+        _write_fragment(
+            vault,
+            "proto-rel",
+            content=f"![img]({long_target})",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_mailto_link_ignored(self, tmp_path: Path) -> None:
+        """``mailto:`` links are external and not reported as broken (#543)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(
+            vault,
+            "mail",
+            content="Reach me at [email](mailto:geoff@example.com).",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_pathological_relative_target_does_not_crash(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An over-long relative file target degrades gracefully (#543).
+
+        A target with no URL scheme but an over-long path segment would
+        raise ``OSError`` from ``Path.exists()``; the scan must not crash.
+        """
+        vault = _make_vault(tmp_path)
+        long_name = "c" * 5000 + ".md"
+        _write_fragment(
+            vault,
+            "pathological",
+            content=f"See [doc]({long_name}) for more.",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        # Must not raise; the unresolvable target is treated as not-a-file.
+        assert result.total_broken == 0
+
 
 # ---------------------------------------------------------------------------
 # DuplicateScanner tests
@@ -539,4 +601,27 @@ class TestLinkExtraction:
         from creek.clean.hygiene import _extract_relative_links
 
         content = "See [section](#heading) for details."
+        assert _extract_relative_links(content) == []
+
+    def test_extract_relative_links_protocol_relative_ignored(self) -> None:
+        """Protocol-relative (``//host``) targets are excluded (#543)."""
+        from creek.clean.hygiene import _extract_relative_links
+
+        content = "![img](//cdn.example.com/x.png)"
+        assert _extract_relative_links(content) == []
+
+    def test_extract_relative_links_mailto_ignored(self) -> None:
+        """``mailto:`` targets are excluded (#543)."""
+        from creek.clean.hygiene import _extract_relative_links
+
+        content = "[mail](mailto:foo@bar.com)"
+        assert _extract_relative_links(content) == []
+
+    def test_extract_relative_links_scheme_with_leading_space_ignored(
+        self,
+    ) -> None:
+        """A scheme target with leading whitespace is still excluded (#543)."""
+        from creek.clean.hygiene import _extract_relative_links
+
+        content = "[x]( https://example.com/y)"
         assert _extract_relative_links(content) == []
