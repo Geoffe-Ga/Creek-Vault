@@ -25,6 +25,7 @@ from creek.author.skills import (
     find_voice_core,
     read_skill,
 )
+from creek.generate.ontology_glossary import GLOSS_STEER
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -235,6 +236,7 @@ def _ask_section(
         "journal, note, or entry, and never narrate that you are quoting "
         "yourself. State the idea, not its provenance.",
         "Do not quote borrowed authors as my own words.",
+        GLOSS_STEER,
     ]
     if contract is not None and contract.structure:
         order = " → ".join(contract.structure)

@@ -66,6 +66,7 @@ from creek.generate.grounding import (
     scan_biographical_sentences,
     score_draft,
 )
+from creek.generate.ontology_glossary import GLOSS_STEER
 from creek.generate.outline import (
     OutlineSection,
     build_stitch_prompt,
@@ -2472,6 +2473,14 @@ _NO_PROVENANCE_STEER = (
     "State the idea, not its provenance."
 )
 
+#: Prompt steer asking the model to gloss each bespoke ontology term in the
+#: owner's voice on its first mention so a newcomer can follow. Appended to every
+#: ``## Ask`` variant and pinned by a structure test so it can never silently
+#: drop out of the prompt. Sourced from the glossary registry's
+#: :data:`~creek.generate.ontology_glossary.GLOSS_STEER` so the draft and voice
+#: surfaces carry identical wording.
+_GLOSS_STEER = GLOSS_STEER
+
 
 def _compose_ask_section(
     idea: IdeaSeed,
@@ -2489,10 +2498,10 @@ def _compose_ask_section(
     the original wording so existing tests and mined-idea drafts
     continue to compose identically.
 
-    Every variant ends with :data:`_NO_FABRICATION_STEER` and
-    :data:`_NO_PROVENANCE_STEER` so the draft prompt always carries the
-    issue #515 no-fabrication instruction and the issue #517 weave-the-source-in
-    instruction.
+    Every variant ends with :data:`_NO_FABRICATION_STEER`,
+    :data:`_NO_PROVENANCE_STEER` and :data:`_GLOSS_STEER` so the draft prompt
+    always carries the no-fabrication, weave-the-source-in, and
+    gloss-bespoke-terms-on-first-mention instructions.
     """
     if twist:
         return (
@@ -2505,7 +2514,7 @@ def _compose_ask_section(
             "verbatim — recombine across the corpus. Honour the "
             "activated skills. Write as the human — not as an AI. "
             "Cite source fragments by their IDs where relevant. "
-            f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER}"
+            f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} {_GLOSS_STEER}"
         )
     if per_dimension:
         return (
@@ -2517,7 +2526,8 @@ def _compose_ask_section(
             "rather than treating any one section as the source of "
             "truth. Honour the activated skills. Write as the human — "
             "not as an AI. Cite source fragments by their IDs where "
-            f"relevant. {_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER}"
+            f"relevant. {_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} "
+            f"{_GLOSS_STEER}"
         )
     return (
         "## Ask\n"
@@ -2525,7 +2535,7 @@ def _compose_ask_section(
         f"{idea.brief_description} "
         "Write as the human — not as an AI. Honour the activated "
         f"skills. Cite source fragments by their IDs where relevant. "
-        f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER}"
+        f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER} {_GLOSS_STEER}"
     )
 
 
