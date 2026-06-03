@@ -347,11 +347,20 @@ a comma, so a multi-clause biographical sentence ("Not the LDS Christ I was
 handed as a kid—the one I actually believe in.") is scored as one unit rather
 than fragmented into clauses that each lose their grounding context.
 
-Note: newline handling is performed by the ``splitlines()`` pre-pass in
-:func:`split_sentences`, *before* this regex ever runs. A sentence
-soft-wrapped across two markdown lines is therefore split at the newline by
-that pre-pass — a known edge handled separately (see issue #522, a follow-up
-to #417)."""
+Note: newline handling is performed before this regex ever runs, in the
+soft-wrap join pass of :func:`split_sentences`. Consecutive non-blank lines
+inside one paragraph are folded into a single flowing block (joined on a
+space) first, so a sentence soft-wrapped across two markdown lines reaches
+this regex whole rather than truncated at the newline."""
+
+
+_STRUCTURAL_LINE_RE = re.compile(r"^(?:#{1,6}\s|\s*(?:[-*+]|\d+\.)\s)")
+"""A markdown line that is structural, not flowing prose.
+
+Matches an ATX heading (``# `` … ``###### ``) or a list item (``- ``, ``* ``,
+``+ ``, or ``1. ``). Such a line is a hard boundary: it is never folded into an
+adjacent text line by the soft-wrap join, so a heading stays dropped and a list
+marker stays separate from the paragraph beside it."""
 
 
 _BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -416,30 +425,55 @@ class BiographicalGroundingFinding:
     max_similarity: float
 
 
+def _logical_blocks(body: str) -> list[str]:
+    """Fold *body*'s physical lines into flowing logical blocks.
+
+    Consecutive non-blank prose lines inside one paragraph are a single
+    soft-wrapped sentence-or-more and are joined on a space. A blank line is a
+    hard paragraph boundary that flushes the current block, and a structural
+    line — a heading or list marker (:data:`_STRUCTURAL_LINE_RE`) — is its own
+    boundary that is dropped from the prose stream rather than folded into a
+    neighbour.
+    """
+    blocks: list[str] = []
+    buffer: list[str] = []
+
+    def _flush() -> None:
+        if buffer:
+            blocks.append(" ".join(buffer))
+            buffer.clear()
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or _STRUCTURAL_LINE_RE.match(stripped):
+            _flush()
+            continue
+        buffer.append(stripped)
+    _flush()
+    return blocks
+
+
 def split_sentences(body: str) -> list[str]:
     """Split *body* into trimmed, non-empty sentences.
 
     Sentences are separated on whitespace following terminal punctuation
-    (``.``, ``!``, ``?``); blank lines and headings collapse away. The split
-    is intentionally coarse — its only job is to isolate a first-person
-    biographical claim from the rest of an otherwise on-topic paragraph so
-    the grounding scan scores the claim, not the paragraph that hides it.
+    (``.``, ``!``, ``?``); blank lines, headings, and list markers collapse
+    away. The split is intentionally coarse — its only job is to isolate a
+    first-person biographical claim from the rest of an otherwise on-topic
+    paragraph so the grounding scan scores the claim, not the paragraph that
+    hides it.
 
-    Newline handling happens here, in the ``body.splitlines()`` pre-pass:
-    each physical line is processed independently and only then is
-    :data:`_SENTENCE_SPLIT_RE` applied. A single sentence that is
-    soft-wrapped across two markdown lines is therefore split at the newline
-    rather than kept whole — a known edge tracked in issue #522 (follow-up to
-    #417); the regex's own "never split on a newline" guarantee applies only
-    *within* a physical line.
+    Soft-wrapped lines are folded into logical blocks *before* splitting (see
+    :func:`_logical_blocks`): consecutive non-blank prose lines inside one
+    paragraph join on a space, so a sentence soft-wrapped across two markdown
+    lines reaches :data:`_SENTENCE_SPLIT_RE` whole rather than truncated at the
+    newline. Blank lines remain hard paragraph boundaries, and a heading or
+    list marker is its own boundary that never merges into adjacent prose.
     """
     sentences: list[str] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
+    for block in _logical_blocks(body):
         sentences.extend(
-            part.strip() for part in _SENTENCE_SPLIT_RE.split(stripped) if part.strip()
+            part.strip() for part in _SENTENCE_SPLIT_RE.split(block) if part.strip()
         )
     return sentences
 
