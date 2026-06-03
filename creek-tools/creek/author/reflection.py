@@ -19,6 +19,7 @@ from creek.author.checks import (
     check_ontological_accuracy,
     check_paradox_preservation,
     check_privacy_compliance,
+    check_unglossed_jargon,
     check_voice_fidelity,
 )
 from creek.author.models import (
@@ -106,6 +107,7 @@ class ReflectionNode:
         findings.extend(check_citation_completeness(evidence))
         findings.extend(check_privacy_compliance(body, evidence, vault, contract))
         findings.extend(check_ontological_accuracy(body))
+        findings.extend(check_unglossed_jargon(body))
         findings.extend(check_paradox_preservation(body, evidence))
         findings.extend(check_attribution_correctness(body, evidence))
         findings.extend(check_voice_fidelity(body, fingerprint, ai_style_config))

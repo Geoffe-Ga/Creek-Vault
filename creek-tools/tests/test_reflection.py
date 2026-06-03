@@ -83,6 +83,30 @@ def test_alias_misuse_revises_with_ontology_finding() -> None:
     assert "rising" in finding.message
 
 
+def test_unglossed_jargon_revises_with_jargon_finding() -> None:
+    """A bespoke term used without a gloss → REVISE + unglossed_jargon finding."""
+    body = "The whole arc climbs toward Ultraviolet and then settles."
+
+    result = ReflectionNode().review(body, _grounded())
+
+    assert result.decision == "REVISE"
+    finding = next(f for f in result.findings if f.dimension == "unglossed_jargon")
+    assert finding.severity == "MID"
+    assert "Ultraviolet" in finding.message
+
+
+def test_glossed_jargon_raises_no_jargon_finding() -> None:
+    """A bespoke term glossed on first mention → no unglossed_jargon finding."""
+    body = (
+        "The whole arc climbs toward Ultraviolet — the altitude where your own "
+        "will quiets and something larger acts through you."
+    )
+
+    result = ReflectionNode().review(body, _grounded())
+
+    assert not any(f.dimension == "unglossed_jargon" for f in result.findings)
+
+
 def test_privacy_leak_revises_with_privacy_finding(tmp_path: Path) -> None:
     """A cited intimate fragment leaked above the OPEN default → privacy finding."""
     secret = "the intimate confession nobody should publish"
