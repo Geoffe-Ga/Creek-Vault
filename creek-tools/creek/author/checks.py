@@ -23,6 +23,7 @@ import yaml
 from creek.author.models import ReflectionFinding
 from creek.generate.ai_style.scanner import scan
 from creek.generate.grounding import scan_biographical_sentences
+from creek.generate.jargon import detect_unglossed_jargon
 
 # Reuse the canonical INC-019 alias vocabulary (public constants) rather than
 # duplicating it, so the ontological-accuracy check and the model validators
@@ -271,6 +272,33 @@ def check_ontological_accuracy(body: str) -> list[ReflectionFinding]:
         )
         for alias, canonical in _LEGACY_ALIASES.items()
         if re.search(rf"\b{re.escape(alias)}\b", body, flags=re.IGNORECASE)
+    ]
+
+
+def check_unglossed_jargon(body: str) -> list[ReflectionFinding]:
+    """Flag bespoke ontology terms used on first mention without a gloss.
+
+    Wraps the conservative :func:`detect_unglossed_jargon` detector: each
+    un-glossed first mention of a bespoke term (a Frequency, Phase, Mode,
+    altitude, or named concept) becomes a ``MID`` ``unglossed_jargon`` finding so
+    a newcomer-facing draft can be revised to weave the gloss in. The detector is
+    biased toward false negatives (it never flags a term with any nearby
+    explanatory phrasing), so a finding here is a soft nudge, not a hard block.
+
+    Args:
+        body: The drafted prose under review.
+
+    Returns:
+        One ``MID`` finding per un-glossed first mention, dimension
+        ``"unglossed_jargon"``.
+    """
+    return [
+        ReflectionFinding(
+            dimension="unglossed_jargon",
+            severity="MID",
+            message=finding.message,
+        )
+        for finding in detect_unglossed_jargon(body)
     ]
 
 

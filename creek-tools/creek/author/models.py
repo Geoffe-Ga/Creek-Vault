@@ -39,6 +39,7 @@ FindingDimension = Literal[
     "paradox_preservation",
     "attribution_correctness",
     "biographical_grounding",
+    "unglossed_jargon",
 ]
 
 
