@@ -143,6 +143,31 @@ class TestNegativeParallelismRegex:
             NEGATIVE_PARALLELISM_RE.search("Not my best work but it is honest") is None
         )
 
+    def test_different_prepositions_does_not_match(self) -> None:
+        """`not <prep> X but <prep'> Y` with DIFFERENT prepositions must not flag.
+
+        The bare ``not <prep> … but <prep>`` arm requires the SAME preposition
+        on both sides via a backreference — that shared preposition is what
+        makes the construction parallel antithesis rather than a casual aside.
+        Here ``through`` and ``with`` differ, so the arm must not fire.
+        """
+        assert (
+            NEGATIVE_PARALLELISM_RE.search("He gave not through duty but with love.")
+            is None
+        )
+
+    def test_pronoun_to_pronoun_disagreement_does_not_match(self) -> None:
+        """A bare-pronoun first subject echoed by a different pronoun is not antithesis.
+
+        "She isn't happy. They are sad." pairs unrelated referents: the cross-
+        sentence arm requires the first clause to carry a concrete ``the <noun>``
+        subject, so a pronoun-led first clause cannot anchor a pronoun echo.
+        This excludes the over-match while keeping the noun→pronoun echo
+        ("The parables … They") and repeated-noun ("The work … The work") paths.
+        """
+        pair = "She isn't happy. They are sad."
+        assert NEGATIVE_PARALLELISM_RE.search(pair) is None
+
 
 class TestNegativeParallelismDensity:
     """The density extractor over the broadened pattern (issue #516)."""

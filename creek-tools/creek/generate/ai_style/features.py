@@ -274,14 +274,23 @@ def vague_attribution_density(text: str) -> float:
 #   3. ``it's not X, it's Y`` (contracted, comma-then-``it's``) and its
 #      uncontracted twin ``it is not X[,] it is Y`` / ``it is not about X[,]
 #      it is about Y``.
-#   4. Cross-sentence subject restatement ``X isn't/weren't Y. <subject>
-#      is/are/was/were/makes Z`` — the negated claim then its affirming echo,
-#      e.g. "The parables weren't instruction manuals. They were field reports."
-#      The echoed subject must be a *genuine* restatement: either a pronoun
-#      (they/it/he/she/we) or the SAME noun repeated (``the <noun>`` …
-#      ``the <noun>`` via the ``xnoun`` backreference). A fresh ``The <word>``
-#      with a different noun is not antithesis and must not match, e.g.
-#      "The algorithm doesn't converge. The teacher is patient."
+#   4. Cross-sentence subject restatement ``The <noun> isn't/weren't Y.
+#      <subject> is/are/was/were/makes Z`` — the negated claim then its
+#      affirming echo, e.g. "The parables weren't instruction manuals. They
+#      were field reports." The first clause MUST carry a concrete ``the
+#      <noun>`` subject; the echoed subject is then either a pronoun
+#      (they/it/he/she/we) or the SAME noun repeated (``the <noun>`` via the
+#      ``xnoun`` backreference). Requiring the concrete-noun lead anchors the
+#      pronoun echo to a real referent: a bare-pronoun first clause echoed by an
+#      unrelated pronoun ("She isn't happy. They are sad.") no longer matches,
+#      because the two pronouns can name different referents. A fresh ``The
+#      <word>`` with a *different* noun is likewise not antithesis, e.g. "The
+#      algorithm doesn't converge. The teacher is patient." Residual trade-off:
+#      a genuine antithesis whose first subject is itself a pronoun ("It isn't
+#      X. It is Y.") is not caught by this arm — but that contracted/pronoun
+#      family is already covered by the ``it's not X, it's Y`` and ``it is not
+#      X … it is`` alternations above, so the loss is only the
+#      pronoun→pronoun-disagreement case we intend to exclude.
 #   5. Em-dash antithesis ``it doesn't … — it …``.
 #   6. ``no X, no Y, just/but``.
 # Calibration: every alternation requires a contrasting second clause (a bare
@@ -293,7 +302,7 @@ NEGATIVE_PARALLELISM_RE = re.compile(
     r"[^.!?\n]{1,80}?,?\s*\bbut (?P=prep)\b"
     r"|\bit'?s not (?:just |merely |only )?[^.!?\n]{1,60}?,\s*it'?s\b"
     r"|\bit is not (?:just |merely |only |about )?[^.!?\n]{1,60}?,?\s*it is\b"
-    r"|\b(?:the (?P<xnoun>[a-z]+) )?"
+    r"|\bthe (?P<xnoun>[a-z]+) "
     r"(?:is|are|was|were|do|does)n'?t\b[^.!?\n]{1,80}?[.!?]\s+"
     r"(?:(?:they|it|he|she|we)|the (?P=xnoun))\b[^.!?\n]{0,12}?"
     r"\b(?:is|are|was|were|do|does|make|makes)\b"
