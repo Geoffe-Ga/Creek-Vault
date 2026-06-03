@@ -33,6 +33,7 @@ full sentence-transformer at unit-test time.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict, final
@@ -332,6 +333,188 @@ def split_paragraphs(body: str) -> list[str]:
     if buffer:
         paragraphs.append("\n".join(buffer).strip())
     return [p for p in paragraphs if p]
+
+
+# ---------------------------------------------------------------------------
+# Sentence-level biographical grounding (issue #515)
+# ---------------------------------------------------------------------------
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+"""Boundary between sentences: whitespace following terminal punctuation.
+
+Conservative on purpose — this regex itself never splits on a bare newline or
+a comma, so a multi-clause biographical sentence ("Not the LDS Christ I was
+handed as a kid—the one I actually believe in.") is scored as one unit rather
+than fragmented into clauses that each lose their grounding context.
+
+Note: newline handling is performed by the ``splitlines()`` pre-pass in
+:func:`split_sentences`, *before* this regex ever runs. A sentence
+soft-wrapped across two markdown lines is therefore split at the newline by
+that pre-pass — a known edge handled separately (see issue #522, a follow-up
+to #417)."""
+
+
+_BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # First-person upbringing / past-state markers, deliberately narrow so
+    # ordinary first-person prose never trips the guard. A bare "I was wrong"
+    # or "I had an idea" is opinion, not biography — so "i was" / "i had" only
+    # qualify in specific biographical forms (raised, born, brought up, handed,
+    # a <kid/child/...>). The bare "i was brought" and non-first-person
+    # "growing up" forms were removed (#519): they matched non-biographical
+    # idioms ("brought here by my editor", "growing up shapes identity") that
+    # the narrower "i was brought up" / "i grew up" patterns already cover.
+    # Childhood time-markers ("as a kid", "when i was") round out the set.
+    # Opinions ("I think", "I want") never match.
+    re.compile(r"\bi was raised\b", re.IGNORECASE),
+    re.compile(r"\bi was born\b", re.IGNORECASE),
+    re.compile(r"\bi was brought up\b", re.IGNORECASE),
+    re.compile(r"\bi was handed\b", re.IGNORECASE),
+    re.compile(
+        r"\bi was an? (?:kid|child|boy|girl|teenager|teen"
+        r"|baby|infant|toddler|youngster)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bi grew up\b", re.IGNORECASE),
+    re.compile(r"\bi used to\b", re.IGNORECASE),
+    re.compile(r"\bas a kid\b", re.IGNORECASE),
+    re.compile(r"\bas a child\b", re.IGNORECASE),
+    re.compile(r"\bwhen i was\b", re.IGNORECASE),
+    re.compile(r"\bmy childhood\b", re.IGNORECASE),
+    re.compile(r"\bmy upbringing\b", re.IGNORECASE),
+)
+"""First-person biographical surface markers (issue #515).
+
+A sentence matching any of these is treated as asserting a biographical fact
+about the owner — an upbringing, a birth, a childhood state, a past habit —
+that must trace to a source. The patterns are deliberately narrow: bare
+``i was`` / ``i had`` are excluded because they cover ordinary first-person
+prose ("I was wrong", "I had an idea"); only their genuinely biographical
+forms (``i was raised/born/brought up/handed``, ``i was a kid``, ``i grew
+up``, ``i used to``) and childhood time-markers (``as a kid``, ``when i was``,
+``my childhood/upbringing``) qualify. The bare ``i was brought`` and
+non-first-person ``growing up`` were dropped (#519) as false-positive prone:
+they matched non-biographical idioms ("brought here by my editor", "growing up
+shapes identity") already covered by ``i was brought up`` / ``i grew up``.
+Opinions ("I think", "I believe", "I love") deliberately never match: those
+are voice, not unverifiable biography."""
+
+
+@final
+@dataclass(frozen=True)
+class BiographicalGroundingFinding:
+    """One first-person biographical sentence that no source supports.
+
+    Attributes:
+        sentence: The exact biographical sentence flagged, verbatim from the
+            draft body, so the operator (or a downstream finding) can quote it.
+        max_similarity: Highest cosine similarity recorded between the
+            sentence and any source paragraph (sources + the voice-core brief).
+            ``0.0`` when there were no sources to score against.
+    """
+
+    sentence: str
+    max_similarity: float
+
+
+def split_sentences(body: str) -> list[str]:
+    """Split *body* into trimmed, non-empty sentences.
+
+    Sentences are separated on whitespace following terminal punctuation
+    (``.``, ``!``, ``?``); blank lines and headings collapse away. The split
+    is intentionally coarse — its only job is to isolate a first-person
+    biographical claim from the rest of an otherwise on-topic paragraph so
+    the grounding scan scores the claim, not the paragraph that hides it.
+
+    Newline handling happens here, in the ``body.splitlines()`` pre-pass:
+    each physical line is processed independently and only then is
+    :data:`_SENTENCE_SPLIT_RE` applied. A single sentence that is
+    soft-wrapped across two markdown lines is therefore split at the newline
+    rather than kept whole — a known edge tracked in issue #522 (follow-up to
+    #417); the regex's own "never split on a newline" guarantee applies only
+    *within* a physical line.
+    """
+    sentences: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        sentences.extend(
+            part.strip() for part in _SENTENCE_SPLIT_RE.split(stripped) if part.strip()
+        )
+    return sentences
+
+
+def is_biographical_sentence(sentence: str) -> bool:
+    """Return whether *sentence* asserts a first-person biographical fact.
+
+    Conservative heuristic (issue #515): only genuinely biographical
+    upbringing / childhood / past-state forms match — "I was raised", "I was
+    born", "I was handed", "I grew up", "I used to", "I was a kid", and
+    childhood time-markers like "as a kid" or "when I was" (see
+    :data:`_BIOGRAPHICAL_PATTERNS`). Ordinary first-person prose ("I was
+    wrong", "I had an idea") and bare opinions ("I think the world is cruel")
+    deliberately never match, which keeps grounded first-person voice from
+    tripping the guard.
+    """
+    return any(pattern.search(sentence) for pattern in _BIOGRAPHICAL_PATTERNS)
+
+
+def scan_biographical_sentences(
+    body: str,
+    *,
+    source_texts: Sequence[str],
+    embedding_fn: EmbeddingFn,
+    threshold: float,
+) -> list[BiographicalGroundingFinding]:
+    """Flag first-person biographical sentences ungrounded in any source.
+
+    For each sentence in *body* that :func:`is_biographical_sentence`
+    matches, embed it and take its maximum cosine similarity against every
+    paragraph of *source_texts* (the source fragments plus the voice-core
+    brief). A sentence whose best similarity falls *below* *threshold* is
+    surfaced as a :class:`BiographicalGroundingFinding`.
+
+    The scan reuses the same cosine machinery as :func:`score_draft` but at
+    sentence granularity, so a single invented first-person claim riding
+    inside an otherwise on-topic paragraph is caught (the paragraph-level
+    guard misses it). It adds no LLM hop — only embedding calls.
+
+    Args:
+        body: The composed draft / review body (frontmatter excluded).
+        source_texts: Source-fragment bodies plus any voice-core brief text
+            the claim may legitimately trace to. Paragraph-split internally.
+        embedding_fn: Callable returning a vector for one text string.
+        threshold: Cosine floor a biographical sentence must clear against
+            some source paragraph to count as grounded. Typically the
+            configured per-paragraph ``grounding_lower``.
+
+    Returns:
+        One finding per ungrounded biographical sentence, in document order.
+        An empty list when no biographical sentence is below threshold.
+
+    Raises:
+        GroundingDimensionError: When *embedding_fn* returns vectors of
+            differing lengths for sentence and source paragraphs.
+    """
+    candidates = [s for s in split_sentences(body) if is_biographical_sentence(s)]
+    if not candidates:
+        return []
+    source_paragraphs: list[str] = []
+    for text in source_texts:
+        source_paragraphs.extend(split_paragraphs(text))
+    source_vectors = [embedding_fn(p) for p in source_paragraphs]
+    findings: list[BiographicalGroundingFinding] = []
+    for sentence in candidates:
+        if source_vectors:
+            sentence_vec = embedding_fn(sentence)
+            best = max(cosine_similarity(sentence_vec, src) for src in source_vectors)
+        else:
+            best = 0.0
+        if best < threshold:
+            findings.append(
+                BiographicalGroundingFinding(sentence=sentence, max_similarity=best)
+            )
+    return findings
 
 
 _NORM_EPSILON = 1e-12

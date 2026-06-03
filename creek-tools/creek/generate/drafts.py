@@ -62,6 +62,7 @@ from creek.generate.grounding import (
     GroundingThresholds,
     ParagraphAnnotation,
     build_grounding_frontmatter,
+    scan_biographical_sentences,
     score_draft,
 )
 from creek.generate.outline import (
@@ -1138,7 +1139,62 @@ class DraftGenerator:
             thresholds=self._grounding_thresholds,
         )
         print(report.summary_line(), file=sys.stderr)
+        # The non-``None`` invariant is established by the guard above; assert
+        # it so ``_warn_ungrounded_biographical``'s non-optional
+        # ``embedding_fn`` contract is explicit and mypy's narrowing is pinned.
+        assert self._embedding_fn is not None
+        self._warn_ungrounded_biographical(
+            body=body,
+            source_texts=source_texts,
+            embedding_fn=self._embedding_fn,
+            thresholds=self._grounding_thresholds,
+        )
         return report
+
+    def _warn_ungrounded_biographical(
+        self,
+        *,
+        body: str,
+        source_texts: list[str],
+        embedding_fn: EmbeddingFn,
+        thresholds: GroundingThresholds,
+    ) -> None:
+        """Surface ungrounded first-person biographical sentences on stderr.
+
+        Reuses the same cosine machinery as the paragraph guard but at
+        sentence granularity (issue #515): a single invented first-person
+        biographical claim — e.g. an upbringing the corpus never mentions —
+        rides inside an otherwise on-topic paragraph and so escapes the
+        paragraph-level grounding score. Each flagged sentence is printed as
+        a ``grounding guard:`` warning so the operator sees it next to the
+        paragraph verdict. The voice-core brief is added to the source corpus
+        so a claim that legitimately traces to the brief is not flagged.
+
+        Args:
+            body: The generated draft body to scan.
+            source_texts: Source-fragment bodies already resolved by the
+                caller. The voice-core brief is appended internally.
+            embedding_fn: The resolved (non-``None``) embedding callable the
+                caller already established the guard is configured with.
+            thresholds: The resolved grounding thresholds; its
+                ``grounding_lower`` is the per-sentence floor.
+        """
+        corpus = source_texts.copy()
+        if self.voice_core.strip():
+            corpus.append(self.voice_core)
+        findings = scan_biographical_sentences(
+            body,
+            source_texts=corpus,
+            embedding_fn=embedding_fn,
+            threshold=thresholds.grounding_lower,
+        )
+        for finding in findings:
+            print(
+                "grounding guard: ungrounded first-person biographical claim "
+                f"(similarity {finding.max_similarity:.2f} < "
+                f"{thresholds.grounding_lower:.2f}): {finding.sentence!r}",
+                file=sys.stderr,
+            )
 
     def generate_draft(
         self,
@@ -2235,6 +2291,18 @@ def _slices_as_provenance(
     )
 
 
+#: Prompt steer that forbids inventing biographical facts or another person's
+#: motives (issue #515). Appended to every ``## Ask`` variant so the model is
+#: told — regardless of mode — that it may connect ideas but never fabricate
+#: the owner's upbringing, events, or someone else's motives. Pinned by a
+#: structure test so the instruction can never silently drop out of the prompt.
+_NO_FABRICATION_STEER = (
+    "Do not assert biographical facts about me that are not present in the "
+    "source fragments. You may draw connections between ideas, but never "
+    "invent events, my upbringing, or another person's motives."
+)
+
+
 def _compose_ask_section(
     idea: IdeaSeed,
     *,
@@ -2250,6 +2318,9 @@ def _compose_ask_section(
     directive so the LLM treats it as load-bearing. Otherwise it keeps
     the original wording so existing tests and mined-idea drafts
     continue to compose identically.
+
+    Every variant ends with :data:`_NO_FABRICATION_STEER` so the draft
+    prompt always carries the issue #515 no-fabrication instruction.
     """
     if twist:
         return (
@@ -2261,7 +2332,8 @@ def _compose_ask_section(
             "combination's style. Do not paraphrase any single source "
             "verbatim — recombine across the corpus. Honour the "
             "activated skills. Write as the human — not as an AI. "
-            "Cite source fragments by their IDs where relevant."
+            "Cite source fragments by their IDs where relevant. "
+            f"{_NO_FABRICATION_STEER}"
         )
     if per_dimension:
         return (
@@ -2272,14 +2344,16 @@ def _compose_ask_section(
             "sections above; weave them together at composition time "
             "rather than treating any one section as the source of "
             "truth. Honour the activated skills. Write as the human — "
-            "not as an AI. Cite source fragments by their IDs where relevant."
+            "not as an AI. Cite source fragments by their IDs where "
+            f"relevant. {_NO_FABRICATION_STEER}"
         )
     return (
         "## Ask\n"
         f'Write a draft essay titled "{idea.title}". '
         f"{idea.brief_description} "
         "Write as the human — not as an AI. Honour the activated "
-        "skills. Cite source fragments by their IDs where relevant."
+        f"skills. Cite source fragments by their IDs where relevant. "
+        f"{_NO_FABRICATION_STEER}"
     )
 
 

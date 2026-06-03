@@ -27,8 +27,10 @@ ReflectionVerdict = Literal["PASS", "REVISE", "ESCALATE"]
 #: breach (citation/privacy), ``MID`` a softer rubric divergence, ``LOW`` a hint.
 FindingSeverity = Literal["LOW", "MID", "HIGH"]
 
-#: The six research-rubric dimensions a reflection finding can fire on (#473).
+#: The research-rubric dimensions a reflection finding can fire on (#473).
 #: Typed so strict mypy catches a mistyped dimension at the construction site.
+#: ``biographical_grounding`` (#515) is the seventh: a HARD gate flagging a
+#: first-person biographical claim that no source supports.
 FindingDimension = Literal[
     "voice_fidelity",
     "ontological_accuracy",
@@ -36,6 +38,7 @@ FindingDimension = Literal[
     "privacy_compliance",
     "paradox_preservation",
     "attribution_correctness",
+    "biographical_grounding",
 ]
 
 
