@@ -15,7 +15,7 @@ Three concerns are pinned here:
 
 from __future__ import annotations
 
-from creek.author.checks import detect_unglossed_jargon
+from creek.generate.jargon import detect_unglossed_jargon
 from creek.generate.ontology_glossary import (
     GLOSS_STEER,
     OntologyTerm,
@@ -70,6 +70,14 @@ class TestRegistryDriftGuard:
             assert altitude.lower() in registry
 
 
+class TestRegistryMemoization:
+    """The registry is built once and reused across calls."""
+
+    def test_registry_is_memoized(self) -> None:
+        """Two calls return the same cached object (identity)."""
+        assert ontology_term_registry() is ontology_term_registry()
+
+
 class TestGlossSteerPinned:
     """The gloss instruction is present in both ``## Ask`` builders."""
 
@@ -78,6 +86,11 @@ class TestGlossSteerPinned:
         lowered = GLOSS_STEER.lower()
         assert "first time" in lowered
         assert "once" in lowered
+
+    def test_steer_names_mode_not_mood(self) -> None:
+        """The steer names ``Mode`` — the concept the registry/detector covers."""
+        assert "Mode" in GLOSS_STEER
+        assert "Mood" not in GLOSS_STEER
 
     def test_draft_ask_carries_gloss_steer_in_every_mode(self) -> None:
         """Every ``_compose_ask_section`` variant carries the gloss steer."""
