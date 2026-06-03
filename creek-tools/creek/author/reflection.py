@@ -1,7 +1,7 @@
 """The Reflection node for the Creek Writing Desk (FEAT-041, #473).
 
 A *deterministic* judge — no LLM, so the mutation tests can assert exact
-verdicts — scores a drafted body against the six research-rubric dimensions and
+verdicts — scores a drafted body against the research-rubric dimensions and
 returns a structured :class:`~creek.author.models.ReflectionResult`
 (``PASS | REVISE | ESCALATE`` plus findings). Citation completeness and privacy
 compliance are HARD gates for research. The conductor (#473) owns the retry loop
@@ -27,6 +27,7 @@ from creek.author.models import (
     ReflectionResult,
     ReflectionVerdict,
 )
+from creek.config import DraftConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -37,14 +38,17 @@ if TYPE_CHECKING:
     from creek.models import MediumContract
 
 #: Default cosine floor a first-person biographical sentence must clear to count
-#: as grounded when no explicit threshold is wired in (issue #515). Mirrors the
-#: ``DraftConfig.grounding_lower`` default so the desk and draft paths agree on
-#: what "grounded enough" means for a single sentence.
-_DEFAULT_BIOGRAPHICAL_GROUNDING_LOWER = 0.30
+#: as grounded when no explicit threshold is wired in (issue #515). Derived from
+#: the ``DraftConfig.grounding_lower`` field default — the single source of truth
+#: — so the desk and draft paths can never drift on what "grounded enough" means
+#: for a single sentence.
+_DEFAULT_BIOGRAPHICAL_GROUNDING_LOWER: float = DraftConfig.model_fields[
+    "grounding_lower"
+].default
 
 
 class ReflectionNode:
-    """A deterministic judge that scores a draft against the six dimensions."""
+    """A deterministic judge scoring a draft against the research rubric dimensions."""
 
     def review(
         self,

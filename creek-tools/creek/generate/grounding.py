@@ -349,17 +349,23 @@ fragmented into clauses that each lose their grounding context."""
 
 
 _BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # First-person subject + a being / having / experience predicate. The
-    # patterns are deliberately narrow: a generic "I think" or "I want"
-    # opinion is NOT biographical, so only being/having/raising verbs and a
-    # handful of childhood time-markers qualify. Keeping the surface small
-    # is what keeps the false-positive rate low on grounded first-person
-    # prose that merely states an opinion.
-    re.compile(r"\bi was\b", re.IGNORECASE),
-    re.compile(r"\bi grew up\b", re.IGNORECASE),
+    # First-person upbringing / past-state markers, deliberately narrow so
+    # ordinary first-person prose never trips the guard. A bare "I was wrong"
+    # or "I had an idea" is opinion, not biography — so "i was" / "i had" only
+    # qualify in specific biographical forms (raised, born, brought up, handed,
+    # a <kid/child/...>). Childhood time-markers ("as a kid", "growing up")
+    # round out the set. Opinions ("I think", "I want") never match.
     re.compile(r"\bi was raised\b", re.IGNORECASE),
+    re.compile(r"\bi was born\b", re.IGNORECASE),
+    re.compile(r"\bi was brought up\b", re.IGNORECASE),
     re.compile(r"\bi was handed\b", re.IGNORECASE),
-    re.compile(r"\bi had\b", re.IGNORECASE),
+    re.compile(
+        r"\bi was an? (?:kid|child|boy|girl|teenager|teen"
+        r"|baby|infant|toddler|youngster)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bi grew up\b", re.IGNORECASE),
+    re.compile(r"\bi was brought\b", re.IGNORECASE),
     re.compile(r"\bi used to\b", re.IGNORECASE),
     re.compile(r"\bas a kid\b", re.IGNORECASE),
     re.compile(r"\bas a child\b", re.IGNORECASE),
@@ -371,9 +377,15 @@ _BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
 """First-person biographical surface markers (issue #515).
 
 A sentence matching any of these is treated as asserting a biographical fact
-about the owner — an event, an upbringing, a past state — that must trace to
-a source. Opinions ("I think", "I believe", "I love") deliberately do not
-match: those are voice, not unverifiable biography."""
+about the owner — an upbringing, a birth, a childhood state, a past habit —
+that must trace to a source. The patterns are deliberately narrow: bare
+``i was`` / ``i had`` are excluded because they cover ordinary first-person
+prose ("I was wrong", "I had an idea"); only their genuinely biographical
+forms (``i was raised/born/handed``, ``i was a kid``, ``i grew up``, ``i used
+to``) and childhood time-markers (``as a kid``, ``when i was``, ``growing
+up``, ``my childhood/upbringing``) qualify. Opinions ("I think", "I believe",
+"I love") deliberately never match: those are voice, not unverifiable
+biography."""
 
 
 @final
@@ -416,11 +428,14 @@ def split_sentences(body: str) -> list[str]:
 def is_biographical_sentence(sentence: str) -> bool:
     """Return whether *sentence* asserts a first-person biographical fact.
 
-    Conservative heuristic (issue #515): a first-person subject paired with a
-    being / having / experience predicate, or a childhood time-marker (see
-    :data:`_BIOGRAPHICAL_PATTERNS`). Bare opinions ("I think the world is
-    cruel") are not biographical and never match, which keeps grounded
-    first-person voice from tripping the guard.
+    Conservative heuristic (issue #515): only genuinely biographical
+    upbringing / childhood / past-state forms match — "I was raised", "I was
+    born", "I was handed", "I grew up", "I used to", "I was a kid", and
+    childhood time-markers like "as a kid" or "when I was" (see
+    :data:`_BIOGRAPHICAL_PATTERNS`). Ordinary first-person prose ("I was
+    wrong", "I had an idea") and bare opinions ("I think the world is cruel")
+    deliberately never match, which keeps grounded first-person voice from
+    tripping the guard.
     """
     return any(pattern.search(sentence) for pattern in _BIOGRAPHICAL_PATTERNS)
 
@@ -471,13 +486,11 @@ def scan_biographical_sentences(
     source_vectors = [embedding_fn(p) for p in source_paragraphs]
     findings: list[BiographicalGroundingFinding] = []
     for sentence in candidates:
-        best = (
-            max(
-                cosine_similarity(embedding_fn(sentence), src) for src in source_vectors
-            )
-            if source_vectors
-            else 0.0
-        )
+        if source_vectors:
+            sentence_vec = embedding_fn(sentence)
+            best = max(cosine_similarity(sentence_vec, src) for src in source_vectors)
+        else:
+            best = 0.0
         if best < threshold:
             findings.append(
                 BiographicalGroundingFinding(sentence=sentence, max_similarity=best)

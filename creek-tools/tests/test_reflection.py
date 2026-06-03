@@ -365,6 +365,14 @@ def test_empty_body_or_no_evidence_escalates() -> None:
     assert ReflectionNode().review("body", EvidenceBundle()).decision == "ESCALATE"
 
 
+def test_default_biographical_grounding_lower_tracks_draft_config() -> None:
+    """The desk default cannot silently drift from ``DraftConfig.grounding_lower``."""
+    from creek.author.reflection import _DEFAULT_BIOGRAPHICAL_GROUNDING_LOWER
+    from creek.config import DraftConfig
+
+    assert DraftConfig().grounding_lower == _DEFAULT_BIOGRAPHICAL_GROUNDING_LOWER
+
+
 def test_conductor_escalates_on_exhaustion(tmp_path: Path) -> None:
     """A reflection that always REVISEs exhausts the budget → ESCALATE at round 2."""
 

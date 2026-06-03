@@ -135,6 +135,21 @@ class TestBiographicalHeuristic:
         assert is_biographical_sentence("I love this idea.") is False
         assert is_biographical_sentence("I want to explore the tension.") is False
 
+    def test_ordinary_first_person_prose_not_biographical(self) -> None:
+        """Bare ``i was`` / ``i had`` prose is opinion, not biography."""
+        assert is_biographical_sentence("I was wrong.") is False
+        assert is_biographical_sentence("I was just thinking.") is False
+        assert is_biographical_sentence("I had an idea.") is False
+        assert is_biographical_sentence("I had a coffee.") is False
+
+    def test_genuine_biographical_claims_match(self) -> None:
+        """Upbringing / childhood-state claims still match after narrowing."""
+        assert is_biographical_sentence("I was raised Catholic.") is True
+        assert is_biographical_sentence("I grew up in Ohio.") is True
+        assert is_biographical_sentence("I was handed this faith as a kid.") is True
+        assert is_biographical_sentence("I was born in 1980.") is True
+        assert is_biographical_sentence("I was a kid then.") is True
+
 
 # ---------------------------------------------------------------------------
 # scan_biographical_sentences
@@ -184,6 +199,29 @@ class TestScanBiographicalSentences:
             threshold=0.30,
         )
         assert findings == []
+
+    def test_embeds_each_candidate_sentence_once(self) -> None:
+        """Each candidate sentence is embedded exactly once, not per source paragraph.
+
+        Regression for the O(M) re-embedding bug: the sentence vector must be
+        hoisted out of the ``max(... for src in source_vectors)`` loop so adding
+        more source paragraphs never multiplies the per-sentence embedding cost.
+        """
+        calls: dict[str, int] = {}
+
+        def _counting_embedder(text: str) -> list[float]:
+            calls[text] = calls.get(text, 0) + 1
+            return _hashed_vector(text)
+
+        scan_biographical_sentences(
+            _LDS_SENTENCE,
+            # Three distinct source paragraphs: a naive impl would embed the
+            # candidate sentence three times (once per source).
+            source_texts=["alpha source", "beta source", "gamma source"],
+            embedding_fn=_counting_embedder,
+            threshold=0.30,
+        )
+        assert calls[_LDS_SENTENCE] == 1
 
     def test_no_sources_scores_zero_and_flags(self) -> None:
         """With no sources a biographical claim is ungrounded by definition."""
