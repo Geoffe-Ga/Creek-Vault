@@ -540,6 +540,162 @@ class TestGenerateDraft:
         assert "### F1.SKILL.md" in captured["prompt"]
 
 
+class TestGenerateDraftCohesion:
+    """The opt-in cohesion pass wiring in ``generate_draft`` (issue #518)."""
+
+    @staticmethod
+    def _two_phase_llm(
+        draft_body: str,
+        cohesion_body: str,
+    ) -> Callable[[str], str]:
+        """Return an LLM stub: first call composes, second smooths.
+
+        The cohesion prompt is recognised by its ``## Cohesion directive``
+        block; any other prompt is the initial composition.
+        """
+
+        def _call(prompt: str) -> str:
+            if "## Cohesion directive" in prompt:
+                return cohesion_body
+            return draft_body
+
+        return _call
+
+    def test_off_by_default_skips_cohesion_llm(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """With cohesion off (default) the cohesion hop never fires."""
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about Pluribus.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        prompts: list[str] = []
+
+        def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return "My dad watched Pluribus. Doubt is the spine."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root)
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == "My dad watched Pluribus. Doubt is the spine."
+        assert not any("## Cohesion directive" in p for p in prompts)
+
+    def test_enabled_applies_smoothed_body(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """With cohesion on, an entity-preserving smoothed body is applied."""
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about Pluribus.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        smoothed = "My dad watched Pluribus. And so, doubt is the spine."
+        gen = DraftGenerator(
+            llm=self._two_phase_llm(
+                "My dad watched Pluribus. Doubt is the spine.",
+                smoothed,
+            ),
+            skills_root=skills_root,
+            cohesion=True,
+        )
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == smoothed
+
+    def test_enabled_but_no_llm_skips_cohesion(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """``voice_guard_no_llm`` (the --no-llm path) skips the pass entirely."""
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about Pluribus.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        prompts: list[str] = []
+
+        def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return "My dad watched Pluribus. Doubt is the spine."
+
+        gen = DraftGenerator(
+            llm=llm,
+            skills_root=skills_root,
+            cohesion=True,
+            voice_guard_no_llm=True,
+        )
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == "My dad watched Pluribus. Doubt is the spine."
+        assert not any("## Cohesion directive" in p for p in prompts)
+
+    def test_fabricated_entity_falls_back_to_original(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A cohesion output adding a new entity is rejected; original kept."""
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about the show.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        original = "My dad watched the show. Doubt is the spine."
+        fabricated = "In 1997, my dad watched the show in Provo. Doubt is the spine."
+        gen = DraftGenerator(
+            llm=self._two_phase_llm(original, fabricated),
+            skills_root=skills_root,
+            cohesion=True,
+        )
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == original
+
+    def test_ungrounded_biographical_smoothing_falls_back(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A smoothed body tripping the grounding re-check falls back (#515).
+
+        The cohesion output is entity-preserving (no new proper noun /
+        number) but smuggles in a first-person biographical claim that the
+        source corpus does not support. With the grounding guard wired, the
+        re-check on the cohesion output rejects it and the original is kept.
+        """
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about doubt and the spine.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        original = "Doubt is the spine of it all."
+        # Entity-preserving but ungrounded: an invented upbringing.
+        smoothed = "Doubt is the spine of it all. And so I was raised on doubt."
+
+        # Orthogonal one-hot vectors: the biographical sentence shares no axis
+        # with the source, so its max cosine similarity is 0.0 < threshold.
+        def embed(text: str) -> list[float]:
+            return [1.0, 0.0] if "raised on doubt" in text else [0.0, 1.0]
+
+        thresholds = GroundingThresholds(
+            derivative_upper=0.85,
+            grounding_lower=0.30,
+            grounding_fraction_lower=0.30,
+        )
+        gen = DraftGenerator(
+            llm=self._two_phase_llm(original, smoothed),
+            skills_root=skills_root,
+            cohesion=True,
+            embedding_fn=embed,
+            grounding_thresholds=thresholds,
+        )
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == original
+
+
 # ---- save_draft -------------------------------------------------------
 
 

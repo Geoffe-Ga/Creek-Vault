@@ -26,7 +26,7 @@ import logging
 import operator
 import re
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -40,6 +40,7 @@ from creek.classify.privacy_filter import (
     filter_fragments_by_tier,
 )
 from creek.generate.ai_style.guard import run_voice_fidelity_guard
+from creek.generate.cohesion import run_cohesion_pass
 from creek.generate.compile_routing import (
     CompiledPageIndex,
     empty_index,
@@ -115,6 +116,27 @@ _MODES_DIR: str = "modes"
 _REGISTERS_DIR: str = "registers"
 
 _SLUG_MAX_LENGTH: int = 80
+
+_BESPOKE_ONTOLOGY_TERMS: tuple[str, ...] = (
+    "fragment",
+    "fragments",
+    "resonance",
+    "resonances",
+    "thread",
+    "threads",
+    "eddy",
+    "eddies",
+    "praxis",
+    "wavelength",
+    "aptitude",
+)
+"""The owner's bespoke Creek ontology vocabulary (issue #518).
+
+Guarded by the cohesion entity-preservation check alongside proper nouns and
+numbers: a cohesion pass that introduces one of these terms where the
+pre-cohesion body had none is fabricating ontology structure, not adding a
+transition. Lowercased on purpose — the guard matches case-insensitively, so a
+mid-sentence ``Eddy`` and a lowercased ``eddy`` are both caught."""
 
 _MIN_TWIST_SOURCES: int = 2
 """Minimum source fragments before a section composes through the twist path.
@@ -729,6 +751,7 @@ class DraftGenerator:
         fingerprint: VoiceFingerprint | None = None,
         ai_style_config: AIStyleConfig | None = None,
         voice_guard_no_llm: bool = False,
+        cohesion: bool = False,
     ) -> None:
         """Initialise with an LLM client and skill tree root.
 
@@ -781,6 +804,14 @@ class DraftGenerator:
             voice_guard_no_llm: When ``True`` the voice-fidelity guard
                 sanitizes and measures only — no rewrite hop (honours the
                 ``creek draft --no-llm`` flag).
+            cohesion: Opt-in switch for the no-fabrication cohesion pass
+                (issue #518). Default ``False`` so the single-topic draft
+                path is byte-for-byte unchanged. When ``True`` — and the LLM
+                is available (skipped under ``voice_guard_no_llm``) — a
+                post-composition pass smooths seams with transitions, gated
+                by the deterministic entity-preservation guard and a
+                biographical-grounding re-check; any violation falls back to
+                the pre-cohesion body.
         """
         self._llm = llm
         self.skills_root = skills_root
@@ -794,6 +825,7 @@ class DraftGenerator:
         self._fingerprint = fingerprint
         self._ai_style_config = ai_style_config
         self._voice_guard_no_llm = voice_guard_no_llm
+        self._cohesion = cohesion
 
     def present_idea(self, idea: IdeaSeed) -> str:
         """Format *idea* as an invitation rather than an imperative.
@@ -1237,6 +1269,11 @@ class DraftGenerator:
             prompt,
             empty_message="LLM returned an empty draft body",
         )
+        body = self._apply_cohesion(
+            body,
+            source_fragments=idea.source_fragments,
+            fragments=fragments,
+        )
         guard = self._build_guard_report(
             body=body,
             source_fragments=idea.source_fragments,
@@ -1291,6 +1328,101 @@ class DraftGenerator:
             raise RuntimeError(empty_message)
         truncated = _warn_if_truncated(response.stop_reason)
         return body, truncated
+
+    def _cohesion_grounding_check(
+        self,
+        body: str,
+        *,
+        source_fragments: tuple[str, ...],
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> Sequence[object]:
+        """Re-run the biographical grounding flag on a cohesion-smoothed body.
+
+        Used as the ``grounding_check`` seam for
+        :func:`~creek.generate.cohesion.run_cohesion_pass` so the cohesion
+        pass cannot smuggle in an ungrounded first-person biographical claim
+        (#515). Returns no findings — which lets the smoothed body through —
+        when the grounding guard is not configured (no embedding callable),
+        matching the dormant behaviour of the paragraph guard.
+
+        Args:
+            body: The cohesion-smoothed body to re-scan.
+            source_fragments: Fragment IDs that fed the draft prompt.
+            fragments: Pre-loaded ``{id: (Fragment, body)}`` map.
+
+        Returns:
+            One finding per ungrounded biographical sentence; empty when the
+            guard is dormant or the body is clean.
+        """
+        if self._embedding_fn is None or self._grounding_thresholds is None:
+            return []
+        corpus = [fragments[fid][1] for fid in source_fragments if fid in fragments]
+        if self.voice_core.strip():
+            corpus.append(self.voice_core)
+        return scan_biographical_sentences(
+            body,
+            source_texts=corpus,
+            embedding_fn=self._embedding_fn,
+            threshold=self._grounding_thresholds.grounding_lower,
+        )
+
+    def _cohesion_llm(self, prompt: str) -> str:
+        """Call the shared draft LLM for the cohesion hop, returning the body.
+
+        Reuses :attr:`_llm` so the cohesion pass shares the same provider seam
+        (and the same test stubs) as composition. The
+        :class:`DraftLLMResponse` wrapper is unwrapped to the plain body string
+        the cohesion guard expects; a truncated stop reason is irrelevant here
+        because the pass only adds transitions.
+
+        Args:
+            prompt: The cohesion prompt built by ``run_cohesion_pass``.
+
+        Returns:
+            The smoothed body text the LLM returned.
+        """
+        return _normalise_llm_response(self._llm(prompt)).text
+
+    def _apply_cohesion(
+        self,
+        body: str,
+        *,
+        source_fragments: tuple[str, ...],
+        fragments: dict[str, tuple[Fragment, str]],
+    ) -> str:
+        """Run the opt-in cohesion pass, returning the smoothed or original body.
+
+        Default-off (issue #518): when :attr:`_cohesion` is ``False`` or the
+        draft is running under ``--no-llm`` (:attr:`_voice_guard_no_llm`),
+        the body is returned unchanged and no extra LLM hop fires. Otherwise
+        :func:`~creek.generate.cohesion.run_cohesion_pass` smooths the seams,
+        gated by the entity-preservation guard and the biographical-grounding
+        re-check; any violation falls back to *body*.
+
+        Args:
+            body: The composed single-topic draft body.
+            source_fragments: Fragment IDs that fed the draft prompt; used to
+                build the grounding re-check corpus.
+            fragments: Pre-loaded ``{id: (Fragment, body)}`` map.
+
+        Returns:
+            The smoothed body when enabled and every guard passes; otherwise
+            *body* unchanged.
+        """
+        enabled = self._cohesion and not self._voice_guard_no_llm
+        cohesion_llm = self._cohesion_llm if enabled else None
+        return run_cohesion_pass(
+            body,
+            cohesion_llm=cohesion_llm,
+            enabled=enabled,
+            grounding_check=lambda smoothed: self._cohesion_grounding_check(
+                smoothed,
+                source_fragments=source_fragments,
+                fragments=fragments,
+            ),
+            voice_core=self.voice_core,
+            bespoke_terms=_BESPOKE_ONTOLOGY_TERMS,
+        )
 
     def resolve_seed(
         self,
