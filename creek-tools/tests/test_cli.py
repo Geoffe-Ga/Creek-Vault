@@ -2014,9 +2014,13 @@ def test_draft_command_happy_path(
 
 def test_draft_cohesion_flag_advertised_in_help() -> None:
     """The opt-in ``--cohesion`` flag is documented in ``creek draft --help``."""
-    result = runner.invoke(app, ["draft", "--help"])
+    # Render at a wide width so the option name cannot wrap, and strip ANSI
+    # so colour codes can't split the ``--cohesion`` token (CI renders the
+    # rich help table coloured and at ~80 cols, breaking literal matching).
+    result = runner.invoke(app, ["draft", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    assert "--cohesion" in result.output
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "--cohesion" in normalized
 
 
 def test_draft_cohesion_flag_smooths_body(
