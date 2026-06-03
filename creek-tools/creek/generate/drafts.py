@@ -1139,6 +1139,10 @@ class DraftGenerator:
             thresholds=self._grounding_thresholds,
         )
         print(report.summary_line(), file=sys.stderr)
+        # The non-``None`` invariant is established by the guard above; assert
+        # it so ``_warn_ungrounded_biographical``'s non-optional
+        # ``embedding_fn`` contract is explicit and mypy's narrowing is pinned.
+        assert self._embedding_fn is not None
         self._warn_ungrounded_biographical(
             body=body,
             source_texts=source_texts,

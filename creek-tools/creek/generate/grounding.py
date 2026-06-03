@@ -342,10 +342,16 @@ def split_paragraphs(body: str) -> list[str]:
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 """Boundary between sentences: whitespace following terminal punctuation.
 
-Conservative on purpose — it never splits on a bare newline or a comma, so
-a multi-clause biographical sentence ("Not the LDS Christ I was handed as a
-kid—the one I actually believe in.") is scored as one unit rather than
-fragmented into clauses that each lose their grounding context."""
+Conservative on purpose — this regex itself never splits on a bare newline or
+a comma, so a multi-clause biographical sentence ("Not the LDS Christ I was
+handed as a kid—the one I actually believe in.") is scored as one unit rather
+than fragmented into clauses that each lose their grounding context.
+
+Note: newline handling is performed by the ``splitlines()`` pre-pass in
+:func:`split_sentences`, *before* this regex ever runs. A sentence
+soft-wrapped across two markdown lines is therefore split at the newline by
+that pre-pass — a known edge handled separately (see issue #522, a follow-up
+to #417)."""
 
 
 _BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -353,8 +359,12 @@ _BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     # ordinary first-person prose never trips the guard. A bare "I was wrong"
     # or "I had an idea" is opinion, not biography — so "i was" / "i had" only
     # qualify in specific biographical forms (raised, born, brought up, handed,
-    # a <kid/child/...>). Childhood time-markers ("as a kid", "growing up")
-    # round out the set. Opinions ("I think", "I want") never match.
+    # a <kid/child/...>). The bare "i was brought" and non-first-person
+    # "growing up" forms were removed (#519): they matched non-biographical
+    # idioms ("brought here by my editor", "growing up shapes identity") that
+    # the narrower "i was brought up" / "i grew up" patterns already cover.
+    # Childhood time-markers ("as a kid", "when i was") round out the set.
+    # Opinions ("I think", "I want") never match.
     re.compile(r"\bi was raised\b", re.IGNORECASE),
     re.compile(r"\bi was born\b", re.IGNORECASE),
     re.compile(r"\bi was brought up\b", re.IGNORECASE),
@@ -365,12 +375,10 @@ _BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(r"\bi grew up\b", re.IGNORECASE),
-    re.compile(r"\bi was brought\b", re.IGNORECASE),
     re.compile(r"\bi used to\b", re.IGNORECASE),
     re.compile(r"\bas a kid\b", re.IGNORECASE),
     re.compile(r"\bas a child\b", re.IGNORECASE),
     re.compile(r"\bwhen i was\b", re.IGNORECASE),
-    re.compile(r"\bgrowing up\b", re.IGNORECASE),
     re.compile(r"\bmy childhood\b", re.IGNORECASE),
     re.compile(r"\bmy upbringing\b", re.IGNORECASE),
 )
@@ -381,11 +389,14 @@ about the owner — an upbringing, a birth, a childhood state, a past habit —
 that must trace to a source. The patterns are deliberately narrow: bare
 ``i was`` / ``i had`` are excluded because they cover ordinary first-person
 prose ("I was wrong", "I had an idea"); only their genuinely biographical
-forms (``i was raised/born/handed``, ``i was a kid``, ``i grew up``, ``i used
-to``) and childhood time-markers (``as a kid``, ``when i was``, ``growing
-up``, ``my childhood/upbringing``) qualify. Opinions ("I think", "I believe",
-"I love") deliberately never match: those are voice, not unverifiable
-biography."""
+forms (``i was raised/born/brought up/handed``, ``i was a kid``, ``i grew
+up``, ``i used to``) and childhood time-markers (``as a kid``, ``when i was``,
+``my childhood/upbringing``) qualify. The bare ``i was brought`` and
+non-first-person ``growing up`` were dropped (#519) as false-positive prone:
+they matched non-biographical idioms ("brought here by my editor", "growing up
+shapes identity") already covered by ``i was brought up`` / ``i grew up``.
+Opinions ("I think", "I believe", "I love") deliberately never match: those
+are voice, not unverifiable biography."""
 
 
 @final
@@ -413,6 +424,14 @@ def split_sentences(body: str) -> list[str]:
     is intentionally coarse — its only job is to isolate a first-person
     biographical claim from the rest of an otherwise on-topic paragraph so
     the grounding scan scores the claim, not the paragraph that hides it.
+
+    Newline handling happens here, in the ``body.splitlines()`` pre-pass:
+    each physical line is processed independently and only then is
+    :data:`_SENTENCE_SPLIT_RE` applied. A single sentence that is
+    soft-wrapped across two markdown lines is therefore split at the newline
+    rather than kept whole — a known edge tracked in issue #522 (follow-up to
+    #417); the regex's own "never split on a newline" guarantee applies only
+    *within* a physical line.
     """
     sentences: list[str] = []
     for line in body.splitlines():

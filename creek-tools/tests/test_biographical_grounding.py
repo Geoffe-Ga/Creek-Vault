@@ -150,6 +150,32 @@ class TestBiographicalHeuristic:
         assert is_biographical_sentence("I was born in 1980.") is True
         assert is_biographical_sentence("I was a kid then.") is True
 
+    def test_bare_i_was_brought_not_biographical(self) -> None:
+        """``i was brought`` without ``up`` is not biographical (#519).
+
+        The bare form matches non-biographical idioms ("brought here by my
+        editor", "brought in to consult"); only the upbringing form
+        ``i was brought up`` qualifies.
+        """
+        assert is_biographical_sentence("I was brought here by my editor.") is False
+        assert is_biographical_sentence("I was brought in to consult.") is False
+        assert is_biographical_sentence("I was brought up Catholic.") is True
+
+    def test_non_first_person_growing_up_not_biographical(self) -> None:
+        """Bare ``growing up`` matches third-person/thematic prose (#519).
+
+        Only the first-person ``i grew up`` should flag; ``growing up`` on its
+        own appears in third-person or thematic sentences about other people.
+        """
+        assert (
+            is_biographical_sentence(
+                "Growing up in a religious household shapes identity."
+            )
+            is False
+        )
+        assert is_biographical_sentence("She described growing up on a farm.") is False
+        assert is_biographical_sentence("I grew up in Ohio.") is True
+
 
 # ---------------------------------------------------------------------------
 # scan_biographical_sentences
