@@ -23,6 +23,9 @@ keyword signal that an explanation is nearby.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from creek.generate.indexes import (
     CANONICAL_FREQUENCY_NAMES,
@@ -31,6 +34,9 @@ from creek.generate.indexes import (
 )
 from creek.generate.wavelength import _PHASE_DESCRIPTIONS
 from creek.models import Frequency, Mode, Phase
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 #: Plain-English activation sense for each engagement mode, adapted from the
 #: ``_mode_activation_phrase`` base map in :mod:`creek.generate.skills`. Kept
@@ -186,7 +192,8 @@ def iter_ontology_terms() -> list[OntologyTerm]:
     ]
 
 
-def ontology_term_registry() -> dict[str, OntologyTerm]:
+@cache
+def ontology_term_registry() -> Mapping[str, OntologyTerm]:
     """Return a lookup of every term surface form (lower-cased) to its term.
 
     Both each term's ``label`` and its ``aliases`` are registered under their
@@ -194,8 +201,13 @@ def ontology_term_registry() -> dict[str, OntologyTerm]:
     ``freq.value in registry`` for every enum member while case-insensitive
     lookups (an altitude or named concept written mid-sentence) still resolve.
 
+    The registry is derived from static enums and constants, so it is built once
+    and memoised. The result is wrapped in a read-only
+    :class:`~types.MappingProxyType` so a caller cannot mutate the shared cached
+    instance.
+
     Returns:
-        A mapping from surface form (exact and lower-cased) to
+        A read-only mapping from surface form (exact and lower-cased) to
         :class:`OntologyTerm`.
     """
     registry: dict[str, OntologyTerm] = {}
@@ -203,7 +215,7 @@ def ontology_term_registry() -> dict[str, OntologyTerm]:
         for surface in (term.label, *term.aliases):
             registry[surface] = term
             registry[surface.lower()] = term
-    return registry
+    return MappingProxyType(registry)
 
 
 #: Prompt steer asking the model to gloss each bespoke term in the owner's voice
@@ -212,7 +224,7 @@ def ontology_term_registry() -> dict[str, OntologyTerm]:
 #: out of the prompt. Phrased as a request for an appositive/short clause — not a
 #: textbook definition — and explicitly first-mention-only ("only once").
 GLOSS_STEER: str = (
-    "The first time you use one of my bespoke terms (a Frequency, Phase, Mood, "
+    "The first time you use one of my bespoke terms (a Frequency, Phase, Mode, "
     "altitude, or named concept like APTITUDE / Whole Adept / Archetypal "
     "Wavelength), weave in a brief plain-English gloss in my voice so a newcomer "
     "can follow — an appositive or short clause, not a dictionary definition, "
