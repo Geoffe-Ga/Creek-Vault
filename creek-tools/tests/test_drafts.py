@@ -654,6 +654,55 @@ class TestGenerateDraftCohesion:
 
         assert draft.body == original
 
+    def test_lowercase_eddies_transition_is_accepted(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A lowercase "eddies of thought" transition is not over-rejected.
+
+        ``eddy``/``eddies`` are common English words; introducing them
+        lowercased as connective prose must NOT be treated as a fabricated
+        ontology term, so the smoothed body is applied.
+        """
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about the show.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        original = "The idea sits there. Doubt is the spine."
+        smoothed = (
+            "The idea sits there, one of the eddies of thought. Doubt is the spine."
+        )
+        gen = DraftGenerator(
+            llm=self._two_phase_llm(original, smoothed),
+            skills_root=skills_root,
+            cohesion=True,
+        )
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == smoothed
+
+    def test_fabricated_capitalized_eddy_falls_back(
+        self,
+        vault: Path,
+        skills_root: Path,
+    ) -> None:
+        """A fabricated capitalized ``Eddy`` ontology term is still rejected."""
+        fragment = _build_fragment()
+        _write_fragment(vault, fragment, "A line about the show.")
+        _seed_skill_tree(skills_root, "frequencies/F1.SKILL.md")
+        original = "The idea sits there. Doubt is the spine."
+        fabricated = "The Eddy of the idea sits there. Doubt is the spine."
+        gen = DraftGenerator(
+            llm=self._two_phase_llm(original, fabricated),
+            skills_root=skills_root,
+            cohesion=True,
+        )
+        seed = _build_seed(source_fragments=(fragment.id,))
+        draft = gen.generate_draft(seed, vault_path=vault)
+
+        assert draft.body == original
+
     def test_ungrounded_biographical_smoothing_falls_back(
         self,
         vault: Path,

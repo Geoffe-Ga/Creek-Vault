@@ -122,23 +122,40 @@ _BESPOKE_ONTOLOGY_TERMS: tuple[str, ...] = (
     "fragments",
     "resonance",
     "resonances",
-    "thread",
-    "threads",
-    "eddy",
-    "eddies",
     "praxis",
     "praxes",
     "wavelength",
     "wavelengths",
     "aptitude",
 )
-"""The owner's bespoke Creek ontology vocabulary.
+"""The owner's *distinctive* bespoke Creek ontology vocabulary.
 
-Guarded by the cohesion entity-preservation check alongside proper nouns and
-numbers: a cohesion pass that introduces one of these terms where the
-pre-cohesion body had none is fabricating ontology structure, not adding a
-transition. Lowercased on purpose — the guard matches case-insensitively, so a
-mid-sentence ``Eddy`` and a lowercased ``eddy`` are both caught."""
+Guarded **case-insensitively** by the cohesion entity-preservation check
+alongside proper nouns and numbers: a cohesion pass that introduces one of
+these terms where the pre-cohesion body had none is fabricating ontology
+structure, not adding a transition. Lowercased on purpose — these terms are
+unambiguous ontology references even in lowercase prose, so a mid-sentence
+``Wavelength`` and a lowercased ``wavelength`` are both caught.
+
+Common English words that double as ontology terms (Thread, Eddy and their
+plurals) are *not* listed here; they live in
+:data:`_COMMON_CAPITALIZED_ONTOLOGY_TERMS` and are guarded case-sensitively so
+ordinary prose like "the eddies of thought" is not mistaken for fabrication."""
+
+_COMMON_CAPITALIZED_ONTOLOGY_TERMS: tuple[str, ...] = (
+    "Thread",
+    "Threads",
+    "Eddy",
+    "Eddies",
+)
+"""Ontology terms that are also common English words.
+
+Guarded **case-sensitively**, in their Capitalized ontological form only, by
+the cohesion entity-preservation check. ``Eddy``/``Thread`` introduced where
+the pre-cohesion body had none is fabricated ontology structure (and is also
+caught as a proper noun); but a lowercase transition like "the eddies of
+thought" is ordinary prose and must NOT be rejected — so the lowercase form is
+deliberately left unguarded here."""
 
 _MIN_TWIST_SOURCES: int = 2
 """Minimum source fragments before a section composes through the twist path.
@@ -1394,6 +1411,12 @@ class DraftGenerator:
     ) -> str:
         """Run the opt-in cohesion pass, returning the smoothed or original body.
 
+        **Single-topic only.** This is called from :meth:`generate_draft`,
+        whose body is a single-topic essay. The cohesion pass must NOT be used
+        on a multi-section outline draft (``compose_outline_draft``), which has
+        its own content-frozen seam stitch; ``run_cohesion_pass`` additionally
+        self-guards by no-opping on any body with 2+ top-level ``## `` headers.
+
         Default-off: when :attr:`_cohesion` is ``False`` or the
         draft is running under ``--no-llm`` (:attr:`_voice_guard_no_llm`),
         the body is returned unchanged and no extra LLM hop fires. Otherwise
@@ -1424,6 +1447,7 @@ class DraftGenerator:
             ),
             voice_core=self.voice_core,
             bespoke_terms=_BESPOKE_ONTOLOGY_TERMS,
+            capitalized_terms=_COMMON_CAPITALIZED_ONTOLOGY_TERMS,
         )
 
     def resolve_seed(

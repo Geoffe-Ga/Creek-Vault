@@ -75,6 +75,35 @@ class TestExtractPreservableTokens:
         )
         assert "fragment" in tokens
 
+    def test_capitalized_common_term_captured_only_when_capitalized(self) -> None:
+        """A capitalized-only common term is caught in ontological form only.
+
+        ``Eddy``/``Eddies`` are common English words; only their capitalized
+        ontological form should register as a preservable bespoke token so a
+        lowercase prose transition ("the eddies of thought") is never treated
+        as a fabricated ontology term.
+        """
+        capped = extract_preservable_tokens(
+            "The Eddies of the mind.",
+            capitalized_terms=("Eddy", "Eddies"),
+        )
+        assert "eddies" in capped
+        lowered = extract_preservable_tokens(
+            "the eddies of thought",
+            capitalized_terms=("Eddy", "Eddies"),
+        )
+        assert "eddies" not in lowered
+
+    def test_markdown_header_word_not_captured_as_proper_noun(self) -> None:
+        """Structural header words are not preservable proper nouns.
+
+        A multi-word ``## Rising Tide`` header is structure, not prose; its
+        title-cased words must not register as fabricated proper nouns.
+        """
+        tokens = extract_preservable_tokens("Intro.\n\n## Rising Tide\n\nThe body.")
+        assert "tide" not in tokens
+        assert "rising" not in tokens
+
 
 class TestIsEntityPreserving:
     """The deterministic pre/post entity-preservation guard."""
@@ -136,6 +165,43 @@ class TestIsEntityPreserving:
         pre = "My dad watched Pluribus in Provo."
         post = "My dad watched Pluribus."
         assert is_entity_preserving(pre=pre, post=post) is True
+
+    def test_lowercase_common_ontology_transition_is_accepted(self) -> None:
+        """A lowercase "eddies" transition is not a fabricated ontology term.
+
+        ``eddy``/``eddies`` are common English words; introducing them lowercased
+        as connective prose ("the eddies of thought") must NOT be rejected as a
+        fabricated ontology term — only their capitalized form is guarded.
+        """
+        pre = "The idea sits there. Doubt is the spine."
+        post = "The idea sits there, one of the eddies of thought. Doubt is the spine."
+        assert (
+            is_entity_preserving(
+                pre=pre,
+                post=post,
+                capitalized_terms=("Eddy", "Eddies", "Thread", "Threads"),
+            )
+            is True
+        )
+
+    def test_fabricated_capitalized_common_term_is_rejected(self) -> None:
+        """A fabricated capitalized ``Eddy``/``Thread`` is still rejected.
+
+        When the pre-body had no eddy/Eddy at all, a post that introduces the
+        capitalized ontological ``Eddy`` is fabricating structure and must be
+        rejected — caught either as a capitalized bespoke term or as a proper
+        noun.
+        """
+        pre = "The idea sits there. Doubt is the spine."
+        post = "The Eddy of the idea sits there. Doubt is the spine."
+        assert (
+            is_entity_preserving(
+                pre=pre,
+                post=post,
+                capitalized_terms=("Eddy", "Eddies", "Thread", "Threads"),
+            )
+            is False
+        )
 
 
 class TestFormatCohesionDirective:
@@ -293,3 +359,53 @@ class TestRunCohesionPass:
             grounding_check=_no_grounding_findings,
         )
         assert capsys.readouterr().err == ""
+
+    def test_multi_section_body_skips_cohesion(self) -> None:
+        """A body with 2+ top-level ``## `` headers is returned unchanged.
+
+        Multi-section outline drafts carry their own seam stitch; the
+        single-topic cohesion pass must not smooth across section seams, so it
+        no-ops and never calls the LLM.
+        """
+        calls: list[str] = []
+
+        def llm(prompt: str) -> str:
+            calls.append(prompt)
+            return "SHOULD NOT RUN"
+
+        multi = "## Rising\n\nFirst part.\n\n## Falling\n\nSecond part."
+        result = run_cohesion_pass(
+            multi,
+            cohesion_llm=llm,
+            enabled=True,
+            grounding_check=_no_grounding_findings,
+        )
+        assert result == multi
+        assert calls == []
+
+    def test_multi_section_body_warns_skipped(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A skipped multi-section body emits the multi-section diagnostic."""
+        multi = "## Rising\n\nFirst part.\n\n## Falling\n\nSecond part."
+        run_cohesion_pass(
+            multi,
+            cohesion_llm=lambda _p: "x",
+            enabled=True,
+            grounding_check=_no_grounding_findings,
+        )
+        err = capsys.readouterr().err.lower()
+        assert "cohesion guard" in err
+        assert "multi-section" in err
+
+    def test_single_section_body_is_processed(self) -> None:
+        """A single-topic body (one or zero ``## `` headers) is smoothed."""
+        pre = "## Rising\n\nMy dad watched Pluribus. Doubt is the spine."
+        smoothed = "## Rising\n\nMy dad watched Pluribus. And so, doubt is the spine."
+        result = run_cohesion_pass(
+            pre,
+            cohesion_llm=lambda _p: smoothed,
+            enabled=True,
+            grounding_check=_no_grounding_findings,
+        )
+        assert result == smoothed
