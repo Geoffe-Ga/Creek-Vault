@@ -148,9 +148,12 @@ _WIKILINK_PATTERN: re.Pattern[str] = re.compile(
 """Matches Obsidian wiki-links like ``[[Target]]`` or ``[[Target|Alias]]``."""
 
 _RELATIVE_LINK_PATTERN: re.Pattern[str] = re.compile(
-    r"\[([^\]]*)\]\((?!https?://)(?!#)([^)]+)\)",
+    r"\[([^\]]*)\]\((?!#)([^)]+)\)",
 )
-"""Matches markdown relative links like ``[text](path/to/file.md)``."""
+"""Matches markdown links like ``[text](path/to/file.md)`` (excluding anchors)."""
+
+_URL_SCHEME_PATTERN: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
+"""Matches a leading URI scheme such as ``http:``, ``https:``, or ``mailto:``."""
 
 
 # ---------------------------------------------------------------------------
@@ -197,16 +200,45 @@ def _extract_wikilinks(content: str) -> list[str]:
     return _WIKILINK_PATTERN.findall(content)
 
 
+def _is_external_target(target: str) -> bool:
+    """Determine whether a link target points outside the local filesystem.
+
+    External targets are out of scope for a broken *local file* link scan:
+    absolute URLs with a scheme (``https://``, ``mailto:``, ``ftp://``, ...)
+    and protocol-relative URLs (``//host/path``).
+
+    Args:
+        target: A whitespace-stripped link target.
+
+    Returns:
+        True if the target is an external URL rather than a local path.
+    """
+    return target.startswith("//") or bool(_URL_SCHEME_PATTERN.match(target))
+
+
 def _extract_relative_links(content: str) -> list[str]:
-    """Extract relative link targets from markdown content.
+    """Extract relative (local file) link targets from markdown content.
+
+    The raw target captured by the pattern may carry an optional title
+    suffix (``path "title"``); only the URL portion is considered. External
+    targets (URLs with a scheme, or protocol-relative ``//host`` targets)
+    are excluded, since they are not local file references.
 
     Args:
         content: Raw markdown text.
 
     Returns:
-        List of relative link target strings.
+        List of relative link target strings, with external URLs removed.
     """
-    return [match[1] for match in _RELATIVE_LINK_PATTERN.findall(content)]
+    targets: list[str] = []
+    for match in _RELATIVE_LINK_PATTERN.findall(content):
+        # A markdown link target may be ``path "optional title"``; the URL
+        # is the first whitespace-delimited token.
+        target = match[1].strip().split(maxsplit=1)[0] if match[1].strip() else ""
+        if not target or _is_external_target(target):
+            continue
+        targets.append(target)
+    return targets
 
 
 class OrphanScanner:
@@ -506,13 +538,46 @@ class BrokenLinkScanner:
             if target not in all_stems
         ]
 
-        for target in _extract_relative_links(content):
-            resolved = (frag_file.parent / target).resolve()
-            vault_resolved = (vault_path / target).resolve()
-            if not resolved.exists() and not vault_resolved.exists():
-                broken.append(target)
+        broken.extend(
+            target
+            for target in _extract_relative_links(content)
+            if self._is_broken_local_link(target, frag_file, vault_path)
+        )
 
         return broken
+
+    @staticmethod
+    def _is_broken_local_link(
+        target: str,
+        frag_file: Path,
+        vault_path: Path,
+    ) -> bool:
+        """Check whether a relative target resolves to no existing file.
+
+        Resolution is wrapped defensively: a pathological target (e.g. one
+        with an over-long path segment) makes ``Path.exists()`` raise
+        ``OSError`` (``ENAMETOOLONG``, ``ELOOP``, ...) rather than returning
+        ``False``. Such targets cannot name a real local file, so they are
+        treated as not-broken (skipped) instead of aborting the whole scan.
+
+        Args:
+            target: A relative link target (no URL scheme).
+            frag_file: The fragment file containing the link.
+            vault_path: Root of the vault for resolving relative paths.
+
+        Returns:
+            True if the target resolves to no existing file under either
+            the fragment's directory or the vault root.
+        """
+        try:
+            resolved = (frag_file.parent / target).resolve()
+            vault_resolved = (vault_path / target).resolve()
+            missing = not resolved.exists() and not vault_resolved.exists()
+        except OSError:
+            logger.debug("Skipping unresolvable link target %r", target)
+            return False
+        else:
+            return missing
 
 
 class DuplicateScanner:
