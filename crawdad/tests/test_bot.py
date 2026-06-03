@@ -154,10 +154,23 @@ def test_render_state_unavailable_reply_directs_to_creek_state() -> None:
     assert "no audit report" in reply.lower()
 
 
-async def test_handle_message_uses_state_unavailable_reply(
+async def test_handle_message_with_none_state_does_not_dead_end(
     config: CrawDadConfig,
 ) -> None:
-    """When session_state is None the allowlisted user gets the guidance reply."""
+    """#527: ``session_state=None`` no longer hard-blocks free-text.
+
+    Previously the handler dead-ended every free-text turn on the
+    "no audit report yet — run ``creek state``" reply whenever
+    ``latest.md`` was absent, diverging from the slash-command path
+    that never gates on session state. With loop components absent the
+    handler now falls through to the FEAT-013 stub reply (and, when the
+    loop is wired, runs the loop with ``state=None`` — see
+    ``test_handle_message_runs_full_loop_when_session_state_is_none``).
+    The ``creek state`` guidance is still surfaced by
+    :func:`render_state_unavailable_reply`.
+    """
+    from crawdad.bot import _STATE_UNAVAILABLE_REPLY
+
     channel = _FakeChannel(id=999, sent=[])
     message = _FakeMessage(
         author=_FakeAuthor(id=111),
@@ -173,7 +186,8 @@ async def test_handle_message_uses_state_unavailable_reply(
     )
 
     assert len(channel.sent) == 1
-    assert "creek state" in channel.sent[0]
+    assert channel.sent[0] != _STATE_UNAVAILABLE_REPLY
+    assert "scaffold" in channel.sent[0].lower()
 
 
 async def test_handle_subprocess_unavailable_replies_gracefully(
@@ -271,6 +285,52 @@ async def test_crawdad_client_on_message_delegates(
 
     assert seen["message"] is message
     assert seen["kwargs"]["bot_user_id"] == 7
+
+
+async def test_crawdad_client_on_message_forwards_workflow_runner(
+    config: CrawDadConfig,
+    session_state: SessionState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug #527-B: the client threads ``workflow_runner`` into ``handle_message``.
+
+    Without this wiring a free-text ``crawdad.run_workflow`` intent
+    soft-errors even though the runner the slash-command path uses exists.
+    """
+    from crawdad.bot import CrawDadClient
+
+    seen: dict[str, Any] = {}
+
+    async def _spy(_message: Any, **kwargs: Any) -> None:
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr("crawdad.bot.handle_message", _spy)
+
+    async def _workflow_runner(_name: str, _inputs: dict[str, str]) -> str:
+        return "ran"  # pragma: no cover - identity check only
+
+    client = CrawDadClient(
+        config=config,
+        session_state=session_state,
+        workflow_runner=_workflow_runner,
+    )
+
+    class _User:
+        id = 7
+
+    object.__setattr__(client, "_connection", None)
+    monkeypatch.setattr(type(client), "user", property(lambda _self: _User()))
+
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="run a workflow",
+    )
+
+    await client.on_message(message)
+
+    assert seen["kwargs"]["workflow_runner"] is _workflow_runner
 
 
 async def test_crawdad_client_on_message_skips_when_not_ready(
@@ -627,6 +687,120 @@ async def test_handle_message_respects_configured_max_loop_rounds(
     assert len(channel.sent) == 1
     assert "back up" in channel.sent[0].lower() or "reframe" in channel.sent[0].lower()
     assert composer.calls == []
+
+
+async def test_handle_message_runs_full_loop_when_session_state_is_none(
+    config: CrawDadConfig,
+) -> None:
+    """Bug #527-A: free-text with ``session_state=None`` reaches the loop.
+
+    Previously the handler hard-stopped on ``_STATE_UNAVAILABLE_REPLY``
+    whenever ``latest.md`` was absent, dead-ending every free-text turn
+    while slash commands (which never gate on state) ran fine. The loop
+    and composer tolerate ``state=None`` everywhere, so a free-text turn
+    must compose a reply instead of bailing.
+    """
+    from crawdad.bot import _STATE_UNAVAILABLE_REPLY
+    from crawdad.history import ConversationHistory
+    from crawdad.intents import RouterResponse
+
+    router = _StubRouter(RouterResponse(intents=[], compose=True))
+    composer = _StubComposer("voice-faithful reply without state")
+    history = ConversationHistory()
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="what's surfacing?",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=None,
+        bot_user_id=42,
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=("creek.state.read",),
+        history=history,
+    )
+
+    assert len(channel.sent) == 1
+    assert channel.sent[0] == "voice-faithful reply without state"
+    assert channel.sent[0] != _STATE_UNAVAILABLE_REPLY
+    # The composer was invoked with ``state=None`` — the loop ran.
+    assert composer.calls and composer.calls[0]["state"] is None
+
+
+async def test_handle_message_forwards_workflow_runner_to_loop(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Bug #527-B: a free-text ``crawdad.run_workflow`` intent invokes the runner.
+
+    The handler must thread the ``workflow_runner`` closure through to
+    :func:`run_one_turn` exactly as the slash command path does, so a
+    natural-language request to run a workflow actually dispatches the
+    runner instead of soft-erroring with "workflow running is
+    unavailable".
+    """
+    from crawdad.history import ConversationHistory
+    from crawdad.intents import (
+        RUN_WORKFLOW_INTENT_TYPE,
+        Intent,
+        RouterResponse,
+    )
+
+    runner_calls: list[tuple[str, dict[str, str]]] = []
+
+    async def _workflow_runner(name: str, inputs: dict[str, str]) -> str:
+        runner_calls.append((name, inputs))
+        return "workflow walked: morning-pages"
+
+    # Router emits a run_workflow intent, then signals compose.
+    router_responses = iter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=RUN_WORKFLOW_INTENT_TYPE,
+                        args={"name": "morning-pages", "inputs": {"mood": "low"}},
+                    )
+                ]
+            ),
+            RouterResponse(intents=[], compose=True),
+        ]
+    )
+
+    class _SeqRouter:
+        async def extract_intents(self, **_kwargs: Any) -> Any:
+            return next(router_responses)
+
+    composer = _StubComposer("composed after workflow")
+    history = ConversationHistory()
+    channel = _FakeChannel(id=999, sent=[])
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="run the morning pages workflow",
+    )
+
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        router=_SeqRouter(),  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_StubMCPClient(_StubSession()),  # type: ignore[arg-type]
+        known_tools=(RUN_WORKFLOW_INTENT_TYPE,),
+        history=history,
+        workflow_runner=_workflow_runner,
+    )
+
+    assert runner_calls == [("morning-pages", {"mood": "low"})]
+    assert len(channel.sent) == 1
+    assert channel.sent[0] == "composed after workflow"
 
 
 async def test_handle_message_without_loop_components_uses_stub_reply(

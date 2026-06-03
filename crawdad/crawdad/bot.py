@@ -168,6 +168,7 @@ async def handle_message(
     skills: VoiceSkillStack | None = None,
     skill_registry: SkillStackRegistry | None = None,
     pending_batches: PendingBatchStore | None = None,
+    workflow_runner: WorkflowRunner | None = None,
 ) -> None:
     """Process one Discord message.
 
@@ -192,15 +193,29 @@ async def handle_message(
             the store and the next non-attachment message in the same
             channel is inspected for a consent / abandonment token
             *before* the agent loop runs.
+        workflow_runner: ADAPT-003 async callback backing
+            ``crawdad.run_workflow`` intents. Threaded through to
+            :func:`run_one_turn` so a free-text request to run an
+            authored workflow dispatches the same walk the
+            ``/crawdad workflow run`` slash command uses (#527). When
+            ``None``, those intents soft-error.
 
     When ``router``, ``composer``, or ``mcp_client`` is ``None``, the
     handler falls back to the FEAT-013 stub reply — useful for tests
     that don't exercise the full loop.
 
+    Session-state note (#527): the loop and composer tolerate
+    ``session_state=None`` everywhere (e.g. ``_wavelength_block``,
+    ``_phase_hint_for``), so a free-text turn runs even when
+    ``latest.md`` is absent — matching the slash-command contract,
+    which never gates on session state. The bot no longer dead-ends
+    free-text on a "session unavailable" reply; ``creek state`` guidance
+    is surfaced only at startup (see ``cli._safe_load_state``) and via
+    :func:`render_state_unavailable_reply`.
+
     Gate ordering note (FEAT-027): attachments are handled *before* the
-    session-state check so a user dropping a file during a degraded
-    session-state condition still gets their file staged with a clear
-    safety report, instead of a misleading "session unavailable" reply.
+    loop so a user dropping a file during a degraded session-state
+    condition still gets their file staged with a clear safety report.
     The attachment path does not need ``session_state``.
     """
     if not _passes_allowlist(message, config=config, bot_user_id=bot_user_id):
@@ -222,9 +237,6 @@ async def handle_message(
         pending_batches=pending_batches,
     ):
         return
-    if session_state is None:
-        await message.channel.send(_STATE_UNAVAILABLE_REPLY)
-        return
     if router is None or composer is None or mcp_client is None:
         await message.channel.send(_stub_reply())
         return
@@ -240,6 +252,7 @@ async def handle_message(
         skills=_resolve_skills(skill_registry, skills),
         skill_registry=skill_registry,
         max_rounds=config.max_loop_rounds,
+        workflow_runner=workflow_runner,
     )
     _LOGGER.info("loop outcome: %s", outcome.kind)
     await message.channel.send(_truncate_for_discord(outcome.reply))
@@ -789,6 +802,10 @@ class CrawDadClient(discord.Client):
         ``list`` and ``run`` subactions. Both default to ``None`` —
         sessions without an MCP tool surface still register the
         command but the handler soft-errors instead of crashing.
+        ``workflow_runner`` is additionally forwarded to the free-text
+        :func:`handle_message` path (#527) so a router-emitted
+        ``crawdad.run_workflow`` intent on a natural-language turn
+        dispatches the same walk as the slash command.
         """
         super().__init__(intents=intents or self._default_intents())
         self._config = config
@@ -802,6 +819,7 @@ class CrawDadClient(discord.Client):
         self._skill_registry = skill_registry
         self._loop_runner = loop_runner
         self._pending_batches = pending_batches
+        self._workflow_runner = workflow_runner
         self.tree = app_commands.CommandTree(self)
         if loop_runner is not None:
             # discord.py's ``CommandTree.command`` signature is wider than
@@ -857,4 +875,5 @@ class CrawDadClient(discord.Client):
             skills=self._skills,
             skill_registry=self._skill_registry,
             pending_batches=self._pending_batches,
+            workflow_runner=self._workflow_runner,
         )
