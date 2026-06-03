@@ -2302,6 +2302,18 @@ _NO_FABRICATION_STEER = (
     "invent events, my upbringing, or another person's motives."
 )
 
+#: Prompt steer that forbids announcing provenance (issue #517). The model must
+#: weave retrieved source fragments in as the owner's own present-tense thinking
+#: rather than narrating that the prose came from a journal/note/entry or that
+#: it is quoting itself. Appended to every ``## Ask`` variant and pinned by a
+#: structure test so it can never silently drop out of the prompt.
+_NO_PROVENANCE_STEER = (
+    "Use the source fragments as your own voice and memory. Weave them in as "
+    "your present-tense thinking — never reference that something came from a "
+    "journal, note, or entry, and never narrate that you are quoting yourself. "
+    "State the idea, not its provenance."
+)
+
 
 def _compose_ask_section(
     idea: IdeaSeed,
@@ -2319,8 +2331,10 @@ def _compose_ask_section(
     the original wording so existing tests and mined-idea drafts
     continue to compose identically.
 
-    Every variant ends with :data:`_NO_FABRICATION_STEER` so the draft
-    prompt always carries the issue #515 no-fabrication instruction.
+    Every variant ends with :data:`_NO_FABRICATION_STEER` and
+    :data:`_NO_PROVENANCE_STEER` so the draft prompt always carries the
+    issue #515 no-fabrication instruction and the issue #517 weave-the-source-in
+    instruction.
     """
     if twist:
         return (
@@ -2333,7 +2347,7 @@ def _compose_ask_section(
             "verbatim — recombine across the corpus. Honour the "
             "activated skills. Write as the human — not as an AI. "
             "Cite source fragments by their IDs where relevant. "
-            f"{_NO_FABRICATION_STEER}"
+            f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER}"
         )
     if per_dimension:
         return (
@@ -2345,7 +2359,7 @@ def _compose_ask_section(
             "rather than treating any one section as the source of "
             "truth. Honour the activated skills. Write as the human — "
             "not as an AI. Cite source fragments by their IDs where "
-            f"relevant. {_NO_FABRICATION_STEER}"
+            f"relevant. {_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER}"
         )
     return (
         "## Ask\n"
@@ -2353,7 +2367,7 @@ def _compose_ask_section(
         f"{idea.brief_description} "
         "Write as the human — not as an AI. Honour the activated "
         f"skills. Cite source fragments by their IDs where relevant. "
-        f"{_NO_FABRICATION_STEER}"
+        f"{_NO_FABRICATION_STEER} {_NO_PROVENANCE_STEER}"
     )
 
 

@@ -230,6 +230,10 @@ def _ask_section(
         "Do not assert biographical facts about me that are not present in the "
         "source fragments. You may draw connections between ideas, but never "
         "invent events, my upbringing, or another person's motives.",
+        "Use the source fragments as your own voice and memory. Weave them in as "
+        "your present-tense thinking — never reference that something came from a "
+        "journal, note, or entry, and never narrate that you are quoting "
+        "yourself. State the idea, not its provenance.",
         "Do not quote borrowed authors as my own words.",
     ]
     if contract is not None and contract.structure:

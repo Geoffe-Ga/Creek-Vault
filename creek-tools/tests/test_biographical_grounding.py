@@ -483,3 +483,41 @@ class TestPromptSteer:
         """The voice agent's ``## Ask`` block carries the steer."""
         section = _ask_section("What is Christ?", None, None)
         assert _STEER_PHRASE in section
+
+
+_PROVENANCE_PHRASE = (
+    "never reference that something came from a journal, note, or entry"
+)
+
+
+class TestProvenanceSteer:
+    """The weave-the-source-in steer is pinned into both prompt surfaces (#517)."""
+
+    def test_draft_ask_carries_provenance_steer_in_every_mode(self) -> None:
+        """Every ``_compose_ask_section`` variant carries the provenance steer."""
+        from creek.generate.drafts import _NO_PROVENANCE_STEER
+        from creek.generate.mining import IdeaSeed, MiningStrategy
+
+        idea = IdeaSeed(
+            strategy=MiningStrategy.RESONANCE_CHAIN,
+            title="Christ",
+            source_fragments=("frag-a",),
+            threads=(),
+            eddies=(),
+            frequency_affinity=(),
+            brief_description="A draft about the pattern.",
+            score=0.8,
+        )
+        for kwargs in (
+            {"per_dimension": False},
+            {"per_dimension": True},
+            {"per_dimension": False, "twist": True},
+        ):
+            section = _compose_ask_section(idea, **kwargs)
+            assert _PROVENANCE_PHRASE in section
+        assert _PROVENANCE_PHRASE in _NO_PROVENANCE_STEER
+
+    def test_voice_ask_carries_provenance_steer(self) -> None:
+        """The voice agent's ``## Ask`` block carries the provenance steer."""
+        section = _ask_section("What is Christ?", None, None)
+        assert _PROVENANCE_PHRASE in section
