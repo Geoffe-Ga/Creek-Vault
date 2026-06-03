@@ -115,6 +115,29 @@ class TestSentenceSplitting:
         body = "# Heading\n\nA real sentence here.\n\n## Another\n"
         assert split_sentences(body) == ["A real sentence here."]
 
+    def test_joins_soft_wrapped_sentence(self) -> None:
+        """A sentence soft-wrapped across two lines is kept whole.
+
+        Consecutive non-blank lines inside one paragraph are a single
+        flowing block, joined on a space, so the regex never splits a
+        biographical claim at the soft newline.
+        """
+        body = "I was raised in a very\nreligious household."
+        assert split_sentences(body) == ["I was raised in a very religious household."]
+
+    def test_blank_line_is_a_hard_sentence_boundary(self) -> None:
+        """A blank line still separates paragraphs into distinct sentences."""
+        body = "First paragraph here\nwrapped on.\n\nSecond paragraph stands alone."
+        assert split_sentences(body) == [
+            "First paragraph here wrapped on.",
+            "Second paragraph stands alone.",
+        ]
+
+    def test_heading_is_not_folded_into_adjacent_text(self) -> None:
+        """A heading line is dropped, not joined to the line beneath it."""
+        body = "# A Heading\nA real sentence here."
+        assert split_sentences(body) == ["A real sentence here."]
+
 
 class TestBiographicalHeuristic:
     """The heuristic is conservative: biography yes, opinion no."""
@@ -206,6 +229,23 @@ class TestScanBiographicalSentences:
         findings = scan_biographical_sentences(
             _GROUNDED_SENTENCE,
             source_texts=["prairie childhood source"],
+            embedding_fn=embedder,
+            threshold=0.30,
+        )
+        assert findings == []
+
+    def test_soft_wrapped_grounded_sentence_scored_whole(self) -> None:
+        """A grounded sentence wrapped across a soft newline is not flagged.
+
+        The full sentence aliases to its source (cosine 1.0); a truncated
+        first-fragment would fall through to a near-orthogonal vector and be
+        falsely flagged. Scoring the whole sentence keeps the finding empty.
+        """
+        whole = "I was raised in a very religious household."
+        embedder = _aliasing_embedder(alias=(whole, "religious-upbringing source"))
+        findings = scan_biographical_sentences(
+            "I was raised in a very\nreligious household.",
+            source_texts=["religious-upbringing source"],
             embedding_fn=embedder,
             threshold=0.30,
         )
