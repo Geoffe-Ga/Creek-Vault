@@ -111,7 +111,10 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
 
 # Phase regex matches FEAT-015 / skill_loader extraction so a workflow's
 # ``state.phase`` reference is the same slug the voice-skill loader uses.
-_PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z\-]+)", re.IGNORECASE)
+# The slug class accepts underscores so the canonical ``bottoming_out``
+# phase value survives intact rather than being truncated to ``bottoming``
+# (#528) — keep this in lockstep with ``skill_loader._PHASE_RE``.
+_PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z_\-]+)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------

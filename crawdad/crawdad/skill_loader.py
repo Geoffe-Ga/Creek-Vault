@@ -43,7 +43,12 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger("crawdad.skill_loader")
 
-_PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z\-]+)", re.IGNORECASE)
+# Capture the phase slug verbatim. The canonical phase enum value is
+# ``bottoming_out`` (underscore — see the Creek ontology / ``creek.models.Phase``),
+# so the slug class accepts underscores as well as hyphens; otherwise the
+# snapshot ``Phase: bottoming_out`` is truncated to ``bottoming`` and the
+# loader silently drops ``phases/bottoming_out.SKILL.md`` (#528).
+_PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z_\-]+)", re.IGNORECASE)
 # Same shape as the captured phase slug. Used to validate caller-supplied
 # register names so path construction can't be tricked into traversal.
 _SAFE_NAME_RE = re.compile(r"^[a-z][a-z\-]*$")
