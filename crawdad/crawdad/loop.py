@@ -185,6 +185,7 @@ class AgentLoop:
                 _LOGGER.warning("MCP unavailable mid-loop: %s", exc)
                 return LoopOutcome(kind="mcp_unavailable", reply=_MCP_UNAVAILABLE_REPLY)
             aggregated.extend(results)
+            self._record_tool_round(results)
         else:
             # Exhausted max_rounds without the router setting compose=true.
             _LOGGER.warning(
@@ -226,6 +227,22 @@ class AgentLoop:
                 workflow_runner=self._workflow_runner,
             )
             return await dispatcher.dispatch(response)
+
+    def _record_tool_round(self, results: list[ToolResult]) -> None:
+        """Thread this round's tool results back into the router's context.
+
+        The router's prompt (:func:`crawdad.router.build_router_prompt`)
+        renders the conversation history, and its instructions reference
+        "prior tool results in the history". Without this turn the router
+        sees byte-identical inputs every round and cannot converge to
+        ``compose=true`` (#526). Recording a synthetic ``tool`` turn here
+        lets the next :meth:`IntentRouter.extract_intents` observe that
+        the tools already ran and stop re-dispatching. Empty rounds are
+        skipped so the history stays meaningful.
+        """
+        if not results:
+            return
+        self._history.append("tool", _render_tool_results(results))
 
     def _current_skills(self) -> VoiceSkillStack:
         """Return the active skill stack, preferring the registry when wired."""
@@ -277,6 +294,17 @@ class AgentLoop:
             _LOGGER.debug("creek.save dispatch race; skipping paradox routing")
             return results
         return [*results, *saved]
+
+
+def _render_tool_results(results: list[ToolResult]) -> str:
+    """Render tool results into a compact transcript line for the router.
+
+    Each result becomes a ``<intent_type>: <body>`` line so the router
+    can see both which tool ran and what it returned. The body is left
+    untruncated here — :meth:`ConversationHistory.append` enforces the
+    per-entry character budget.
+    """
+    return "\n".join(f"{result.intent_type}: {result.body}" for result in results)
 
 
 def _max_ceiling_from(results: list[ToolResult]) -> PrivacyTierCeiling:
