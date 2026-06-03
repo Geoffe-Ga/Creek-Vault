@@ -167,6 +167,32 @@ def test_single_triad_below_margin_no_false_positive() -> None:
     )
 
 
+def test_single_antithesis_below_margin_no_false_positive() -> None:
+    """One deliberate antithesis in a long clean paragraph stays under the margin.
+
+    The owner uses antithesis occasionally; a single rhetorical turn must not
+    trip the surface margin (issue #516 calibration).
+    """
+    text = "We win not through force but through patience. " + " ".join(["plain"] * 999)
+    assert not _fired(
+        scan(text, fingerprint=_PLAIN, config=_CONFIG), "negative_parallelism"
+    )
+
+
+def test_saturated_antithesis_fires_for_plain_user() -> None:
+    """A cluster of `not X but Y` antithesis flags for a plain user (issue #516)."""
+    text = (
+        "Not through bliss, necessarily, but through outrage. "
+        "The parables weren't instruction manuals. They were field reports. "
+        "The work isn't to save everyone. The work is to be findable. "
+        "It doesn't make you easier to manipulate—it makes you ungovernable. "
+        "It is not about winning, it is about showing up."
+    )
+    assert _fired(
+        scan(text, fingerprint=_PLAIN, config=_CONFIG), "negative_parallelism"
+    )
+
+
 def test_findings_carry_a_span_and_message() -> None:
     """A fired discourse finding locates the offending text and hints why."""
     text = "The work was hard. In summary, it succeeded."

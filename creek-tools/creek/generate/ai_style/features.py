@@ -264,9 +264,35 @@ def vague_attribution_density(text: str) -> float:
 # Each pattern matches the offending phrase as group 0 (no lead-in capture)
 # unless noted, so a plain ``finditer`` span is the thing to surface.
 
+# Antithesis / negative-parallelism. The alternations, in order:
+#   1. ``not only X but [also] Y``.
+#   2. Bare ``not <prep> X[,] but <prep> Y`` — antithesis built from parallel
+#      prepositional phrases, the dominant AI tell from issue #516, e.g.
+#      "Not through bliss, necessarily, but through outrage". The shared
+#      preposition is what makes it *parallel* antithesis rather than a casual
+#      concessive ("Not my best work but it is honest"), which must not flag.
+#   3. ``it's not X, it's Y`` (contracted, comma-then-``it's``) and its
+#      uncontracted twin ``it is not X[,] it is Y`` / ``it is not about X[,]
+#      it is about Y``.
+#   4. Cross-sentence subject restatement ``X isn't/weren't Y. <subject>
+#      is/are/was/were/makes Z`` — the negated claim then its affirming echo,
+#      e.g. "The parables weren't instruction manuals. They were field reports."
+#   5. Em-dash antithesis ``it doesn't … — it …``.
+#   6. ``no X, no Y, just/but``.
+# Calibration: every alternation requires a contrasting second clause (a bare
+# negation never matches), so a single deliberate antithesis registers as one
+# count and is gated by the surface margin, not a hard failure.
 NEGATIVE_PARALLELISM_RE = re.compile(
     r"\bnot only\b[^.!?\n]{1,80}?\bbut(?: also)?\b"
+    r"|\bnot (?P<prep>through|by|with|for|about|in|of|from|because)\b"
+    r"[^.!?\n]{1,80}?,?\s*\bbut (?P=prep)\b"
     r"|\bit'?s not (?:just |merely |only )?[^.!?\n]{1,60}?,\s*it'?s\b"
+    r"|\bit is not (?:just |merely |only |about )?[^.!?\n]{1,60}?,?\s*it is\b"
+    r"|\b(?:is|are|was|were|do|does)n'?t\b[^.!?\n]{1,80}?[.!?]\s+"
+    r"(?:they|it|he|she|we|the [a-z]+)\b[^.!?\n]{0,12}?"
+    r"\b(?:is|are|was|were|do|does|make|makes)\b"
+    r"|\b(?:is|are|was|were|do|does)n'?t\b[^.!?\n]{1,60}?—"
+    r"\s*it\b[^.!?\n]{0,40}?\b(?:is|makes?|does)\b"
     r"|\bno [a-z]+, no [a-z]+,?\s+(?:just|but)\b",
     re.IGNORECASE,
 )

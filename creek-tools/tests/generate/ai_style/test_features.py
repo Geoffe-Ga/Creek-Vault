@@ -6,11 +6,13 @@ import pytest
 
 from creek.generate.ai_style.features import (
     FINGERPRINT_FEATURES,
+    NEGATIVE_PARALLELISM_RE,
     ai_vocab_density,
     concrete_density,
     curly_quote_density,
     em_dash_density,
     marketing_verb_ratio,
+    negative_parallelism_density,
     rule_of_three_rate,
     sentence_length_mean,
     transition_opener_rate,
@@ -78,6 +80,70 @@ def test_concrete_density_counts_the_word() -> None:
     """ "concrete" is counted; absent text scores zero."""
     assert concrete_density("no concrete evidence and concrete examples") > 0.0
     assert concrete_density("a plain sentence") == 0.0
+
+
+class TestNegativeParallelismRegex:
+    """The broadened antithesis pattern (issue #516)."""
+
+    # Existing constructions must keep matching.
+    _LEGACY = (
+        "It's not only fast, but also cheap.",
+        "It's not a bug, it's a feature.",
+        "No gods, no masters, just us.",
+    )
+    # The bare `not X, but Y` family and cross-sentence subject restatement
+    # that the old pattern missed (reproduction sentences from issue #516).
+    _NEW = (
+        "Not through bliss, necessarily, but through outrage, the sticky ones.",
+        "We win not through force but through patience.",
+        "The parables weren't instruction manuals. They were field reports.",
+        "The work isn't to save everyone. The work is to be findable.",
+        "It doesn't make you easier to manipulate—it makes you ungovernable.",
+        "It is not about winning, it is about showing up.",
+        "It's not about the money, it's about the principle.",
+    )
+
+    @pytest.mark.parametrize("text", _LEGACY)
+    def test_legacy_constructions_still_match(self, text: str) -> None:
+        """The constructions the original regex caught keep firing."""
+        assert NEGATIVE_PARALLELISM_RE.search(text) is not None
+
+    @pytest.mark.parametrize("text", _NEW)
+    def test_new_constructions_match(self, text: str) -> None:
+        """Each issue #516 reproduction sentence is now matched."""
+        assert NEGATIVE_PARALLELISM_RE.search(text) is not None
+
+    def test_ordinary_sentence_does_not_match(self) -> None:
+        """A plain sentence with no antithesis must not match."""
+        plain = "The river flowed quietly downhill."
+        assert NEGATIVE_PARALLELISM_RE.search(plain) is None
+
+    def test_plain_negation_alone_does_not_match(self) -> None:
+        """A bare negation with no contrasting clause must not match."""
+        assert NEGATIVE_PARALLELISM_RE.search("I do not like the rain at all.") is None
+
+
+class TestNegativeParallelismDensity:
+    """The density extractor over the broadened pattern (issue #516)."""
+
+    _SATURATED = (
+        "Not through bliss, necessarily, but through outrage. "
+        "The parables weren't instruction manuals. They were field reports. "
+        "The work isn't to save everyone. The work is to be findable. "
+        "It doesn't make you easier to manipulate—it makes you ungovernable. "
+        "It is not about winning, it is about showing up."
+    )
+    _CONTROL = "The river flowed downhill. " + " ".join(["plain"] * 40)
+
+    def test_density_higher_on_saturated_than_clean(self) -> None:
+        """A paragraph dense with antithesis scores well above a clean control."""
+        saturated = negative_parallelism_density(self._SATURATED)
+        clean = negative_parallelism_density(self._CONTROL)
+        assert saturated > clean
+
+    def test_clean_control_is_zero(self) -> None:
+        """The clean control has no antithesis density."""
+        assert negative_parallelism_density(self._CONTROL) == 0.0
 
 
 def test_registry_exposes_all_extractors() -> None:
