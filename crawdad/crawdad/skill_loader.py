@@ -8,9 +8,16 @@ error):
 ::
 
     <vault>/creek-skills/
-    ├── voice-core/SKILL.md           # always loaded
+    ├── voice-core/SKILL.md           # always loaded (crawdad-authored layout)
+    ├── meta/voice-core.SKILL.md      # always loaded (``creek skills generate`` layout)
     ├── phases/<phase>.SKILL.md       # matched against session wavelength
     └── registers/<register>.SKILL.md # ``confessional`` by default
+
+The voice-core skill is resolved against both candidate locations in
+order — ``voice-core/SKILL.md`` first, then ``meta/voice-core.SKILL.md``
+— and the first that exists is loaded as the load-bearing first entry.
+The canonical generator (``creek skills generate``) writes the second
+layout, so a generator-built vault still gets voice-core (#538).
 
 The session-state wavelength snapshot supplies the phase. The default
 register is :data:`crawdad.config.DEFAULT_REGISTER` ("confessional",
@@ -53,6 +60,16 @@ _PHASE_RE = re.compile(r"phase[:\s]*\*{0,2}([a-z_\-]+)", re.IGNORECASE)
 # register names so path construction can't be tricked into traversal.
 _SAFE_NAME_RE = re.compile(r"^[a-z][a-z\-]*$")
 _PROMPT_SEPARATOR = "\n\n---\n\n"
+
+# Candidate voice-core locations, resolved in order. The first existing
+# file wins. ``voice-core/SKILL.md`` is the crawdad-authored layout; the
+# canonical generator (``creek skills generate``) writes the second,
+# ``meta/voice-core.SKILL.md`` (#538). Kept self-contained — crawdad must
+# not depend on creek-tools.
+_VOICE_CORE_CANDIDATES: tuple[tuple[str, ...], ...] = (
+    ("voice-core", "SKILL.md"),
+    ("meta", "voice-core.SKILL.md"),
+)
 
 
 class VoiceSkill(BaseModel):
@@ -120,8 +137,9 @@ def load_skills_for_session(
         return VoiceSkillStack(skills=())
 
     collected: list[VoiceSkill] = []
-    voice_core = root / "voice-core" / "SKILL.md"
-    _append_if_present(collected, voice_core, name="voice-core")
+    voice_core = _resolve_voice_core(root)
+    if voice_core is not None:
+        _append_if_present(collected, voice_core, name="voice-core")
 
     phase = _phase_from_state(state)
     if phase:
@@ -219,6 +237,21 @@ class SkillStackRegistry:
         )
         _LOGGER.info("activated voice register %r", name)
         return True
+
+
+def _resolve_voice_core(root: Path) -> Path | None:
+    """Return the first existing voice-core ``SKILL.md`` under *root*, or ``None``.
+
+    Checks each :data:`_VOICE_CORE_CANDIDATES` location in order so a tree
+    authored by either crawdad (``voice-core/SKILL.md``) or the canonical
+    generator (``meta/voice-core.SKILL.md``) resolves, preserving the
+    crawdad-style location's precedence when both exist (#538).
+    """
+    for parts in _VOICE_CORE_CANDIDATES:
+        candidate = root.joinpath(*parts)
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _append_if_present(target: list[VoiceSkill], path: Path, *, name: str) -> None:

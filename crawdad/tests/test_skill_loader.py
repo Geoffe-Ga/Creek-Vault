@@ -126,6 +126,63 @@ def test_load_skills_missing_phase_file_skips_it(tmp_path: Path) -> None:
     assert "Voice core only" in bodies[0]
 
 
+def test_load_skills_finds_voice_core_in_meta_dir(tmp_path: Path) -> None:
+    """The generator layout ``meta/voice-core.SKILL.md`` still loads voice-core (#538).
+
+    ``creek skills generate`` writes voice-core to
+    ``creek-skills/meta/voice-core.SKILL.md`` (no ``voice-core/`` dir),
+    whereas crawdad historically only looked at
+    ``creek-skills/voice-core/SKILL.md``. The loader must resolve both,
+    and voice-core must remain the first/load-bearing entry in the stack.
+    """
+    skills = tmp_path / "creek-skills"
+    (skills / "meta").mkdir(parents=True)
+    (skills / "meta" / "voice-core.SKILL.md").write_text(
+        "# Voice core (generator)\nThe load-bearing voice rules.", encoding="utf-8"
+    )
+    (skills / "registers").mkdir()
+    (skills / "registers" / "confessional.SKILL.md").write_text(
+        "# Confessional\nReflective, first-person, soft.", encoding="utf-8"
+    )
+    state = _make_state("rising")
+
+    stack = load_skills_for_session(vault_path=tmp_path, state=state)
+
+    names = stack.names()
+    assert "voice-core" in names
+    # voice-core is the first / load-bearing entry in the stack.
+    assert names[0] == "voice-core"
+    assert any("Voice core (generator)" in body for body in stack.bodies())
+
+
+def test_load_skills_voice_core_dir_takes_precedence_over_meta(
+    tmp_path: Path,
+) -> None:
+    """When both locations exist, ``voice-core/SKILL.md`` wins (#538).
+
+    The crawdad-style ``voice-core/SKILL.md`` is the first candidate, so
+    a tree carrying both layouts resolves to it and never double-loads.
+    """
+    skills = tmp_path / "creek-skills"
+    (skills / "voice-core").mkdir(parents=True)
+    (skills / "voice-core" / "SKILL.md").write_text(
+        "# Voice core (crawdad)\nPrimary location.", encoding="utf-8"
+    )
+    (skills / "meta").mkdir()
+    (skills / "meta" / "voice-core.SKILL.md").write_text(
+        "# Voice core (generator)\nFallback location.", encoding="utf-8"
+    )
+    state = _make_state("rising")
+
+    stack = load_skills_for_session(vault_path=tmp_path, state=state)
+
+    bodies = stack.bodies()
+    assert any("Voice core (crawdad)" in body for body in bodies)
+    assert not any("Voice core (generator)" in body for body in bodies)
+    # Exactly one voice-core entry — no double-load.
+    assert stack.names().count("voice-core") == 1
+
+
 def test_load_skills_handles_state_without_wavelength(
     vault_with_voice_tree: Path,
 ) -> None:
