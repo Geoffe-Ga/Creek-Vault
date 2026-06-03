@@ -322,6 +322,33 @@ KNOWLEDGE_CUTOFF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# First-person sourcing / provenance announcements. The model narrates that
+# its prose was retrieved from the owner's journals/notes rather than weaving
+# the material in as the owner's own live thinking (issue #517). Generic-prior
+# tell: these should essentially never appear in finished prose. Kept
+# conservative — match self-referential SOURCING announcements, not ordinary
+# uses of "wrote"/"note" ("I wrote her a letter.", "Note the difference.").
+#   1. ``my journal(s)/notes/entries`` and the verb ``journaling`` (the
+#      ``my …`` branch also covers ``in my notes`` via the substring).
+#   2. ``I('ve| have)? been journaling`` / ``… been writing in my
+#      journals/notes/diary`` — narrating the act of keeping a journal as the
+#      source. Bare "been writing" is dropped: it matches ordinary prose
+#      ("I have been writing code.") without announcing a source (#525).
+#   3. ``from one of (them|my journals/notes/entries)`` — quoting a source.
+#   4. ``as I wrote (in …)`` / ``one of my (journals|notes|entries)`` — pointing
+#      at a prior written-down source.
+#   5. ``my journals keep …`` — personifying the corpus as a source.
+PROVENANCE_RE = re.compile(
+    r"\bmy (?:journals?|notes|entries)\b"
+    r"|\bjournaling\b"
+    r"|\bi(?:'ve| have)? been journaling\b"
+    r"|\bi(?:'ve| have)? been writing in my (?:journals?|notes?|diary)\b"
+    r"|\bfrom one of (?:them|my (?:journals?|notes|entries))\b"
+    r"|\bas i wrote\b"
+    r"|\bone of my (?:journals?|notes|entries)\b",
+    re.IGNORECASE,
+)
+
 DIDACTIC_DISCLAIMER_RE = re.compile(
     r"\bit'?s important to note\b"
     r"|\bimportant to note that\b"
@@ -373,6 +400,11 @@ def knowledge_cutoff_density(text: str) -> float:
     return rate_per_kwords(len(KNOWLEDGE_CUTOFF_RE.findall(text)), text)
 
 
+def provenance_density(text: str) -> float:
+    """Return first-person sourcing/provenance announcements per 1000 words."""
+    return rate_per_kwords(len(PROVENANCE_RE.findall(text)), text)
+
+
 def didactic_disclaimer_density(text: str) -> float:
     """Return didactic disclaimers (important to note, may vary) per 1000 words."""
     return rate_per_kwords(len(DIDACTIC_DISCLAIMER_RE.findall(text)), text)
@@ -404,6 +436,7 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "negative_parallelism_density": negative_parallelism_density,
     "challenges_section_density": challenges_section_density,
     "list_title_lead_density": list_title_lead_density,
+    "provenance_density": provenance_density,
     "didactic_disclaimer_density": didactic_disclaimer_density,
     "section_summary_density": section_summary_density,
     "comm_boilerplate_density": comm_boilerplate_density,

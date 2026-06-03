@@ -7,12 +7,14 @@ collaborative-comm boilerplate. They point at structural habits rather than
 single words, so like the rhetorical tells they are **surface-only**: the
 scanner flags them for review/rewrite, never auto-strips.
 
-Every tell except :data:`KNOWLEDGE_CUTOFF` is **vault-relative** — a writer
-who genuinely loves a triad or opens with "Overall," has a high baseline and
-is not flagged for it. The knowledge-cutoff disclaimer is the exception: it
-fires regardless of the fingerprint (``margin`` and ``generic_prior`` both
-``0``) because phrases like "As of my last knowledge update" are never
-desirable in finished prose, and its caveat carries a fabrication-risk hint.
+Most tells are **vault-relative** — a writer who genuinely loves a triad or
+opens with "Overall," has a high baseline and is not flagged for it. Two are
+the exception: :data:`KNOWLEDGE_CUTOFF` and :data:`PROVENANCE_TELL` fire
+regardless of the fingerprint (``margin`` and ``generic_prior`` both ``0``)
+because phrases like "As of my last knowledge update" or "from one of my
+journals" are never desirable in finished prose. The knowledge-cutoff caveat
+carries a fabrication-risk hint; the provenance caveat steers the draft to
+state the idea, not its journal/note provenance.
 
 Each tell reuses the shared pattern + extractor from
 :mod:`creek.generate.ai_style.features`, so the locator highlights exactly
@@ -127,6 +129,27 @@ KNOWLEDGE_CUTOFF = register(
         "regardless of your fingerprint — verify the claim or cut it.",
         measure=features.knowledge_cutoff_density,
         locate=lambda text: _spans(features.KNOWLEDGE_CUTOFF_RE, text),
+        # Never legitimate: fire on any occurrence, independent of the voice.
+        generic_prior=0.0,
+        margin=0.0,
+    ),
+)
+
+PROVENANCE_TELL = register(
+    Tell(
+        id="provenance_tell",
+        category="discourse",
+        feature_key="provenance_density",
+        handling="surface",
+        polarity="avoid",
+        description="First-person sourcing announcement (my journals, one of them).",
+        caveat="The draft should weave source fragments in as the owner's own "
+        "present-tense thinking, never narrate that something came from a "
+        "journal/note/entry or that it is quoting itself. Never desirable in "
+        "finished prose, so flagged regardless of your fingerprint — state the "
+        "idea, not its provenance.",
+        measure=features.provenance_density,
+        locate=lambda text: _spans(features.PROVENANCE_RE, text),
         # Never legitimate: fire on any occurrence, independent of the voice.
         generic_prior=0.0,
         margin=0.0,

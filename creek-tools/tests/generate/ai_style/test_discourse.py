@@ -39,7 +39,7 @@ def _message(report, tell_id: str) -> str:
 
 
 def test_discourse_tells_registered_and_surface() -> None:
-    """All eight discourse tells are registered and surface-handled."""
+    """All nine discourse tells are registered and surface-handled."""
     tells = {t.id: t for t in get_tells(["discourse"])}
     assert {
         "negative_parallelism",
@@ -50,8 +50,95 @@ def test_discourse_tells_registered_and_surface() -> None:
         "didactic_disclaimer",
         "section_summary",
         "comm_boilerplate",
+        "provenance_tell",
     } <= set(tells)
     assert all(tells[t].handling == "surface" for t in tells)
+
+
+class TestProvenanceTellIsFingerprintIndependent:
+    """First-person sourcing/provenance announcements fire regardless of voice.
+
+    These are a generic-prior tell: phrases that narrate that prose came from
+    the owner's journals/notes/entries should essentially never appear in
+    finished prose, so they fire even for an ornate baseline (issue #517).
+    """
+
+    def test_fires_for_plain_and_ornate(self) -> None:
+        """It fires for an ornate user too; provenance narration is never wanted."""
+        text = "My journals keep circling this. From one of them: it is true."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+        assert _fired(
+            scan(text, fingerprint=_ORNATE, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_my_journals_keep_circling(self) -> None:
+        """'My journals keep circling this.' is flagged."""
+        text = "My journals keep circling this."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+    def test_from_one_of_them(self) -> None:
+        """'From one of them:' is flagged."""
+        text = "From one of them: the work is to be findable."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+    def test_been_journaling_about_this(self) -> None:
+        """\"I've been journaling about this.\" is flagged."""
+        text = "I've been journaling about this."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+    def test_been_writing_in_my_journal(self) -> None:
+        """'I have been writing in my journal.' names a source; flagged."""
+        text = "I have been writing in my journal."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+    def test_coming_back_to_this_in_my_notes(self) -> None:
+        """'I keep coming back to this in my notes.' is flagged."""
+        text = "I keep coming back to this in my notes."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+    def test_in_my_journals_still_matches_via_my_branch(self) -> None:
+        """'in my journals' still fires via the 'my …' branch (#525)."""
+        text = "I keep coming back to this in my journals."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+
+class TestProvenanceTellFalsePositiveGuard:
+    """Clean prose that expresses the idea without naming a source must not fire."""
+
+    def test_same_idea_without_source_not_flagged(self) -> None:
+        """The bare thought, with no journal/note reference, does not fire."""
+        text = "I keep coming back to this. It will not let me go."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_wrote_in_non_sourcing_sense_not_flagged(self) -> None:
+        """'I wrote her a letter.' uses 'wrote' in an ordinary sense; no fire."""
+        text = "I wrote her a letter. We talked for hours."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_note_in_non_sourcing_sense_not_flagged(self) -> None:
+        """'Note the difference.' uses 'note' as an imperative; no fire."""
+        text = "Note the difference between the two readings."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_been_writing_code_not_flagged(self) -> None:
+        """'I have been writing code.' is ordinary prose, not sourcing (#525)."""
+        text = "I have been writing code."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_been_writing_tests_not_flagged(self) -> None:
+        """\"I've been writing tests all morning.\" is not sourcing (#525)."""
+        text = "I've been writing tests all morning."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
 
 
 class TestVaultRelative:
