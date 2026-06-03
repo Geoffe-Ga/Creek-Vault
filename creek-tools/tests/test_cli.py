@@ -3146,3 +3146,232 @@ def test_build_draft_llm_falls_back_to_config_max_tokens(
     llm = cli_module._build_draft_llm()
     llm("a prompt")
     assert captured["max_tokens"] == 2048
+
+
+# ---- voice-check subcommand ------------------------------------------
+
+
+def _voice_fixture_dir(name: str) -> Path:
+    """Return the ``tests/fixtures/voice/<name>`` directory.
+
+    Args:
+        name: Sub-directory under the voice fixture root (``in_voice`` or
+            ``slop``).
+
+    Returns:
+        Absolute path to the requested fixture sub-directory.
+    """
+    return Path(__file__).resolve().parent / "fixtures" / "voice" / name
+
+
+def _scaffold_voice_vault(vault: Path) -> None:
+    """Write the in-voice exemplars into *vault* as self-authored fragments.
+
+    Mirrors the regression harness: each in-voice fixture becomes a minimal
+    ``source.author: self`` fragment so the production fingerprint builder
+    measures it. The set is large enough (six exemplars) to clear the
+    ``min_fingerprint_fragments`` floor, so the resulting fingerprint is not
+    treated as thin.
+
+    Args:
+        vault: Vault root to scaffold.
+    """
+    fragments_dir = vault / "01-Fragments"
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    for index, path in enumerate(sorted(_voice_fixture_dir("in_voice").glob("*.md"))):
+        body = path.read_text(encoding="utf-8")
+        fragment = (
+            "---\n"
+            "source:\n"
+            "  author: self\n"
+            "  platform: markdown\n"
+            "privacy_tier: open\n"
+            "---\n"
+            f"{body}\n"
+        )
+        (fragments_dir / f"exemplar_{index:02d}.md").write_text(
+            fragment,
+            encoding="utf-8",
+        )
+
+
+def _build_and_persist_fingerprint(vault: Path) -> None:
+    """Build and save the voice fingerprint for *vault* on disk.
+
+    Uses the same production API ``creek report --type fingerprint`` drives,
+    so ``voice-check`` can later load the persisted artefact.
+
+    Args:
+        vault: Vault root holding the self-authored fragments.
+    """
+    from creek.config import AIStyleConfig
+    from creek.generate.ai_style.fingerprint import (
+        build_fingerprint,
+        save_fingerprint,
+    )
+
+    config = AIStyleConfig()
+    fingerprint = build_fingerprint(vault, config)
+    save_fingerprint(fingerprint, vault, config)
+
+
+def test_voice_check_help_advertises_options() -> None:
+    """``creek voice-check --help`` documents its flags, ANSI/width-robust."""
+    # Render wide and strip ANSI so the rich help table cannot wrap or
+    # colour-split the option tokens (LESSON from #519/#529).
+    result = runner.invoke(app, ["voice-check", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "--max-distance" in normalized
+    assert "--vault" in normalized
+    assert "--json" in normalized
+
+
+def test_voice_check_in_voice_file_exits_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-voice file scores below threshold and exits 0."""
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    target = tmp_path / "in_voice.md"
+    target.write_text(
+        (_voice_fixture_dir("in_voice") / "01_morning.md").read_text(
+            encoding="utf-8",
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    plain = _strip_ansi(result.output)
+    assert "voice_distance" in plain.lower()
+
+
+def test_voice_check_slop_file_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An AI-slop file diverges past threshold and exits non-zero."""
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    target = tmp_path / "slop.md"
+    target.write_text(
+        (_voice_fixture_dir("slop") / "03_wiki_padding.md").read_text(
+            encoding="utf-8",
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault), "--max-distance", "0.1"],
+    )
+
+    assert result.exit_code != 0, result.output
+
+
+def test_voice_check_missing_fingerprint_is_graceful(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No fingerprint and no eligible fragments → clear notice, no traceback."""
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    target = tmp_path / "anything.md"
+    target.write_text("Some text to check.\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault)],
+    )
+
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    plain = _strip_ansi(result.output).lower()
+    assert "fingerprint" in plain
+    assert "report --type fingerprint" in plain
+
+
+def test_voice_check_missing_file_exits_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-existent target file exits 2 with a clear error."""
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(tmp_path / "nope.md"), "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 2
+    assert "not found" in _strip_ansi(result.output).lower()
+
+
+def test_voice_check_json_flag_emits_machine_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--json`` emits a parseable object carrying voice_distance + verdict."""
+    import json
+
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    target = tmp_path / "in_voice.md"
+    target.write_text(
+        (_voice_fixture_dir("in_voice") / "02_boat.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(_strip_ansi(result.output))
+    assert "voice_distance" in payload
+    assert payload["in_voice"] is True
+    assert payload["max_distance"] == pytest.approx(0.35)
+
+
+def test_voice_check_builds_fingerprint_when_not_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no persisted artefact, voice-check builds from vault fragments."""
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)  # fragments present, but fingerprint NOT saved
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+
+    target = tmp_path / "in_voice.md"
+    target.write_text(
+        (_voice_fixture_dir("in_voice") / "05_shed.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "voice_distance" in _strip_ansi(result.output).lower()

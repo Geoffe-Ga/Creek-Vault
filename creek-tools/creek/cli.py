@@ -33,7 +33,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from creek.classify.prompt import PromptOntology
-    from creek.config import CreekConfig
+    from creek.config import AIStyleConfig, CreekConfig
+    from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
     from creek.generate.compost_embedding import CompostExemplar
     from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import (
@@ -1300,6 +1301,206 @@ def _report_fingerprint(vault_path: Path) -> None:
         f"across {len(fingerprint.features)} features → {path}"
         f"[/bold green]{thin}",
     )
+
+
+def _default_voice_max_distance() -> float:
+    """Return the default ``voice-check`` distance ceiling from config.
+
+    Sources the threshold from
+    :attr:`creek.config.AIStyleConfig.voice_distance_upper` rather than
+    hard-coding a magic number, so the CLI default tracks the same
+    constant the draft guard and the lint check use.
+
+    Returns:
+        The configured ``voice_distance_upper`` default.
+    """
+    from creek.config import AIStyleConfig
+
+    return AIStyleConfig().voice_distance_upper
+
+
+_DEFAULT_VOICE_MAX_DISTANCE: float = _default_voice_max_distance()
+"""Default ``--max-distance`` for ``creek voice-check`` (config-sourced)."""
+
+
+def _resolve_voice_fingerprint(
+    vault_path: Path,
+    ai_style: AIStyleConfig,
+) -> VoiceFingerprint:
+    """Return the vault's voice fingerprint, persisted-first then built.
+
+    Mirrors how ``draft`` consumes the fingerprint: prefer the artefact
+    saved at ``<vault>/00-Creek-Meta/voice-fingerprint.json`` and fall back
+    to building one from the vault's self-authored fragments when no file
+    exists yet.
+
+    Args:
+        vault_path: Vault root.
+        ai_style: AI-style configuration (fingerprint path + weights).
+
+    Returns:
+        A :class:`VoiceFingerprint`; its ``fragment_count`` is ``0`` when
+        neither a persisted artefact nor eligible fragments exist.
+    """
+    from creek.generate.ai_style.fingerprint import (
+        build_fingerprint,
+        load_fingerprint,
+    )
+
+    fingerprint = load_fingerprint(vault_path, ai_style)
+    if fingerprint.fragment_count > 0:
+        return fingerprint
+    return build_fingerprint(vault_path, ai_style)
+
+
+def _print_voice_check_summary(
+    *,
+    report: ScanReport,
+    in_voice: bool,
+    max_distance: float,
+) -> None:
+    """Render the human-readable ``voice-check`` summary.
+
+    Args:
+        report: The scan report produced for the target file.
+        in_voice: Whether the file scored within bounds.
+        max_distance: The threshold the distance was compared against.
+    """
+    verdict = (
+        "[bold green]in voice[/bold green]"
+        if in_voice
+        else "[bold red]diverges from voice[/bold red]"
+    )
+    thin = " [dim](thin fingerprint — flagging softened)[/dim]"
+    console.print(
+        f"voice_distance: {report.voice_distance:.4f} "
+        f"(max {max_distance:.4f}) → {verdict}"
+        f"{thin if report.thin_fingerprint else ''}",
+    )
+    if not report.findings:
+        return
+    noun = "finding" if len(report.findings) == 1 else "findings"
+    console.print(f"[bold]{len(report.findings)} {noun}:[/bold]")
+    for finding in report.findings:
+        console.print(f"  [dim]L{finding.line}:[/dim] {finding.message}")
+
+
+def _emit_voice_check_json(
+    *,
+    target: Path,
+    report: ScanReport,
+    in_voice: bool,
+    max_distance: float,
+) -> None:
+    """Print a machine-readable JSON object for ``voice-check --json``.
+
+    Args:
+        target: The scanned file.
+        report: The scan report.
+        in_voice: Whether the file scored within bounds.
+        max_distance: The threshold compared against.
+    """
+    import json
+
+    payload = {
+        "file": str(target),
+        "voice_distance": report.voice_distance,
+        "max_distance": max_distance,
+        "in_voice": in_voice,
+        "thin_fingerprint": report.thin_fingerprint,
+        "findings": [
+            {
+                "line": finding.line,
+                "tell_id": finding.tell_id,
+                "category": str(finding.category),
+                "feature_key": finding.feature_key,
+                "direction": str(finding.direction),
+                "message": finding.message,
+            }
+            for finding in report.findings
+        ],
+    }
+    console.print(json.dumps(payload, indent=2))
+
+
+@app.command(name="voice-check")
+def voice_check(
+    file: Path = typer.Argument(..., help="Markdown file to score against your voice"),
+    vault: Path | None = typer.Option(None, "--vault", help="Obsidian vault path"),
+    max_distance: float = typer.Option(
+        _DEFAULT_VOICE_MAX_DISTANCE,
+        "--max-distance",
+        help=(
+            "Voice-distance ceiling. A file whose distance exceeds this is "
+            "treated as diverging and the command exits non-zero. Defaults to "
+            "the AI-style config's voice_distance_upper."
+        ),
+    ),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a machine-readable JSON object instead of a text summary.",
+    ),
+) -> None:
+    """Score a markdown FILE against the vault voice fingerprint.
+
+    Loads the vault's voice fingerprint (the persisted
+    ``00-Creek-Meta/voice-fingerprint.json`` when present, otherwise built
+    from self-authored fragments — the same artefact ``creek report --type
+    fingerprint`` and ``creek draft`` consume), scans FILE's content, and
+    prints the resulting ``voice_distance`` plus any divergence findings.
+
+    Exit codes: ``0`` when the file is in voice (distance within
+    ``--max-distance``); ``1`` when it diverges; ``2`` for a missing file.
+    When no fingerprint can be resolved (no persisted artefact and no
+    eligible fragments) the command emits a notice pointing at ``creek
+    report --type fingerprint`` and exits ``0`` (nothing to compare
+    against — fail open so pre-commit / CI hooks do not block on an
+    un-profiled vault). The scan is fully offline; no LLM or consent is
+    involved.
+    """
+    from creek.generate.ai_style.scanner import scan
+
+    if not file.exists():
+        console.print(f"[red]File not found: {file}[/red]")
+        raise typer.Exit(code=2)
+
+    vault_path = _resolve_vault(vault)
+    ai_style = _load_config_for_vault(vault).ai_style
+    fingerprint = _resolve_voice_fingerprint(vault_path, ai_style)
+
+    if fingerprint.fragment_count == 0:
+        console.print(
+            "[yellow]No voice fingerprint available (no persisted "
+            "artefact and no self-authored fragments). Run "
+            "[bold]creek report --type fingerprint[/bold] to build one. "
+            "Skipping the check.[/yellow]",
+        )
+        return
+
+    report = scan(
+        file.read_text(encoding="utf-8"),
+        fingerprint=fingerprint,
+        config=ai_style,
+    )
+    in_voice = report.voice_distance <= max_distance
+
+    if json_out:
+        _emit_voice_check_json(
+            target=file,
+            report=report,
+            in_voice=in_voice,
+            max_distance=max_distance,
+        )
+    else:
+        _print_voice_check_summary(
+            report=report,
+            in_voice=in_voice,
+            max_distance=max_distance,
+        )
+
+    if not in_voice:
+        raise typer.Exit(code=1)
 
 
 _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
