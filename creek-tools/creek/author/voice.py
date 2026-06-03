@@ -227,6 +227,9 @@ def _ask_section(
         "Write in my (the vault owner's) voice.",
         "Every statement must trace to the provided source fragments — do not "
         "invent facts and do not add claims.",
+        "Do not assert biographical facts about me that are not present in the "
+        "source fragments. You may draw connections between ideas, but never "
+        "invent events, my upbringing, or another person's motives.",
         "Do not quote borrowed authors as my own words.",
     ]
     if contract is not None and contract.structure:

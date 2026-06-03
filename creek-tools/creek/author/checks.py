@@ -22,6 +22,7 @@ import yaml
 
 from creek.author.models import ReflectionFinding
 from creek.generate.ai_style.scanner import scan
+from creek.generate.grounding import scan_biographical_sentences
 
 # Reuse the canonical INC-019 alias vocabulary (public constants) rather than
 # duplicating it, so the ontological-accuracy check and the model validators
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from creek.author.models import EvidenceBundle
     from creek.config import AIStyleConfig
     from creek.generate.ai_style.model import VoiceFingerprint
+    from creek.generate.grounding import EmbeddingFn
     from creek.models import MediumContract
 
 #: Privacy tiers from least to most restrictive; index = restrictiveness rank.
@@ -81,6 +83,67 @@ def check_citation_completeness(evidence: EvidenceBundle) -> list[ReflectionFind
         )
         for claim in evidence.claims
         if not claim.source_fragments
+    ]
+
+
+def check_biographical_grounding(
+    body: str,
+    evidence: EvidenceBundle,
+    *,
+    embedding_fn: EmbeddingFn | None,
+    grounding_lower: float,
+    voice_core: str | None = None,
+) -> list[ReflectionFinding]:
+    """Flag invented first-person biographical claims in the body (HARD).
+
+    A research/desk draft must not assert a biographical fact about the owner
+    (an event, an upbringing, a past state) that no source supports — e.g.
+    amplifying a brief's "the LDS Christ I was handed" into a childhood the
+    corpus never mentions (issue #515). Each grounded claim's text plus the
+    optional voice-core brief form the source corpus; a first-person
+    biographical sentence whose cosine similarity falls below *grounding_lower*
+    against all of them is fabrication.
+
+    The check is dormant — and returns no findings — when *embedding_fn* is
+    ``None``, mirroring how :func:`check_voice_fidelity` stays dormant without
+    a fingerprint. This keeps the deterministic reflection node free of the
+    sentence-transformer import unless a caller wires the embedder in.
+
+    Args:
+        body: The drafted prose under review.
+        evidence: The evidence the draft was rendered from; each claim's text
+            is a legitimate grounding source.
+        embedding_fn: Embedding callable, or ``None`` to skip the check.
+        grounding_lower: Cosine floor a biographical sentence must clear
+            against some source to count as grounded.
+        voice_core: The voice-core brief text, treated as tone guidance the
+            claim may also trace to, or ``None``.
+
+    Returns:
+        One ``HIGH`` ``biographical_grounding`` finding per ungrounded
+        biographical sentence.
+    """
+    if embedding_fn is None:
+        return []
+    source_texts = [claim.claim for claim in evidence.claims]
+    if voice_core:
+        source_texts.append(voice_core)
+    return [
+        ReflectionFinding(
+            dimension="biographical_grounding",
+            severity="HIGH",
+            message=(
+                "First-person biographical claim is not grounded in any "
+                f"source (similarity {finding.max_similarity:.2f} < "
+                f"{grounding_lower:.2f}): {finding.sentence!r}."
+            ),
+        )
+        for finding in scan_biographical_sentences(
+            body,
+            source_texts=source_texts,
+            embedding_fn=embedding_fn,
+            threshold=grounding_lower,
+        )
     ]
 
 

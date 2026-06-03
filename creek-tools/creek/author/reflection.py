@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from creek.author.checks import (
     check_attribution_correctness,
+    check_biographical_grounding,
     check_citation_completeness,
     check_ontological_accuracy,
     check_paradox_preservation,
@@ -32,7 +33,14 @@ if TYPE_CHECKING:
 
     from creek.config import AIStyleConfig
     from creek.generate.ai_style.model import VoiceFingerprint
+    from creek.generate.grounding import EmbeddingFn
     from creek.models import MediumContract
+
+#: Default cosine floor a first-person biographical sentence must clear to count
+#: as grounded when no explicit threshold is wired in (issue #515). Mirrors the
+#: ``DraftConfig.grounding_lower`` default so the desk and draft paths agree on
+#: what "grounded enough" means for a single sentence.
+_DEFAULT_BIOGRAPHICAL_GROUNDING_LOWER = 0.30
 
 
 class ReflectionNode:
@@ -48,6 +56,9 @@ class ReflectionNode:
         vault: Path | None = None,
         fingerprint: VoiceFingerprint | None = None,
         ai_style_config: AIStyleConfig | None = None,
+        embedding_fn: EmbeddingFn | None = None,
+        grounding_lower: float = _DEFAULT_BIOGRAPHICAL_GROUNDING_LOWER,
+        voice_core: str | None = None,
     ) -> ReflectionResult:
         """Judge *body* against *evidence* and return a structured result.
 
@@ -72,6 +83,13 @@ class ReflectionNode:
                 fidelity (the voice cannot be measured without it).
             ai_style_config: The AI-style configuration. ``None`` skips voice
                 fidelity.
+            embedding_fn: Embedding callable for the biographical-grounding
+                check (issue #515). ``None`` skips it — the check is dormant
+                unless a caller wires an embedder in.
+            grounding_lower: Cosine floor a first-person biographical sentence
+                must clear against the evidence to count as grounded.
+            voice_core: The voice-core brief text, treated as tone guidance a
+                biographical claim may also trace to, or ``None``.
 
         Returns:
             A :class:`ReflectionResult` with the verdict and any findings.
@@ -87,6 +105,15 @@ class ReflectionNode:
         findings.extend(check_paradox_preservation(body, evidence))
         findings.extend(check_attribution_correctness(body, evidence))
         findings.extend(check_voice_fidelity(body, fingerprint, ai_style_config))
+        findings.extend(
+            check_biographical_grounding(
+                body,
+                evidence,
+                embedding_fn=embedding_fn,
+                grounding_lower=grounding_lower,
+                voice_core=voice_core,
+            )
+        )
 
         decision: ReflectionVerdict = "PASS" if not findings else "REVISE"
         return ReflectionResult(decision=decision, findings=findings)

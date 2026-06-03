@@ -33,6 +33,7 @@ full sentence-transformer at unit-test time.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict, final
@@ -332,6 +333,156 @@ def split_paragraphs(body: str) -> list[str]:
     if buffer:
         paragraphs.append("\n".join(buffer).strip())
     return [p for p in paragraphs if p]
+
+
+# ---------------------------------------------------------------------------
+# Sentence-level biographical grounding (issue #515)
+# ---------------------------------------------------------------------------
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+"""Boundary between sentences: whitespace following terminal punctuation.
+
+Conservative on purpose — it never splits on a bare newline or a comma, so
+a multi-clause biographical sentence ("Not the LDS Christ I was handed as a
+kid—the one I actually believe in.") is scored as one unit rather than
+fragmented into clauses that each lose their grounding context."""
+
+
+_BIOGRAPHICAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # First-person subject + a being / having / experience predicate. The
+    # patterns are deliberately narrow: a generic "I think" or "I want"
+    # opinion is NOT biographical, so only being/having/raising verbs and a
+    # handful of childhood time-markers qualify. Keeping the surface small
+    # is what keeps the false-positive rate low on grounded first-person
+    # prose that merely states an opinion.
+    re.compile(r"\bi was\b", re.IGNORECASE),
+    re.compile(r"\bi grew up\b", re.IGNORECASE),
+    re.compile(r"\bi was raised\b", re.IGNORECASE),
+    re.compile(r"\bi was handed\b", re.IGNORECASE),
+    re.compile(r"\bi had\b", re.IGNORECASE),
+    re.compile(r"\bi used to\b", re.IGNORECASE),
+    re.compile(r"\bas a kid\b", re.IGNORECASE),
+    re.compile(r"\bas a child\b", re.IGNORECASE),
+    re.compile(r"\bwhen i was\b", re.IGNORECASE),
+    re.compile(r"\bgrowing up\b", re.IGNORECASE),
+    re.compile(r"\bmy childhood\b", re.IGNORECASE),
+    re.compile(r"\bmy upbringing\b", re.IGNORECASE),
+)
+"""First-person biographical surface markers (issue #515).
+
+A sentence matching any of these is treated as asserting a biographical fact
+about the owner — an event, an upbringing, a past state — that must trace to
+a source. Opinions ("I think", "I believe", "I love") deliberately do not
+match: those are voice, not unverifiable biography."""
+
+
+@final
+@dataclass(frozen=True)
+class BiographicalGroundingFinding:
+    """One first-person biographical sentence that no source supports.
+
+    Attributes:
+        sentence: The exact biographical sentence flagged, verbatim from the
+            draft body, so the operator (or a downstream finding) can quote it.
+        max_similarity: Highest cosine similarity recorded between the
+            sentence and any source paragraph (sources + the voice-core brief).
+            ``0.0`` when there were no sources to score against.
+    """
+
+    sentence: str
+    max_similarity: float
+
+
+def split_sentences(body: str) -> list[str]:
+    """Split *body* into trimmed, non-empty sentences.
+
+    Sentences are separated on whitespace following terminal punctuation
+    (``.``, ``!``, ``?``); blank lines and headings collapse away. The split
+    is intentionally coarse — its only job is to isolate a first-person
+    biographical claim from the rest of an otherwise on-topic paragraph so
+    the grounding scan scores the claim, not the paragraph that hides it.
+    """
+    sentences: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        sentences.extend(
+            part.strip() for part in _SENTENCE_SPLIT_RE.split(stripped) if part.strip()
+        )
+    return sentences
+
+
+def is_biographical_sentence(sentence: str) -> bool:
+    """Return whether *sentence* asserts a first-person biographical fact.
+
+    Conservative heuristic (issue #515): a first-person subject paired with a
+    being / having / experience predicate, or a childhood time-marker (see
+    :data:`_BIOGRAPHICAL_PATTERNS`). Bare opinions ("I think the world is
+    cruel") are not biographical and never match, which keeps grounded
+    first-person voice from tripping the guard.
+    """
+    return any(pattern.search(sentence) for pattern in _BIOGRAPHICAL_PATTERNS)
+
+
+def scan_biographical_sentences(
+    body: str,
+    *,
+    source_texts: Sequence[str],
+    embedding_fn: EmbeddingFn,
+    threshold: float,
+) -> list[BiographicalGroundingFinding]:
+    """Flag first-person biographical sentences ungrounded in any source.
+
+    For each sentence in *body* that :func:`is_biographical_sentence`
+    matches, embed it and take its maximum cosine similarity against every
+    paragraph of *source_texts* (the source fragments plus the voice-core
+    brief). A sentence whose best similarity falls *below* *threshold* is
+    surfaced as a :class:`BiographicalGroundingFinding`.
+
+    The scan reuses the same cosine machinery as :func:`score_draft` but at
+    sentence granularity, so a single invented first-person claim riding
+    inside an otherwise on-topic paragraph is caught (the paragraph-level
+    guard misses it). It adds no LLM hop — only embedding calls.
+
+    Args:
+        body: The composed draft / review body (frontmatter excluded).
+        source_texts: Source-fragment bodies plus any voice-core brief text
+            the claim may legitimately trace to. Paragraph-split internally.
+        embedding_fn: Callable returning a vector for one text string.
+        threshold: Cosine floor a biographical sentence must clear against
+            some source paragraph to count as grounded. Typically the
+            configured per-paragraph ``grounding_lower``.
+
+    Returns:
+        One finding per ungrounded biographical sentence, in document order.
+        An empty list when no biographical sentence is below threshold.
+
+    Raises:
+        GroundingDimensionError: When *embedding_fn* returns vectors of
+            differing lengths for sentence and source paragraphs.
+    """
+    candidates = [s for s in split_sentences(body) if is_biographical_sentence(s)]
+    if not candidates:
+        return []
+    source_paragraphs: list[str] = []
+    for text in source_texts:
+        source_paragraphs.extend(split_paragraphs(text))
+    source_vectors = [embedding_fn(p) for p in source_paragraphs]
+    findings: list[BiographicalGroundingFinding] = []
+    for sentence in candidates:
+        best = (
+            max(
+                cosine_similarity(embedding_fn(sentence), src) for src in source_vectors
+            )
+            if source_vectors
+            else 0.0
+        )
+        if best < threshold:
+            findings.append(
+                BiographicalGroundingFinding(sentence=sentence, max_similarity=best)
+            )
+    return findings
 
 
 _NORM_EPSILON = 1e-12
