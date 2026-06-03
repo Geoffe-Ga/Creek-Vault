@@ -85,11 +85,14 @@ def test_concrete_density_counts_the_word() -> None:
 class TestNegativeParallelismRegex:
     """The broadened antithesis pattern (issue #516)."""
 
-    # Existing constructions must keep matching.
+    # Existing constructions must keep matching. The contracted
+    # `it's not X, it's Y` family was matched by the original regex, so it
+    # belongs here, not in the broadened-pattern fixtures.
     _LEGACY = (
         "It's not only fast, but also cheap.",
         "It's not a bug, it's a feature.",
         "No gods, no masters, just us.",
+        "It's not about the money, it's about the principle.",
     )
     # The bare `not X, but Y` family and cross-sentence subject restatement
     # that the old pattern missed (reproduction sentences from issue #516).
@@ -100,7 +103,6 @@ class TestNegativeParallelismRegex:
         "The work isn't to save everyone. The work is to be findable.",
         "It doesn't make you easier to manipulate—it makes you ungovernable.",
         "It is not about winning, it is about showing up.",
-        "It's not about the money, it's about the principle.",
     )
 
     @pytest.mark.parametrize("text", _LEGACY)
@@ -122,6 +124,25 @@ class TestNegativeParallelismRegex:
         """A bare negation with no contrasting clause must not match."""
         assert NEGATIVE_PARALLELISM_RE.search("I do not like the rain at all.") is None
 
+    def test_cross_sentence_different_subjects_does_not_match(self) -> None:
+        """A negation sentence followed by an unrelated `The <word>` is not antithesis.
+
+        The cross-sentence arm must only fire on a genuinely repeated subject
+        (a pronoun echo or the same noun restated), not on any new `The <word>`.
+        """
+        pair = "The algorithm doesn't converge. The teacher is patient."
+        assert NEGATIVE_PARALLELISM_RE.search(pair) is None
+
+    def test_casual_concessive_does_not_match(self) -> None:
+        """A casual concessive (`Not X but Y`, no shared preposition) must not flag.
+
+        Pins the boundary the PR body claims: the shared-preposition design
+        keeps a concessive aside out of the antithesis count.
+        """
+        assert (
+            NEGATIVE_PARALLELISM_RE.search("Not my best work but it is honest") is None
+        )
+
 
 class TestNegativeParallelismDensity:
     """The density extractor over the broadened pattern (issue #516)."""
@@ -140,6 +161,11 @@ class TestNegativeParallelismDensity:
         saturated = negative_parallelism_density(self._SATURATED)
         clean = negative_parallelism_density(self._CONTROL)
         assert saturated > clean
+        # Magnitude floor so a silent drop in match count is caught. The
+        # saturated fixture currently scores ~76.9 per 1000 words (5 matches /
+        # 65 words); 30.0 leaves generous headroom while still flagging a
+        # regression that loses several of those matches.
+        assert saturated > 30.0
 
     def test_clean_control_is_zero(self) -> None:
         """The clean control has no antithesis density."""

@@ -277,6 +277,11 @@ def vague_attribution_density(text: str) -> float:
 #   4. Cross-sentence subject restatement ``X isn't/weren't Y. <subject>
 #      is/are/was/were/makes Z`` — the negated claim then its affirming echo,
 #      e.g. "The parables weren't instruction manuals. They were field reports."
+#      The echoed subject must be a *genuine* restatement: either a pronoun
+#      (they/it/he/she/we) or the SAME noun repeated (``the <noun>`` …
+#      ``the <noun>`` via the ``xnoun`` backreference). A fresh ``The <word>``
+#      with a different noun is not antithesis and must not match, e.g.
+#      "The algorithm doesn't converge. The teacher is patient."
 #   5. Em-dash antithesis ``it doesn't … — it …``.
 #   6. ``no X, no Y, just/but``.
 # Calibration: every alternation requires a contrasting second clause (a bare
@@ -288,8 +293,9 @@ NEGATIVE_PARALLELISM_RE = re.compile(
     r"[^.!?\n]{1,80}?,?\s*\bbut (?P=prep)\b"
     r"|\bit'?s not (?:just |merely |only )?[^.!?\n]{1,60}?,\s*it'?s\b"
     r"|\bit is not (?:just |merely |only |about )?[^.!?\n]{1,60}?,?\s*it is\b"
-    r"|\b(?:is|are|was|were|do|does)n'?t\b[^.!?\n]{1,80}?[.!?]\s+"
-    r"(?:they|it|he|she|we|the [a-z]+)\b[^.!?\n]{0,12}?"
+    r"|\b(?:the (?P<xnoun>[a-z]+) )?"
+    r"(?:is|are|was|were|do|does)n'?t\b[^.!?\n]{1,80}?[.!?]\s+"
+    r"(?:(?:they|it|he|she|we)|the (?P=xnoun))\b[^.!?\n]{0,12}?"
     r"\b(?:is|are|was|were|do|does|make|makes)\b"
     r"|\b(?:is|are|was|were|do|does)n'?t\b[^.!?\n]{1,60}?—"
     r"\s*it\b[^.!?\n]{0,40}?\b(?:is|makes?|does)\b"
