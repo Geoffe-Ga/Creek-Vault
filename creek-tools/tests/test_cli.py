@@ -3412,6 +3412,98 @@ def test_voice_check_json_survives_square_brackets_in_findings(
     assert payload["findings"][0]["message"] == bracketed
 
 
+def _write_voice_distance_config(vault: Path, upper: float) -> Path:
+    """Write a vault ``creek_config.yaml`` overriding ``voice_distance_upper``.
+
+    Args:
+        vault: Vault root whose ``00-Creek-Meta`` config dir receives the file.
+        upper: Custom ``ai_style.voice_distance_upper`` ceiling to persist.
+
+    Returns:
+        Path to the written ``creek_config.yaml``.
+    """
+    config_dir = vault / "00-Creek-Meta"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "creek_config.yaml"
+    config_path.write_text(
+        f"ai_style:\n  voice_distance_upper: {upper}\n",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_voice_check_default_threshold_honors_vault_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``--max-distance``, the vault's ``voice_distance_upper`` wins.
+
+    A vault config pins ``voice_distance_upper`` to 0.10 — far below the 0.35
+    default. A file whose distance sits between the two (~0.29) passes under
+    the default but must DIVERGE under the vault override. This pins that the
+    effective threshold is resolved from the loaded vault config at call time,
+    not frozen from the default config at module import.
+    """
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    config_path = _write_voice_distance_config(vault, 0.10)
+    monkeypatch.setenv("CREEK_CONFIG", str(config_path))
+
+    # ~0.29 distance: comfortably above the 0.10 override, below the 0.35 default.
+    target = tmp_path / "padded.md"
+    target.write_text(
+        (_voice_fixture_dir("slop") / "03_wiki_padding.md").read_text(
+            encoding="utf-8",
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault)],
+    )
+
+    assert result.exit_code != 0, result.output
+    plain = _strip_ansi(result.output)
+    # The summary reports the override (0.1000), not the 0.35 default.
+    assert "0.1000" in plain
+    assert "0.3500" not in plain
+
+
+def test_voice_check_explicit_max_distance_overrides_vault_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--max-distance`` beats the vault's configured ceiling.
+
+    The vault pins ``voice_distance_upper`` to 0.10, but passing
+    ``--max-distance 0.5`` must take precedence so the ~0.29 file passes.
+    """
+    vault = tmp_path / "vault"
+    _scaffold_voice_vault(vault)
+    _build_and_persist_fingerprint(vault)
+    config_path = _write_voice_distance_config(vault, 0.10)
+    monkeypatch.setenv("CREEK_CONFIG", str(config_path))
+
+    target = tmp_path / "padded.md"
+    target.write_text(
+        (_voice_fixture_dir("slop") / "03_wiki_padding.md").read_text(
+            encoding="utf-8",
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["voice-check", str(target), "--vault", str(vault), "--max-distance", "0.5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    plain = _strip_ansi(result.output)
+    assert "0.5000" in plain
+
+
 def test_voice_check_builds_fingerprint_when_not_persisted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

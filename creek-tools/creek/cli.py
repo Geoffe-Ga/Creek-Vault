@@ -1303,15 +1303,6 @@ def _report_fingerprint(vault_path: Path) -> None:
     )
 
 
-_DEFAULT_VOICE_MAX_DISTANCE: float = AIStyleConfig().voice_distance_upper
-"""Default ``--max-distance`` for ``creek voice-check`` (config-sourced).
-
-Sourced directly from
-:attr:`creek.config.AIStyleConfig.voice_distance_upper` so the CLI default
-tracks the same constant the draft guard and the lint check use.
-"""
-
-
 def _resolve_voice_fingerprint(
     vault_path: Path,
     ai_style: AIStyleConfig,
@@ -1418,13 +1409,14 @@ def _emit_voice_check_json(
 def voice_check(
     file: Path = typer.Argument(..., help="Markdown file to score against your voice"),
     vault: Path | None = typer.Option(None, "--vault", help="Obsidian vault path"),
-    max_distance: float = typer.Option(
-        _DEFAULT_VOICE_MAX_DISTANCE,
+    max_distance: float | None = typer.Option(
+        None,
         "--max-distance",
         help=(
             "Voice-distance ceiling. A file whose distance exceeds this is "
-            "treated as diverging and the command exits non-zero. Defaults to "
-            "the AI-style config's voice_distance_upper."
+            "treated as diverging and the command exits non-zero. When "
+            "omitted, defaults to the vault's configured "
+            "voice_distance_upper (the same ceiling creek draft enforces)."
         ),
     ),
     json_out: bool = typer.Option(
@@ -1458,6 +1450,11 @@ def voice_check(
 
     vault_path = _resolve_vault(vault)
     ai_style = _load_config_for_vault(vault).ai_style
+    # Resolve the ceiling from THIS vault's config at call time so a per-vault
+    # voice_distance_upper override is honoured; an explicit flag still wins.
+    effective_max_distance = (
+        max_distance if max_distance is not None else ai_style.voice_distance_upper
+    )
     fingerprint = _resolve_voice_fingerprint(vault_path, ai_style)
 
     if fingerprint.fragment_count == 0:
@@ -1474,20 +1471,20 @@ def voice_check(
         fingerprint=fingerprint,
         config=ai_style,
     )
-    in_voice = report.voice_distance <= max_distance
+    in_voice = report.voice_distance <= effective_max_distance
 
     if json_out:
         _emit_voice_check_json(
             target=file,
             report=report,
             in_voice=in_voice,
-            max_distance=max_distance,
+            max_distance=effective_max_distance,
         )
     else:
         _print_voice_check_summary(
             report=report,
             in_voice=in_voice,
-            max_distance=max_distance,
+            max_distance=effective_max_distance,
         )
 
     if not in_voice:
