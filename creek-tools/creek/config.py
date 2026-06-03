@@ -765,6 +765,19 @@ class DraftConfig(BaseModel):
     CLI flag overrides it per invocation. A draft cut off at this ceiling
     is flagged ``truncated`` in frontmatter and warned about on stderr."""
 
+    cohesion: bool = Field(default=False)
+    """Opt-in switch for the no-fabrication cohesion pass.
+
+    Default ``False`` so merging the pass changes no current behaviour: a
+    single-topic draft is composed exactly as before unless the operator
+    passes ``creek draft --cohesion`` (or sets this to ``true`` in
+    ``draft:``). When enabled — and only with the LLM available, never on
+    the ``--no-llm`` path — a post-composition pass smooths abrupt seams by
+    inserting transitions. The rewrite is gated by a deterministic
+    entity-preservation guard (no new proper noun, number, or bespoke
+    ontology term) plus a biographical-grounding re-check; any violation
+    falls back to the pre-cohesion body."""
+
 
 AIStyleCategory = Literal[
     "mechanical",

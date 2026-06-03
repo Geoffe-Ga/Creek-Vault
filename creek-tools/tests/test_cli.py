@@ -2012,6 +2012,80 @@ def test_draft_command_happy_path(
     assert drafts[0].name.endswith("-naming-what-orbits.md")
 
 
+def test_draft_cohesion_flag_advertised_in_help() -> None:
+    """The opt-in ``--cohesion`` flag is documented in ``creek draft --help``."""
+    # Render at a wide width so the option name cannot wrap, and strip ANSI
+    # so colour codes can't split the ``--cohesion`` token (CI renders the
+    # rich help table coloured and at ~80 cols, breaking literal matching).
+    result = runner.invoke(app, ["draft", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "--cohesion" in normalized
+
+
+def test_draft_cohesion_flag_smooths_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek draft --cohesion`` runs the entity-preserving cohesion pass.
+
+    Stubs a two-phase LLM: the first call composes a seamed body, the
+    cohesion call (recognised by its ``## Cohesion directive`` block) returns
+    a transitions-only smoothed body. The saved draft must carry the smoothed
+    body — proving the flag wired the pass on.
+    """
+    from creek import cli as cli_module
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+    from creek.models import Frequency
+
+    seed = IdeaSeed(
+        strategy=MiningStrategy.THREAD_TERMINUS,
+        title="Naming what orbits",
+        source_fragments=(),
+        threads=(),
+        eddies=(),
+        frequency_affinity=(Frequency.F1,),
+        brief_description="An essay waits here.",
+        score=0.8,
+    )
+    smoothed = "My dad watched Pluribus. And so, doubt is the spine."
+
+    def _two_phase(prompt: str) -> str:
+        if "## Cohesion directive" in prompt:
+            return smoothed
+        return "My dad watched Pluribus. Doubt is the spine."
+
+    monkeypatch.setattr(
+        cli_module,
+        "_build_draft_llm",
+        lambda *_a, **_k: _two_phase,
+    )
+
+    def _stub_mine_all(
+        _self: object,
+        _vault: object,
+        *,
+        current_phase: object,
+    ) -> list[IdeaSeed]:
+        del current_phase
+        return [seed]
+
+    monkeypatch.setattr(
+        "creek.generate.mining.IdeaMiner.mine_all",
+        _stub_mine_all,
+    )
+
+    vault = tmp_path / "vault"
+    for sub in ("01-Fragments", "02-Threads", "03-Eddies", "07-Voice/Drafts"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault), "--cohesion"])
+    assert result.exit_code == 0, result.output
+    drafts = list((vault / "07-Voice" / "Drafts").glob("*.md"))
+    assert len(drafts) == 1
+    assert smoothed in drafts[0].read_text(encoding="utf-8")
+
+
 def test_draft_command_errors_when_llm_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

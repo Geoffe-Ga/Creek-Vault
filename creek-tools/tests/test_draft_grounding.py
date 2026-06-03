@@ -245,6 +245,14 @@ class TestDraftConfig:
         """Operators may pin a default token ceiling for longer drafts."""
         assert DraftConfig(max_tokens=4096).max_tokens == 4096
 
+    def test_cohesion_defaults_off(self) -> None:
+        """The cohesion pass must default off so merging changes nothing."""
+        assert DraftConfig().cohesion is False
+
+    def test_cohesion_can_be_enabled(self) -> None:
+        """Operators may persist the opt-in cohesion pass in ``draft:`` config."""
+        assert DraftConfig(cohesion=True).cohesion is True
+
     def test_creekconfig_exposes_draft_section(self) -> None:
         """The top-level ``draft:`` section must hang off ``CreekConfig``."""
         from creek.config import CreekConfig

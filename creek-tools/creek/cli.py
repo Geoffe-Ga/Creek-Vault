@@ -2362,6 +2362,18 @@ def draft(
             "rewrite pass (no extra network hop)."
         ),
     ),
+    cohesion: bool = typer.Option(
+        False,
+        "--cohesion",
+        help=(
+            "Opt in to the no-fabrication cohesion pass: after "
+            "composing a single-topic draft, run an LLM pass that smooths "
+            "abrupt seams with transitions. A deterministic entity-preservation "
+            "guard rejects any output that introduces a new proper noun, "
+            "number, or ontology term, falling back to the original body. "
+            "Default off; requires the LLM, so it is skipped under --no-llm."
+        ),
+    ),
 ) -> None:
     """Draft an essay from a mined idea with the activated skill stack.
 
@@ -2407,7 +2419,9 @@ def draft(
     skills_dir = skills_root if skills_root is not None else vault_path / "creek-skills"
     current_phase = _parse_phase(phase)
     voice_text = _read_voice_core(voice_core)
-    ai_style = _load_config_for_vault(vault).ai_style
+    vault_config = _load_config_for_vault(vault)
+    ai_style = vault_config.ai_style
+    cohesion_enabled = cohesion or vault_config.draft.cohesion
     fingerprint = load_fingerprint(vault_path, ai_style)
     style_preamble = build_style_preamble(fingerprint, ai_style)
     override = _parse_include_tier(include_tier)
@@ -2439,6 +2453,7 @@ def draft(
         fingerprint=fingerprint,
         ai_style_config=ai_style,
         voice_guard_no_llm=no_llm,
+        cohesion=cohesion_enabled,
     )
 
     if outline_text is not None:
