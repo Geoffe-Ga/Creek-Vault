@@ -127,10 +127,12 @@ _BESPOKE_ONTOLOGY_TERMS: tuple[str, ...] = (
     "eddy",
     "eddies",
     "praxis",
+    "praxes",
     "wavelength",
+    "wavelengths",
     "aptitude",
 )
-"""The owner's bespoke Creek ontology vocabulary (issue #518).
+"""The owner's bespoke Creek ontology vocabulary.
 
 Guarded by the cohesion entity-preservation check alongside proper nouns and
 numbers: a cohesion pass that introduces one of these terms where the
@@ -804,8 +806,8 @@ class DraftGenerator:
             voice_guard_no_llm: When ``True`` the voice-fidelity guard
                 sanitizes and measures only — no rewrite hop (honours the
                 ``creek draft --no-llm`` flag).
-            cohesion: Opt-in switch for the no-fabrication cohesion pass
-                (issue #518). Default ``False`` so the single-topic draft
+            cohesion: Opt-in switch for the no-fabrication cohesion pass.
+                Default ``False`` so the single-topic draft
                 path is byte-for-byte unchanged. When ``True`` — and the LLM
                 is available (skipped under ``voice_guard_no_llm``) — a
                 post-composition pass smooths seams with transitions, gated
@@ -1340,8 +1342,8 @@ class DraftGenerator:
 
         Used as the ``grounding_check`` seam for
         :func:`~creek.generate.cohesion.run_cohesion_pass` so the cohesion
-        pass cannot smuggle in an ungrounded first-person biographical claim
-        (#515). Returns no findings — which lets the smoothed body through —
+        pass cannot smuggle in an ungrounded first-person biographical claim.
+        Returns no findings — which lets the smoothed body through —
         when the grounding guard is not configured (no embedding callable),
         matching the dormant behaviour of the paragraph guard.
 
@@ -1392,7 +1394,7 @@ class DraftGenerator:
     ) -> str:
         """Run the opt-in cohesion pass, returning the smoothed or original body.
 
-        Default-off (issue #518): when :attr:`_cohesion` is ``False`` or the
+        Default-off: when :attr:`_cohesion` is ``False`` or the
         draft is running under ``--no-llm`` (:attr:`_voice_guard_no_llm`),
         the body is returned unchanged and no extra LLM hop fires. Otherwise
         :func:`~creek.generate.cohesion.run_cohesion_pass` smooths the seams,

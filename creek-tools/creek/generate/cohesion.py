@@ -1,4 +1,4 @@
-"""No-fabrication cohesion pass for single-topic drafts (issue #518).
+"""No-fabrication cohesion pass for single-topic drafts.
 
 Single-topic drafts often read as disjointed — sections sit next to each
 other with abrupt seams and no connective tissue. This module adds an
@@ -25,6 +25,7 @@ voice — still no new content.
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Callable, Sequence
 
 #: Callable ``(prompt) -> body`` for the cohesion LLM hop. Reuses the draft
@@ -34,7 +35,7 @@ CohesionLLM = Callable[[str], str]
 
 #: Callable ``(body) -> findings`` for the post-cohesion grounding re-check.
 #: Returns a non-empty sequence when the smoothed body smuggled in an
-#: ungrounded first-person claim (#515); the pass then falls back.
+#: ungrounded first-person claim; the pass then falls back.
 GroundingCheck = Callable[[str], Sequence[object]]
 
 
@@ -183,6 +184,19 @@ def build_cohesion_prompt(body: str, *, voice_core: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def _warn_cohesion_fallback(reason: str) -> None:
+    """Print a brief cohesion-guard fallback diagnostic to stderr.
+
+    Mirrors the ``grounding guard:`` stderr warnings emitted by the draft
+    grounding checks so an operator who opted into ``--cohesion`` learns *why*
+    the pass had no effect.
+
+    Args:
+        reason: A short phrase naming which guard rejected the output.
+    """
+    print(f"cohesion guard: {reason}; kept pre-cohesion body", file=sys.stderr)
+
+
 def run_cohesion_pass(
     body: str,
     *,
@@ -206,8 +220,12 @@ def run_cohesion_pass(
        output — a new proper noun, number, or bespoke term appeared — the
        original body is returned.
     #. **Ungrounded claim.** When *grounding_check* flags the smoothed body
-       (a smuggled first-person biographical claim, #515), the original body
+       (a smuggled first-person biographical claim), the original body
        is returned.
+
+    Each fallback (empty response, fabricated entity, ungrounded claim) emits
+    a brief ``cohesion guard:`` warning on stderr so an operator who opted into
+    the pass learns why it had no effect. The return contract is unchanged.
 
     Args:
         body: The composed single-topic draft body.
@@ -226,9 +244,12 @@ def run_cohesion_pass(
         return body
     smoothed = cohesion_llm(build_cohesion_prompt(body, voice_core=voice_core)).strip()
     if not smoothed:
+        _warn_cohesion_fallback("empty cohesion response")
         return body
     if not is_entity_preserving(pre=body, post=smoothed, bespoke_terms=bespoke_terms):
+        _warn_cohesion_fallback("cohesion output introduced a new entity/number/term")
         return body
     if grounding_check(smoothed):
+        _warn_cohesion_fallback("cohesion output smuggled an ungrounded claim")
         return body
     return smoothed

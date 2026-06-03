@@ -246,7 +246,7 @@ class TestDraftConfig:
         assert DraftConfig(max_tokens=4096).max_tokens == 4096
 
     def test_cohesion_defaults_off(self) -> None:
-        """The cohesion pass must default off so merging changes nothing (#518)."""
+        """The cohesion pass must default off so merging changes nothing."""
         assert DraftConfig().cohesion is False
 
     def test_cohesion_can_be_enabled(self) -> None:

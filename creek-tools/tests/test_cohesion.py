@@ -1,4 +1,4 @@
-"""Tests for the no-fabrication cohesion pass (issue #518).
+"""Tests for the no-fabrication cohesion pass.
 
 The cohesion pass smooths seams between independently-composed sections of
 a single-topic draft by inserting transitions. It is gated behind a hard,
@@ -14,6 +14,8 @@ that runs the pass only when explicitly enabled.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from creek.generate.cohesion import (
     build_cohesion_prompt,
     extract_preservable_tokens,
@@ -21,6 +23,9 @@ from creek.generate.cohesion import (
     is_entity_preserving,
     run_cohesion_pass,
 )
+
+if TYPE_CHECKING:
+    import pytest
 
 
 class TestExtractPreservableTokens:
@@ -104,6 +109,24 @@ class TestIsEntityPreserving:
                 pre=pre,
                 post=post,
                 bespoke_terms=("eddy", "fragment", "praxis"),
+            )
+            is False
+        )
+
+    def test_new_pluralised_bespoke_term_is_rejected(self) -> None:
+        """A fabricated *plural* ontology term cannot slip the guard.
+
+        Without ``wavelengths`` in the preserve set a cohesion pass could
+        introduce the plural while ``wavelength`` was absent — fabricating
+        ontology structure. The plural must be guarded just like the singular.
+        """
+        pre = "The idea sits there, unmoving."
+        post = "The Wavelengths of the idea sit there, unmoving."
+        assert (
+            is_entity_preserving(
+                pre=pre,
+                post=post,
+                bespoke_terms=("wavelength", "wavelengths", "praxis", "praxes"),
             )
             is False
         )
@@ -235,3 +258,38 @@ class TestRunCohesionPass:
             grounding_check=_no_grounding_findings,
         )
         assert result == "Original body."
+
+    def test_rejected_output_warns_on_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A guard-rejected cohesion output emits a stderr fallback diagnostic.
+
+        An operator who opted into ``--cohesion`` should see *why* the pass
+        had no effect, mirroring the biographical grounding-guard warning.
+        """
+        pre = "My dad watched the show. Doubt is the spine."
+        fabricated = "In 1997, my dad watched the show in Provo. Doubt is the spine."
+
+        run_cohesion_pass(
+            pre,
+            cohesion_llm=lambda _p: fabricated,
+            enabled=True,
+            grounding_check=_no_grounding_findings,
+        )
+        err = capsys.readouterr().err
+        assert "cohesion guard" in err.lower()
+
+    def test_accepted_output_emits_no_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An accepted cohesion output emits no fallback diagnostic."""
+        pre = "My dad watched Pluribus. Doubt is the spine."
+        smoothed = "My dad watched Pluribus. And so, doubt is the spine."
+
+        run_cohesion_pass(
+            pre,
+            cohesion_llm=lambda _p: smoothed,
+            enabled=True,
+            grounding_check=_no_grounding_findings,
+        )
+        assert capsys.readouterr().err == ""

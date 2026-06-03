@@ -541,7 +541,7 @@ class TestGenerateDraft:
 
 
 class TestGenerateDraftCohesion:
-    """The opt-in cohesion pass wiring in ``generate_draft`` (issue #518)."""
+    """The opt-in cohesion pass wiring in ``generate_draft``."""
 
     @staticmethod
     def _two_phase_llm(
@@ -659,7 +659,7 @@ class TestGenerateDraftCohesion:
         vault: Path,
         skills_root: Path,
     ) -> None:
-        """A smoothed body tripping the grounding re-check falls back (#515).
+        """A smoothed body tripping the grounding re-check falls back.
 
         The cohesion output is entity-preserving (no new proper noun /
         number) but smuggles in a first-person biographical claim that the

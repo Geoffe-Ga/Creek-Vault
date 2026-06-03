@@ -2366,7 +2366,7 @@ def draft(
         False,
         "--cohesion",
         help=(
-            "Opt in to the no-fabrication cohesion pass (issue #518): after "
+            "Opt in to the no-fabrication cohesion pass: after "
             "composing a single-topic draft, run an LLM pass that smooths "
             "abrupt seams with transitions. A deterministic entity-preservation "
             "guard rejects any output that introduces a new proper noun, "
@@ -2421,8 +2421,6 @@ def draft(
     voice_text = _read_voice_core(voice_core)
     vault_config = _load_config_for_vault(vault)
     ai_style = vault_config.ai_style
-    # The --cohesion flag opts the run in; draft.cohesion persists the default
-    # in config (default False). Either turning it on enables the pass (#518).
     cohesion_enabled = cohesion or vault_config.draft.cohesion
     fingerprint = load_fingerprint(vault_path, ai_style)
     style_preamble = build_style_preamble(fingerprint, ai_style)

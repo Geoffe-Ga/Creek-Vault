@@ -766,7 +766,7 @@ class DraftConfig(BaseModel):
     is flagged ``truncated`` in frontmatter and warned about on stderr."""
 
     cohesion: bool = Field(default=False)
-    """Opt-in switch for the no-fabrication cohesion pass (issue #518).
+    """Opt-in switch for the no-fabrication cohesion pass.
 
     Default ``False`` so merging the pass changes no current behaviour: a
     single-topic draft is composed exactly as before unless the operator
