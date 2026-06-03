@@ -86,9 +86,19 @@ class TestProvenanceTellIsFingerprintIndependent:
         text = "I've been journaling about this."
         assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
 
+    def test_been_writing_in_my_journal(self) -> None:
+        """'I have been writing in my journal.' names a source; flagged."""
+        text = "I have been writing in my journal."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
     def test_coming_back_to_this_in_my_notes(self) -> None:
         """'I keep coming back to this in my notes.' is flagged."""
         text = "I keep coming back to this in my notes."
+        assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
+
+    def test_in_my_journals_still_matches_via_my_branch(self) -> None:
+        """'in my journals' still fires via the 'my …' branch (#525)."""
+        text = "I keep coming back to this in my journals."
         assert _fired(scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell")
 
 
@@ -112,6 +122,20 @@ class TestProvenanceTellFalsePositiveGuard:
     def test_note_in_non_sourcing_sense_not_flagged(self) -> None:
         """'Note the difference.' uses 'note' as an imperative; no fire."""
         text = "Note the difference between the two readings."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_been_writing_code_not_flagged(self) -> None:
+        """'I have been writing code.' is ordinary prose, not sourcing (#525)."""
+        text = "I have been writing code."
+        assert not _fired(
+            scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
+        )
+
+    def test_been_writing_tests_not_flagged(self) -> None:
+        """\"I've been writing tests all morning.\" is not sourcing (#525)."""
+        text = "I've been writing tests all morning."
         assert not _fired(
             scan(text, fingerprint=_PLAIN, config=_CONFIG), "provenance_tell"
         )

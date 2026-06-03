@@ -328,18 +328,21 @@ KNOWLEDGE_CUTOFF_RE = re.compile(
 # tell: these should essentially never appear in finished prose. Kept
 # conservative — match self-referential SOURCING announcements, not ordinary
 # uses of "wrote"/"note" ("I wrote her a letter.", "Note the difference.").
-#   1. ``(in )?my journal(s)/notes/entries`` and the verb ``journaling``.
-#   2. ``I('ve| have)? been writing/journaling`` — narrating the act of
-#      keeping a journal.
+#   1. ``my journal(s)/notes/entries`` and the verb ``journaling`` (the
+#      ``my …`` branch also covers ``in my notes`` via the substring).
+#   2. ``I('ve| have)? been journaling`` / ``… been writing in my
+#      journals/notes/diary`` — narrating the act of keeping a journal as the
+#      source. Bare "been writing" is dropped: it matches ordinary prose
+#      ("I have been writing code.") without announcing a source (#525).
 #   3. ``from one of (them|my journals/notes/entries)`` — quoting a source.
 #   4. ``as I wrote (in …)`` / ``one of my (journals|notes|entries)`` — pointing
 #      at a prior written-down source.
 #   5. ``my journals keep …`` — personifying the corpus as a source.
 PROVENANCE_RE = re.compile(
-    r"\bin my (?:journals?|notes|entries)\b"
-    r"|\bmy (?:journals?|notes|entries)\b"
+    r"\bmy (?:journals?|notes|entries)\b"
     r"|\bjournaling\b"
-    r"|\bi(?:'ve| have)? been (?:writing|journaling)\b"
+    r"|\bi(?:'ve| have)? been journaling\b"
+    r"|\bi(?:'ve| have)? been writing in my (?:journals?|notes?|diary)\b"
     r"|\bfrom one of (?:them|my (?:journals?|notes|entries))\b"
     r"|\bas i wrote\b"
     r"|\bone of my (?:journals?|notes|entries)\b",
