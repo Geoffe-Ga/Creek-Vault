@@ -51,10 +51,11 @@ echo "[ok] DISCORD_BOT_TOKEN and ANTHROPIC_API_KEY present"
 VP="$(sed -n 's/^vault_path:[[:space:]]*//p' "$VAULT_CONFIG" | head -1 | tr -d '"'"'"' ')"
 if [[ "$VP" != /* ]]; then
   echo "[fix] vault_path in $VAULT_CONFIG is '$VP' (relative) — rewriting to absolute"
-  # Portable in-place edit: GNU sed needs no suffix, BSD/macOS sed requires one.
-  # `-i.bak` works on both; the .bak also serves as a backup of the prior config.
-  sed -i.bak "s|^vault_path:.*|vault_path: $VAULT|" "$VAULT_CONFIG" \
-    && rm -f "${VAULT_CONFIG}.bak"
+  # Atomic, portable rewrite: write to a temp file then mv into place. Avoids the
+  # GNU-vs-BSD `sed -i` suffix split, and the original survives if sed fails.
+  TMP_CFG="$(mktemp)"
+  sed "s|^vault_path:.*|vault_path: $VAULT|" "$VAULT_CONFIG" > "$TMP_CFG" \
+    && mv "$TMP_CFG" "$VAULT_CONFIG"
 else
   echo "[ok] vault_path is absolute ($VP)"
 fi
@@ -84,13 +85,12 @@ else
   echo "       build one with: (cd $CREEK_PROJECT && uv run creek skills generate --vault $VAULT)"
 fi
 
-# 6. Preserve existing Discord allowlists if a config is already present.
-#    Read ALL numeric ids under each key (not just the first), validate each is
-#    a snowflake, and fall back to the known single-user defaults when empty.
-#    NOTE: these defaults are the repo author's own Discord ids — replace them
-#    with your own user/channel ids when running a different deployment.
-DEFAULT_USER="579188864804192268"
-DEFAULT_CHANNEL="860198841784205325"
+# 6. Determine the Discord allowlists. Preferred source is the existing config
+#    (preserve ALL numeric ids, not just the first); otherwise fall back to the
+#    CRAWDAD_DEFAULT_USER / CRAWDAD_DEFAULT_CHANNEL env vars. No personal ids are
+#    baked into this script — a fresh vault with no prior config must supply them.
+DEFAULT_USER="${CRAWDAD_DEFAULT_USER:-}"
+DEFAULT_CHANNEL="${CRAWDAD_DEFAULT_CHANNEL:-}"
 
 # read_list <file> <key> -> one numeric id per line for that YAML sequence
 read_list() {
@@ -109,21 +109,32 @@ if [[ -f "$CONFIG_OUT" ]]; then
   while IFS= read -r id; do [[ "$id" =~ ^[0-9]+$ ]] && CHAN_IDS+=("$id"); done \
     < <(read_list "$CONFIG_OUT" allowed_channel_ids)
 fi
-[[ ${#USER_IDS[@]} -eq 0 ]] && USER_IDS=("$DEFAULT_USER")
-[[ ${#CHAN_IDS[@]} -eq 0 ]] && CHAN_IDS=("$DEFAULT_CHANNEL")
+if [[ ${#USER_IDS[@]} -eq 0 ]]; then
+  [[ "$DEFAULT_USER" =~ ^[0-9]+$ ]] \
+    || fail "no allowed_user_ids in $CONFIG_OUT and CRAWDAD_DEFAULT_USER is unset/invalid — export it as your Discord user id"
+  USER_IDS=("$DEFAULT_USER")
+fi
+if [[ ${#CHAN_IDS[@]} -eq 0 ]]; then
+  [[ "$DEFAULT_CHANNEL" =~ ^[0-9]+$ ]] \
+    || fail "no allowed_channel_ids in $CONFIG_OUT and CRAWDAD_DEFAULT_CHANNEL is unset/invalid — export it as your Discord channel id"
+  CHAN_IDS=("$DEFAULT_CHANNEL")
+fi
 echo "[ok] allowlist: ${#USER_IDS[@]} user(s), ${#CHAN_IDS[@]} channel(s)"
 
 # 7. Write the launch config. mcp_server_command must point at the creek-tools
 #    project (absolute) and the vault's own config. Path values are single-quoted
-#    so a path containing YAML-reserved chars (: # & *) can't corrupt the config
-#    or inject into the executed mcp_server_command argv.
+#    (with embedded single quotes doubled per YAML) so a path containing
+#    YAML-reserved chars (: # & *) or a quote can't corrupt the config or inject
+#    into the executed mcp_server_command argv.
+# Emit a YAML single-quoted scalar, doubling any embedded single quote per spec.
+sq() { local q="'" s="$1"; s="${s//$q/$q$q}"; printf '%s%s%s' "$q" "$s" "$q"; }
 {
-  printf "vault_path: '%s'\n" "$VAULT"
+  printf "vault_path: %s\n" "$(sq "$VAULT")"
   printf "mcp_server_command:\n"
   printf "  - uv\n  - run\n  - --project\n"
-  printf "  - '%s'\n" "$CREEK_PROJECT"
+  printf "  - %s\n" "$(sq "$CREEK_PROJECT")"
   printf "  - creek-tools-mcp\n  - --config\n"
-  printf "  - '%s'\n" "$VAULT_CONFIG"
+  printf "  - %s\n" "$(sq "$VAULT_CONFIG")"
   printf "allowed_user_ids:\n"
   for id in "${USER_IDS[@]}"; do printf "  - %s\n" "$id"; done
   printf "allowed_channel_ids:\n"

@@ -22,13 +22,24 @@ per turn and runs a Haiku-router → MCP → Sonnet-composer agent loop.
 
 ## Step 1 — Ask which vault (always)
 
-Do **not** assume the vault. Ask the user for the vault directory. On this
-machine the known options (examples — substitute the user's actual vaults) are:
+Always ask the user which vault directory to launch against — never assume one.
+To help them choose:
 
-- Demo / prod: `/Users/geoffgallinger/Documents/creek-demo-2026-05-30`
-- Primary: `/Users/geoffgallinger/Documents/creek`
+- **Discover the Creek vaults on this machine** (a vault is any dir with a
+  `00-Creek-Meta/creek_config.yaml`):
+  ```bash
+  find ~ -maxdepth 5 -path '*/00-Creek-Meta/creek_config.yaml' 2>/dev/null \
+    | sed 's#/00-Creek-Meta/creek_config.yaml##'
+  ```
+- **Offer the last-launched vault as the default.** If `crawdad/crawdad.yaml`
+  already exists, its `vault_path` is the vault CrawDad last ran against — a
+  sensible default when the user has no preference. Read it with:
+  ```bash
+  sed -n "s/^vault_path:[[:space:]]*//p" "$(git rev-parse --show-toplevel)/crawdad/crawdad.yaml" | tr -d "\"'"
+  ```
 
-Run unattended against the **demo** vault unless told otherwise.
+If a non-interactive run gives you no vault and no prior config exists, stop and
+ask rather than guessing.
 
 ## Step 2 — Preflight + write the launch config
 
@@ -50,8 +61,11 @@ What it checks/fixes (each is a real launch failure mode):
   free-text replies + session-state load at startup).
 - **`creek-skills/voice-core/SKILL.md`** — mirrors `meta/voice-core.SKILL.md`
   into it (bug #538) so replies sound like the vault owner, not generic.
-- **Discord allowlists** — preserved from the existing config, else the known
-  single-user defaults. Both lists must be non-empty or the bot won't start.
+- **Discord allowlists** — all ids preserved from the existing `crawdad.yaml`,
+  else taken from `CRAWDAD_DEFAULT_USER` / `CRAWDAD_DEFAULT_CHANNEL` in the env.
+  A fresh vault with no prior config and no env defaults fails with a clear
+  message (both lists must be non-empty or the bot won't start) — export those
+  two vars or hand-edit the allowlists before retrying.
 
 If the script prints `ERROR:`, stop and fix what it reports before launching.
 
