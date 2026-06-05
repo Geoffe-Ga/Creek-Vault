@@ -136,7 +136,13 @@ echo "[ok] allowlist: ${#USER_IDS[@]} user(s), ${#CHAN_IDS[@]} channel(s)"
 #    DIRECTLY (no `uv run`: deterministic, fast, no lock contention, and `exec`
 #    hands stdio straight to the server so the MCP JSON-RPC stream stays clean).
 #    Falls back to `uv run` if the venv binary isn't present yet.
-LOGIN_SHELL="${SHELL:-/bin/zsh}"
+# /bin/bash is the universal fallback (always present, POSIX `export`/`;`/`exec`).
+# fish can't run the `export VAR=val; exec …` wrapper, so coerce it to bash too.
+LOGIN_SHELL="${SHELL:-/bin/bash}"
+if [[ "$LOGIN_SHELL" == *fish ]]; then
+  echo "[warn] \$SHELL is fish, which can't run the POSIX MCP wrapper — using /bin/bash"
+  LOGIN_SHELL=/bin/bash
+fi
 MCP_BIN="$CREEK_PROJECT/.venv/bin/creek-tools-mcp"
 
 # shq: POSIX shell single-quote (embedded ' becomes '\'') — safe argv for the -lc string.
@@ -153,7 +159,7 @@ MCP_INNER="export CREEK_ANTHROPIC_CONSENT=1; $MCP_EXEC"
 # 8. Write the launch config. Every scalar is a YAML single-quoted string (with
 #    embedded single quotes doubled per spec) so a path with YAML-reserved chars
 #    (: # & *) or a quote can't corrupt the config or inject into the argv.
-# Emit a YAML single-quoted scalar, doubling any embedded single quote per spec.
+# sq: YAML single-quoted scalar (embedded ' becomes '') — safe scalar for crawdad.yaml.
 sq() { local q="'" s="$1"; s="${s//$q/$q$q}"; printf '%s%s%s' "$q" "$s" "$q"; }
 {
   printf "vault_path: %s\n" "$(sq "$VAULT")"

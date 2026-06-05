@@ -96,9 +96,11 @@ cd <REPO>/crawdad && uv run crawdad run --config <REPO>/crawdad/crawdad.yaml
 
 Use `run_in_background: true`. Then read the background output to confirm it
 connected to Discord (look for the gateway/ready log line) and report the
-channel it's listening in. Both `crawdad` and `creek-tools-mcp` run from source
-via `uv run`, so **to pick up merged/edited code just restart the bot** — no
-reinstall needed.
+channel it's listening in. `crawdad` runs from source via `uv run`, and
+`creek-tools-mcp` runs from its pre-built editable venv binary (or `uv run` in
+the fallback) — both reflect source edits, so **to pick up merged/edited code
+just restart the bot**, no reinstall needed. Only a *dependency* change needs a
+`uv sync` in `creek-tools` first.
 
 ## Notes
 
