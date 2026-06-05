@@ -9,6 +9,9 @@ description: >-
   secrets, allowlists) and starts the bot in the background. Do NOT use for
   driving the `creek` CLI / writing essays (use creek-cli) or editing
   crawdad/creek-tools source (use stay-green/work-issue).
+metadata:
+  author: Geoff
+  version: 1.0.0
 ---
 
 # crawdad-launch
@@ -19,8 +22,8 @@ per turn and runs a Haiku-router → MCP → Sonnet-composer agent loop.
 
 ## Step 1 — Ask which vault (always)
 
-Do **not** assume the vault. Ask the user for the vault directory. Offer the
-known options as a sensible default:
+Do **not** assume the vault. Ask the user for the vault directory. On this
+machine the known options (examples — substitute the user's actual vaults) are:
 
 - Demo / prod: `/Users/geoffgallinger/Documents/creek-demo-2026-05-30`
 - Primary: `/Users/geoffgallinger/Documents/creek`
@@ -30,10 +33,11 @@ Run unattended against the **demo** vault unless told otherwise.
 ## Step 2 — Preflight + write the launch config
 
 Run the bundled script with the chosen vault. It validates the vault, ensures
-the env secrets, fixes the known gotchas, and writes `crawdad/crawdad.yaml`:
+the env secrets, fixes the known gotchas, and writes `crawdad/crawdad.yaml`.
+Resolve the script via the repo root so this works on any checkout:
 
 ```bash
-bash /Users/geoffgallinger/Projects/creek-tools/.claude/skills/crawdad-launch/launch.sh <VAULT>
+bash "$(git rev-parse --show-toplevel)/.claude/skills/crawdad-launch/launch.sh" <VAULT>
 ```
 
 What it checks/fixes (each is a real launch failure mode):
@@ -53,12 +57,14 @@ If the script prints `ERROR:`, stop and fix what it reports before launching.
 
 ## Step 3 — Launch the bot (background)
 
-On `READY`, start the bot as a **background** Bash process (it's a long-running
-Discord client, not a one-shot):
+On success the script prints a `READY` block ending with the exact, fully
+resolved launch command under `Launch with:`. Run **that** command verbatim
+(it already contains the right repo-derived absolute paths — don't hand-write
+paths) as a **background** Bash process, since it's a long-running Discord
+client, not a one-shot. The shape is:
 
 ```bash
-cd /Users/geoffgallinger/Projects/creek-tools/crawdad && \
-  uv run crawdad run --config /Users/geoffgallinger/Projects/creek-tools/crawdad/crawdad.yaml
+cd <REPO>/crawdad && uv run crawdad run --config <REPO>/crawdad/crawdad.yaml
 ```
 
 Use `run_in_background: true`. Then read the background output to confirm it
