@@ -121,20 +121,68 @@ if [[ ${#CHAN_IDS[@]} -eq 0 ]]; then
 fi
 echo "[ok] allowlist: ${#USER_IDS[@]} user(s), ${#CHAN_IDS[@]} channel(s)"
 
-# 7. Write the launch config. mcp_server_command must point at the creek-tools
-#    project (absolute) and the vault's own config. Path values are single-quoted
-#    (with embedded single quotes doubled per YAML) so a path containing
-#    YAML-reserved chars (: # & *) or a quote can't corrupt the config or inject
-#    into the executed mcp_server_command argv.
-# Emit a YAML single-quoted scalar, doubling any embedded single quote per spec.
+# 7. Build the MCP server command.
+#
+#    CrawDad spawns this per turn via the MCP stdio SDK, which (a) scrubs the
+#    environment down to a safe allowlist — dropping ANTHROPIC_API_KEY, so
+#    in-MCP cloud tools (draft/author/mine/classify) silently degrade — and
+#    (b) inherits whatever start-up cost the command has. Spawning `uv run`
+#    every turn is slow and contends on uv's project lock when the agent loop
+#    fires several rounds, which surfaces as "could not start ... ('uv')".
+#
+#    Fix both by wrapping the command in a LOGIN shell that re-establishes the
+#    user's exported secrets (ANTHROPIC_API_KEY) from their profile and sets
+#    CREEK_ANTHROPIC_CONSENT=1, then `exec`s the creek-tools venv entry point
+#    DIRECTLY (no `uv run`: deterministic, fast, no lock contention, and `exec`
+#    hands stdio straight to the server so the MCP JSON-RPC stream stays clean).
+#    Falls back to `uv run` if the venv binary isn't present yet.
+# /bin/bash is the universal fallback (always present, POSIX `export`/`;`/`exec`);
+# fish can't run the `export VAR=val; exec …` wrapper, so coerce it to bash too.
+LOGIN_SHELL="${SHELL:-/bin/bash}"
+if [[ "$LOGIN_SHELL" == *fish ]]; then
+  echo "[warn] \$SHELL is fish, which can't run the POSIX MCP wrapper — using /bin/bash"
+  LOGIN_SHELL=/bin/bash
+fi
+MCP_BIN="$CREEK_PROJECT/.venv/bin/creek-tools-mcp"
+
+# The wrapper recovers ANTHROPIC_API_KEY by sourcing the LOGIN profile
+# (~/.zprofile, ~/.zshenv, ~/.bash_profile, ~/.profile) — NOT an interactive rc
+# (~/.zshrc, ~/.bashrc). Verify that actually works by probing the login shell
+# under a scrubbed env (mimicking the MCP SDK, which drops the key): if the key
+# only lives in an rc file, the wrapper can't recover it and cloud tools degrade.
+if env -i HOME="$HOME" PATH="$PATH" TERM="${TERM:-xterm}" \
+     "$LOGIN_SHELL" -lc 'printenv ANTHROPIC_API_KEY' >/dev/null 2>&1; then
+  echo "[ok] $LOGIN_SHELL login profile exposes ANTHROPIC_API_KEY to the MCP wrapper"
+else
+  echo "[warn] $LOGIN_SHELL login profile does NOT export ANTHROPIC_API_KEY —"
+  echo "       in-MCP cloud tools (draft/author/mine/classify) will degrade."
+  echo "       Add 'export ANTHROPIC_API_KEY=…' to a LOGIN file (~/.zprofile,"
+  echo "       ~/.zshenv or ~/.bash_profile), not ~/.zshrc / ~/.bashrc, then relaunch."
+fi
+
+# shq: POSIX shell single-quote (embedded ' becomes '\'') — safe argv for the -lc string.
+shq() { local q="'" s="$1"; s="${s//$q/$q\\$q$q}"; printf '%s%s%s' "$q" "$s" "$q"; }
+if [[ -x "$MCP_BIN" ]]; then
+  echo "[ok] using direct MCP entry point $MCP_BIN"
+  MCP_EXEC="exec $(shq "$MCP_BIN") --config $(shq "$VAULT_CONFIG")"
+else
+  echo "[warn] $MCP_BIN missing — falling back to 'uv run' (slower; run 'uv sync' in creek-tools)"
+  MCP_EXEC="exec uv run --project $(shq "$CREEK_PROJECT") creek-tools-mcp --config $(shq "$VAULT_CONFIG")"
+fi
+MCP_INNER="export CREEK_ANTHROPIC_CONSENT=1; $MCP_EXEC"
+echo "[ok] CREEK_ANTHROPIC_CONSENT=1 in MCP wrapper — cloud tools (draft/author/mine/classify) egress vault content to Anthropic on your key"
+
+# 8. Write the launch config. Every scalar is a YAML single-quoted string (with
+#    embedded single quotes doubled per spec) so a path with YAML-reserved chars
+#    (: # & *) or a quote can't corrupt the config or inject into the argv.
+# sq: YAML single-quoted scalar (embedded ' becomes '') — safe scalar for crawdad.yaml.
 sq() { local q="'" s="$1"; s="${s//$q/$q$q}"; printf '%s%s%s' "$q" "$s" "$q"; }
 {
   printf "vault_path: %s\n" "$(sq "$VAULT")"
   printf "mcp_server_command:\n"
-  printf "  - uv\n  - run\n  - --project\n"
-  printf "  - %s\n" "$(sq "$CREEK_PROJECT")"
-  printf "  - creek-tools-mcp\n  - --config\n"
-  printf "  - %s\n" "$(sq "$VAULT_CONFIG")"
+  printf "  - %s\n" "$(sq "$LOGIN_SHELL")"
+  printf "  - %s\n" "$(sq "-lc")"
+  printf "  - %s\n" "$(sq "$MCP_INNER")"
   printf "allowed_user_ids:\n"
   for id in "${USER_IDS[@]}"; do printf "  - %s\n" "$id"; done
   printf "allowed_channel_ids:\n"

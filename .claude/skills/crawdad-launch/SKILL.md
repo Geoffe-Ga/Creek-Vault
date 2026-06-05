@@ -11,7 +11,7 @@ description: >-
   crawdad/creek-tools source (use stay-green/work-issue).
 metadata:
   author: Geoff
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # crawdad-launch
@@ -66,6 +66,25 @@ What it checks/fixes (each is a real launch failure mode):
   A fresh vault with no prior config and no env defaults fails with a clear
   message (both lists must be non-empty or the bot won't start) — export those
   two vars or hand-edit the allowlists before retrying.
+- **MCP launch wrapper** — `mcp_server_command` is generated as a **login shell**
+  wrapper (`$SHELL -lc 'export CREEK_ANTHROPIC_CONSENT=1; exec <venv>/creek-tools-mcp …'`)
+  rather than a bare `uv run`. This fixes two real failures: (1) CrawDad spawns
+  the MCP server through the stdio SDK, which **scrubs the environment** and drops
+  `ANTHROPIC_API_KEY`, so in-MCP cloud tools (`draft`/`author`/`mine`/`classify`)
+  silently degrade — the login shell re-establishes the key from your profile;
+  and (2) spawning `uv run` every turn is slow and contends on uv's project lock
+  across agent-loop rounds, surfacing as `could not start … ('uv')` →
+  `mcp_unavailable` replies — `exec`ing the creek-tools venv entry point directly
+  is fast, lock-free, and keeps the JSON-RPC stdout stream clean. Falls back to
+  `uv run` if the venv binary isn't built yet (`uv sync` in `creek-tools`).
+  **`CREEK_ANTHROPIC_CONSENT=1` means vault content egresses to Anthropic on the
+  user's key** when those tools run — intended for the user's own vault.
+  Because the login shell only sources *login* profiles (`~/.zprofile`,
+  `~/.zshenv`, `~/.bash_profile`, `~/.profile`) and **not** interactive rc files
+  (`~/.zshrc`, `~/.bashrc`), `ANTHROPIC_API_KEY` must be exported in a login
+  file. The script probes for this under a scrubbed env and prints a `[warn]`
+  (with the fix) if the key is only in an rc file — heed it or the cloud tools
+  degrade exactly as before.
 
 If the script prints `ERROR:`, stop and fix what it reports before launching.
 
@@ -83,9 +102,11 @@ cd <REPO>/crawdad && uv run crawdad run --config <REPO>/crawdad/crawdad.yaml
 
 Use `run_in_background: true`. Then read the background output to confirm it
 connected to Discord (look for the gateway/ready log line) and report the
-channel it's listening in. Both `crawdad` and `creek-tools-mcp` run from source
-via `uv run`, so **to pick up merged/edited code just restart the bot** — no
-reinstall needed.
+channel it's listening in. `crawdad` runs from source via `uv run`, and
+`creek-tools-mcp` runs from its pre-built editable venv binary (or `uv run` in
+the fallback) — both reflect source edits, so **to pick up merged/edited code
+just restart the bot**, no reinstall needed. Only a *dependency* change needs a
+`uv sync` in `creek-tools` first.
 
 ## Notes
 
