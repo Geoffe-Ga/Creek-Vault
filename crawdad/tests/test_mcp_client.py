@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp.client.stdio import get_default_environment
 
+import crawdad.mcp_client as mcp_client
 from crawdad.mcp_client import MCPClient, MCPSession, MCPUnavailableError
 
 
@@ -123,3 +125,80 @@ async def test_list_tool_details_translates_underlying_failure() -> None:
 
     with pytest.raises(MCPUnavailableError, match="list_tool_details"):
         await session.list_tool_details()
+
+
+# --- Issue #549: forward credentials the stdio SDK would otherwise scrub ------
+
+
+def test_subprocess_env_forwards_anthropic_api_key() -> None:
+    """The API key the stdio SDK drops is re-added from the source env."""
+    env = mcp_client._subprocess_env({"ANTHROPIC_API_KEY": "sk-test-123"})
+
+    assert env["ANTHROPIC_API_KEY"] == "sk-test-123"
+
+
+def test_subprocess_env_keeps_sdk_safe_defaults() -> None:
+    """Forwarding augments, never replaces, the SDK default-environment allowlist."""
+    env = mcp_client._subprocess_env({"ANTHROPIC_API_KEY": "sk-test-123"})
+
+    for key, value in get_default_environment().items():
+        assert env[key] == value
+
+
+def test_subprocess_env_omits_absent_credentials() -> None:
+    """A source env without the credentials yields no key — no blank entry."""
+    env = mcp_client._subprocess_env({})
+
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CREEK_ANTHROPIC_CONSENT" not in env
+
+
+def test_subprocess_env_treats_blank_value_as_unset() -> None:
+    """An empty-string credential is not forwarded (would disable the provider)."""
+    env = mcp_client._subprocess_env({"ANTHROPIC_API_KEY": ""})
+
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_subprocess_env_forwards_consent_only_when_present() -> None:
+    """Cloud-egress consent is opt-in: forwarded iff set in the source env."""
+    without = mcp_client._subprocess_env({"ANTHROPIC_API_KEY": "sk"})
+    assert "CREEK_ANTHROPIC_CONSENT" not in without
+
+    with_consent = mcp_client._subprocess_env(
+        {"ANTHROPIC_API_KEY": "sk", "CREEK_ANTHROPIC_CONSENT": "1"},
+    )
+    assert with_consent["CREEK_ANTHROPIC_CONSENT"] == "1"
+
+
+def test_subprocess_env_ignores_unlisted_vars() -> None:
+    """Only the documented allowlist is forwarded; other env vars never leak."""
+    env = mcp_client._subprocess_env(
+        {"SECRET_TOKEN": "nope", "ANTHROPIC_API_KEY": "sk"},
+    )
+
+    assert "SECRET_TOKEN" not in env
+
+
+async def test_connect_passes_forwarded_env_to_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``connect`` hands StdioServerParameters an env carrying the API key.
+
+    Regression guard for issue #549: without an explicit ``env=``, the stdio
+    SDK scrubs ANTHROPIC_API_KEY and in-MCP cloud tools silently degrade.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-connect-test")
+    captured: dict[str, Any] = {}
+    real_params = mcp_client.StdioServerParameters
+
+    def _spy(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_params(**kwargs)
+
+    monkeypatch.setattr(mcp_client, "StdioServerParameters", _spy)
+
+    async with MCPClient(_fixture_command()).connect() as session:
+        await session.list_tools()
+
+    assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-connect-test"

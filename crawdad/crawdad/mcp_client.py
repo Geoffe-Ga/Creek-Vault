@@ -17,17 +17,54 @@ Both ``connect`` failures and mid-session subprocess deaths surface as
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.stdio import (
+    StdioServerParameters,
+    get_default_environment,
+    stdio_client,
+)
 from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
 
 _LOGGER = logging.getLogger("crawdad.mcp_client")
+
+#: Credential env vars the stdio SDK scrubs but the in-MCP cloud tools need.
+#: ``CREEK_ANTHROPIC_CONSENT`` gates cloud egress, so it is forwarded only when
+#: explicitly set in CrawDad's own environment (opt-in). See issue #549.
+_FORWARDED_ENV_VARS: Final = ("ANTHROPIC_API_KEY", "CREEK_ANTHROPIC_CONSENT")
+
+
+def _subprocess_env(source: Mapping[str, str]) -> dict[str, str]:
+    """Build the environment for the spawned ``creek-tools-mcp`` subprocess.
+
+    The stdio SDK launches the server with a scrubbed environment limited to
+    a small safe allowlist (:func:`get_default_environment`). That allowlist
+    drops ``ANTHROPIC_API_KEY``, so in-MCP cloud tools
+    (``draft``/``author``/``mine``/``classify``) silently fall back to
+    non-cloud behaviour — issue #549. Re-add the forwarded credential vars
+    that are present (and non-empty) in *source* on top of the safe defaults.
+
+    Args:
+        source: The parent environment to forward credentials from, normally
+            :data:`os.environ`.
+
+    Returns:
+        The SDK safe-default environment augmented with any forwarded
+        credentials. Absent or blank credentials are omitted entirely so the
+        subprocess never sees an empty value.
+    """
+    env = dict(get_default_environment())
+    for name in _FORWARDED_ENV_VARS:
+        value = source.get(name)
+        if value:
+            env[name] = value
+    return env
 
 
 class MCPUnavailableError(RuntimeError):
@@ -138,6 +175,7 @@ class MCPClient:
         params = StdioServerParameters(
             command=self._command[0],
             args=list(self._command[1:]),
+            env=_subprocess_env(os.environ),
         )
         try:
             async with (
