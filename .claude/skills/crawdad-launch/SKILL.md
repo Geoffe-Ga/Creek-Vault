@@ -79,6 +79,12 @@ What it checks/fixes (each is a real launch failure mode):
   `uv run` if the venv binary isn't built yet (`uv sync` in `creek-tools`).
   **`CREEK_ANTHROPIC_CONSENT=1` means vault content egresses to Anthropic on the
   user's key** when those tools run — intended for the user's own vault.
+  Because the login shell only sources *login* profiles (`~/.zprofile`,
+  `~/.zshenv`, `~/.bash_profile`, `~/.profile`) and **not** interactive rc files
+  (`~/.zshrc`, `~/.bashrc`), `ANTHROPIC_API_KEY` must be exported in a login
+  file. The script probes for this under a scrubbed env and prints a `[warn]`
+  (with the fix) if the key is only in an rc file — heed it or the cloud tools
+  degrade exactly as before.
 
 If the script prints `ERROR:`, stop and fix what it reports before launching.
 

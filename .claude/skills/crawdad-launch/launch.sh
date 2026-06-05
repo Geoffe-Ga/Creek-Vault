@@ -136,7 +136,7 @@ echo "[ok] allowlist: ${#USER_IDS[@]} user(s), ${#CHAN_IDS[@]} channel(s)"
 #    DIRECTLY (no `uv run`: deterministic, fast, no lock contention, and `exec`
 #    hands stdio straight to the server so the MCP JSON-RPC stream stays clean).
 #    Falls back to `uv run` if the venv binary isn't present yet.
-# /bin/bash is the universal fallback (always present, POSIX `export`/`;`/`exec`).
+# /bin/bash is the universal fallback (always present, POSIX `export`/`;`/`exec`);
 # fish can't run the `export VAR=val; exec …` wrapper, so coerce it to bash too.
 LOGIN_SHELL="${SHELL:-/bin/bash}"
 if [[ "$LOGIN_SHELL" == *fish ]]; then
@@ -144,6 +144,21 @@ if [[ "$LOGIN_SHELL" == *fish ]]; then
   LOGIN_SHELL=/bin/bash
 fi
 MCP_BIN="$CREEK_PROJECT/.venv/bin/creek-tools-mcp"
+
+# The wrapper recovers ANTHROPIC_API_KEY by sourcing the LOGIN profile
+# (~/.zprofile, ~/.zshenv, ~/.bash_profile, ~/.profile) — NOT an interactive rc
+# (~/.zshrc, ~/.bashrc). Verify that actually works by probing the login shell
+# under a scrubbed env (mimicking the MCP SDK, which drops the key): if the key
+# only lives in an rc file, the wrapper can't recover it and cloud tools degrade.
+if env -i HOME="$HOME" PATH="$PATH" TERM="${TERM:-xterm}" \
+     "$LOGIN_SHELL" -lc 'printenv ANTHROPIC_API_KEY' >/dev/null 2>&1; then
+  echo "[ok] $LOGIN_SHELL login profile exposes ANTHROPIC_API_KEY to the MCP wrapper"
+else
+  echo "[warn] $LOGIN_SHELL login profile does NOT export ANTHROPIC_API_KEY —"
+  echo "       in-MCP cloud tools (draft/author/mine/classify) will degrade."
+  echo "       Add 'export ANTHROPIC_API_KEY=…' to a LOGIN file (~/.zprofile,"
+  echo "       ~/.zshenv or ~/.bash_profile), not ~/.zshrc / ~/.bashrc, then relaunch."
+fi
 
 # shq: POSIX shell single-quote (embedded ' becomes '\'') — safe argv for the -lc string.
 shq() { local q="'" s="$1"; s="${s//$q/$q\\$q$q}"; printf '%s%s%s' "$q" "$s" "$q"; }
@@ -155,6 +170,7 @@ else
   MCP_EXEC="exec uv run --project $(shq "$CREEK_PROJECT") creek-tools-mcp --config $(shq "$VAULT_CONFIG")"
 fi
 MCP_INNER="export CREEK_ANTHROPIC_CONSENT=1; $MCP_EXEC"
+echo "[ok] CREEK_ANTHROPIC_CONSENT=1 in MCP wrapper — cloud tools (draft/author/mine/classify) egress vault content to Anthropic on your key"
 
 # 8. Write the launch config. Every scalar is a YAML single-quoted string (with
 #    embedded single quotes doubled per spec) so a path with YAML-reserved chars
