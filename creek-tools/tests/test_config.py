@@ -7,6 +7,7 @@ import yaml
 
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
+    AIStyleConfig,
     ChatbotCleaningConfig,
     ClassificationConfig,
     CleaningConfig,
@@ -25,6 +26,7 @@ from creek.config import (
     RedactionConfig,
     SourcePaths,
     ValidationConfig,
+    VoiceAudienceWeightingConfig,
     generate_default_config,
     load_config,
 )
@@ -756,3 +758,47 @@ class TestGenerateDefaultConfig:
         cfg = load_config(output)
         # The comment is informational — provider default still ollama.
         assert cfg.llm.provider == "ollama"
+
+
+class TestVoiceConfigRoundtrip:
+    """Round-trip the epic-551 voice config knobs through YAML."""
+
+    def test_voice_config_roundtrips_through_yaml(self, tmp_path: Path) -> None:
+        """Audience weighting + voice-distance target survive dump → load."""
+        original = CreekConfig(
+            vault_path=tmp_path / "vault",
+            voice_audience_weighting=VoiceAudienceWeightingConfig(
+                enabled=True,
+                privacy_tier_authority={"open": 1.5, "personal": 1.0, "intimate": 0.0},
+                representativeness_authority={"self": 1.0, "reference": 0.3},
+            ),
+            ai_style=AIStyleConfig(
+                voice_distance_upper=0.4,
+                voice_distance_target=0.2,
+            ),
+        )
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.safe_dump(original.model_dump(mode="json")),
+            encoding="utf-8",
+        )
+
+        loaded = load_config(config_file)
+
+        weighting = loaded.voice_audience_weighting
+        assert weighting.enabled is True
+        assert weighting.privacy_tier_authority["open"] == 1.5
+        assert weighting.privacy_tier_authority["intimate"] == 0.0
+        assert weighting.representativeness_authority["reference"] == 0.3
+        assert loaded.ai_style.voice_distance_upper == 0.4
+        assert loaded.ai_style.voice_distance_target == 0.2
+
+    def test_default_voice_config_has_validated_defaults(self) -> None:
+        """The default config exposes sane, validated voice knobs."""
+        config = CreekConfig()
+        assert config.voice_audience_weighting.enabled is True
+        # Target never exceeds the accepted-divergence ceiling.
+        assert (
+            config.ai_style.voice_distance_target
+            <= config.ai_style.voice_distance_upper
+        )

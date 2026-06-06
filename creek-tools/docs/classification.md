@@ -203,6 +203,10 @@ The Anthropic path is **not** the default — opt in deliberately. Cost on a 10k
 
 Generation flows (`mine`, `draft`, `report`, `skills`) honour the tier via the shared filter in `creek/classify/privacy_filter.py`: `intimate` fragments are excluded by default; `personal` fragments are included with their body replaced by a title-only summary; `open` (or `public`) fragments pass through unredacted. Override with `--include-tier {open,personal,intimate,all}` if you genuinely want a richer scope; any value above the default writes an audit entry to `<vault>/00-Creek-Meta/audit/privacy.jsonl`.
 
+### Attribution and the voice corpus
+
+`privacy_tier` is one of two axes that decide whether a fragment may feed the voice proxy; the other is `source.author`. `Fragment.voice_proxy_eligible` is `True` only for `self`-authored, non-`intimate` fragments. AI-chat ingests are split per turn (see [ingestion](./ingestion.md#ai-chat-attribution-per-turn)): the human turn is `self` and eligible; the AI turn is `author=ai` with `voice_weight=0.0` and is excluded. Among eligible fragments, the audience-weighting model then grants `open` work more authority than `personal` (see [generation](./generation.md#voice-fidelity-feat-040)).
+
 ## Re-classifying after taxonomy changes
 
 Edit `06-Frequencies/_keyword_atlas.yaml`, then re-run with `--force` so the rule classifier overwrites the prior decisions:

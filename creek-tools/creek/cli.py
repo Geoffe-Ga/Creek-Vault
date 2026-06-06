@@ -559,6 +559,16 @@ def ingest(
             "without re-ingesting body content. Idempotent."
         ),
     ),
+    refresh_ai_chat: bool = typer.Option(
+        False,
+        "--refresh-ai-chat",
+        help=(
+            "Migration: re-split previously-merged Claude/ChatGPT fragments "
+            "into per-turn attributed fragments (human=self, AI=ai, "
+            "voice_weight 0), removing AI prose from the voice corpus. "
+            "Idempotent. --type / --input are ignored."
+        ),
+    ),
 ) -> None:
     """Ingest a specific source type into the vault.
 
@@ -577,6 +587,10 @@ def ingest(
     """
     if refresh_dates:
         _run_refresh_dates(vault)
+        return
+
+    if refresh_ai_chat:
+        _run_refresh_ai_chat(vault)
         return
 
     if type is None or input is None:
@@ -639,6 +653,35 @@ def _run_refresh_dates(vault: Path | None) -> None:
     console.print(f"  no source date: {result.no_date_found}")
     console.print(f"  missing source file: {result.missing_source}")
     console.print(f"  unsupported source: {result.unsupported}")
+    if result.errors:
+        console.print(f"[yellow]Errors: {len(result.errors)}[/yellow]")
+        for err in result.errors:
+            console.print(f"  [dim]{err}[/dim]")
+
+
+def _run_refresh_ai_chat(vault: Path | None) -> None:
+    """Execute the ``--refresh-ai-chat`` merged-fragment re-split migration.
+
+    Resolves the vault path (CLI flag → configured default), invokes
+    :func:`creek.ingest.refresh.resplit_merged_ai_chat`, and renders a
+    one-screen summary. Exit codes: 0 on success, 1 if the vault path is
+    unusable.
+    """
+    from creek.ingest.refresh import resplit_merged_ai_chat
+
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    if not vault_path.exists():
+        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
+        raise typer.Exit(code=1)
+
+    result = resplit_merged_ai_chat(vault_path)
+    console.print(
+        f"[bold green]Re-split {result.resplit} merged AI-chat "
+        "fragment(s).[/bold green]",
+    )
+    console.print(f"  scanned: {result.scanned}")
+    console.print(f"  skipped (not merged AI-chat): {result.skipped}")
     if result.errors:
         console.print(f"[yellow]Errors: {len(result.errors)}[/yellow]")
         for err in result.errors:
