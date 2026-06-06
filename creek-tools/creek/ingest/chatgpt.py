@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Per-turn authorship roles stashed on ``ParsedFragment.metadata`` so the
-# frontmatter stage can attribute each split turn (FEAT #553): the human turn
-# is the owner's voice, the AI turn is quarantined out of the voice proxy.
+# frontmatter stage can attribute each split turn: the human turn is the
+# owner's voice, the AI turn is quarantined out of the voice proxy.
 _ROLE_SELF = Authorship.SELF.value
 _ROLE_AI = Authorship.AI.value
 
@@ -166,8 +166,8 @@ class ChatGPTIngestor(Ingestor):
         if conv_id is not None:
             source["conversation_id"] = conv_id
         if is_ai:
-            # FEAT #553: AI turns are AI-authored, excluded from the voice
-            # proxy via ``voice_proxy_eligible``; zero weight is belt-and-braces.
+            # AI turns are AI-authored, excluded from the voice proxy via
+            # ``voice_proxy_eligible``; zero weight is belt-and-braces.
             source["author"] = _ROLE_AI
         frontmatter_dict: dict[str, Any] = {
             "title": fragment.metadata.get("title", "Untitled Conversation"),
@@ -562,7 +562,7 @@ def _pair_messages_to_fragments(
                         if msg_authored_at is not None
                         else conv_authored_at
                     )
-                    # FEAT #553: emit the human turn and the AI turn as two
+                    # Emit the human turn and the AI turn as two
                     # separately-attributed fragments instead of one merged
                     # fragment, so the AI's prose can never train the voice
                     # proxy. Both share the conversation id, turn index, and

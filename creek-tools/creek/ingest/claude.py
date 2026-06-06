@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Per-turn authorship roles stashed on ``ParsedFragment.metadata`` so the
-# convert/frontmatter stages can attribute each split turn correctly
-# (FEAT #553): the human turn is the owner's voice, the AI turn is not.
+# convert/frontmatter stages can attribute each split turn correctly: the
+# human turn is the owner's voice, the AI turn is not.
 _ROLE_SELF = Authorship.SELF.value
 _ROLE_AI = Authorship.AI.value
 
@@ -313,7 +313,7 @@ class ClaudeIngestor(Ingestor):
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Convert a single-turn parsed fragment to Markdown.
 
-        Each conversation turn is now its own fragment (FEAT #553). The
+        Each conversation turn is its own fragment. The
         human turn — the owner's own words — is rendered as a blockquote
         (each line prefixed with ``>``); the AI turn is rendered as plain
         text, matching the prior merged formatting per role.
@@ -363,9 +363,9 @@ class ClaudeIngestor(Ingestor):
         if model is not None:
             source["model"] = model
         if is_ai:
-            # FEAT #553: the AI turn is AI-authored, so it can never feed the
-            # voice proxy (``source.author=ai`` makes ``voice_proxy_eligible``
-            # False); zero weight is belt-and-braces against future selectors.
+            # The AI turn is AI-authored, so it can never feed the voice proxy
+            # (``source.author=ai`` makes ``voice_proxy_eligible`` False); zero
+            # weight is belt-and-braces against future selectors.
             source["author"] = _ROLE_AI
 
         suffix = ", AI" if is_ai else ""
@@ -487,8 +487,8 @@ class ClaudeIngestor(Ingestor):
     ) -> list[ParsedFragment]:
         """Build the human and AI fragments for one conversation turn.
 
-        FEAT #553: the human turn and the AI turn are genuinely different
-        authors, so they become two separately-attributed fragments rather
+        The human turn and the AI turn are genuinely different authors, so
+        they become two separately-attributed fragments rather
         than one merged fragment. Both share the conversation id, turn index,
         and timestamp so threading/linking still works; ``author_role`` tags
         each for the convert/frontmatter stages.

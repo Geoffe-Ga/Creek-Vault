@@ -1,4 +1,4 @@
-"""Per-turn attribution for AI-chat ingests (FEAT #553, epic #551).
+"""Per-turn attribution for AI-chat ingests.
 
 Proves the core fix: ingesting a Claude or ChatGPT conversation emits the
 human turn and the AI turn as *separately attributed* fragments — the human
@@ -215,7 +215,7 @@ def test_ai_turn_excluded_from_voice_corpus_human_turn_not(tmp_path: Path) -> No
 
 
 def test_fresh_chat_ai_corpus_leak_is_zero(tmp_path: Path) -> None:
-    """A freshly-ingested chat reports ≈0 AI-corpus leak (DoD for #553)."""
+    """A freshly-ingested chat reports ≈0 AI-corpus leak."""
     frags = _ingest_fragments(
         ClaudeIngestor(),
         _claude_export([("Q1", "A1"), ("Q2", "A2"), ("Q3", "A3")]),

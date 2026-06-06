@@ -1,4 +1,4 @@
-"""Read-only ``creek voice-authenticity`` diagnostic (epic #551, issue #552).
+"""Read-only ``creek voice-authenticity`` diagnostic.
 
 This is the *tracer skeleton* for the voice-authenticity feature: it makes
 three otherwise-hidden defects observable without changing any behaviour.
@@ -12,18 +12,19 @@ The three sub-scores:
     Distribution of the *voice-eligible* corpus (self-authored, non-INTIMATE
     fragments — see :attr:`creek.models.Fragment.voice_proxy_eligible`) by
     ``privacy_tier``. ``weighting_active`` is a stub ``False`` until the
-    graduated audience-authority model lands (issue #554).
+    graduated audience-authority model lands.
 
 ``ai_corpus_leak``
     Count and fraction of voice-eligible fragments whose
     ``source.platform`` is an AI-chat platform (``claude`` / ``chatgpt``).
-    These leak into the voice corpus today; issue #553 quarantines them.
+    These leak into the voice corpus until AI-chat turns are split and the
+    AI half is quarantined.
 
 ``deslop``
     Given an optional drafted essay, whether the AI-mannerism guard left a
     ``voice_distance`` attestation in the draft frontmatter, how many
     residual findings it recorded, and a ``status`` reason. The status string
-    is a stub until the faithful de-slop pass lands (issue #556).
+    is a stub until the faithful de-slop pass lands.
 
 Read-only: nothing here mutates the vault.
 """
@@ -61,7 +62,8 @@ class AudienceMix:
             ``intimate`` is always ``0`` because INTIMATE fragments are not
             voice-eligible; it is reported for transparency.
         weighting_active: Whether graduated audience-authority weighting is
-            applied during voice selection. Stub ``False`` until issue #554.
+            applied during voice selection. Stub ``False`` until audience
+            weighting lands.
     """
 
     by_tier: dict[str, int]
@@ -81,11 +83,11 @@ class AICorpusLeak:
         leaked: Voice-eligible fragments from an AI-chat platform
             (``claude`` / ``chatgpt``) that have **not** been quarantined —
             i.e. their conversation has no AI-authored sibling turn, so the
-            fragment still fuses AI prose into the voice corpus. After the
-            FEAT #553 split a freshly-ingested chat has an AI-authored sibling
+            fragment still fuses AI prose into the voice corpus. Once AI-chat
+            turns are split, a freshly-ingested chat has an AI-authored sibling
             per turn, so its human turns no longer count and this drops to ≈0;
             legacy *merged* fragments (no AI sibling) still flag, which is what
-            drives the #557 re-ingest migration.
+            drives the re-ingest migration.
         eligible_total: Size of the voice-eligible corpus.
     """
 
@@ -110,8 +112,8 @@ class DeslopStatus:
             AI-mannerism guard ran and recorded a result).
         voice_distance: The recorded distance, or ``None`` when unattested.
         residual_findings: Count of recorded residual voice findings.
-        status: A human-readable reason. Stub wording until issue #556 adds
-            the rewritten-vs-measured distinction.
+        status: A human-readable reason. Stub wording until the faithful
+            de-slop pass adds the rewritten-vs-measured distinction.
     """
 
     draft: str
@@ -238,7 +240,7 @@ def _probe_ai_corpus_leak(
     """Count un-quarantined AI-chat fragments in the voice-eligible corpus.
 
     A conversation is *quarantined* once it contains an AI-authored sibling
-    turn (the FEAT #553 split). An eligible AI-chat fragment from a
+    turn (the per-turn split). An eligible AI-chat fragment from a
     conversation with no such sibling is still a merged fragment fusing AI
     prose into the corpus, and counts as leaked.
 
@@ -292,7 +294,7 @@ def _probe_deslop(draft_path: Path) -> DeslopStatus:
         attested=True,
         voice_distance=float(raw_distance),
         residual_findings=residual,
-        status="attested (rewritten-vs-measured detection lands in #556)",
+        status="attested (rewritten-vs-measured detection not yet recorded)",
     )
 
 

@@ -735,7 +735,7 @@ class TestClaudeIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        # FEAT #553: one turn now splits into a human and an AI fragment.
+        # One turn now splits into a human and an AI fragment.
         assert len(fragments) == 2
         assert "quantum" in fragments[0].content.lower()
 
@@ -775,7 +775,7 @@ class TestClaudeIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        # FEAT #553: the collapsed assistant turn is now its own AI fragment.
+        # The collapsed assistant turn is now its own AI fragment.
         assert len(fragments) == 2
         assert "Final polished" in fragments[1].content
 
@@ -810,7 +810,7 @@ class TestClaudeIngestorIntegration:
         )
         fragments = ingestor.parse(raw)
         # Without filter, system is still skipped by _pair_turns but the short
-        # human turn is kept — and FEAT #553 splits it into human + AI.
+        # human turn is kept — and is split into a human and an AI fragment.
         assert len(fragments) == 2
 
 
@@ -895,7 +895,7 @@ class TestChatGPTIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        # FEAT #553: one turn now splits into a human and an AI fragment.
+        # One turn now splits into a human and an AI fragment.
         assert len(fragments) == 2
         assert "machine learning" in fragments[0].content.lower()
 
