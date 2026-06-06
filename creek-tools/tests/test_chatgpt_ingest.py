@@ -240,7 +240,8 @@ class TestChatGPTParse:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One user+assistant pair → human + AI fragment.
+        assert len(fragments) == 2
 
     def test_parses_multiple_conversations(self) -> None:
         """parse() should handle multiple conversations in one file."""
@@ -249,16 +250,21 @@ class TestChatGPTParse:
         raw = _make_raw_doc([conv1, conv2])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 2
+        # Two conversations, one pair each → human + AI fragment per pair.
+        assert len(fragments) == 4
 
     def test_fragment_content_has_user_and_assistant(self) -> None:
-        """parse() should pair user and assistant messages in fragments."""
+        """User text lands in the human fragment, assistant in the AI one."""
         conv = _minimal_conversation()
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
+        # Human fragment (index 0) carries only the user text.
         assert "Hello!" in fragments[0].content
-        assert "Hi there!" in fragments[0].content
+        assert "Hi there!" not in fragments[0].content
+        # AI fragment (index 1) carries only the assistant text.
+        assert "Hi there!" in fragments[1].content
+        assert "Hello!" not in fragments[1].content
 
     def test_fragment_excludes_system_messages(self) -> None:
         """parse() should skip system messages from fragment content."""
@@ -382,12 +388,12 @@ class TestChatGPTParse:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        # Two user+assistant pairs = two fragments
-        assert len(fragments) == 2
+        # Two user+assistant pairs, each split into human + AI = four fragments.
+        assert len(fragments) == 4
         assert "First question" in fragments[0].content
-        assert "First answer" in fragments[0].content
-        assert "Second question" in fragments[1].content
-        assert "Second answer" in fragments[1].content
+        assert "First answer" in fragments[1].content
+        assert "Second question" in fragments[2].content
+        assert "Second answer" in fragments[3].content
 
     def test_fixture_file_parses(self) -> None:
         """parse() should handle the sample ChatGPT export fixture."""
@@ -401,8 +407,9 @@ class TestChatGPTParse:
         )
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        # Fixture has 2 conversations: first has 2 pairs, second has 1 pair
-        assert len(fragments) == 3
+        # Fixture has 2 conversations: first 2 pairs, second 1 pair = 3 pairs;
+        # each pair splits into a human + AI fragment = six fragments.
+        assert len(fragments) == 6
 
 
 # ---- Branching Conversation Tests ----
@@ -499,11 +506,14 @@ class TestChatGPTBranching:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        # Should follow the long branch (2 pairs), not short branch (1 pair)
-        assert len(fragments) == 2
+        # Follow the long branch (2 pairs → 4 fragments), not the short
+        # branch (1 pair → 2 fragments).
+        assert len(fragments) == 4
         all_content = " ".join(f.content for f in fragments)
         assert "Long branch answer." in all_content
         assert "Story continues here." in all_content
+        # The short branch's answer must not leak in.
+        assert "Short branch answer." not in all_content
 
 
 # ---- Edge Case Tests ----
@@ -558,7 +568,8 @@ class TestChatGPTEdgeCases:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One pair → human + AI fragment.
+        assert len(fragments) == 2
 
     def test_empty_parts_list(self) -> None:
         """parse() should handle messages with empty parts list."""
@@ -600,8 +611,8 @@ class TestChatGPTEdgeCases:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        # Empty content pair should still produce a fragment (empty content)
-        assert len(fragments) == 1
+        # Empty content pair should still produce a human + AI fragment.
+        assert len(fragments) == 2
 
     def test_missing_content_key(self) -> None:
         """parse() should handle messages missing the content key."""
@@ -645,7 +656,8 @@ class TestChatGPTEdgeCases:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One pair → human + AI fragment.
+        assert len(fragments) == 2
 
     def test_empty_conversations_list(self) -> None:
         """parse() should return empty list for empty conversations array."""
@@ -885,7 +897,8 @@ class TestChatGPTEdgeCases:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One pair → human + AI fragment.
+        assert len(fragments) == 2
         # Should use the fixed sentinel: 2000-01-01 in LA timezone
         assert fragments[0].timestamp == datetime(2000, 1, 1, tzinfo=LA_TZ)
 
@@ -930,7 +943,8 @@ class TestChatGPTEdgeCases:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One pair → human + AI fragment.
+        assert len(fragments) == 2
         # Conversation create_time=0 -> sentinel; no message create_time -> fallback
         assert fragments[0].timestamp == datetime(2000, 1, 1, tzinfo=LA_TZ)
 
@@ -1013,8 +1027,20 @@ class TestChatGPTEdgeCases:
         raw = _make_raw_doc([conv])
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(raw)
-        assert fragments[0].metadata["title"] == "Multi (turn 0)"
-        assert fragments[1].metadata["title"] == "Multi (turn 1)"
+        # Each pair splits into a human fragment and an AI fragment; the AI
+        # title gets the ", AI" suffix and shares the human's turn index.
+        assert [f.metadata["title"] for f in fragments] == [
+            "Multi (turn 0)",
+            "Multi (turn 0, AI)",
+            "Multi (turn 1)",
+            "Multi (turn 1, AI)",
+        ]
+        assert [f.metadata["author_role"] for f in fragments] == [
+            "self",
+            "ai",
+            "self",
+            "ai",
+        ]
 
     def test_discover_non_directory_path(self, tmp_path: Path) -> None:
         """discover() should return empty list for non-directory path."""
@@ -1195,12 +1221,14 @@ class TestChatGPTAuthoredAt:
         # = 1700042410.0
         ingestor = ChatGPTIngestor()
         fragments = ingestor.parse(_make_raw_doc([conv]))
-        assert len(fragments) == 1
-        authored = fragments[0].metadata["authored_at"]
-        assert authored is not None
-        assert authored == datetime.fromtimestamp(1700042410.0, tz=UTC)
-        # UTC, not LA — preserves the source's instant honestly.
-        assert authored.tzinfo == UTC
+        # One pair → human + AI fragment, both anchored to the user epoch.
+        assert len(fragments) == 2
+        for frag in fragments:
+            authored = frag.metadata["authored_at"]
+            assert authored is not None
+            assert authored == datetime.fromtimestamp(1700042410.0, tz=UTC)
+            # UTC, not LA — preserves the source's instant honestly.
+            assert authored.tzinfo == UTC
 
     def test_authored_at_falls_back_to_conversation_create_time(self) -> None:
         """No per-message ``create_time`` → conversation-level epoch wins.

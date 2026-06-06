@@ -27,6 +27,7 @@ from creek.ingest.base import (
     normalize_timestamp,
     parse_authored_at,
 )
+from creek.models import Authorship
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -35,6 +36,12 @@ if TYPE_CHECKING:
     from creek.clean.filters.chatbot import ChatbotFilter
 
 logger = logging.getLogger(__name__)
+
+# Per-turn authorship roles stashed on ``ParsedFragment.metadata`` so the
+# convert/frontmatter stages can attribute each split turn correctly
+# (FEAT #553): the human turn is the owner's voice, the AI turn is not.
+_ROLE_SELF = Authorship.SELF.value
+_ROLE_AI = Authorship.AI.value
 
 # ---- Content Extraction ----
 
@@ -304,25 +311,24 @@ class ClaudeIngestor(Ingestor):
         return fragments
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
-        """Convert a parsed fragment to Markdown with blockquote formatting.
+        """Convert a single-turn parsed fragment to Markdown.
 
-        The human turn is rendered as a blockquote (each line prefixed
-        with ``>``), followed by a blank line, then the assistant response
-        as plain text.
+        Each conversation turn is now its own fragment (FEAT #553). The
+        human turn — the owner's own words — is rendered as a blockquote
+        (each line prefixed with ``>``); the AI turn is rendered as plain
+        text, matching the prior merged formatting per role.
 
         Args:
-            fragment: A parsed fragment containing human and assistant text.
+            fragment: A parsed fragment carrying one turn's ``turn_text``
+                and ``author_role``.
 
         Returns:
-            A Markdown-formatted string.
+            A Markdown-formatted string for that single turn.
         """
-        human_text = fragment.metadata.get("human_text", "")
-        assistant_text = fragment.metadata.get("assistant_text", "")
-
-        human_lines = human_text.split("\n")
-        blockquote = "\n".join(f"> {line}" for line in human_lines)
-
-        return f"{blockquote}\n\n{assistant_text}"
+        text = str(fragment.metadata.get("turn_text", ""))
+        if fragment.metadata.get("author_role", _ROLE_SELF) != _ROLE_AI:
+            return "\n".join(f"> {line}" for line in text.split("\n"))
+        return text
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Generate YAML frontmatter metadata for a Claude conversation fragment.
@@ -347,6 +353,7 @@ class ClaudeIngestor(Ingestor):
         turn_idx = meta.get("turn_index", 0)
         conv_id = meta.get("conversation_id", "unknown")
         model = meta.get("model")
+        is_ai = meta.get("author_role", _ROLE_SELF) == _ROLE_AI
 
         source: dict[str, Any] = {
             "platform": "claude",
@@ -355,12 +362,20 @@ class ClaudeIngestor(Ingestor):
         }
         if model is not None:
             source["model"] = model
+        if is_ai:
+            # FEAT #553: the AI turn is AI-authored, so it can never feed the
+            # voice proxy (``source.author=ai`` makes ``voice_proxy_eligible``
+            # False); zero weight is belt-and-braces against future selectors.
+            source["author"] = _ROLE_AI
 
+        suffix = ", AI" if is_ai else ""
         frontmatter_dict: dict[str, Any] = {
-            "title": f"{conv_name} (turn {turn_idx})",
+            "title": f"{conv_name} (turn {turn_idx}{suffix})",
             "created": fragment.timestamp.isoformat(),
             "source": source,
         }
+        if is_ai:
+            frontmatter_dict["voice_weight"] = 0.0
         authored_at: datetime | None = meta.get("authored_at")
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()
@@ -443,21 +458,22 @@ class ClaudeIngestor(Ingestor):
 
         fragments: list[ParsedFragment] = []
         for idx, (human_msg, assistant_msg) in enumerate(pairs):
-            fragment = self._build_fragment(
-                human_msg=human_msg,
-                assistant_msg=assistant_msg,
-                turn_index=idx,
-                conv_id=conv_id,
-                conv_name=conv_name,
-                model=model,
-                fallback_ts=fallback_ts,
-                source_path=source_path,
+            fragments.extend(
+                self._build_turn_fragments(
+                    human_msg=human_msg,
+                    assistant_msg=assistant_msg,
+                    turn_index=idx,
+                    conv_id=conv_id,
+                    conv_name=conv_name,
+                    model=model,
+                    fallback_ts=fallback_ts,
+                    source_path=source_path,
+                )
             )
-            fragments.append(fragment)
 
         return fragments
 
-    def _build_fragment(
+    def _build_turn_fragments(
         self,
         *,
         human_msg: dict[str, Any],
@@ -468,8 +484,14 @@ class ClaudeIngestor(Ingestor):
         model: str | None,
         fallback_ts: str,
         source_path: str,
-    ) -> ParsedFragment:
-        """Build a single ParsedFragment from a human+assistant turn pair.
+    ) -> list[ParsedFragment]:
+        """Build the human and AI fragments for one conversation turn.
+
+        FEAT #553: the human turn and the AI turn are genuinely different
+        authors, so they become two separately-attributed fragments rather
+        than one merged fragment. Both share the conversation id, turn index,
+        and timestamp so threading/linking still works; ``author_role`` tags
+        each for the convert/frontmatter stages.
 
         Args:
             human_msg: The human message dict.
@@ -482,7 +504,7 @@ class ClaudeIngestor(Ingestor):
             source_path: Original file path.
 
         Returns:
-            A ParsedFragment for this turn pair.
+            ``[human_fragment, ai_fragment]`` for this turn.
         """
         human_text = _extract_text(human_msg.get("content", ""))
         assistant_text = _extract_text(assistant_msg.get("content", ""))
@@ -494,22 +516,26 @@ class ClaudeIngestor(Ingestor):
         # ``None`` when no real source date exists.
         authored_at = _resolve_authored_at(human_msg, fallback_ts)
 
-        content = f"{human_text}\n\n{assistant_text}"
-
-        metadata: dict[str, Any] = {
+        base: dict[str, Any] = {
             "conversation_id": conv_id,
             "conversation_name": conv_name,
             "turn_index": turn_index,
-            "human_text": human_text,
-            "assistant_text": assistant_text,
             "authored_at": authored_at,
         }
         if model is not None:
-            metadata["model"] = model
+            base["model"] = model
 
-        return ParsedFragment(
-            content=content,
-            metadata=metadata,
-            source_path=source_path,
-            timestamp=timestamp,
-        )
+        return [
+            ParsedFragment(
+                content=human_text,
+                metadata=base | {"author_role": _ROLE_SELF, "turn_text": human_text},
+                source_path=source_path,
+                timestamp=timestamp,
+            ),
+            ParsedFragment(
+                content=assistant_text,
+                metadata=base | {"author_role": _ROLE_AI, "turn_text": assistant_text},
+                source_path=source_path,
+                timestamp=timestamp,
+            ),
+        ]

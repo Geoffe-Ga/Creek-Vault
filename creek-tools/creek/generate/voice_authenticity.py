@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.generate.ai_style.guard import VOICE_DISTANCE_KEY, VOICE_FINDINGS_KEY
-from creek.models import Fragment, PrivacyTier, SourcePlatform
+from creek.models import Authorship, Fragment, PrivacyTier, SourcePlatform
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -78,8 +78,14 @@ class AICorpusLeak:
     """AI-chat ingests leaking into the voice-eligible corpus.
 
     Attributes:
-        leaked: Eligible fragments whose ``source.platform`` is an AI-chat
-            platform (``claude`` / ``chatgpt``).
+        leaked: Voice-eligible fragments from an AI-chat platform
+            (``claude`` / ``chatgpt``) that have **not** been quarantined —
+            i.e. their conversation has no AI-authored sibling turn, so the
+            fragment still fuses AI prose into the voice corpus. After the
+            FEAT #553 split a freshly-ingested chat has an AI-authored sibling
+            per turn, so its human turns no longer count and this drops to ≈0;
+            legacy *merged* fragments (no AI sibling) still flag, which is what
+            drives the #557 re-ingest migration.
         eligible_total: Size of the voice-eligible corpus.
     """
 
@@ -206,19 +212,56 @@ def _probe_audience_mix(eligible: list[Fragment]) -> AudienceMix:
     return AudienceMix(by_tier=by_tier, weighting_active=False)
 
 
-def _probe_ai_corpus_leak(eligible: list[Fragment]) -> AICorpusLeak:
-    """Count eligible fragments ingested from AI-chat platforms.
+def _conversation_key(fragment: Fragment) -> tuple[str, str | None, str | None] | None:
+    """Return a key grouping a turn's human and AI fragments, or ``None``.
+
+    Both halves of a split turn share platform, conversation id, and source
+    file, so this pairs a human turn with its AI sibling even when the export
+    carried no conversation id. Returns ``None`` when the fragment has neither
+    a conversation id nor a source file — there is then no reliable signal to
+    pair siblings on, so such a fragment is never treated as quarantined.
+    """
+    source = fragment.source
+    if source.conversation_id is source.original_file is None:
+        return None
+    return (
+        str(source.platform),
+        source.conversation_id,
+        source.original_file,
+    )
+
+
+def _probe_ai_corpus_leak(
+    eligible: list[Fragment],
+    all_fragments: list[Fragment],
+) -> AICorpusLeak:
+    """Count un-quarantined AI-chat fragments in the voice-eligible corpus.
+
+    A conversation is *quarantined* once it contains an AI-authored sibling
+    turn (the FEAT #553 split). An eligible AI-chat fragment from a
+    conversation with no such sibling is still a merged fragment fusing AI
+    prose into the corpus, and counts as leaked.
 
     Args:
         eligible: The voice-eligible fragments.
+        all_fragments: Every loaded fragment (used to find AI-authored
+            siblings that mark a conversation as quarantined).
 
     Returns:
         The AI-corpus-leak sub-score.
     """
+    quarantined = {
+        key
+        for fragment in all_fragments
+        if str(fragment.source.platform) in _AI_CHAT_PLATFORMS
+        and str(fragment.source.author) == Authorship.AI.value
+        and (key := _conversation_key(fragment)) is not None
+    }
     leaked = sum(
         1
         for fragment in eligible
         if str(fragment.source.platform) in _AI_CHAT_PLATFORMS
+        and _conversation_key(fragment) not in quarantined
     )
     return AICorpusLeak(leaked=leaked, eligible_total=len(eligible))
 
@@ -273,14 +316,11 @@ def build_voice_authenticity_report(
         The assembled :class:`VoiceAuthenticityReport`.
     """
     records = iter_vault_fragments(vault_path / _FRAGMENTS_SUBDIR)
-    eligible = [
-        fragment
-        for _path, fragment, _body, _raw in records
-        if fragment.voice_proxy_eligible
-    ]
+    fragments = [fragment for _path, fragment, _body, _raw in records]
+    eligible = [fragment for fragment in fragments if fragment.voice_proxy_eligible]
     deslop = _probe_deslop(draft_path) if draft_path is not None else None
     return VoiceAuthenticityReport(
         audience_mix=_probe_audience_mix(eligible),
-        ai_corpus_leak=_probe_ai_corpus_leak(eligible),
+        ai_corpus_leak=_probe_ai_corpus_leak(eligible, fragments),
         deslop=deslop,
     )
