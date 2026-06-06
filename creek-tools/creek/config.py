@@ -794,13 +794,19 @@ create an import cycle, since ``ai_style`` imports this module. The
 
 
 def _default_enabled_categories() -> list[AIStyleCategory]:
-    """Return the default set of enabled tell categories (all five)."""
+    """Return the default enabled tell categories — the four *voice* families.
+
+    ``citation`` is intentionally excluded by default: citation-integrity tells
+    are voice-neutral (factual integrity, not idiolect), so mixing their
+    zero contributions into the scalar ``voice_distance`` would dilute the
+    idiolect signal. They register normally and are surfaced by enabling the
+    ``citation`` category explicitly (e.g. a "lint my draft" surface).
+    """
     categories: list[AIStyleCategory] = [
         "mechanical",
         "lexical",
         "rhetorical",
         "discourse",
-        "citation",
     ]
     return categories
 
@@ -897,6 +903,14 @@ class AIStyleConfig(BaseModel):
     user's voice enough to warrant a rewrite pass / lint finding. Capped at
     1.0 because ``voice_distance`` is always ``< 1.0``; a higher threshold
     would silently disable the check."""
+
+    citation_network_checks: bool = False
+    """Opt-in toggle for live external-link checking by the ``citation`` tells.
+
+    Off by default so the scanner is fully offline (ISBN/DOI checksum +
+    syntax only). When ``True``, a wired resolver may probe outbound links
+    (cached, rate-limited, timeout-bounded); documented false-positive hosts
+    (paywalls, libraries, the low-PMID artefact) are never reported."""
 
     voice_distance_target: float = Field(default=0.25, ge=0.0, le=1.0)
     """Target distance the de-slop rewrite loop drives toward — distinct from
