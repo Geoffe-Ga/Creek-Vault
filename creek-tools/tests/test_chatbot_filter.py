@@ -735,7 +735,8 @@ class TestClaudeIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn now splits into a human and an AI fragment.
+        assert len(fragments) == 2
         assert "quantum" in fragments[0].content.lower()
 
     def test_filter_collapses_regenerations_during_parse(self) -> None:
@@ -774,8 +775,9 @@ class TestClaudeIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
-        assert "Final polished" in fragments[0].content
+        # The collapsed assistant turn is now its own AI fragment.
+        assert len(fragments) == 2
+        assert "Final polished" in fragments[1].content
 
     def test_no_filter_keeps_all_messages(self) -> None:
         """ClaudeIngestor without filter should keep all non-system messages."""
@@ -807,9 +809,9 @@ class TestClaudeIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        # Without filter, system is still skipped by _pair_turns but short
-        # human messages are kept
-        assert len(fragments) == 1
+        # Without filter, system is still skipped by _pair_turns but the short
+        # human turn is kept — and is split into a human and an AI fragment.
+        assert len(fragments) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +895,8 @@ class TestChatGPTIngestorIntegration:
             detected_encoding=encoding,
         )
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn now splits into a human and an AI fragment.
+        assert len(fragments) == 2
         assert "machine learning" in fragments[0].content.lower()
 
     def test_filter_skips_tool_outputs_during_parse(self) -> None:

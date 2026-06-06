@@ -283,7 +283,7 @@ class TestParse:
     def test_human_assistant_pair_becomes_fragment(
         self, ingestor: ClaudeIngestor
     ) -> None:
-        """Each human+assistant turn pair should produce one fragment."""
+        """Each human+assistant turn pair should produce two fragments."""
         conv = _make_single_conversation(
             messages=[
                 {
@@ -310,7 +310,8 @@ class TestParse:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 2
+        # Two turn-pairs, each split into human + AI fragment = four total.
+        assert len(fragments) == 4
 
     def test_preserves_conversation_metadata(self, ingestor: ClaudeIngestor) -> None:
         """parse() should preserve conversation_id and model in metadata."""
@@ -335,7 +336,7 @@ class TestParse:
     def test_fragment_content_contains_both_turns(
         self, ingestor: ClaudeIngestor
     ) -> None:
-        """Fragment content should include both human and assistant text."""
+        """Human text lands in the human fragment, assistant in the AI one."""
         conv = _make_single_conversation(
             messages=[
                 {
@@ -352,8 +353,12 @@ class TestParse:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
+        # Human fragment (index 0) carries only the human text.
         assert "My specific question" in fragments[0].content
-        assert "The specific answer" in fragments[0].content
+        assert "The specific answer" not in fragments[0].content
+        # AI fragment (index 1) carries only the assistant text.
+        assert "The specific answer" in fragments[1].content
+        assert "My specific question" not in fragments[1].content
 
     def test_timestamp_from_human_turn(self, ingestor: ClaudeIngestor) -> None:
         """Fragment timestamp should come from the human turn."""
@@ -392,7 +397,8 @@ class TestParse:
         conv2 = _make_single_conversation(uuid="conv-2", name="Second")
         raw = _raw_doc_from_export(_make_claude_export([conv1, conv2]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 2
+        # Two conversations, each one turn-pair split into human + AI = four.
+        assert len(fragments) == 4
         ids = {f.metadata["conversation_id"] for f in fragments}
         assert ids == {"conv-1", "conv-2"}
 
@@ -432,8 +438,10 @@ class TestParse:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn-pair → human + AI fragment.
+        assert len(fragments) == 2
         assert "You are a helpful assistant" not in fragments[0].content
+        assert "You are a helpful assistant" not in fragments[1].content
 
     def test_handles_missing_model_field(self, ingestor: ClaudeIngestor) -> None:
         """parse() should handle conversations without a model field."""
@@ -489,8 +497,11 @@ class TestParse:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        # The trailing human turn should not produce a fragment
-        assert len(fragments) == 1
+        # The one complete pair yields human + AI; the trailing human turn
+        # (no assistant reply) produces nothing.
+        assert len(fragments) == 2
+        assert "Unanswered question" not in fragments[0].content
+        assert "Unanswered question" not in fragments[1].content
 
     def test_single_conversation_format_parse(self, ingestor: ClaudeIngestor) -> None:
         """parse() should handle the single-conversation format."""
@@ -513,7 +524,8 @@ class TestParse:
         }
         raw = _raw_doc_from_export(json.dumps(single_conv).encode("utf-8"))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn-pair → human + AI fragment.
+        assert len(fragments) == 2
         assert fragments[0].metadata["conversation_id"] == "conv-single"
 
     def test_handles_content_as_list(self, ingestor: ClaudeIngestor) -> None:
@@ -534,7 +546,8 @@ class TestParse:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn-pair → human + AI fragment.
+        assert len(fragments) == 2
         assert "Hello from list" in fragments[0].content
 
     def test_turn_index_in_metadata(self, ingestor: ClaudeIngestor) -> None:
@@ -565,8 +578,14 @@ class TestParse:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert fragments[0].metadata["turn_index"] == 0
-        assert fragments[1].metadata["turn_index"] == 1
+        # Human and AI fragments of one turn share the turn_index.
+        assert [f.metadata["turn_index"] for f in fragments] == [0, 0, 1, 1]
+        assert [f.metadata["author_role"] for f in fragments] == [
+            "self",
+            "ai",
+            "self",
+            "ai",
+        ]
 
 
 # ---- convert_to_markdown() Tests ----
@@ -622,7 +641,8 @@ class TestConvertToMarkdown:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        markdown = ingestor.convert_to_markdown(fragments[0])
+        # The AI fragment (index 1) renders the assistant text as plain text.
+        markdown = ingestor.convert_to_markdown(fragments[1])
         assert "The answer text" in markdown
         # The answer should not itself be blockquoted
         lines = markdown.split("\n")
@@ -631,7 +651,7 @@ class TestConvertToMarkdown:
         assert not answer_lines[0].startswith(">")
 
     def test_markdown_contains_both_turns(self, ingestor: ClaudeIngestor) -> None:
-        """Markdown output should contain both the human and assistant text."""
+        """Human markdown holds the human text; AI markdown the assistant text."""
         conv = _make_single_conversation(
             messages=[
                 {
@@ -648,9 +668,12 @@ class TestConvertToMarkdown:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        markdown = ingestor.convert_to_markdown(fragments[0])
-        assert "HUMAN_CONTENT_ABC" in markdown
-        assert "ASSISTANT_CONTENT_XYZ" in markdown
+        human_md = ingestor.convert_to_markdown(fragments[0])
+        ai_md = ingestor.convert_to_markdown(fragments[1])
+        assert "HUMAN_CONTENT_ABC" in human_md
+        assert "ASSISTANT_CONTENT_XYZ" not in human_md
+        assert "ASSISTANT_CONTENT_XYZ" in ai_md
+        assert "HUMAN_CONTENT_ABC" not in ai_md
 
     def test_multiline_human_content_blockquoted(
         self, ingestor: ClaudeIngestor
@@ -806,10 +829,12 @@ class TestClaudeAuthoredAt:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
-        authored = fragments[0].metadata["authored_at"]
-        assert authored is not None
-        assert authored == datetime(2024, 11, 15, 10, 30, tzinfo=UTC)
+        # One turn-pair → human + AI fragment, both sharing authored_at.
+        assert len(fragments) == 2
+        for frag in fragments:
+            authored = frag.metadata["authored_at"]
+            assert authored is not None
+            assert authored == datetime(2024, 11, 15, 10, 30, tzinfo=UTC)
 
     def test_authored_at_falls_back_to_conversation_created_at(
         self, ingestor: ClaudeIngestor
@@ -1006,7 +1031,8 @@ class TestEdgeCases:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn-pair → human + AI fragment.
+        assert len(fragments) == 2
         assert "word" in fragments[0].content
 
     def test_unicode_content(self, ingestor: ClaudeIngestor) -> None:
@@ -1027,8 +1053,11 @@ class TestEdgeCases:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn-pair \u2192 human + AI fragment.
+        assert len(fragments) == 2
+        # Human unicode in the human fragment; assistant unicode in the AI one.
         assert "\u2603" in fragments[0].content
+        assert "\u2728" in fragments[1].content
 
     def test_consecutive_human_messages(self, ingestor: ClaudeIngestor) -> None:
         """parse() should handle consecutive human messages correctly."""
@@ -1131,7 +1160,8 @@ class TestEdgeCases:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        assert len(fragments) == 1
+        # One turn-pair → human + AI fragment.
+        assert len(fragments) == 2
         assert "Describe this image" in fragments[0].content
         # Non-text parts should be excluded
         assert "http://example.com" not in fragments[0].content

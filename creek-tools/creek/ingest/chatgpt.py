@@ -28,6 +28,7 @@ from creek.ingest.base import (
     RawDocument,
     normalize_encoding,
 )
+from creek.models import Authorship
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,6 +36,12 @@ if TYPE_CHECKING:
     from creek.clean.filters.chatbot import ChatbotFilter
 
 logger = logging.getLogger(__name__)
+
+# Per-turn authorship roles stashed on ``ParsedFragment.metadata`` so the
+# frontmatter stage can attribute each split turn: the human turn is the
+# owner's voice, the AI turn is quarantined out of the voice proxy.
+_ROLE_SELF = Authorship.SELF.value
+_ROLE_AI = Authorship.AI.value
 
 
 class ChatGPTIngestor(Ingestor):
@@ -150,6 +157,7 @@ class ChatGPTIngestor(Ingestor):
         Returns:
             A dict of frontmatter key-value pairs.
         """
+        is_ai = fragment.metadata.get("author_role", _ROLE_SELF) == _ROLE_AI
         source: dict[str, Any] = {
             "platform": "chatgpt",
             "original_file": fragment.source_path,
@@ -157,11 +165,17 @@ class ChatGPTIngestor(Ingestor):
         conv_id = fragment.metadata.get("conversation_id")
         if conv_id is not None:
             source["conversation_id"] = conv_id
+        if is_ai:
+            # AI turns are AI-authored, excluded from the voice proxy via
+            # ``voice_proxy_eligible``; zero weight is belt-and-braces.
+            source["author"] = _ROLE_AI
         frontmatter_dict: dict[str, Any] = {
             "title": fragment.metadata.get("title", "Untitled Conversation"),
             "created": fragment.timestamp.isoformat(),
             "source": source,
         }
+        if is_ai:
+            frontmatter_dict["voice_weight"] = 0.0
         authored_at: datetime | None = fragment.metadata.get("authored_at")
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()
@@ -548,23 +562,39 @@ def _pair_messages_to_fragments(
                         if msg_authored_at is not None
                         else conv_authored_at
                     )
-                    content = (
-                        f"**User**: {user_text}\n\n**Assistant**: {assistant_text}"
-                    )
-                    turn_title = f"{title} (turn {turn_idx})"
-                    meta: dict[str, Any] = {
-                        "title": turn_title,
+                    # Emit the human turn and the AI turn as two
+                    # separately-attributed fragments instead of one merged
+                    # fragment, so the AI's prose can never train the voice
+                    # proxy. Both share the conversation id, turn index, and
+                    # timestamp so threading/linking still works.
+                    base_meta: dict[str, Any] = {
                         "platform": "chatgpt",
                         "authored_at": authored_at,
                     }
                     if conversation_id is not None:
-                        meta["conversation_id"] = conversation_id
-                    fragments.append(
-                        ParsedFragment(
-                            content=content,
-                            metadata=meta,
-                            source_path=source_path,
-                            timestamp=fragment_ts,
+                        base_meta["conversation_id"] = conversation_id
+                    fragments.extend(
+                        (
+                            ParsedFragment(
+                                content=user_text,
+                                metadata=base_meta
+                                | {
+                                    "title": f"{title} (turn {turn_idx})",
+                                    "author_role": _ROLE_SELF,
+                                },
+                                source_path=source_path,
+                                timestamp=fragment_ts,
+                            ),
+                            ParsedFragment(
+                                content=assistant_text,
+                                metadata=base_meta
+                                | {
+                                    "title": f"{title} (turn {turn_idx}, AI)",
+                                    "author_role": _ROLE_AI,
+                                },
+                                source_path=source_path,
+                                timestamp=fragment_ts,
+                            ),
                         )
                     )
                     turn_idx += 1

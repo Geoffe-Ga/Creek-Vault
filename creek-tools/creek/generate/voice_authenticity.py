@@ -1,4 +1,4 @@
-"""Read-only ``creek voice-authenticity`` diagnostic (epic #551, issue #552).
+"""Read-only ``creek voice-authenticity`` diagnostic.
 
 This is the *tracer skeleton* for the voice-authenticity feature: it makes
 three otherwise-hidden defects observable without changing any behaviour.
@@ -12,18 +12,19 @@ The three sub-scores:
     Distribution of the *voice-eligible* corpus (self-authored, non-INTIMATE
     fragments — see :attr:`creek.models.Fragment.voice_proxy_eligible`) by
     ``privacy_tier``. ``weighting_active`` is a stub ``False`` until the
-    graduated audience-authority model lands (issue #554).
+    graduated audience-authority model lands.
 
 ``ai_corpus_leak``
     Count and fraction of voice-eligible fragments whose
     ``source.platform`` is an AI-chat platform (``claude`` / ``chatgpt``).
-    These leak into the voice corpus today; issue #553 quarantines them.
+    These leak into the voice corpus until AI-chat turns are split and the
+    AI half is quarantined.
 
 ``deslop``
     Given an optional drafted essay, whether the AI-mannerism guard left a
     ``voice_distance`` attestation in the draft frontmatter, how many
     residual findings it recorded, and a ``status`` reason. The status string
-    is a stub until the faithful de-slop pass lands (issue #556).
+    is a stub until the faithful de-slop pass lands.
 
 Read-only: nothing here mutates the vault.
 """
@@ -37,7 +38,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.generate.ai_style.guard import VOICE_DISTANCE_KEY, VOICE_FINDINGS_KEY
-from creek.models import Fragment, PrivacyTier, SourcePlatform
+from creek.models import Authorship, Fragment, PrivacyTier, SourcePlatform
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -61,7 +62,8 @@ class AudienceMix:
             ``intimate`` is always ``0`` because INTIMATE fragments are not
             voice-eligible; it is reported for transparency.
         weighting_active: Whether graduated audience-authority weighting is
-            applied during voice selection. Stub ``False`` until issue #554.
+            applied during voice selection. Stub ``False`` until audience
+            weighting lands.
     """
 
     by_tier: dict[str, int]
@@ -78,8 +80,14 @@ class AICorpusLeak:
     """AI-chat ingests leaking into the voice-eligible corpus.
 
     Attributes:
-        leaked: Eligible fragments whose ``source.platform`` is an AI-chat
-            platform (``claude`` / ``chatgpt``).
+        leaked: Voice-eligible fragments from an AI-chat platform
+            (``claude`` / ``chatgpt``) that have **not** been quarantined —
+            i.e. their conversation has no AI-authored sibling turn, so the
+            fragment still fuses AI prose into the voice corpus. Once AI-chat
+            turns are split, a freshly-ingested chat has an AI-authored sibling
+            per turn, so its human turns no longer count and this drops to ≈0;
+            legacy *merged* fragments (no AI sibling) still flag, which is what
+            drives the re-ingest migration.
         eligible_total: Size of the voice-eligible corpus.
     """
 
@@ -104,8 +112,8 @@ class DeslopStatus:
             AI-mannerism guard ran and recorded a result).
         voice_distance: The recorded distance, or ``None`` when unattested.
         residual_findings: Count of recorded residual voice findings.
-        status: A human-readable reason. Stub wording until issue #556 adds
-            the rewritten-vs-measured distinction.
+        status: A human-readable reason. Stub wording until the faithful
+            de-slop pass adds the rewritten-vs-measured distinction.
     """
 
     draft: str
@@ -206,19 +214,56 @@ def _probe_audience_mix(eligible: list[Fragment]) -> AudienceMix:
     return AudienceMix(by_tier=by_tier, weighting_active=False)
 
 
-def _probe_ai_corpus_leak(eligible: list[Fragment]) -> AICorpusLeak:
-    """Count eligible fragments ingested from AI-chat platforms.
+def _conversation_key(fragment: Fragment) -> tuple[str, str | None, str | None] | None:
+    """Return a key grouping a turn's human and AI fragments, or ``None``.
+
+    Both halves of a split turn share platform, conversation id, and source
+    file, so this pairs a human turn with its AI sibling even when the export
+    carried no conversation id. Returns ``None`` when the fragment has neither
+    a conversation id nor a source file — there is then no reliable signal to
+    pair siblings on, so such a fragment is never treated as quarantined.
+    """
+    source = fragment.source
+    if source.conversation_id is source.original_file is None:
+        return None
+    return (
+        str(source.platform),
+        source.conversation_id,
+        source.original_file,
+    )
+
+
+def _probe_ai_corpus_leak(
+    eligible: list[Fragment],
+    all_fragments: list[Fragment],
+) -> AICorpusLeak:
+    """Count un-quarantined AI-chat fragments in the voice-eligible corpus.
+
+    A conversation is *quarantined* once it contains an AI-authored sibling
+    turn (the per-turn split). An eligible AI-chat fragment from a
+    conversation with no such sibling is still a merged fragment fusing AI
+    prose into the corpus, and counts as leaked.
 
     Args:
         eligible: The voice-eligible fragments.
+        all_fragments: Every loaded fragment (used to find AI-authored
+            siblings that mark a conversation as quarantined).
 
     Returns:
         The AI-corpus-leak sub-score.
     """
+    quarantined = {
+        key
+        for fragment in all_fragments
+        if str(fragment.source.platform) in _AI_CHAT_PLATFORMS
+        and str(fragment.source.author) == Authorship.AI.value
+        and (key := _conversation_key(fragment)) is not None
+    }
     leaked = sum(
         1
         for fragment in eligible
         if str(fragment.source.platform) in _AI_CHAT_PLATFORMS
+        and _conversation_key(fragment) not in quarantined
     )
     return AICorpusLeak(leaked=leaked, eligible_total=len(eligible))
 
@@ -249,7 +294,7 @@ def _probe_deslop(draft_path: Path) -> DeslopStatus:
         attested=True,
         voice_distance=float(raw_distance),
         residual_findings=residual,
-        status="attested (rewritten-vs-measured detection lands in #556)",
+        status="attested (rewritten-vs-measured detection not yet recorded)",
     )
 
 
@@ -273,14 +318,11 @@ def build_voice_authenticity_report(
         The assembled :class:`VoiceAuthenticityReport`.
     """
     records = iter_vault_fragments(vault_path / _FRAGMENTS_SUBDIR)
-    eligible = [
-        fragment
-        for _path, fragment, _body, _raw in records
-        if fragment.voice_proxy_eligible
-    ]
+    fragments = [fragment for _path, fragment, _body, _raw in records]
+    eligible = [fragment for fragment in fragments if fragment.voice_proxy_eligible]
     deslop = _probe_deslop(draft_path) if draft_path is not None else None
     return VoiceAuthenticityReport(
         audience_mix=_probe_audience_mix(eligible),
-        ai_corpus_leak=_probe_ai_corpus_leak(eligible),
+        ai_corpus_leak=_probe_ai_corpus_leak(eligible, fragments),
         deslop=deslop,
     )
