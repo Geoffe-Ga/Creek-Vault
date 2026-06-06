@@ -10,6 +10,15 @@ catalogs and add the sanitizer, prompt prevention, guard, and lint check.
 
 from __future__ import annotations
 
+from creek.generate.ai_style.citations import (
+    INVALID_DOI,
+    INVALID_ISBN,
+    PAGELESS_BOOK,
+    TRACKING_PARAM,
+    UNDEFINED_REF,
+    check_external_links,
+    extract_urls,
+)
 from creek.generate.ai_style.discourse import (
     CHALLENGES_SECTION,
     COMM_BOILERPLATE,
@@ -83,16 +92,21 @@ __all__ = [
     "COPULATIVE_AVOIDANCE",
     "DIDACTIC_DISCLAIMER",
     "FINGERPRINT_FEATURES",
+    "INVALID_DOI",
+    "INVALID_ISBN",
     "KNOWLEDGE_CUTOFF",
     "LIST_TITLE_LEAD",
     "NEGATIVE_PARALLELISM",
+    "PAGELESS_BOOK",
     "PEACOCK",
     "RULE_OF_THREE_PADDING",
     "SECTION_SUMMARY",
     "SIGNIFICANCE",
     "SUPERFICIAL_ING",
     "TELL_REGISTRY",
+    "TRACKING_PARAM",
     "TRANSITION_OPENER",
+    "UNDEFINED_REF",
     "VAGUE_ATTRIBUTION",
     "Category",
     "Direction",
@@ -108,6 +122,8 @@ __all__ = [
     "build_fingerprint",
     "build_style_preamble",
     "build_voice_fidelity_frontmatter",
+    "check_external_links",
+    "extract_urls",
     "extract_user_turns",
     "get_tells",
     "load_fingerprint",
