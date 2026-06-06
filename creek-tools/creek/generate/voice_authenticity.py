@@ -112,12 +112,15 @@ class DeslopStatus:
 
     Attributes:
         draft: The drafted-essay path that was probed.
-        attested: Whether a ``voice_distance`` attestation is present (the
-            AI-mannerism guard ran and recorded a result).
-        voice_distance: The recorded distance, or ``None`` when unattested.
+        attested: Whether the AI-mannerism guard left any outcome on the
+            draft — a ``voice_guard_status`` and/or a measured ``voice_distance``
+            (so a loud skip such as ``skipped:thin_fingerprint`` still attests).
+        voice_distance: The recorded distance, or ``None`` when none was
+            measured (e.g. a skip path).
         residual_findings: Count of recorded residual voice findings.
-        status: A human-readable reason. Stub wording until the faithful
-            de-slop pass adds the rewritten-vs-measured distinction.
+        status: The guard's recorded ``voice_guard_status`` (e.g. ``rewritten``,
+            ``measured_only:below_target``, ``skipped:thin_fingerprint``) when
+            present, otherwise a message noting no attestation was found.
     """
 
     draft: str

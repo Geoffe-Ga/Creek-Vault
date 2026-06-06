@@ -130,6 +130,22 @@ def test_status_below_target() -> None:
     assert report.status == "measured_only:below_target"
 
 
+def test_status_above_target() -> None:
+    """A mannered draft with the rewrite loop disabled records above_target.
+
+    With ``max_revision_passes=0`` an LLM is present but never invoked, so a
+    draft still over the target is measured but not rewritten.
+    """
+    report = run_voice_fidelity_guard(
+        _TROPEY,
+        fingerprint=_fingerprint(),
+        config=AIStyleConfig(voice_distance_upper=0.001, max_revision_passes=0),
+        llm=_const_llm(_PLAIN),
+    )
+    assert report.passes == 0
+    assert report.status == "measured_only:above_target"
+
+
 def test_frontmatter_always_stamps_status() -> None:
     """``to_frontmatter`` always carries the guard status."""
     report = run_voice_fidelity_guard(
