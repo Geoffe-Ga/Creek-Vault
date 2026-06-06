@@ -49,14 +49,12 @@ The epic is done when:
 
 ## Child Issues
 
-_Filled in after child issues are filed._
-
-- [ ] #NNN — Skeleton: `creek voice-authenticity` diagnostic surface
-- [ ] #NNN — Core: split AI-chat ingests by turn; attribute human=self / AI=ai
-- [ ] #NNN — Core: audience-weighted voice authority
-- [ ] #NNN — Core: citation/quotation-density voice pattern (audience-weighted)
-- [ ] #NNN — Core: make the de-slop pass faithful and loud on the real draft path
-- [ ] #NNN — Edges/Polish: config knobs, migration, docs, end-to-end regression
+- [ ] #552 — Skeleton: `creek voice-authenticity` diagnostic surface
+- [ ] #553 — Core: split AI-chat ingests by turn; attribute human=self / AI=ai
+- [ ] #554 — Core: audience-weighted voice authority
+- [ ] #555 — Core: citation/quotation-density voice pattern (audience-weighted)
+- [ ] #556 — Core: make the de-slop pass faithful and loud on the real draft path
+- [ ] #557 — Edges/Polish: config knobs, migration, docs, end-to-end regression
 
 ## Sequencing Notes
 

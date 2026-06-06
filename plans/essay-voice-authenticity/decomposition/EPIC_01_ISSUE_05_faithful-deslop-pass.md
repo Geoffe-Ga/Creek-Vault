@@ -15,8 +15,8 @@ seeded with known tells comes out of the real `creek draft` path with those tell
 
 ## Context
 
-- **Parent epic:** #EPIC_01_NUMBER
-- **Predecessor issue(s):** #EPIC_01_ISSUE_01_NUMBER (diagnostic's `deslop` sub-score consumes this).
+- **Parent epic:** #551
+- **Predecessor issue(s):** #552 (diagnostic's `deslop` sub-score consumes this).
 - **Findings:** SPEC summary §"The de-slop pass runs but often no-ops silently".
 - **Files involved:**
   - `creek-tools/creek/generate/drafts.py` — `_apply_voice_fidelity` (the silent
@@ -89,7 +89,7 @@ performs no LLM rewrite; behavior stays deterministic and offline.
 - [ ] `pre-commit run --all-files -c creek-tools/.pre-commit-config.yaml` is clean.
 - [ ] Coverage on changed lines ≥90% branch; docstrings ≥95%; complexity ≤10; MyPy strict.
 - [ ] Integration test proves planted tells are removed on the real `save_draft` path; a separate test proves a thin fingerprint is reported, never silently swallowed.
-- [ ] PR body includes `Refs #EPIC_01_NUMBER` and `Closes #THIS_ISSUE_NUMBER`.
+- [ ] PR body includes `Refs #551` and `Closes #556`.
 - [ ] Latest Claude reviewer `Verdict:` on HEAD is `LGTM`.
 
 ## Labels

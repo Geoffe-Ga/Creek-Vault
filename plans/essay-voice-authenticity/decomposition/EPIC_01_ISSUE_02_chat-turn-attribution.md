@@ -13,8 +13,8 @@ the diagnostic's `ai_corpus_leak` to ≈0 for freshly-ingested chats.
 
 ## Context
 
-- **Parent epic:** #EPIC_01_NUMBER
-- **Predecessor issue(s):** #EPIC_01_ISSUE_01_NUMBER (the `ai_corpus_leak` probe exists to prove the fix).
+- **Parent epic:** #551
+- **Predecessor issue(s):** #552 (the `ai_corpus_leak` probe exists to prove the fix).
 - **Findings:** SPEC summary §"AI chat turns leak into the voice corpus".
 - **Files involved:**
   - `creek-tools/creek/ingest/claude.py` — `ClaudeIngestor._build_fragment` currently **merges**
@@ -82,7 +82,7 @@ unchanged; their fragments keep their existing single-author attribution.
 - [ ] `pre-commit run --all-files -c creek-tools/.pre-commit-config.yaml` is clean.
 - [ ] Coverage on changed lines ≥90% branch; docstrings ≥95%; complexity ≤10; MyPy strict.
 - [ ] Proven by a test that an AI turn is excluded from the voice corpus and a human turn is not.
-- [ ] PR body includes `Refs #EPIC_01_NUMBER` and `Closes #THIS_ISSUE_NUMBER`, and states which attribution decision was taken.
+- [ ] PR body includes `Refs #551` and `Closes #553`, and states which attribution decision was taken.
 - [ ] Latest Claude reviewer `Verdict:` on HEAD is `LGTM`.
 
 ## Labels

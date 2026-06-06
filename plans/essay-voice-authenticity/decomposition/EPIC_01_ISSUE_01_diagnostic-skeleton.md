@@ -14,7 +14,7 @@ end-to-end and print sensible numbers on a real vault from day one.
 
 ## Context
 
-- **Parent epic:** #EPIC_01_NUMBER
+- **Parent epic:** #551
 - **Predecessor issue(s):** none — this is the skeleton.
 - **Findings:** `plans/essay-voice-authenticity/decomposition/2026-06-05_SPEC_summary.md`.
 - **Files involved:**
@@ -83,9 +83,9 @@ vault after this issue; later issues only deepen the probes, never re-wire the s
 - [ ] `pre-commit run --all-files -c creek-tools/.pre-commit-config.yaml` is clean.
 - [ ] Coverage on changed lines ≥90% branch; docstrings ≥95%; complexity ≤10; MyPy strict.
 - [ ] Smoke test proves report shape on a fixture vault that contains both native and AI-chat fragments.
-- [ ] PR body includes `Refs #EPIC_01_NUMBER` and `Closes #THIS_ISSUE_NUMBER`.
+- [ ] PR body includes `Refs #551` and `Closes #552`.
 - [ ] Latest Claude reviewer `Verdict:` on HEAD is `LGTM`.
 
 ## Labels
 
-`spec-decomposition`, `voice`, `cli`
+`spec-decomposition`, `voice`

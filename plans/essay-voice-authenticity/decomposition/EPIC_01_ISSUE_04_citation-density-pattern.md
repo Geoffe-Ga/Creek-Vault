@@ -13,8 +13,8 @@ heavy-citation habit of *public* work (where it is prevalent) shapes drafts, whi
 
 ## Context
 
-- **Parent epic:** #EPIC_01_NUMBER
-- **Predecessor issue(s):** #EPIC_01_ISSUE_03_NUMBER (provides `audience_authority`, which this
+- **Parent epic:** #551
+- **Predecessor issue(s):** #554 (provides `audience_authority`, which this
   pattern must be weighted by).
 - **Findings:** SPEC summary §"Citation/quotation density is unmeasured".
 - **Files involved:**
@@ -72,7 +72,7 @@ do not re-derive audience weighting here.
 - [ ] `pre-commit run --all-files -c creek-tools/.pre-commit-config.yaml` is clean.
 - [ ] Coverage on changed lines ≥90% branch; docstrings ≥95%; complexity ≤10; MyPy strict.
 - [ ] Test proves citation-heavy public work raises the aggregated metric while private-only work does not.
-- [ ] PR body includes `Refs #EPIC_01_NUMBER` and `Closes #THIS_ISSUE_NUMBER`.
+- [ ] PR body includes `Refs #551` and `Closes #555`.
 - [ ] Latest Claude reviewer `Verdict:` on HEAD is `LGTM`.
 
 ## Labels

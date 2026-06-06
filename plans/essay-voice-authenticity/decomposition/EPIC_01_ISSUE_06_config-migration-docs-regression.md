@@ -12,9 +12,9 @@ diagnostic to a clean bill of health.
 
 ## Context
 
-- **Parent epic:** #EPIC_01_NUMBER
-- **Predecessor issue(s):** #EPIC_01_ISSUE_02_NUMBER, #EPIC_01_ISSUE_03_NUMBER,
-  #EPIC_01_ISSUE_04_NUMBER, #EPIC_01_ISSUE_05_NUMBER (all of the behavior this issue documents,
+- **Parent epic:** #551
+- **Predecessor issue(s):** #553, #554,
+  #555, #556 (all of the behavior this issue documents,
   configures, and proves end-to-end).
 - **Files involved:**
   - `creek-tools/creek/config.py` — consolidate the audience-weight knobs (Issue 03), citation
@@ -79,7 +79,7 @@ once; a vault with no merged chat fragments is unchanged.
 - [ ] Coverage on changed lines ≥90% branch; docstrings ≥95%; complexity ≤10; MyPy strict.
 - [ ] The end-to-end regression asserts all four acceptance points above.
 - [ ] `cd creek-tools && ./scripts/check-all.sh` is green.
-- [ ] PR body includes `Refs #EPIC_01_NUMBER` and `Closes #THIS_ISSUE_NUMBER`.
+- [ ] PR body includes `Refs #551` and `Closes #557`.
 - [ ] Latest Claude reviewer `Verdict:` on HEAD is `LGTM`.
 
 ## Labels

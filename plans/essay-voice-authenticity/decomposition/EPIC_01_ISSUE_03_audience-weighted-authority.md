@@ -14,8 +14,8 @@ how drafts sound. Flip the diagnostic's `audience_weighting_active` to `True`.
 
 ## Context
 
-- **Parent epic:** #EPIC_01_NUMBER
-- **Predecessor issue(s):** #EPIC_01_ISSUE_01_NUMBER (diagnostic exposes `audience_mix`).
+- **Parent epic:** #551
+- **Predecessor issue(s):** #552 (diagnostic exposes `audience_mix`).
 - **Findings:** SPEC summary §"Audience weight is unused".
 - **Files involved:**
   - `creek-tools/creek/generate/voice.py` — `_eligible_register` (binary gate today),
@@ -76,7 +76,7 @@ behavior change); only mixed-audience vaults shift.
 - [ ] `pre-commit run --all-files -c creek-tools/.pre-commit-config.yaml` is clean.
 - [ ] Coverage on changed lines ≥90% branch; docstrings ≥95%; complexity ≤10; MyPy strict.
 - [ ] Test proves an `OPEN` fragment outweighs a competing `PERSONAL` fragment in the generated profile.
-- [ ] PR body includes `Refs #EPIC_01_NUMBER` and `Closes #THIS_ISSUE_NUMBER`.
+- [ ] PR body includes `Refs #551` and `Closes #554`.
 - [ ] Latest Claude reviewer `Verdict:` on HEAD is `LGTM`.
 
 ## Labels

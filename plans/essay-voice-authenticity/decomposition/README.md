@@ -17,9 +17,17 @@ voice-authenticity` diagnostic); each later issue turns one of its stubbed measu
 Issue 04 depends on Issue 03; Issue 06 depends on 02–05. **Start with
 `EPIC_01_ISSUE_01_diagnostic-skeleton.md`.**
 
-## Filing as GitHub issues
+## Filed GitHub issues
 
-The bodies use `EPIC_01_NUMBER` and `THIS_ISSUE_NUMBER` placeholders. File the epic first, capture
-its number, substitute it into the child bodies, file the children, then edit the epic to fill in
-the Child Issues checklist with the real numbers (via `mcp__github__issue_write` or `gh issue
-create --body-file`).
+Filed 2026-06-05 against `Geoffe-Ga/Creek-Vault`:
+
+- Epic **#551** — Essay Voice Authenticity
+- **#552** — Skeleton: `creek voice-authenticity` diagnostic
+- **#553** — Split AI-chat ingests by turn (human=self / AI=ai)
+- **#554** — Audience-weighted voice authority
+- **#555** — Citation/quotation-density voice pattern (audience-weighted)
+- **#556** — Faithful, loud de-slop pass on the real draft path
+- **#557** — Config knobs, migration, docs, end-to-end regression
+
+The placeholder tokens (`EPIC_01_NUMBER`, `EPIC_01_ISSUE_0N_NUMBER`, `THIS_ISSUE_NUMBER`) in the
+bodies on disk have been resolved to the real issue numbers above.
