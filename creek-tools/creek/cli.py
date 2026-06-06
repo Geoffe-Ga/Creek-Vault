@@ -1491,6 +1491,56 @@ def voice_check(
         raise typer.Exit(code=1)
 
 
+@app.command(name="voice-authenticity")
+def voice_authenticity(
+    vault: Path | None = typer.Option(None, "--vault", help="Obsidian vault path"),
+    draft: Path | None = typer.Option(
+        None,
+        "--draft",
+        help=(
+            "Optional drafted essay to audit. Reads its voice-fidelity "
+            "attestation (voice_distance) from the frontmatter for the "
+            "de-slop sub-score."
+        ),
+    ),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a machine-readable JSON object instead of a text summary.",
+    ),
+) -> None:
+    """Audit a vault's voice corpus (and optionally a draft) for authenticity.
+
+    Read-only diagnostic that makes three voice defects observable:
+
+    * **audience mix** — the voice-eligible corpus bucketed by privacy tier
+      (and whether graduated audience weighting is active yet);
+    * **AI-corpus leak** — the fraction of eligible fragments that are
+      ``claude`` / ``chatgpt`` ingests (these leak into the voice corpus
+      today);
+    * **de-slop** — when ``--draft`` is given, whether the AI-mannerism guard
+      left a ``voice_distance`` attestation and how many residual findings
+      it recorded.
+
+    The command mutates nothing and always exits ``0`` on success; a missing
+    ``--draft`` file exits ``2``.
+    """
+    from creek.generate.voice_authenticity import build_voice_authenticity_report
+
+    vault_path = _resolve_vault(vault)
+    if draft is not None and not draft.exists():
+        console.print(f"[red]Draft not found: {draft}[/red]")
+        raise typer.Exit(code=2)
+
+    report = build_voice_authenticity_report(vault_path, draft_path=draft)
+
+    if json_out:
+        # Emit raw so Rich never interprets ``[...]`` in the content as markup.
+        typer.echo(report.to_json())
+    else:
+        console.print(report.summary_line(), markup=False)
+
+
 _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "tags": _report_tags,
     "unnamed": _report_unnamed,
