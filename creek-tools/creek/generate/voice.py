@@ -748,6 +748,25 @@ _ELLIPSIS_RE: re.Pattern[str] = re.compile(r"\.{3}|\u2026")
 _PARENTHETICAL_RE: re.Pattern[str] = re.compile(r"\([^)]+\)")
 _EXCLAMATION_RE: re.Pattern[str] = re.compile(r"!")
 
+# Citation / quotation / reference signals. Each matched span is one
+# "citation signal"; their per-1000-word rate is ``citation_density``.
+_QUOTATION_SPAN_RE: re.Pattern[str] = re.compile(r'"[^"\n]+"|\u201c[^\u201d\n]+\u201d')
+_BLOCKQUOTE_LINE_RE: re.Pattern[str] = re.compile(r"^\s*>", re.MULTILINE)
+_ATTRIBUTION_RE: re.Pattern[str] = re.compile(
+    r"\baccording to\b"
+    r"|\bas [^,.\n]{1,40}? (?:notes|writes|argues|observes|put it|puts it|said|says)\b"
+    r"|\bin [^,.\n]{1,30}?'s words\b",
+    re.IGNORECASE,
+)
+_REFERENCE_MARKER_RE: re.Pattern[str] = re.compile(
+    r"\[\d+\]|\([A-Z][A-Za-z.-]+(?: et al\.?)?,?\s+\d{4}[a-z]?\)",
+)
+_OUTBOUND_LINK_RE: re.Pattern[str] = re.compile(r"https?://\S+")
+
+_CITATION_PROMPT_THRESHOLD: float = 1.0
+"""Citation density (signals per 1000 words) above which the generated voice
+skill explicitly instructs the writer to reference and quote sources."""
+
 _SHORT_SENTENCE_MAX: int = 9
 """Sentences with at most this many words are classified as *short*."""
 
@@ -879,6 +898,9 @@ class VoicePatterns:
         rhetorical_moves: Self-deprecation, paradox, and callback counts.
         vocabulary: Vocabulary fingerprint (TF-IDF, coinages, phrases).
         punctuation: Punctuation habit frequencies.
+        citation_density: Citation / quotation / reference signals per ~1000
+            words, aggregated across the corpus weighted by each text's
+            audience authority. ``0.0`` when the corpus cites nothing.
     """
 
     sentence_metrics: SentenceMetrics
@@ -888,6 +910,7 @@ class VoicePatterns:
     rhetorical_moves: RhetoricalMoves
     vocabulary: VocabularyFingerprint
     punctuation: PunctuationHabits
+    citation_density: float = 0.0
 
 
 # ---- Sentence helpers ----
@@ -1039,6 +1062,55 @@ def _compute_punctuation(combined: str, total_words: int) -> PunctuationHabits:
     )
 
 
+def _count_citation_signals(text: str) -> int:
+    """Return the number of citation / quotation / reference signals in *text*.
+
+    Counts quotation spans, blockquote lines, attribution phrases, reference
+    markers (``[1]`` / author-year), and outbound source links.
+    """
+    return (
+        len(_QUOTATION_SPAN_RE.findall(text))
+        + len(_BLOCKQUOTE_LINE_RE.findall(text))
+        + len(_ATTRIBUTION_RE.findall(text))
+        + len(_REFERENCE_MARKER_RE.findall(text))
+        + len(_OUTBOUND_LINK_RE.findall(text))
+    )
+
+
+def _compute_citation_density(
+    texts: list[str],
+    weights: list[float] | None,
+) -> float:
+    """Return the audience-weighted citation density across *texts*.
+
+    Each text contributes its own per-1000-word citation rate, combined as a
+    weighted mean using *weights* (per-fragment audience authority). A
+    ``None`` or wrong-length *weights* falls back to uniform weighting; a
+    non-positive total weight yields ``0.0``.
+
+    Args:
+        texts: Exemplar body texts.
+        weights: Per-text audience-authority weights, or ``None``.
+
+    Returns:
+        The weighted citation density (signals per ~1000 words).
+    """
+    if not texts:
+        return 0.0
+    effective = weights if weights is not None and len(weights) == len(texts) else None
+    resolved = effective if effective is not None else [1.0] * len(texts)
+    total_weight = sum(resolved)
+    if total_weight <= 0:
+        return 0.0
+    accumulated = 0.0
+    for text, weight in zip(texts, resolved, strict=True):
+        density = _frequency_per_thousand(
+            _count_citation_signals(text), _count_words(text)
+        )
+        accumulated += weight * density
+    return accumulated / total_weight
+
+
 # ---- TF-IDF helpers ----
 
 
@@ -1141,11 +1213,19 @@ class VoicePatternExtractor:
             else None
         )
 
-    def extract_patterns(self, texts: list[str]) -> VoicePatterns:
+    def extract_patterns(
+        self,
+        texts: list[str],
+        *,
+        weights: list[float] | None = None,
+    ) -> VoicePatterns:
         """Extract all voice patterns from exemplar body texts.
 
         Args:
             texts: Body texts of voice exemplar fragments.
+            weights: Optional per-text audience-authority weights, parallel
+                to *texts*. Used only for ``citation_density`` so public-work
+                citation habits dominate; ``None`` weights every text equally.
 
         Returns:
             A :class:`VoicePatterns` containing every extracted metric.
@@ -1161,6 +1241,7 @@ class VoicePatternExtractor:
             rhetorical_moves=_compute_rhetorical_moves(combined),
             vocabulary=self.extract_vocabulary(texts),
             punctuation=_compute_punctuation(combined, total_words),
+            citation_density=_compute_citation_density(texts, weights),
         )
 
     def extract_metaphors(self, texts: list[str]) -> list[MetaphorFamily]:
@@ -1492,6 +1573,12 @@ def _build_voice_prompt(
     if patterns.metaphor_families:
         domains = ", ".join(f.domain for f in patterns.metaphor_families)
         lines.append(f"Metaphors surface from: {domains}.")
+    if patterns.citation_density >= _CITATION_PROMPT_THRESHOLD:
+        lines.append(
+            "Reference and quote your sources — you cite at roughly "
+            f"{patterns.citation_density:.1f} markers per 1000 words; "
+            "ground claims in attributed quotations and references.",
+        )
     moves = patterns.rhetorical_moves
     if moves.paradox_count > 0:
         lines.append("Use paradox constructions to hold tension without resolving it.")
@@ -1690,7 +1777,11 @@ class VoiceProfileGenerator:
                     continue
                 ranked = self._rank_exemplars(register_exemplars)
                 bodies = [e.body for e in ranked]
-                patterns = self._extractor.extract_patterns(bodies)
+                weights = [
+                    audience_authority(e.fragment, self._audience_weighting)
+                    for e in ranked
+                ]
+                patterns = self._extractor.extract_patterns(bodies, weights=weights)
                 profile = self.generate_profile(register, ranked, patterns)
                 written.append(self.write_profile(profile, vault_path))
                 # Drop the per-register working set before moving on so
