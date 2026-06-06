@@ -1058,6 +1058,51 @@ class SourcePaths(BaseModel):
     """Code project directories."""
 
 
+def _default_privacy_tier_authority() -> dict[str, float]:
+    """Default per-privacy-tier voice-authority multipliers.
+
+    ``OPEN`` (publishable, public-facing) work carries the most authority
+    over the voice proxy; ``PERSONAL`` is the baseline; ``UNCLASSIFIED`` is
+    treated cautiously below baseline; ``INTIMATE`` is ``0.0`` (it is also
+    gated out entirely by default).
+    """
+    return {"open": 1.5, "personal": 1.0, "unclassified": 0.75, "intimate": 0.0}
+
+
+def _default_representativeness_authority() -> dict[str, float]:
+    """Default per-representativeness voice-authority multipliers.
+
+    The owner's own (``self``) and explicitly ``endorsed`` material outrank
+    ``aspirational`` (voices they want to grow into) and ``reference``
+    (borrowed) material, which keeps its existing near-zero influence.
+    """
+    return {"self": 1.0, "endorsed": 0.9, "aspirational": 0.6, "reference": 0.3}
+
+
+class VoiceAudienceWeightingConfig(BaseModel):
+    """Graduated audience-authority weighting for the voice proxy (issue #554).
+
+    Replaces the historical binary privacy gate with a multiplier so that
+    public-facing fragments dominate how drafts sound. The multiplier is the
+    product of a per-``privacy_tier`` and a per-``representativeness`` factor;
+    it is applied on top of (not in place of) the ``voice_weight`` gate.
+    Disabling it makes every authority ``1.0`` — i.e. the pre-#554 ranking.
+    """
+
+    enabled: bool = True
+    """Master switch; ``False`` makes every fragment's authority ``1.0``."""
+
+    privacy_tier_authority: dict[str, float] = Field(
+        default_factory=_default_privacy_tier_authority,
+    )
+    """Multiplier per ``privacy_tier`` value (missing tiers default to 1.0)."""
+
+    representativeness_authority: dict[str, float] = Field(
+        default_factory=_default_representativeness_authority,
+    )
+    """Multiplier per ``representativeness`` value (missing default to 1.0)."""
+
+
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
 
@@ -1127,6 +1172,11 @@ class CreekConfig(BaseSettings):
 
     author: AuthorConfig = Field(default_factory=AuthorConfig)
     """Creek Writing Desk author-subsystem settings (FEAT-041)."""
+
+    voice_audience_weighting: VoiceAudienceWeightingConfig = Field(
+        default_factory=VoiceAudienceWeightingConfig,
+    )
+    """Graduated audience-authority weighting for the voice proxy (issue #554)."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
