@@ -761,7 +761,17 @@ _ATTRIBUTION_RE: re.Pattern[str] = re.compile(
 _REFERENCE_MARKER_RE: re.Pattern[str] = re.compile(
     r"\[\d+\]|\([A-Z][A-Za-z.-]+(?: et al\.?)?,?\s+\d{4}[a-z]?\)",
 )
-_OUTBOUND_LINK_RE: re.Pattern[str] = re.compile(r"https?://\S+")
+# Stop before terminal punctuation so a trailing ``.``/``,`` does not inflate
+# the match (e.g. "see https://example.com." counts one clean link).
+_OUTBOUND_LINK_RE: re.Pattern[str] = re.compile(r"https?://[^\s.,;:!?)]+")
+
+_MIN_QUOTE_WORDS: int = 4
+"""Minimum whitespace-token count for a quoted span to count as a citation.
+
+Quoting a *source* tends to span several words; short quoted spans are almost
+always dialogue tags, scare quotes (``the "obvious" fix``), or inline code
+(``"--verbose"``), so requiring at least this many words filters those false
+positives out of ``citation_density``."""
 
 _CITATION_PROMPT_THRESHOLD: float = 1.0
 """Citation density (signals per 1000 words) above which the generated voice
@@ -1062,14 +1072,36 @@ def _compute_punctuation(combined: str, total_words: int) -> PunctuationHabits:
     )
 
 
+def _count_quotation_spans(text: str) -> int:
+    """Count source-quotation spans (quoted spans of at least 4 words).
+
+    The word-count floor (:data:`_MIN_QUOTE_WORDS`) filters dialogue tags,
+    scare quotes, and inline code, which are short quoted spans rather than
+    quoted source material.
+    """
+    return sum(
+        1
+        for span in _QUOTATION_SPAN_RE.findall(text)
+        if len(span.split()) >= _MIN_QUOTE_WORDS
+    )
+
+
 def _count_citation_signals(text: str) -> int:
     """Return the number of citation / quotation / reference signals in *text*.
 
-    Counts quotation spans, blockquote lines, attribution phrases, reference
-    markers (``[1]`` / author-year), and outbound source links.
+    Sums five independent signal families: source-quotation spans (see
+    :func:`_count_quotation_spans`), blockquote lines, attribution phrases,
+    reference markers (``[1]`` / author-year), and outbound source links.
+
+    The families are counted **independently and by design** — a single dense
+    construct (e.g. a blockquote that both attributes a source and links to it)
+    legitimately fires several counters, because layering quotation, attribution
+    and a link *is* denser citation behaviour than any one alone. The signal is
+    a soft voice-shaping rate, not an exact count, so this compounding is the
+    intended behaviour rather than double-counting to be deduplicated.
     """
     return (
-        len(_QUOTATION_SPAN_RE.findall(text))
+        _count_quotation_spans(text)
         + len(_BLOCKQUOTE_LINE_RE.findall(text))
         + len(_ATTRIBUTION_RE.findall(text))
         + len(_REFERENCE_MARKER_RE.findall(text))
@@ -1085,20 +1117,23 @@ def _compute_citation_density(
 
     Each text contributes its own per-1000-word citation rate, combined as a
     weighted mean using *weights* (per-fragment audience authority). A
-    ``None`` or wrong-length *weights* falls back to uniform weighting; a
-    non-positive total weight yields ``0.0``.
+    ``None`` or wrong-length *weights* falls back to uniform weighting;
+    negative weights are clamped to ``0.0``; a non-positive total weight
+    yields ``0.0``.
 
     Args:
         texts: Exemplar body texts.
-        weights: Per-text audience-authority weights, or ``None``.
+        weights: Per-text non-negative audience-authority weights, or ``None``.
 
     Returns:
         The weighted citation density (signals per ~1000 words).
     """
     if not texts:
         return 0.0
-    effective = weights if weights is not None and len(weights) == len(texts) else None
-    resolved = effective if effective is not None else [1.0] * len(texts)
+    if weights is None or len(weights) != len(texts):
+        resolved = [1.0] * len(texts)
+    else:
+        resolved = [max(0.0, weight) for weight in weights]
     total_weight = sum(resolved)
     if total_weight <= 0:
         return 0.0

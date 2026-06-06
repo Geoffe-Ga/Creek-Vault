@@ -9,12 +9,15 @@ writing. The generated voice skill surfaces the tendency.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import frontmatter
 import pytest
 
 from creek.generate.voice import (
-    Exemplar,
     VoicePatternExtractor,
     VoiceProfileGenerator,
+    _count_citation_signals,
 )
 from creek.models import (
     Confidence,
@@ -30,6 +33,9 @@ from creek.models import (
     VoiceRegister,
     WavelengthClassification,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _CITATION_HEAVY = (
     'According to Smith, the river "shapes the valley over time" [1]. '
@@ -92,7 +98,7 @@ def test_audience_weighting_lifts_public_citation_signal() -> None:
     assert weighted.citation_density > uniform.citation_density
 
 
-def test_zero_weights_fall_back_to_zero_density() -> None:
+def test_all_zero_weights_yield_zero_density() -> None:
     """All-zero weights yield a safe zero density (no division by zero)."""
     patterns = VoicePatternExtractor().extract_patterns(
         [_CITATION_HEAVY],
@@ -108,6 +114,35 @@ def test_mismatched_weights_fall_back_to_uniform() -> None:
     uniform = extractor.extract_patterns(texts)
     mismatched = extractor.extract_patterns(texts, weights=[1.0])
     assert mismatched.citation_density == uniform.citation_density
+
+
+def test_negative_weights_are_clamped() -> None:
+    """A negative weight is clamped to 0, never producing a sub-zero density."""
+    patterns = VoicePatternExtractor().extract_patterns(
+        [_CITATION_HEAVY, _CITATION_LIGHT],
+        weights=[-5.0, 1.0],
+    )
+    # The citation-heavy text is clamped out; only the light text remains.
+    assert patterns.citation_density == 0.0
+
+
+def test_dialogue_and_scare_quotes_are_not_citations() -> None:
+    """Short quoted spans (dialogue, scare quotes) do not count as citations."""
+    prose = (
+        '"I\'ll be back," he said, choosing the "obvious" path. '
+        'She ran it with "--verbose" and moved on. ' + "word " * 40
+    )
+    patterns = VoicePatternExtractor().extract_patterns([prose])
+    assert patterns.citation_density == 0.0
+
+
+def test_overlapping_signals_compound_by_design() -> None:
+    """A dense line that quotes, attributes, and links fires every counter."""
+    # Blockquote + attribution ("according to") + outbound link on one line.
+    layered = "> According to Smith, see https://example.com/data"
+    assert _count_citation_signals(layered) == 3
+    # A plain blockquote with none of the other families fires only once.
+    assert _count_citation_signals("> just a quoted thought here") == 1
 
 
 def _citation_fragment(frag_id: str, privacy: PrivacyTier) -> Fragment:
@@ -126,18 +161,31 @@ def _citation_fragment(frag_id: str, privacy: PrivacyTier) -> Fragment:
     )
 
 
-def test_generated_skill_surfaces_citation_habit() -> None:
-    """The generated voice prompt mentions the owner's citation tendency."""
-    generator = VoiceProfileGenerator(max_exemplars=5, min_exemplars=1)
+def _write_fragment(vault: Path, fragment: Fragment, *, body: str) -> None:
+    """Persist *fragment* with *body* under ``01-Fragments/Writing``."""
+    target = vault / "01-Fragments" / "Writing" / f"{fragment.id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=body, **fragment.model_dump(mode="json"))
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def test_generated_skill_surfaces_citation_via_weighted_path(tmp_path: Path) -> None:
+    """The full weighted ``generate_all_profiles`` path surfaces the habit.
+
+    This exercises the production path (``extract_patterns(bodies,
+    weights=...)``) rather than an unweighted call, so the audience-weighted
+    feature is covered end-to-end at the prompt level.
+    """
+    vault = tmp_path / "vault"
     body = _CITATION_HEAVY + "\n\n" + "word " * 250
-    exemplars = [
-        Exemplar(fragment=_citation_fragment("frag-open", PrivacyTier.OPEN), body=body),
-    ]
-    patterns = VoicePatternExtractor().extract_patterns([body])
-    profile = generator.generate_profile(
-        VoiceRegister.ANALYTICAL.value,
-        exemplars,
-        patterns,
+    _write_fragment(
+        vault,
+        _citation_fragment("frag-open", PrivacyTier.OPEN),
+        body=body,
     )
-    lowered = profile.voice_prompt.lower()
-    assert "cite" in lowered or "reference" in lowered or "quote" in lowered
+
+    generator = VoiceProfileGenerator(max_exemplars=5, min_exemplars=1)
+    written = generator.generate_all_profiles(vault)
+
+    rendered = "\n".join(path.read_text(encoding="utf-8") for path in written).lower()
+    assert "cite" in rendered or "reference" in rendered or "quote" in rendered
