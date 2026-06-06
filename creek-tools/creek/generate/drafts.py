@@ -39,7 +39,10 @@ from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
 )
-from creek.generate.ai_style.guard import run_voice_fidelity_guard
+from creek.generate.ai_style.guard import (
+    VOICE_GUARD_STATUS_KEY,
+    run_voice_fidelity_guard,
+)
 from creek.generate.cohesion import run_cohesion_pass
 from creek.generate.compile_routing import (
     CompiledPageIndex,
@@ -2111,6 +2114,23 @@ class DraftGenerator:
 
         return _still_grounded
 
+    @staticmethod
+    def _skipped_voice_guard(
+        body: str,
+        reason: str,
+    ) -> tuple[str, dict[str, object]]:
+        """Report a skipped de-slop pass loudly and stamp its reason.
+
+        Args:
+            body: The unchanged draft body.
+            reason: A ``skipped:*`` :data:`VOICE_GUARD_STATUS_KEY` value.
+
+        Returns:
+            The unchanged *body* and a frontmatter payload carrying the reason.
+        """
+        print(f"voice-fidelity: skipped — {reason}", file=sys.stderr)
+        return body, {VOICE_GUARD_STATUS_KEY: reason}
+
     def _apply_voice_fidelity(
         self,
         body: str,
@@ -2120,16 +2140,21 @@ class DraftGenerator:
     ) -> tuple[str, dict[str, object]]:
         """Run the voice-fidelity guard, returning ``(body, frontmatter)``.
 
-        A no-op (returns *body* unchanged and an empty payload) when the
-        fingerprint or AI-style config is absent or the subsystem is
-        disabled. Otherwise sanitizes, measures, and bounded-rewrites *body*
-        toward the user's voice, prints the guard's summary to stderr, and
-        returns the guarded body plus its frontmatter fields.
+        Never a *silent* no-op: when the subsystem is disabled or the
+        fingerprint is absent / thin, the body is returned unchanged but a
+        loud ``voice_guard_status`` reason is stamped on the frontmatter and
+        echoed to stderr. Otherwise it sanitizes, measures, and bounded-
+        rewrites *body* toward the user's voice and returns the guarded body
+        plus its frontmatter fields (which always carry a status).
         """
         config = self._ai_style_config
         fingerprint = self._fingerprint
-        if config is None or fingerprint is None or not config.enabled:
-            return body, {}
+        if config is None or not config.enabled:
+            return self._skipped_voice_guard(body, "skipped:disabled")
+        if fingerprint is None or fingerprint.fragment_count == 0:
+            return self._skipped_voice_guard(body, "skipped:no_fingerprint")
+        if fingerprint.is_thin(config.min_fingerprint_fragments):
+            return self._skipped_voice_guard(body, "skipped:thin_fingerprint")
         report = run_voice_fidelity_guard(
             body,
             fingerprint=fingerprint,

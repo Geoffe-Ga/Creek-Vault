@@ -16,7 +16,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -898,6 +898,15 @@ class AIStyleConfig(BaseModel):
     1.0 because ``voice_distance`` is always ``< 1.0``; a higher threshold
     would silently disable the check."""
 
+    voice_distance_target: float = Field(default=0.25, ge=0.0, le=1.0)
+    """Target distance the de-slop rewrite loop drives toward — distinct from
+    the accepted-divergence ceiling :attr:`voice_distance_upper`. The loop
+    keeps rewriting while distance exceeds this target (up to
+    :attr:`max_revision_passes`), so a mannered draft below the permissive
+    ceiling is still stripped rather than merely measured. Clamped to
+    ``voice_distance_upper`` when configured above it (the target never exceeds
+    the ceiling), so lowering the ceiling reproduces the pre-target behaviour."""
+
     default_margin: float = Field(default=0.5, ge=0.0)
     """Default divergence margin, in absolute rate units, a feature must
     exceed before it produces a :class:`~creek.generate.ai_style.model.Finding`.
@@ -1006,6 +1015,18 @@ class AIStyleConfig(BaseModel):
             if key == category:
                 return weight
         return 1.0
+
+    @model_validator(mode="after")
+    def _clamp_target_to_ceiling(self) -> "AIStyleConfig":
+        """Keep ``voice_distance_target`` at or below ``voice_distance_upper``.
+
+        Clamping (rather than rejecting) means a config that lowers the ceiling
+        below the default target reproduces the pre-target behaviour — the loop
+        simply drives to the ceiling — instead of raising a validation error.
+        """
+        if self.voice_distance_target > self.voice_distance_upper:
+            self.voice_distance_target = self.voice_distance_upper
+        return self
 
 
 class LintConfig(BaseModel):
