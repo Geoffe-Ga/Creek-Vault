@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
+import pytest
 from typer.testing import CliRunner
 
 from creek.audit import AuditLog
@@ -179,6 +180,46 @@ def test_draft_help_omits_internal_issue_tags() -> None:
     # Internal issue references belong in docstrings/commits, not user --help —
     # guard the whole class (FEAT-040, FEAT-032, …), not just one tag.
     assert "FEAT-" not in plain
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["init", "--help"],
+        ["process", "--help"],
+        ["ingest", "--help"],
+        ["redact", "--help"],
+        ["classify", "--help"],
+        ["link", "--help"],
+        ["compile", "--help"],
+        ["voice-check", "--help"],
+        ["voice-authenticity", "--help"],
+        ["report", "--help"],
+        ["state", "--help"],
+        ["state-budget", "--help"],
+        ["lint", "--help"],
+        ["review", "--help"],
+        ["gdrive", "--help"],
+        ["mine", "--help"],
+        ["draft", "--help"],
+        ["author", "--help"],
+        ["save", "--help"],
+        ["clean", "--help"],
+        ["purge", "--help"],
+        ["skills", "--help"],
+        ["compost", "--help"],
+    ],
+)
+def test_subcommand_help_omits_internal_issue_tags(command: list[str]) -> None:
+    """No subcommand's user-facing --help leaks an internal FEAT-* tag (#445).
+
+    Issue references belong in internal docstrings/commits, not the help a user
+    reads. Typer renders both option ``help=`` strings and the command
+    docstring into --help, so the guard covers every rendered surface.
+    """
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert "FEAT-" not in _plain(result.output)
 
 
 def test_report_help_mentions_include_tier() -> None:
