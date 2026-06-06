@@ -274,6 +274,37 @@ sources:
 
 These are **relative to `source_drive`**. `creek process` walks them in order. Override on the CLI with `--input` for one-off runs.
 
+## `voice_audience_weighting` — graduated voice authority
+
+```yaml
+voice_audience_weighting:
+  enabled: true
+  privacy_tier_authority:
+    open: 1.5          # public-facing work carries the most authority
+    personal: 1.0      # baseline
+    unclassified: 0.75
+    intimate: 0.0      # also excluded from the corpus entirely
+  representativeness_authority:
+    self: 1.0
+    endorsed: 0.9
+    aspirational: 0.6
+    reference: 0.3     # borrowed material keeps near-zero influence
+```
+
+Each voice exemplar's ranking score is multiplied by `privacy_tier_authority[tier] × representativeness_authority[value]`, so an `OPEN` essay outweighs a `PERSONAL` chat turn and dominates the patterns that shape drafts. Setting `enabled: false` makes every authority `1.0` (the pre-weighting ranking). Missing keys default to `1.0`.
+
+## `ai_style` — voice fidelity / de-slop
+
+```yaml
+ai_style:
+  enabled: true
+  voice_distance_upper: 0.35   # accepted-divergence ceiling
+  voice_distance_target: 0.25  # the de-slop rewrite loop drives toward this
+  min_fingerprint_fragments: 5 # below this the fingerprint is "thin"
+```
+
+`voice_distance_target` is the value the post-composition de-slop rewrite loop drives toward; it is distinct from `voice_distance_upper` (the accepted ceiling) and is **clamped** to the ceiling if configured above it. The guard always stamps a `voice_guard_status` on the draft (`rewritten`, `measured_only:*`, or `skipped:*`) — it never silently passes a mannered draft through. See [generation](./generation.md#voice-fidelity-feat-040).
+
 ## Environment variables
 
 Every leaf field can be overridden by a `CREEK_…` env-var. Nested keys use double underscores:

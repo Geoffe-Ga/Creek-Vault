@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.ingest.base import generate_fragment_id
 from creek.ingest.documents import (
     _extract_docx_metadata,
     _extract_pdf_metadata,
@@ -46,7 +47,9 @@ from creek.ingest.images import _extract_exif_authored_at
 from creek.ingest.markdown import _extract_authored_at_from_frontmatter
 from creek.ingest.presentations import _extract_pptx_authored_at
 from creek.ingest.spreadsheets import _extract_xlsx_authored_at
+from creek.models import Authorship, Fragment
 from creek.vault.reader import try_load_fragment
+from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -280,3 +283,182 @@ def _rewrite_frontmatter(md_file: Path, metadata: dict[str, object]) -> None:
     post = frontmatter.load(str(md_file))
     post.metadata = metadata
     md_file.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+
+# --- Migration: re-split pre-split merged AI-chat fragments -----------------
+#
+# Before per-turn attribution landed, a Claude/ChatGPT conversation turn was
+# ingested as ONE ``source.author=self`` fragment fusing the human turn and the
+# AI turn, so the AI's prose leaked into the voice corpus. This migration
+# re-splits each such merged fragment back into two attributed fragments — the
+# human turn (``self``) and the AI turn (``ai`` / ``voice_weight=0.0``) — by
+# parsing the stored body. It is opt-in (``creek ingest --refresh-ai-chat``)
+# and idempotent: a freshly-split vault has no merged fragments left to touch.
+
+_AI_CHAT_PLATFORMS: frozenset[str] = frozenset({"claude", "chatgpt"})
+
+
+@dataclass
+class ResplitResult:
+    """Summary of a :func:`resplit_merged_ai_chat` run.
+
+    Attributes:
+        scanned: Fragment files inspected.
+        resplit: Merged AI-chat fragments split into a human + AI pair.
+        skipped: Fragments that were not merged AI-chat content (already
+            split, native sources, or AI-authored turns).
+        errors: Human-readable per-fragment failure messages.
+    """
+
+    scanned: int = 0
+    resplit: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+def _parse_claude_merged(body: str) -> tuple[str, str] | None:
+    """Split a merged Claude body into ``(human, assistant)`` or ``None``.
+
+    The pre-split Claude body blockquotes the human turn (``> ...``) and
+    follows it with the assistant's plain prose. A body with no blockquote
+    *or* no plain prose is not a merged turn (e.g. an already-split human
+    fragment is entirely blockquoted), so this returns ``None``.
+    """
+    quoted = [line[1:].lstrip() for line in body.split("\n") if line.startswith(">")]
+    plain = [
+        line for line in body.split("\n") if not line.startswith(">") and line.strip()
+    ]
+    human = "\n".join(quoted).strip()
+    assistant = "\n".join(plain).strip()
+    if not human or not assistant:
+        return None
+    return human, assistant
+
+
+def _parse_chatgpt_merged(body: str) -> tuple[str, str] | None:
+    """Split a merged ChatGPT body into ``(human, assistant)`` or ``None``.
+
+    The pre-split ChatGPT body carries a ``# Title`` heading and a blockquoted
+    ``**User**: …`` / ``**Assistant**: …`` pair. A body lacking both markers is
+    not a merged turn and returns ``None``.
+    """
+    cleaned: list[str] = []
+    for line in body.split("\n"):
+        if line.startswith(">"):
+            cleaned.append(line[1:].lstrip())
+        elif not line.startswith("# "):
+            cleaned.append(line)
+    text = "\n".join(cleaned)
+    if "**User**:" not in text or "**Assistant**:" not in text:
+        return None
+    user_part, _, assistant_part = text.partition("**Assistant**:")
+    human = user_part.replace("**User**:", "").strip()
+    assistant = assistant_part.strip()
+    if not human or not assistant:
+        return None
+    return human, assistant
+
+
+def _split_turns(platform: str, body: str) -> tuple[str, str] | None:
+    """Dispatch to the platform's merged-body parser."""
+    if platform == "claude":
+        return _parse_claude_merged(body)
+    return _parse_chatgpt_merged(body)
+
+
+def _build_split_fragment(
+    merged: Fragment,
+    text: str,
+    *,
+    is_ai: bool,
+) -> tuple[Fragment, str]:
+    """Build one attributed per-turn fragment + body from a merged fragment.
+
+    Args:
+        merged: The original merged fragment (source of provenance).
+        text: The turn's text (human or assistant).
+        is_ai: Whether this is the AI turn (``author=ai``, zero voice weight).
+
+    Returns:
+        ``(fragment, body)`` ready for :meth:`VaultWriter.write_fragment`. The
+        human body is blockquoted and the AI body is plain, matching the
+        per-turn ingest format.
+    """
+    author = Authorship.AI if is_ai else Authorship.SELF
+    source = merged.source.model_copy(update={"author": author})
+    new_id = generate_fragment_id(
+        source.original_file or merged.id, merged.created, text
+    )
+    fragment = merged.model_copy(
+        update={
+            "id": new_id,
+            "source": source,
+            "title": f"{merged.title} (AI)" if is_ai else merged.title,
+            "voice_weight": 0.0 if is_ai else 1.0,
+        },
+    )
+    body = text if is_ai else "\n".join(f"> {line}" for line in text.split("\n"))
+    return fragment, body
+
+
+def resplit_merged_ai_chat(vault_path: Path) -> ResplitResult:
+    """Re-split merged AI-chat fragments into per-turn attributed fragments.
+
+    Walks ``vault_path/01-Fragments/``; for every Claude/ChatGPT
+    ``source.author=self`` fragment whose body still fuses a human and an AI
+    turn, writes a human fragment (``self``, full weight) and an AI fragment
+    (``ai``, ``voice_weight=0.0``), then removes the merged file.
+
+    Idempotent: an already-split vault has no merged fragments, so a second
+    run is a no-op; a vault with no AI-chat content is unchanged.
+
+    Args:
+        vault_path: Vault root (the directory containing ``01-Fragments/``).
+
+    Returns:
+        A :class:`ResplitResult` summarising what changed.
+    """
+    result = ResplitResult()
+    fragments_root = vault_path / "01-Fragments"
+    if not fragments_root.exists():
+        return result
+
+    writer = VaultWriter(vault_path)
+    for md_file in sorted(fragments_root.rglob("*.md")):
+        result.scanned += 1
+        try:
+            _resplit_fragment(md_file, writer, result)
+        except Exception as exc:  # per-fragment isolation
+            logger.exception("Re-split failed for %s", md_file)
+            result.errors.append(f"{md_file}: {exc}")
+    return result
+
+
+def _resplit_fragment(
+    md_file: Path,
+    writer: VaultWriter,
+    result: ResplitResult,
+) -> None:
+    """Re-split one fragment file if it is a merged AI-chat turn."""
+    record = try_load_fragment(md_file)
+    if record is None:
+        result.scanned -= 1
+        return
+    fragment, body, _raw = record
+    platform = str(fragment.source.platform)
+    if platform not in _AI_CHAT_PLATFORMS or str(fragment.source.author) != "self":
+        result.skipped += 1
+        return
+    turns = _split_turns(platform, body)
+    if turns is None:
+        result.skipped += 1
+        return
+    human_text, ai_text = turns
+    human_fragment, human_body = _build_split_fragment(
+        fragment, human_text, is_ai=False
+    )
+    ai_fragment, ai_body = _build_split_fragment(fragment, ai_text, is_ai=True)
+    writer.write_fragment(human_fragment, human_body)
+    writer.write_fragment(ai_fragment, ai_body)
+    md_file.unlink()
+    result.resplit += 1
