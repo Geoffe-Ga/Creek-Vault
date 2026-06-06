@@ -1080,13 +1080,13 @@ def _default_representativeness_authority() -> dict[str, float]:
 
 
 class VoiceAudienceWeightingConfig(BaseModel):
-    """Graduated audience-authority weighting for the voice proxy (issue #554).
+    """Graduated audience-authority weighting for the voice proxy.
 
     Replaces the historical binary privacy gate with a multiplier so that
     public-facing fragments dominate how drafts sound. The multiplier is the
     product of a per-``privacy_tier`` and a per-``representativeness`` factor;
     it is applied on top of (not in place of) the ``voice_weight`` gate.
-    Disabling it makes every authority ``1.0`` — i.e. the pre-#554 ranking.
+    Disabling it makes every authority ``1.0`` — i.e. the pre-weighting ranking.
     """
 
     enabled: bool = True
@@ -1176,7 +1176,7 @@ class CreekConfig(BaseSettings):
     voice_audience_weighting: VoiceAudienceWeightingConfig = Field(
         default_factory=VoiceAudienceWeightingConfig,
     )
-    """Graduated audience-authority weighting for the voice proxy (issue #554)."""
+    """Graduated audience-authority weighting for the voice proxy."""
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""

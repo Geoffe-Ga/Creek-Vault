@@ -163,7 +163,7 @@ def audience_authority(
     Args:
         fragment: The candidate exemplar fragment.
         weighting: The audience-weighting configuration. When disabled every
-            fragment returns ``1.0`` (the pre-#554 uniform ranking).
+            fragment returns ``1.0`` (the pre-weighting uniform ranking).
 
     Returns:
         A non-negative multiplier; ``0.0`` for tiers with no authority
