@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.config import VoiceAudienceWeightingConfig
 from creek.generate.ai_style.guard import VOICE_DISTANCE_KEY, VOICE_FINDINGS_KEY
 from creek.models import Authorship, Fragment, PrivacyTier, SourcePlatform
 from creek.vault.reader import iter_vault_fragments
@@ -62,8 +63,7 @@ class AudienceMix:
             ``intimate`` is always ``0`` because INTIMATE fragments are not
             voice-eligible; it is reported for transparency.
         weighting_active: Whether graduated audience-authority weighting is
-            applied during voice selection. Stub ``False`` until audience
-            weighting lands.
+            applied during voice selection.
     """
 
     by_tier: dict[str, int]
@@ -205,13 +205,17 @@ def _probe_audience_mix(eligible: list[Fragment]) -> AudienceMix:
         eligible: The voice-eligible fragments.
 
     Returns:
-        The audience-mix sub-score (``weighting_active`` stubbed ``False``).
+        The audience-mix sub-score. ``weighting_active`` reflects whether the
+        voice pipeline applies graduated audience-authority weighting.
     """
     by_tier = {tier.value: 0 for tier in PrivacyTier}
     for fragment in eligible:
         tier = str(fragment.privacy_tier)
         by_tier[tier] = by_tier.get(tier, 0) + 1
-    return AudienceMix(by_tier=by_tier, weighting_active=False)
+    return AudienceMix(
+        by_tier=by_tier,
+        weighting_active=VoiceAudienceWeightingConfig().enabled,
+    )
 
 
 def _conversation_key(fragment: Fragment) -> tuple[str, str | None, str | None] | None:

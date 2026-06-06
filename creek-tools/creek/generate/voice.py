@@ -39,6 +39,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.config import VoiceAudienceWeightingConfig
 from creek.models import (
     Confidence,
     Fragment,
@@ -145,6 +146,38 @@ def _is_fully_classified(fragment: Fragment) -> bool:
 def _word_count(body: str) -> int:
     """Return the whitespace-delimited token count of *body*."""
     return len(body.split())
+
+
+def audience_authority(
+    fragment: Fragment,
+    weighting: VoiceAudienceWeightingConfig,
+) -> float:
+    """Return the audience-authority multiplier for *fragment*.
+
+    Combines a per-``privacy_tier`` factor (public-facing work outranks
+    private writing) with a per-``representativeness`` factor (the owner's own
+    and endorsed material outranks aspirational and borrowed material). The
+    result multiplies a fragment's ranking score so higher-authority fragments
+    win ties and dominate the exemplars that feed each voice profile.
+
+    Args:
+        fragment: The candidate exemplar fragment.
+        weighting: The audience-weighting configuration. When disabled every
+            fragment returns ``1.0`` (the pre-weighting uniform ranking).
+
+    Returns:
+        A non-negative multiplier; ``0.0`` for tiers with no authority
+        (e.g. ``intimate``). Unknown tier / representativeness values fall
+        back to ``1.0`` so a new enum member never silently zeroes a fragment.
+    """
+    if not weighting.enabled:
+        return 1.0
+    privacy = weighting.privacy_tier_authority.get(str(fragment.privacy_tier), 1.0)
+    representativeness = weighting.representativeness_authority.get(
+        str(fragment.representativeness),
+        1.0,
+    )
+    return privacy * representativeness
 
 
 def _is_other_authors_path(md_file: Path) -> bool:
@@ -321,6 +354,7 @@ class VoiceExemplarCollector:
         max_per_register: int = DEFAULT_MAX_PER_REGISTER,
         min_per_register: int = DEFAULT_MIN_PER_REGISTER,
         allow_intimate: bool = False,
+        audience_weighting: VoiceAudienceWeightingConfig | None = None,
     ) -> None:
         """Initialise the collector.
 
@@ -331,6 +365,11 @@ class VoiceExemplarCollector:
                 warning is emitted. Must be at least 1.
             allow_intimate: Whether to include ``intimate`` privacy tier
                 fragments. Defaults to ``False``.
+            audience_weighting: Graduated audience-authority multipliers
+                applied during ranking. Defaults to the standard weighting,
+                which keeps a uniform-audience vault's relative ranking
+                unchanged while letting public-facing work dominate a
+                mixed-audience one.
 
         Raises:
             ValueError: If ``max_per_register`` or ``min_per_register``
@@ -352,6 +391,7 @@ class VoiceExemplarCollector:
         self.max_per_register = max_per_register
         self.min_per_register = min_per_register
         self.allow_intimate = allow_intimate
+        self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._records: dict[str, _ExemplarRecord] = {}
 
     # ---- Collection ----
@@ -426,7 +466,7 @@ class VoiceExemplarCollector:
     def rank_exemplars(self, fragments: list[Fragment]) -> list[Fragment]:
         """Rank *fragments* by quality and return the top ``max_per_register``.
 
-        Scoring (max 5 per fragment):
+        Quality base (max 5 per fragment):
 
         - ``conviction`` confidence: 3 points; ``settled``: 2 points.
         - Body length in ``[200, 800]`` words: +1 point (uses the cached
@@ -435,7 +475,10 @@ class VoiceExemplarCollector:
         - All classification axes populated (frequency, wavelength
           phase / mode, voice register, voice confidence): +1 point.
 
-        Ties are broken by ascending ID for deterministic ordering.
+        The base is then multiplied by :func:`audience_authority`, so a
+        public-facing (``OPEN``) fragment outranks an otherwise-equal
+        ``PERSONAL`` one. Ties are broken by ascending ID for deterministic
+        ordering.
 
         Args:
             fragments: Fragments to rank. May be empty.
@@ -452,8 +495,13 @@ class VoiceExemplarCollector:
         )
         return scored[: self.max_per_register]
 
-    def _score(self, fragment: Fragment) -> int:
-        """Return the integer ranking score for *fragment*."""
+    def _score(self, fragment: Fragment) -> float:
+        """Return the audience-weighted ranking score for *fragment*.
+
+        The quality base (confidence + length + classification bonuses) is
+        multiplied by :func:`audience_authority`, so public-facing,
+        self-representative fragments win ties and outrank private ones.
+        """
         score = _CONFIDENCE_SCORE.get(_confidence_value(fragment), 0)
         record = self._records.get(fragment.id)
         if record is not None and (
@@ -462,7 +510,7 @@ class VoiceExemplarCollector:
             score += _LENGTH_BONUS
         if _is_fully_classified(fragment):
             score += _CLASSIFICATION_BONUS
-        return score
+        return score * audience_authority(fragment, self._audience_weighting)
 
     # ---- Persistence ----
 
@@ -1334,14 +1382,18 @@ class Exemplar:
     body: str
 
 
-def _exemplar_score(exemplar: Exemplar) -> int:
-    """Return the ranking score for *exemplar*.
+def _exemplar_score(
+    exemplar: Exemplar,
+    weighting: VoiceAudienceWeightingConfig,
+) -> float:
+    """Return the audience-weighted ranking score for *exemplar*.
 
     Mirrors :meth:`VoiceExemplarCollector._score` but reads word count
     from the exemplar's body rather than a cached record: confidence
     base (3 for conviction, 2 for settled), +1 bonus for a body in the
     medium-length band [200, 800] words, and +1 bonus when every
-    classification axis is populated.
+    classification axis is populated. The base is then multiplied by
+    :func:`audience_authority` so public-facing exemplars dominate.
     """
     fragment = exemplar.fragment
     score = _CONFIDENCE_SCORE.get(_confidence_value(fragment), 0)
@@ -1350,7 +1402,7 @@ def _exemplar_score(exemplar: Exemplar) -> int:
         score += _LENGTH_BONUS
     if _is_fully_classified(fragment):
         score += _CLASSIFICATION_BONUS
-    return score
+    return score * audience_authority(fragment, weighting)
 
 
 @dataclass(frozen=True)
@@ -1476,6 +1528,7 @@ class VoiceProfileGenerator:
         min_exemplars: int = _DEFAULT_MIN_EXEMPLARS_PER_PROFILE,
         collector: VoiceExemplarCollector | None = None,
         extractor: VoicePatternExtractor | None = None,
+        audience_weighting: VoiceAudienceWeightingConfig | None = None,
     ) -> None:
         """Initialise the generator.
 
@@ -1506,9 +1559,11 @@ class VoiceProfileGenerator:
             raise ValueError(msg)
         self.max_exemplars = max_exemplars
         self.min_exemplars = min_exemplars
+        self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._collector = collector or VoiceExemplarCollector(
             max_per_register=max_exemplars,
             min_per_register=min_exemplars,
+            audience_weighting=self._audience_weighting,
         )
         self._extractor = extractor or VoicePatternExtractor()
 
@@ -1736,7 +1791,10 @@ class VoiceProfileGenerator:
         """
         scored = sorted(
             exemplars,
-            key=lambda e: (-_exemplar_score(e), e.fragment.id),
+            key=lambda e: (
+                -_exemplar_score(e, self._audience_weighting),
+                e.fragment.id,
+            ),
         )
         return scored[: self.max_exemplars]
 

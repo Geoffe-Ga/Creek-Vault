@@ -142,8 +142,8 @@ def test_audience_mix_buckets_eligible_by_tier(tmp_path: Path) -> None:
     assert mix.by_tier["personal"] == 2
     assert mix.by_tier["unclassified"] == 1
     assert mix.by_tier["intimate"] == 0
-    # Weighting is OFF until Issue #554 lands.
-    assert mix.weighting_active is False
+    # Graduated audience-authority weighting is active in the voice pipeline.
+    assert mix.weighting_active is True
 
 
 def test_ai_corpus_leak_counts_chat_platforms(tmp_path: Path) -> None:
@@ -231,7 +231,7 @@ def test_to_json_is_stable_and_parseable(tmp_path: Path) -> None:
     payload = json.loads(report.to_json())
 
     assert payload["eligible_total"] == 5
-    assert payload["audience_mix"]["weighting_active"] is False
+    assert payload["audience_mix"]["weighting_active"] is True
     assert payload["audience_mix"]["by_tier"]["open"] == 2
     assert payload["audience_mix"]["total"] == 5
     assert payload["ai_corpus_leak"]["leaked"] == 2
