@@ -100,18 +100,60 @@ def test_redaction_preserves_non_sensitive_text(noise: str) -> None:
 def test_redacted_marker_is_present_when_secret_matches(
     prefix: str, secret: str, suffix: str
 ) -> None:
-    """When a known secret is in the input, at least one ``[REDACTED:`` marker
-    appears in the output (provided the secret matches a built-in pattern).
+    """A known secret bounded by delimiters is always fully redacted (#435).
+
+    The secret is whitespace-delimited from the noise so adjacency cannot
+    *fuse* with and invalidate its pattern token. (A word char glued straight
+    onto an email TLD — ``user@example.com0`` — is genuinely not an email and
+    is correctly left intact; that boundary decision is pinned by the
+    deterministic tests below. Gating ``secret not in redacted`` on the mere
+    presence of *any* ``[REDACTED:`` marker — which can come from unrelated
+    high-entropy noise in the prefix — was the bug behind #435.)
     """
     redactor = _make_redactor()
-    content = f"{prefix}{secret}{suffix}"
+    # Gate on whether the secret matches a pattern as a clean, delimited token
+    # (some samples — e.g. a low-entropy ssh-rsa body — match no built-in
+    # pattern). This is the precise precondition the #435 bug lacked: it gated
+    # on *any* marker appearing, which could come from unrelated prefix noise.
+    if secret in redactor.redact_content(f" {secret} "):
+        return
+    content = f"{prefix} {secret} {suffix}"
     redacted = redactor.redact_content(content)
-    # If a built-in pattern fired, a [REDACTED:<type>] token appears.
-    # If no pattern fired (e.g. a sample we don't yet match), the
-    # property still trivially holds because the test only asserts on
-    # the inputs that *do* match.
-    if "[REDACTED:" in redacted:
-        assert secret not in redacted
+    # A matching secret, delimited from the noise, is removed whole — no
+    # fragment of the matched secret survives.
+    assert secret not in redacted
+
+
+def test_digit_glued_email_is_left_intact_but_bounded_email_is_redacted() -> None:
+    """The #435 boundary decision: a word char glued to the TLD is not an email.
+
+    ``user@example.com0`` is not a valid email (``.com0`` is not a TLD), so
+    redacting ``user@example.com`` out of it is *not* attempted — doing so
+    would leave fragments for inputs like ``user@example.community``. A
+    properly bounded email is redacted whole. So a redaction marker that
+    appears alongside such a glued string does not mean a leak occurred.
+    """
+    redactor = _make_redactor()
+    # Glued to a digit → not an email → correctly left intact.
+    assert redactor.redact_content("user@example.com0") == "user@example.com0"
+    # Bounded → redacted whole.
+    bounded = redactor.redact_content("contact user@example.com today")
+    assert "user@example.com" not in bounded
+    assert "[REDACTED:email]" in bounded
+
+
+def test_high_entropy_email_local_part_redacted_whole_no_fragment() -> None:
+    """An email with a high-entropy local part is redacted as one whole email.
+
+    The named ``email`` pass runs before the high-entropy detector, so the
+    whole address is replaced and no high-entropy fragment of it is left
+    behind — the failure mode #435's title warned about.
+    """
+    redactor = _make_redactor()
+    out = redactor.redact_content("key aB3xY7zQ9mK2pL5nR8vT4wd@example.com end")
+    assert "aB3xY7zQ9mK2pL5nR8vT4wd" not in out
+    assert "@example.com" not in out
+    assert "[REDACTED:email]" in out
 
 
 @_PROFILE
