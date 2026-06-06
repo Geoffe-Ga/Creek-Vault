@@ -203,16 +203,18 @@ def test_under_ceiling_skips_rewrite() -> None:
 
 
 def test_summary_line_wording() -> None:
-    """The stderr summary matches the documented contract wording."""
+    """The stderr summary names the status and the measured distance."""
     report = VoiceFidelityReport(
         body="x",
         voice_distance=0.22,
         findings=(),
         thin_fingerprint=False,
         passes=1,
+        status="rewritten",
     )
     assert report.summary_line() == (
-        "voice-fidelity: distance 0.22 (0 residual divergences) — see frontmatter"
+        "voice-fidelity: rewritten — distance 0.22 "
+        "(0 residual divergences) — see frontmatter"
     )
 
 

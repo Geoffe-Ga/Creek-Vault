@@ -59,6 +59,16 @@ VOICE_DISTANCE_KEY = "voice_distance"
 VOICE_FINDINGS_KEY = "voice_findings"
 """Frontmatter key for the residual per-finding list."""
 
+VOICE_GUARD_STATUS_KEY = "voice_guard_status"
+"""Frontmatter key for the machine-readable guard outcome.
+
+Always present once the guard (or its draft-path caller) has run, so a draft
+never carries silently-unchanged prose without a recorded reason. Values:
+``skipped:disabled`` / ``skipped:no_fingerprint`` / ``skipped:thin_fingerprint``
+(the draft-path skip reasons), ``measured_only:no_llm`` /
+``measured_only:no_rewriter`` / ``measured_only:below_target`` /
+``measured_only:above_target`` (ran but did not rewrite), and ``rewritten``."""
+
 
 class VoiceFindingEntry(TypedDict):
     """Frontmatter shape for one residual voice-fidelity finding.
@@ -101,6 +111,8 @@ class VoiceFidelityReport:
             configured minimum and the distance was softened accordingly.
         passes: How many rewrite passes were actually attempted (``0`` when
             the draft was already within bounds, ``no_llm``, or disabled).
+        status: The machine-readable guard outcome stamped on the draft
+            (see :data:`VOICE_GUARD_STATUS_KEY`) — never silently empty.
     """
 
     body: str
@@ -108,6 +120,7 @@ class VoiceFidelityReport:
     findings: tuple[Finding, ...]
     thin_fingerprint: bool
     passes: int
+    status: str
 
     def summary_line(self) -> str:
         """Return the stderr one-liner ``creek draft`` prints after composing.
@@ -118,8 +131,8 @@ class VoiceFidelityReport:
         count = len(self.findings)
         noun = "divergence" if count == 1 else "divergences"
         return (
-            f"voice-fidelity: distance {self.voice_distance:.2f} "
-            f"({count} residual {noun}) — see frontmatter"
+            f"voice-fidelity: {self.status} — distance "
+            f"{self.voice_distance:.2f} ({count} residual {noun}) — see frontmatter"
         )
 
     def to_frontmatter(self) -> dict[str, object]:
@@ -127,6 +140,7 @@ class VoiceFidelityReport:
         return build_voice_fidelity_frontmatter(
             voice_distance=self.voice_distance,
             findings=self.findings,
+            status=self.status,
         )
 
 
@@ -150,17 +164,22 @@ def build_voice_fidelity_frontmatter(
     *,
     voice_distance: float | None,
     findings: Sequence[Finding],
+    status: str | None = None,
 ) -> dict[str, object]:
     """Build the partial frontmatter payload for voice-fidelity fields.
 
     Single source of truth for how the guard's fields appear on disk.
     ``None`` distance and an empty findings sequence are skipped so a draft
-    saved without the guard never grows misleading zero-value fields.
+    saved without the guard never grows misleading zero-value fields. The
+    *status*, when given, is always recorded — a guarded draft never lacks a
+    machine-readable outcome.
 
     Args:
         voice_distance: The final scalar distance, or ``None`` when the guard
             did not run.
         findings: The residual findings (empty sequence when none).
+        status: The machine-readable guard outcome (see
+            :data:`VOICE_GUARD_STATUS_KEY`), or ``None`` to omit.
 
     Returns:
         A dict carrying only the populated keys, for the caller to merge.
@@ -170,6 +189,8 @@ def build_voice_fidelity_frontmatter(
         payload[VOICE_DISTANCE_KEY] = round(voice_distance, 4)
     if findings:
         payload[VOICE_FINDINGS_KEY] = [_finding_entry(f) for f in findings]
+    if status is not None:
+        payload[VOICE_GUARD_STATUS_KEY] = status
     return payload
 
 
@@ -238,7 +259,7 @@ def _revise_toward_voice(
     """
     passes = 0
     while (
-        best.report.voice_distance > config.voice_distance_upper
+        best.report.voice_distance > config.voice_distance_target
         and passes < config.max_revision_passes
     ):
         passes += 1
@@ -255,6 +276,38 @@ def _revise_toward_voice(
             break
         best = _Candidate(candidate_body, candidate_report)
     return best, passes
+
+
+def _guard_status(
+    *,
+    passes: int,
+    no_llm: bool,
+    has_llm: bool,
+    distance: float,
+    target: float,
+) -> str:
+    """Return the machine-readable guard outcome for a draft that was scanned.
+
+    Args:
+        passes: Rewrite passes actually applied.
+        no_llm: Whether the rewrite hop was suppressed (``--no-llm``).
+        has_llm: Whether a rewrite LLM was supplied.
+        distance: The final measured voice distance.
+        target: The de-slop target the rewrite loop drives toward.
+
+    Returns:
+        ``rewritten`` when a pass was applied, otherwise a ``measured_only:*``
+        reason explaining why no rewrite occurred.
+    """
+    if passes > 0:
+        return "rewritten"
+    if no_llm:
+        return "measured_only:no_llm"
+    if not has_llm:
+        return "measured_only:no_rewriter"
+    if distance <= target:
+        return "measured_only:below_target"
+    return "measured_only:above_target"
 
 
 def run_voice_fidelity_guard(
@@ -292,6 +345,7 @@ def run_voice_fidelity_guard(
             findings=(),
             thin_fingerprint=False,
             passes=0,
+            status="skipped:disabled",
         )
     sanitized = sanitize(body, fingerprint=fingerprint, config=config)
     report = scan(sanitized, fingerprint=fingerprint, config=config, context=context)
@@ -313,4 +367,11 @@ def run_voice_fidelity_guard(
         findings=tuple(best.report.findings),
         thin_fingerprint=best.report.thin_fingerprint,
         passes=passes,
+        status=_guard_status(
+            passes=passes,
+            no_llm=no_llm,
+            has_llm=llm is not None,
+            distance=best.report.voice_distance,
+            target=config.voice_distance_target,
+        ),
     )

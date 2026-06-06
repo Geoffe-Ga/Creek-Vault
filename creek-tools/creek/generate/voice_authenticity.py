@@ -38,7 +38,11 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.config import VoiceAudienceWeightingConfig
-from creek.generate.ai_style.guard import VOICE_DISTANCE_KEY, VOICE_FINDINGS_KEY
+from creek.generate.ai_style.guard import (
+    VOICE_DISTANCE_KEY,
+    VOICE_FINDINGS_KEY,
+    VOICE_GUARD_STATUS_KEY,
+)
 from creek.models import Authorship, Fragment, PrivacyTier, SourcePlatform
 from creek.vault.reader import iter_vault_fragments
 
@@ -283,22 +287,25 @@ def _probe_deslop(draft_path: Path) -> DeslopStatus:
     """
     post = frontmatter.load(str(draft_path))
     raw_distance = post.metadata.get(VOICE_DISTANCE_KEY)
+    guard_status = post.metadata.get(VOICE_GUARD_STATUS_KEY)
     findings = post.metadata.get(VOICE_FINDINGS_KEY, [])
     residual = len(findings) if isinstance(findings, list) else 0
-    if not isinstance(raw_distance, (int, float)):
-        return DeslopStatus(
-            draft=str(draft_path),
-            attested=False,
-            voice_distance=None,
-            residual_findings=residual,
-            status="no voice-fidelity attestation in draft frontmatter",
-        )
+    distance = float(raw_distance) if isinstance(raw_distance, (int, float)) else None
+    # The guard attests by stamping a status (even on a loud skip) and/or a
+    # measured distance; either one means the de-slop pass ran on this draft.
+    attested = isinstance(guard_status, str) or distance is not None
+    if not attested:
+        status = "no voice-fidelity attestation in draft frontmatter"
+    elif isinstance(guard_status, str):
+        status = guard_status
+    else:
+        status = "attested (no guard status recorded)"
     return DeslopStatus(
         draft=str(draft_path),
-        attested=True,
-        voice_distance=float(raw_distance),
+        attested=attested,
+        voice_distance=distance,
         residual_findings=residual,
-        status="attested (rewritten-vs-measured detection not yet recorded)",
+        status=status,
     )
 
 
