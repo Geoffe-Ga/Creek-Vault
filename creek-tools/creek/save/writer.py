@@ -18,6 +18,7 @@ behaviour consistent.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -162,14 +163,14 @@ def _shape_for_target(request: SaveRequest) -> dict[str, Any]:
     if request.target == SaveTarget.PRAXIS:
         return Praxis(title=title).model_dump(mode="json")
     if request.target == SaveTarget.AI_AS_USER:
-        return _shape_ai_as_user_fragment(title)
+        return _shape_ai_as_user_fragment(title, request.body)
     return {
         "title": title,
         "tags": [request.target.value],
     }
 
 
-def _shape_ai_as_user_fragment(title: str) -> dict[str, Any]:
+def _shape_ai_as_user_fragment(title: str, body: str) -> dict[str, Any]:
     """Shape kept AI output as an AI-attributed, voice-neutral fragment.
 
     The note is a real :class:`~creek.models.Fragment` (round-trippable through
@@ -178,10 +179,17 @@ def _shape_ai_as_user_fragment(title: str) -> dict[str, Any]:
     folder, ``voice_weight=0.0`` so it never colours the owner's generated
     voice, and ``representativeness=endorsed`` because the owner kept it on
     purpose.
+
+    The fragment ``id`` appends a short content digest to the title slug so two
+    kept outputs that share a title get distinct ids (the filename is already
+    de-duplicated by the writer's atomic collision-retry; this keeps the
+    in-frontmatter id unique too). Identical content under the same title yields
+    the same id — a harmless idempotent re-save.
     """
     slug = slugify_filename(title, max_length=_MAX_FILENAME_LENGTH) or "untitled"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
     return Fragment(
-        id=f"{SaveTarget.AI_AS_USER.value}-{slug}",
+        id=f"{SaveTarget.AI_AS_USER.value}-{slug}-{digest}",
         title=title,
         source=FragmentSource(
             platform=SourcePlatform.CLAUDE,
