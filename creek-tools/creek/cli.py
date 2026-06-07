@@ -98,7 +98,7 @@ skills_app = typer.Typer(
 )
 compost_app = typer.Typer(
     name="compost",
-    help="Compost detection utilities (FEAT-018: embedding gate + verifier).",
+    help="Compost detection utilities (embedding gate + verifier).",
 )
 app.add_typer(clean_app, name="clean")
 app.add_typer(purge_app, name="purge")
@@ -403,11 +403,11 @@ def init(
         help=(
             "Allow scaffolding inside a git repository. Off by default "
             "to protect against accidental version-control of personal "
-            "vault data (FEAT-019)."
+            "vault data."
         ),
     ),
 ) -> None:
-    """Scaffold a Creek vault at ``--vault <path>`` (FEAT-019 / ARCH-002).
+    """Scaffold a Creek vault at ``--vault <path>``.
 
     Materialises the canonical folder topology, copies the ontology
     spec, AGENTS.md, and the schema-skill tree into the user-chosen
@@ -555,7 +555,7 @@ def ingest(
         False,
         "--refresh-dates",
         help=(
-            "FEAT-031 backfill: re-extract authored_at on existing fragments "
+            "Backfill: re-extract authored_at on existing fragments "
             "without re-ingesting body content. Idempotent."
         ),
     ),
@@ -579,7 +579,7 @@ def ingest(
     input is idempotent: deterministic fragment IDs ensure existing
     files are recognised and skipped.
 
-    ``--refresh-dates`` is a one-shot FEAT-031 backfill: it walks
+    ``--refresh-dates`` is a one-shot backfill: it walks
     ``--vault`` (or the configured vault), re-runs the per-format
     authored-date extraction chain against each fragment's source
     file, and rewrites the frontmatter in place. ``--type`` /
@@ -871,7 +871,7 @@ def classify(
         "--calibrate",
         help=(
             "Run the LLM classifier against the calibration fixture and "
-            "print per-dimension agreement (FEAT-017b). Skips the vault "
+            "print per-dimension agreement. Skips the vault "
             "run, but still requires a valid creek_config.yaml because "
             "the LLM provider settings come from `llm:` there."
         ),
@@ -889,7 +889,7 @@ def classify(
         "--enforce-floors",
         help=(
             "Exit non-zero if any per-dimension agreement falls below the "
-            "documented FEAT-017 floor. Use in CI runs that should fail "
+            "documented floor. Use in CI runs that should fail "
             "loud on a regressed prompt or example set."
         ),
     ),
@@ -897,7 +897,7 @@ def classify(
         False,
         "--reatomize",
         help=(
-            "Enable FEAT-023 confidence-driven re-atomization for this run "
+            "Enable confidence-driven re-atomization for this run "
             "regardless of the YAML default. Below-threshold or unclassified "
             "fragments are re-atomized (split or aggregated) and re-classified "
             "until a leaf clears the threshold or a terminal level is reached."
@@ -907,7 +907,7 @@ def classify(
         "auto",
         "--reatomize-direction",
         help=(
-            "Override the FEAT-023 direction heuristic. 'auto' routes by "
+            "Override the direction heuristic. 'auto' routes by "
             "source/level; 'split' forces zoom-in; 'aggregate' forces zoom-out."
         ),
     ),
@@ -921,7 +921,7 @@ def classify(
     ``classification.method: manual`` are preserved unless ``--force``
     is supplied.
 
-    ``--calibrate`` flips this into FEAT-017b mode: instead of touching
+    ``--calibrate`` flips this into calibration mode: instead of touching
     the vault, the classifier runs against the calibration fixture and
     prints per-dimension agreement. Pair with ``--enforce-floors`` in
     CI to fail the build when a dimension regresses below the
@@ -1214,7 +1214,7 @@ def compile_(
         help="Human-readable title for the compiled page",
     ),
 ) -> None:
-    """Roll a fragment up into a compiled-layer page (FEAT-003).
+    """Roll a fragment up into a compiled-layer page.
 
     Reads the source fragment from ``<vault>/01-Fragments``, calls the
     configured LLM to synthesise claims with per-claim provenance back
@@ -1642,7 +1642,7 @@ def report(
 def state(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Render ``00-Creek-Meta/State/<iso-week>.md`` audit report (FEAT-006).
+    """Render ``00-Creek-Meta/State/<iso-week>.md`` audit report.
 
     The command is a *view* over the compiled vault layer — it never
     re-runs classification, linking, or compile. It reads existing
@@ -1664,7 +1664,7 @@ def state(
 def state_budget(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Verify ``00-Creek-Meta/State/latest.md`` is within its size budget (FEAT-007).
+    """Verify ``00-Creek-Meta/State/latest.md`` is within its size budget.
 
     The audit report is the session-start context for CrawDad and Claude
     Code — it must fit in a single context window. This command checks
@@ -1702,14 +1702,14 @@ def lint(
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Run unified vault hygiene checks (FEAT-008).
+    """Run unified vault hygiene checks.
 
     Default behaviour runs all deterministic checks. Pass ``--since`` to
     also run the semantic checks (paradox, synchronicity, unnamed) over
     the same window. Pass one or more ``--check NAME`` to run only the
     named checks. Lint never resolves paradoxes, never auto-creates
     compiled pages, and never deletes orphan fragments — those are the
-    load-bearing rules pinned by FEAT-008.
+    load-bearing rules pinned by the hygiene suite.
     """
     from creek.lint import LintRunner, parse_since
 
@@ -2073,7 +2073,7 @@ def mine(
     (Threads, Eddies, Frequency indexes) and falls back to fragments
     only when a compiled page is missing — appending a
     ``compile-needed`` entry to ``compile-gaps.jsonl`` for ``creek
-    lint`` to surface later (FEAT-004).
+    lint`` to surface later.
     """
     from creek.generate.mining import IdeaMiner
 
@@ -3005,7 +3005,7 @@ def author(
         "--medium",
         help=(
             "Output medium: research, chat, essay, research-piece, "
-            "book-report, or how-to (FEAT-041)."
+            "book-report, or how-to."
         ),
     ),
     work: Path | None = typer.Option(
@@ -3030,7 +3030,7 @@ def author(
         ),
     ),
 ) -> None:
-    """Author a piece with the Creek Writing Desk (FEAT-041 stub skeleton).
+    """Author a piece with the Creek Writing Desk (stub skeleton).
 
     Drives an end-to-end author desk — stub Graph/Retrieval/Ontology
     specialists, a stub Voice agent, and a stub Reflection node — and prints a
@@ -3102,7 +3102,7 @@ def save_cmd(
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """File an answer back into the vault (FEAT-009).
+    """File an answer back into the vault.
 
     Writes a properly-classified note with full ``saved_from``
     frontmatter to the directory chosen by ``--target``. Honours
@@ -3790,7 +3790,7 @@ def compost_calibrate(
         ),
     ),
 ) -> None:
-    """Score the compost detector against a labelled fixture (FEAT-028).
+    """Score the compost detector against a labelled fixture.
 
     Runs every fixture entry through the embedding gate + (optional) LLM
     verifier, then reports the confusion matrix, recall, precision, F1,
@@ -3837,7 +3837,7 @@ def _run_compost_calibration(
     floor_recall: float | None,
     floor_precision: float | None,
 ) -> None:
-    """Drive ``creek compost calibrate --fixture`` end-to-end (FEAT-028).
+    """Drive ``creek compost calibrate --fixture`` end-to-end.
 
     Resolves the fixture path (falling back to the packaged default),
     wires the embedding similarity closure + LLM verifier (or skips the
