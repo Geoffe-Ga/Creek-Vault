@@ -79,7 +79,7 @@ OPPOSITE_PHASE_PAIRS: frozenset[frozenset[str]] = frozenset(
 """Archetypal Wavelength phase pairs treated as opposites for Rule 1."""
 
 
-_OPPOSITE_CONFIDENCE_PAIRS: frozenset[frozenset[str]] = frozenset(
+OPPOSITE_CONFIDENCE_PAIRS: frozenset[frozenset[str]] = frozenset(
     {
         frozenset({Confidence.MUSING.value, Confidence.SETTLED.value}),
         frozenset({Confidence.MUSING.value, Confidence.CONVICTION.value}),
@@ -423,7 +423,7 @@ class ParadoxDetector:
         if conf_a is None or conf_b is None:
             return False
         pair = frozenset({str(conf_a), str(conf_b)})
-        return pair in _OPPOSITE_CONFIDENCE_PAIRS
+        return pair in OPPOSITE_CONFIDENCE_PAIRS
 
     @staticmethod
     def _opposite_dosages(a: Fragment, b: Fragment) -> bool:
