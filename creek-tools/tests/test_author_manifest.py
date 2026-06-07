@@ -146,14 +146,25 @@ def test_default_privacy_tier_fails_closed_on_garbage(tmp_path: Path) -> None:
     assert load_author_manifest(path).default_privacy_tier == PrivacyTier.OPEN
 
 
-def test_attribution_required_fails_closed_on_non_bool(tmp_path: Path) -> None:
-    """A non-boolean ``attribution_required`` fails closed to True (require it)."""
+def test_attribution_required_fails_closed_on_non_bool(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-boolean ``attribution_required`` fails closed to True, loudly."""
     body = _FULL_MANIFEST.replace(
         "attribution_required: true", "attribution_required: maybe"
     )
     path = _write_manifest(tmp_path, "bad-attr", body)
 
-    assert load_author_manifest(path).attribution_required is True
+    with caplog.at_level("WARNING"):
+        manifest = load_author_manifest(path)
+
+    assert manifest.attribution_required is True
+    # The fail-closed path is loud, never silent.
+    assert any(
+        "attribution_required" in record.message and "failing closed" in record.message
+        for record in caplog.records
+    )
 
 
 def test_attribution_required_false_is_preserved(tmp_path: Path) -> None:
@@ -164,6 +175,36 @@ def test_attribution_required_false_is_preserved(tmp_path: Path) -> None:
     path = _write_manifest(tmp_path, "attr-false", body)
 
     assert load_author_manifest(path).attribution_required is False
+
+
+def test_attribution_required_numeric_one_is_true(tmp_path: Path) -> None:
+    """YAML integer ``1`` is honoured as ``True`` (require attribution), not coerced."""
+    body = _FULL_MANIFEST.replace(
+        "attribution_required: true", "attribution_required: 1"
+    )
+    path = _write_manifest(tmp_path, "attr-one", body)
+
+    assert load_author_manifest(path).attribution_required is True
+
+
+def test_attribution_required_numeric_zero_is_false(tmp_path: Path) -> None:
+    """YAML integer ``0`` carries unambiguous intent and is honoured as ``False``."""
+    body = _FULL_MANIFEST.replace(
+        "attribution_required: true", "attribution_required: 0"
+    )
+    path = _write_manifest(tmp_path, "attr-zero", body)
+
+    assert load_author_manifest(path).attribution_required is False
+
+
+def test_attribution_required_other_int_fails_closed(tmp_path: Path) -> None:
+    """An out-of-domain integer (e.g. ``2``) is ambiguous and fails closed to True."""
+    body = _FULL_MANIFEST.replace(
+        "attribution_required: true", "attribution_required: 2"
+    )
+    path = _write_manifest(tmp_path, "attr-two", body)
+
+    assert load_author_manifest(path).attribution_required is True
 
 
 def test_null_privacy_tier_fails_closed(tmp_path: Path) -> None:

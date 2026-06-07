@@ -115,6 +115,24 @@ def test_provider_omits_system_when_none(monkeypatch: pytest.MonkeyPatch) -> Non
     assert kwargs["messages"] == [{"role": "user", "content": "just the prompt"}]
 
 
+def test_complete_uses_default_unbounded_max_tokens() -> None:
+    """``complete`` with no ``max_tokens`` passes ``None`` through (#455).
+
+    The default (unbounded) path was previously only exercised with an explicit
+    ceiling; this pins that the default forwards ``max_tokens=None``.
+    """
+    provider = MagicMock()
+    provider.call_with_metadata.return_value = AnthropicCompletion(
+        text="completion", usage={"input_tokens": 1}
+    )
+
+    client = AuthorLLMClient(provider)
+    text = client.complete("ask")
+
+    assert text == "completion"
+    provider.call_with_metadata.assert_called_once_with("ask", max_tokens=None)
+
+
 def test_complete_with_usage_returns_text_and_usage() -> None:
     """``complete_with_usage`` returns the full completion; ``complete`` stays str."""
     provider = MagicMock()

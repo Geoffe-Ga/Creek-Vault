@@ -92,6 +92,27 @@ def test_harness_rejects_out_of_range_weight() -> None:
         assert_contract_conformant(bad)
 
 
+def test_harness_rejects_out_of_range_rubric() -> None:
+    """A reflection-rubric weight outside [0, 1] is non-conformant (#457).
+
+    Mirrors :func:`test_harness_rejects_out_of_range_weight` for the rubric
+    map: the values sum to ~1.0 and every required key is present, so only the
+    range branch can fire.
+    """
+    bad = MediumContract(
+        medium="bad",
+        structure=["reply"],
+        specialist_weights={"voice": 1.0},
+        reflection_rubric={
+            "ontological_accuracy": 1.5,
+            "citation_completeness": 0.0,
+            "voice_fidelity": -0.5,
+        },
+    )
+    with pytest.raises(ContractConformanceError, match="outside"):
+        assert_contract_conformant(bad)
+
+
 def test_harness_rejects_missing_rubric_keys() -> None:
     """A rubric missing a required dimension is non-conformant."""
     bad = MediumContract(
