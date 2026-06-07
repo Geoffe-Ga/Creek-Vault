@@ -1232,6 +1232,39 @@ def test_report_unnamed_command(tmp_path: Path) -> None:
     assert (vault / "10-Liminal" / "Unnamed" / "Digests").is_dir()
 
 
+def test_report_decisions_skeleton_stub(tmp_path: Path) -> None:
+    """``report --type decisions`` routes to its stub handler and writes nothing."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would generate" in result.output
+    assert "08-Decisions/" in result.output
+    # Scope fence: the stub creates nothing under the target folder.
+    assert not (vault / "08-Decisions").exists()
+
+
+def test_report_lexicon_skeleton_stub(tmp_path: Path) -> None:
+    """``report --type lexicon`` routes to its stub handler and writes nothing."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "lexicon", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would generate" in result.output
+    assert "07-Voice/Lexicon/" in result.output
+    assert not (vault / "07-Voice" / "Lexicon").exists()
+
+
 def test_report_voice_command(tmp_path: Path) -> None:
     """Test that report --type voice generates register profiles."""
     from datetime import UTC, datetime
