@@ -442,6 +442,39 @@ class VoiceExemplarCollector:
         self._warn_below_minimum(buckets)
         return buckets
 
+    def collect_all_exemplars(self, vault_path: Path) -> list[Exemplar]:
+        """Collect every qualifying exemplar across all registers, with bodies.
+
+        Shares the eligibility gate with :meth:`collect_exemplars` (``settled``
+        or ``conviction`` confidence, a set register, intimate filtered unless
+        :attr:`allow_intimate`, ``11-Other-Authors`` excluded) but returns a
+        flat :class:`Exemplar` list — fragment paired with its on-disk body —
+        rather than per-register ``Fragment`` buckets. Consumers that need the
+        whole voice corpus as one unit (e.g. the lexicon) use this so they share
+        a single source of truth for *which* fragments count as exemplars.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            Every qualifying exemplar with its body, in on-disk discovery order.
+        """
+        fragments_dir = vault_path / _FRAGMENTS_SUBDIR
+        exemplars: list[Exemplar] = []
+        if not fragments_dir.is_dir():
+            return exemplars
+        for md_file in sorted(fragments_dir.rglob("*.md")):
+            if _is_other_authors_path(md_file):
+                continue
+            loaded = _load_fragment_with_body(md_file)
+            if loaded is None:
+                continue
+            fragment, body = loaded
+            if self._eligible_register(fragment) is None:
+                continue
+            exemplars.append(Exemplar(fragment=fragment, body=body))
+        return exemplars
+
     def _eligible_register(self, fragment: Fragment) -> str | None:
         """Return the fragment's register if it qualifies, else ``None``."""
         return _eligible_register(fragment, allow_intimate=self.allow_intimate)

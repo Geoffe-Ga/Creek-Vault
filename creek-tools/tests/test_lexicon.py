@@ -23,6 +23,7 @@ from creek.generate.lexicon import (
     LexiconContext,
     LexiconGenerator,
     MetaphorInventory,
+    generate_lexicon,
 )
 from creek.generate.voice import (
     Exemplar,
@@ -80,6 +81,61 @@ def _make_fragment(frag_id: str, title: str = "Untitled") -> Fragment:
 def _exemplar(frag_id: str, body: str) -> Exemplar:
     """Build an Exemplar with a default fragment and the given body."""
     return Exemplar(fragment=_make_fragment(frag_id), body=body)
+
+
+def _seed_exemplar_file(vault: Path, frag_id: str, body: str) -> None:
+    """Write a qualifying voice-exemplar fragment file under the vault."""
+    fragments_dir = vault / "01-Fragments" / "Journal"
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(
+        content=body,
+        **_make_fragment(frag_id).model_dump(mode="json"),
+    )
+    (fragments_dir / f"{frag_id}.md").write_text(
+        frontmatter.dumps(post),
+        encoding="utf-8",
+    )
+
+
+def test_generate_lexicon_writes_populated_glossary(tmp_path: Path) -> None:
+    """generate_lexicon collects vault exemplars and writes a filled glossary.
+
+    Bodies carry Buddhist tradition keywords (``dharma`` / ``karma``) and a
+    twice-repeated phrase so the borrowed-term and distinctive-phrase
+    inventories are non-empty (#580).
+    """
+    _seed_exemplar_file(
+        tmp_path,
+        "ex-1",
+        "The dharma teaches that the river flows toward the sea; the river flows on.",
+    )
+    _seed_exemplar_file(
+        tmp_path,
+        "ex-2",
+        "With karma in mind, the river flows again and the river flows still.",
+    )
+
+    lexicon, paths = generate_lexicon(tmp_path)
+
+    assert lexicon is not None
+    glossary = tmp_path / "07-Voice" / "Lexicon" / "glossary.md"
+    assert glossary.exists()
+    assert glossary == paths[0]
+    text = glossary.read_text(encoding="utf-8").lower()
+    assert "voice lexicon" in text
+    # The Buddhist borrowed terms were detected — a non-empty glossary section.
+    assert "dharma" in text
+
+
+def test_generate_lexicon_empty_vault_returns_none(tmp_path: Path) -> None:
+    """A vault with no qualifying exemplars yields (None, []) and writes nothing."""
+    (tmp_path / "01-Fragments").mkdir(parents=True)
+
+    lexicon, paths = generate_lexicon(tmp_path)
+
+    assert lexicon is None
+    assert paths == []
+    assert not (tmp_path / "07-Voice" / "Lexicon").exists()
 
 
 def _empty_patterns() -> VoicePatterns:

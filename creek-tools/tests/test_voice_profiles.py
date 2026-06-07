@@ -200,6 +200,37 @@ def vault(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_collect_all_exemplars_returns_flat_bodies(vault: Path) -> None:
+    """collect_all_exemplars flattens every qualifying exemplar, with bodies.
+
+    Shares the eligibility gate with ``collect_exemplars`` — a ``musing``
+    fragment is excluded — but returns one flat list across registers for
+    consumers like the lexicon (#580).
+    """
+    from creek.generate.voice import VoiceExemplarCollector
+
+    _write_fragment_file(
+        vault,
+        _make_fragment("ex-1", "T1", VoiceRegister.CONFESSIONAL, Confidence.CONVICTION),
+        "First exemplar body about tides and rivers.",
+    )
+    _write_fragment_file(
+        vault,
+        _make_fragment("ex-2", "T2", VoiceRegister.ANALYTICAL, Confidence.SETTLED),
+        "Second exemplar body, analytical and measured.",
+    )
+    _write_fragment_file(
+        vault,
+        _make_fragment("ex-3", "T3", VoiceRegister.CONFESSIONAL, Confidence.MUSING),
+        "Ineligible musing body.",
+    )
+
+    exemplars = VoiceExemplarCollector().collect_all_exemplars(vault)
+
+    assert {e.fragment.id for e in exemplars} == {"ex-1", "ex-2"}
+    assert all(e.body for e in exemplars)
+
+
 # ---- Module surface ----
 
 

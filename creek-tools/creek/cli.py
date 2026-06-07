@@ -1307,15 +1307,26 @@ def _report_decisions(vault_path: Path) -> None:
 
 
 def _report_lexicon(vault_path: Path) -> None:
-    """Stub for the ``lexicon`` report (skeleton; #579).
+    """Generate the voice lexicon glossary + metaphor index (#580).
 
-    Routing tracer only — emits a typed "would generate" line and writes
-    nothing. The real ``LexiconGenerator`` wiring lands in the follow-up that
-    persists ``07-Voice/Lexicon/``; this proves the dispatch end-to-end first.
+    Collects the vault's voice exemplars (sharing the voice report's eligibility
+    gate), builds a :class:`~creek.generate.lexicon.Lexicon`, and persists it to
+    ``07-Voice/Lexicon/``. Mirrors ``_report_voice``'s friendly "no qualifying
+    exemplars" message when the corpus is empty.
     """
+    from creek.generate.lexicon import generate_lexicon
+
+    lexicon, written_paths = generate_lexicon(vault_path)
+    if lexicon is None or not written_paths:
+        console.print(
+            "[yellow]No lexicon generated: no qualifying exemplars found.[/yellow]",
+        )
+        return
+    glossary = written_paths[0]
     console.print(
-        "[bold green]Would generate: lexicon glossary at 07-Voice/Lexicon/ "
-        "(not yet wired — see follow-up)[/bold green]",
+        f"[bold green]Lexicon generated: {glossary.relative_to(vault_path)} "
+        f"({len(lexicon.coined_terms)} coined terms, "
+        f"{len(lexicon.metaphors)} metaphors)[/bold green]",
     )
 
 
