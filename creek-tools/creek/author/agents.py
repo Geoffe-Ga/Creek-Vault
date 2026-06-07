@@ -27,7 +27,7 @@ from creek.author.models import (
 )
 from creek.classify.rules import RuleClassifier
 from creek.classify.weighted import WeightedDimension
-from creek.generate.paradox import OPPOSITE_PHASE_PAIRS
+from creek.generate.paradox import OPPOSITE_CONFIDENCE_PAIRS, OPPOSITE_PHASE_PAIRS
 from creek.link.embeddings import (
     EmbeddingLinker,
     EmbeddingModelUnavailableError,
@@ -35,7 +35,7 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
-from creek.models import Dosage, Frequency, Mode, Phase, VoiceRegister
+from creek.models import Confidence, Dosage, Frequency, Mode, Phase, VoiceRegister
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -441,17 +441,17 @@ def _aggregate_optional(
 class _FragmentSignal:
     """The canonical ontology signal a single corpus fragment carries."""
 
-    __slots__ = ("dosage", "frequency", "mode", "phase", "voice_register")
+    __slots__ = ("confidence", "dosage", "frequency", "mode", "phase", "voice_register")
 
     def __init__(self, fragment: Fragment, body: str) -> None:
         """Classify *fragment* deterministically, keeping any frontmatter dosage.
 
-        The rule classifier supplies frequency, phase, mode, and voice
-        register from ``title + body`` keyword signal; the rule classifier
-        does not detect dosage, so dosage is read from the fragment's existing
-        frontmatter (``wavelength.dosage``) instead. ``voice_register`` is
-        ``None`` when no register keyword fired (the enum has no
-        ``UNCLASSIFIED`` member).
+        The rule classifier supplies frequency, phase, mode, voice register,
+        and confidence from ``title + body`` keyword signal; the rule
+        classifier does not detect dosage, so dosage is read from the
+        fragment's existing frontmatter (``wavelength.dosage``) instead.
+        ``voice_register`` and ``confidence`` are ``None`` when no keyword
+        fired (neither enum has an ``UNCLASSIFIED`` member).
 
         Args:
             fragment: The corpus fragment to scan.
@@ -470,6 +470,12 @@ class _FragmentSignal:
         # canonical enum so aggregation sorts on ``.value`` like the other axes.
         self.voice_register: VoiceRegister | None = (
             VoiceRegister(register) if register is not None else None
+        )
+        # Confidence is likewise surfaced as a plain ``str`` (or ``None``);
+        # rewrap it so the confidence-paradox detector can compare enum members.
+        confidence = classified.voice.confidence
+        self.confidence: Confidence | None = (
+            Confidence(confidence) if confidence is not None else None
         )
 
 
@@ -510,6 +516,23 @@ def _detect_dosage_paradoxes(
     return paradoxes
 
 
+def _pair_sort_key(pair: frozenset[str]) -> list[str]:
+    """Deterministic sort key for an opposite-pair ``frozenset``.
+
+    Frozensets have no inherent order, so paradox detection iterates the
+    opposite pairs in a stable order keyed on each pair's sorted member list.
+    A named key spells out that intent (the equivalent bare ``key=sorted``
+    reads as a puzzle at the call site).
+
+    Args:
+        pair: One opposite pair (e.g. ``{"rising", "diminishing"}``).
+
+    Returns:
+        The pair's members sorted into a list, used purely as a sort key.
+    """
+    return sorted(pair)
+
+
 def _detect_phase_paradoxes(
     signals: list[tuple[str, _FragmentSignal]],
 ) -> list[OntologyParadox]:
@@ -530,7 +553,7 @@ def _detect_phase_paradoxes(
         if sig.phase is not Phase.UNCLASSIFIED:
             first_for_phase.setdefault(sig.phase, fid)
     paradoxes: list[OntologyParadox] = []
-    for pair in sorted(OPPOSITE_PHASE_PAIRS, key=sorted):
+    for pair in sorted(OPPOSITE_PHASE_PAIRS, key=_pair_sort_key):
         phases = [Phase(value) for value in pair]
         if all(phase in first_for_phase for phase in phases):
             lo, hi = sorted(phases, key=lambda p: p.value)
@@ -541,6 +564,46 @@ def _detect_phase_paradoxes(
                     description=(
                         f"The topic sits on opposite phases — {lo.value} in one "
                         f"fragment and {hi.value} in another."
+                    ),
+                )
+            )
+    return paradoxes
+
+
+def _detect_confidence_paradoxes(
+    signals: list[tuple[str, _FragmentSignal]],
+) -> list[OntologyParadox]:
+    """Surface opposite-confidence contradictions across fragments.
+
+    Reuses the canonical opposite-confidence pairs from
+    :data:`creek.generate.paradox.OPPOSITE_CONFIDENCE_PAIRS` — the same pairs
+    the generate-side paradox engine treats as opposites (e.g. musing vs
+    conviction), so the desk and the vault agree on what a confidence
+    contradiction is.
+
+    Args:
+        signals: ``(fragment_id, signal)`` pairs for the classified corpus.
+
+    Returns:
+        One :class:`OntologyParadox` per opposite-confidence pair present in the
+        corpus; the contradiction is named, never resolved.
+    """
+    first_for_confidence: dict[Confidence, str] = {}
+    for fid, sig in signals:
+        if sig.confidence is not None:
+            first_for_confidence.setdefault(sig.confidence, fid)
+    paradoxes: list[OntologyParadox] = []
+    for pair in sorted(OPPOSITE_CONFIDENCE_PAIRS, key=_pair_sort_key):
+        levels = [Confidence(value) for value in pair]
+        if all(level in first_for_confidence for level in levels):
+            lo, hi = sorted(levels, key=lambda c: c.value)
+            paradoxes.append(
+                OntologyParadox(
+                    kind="confidence",
+                    fragment_ids=(first_for_confidence[lo], first_for_confidence[hi]),
+                    description=(
+                        f"The topic is held at opposite confidence levels — "
+                        f"{lo.value} in one fragment and {hi.value} in another."
                     ),
                 )
             )
@@ -578,6 +641,47 @@ def _ontology_claim(
     return EvidenceClaim(claim=summary, source_fragments=fragment_ids.copy())
 
 
+_CONFIDENCE_SENTINELS: tuple[tuple[str, object], ...] = (
+    ("frequency", Frequency.UNCLASSIFIED),
+    ("phase", Phase.UNCLASSIFIED),
+    ("mode", Mode.UNCLASSIFIED),
+    ("dosage", Dosage.UNCLASSIFIED),
+)
+"""The sentinel-bearing axes whose classification rate feeds overall confidence."""
+
+
+def _overall_confidence(signals: list[tuple[str, _FragmentSignal]]) -> float:
+    """Aggregate corpus-wide classification coverage into a 0.0-1.0 confidence.
+
+    The score is the mean, across fragments, of the fraction of
+    sentinel-bearing axes (frequency / phase / mode / dosage) that resolved to
+    a non-``UNCLASSIFIED`` value. A fully-classified corpus scores 1.0; an
+    all-unclassified corpus scores 0.0; partial classification lands in
+    between — a real signal the prior ``1.0 if signals else 0.0`` placeholder
+    could not express. Voice register is excluded: it has no ``UNCLASSIFIED``
+    sentinel, so "did it classify" is not well-defined for that axis.
+
+    Args:
+        signals: ``(fragment_id, signal)`` pairs for the classified corpus.
+
+    Returns:
+        The mean axis-coverage fraction, rounded to four decimal places, or
+        ``0.0`` for an empty corpus.
+    """
+    if not signals:
+        return 0.0
+    axis_count = len(_CONFIDENCE_SENTINELS)
+    total = 0.0
+    for _fid, sig in signals:
+        classified = sum(
+            1
+            for axis, sentinel in _CONFIDENCE_SENTINELS
+            if getattr(sig, axis) is not sentinel
+        )
+        total += classified / axis_count
+    return round(total / len(signals), 4)
+
+
 def _build_analysis(
     signals: list[tuple[str, _FragmentSignal]],
 ) -> OntologyAnalysis:
@@ -585,14 +689,16 @@ def _build_analysis(
 
     Each axis is aggregated independently: frequency / phase / mode / dosage
     drop their ``UNCLASSIFIED`` sentinel, while voice register (no such
-    sentinel) drops the ``None`` picks via :func:`_aggregate_optional`. Dosage
-    and phase contradictions are surfaced — never resolved.
+    sentinel) drops the ``None`` picks via :func:`_aggregate_optional`. Dosage,
+    phase, and confidence contradictions are surfaced — never resolved — and
+    ``overall_confidence`` reflects the corpus-wide classification coverage
+    (see :func:`_overall_confidence`).
 
     Args:
         signals: ``(fragment_id, signal)`` pairs for the classified corpus.
 
     Returns:
-        The aggregated analysis with full confidence when any signal is present.
+        The aggregated analysis with confidence scaled to axis coverage.
     """
     return OntologyAnalysis(
         frequencies=_aggregate_dimension(
@@ -611,9 +717,11 @@ def _build_analysis(
             [sig.voice_register for _id, sig in signals]
         ),
         paradoxes=tuple(
-            _detect_dosage_paradoxes(signals) + _detect_phase_paradoxes(signals)
+            _detect_dosage_paradoxes(signals)
+            + _detect_phase_paradoxes(signals)
+            + _detect_confidence_paradoxes(signals)
         ),
-        overall_confidence=1.0 if signals else 0.0,
+        overall_confidence=_overall_confidence(signals),
     )
 
 

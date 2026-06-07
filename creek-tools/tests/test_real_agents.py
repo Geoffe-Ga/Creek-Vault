@@ -183,6 +183,11 @@ _F6_BODY = "community empathy harmony inclusion caring sharing equality consensu
 _F3_BODY = "power dominance control conquest force aggression warrior rebellion"
 _RISING_BODY = "emerging building growing momentum ascending intensifying gathering"
 _DIMINISHING_BODY = "diminishing declining waning subsiding settling calming quieting"
+# Confidence-keyword bodies (CONFIDENCE_SIGNALS) drawn from an opposite pair —
+# MUSING vs CONVICTION — so the rule classifier resolves opposite confidence and
+# the Ontology agent surfaces a confidence paradox deterministically.
+_MUSING_BODY = "maybe perhaps wondering possibly might not sure could be"
+_CONVICTION_BODY = "absolutely undeniably fundamental non-negotiable i am certain"
 # Dense with analytical voice-register signals (VOICE_REGISTER_SIGNALS) so the
 # rule classifier resolves the fragment's register to ANALYTICAL deterministically.
 _ANALYTICAL_BODY = (
@@ -273,6 +278,43 @@ def test_ontology_surfaces_phase_paradox_without_resolving(tmp_path: Path) -> No
     assert {Phase.RISING, Phase.DIMINISHING} <= phase_values
 
 
+def test_ontology_surfaces_confidence_paradox_without_resolving(
+    tmp_path: Path,
+) -> None:
+    """Opposite confidence levels across fragments surface a confidence paradox."""
+    _write_classified(tmp_path, "frag-musing", "Tentative take", body=_MUSING_BODY)
+    _write_classified(tmp_path, "frag-sure", "Firm take", body=_CONVICTION_BODY)
+
+    bundle = OntologySpecialist().gather("take", tmp_path)
+
+    assert bundle.ontology is not None
+    confidence_paradoxes = [
+        p for p in bundle.ontology.paradoxes if p.kind == "confidence"
+    ]
+    assert confidence_paradoxes, "confidence contradiction must be surfaced"
+    assert set(confidence_paradoxes[0].fragment_ids) == {"frag-musing", "frag-sure"}
+
+
+def test_ontology_overall_confidence_scales_with_axis_coverage(
+    tmp_path: Path,
+) -> None:
+    """``overall_confidence`` is a real aggregate, not 1.0 whenever a signal exists.
+
+    A fragment keyworded only on frequency and phase leaves mode and dosage
+    UNCLASSIFIED, so corpus-wide axis coverage is strictly below full
+    confidence — a distinction the old ``1.0 if signals else 0.0`` placeholder
+    could not express.
+    """
+    _write_classified(
+        tmp_path, "frag-partial", "Rising power", body=f"{_F3_BODY} {_RISING_BODY}"
+    )
+
+    bundle = OntologySpecialist().gather("power", tmp_path)
+
+    assert bundle.ontology is not None
+    assert 0.0 < bundle.ontology.overall_confidence < 1.0
+
+
 def test_ontology_empty_vault_returns_empty_bundle(tmp_path: Path) -> None:
     """An empty corpus yields an empty bundle with no ontology and no crash."""
     bundle = OntologySpecialist().gather("q", tmp_path)
@@ -290,6 +332,7 @@ def test_ontology_unclassified_corpus_still_grounds_claim(tmp_path: Path) -> Non
     bundle = OntologySpecialist().gather("q", tmp_path)
 
     assert bundle.ontology is not None
+    assert bundle.ontology.overall_confidence == 0.0
     assert bundle.claims
     cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
     assert cited == {"frag-a", "frag-b"}
