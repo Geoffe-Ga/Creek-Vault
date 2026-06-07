@@ -91,11 +91,12 @@ def _content_hash(entry: dict[str, Any]) -> str:
 def summarise_args(args: dict[str, Any]) -> dict[str, Any]:
     """Return a privacy-safe summary of *args* for the audit log.
 
-    Strings are kept up to a short prefix length so the audit log never
-    captures a fragment body or draft prompt; long fields are reported
-    as ``{"len": N}`` instead. Pure scalars and short strings pass
-    through unchanged so the audit entry still names *which* skill /
-    phase / index a tool was invoked with.
+    A string of at most 64 characters passes through verbatim; a longer one
+    (which could be a fragment body or draft prompt) is replaced by its length
+    as ``{"len": N}`` — never truncated to a prefix — so the log never captures
+    sensitive content. Lists/tuples report a ``{"count": N}``, dicts their
+    sorted keys, and pure scalars pass through, so the entry still names *which*
+    skill / phase / index a tool was invoked with.
     """
     summary: dict[str, Any] = {}
     for key, value in args.items():

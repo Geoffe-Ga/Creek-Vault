@@ -558,9 +558,17 @@ class AuthorManifest(BaseModel):
     @field_validator("attribution_required", mode="before")
     @classmethod
     def _coerce_attribution_required(cls, value: object) -> bool:
-        """Fail closed to ``True`` (require attribution) for a non-boolean value."""
+        """Fail closed to ``True`` (require attribution) for a non-boolean value.
+
+        YAML/JSON commonly write a boolean as the integer ``1`` / ``0``; those
+        carry unambiguous intent, so they are honoured (``1`` → require, ``0``
+        → not required) rather than failing closed. Any other non-boolean value
+        is ambiguous and resolves to ``True``.
+        """
         if isinstance(value, bool):
             return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
         _warn_fail_closed(
             "attribution_required", value, "True", reason="is not a boolean"
         )
