@@ -18,6 +18,7 @@ import pytest
 from pydantic import ValidationError
 
 from creek.models import (
+    AuthorManifest,
     Fragment,
     FragmentSource,
     Frequency,
@@ -26,7 +27,7 @@ from creek.models import (
     SourcePlatform,
     WavelengthClassification,
 )
-from creek.vault.writer import VaultWriter
+from creek.vault.writer import VaultWriter, _apply_other_author_attribution
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -273,6 +274,38 @@ class TestOtherAuthorAttribution:
         assert post["source"]["author_slug"] is None
         assert post["voice_weight"] == 1.0
         assert post["representativeness"] == "self"
+
+
+def test_apply_other_author_attribution_returns_new_fragment_without_mutating() -> None:
+    """The helper is pure: it returns a stamped copy and never mutates its input.
+
+    The writer's deep-copy guard (#470) already protected callers end-to-end,
+    but the helper itself was an in-place mutator — a footgun for any future
+    caller. It now returns a fresh Fragment so caller-mutation can't be
+    reintroduced (#500).
+    """
+    frag = _classified_borrowed_fragment("mentor", "frag-pure0001")
+    manifest = AuthorManifest(
+        author_slug="mentor",
+        author_kind="human_source",
+        voice_weight=0.3,
+        representativeness="aspirational",
+    )
+
+    stamped = _apply_other_author_attribution(frag, manifest)
+
+    # A distinct object (and distinct nested source) is returned.
+    assert stamped is not frag
+    assert stamped.source is not frag.source
+    # The returned copy carries the manifest attribution.
+    assert stamped.voice_weight == 0.3
+    assert stamped.representativeness == "aspirational"
+    assert stamped.source.author == "other"
+    assert stamped.source.author_slug == "mentor"
+    # The caller's fragment keeps its native defaults — never mutated.
+    assert frag.voice_weight == 1.0
+    assert frag.representativeness == "self"
+    assert frag.source.author == "self"
 
 
 class TestAuthorSlugPathSafety:
