@@ -390,13 +390,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def _apply_other_author_attribution(
     fragment: Fragment,
     manifest: AuthorManifest,
-) -> None:
-    """Stamp borrowed-author attribution from *manifest* onto *fragment* (#470).
+) -> Fragment:
+    """Return a copy of *fragment* stamped with *manifest* attribution (#470).
 
-    Mutates *fragment* in place (``Fragment``/``FragmentSource`` are mutable
-    Pydantic models, not frozen). Only the *attribution* axis changes — the
+    Pure function — *fragment* is never mutated; a new ``Fragment`` (with a new
+    ``FragmentSource``) is returned. Only the *attribution* axis changes — the
     fragment's frequency / wavelength / voice (its IDEAS classification, set
-    upstream) is left untouched:
+    upstream) is carried over untouched:
 
     * ``source.author_slug`` ← the manifest slug (the folder name).
     * ``source.author`` ← per :data:`_AUTHOR_KIND_TO_AUTHORSHIP`
@@ -406,20 +406,38 @@ def _apply_other_author_attribution(
     * ``voice_weight`` ← the manifest's ``voice_weight`` (default ``0.0``, and
       ``0.0`` when the manifest was loaded fail-closed from a missing file).
 
+    Returning a copy (rather than mutating in place) means a future caller can't
+    reintroduce the caller-mutation bug the writer's deep copy used to guard
+    against (#500).
+
     Args:
-        fragment: The fragment to stamp (mutated in place).
+        fragment: The fragment to stamp (read-only).
         manifest: The governing ``11-Other-Authors/<slug>/`` manifest.
+
+    Returns:
+        A new ``Fragment`` carrying the borrowed-author attribution.
     """
-    fragment.source.author_slug = manifest.author_slug
-    fragment.source.author = _AUTHOR_KIND_TO_AUTHORSHIP.get(
-        manifest.author_kind,
-        Authorship.OTHER,
+    representativeness = (
+        "endorsed"
+        if manifest.author_kind == "ai_as_user"
+        else manifest.representativeness
     )
-    if manifest.author_kind == "ai_as_user":
-        fragment.representativeness = "endorsed"
-    else:
-        fragment.representativeness = manifest.representativeness
-    fragment.voice_weight = manifest.voice_weight
+    source = fragment.source.model_copy(
+        update={
+            "author_slug": manifest.author_slug,
+            "author": _AUTHOR_KIND_TO_AUTHORSHIP.get(
+                manifest.author_kind,
+                Authorship.OTHER,
+            ),
+        },
+    )
+    return fragment.model_copy(
+        update={
+            "source": source,
+            "representativeness": representativeness,
+            "voice_weight": manifest.voice_weight,
+        },
+    )
 
 
 class VaultWriter:
@@ -524,11 +542,11 @@ class VaultWriter:
         """
         slug = fragment.source.author_slug
         if slug:
-            # Stamp on a deep copy so the caller's Fragment is never mutated —
-            # only the written file carries the manifest attribution (#470).
-            stamped = fragment.model_copy(deep=True)
+            # The helper returns a stamped copy, so the caller's Fragment is
+            # never mutated — only the written file carries the manifest
+            # attribution (#470).
             manifest = load_author_manifest_or_default(self.vault_path, slug)
-            _apply_other_author_attribution(stamped, manifest)
+            stamped = _apply_other_author_attribution(fragment, manifest)
             target_dir = self.vault_path / OTHER_AUTHORS_DIR / slug
             return self._write_model(stamped, target_dir, body=body)
         platform = fragment.source.platform

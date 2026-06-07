@@ -11,8 +11,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, get_args
 
 import pytest
+import yaml
+from pydantic import ValidationError
 
 from creek.models import AuthorKind, AuthorManifest, PrivacyTier, Representativeness
+from creek.vault import authors
 from creek.vault.authors import (
     load_author_manifest,
     load_author_manifest_or_default,
@@ -20,6 +23,16 @@ from creek.vault.authors import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_MALFORMED_YAML = "---\nauthor_kind: human_source\n  bad: indent\n: : :\n---\n# body\n"
+
+
+def _a_validation_error() -> ValidationError:
+    """Capture a genuine ``ValidationError`` to exercise the loader branch."""
+    with pytest.raises(ValidationError) as exc_info:
+        AuthorManifest.model_validate(123)
+    return exc_info.value
+
 
 _FULL_MANIFEST = """---
 type: author_manifest
@@ -295,3 +308,62 @@ def test_load_or_default_fails_closed_when_missing(tmp_path: Path) -> None:
     assert manifest.author_kind == "human_source"
     assert manifest.voice_weight == 0.0
     assert manifest.representativeness == "reference"
+
+
+def test_load_or_default_fails_closed_on_malformed_yaml(tmp_path: Path) -> None:
+    """Malformed manifest YAML fails closed to a safe default, not a raise."""
+    _write_manifest(tmp_path, "garbled", _MALFORMED_YAML)
+
+    manifest = load_author_manifest_or_default(tmp_path, "garbled")
+
+    assert manifest == AuthorManifest(author_slug="garbled")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("disk"), yaml.YAMLError("bad"), _a_validation_error()],
+    ids=["oserror", "yamlerror", "validationerror"],
+)
+def test_load_or_default_fails_closed_on_loader_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    """Every fail-closed branch resolves to a safe default manifest (#500).
+
+    Drives each ``except`` arm of ``load_author_manifest_or_default`` directly
+    at the loader level (rather than only end-to-end through the writer) by
+    making the inner parse raise the corresponding error.
+    """
+
+    def _raise(_path: Path) -> AuthorManifest:
+        raise error
+
+    monkeypatch.setattr(authors, "load_author_manifest", _raise)
+
+    manifest = load_author_manifest_or_default(tmp_path, "slug")
+
+    assert manifest == AuthorManifest(author_slug="slug")
+
+
+def test_load_or_default_fails_closed_when_present_but_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present-but-unreadable ``_author.md`` fails closed like a missing one.
+
+    ``is_file()`` returns True for a permission-locked file, so the *read* (not
+    the existence check) is what fails. The resulting ``PermissionError`` (an
+    ``OSError``) is caught and normalised to the same safe default a missing
+    manifest produces — confirming the two paths agree (#500 item 3).
+    """
+    _write_manifest(tmp_path, "locked", _FULL_MANIFEST)
+
+    def _deny(_path: str) -> object:
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(authors.frontmatter, "load", _deny)
+
+    manifest = load_author_manifest_or_default(tmp_path, "locked")
+
+    assert manifest == AuthorManifest(author_slug="locked")
