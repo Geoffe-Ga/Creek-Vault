@@ -155,6 +155,44 @@ def test_ai_as_user_save_lands_attributed_fragment(vault: Path) -> None:
     assert post["representativeness"] == "endorsed"
 
 
+def test_ai_as_user_same_title_distinct_content_get_distinct_ids(vault: Path) -> None:
+    """Two same-titled AI saves with different bodies get distinct ids (#489).
+
+    The id appends a content digest to the title slug, so the in-frontmatter
+    ``id`` no longer collides when two kept outputs share a title (the filename
+    was already de-duplicated by the atomic collision-retry).
+    """
+    first = save_to_vault(
+        _make_request(SaveTarget.AI_AS_USER, title="Same Title", body="First body."),
+        vault_path=vault,
+    )
+    second = save_to_vault(
+        _make_request(SaveTarget.AI_AS_USER, title="Same Title", body="Second body."),
+        vault_path=vault,
+    )
+
+    first_id = frontmatter.load(str(first))["id"]
+    second_id = frontmatter.load(str(second))["id"]
+    assert first_id != second_id
+    assert first_id.startswith("ai-as-user-Same-Title-")
+
+
+def test_ai_as_user_same_title_same_content_is_idempotent_id(vault: Path) -> None:
+    """Identical title+body yields the same id — a harmless idempotent re-save."""
+    request = _make_request(
+        SaveTarget.AI_AS_USER, title="Same Title", body="Identical body."
+    )
+    first = save_to_vault(request, vault_path=vault)
+    second = save_to_vault(
+        _make_request(
+            SaveTarget.AI_AS_USER, title="Same Title", body="Identical body."
+        ),
+        vault_path=vault,
+    )
+
+    assert frontmatter.load(str(first))["id"] == frontmatter.load(str(second))["id"]
+
+
 def test_ai_as_user_save_round_trips_through_the_fragment_reader(vault: Path) -> None:
     """The saved note loads as a valid Fragment via the vault reader."""
     from creek.vault.reader import try_load_fragment
