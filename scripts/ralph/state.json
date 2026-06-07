@@ -1,8 +1,8 @@
 {
-  "completed_since_groom": 9,
-  "total_completed": 59,
+  "completed_since_groom": 10,
+  "total_completed": 60,
   "groom_interval": 10,
   "last_groom_at": "2026-06-06T12:23:21.319587",
-  "last_completed_issue": 481,
+  "last_completed_issue": 487,
   "started_at": null
 }
