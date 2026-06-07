@@ -525,6 +525,41 @@ def test_report_decisions_no_candidates_returns_empty_paths(vault: Path) -> None
     assert result["report_paths"] == []
 
 
+def test_report_rhetorical_patterns_generates(vault: Path) -> None:
+    """The ``rhetorical-patterns`` report writes a per-register note (#582)."""
+    frags = vault / "01-Fragments" / "Notes"
+    frags.mkdir(parents=True, exist_ok=True)
+    (frags / "ex-1.md").write_text(
+        '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        "source:\n  platform: journal\n  author: self\n"
+        "voice:\n  voice_register: confessional\n  confidence: conviction\n"
+        "---\nThe truth is we rise; as I said before, we rise.\n",
+        encoding="utf-8",
+    )
+    result = report_tool(
+        vault_path=vault,
+        report_type="rhetorical-patterns",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+    assert result["status"] == "ok"
+    assert any("07-Voice/Rhetorical-Patterns" in p for p in result["report_paths"])
+    assert _read_audit(vault)[-1]["tool"] == "creek.report"
+
+
+def test_report_rhetorical_patterns_no_exemplars_returns_empty_paths(
+    vault: Path,
+) -> None:
+    """A rhetorical-patterns report on an exemplar-free vault is ok with no paths."""
+    result = report_tool(
+        vault_path=vault,
+        report_type="rhetorical-patterns",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+    assert result["report_paths"] == []
+
+
 def _seed_voice_exemplar(vault: Path, frag_id: str, body: str) -> None:
     """Write a qualifying voice-exemplar fragment (settled + register) on disk."""
     fm = (

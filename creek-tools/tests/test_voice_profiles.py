@@ -231,6 +231,38 @@ def test_collect_all_exemplars_returns_flat_bodies(vault: Path) -> None:
     assert all(e.body for e in exemplars)
 
 
+def test_generate_rhetorical_patterns_writes_per_register_notes(vault: Path) -> None:
+    """generate_rhetorical_patterns writes a per-register moves note (#582)."""
+    _write_fragment_file(
+        vault,
+        _make_fragment("ex-1", "T1", VoiceRegister.CONFESSIONAL, Confidence.CONVICTION),
+        "Maybe I am wrong, but the truth is we rise. As I said before, we rise.",
+    )
+    _write_fragment_file(
+        vault,
+        _make_fragment("ex-2", "T2", VoiceRegister.CONFESSIONAL, Confidence.SETTLED),
+        "I could be mistaken. Yet it is both true and false. Back to my point.",
+    )
+
+    written = VoiceProfileGenerator().generate_rhetorical_patterns(vault)
+
+    note = vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md"
+    assert note in written
+    text = note.read_text(encoding="utf-8")
+    assert "### Rhetorical Moves" in text
+    post = frontmatter.load(str(note))
+    assert post["type"] == "rhetorical_patterns"
+    assert post["register"] == "confessional"
+
+
+def test_generate_rhetorical_patterns_empty_vault_writes_nothing(vault: Path) -> None:
+    """A vault with no qualifying exemplars writes no notes and no folder (#582)."""
+    written = VoiceProfileGenerator().generate_rhetorical_patterns(vault)
+
+    assert written == []
+    assert not (vault / "07-Voice" / "Rhetorical-Patterns").exists()
+
+
 # ---- Module surface ----
 
 
