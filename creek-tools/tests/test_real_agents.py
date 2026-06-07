@@ -32,6 +32,7 @@ from creek.link.embeddings import (
     fragment_embedding_text,
 )
 from creek.models import Frequency, Phase, VoiceRegister
+from tests.helpers import write_raw_fragment_file as _write
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,40 +42,6 @@ if TYPE_CHECKING:
 def _isolate_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear any leaked ``CREEK_CONFIG`` so tests use vault discovery/defaults."""
     monkeypatch.delenv("CREEK_CONFIG", raising=False)
-
-
-_FM = (
-    '---\ntype: fragment\nid: {id}\ntitle: "{title}"\n'
-    "source:\n  platform: {platform}\n  author: {author}\n{extra}---\n{body}\n"
-)
-
-
-def _write(
-    vault: Path,
-    subdir: str,
-    frag_id: str,
-    title: str,
-    *,
-    body: str = "body",
-    author: str = "self",
-    author_slug: str | None = None,
-    platform: str = "journal",
-) -> None:
-    """Write a minimal fragment markdown file under *subdir*."""
-    folder = vault / subdir
-    folder.mkdir(parents=True, exist_ok=True)
-    extra = f"  author_slug: {author_slug}\n" if author_slug else ""
-    (folder / f"{frag_id}.md").write_text(
-        _FM.format(
-            id=frag_id,
-            title=title,
-            platform=platform,
-            author=author,
-            extra=extra,
-            body=body,
-        ),
-        encoding="utf-8",
-    )
 
 
 def test_retrieval_returns_cited_claims(tmp_path: Path) -> None:

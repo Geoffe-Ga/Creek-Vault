@@ -24,56 +24,10 @@ from creek.author import (
     run_author,
 )
 from creek.author.conductor import build_default_conductor
+from tests.helpers import write_raw_fragment_file as _write
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-_FM = (
-    '---\ntype: fragment\nid: {id}\ntitle: "{title}"\n'
-    "source:\n  platform: {platform}\n  author: {author}\n{extra}---\n{body}\n"
-)
-
-
-def _write(
-    vault: Path,
-    subdir: str,
-    frag_id: str,
-    title: str,
-    *,
-    body: str = "body",
-    author: str = "self",
-    author_slug: str | None = None,
-    platform: str = "journal",
-) -> None:
-    """Write a minimal fragment markdown file under *subdir* of *vault*.
-
-    Mirrors the ``_write`` helper in ``test_real_agents.py`` so other-author
-    fragments are seeded the established way (``author_slug`` in frontmatter).
-
-    Args:
-        vault: The vault root to write under.
-        subdir: The vault subdirectory (e.g. ``11-Other-Authors/<slug>``).
-        frag_id: The fragment id (also the file stem).
-        title: The fragment title.
-        body: The fragment body text.
-        author: The authorship axis (``self``/``other``/...).
-        author_slug: The ``11-Other-Authors/`` slug, or ``None`` for self.
-        platform: The source platform string.
-    """
-    folder = vault / subdir
-    folder.mkdir(parents=True, exist_ok=True)
-    extra = f"  author_slug: {author_slug}\n" if author_slug else ""
-    (folder / f"{frag_id}.md").write_text(
-        _FM.format(
-            id=frag_id,
-            title=title,
-            platform=platform,
-            author=author,
-            extra=extra,
-            body=body,
-        ),
-        encoding="utf-8",
-    )
 
 
 def test_book_report_contract_loads_and_conforms(tmp_path: Path) -> None:
