@@ -1297,6 +1297,45 @@ def test_report_lexicon_no_exemplars_is_friendly(tmp_path: Path) -> None:
     assert not (vault / "07-Voice" / "Lexicon").exists()
 
 
+def test_report_rhetorical_patterns_no_exemplars_is_friendly(tmp_path: Path) -> None:
+    """``report --type rhetorical-patterns`` with no exemplars is friendly (#582)."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No rhetorical patterns written" in result.output
+
+
+def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
+    """``report --type rhetorical-patterns`` writes a per-register note (#582)."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments" / "Journal"
+    frags.mkdir(parents=True)
+    (frags / "ex-1.md").write_text(
+        '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        "source:\n  platform: journal\n  author: self\n"
+        "voice:\n  voice_register: confessional\n  confidence: conviction\n"
+        "---\nThe truth is we rise; as I said before, we rise.\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Rhetorical patterns written" in result.output
+    assert (vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").exists()
+
+
 def test_report_voice_command(tmp_path: Path) -> None:
     """Test that report --type voice generates register profiles."""
     from datetime import UTC, datetime

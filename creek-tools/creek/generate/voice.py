@@ -1427,6 +1427,9 @@ _PROFILE_SUBDIR: str = "07-Voice"
 _PROFILE_FILENAME_SUFFIX: str = "-profile.md"
 """Filename suffix for register profile markdown files."""
 
+_RHETORICAL_SUBDIR: tuple[str, str] = ("07-Voice", "Rhetorical-Patterns")
+"""Vault subdirectory where per-register rhetorical-pattern notes are persisted."""
+
 _DEFAULT_MAX_EXEMPLARS_PER_PROFILE: int = 10
 """Default maximum number of exemplar passages included in a profile."""
 
@@ -1835,6 +1838,53 @@ class VoiceProfileGenerator:
             List of paths written, one per register with exemplars.
         """
         written: list[Path] = []
+        for register, ranked, patterns in self._iter_register_patterns(vault_path):
+            profile = self.generate_profile(register, ranked, patterns)
+            written.append(self.write_profile(profile, vault_path))
+        return written
+
+    def generate_rhetorical_patterns(self, vault_path: Path) -> list[Path]:
+        """Persist a per-register rhetorical-patterns note (#582).
+
+        Reuses the same streaming exemplar collection and pattern extraction as
+        :meth:`generate_all_profiles` (via :meth:`_iter_register_patterns`), but
+        writes only the ontology's "### Rhetorical Moves" section — computed by
+        :func:`_compute_rhetorical_moves` through the pattern extractor — to
+        ``07-Voice/Rhetorical-Patterns/<register>.md``. No move-detection logic
+        is duplicated.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            List of paths written, one per register with exemplars.
+        """
+        return [
+            self._write_rhetorical_note(register, patterns, vault_path)
+            for register, _ranked, patterns in self._iter_register_patterns(vault_path)
+        ]
+
+    # ---- Private helpers ----
+
+    def _iter_register_patterns(
+        self,
+        vault_path: Path,
+    ) -> Iterator[tuple[str, list[Exemplar], VoicePatterns]]:
+        """Yield ``(register, ranked_exemplars, patterns)`` per non-empty register.
+
+        The single streaming exemplar-collection + ranking + pattern-extraction
+        path shared by :meth:`generate_all_profiles` and
+        :meth:`generate_rhetorical_patterns`. Memory peaks at the largest single
+        register: each register's working set is released before the next is
+        loaded (PERF-004).
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Yields:
+            ``(register, ranked exemplars, extracted patterns)`` for every
+            register that has qualifying exemplars.
+        """
         with self._streaming_accumulator(vault_path) as register_paths:
             for register in VOICE_REGISTERS:
                 jsonl_path = register_paths.get(register)
@@ -1850,14 +1900,38 @@ class VoiceProfileGenerator:
                     for e in ranked
                 ]
                 patterns = self._extractor.extract_patterns(bodies, weights=weights)
-                profile = self.generate_profile(register, ranked, patterns)
-                written.append(self.write_profile(profile, vault_path))
-                # Drop the per-register working set before moving on so
-                # the next register's load does not stack on top of it.
-                del register_exemplars, ranked, bodies, patterns, profile
-        return written
+                yield register, ranked, patterns
+                del register_exemplars, ranked, bodies, patterns
 
-    # ---- Private helpers ----
+    def _write_rhetorical_note(
+        self,
+        register: str,
+        patterns: VoicePatterns,
+        vault_path: Path,
+    ) -> Path:
+        """Write *register*'s rhetorical-moves note and return its path."""
+        target_dir = vault_path.joinpath(*_RHETORICAL_SUBDIR)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{register}.md"
+        body = "\n".join(
+            [
+                f"# Rhetorical Patterns — {register}",
+                "",
+                "### Rhetorical Moves",
+                "",
+                *_format_rhetorical_moves(patterns),
+                "",
+            ],
+        )
+        post = frontmatter.Post(
+            content=body,
+            type="rhetorical_patterns",
+            register=register,
+            generated_date=datetime.now(tz=UTC).isoformat(),
+            tags=["voice", "rhetorical-patterns", register],
+        )
+        target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return target
 
     @contextmanager
     def _streaming_accumulator(

@@ -4,7 +4,8 @@ Wraps the CLI's report dispatcher. Generating report types exposed via
 MCP today: ``tags`` (the tag-garden generator), ``voice`` (the
 per-register voice profiles), ``lexicon`` (the voice glossary + metaphor
 index, #580), and ``decisions`` (draft Decision notes from
-decision-signalling fragments, #581). ``unnamed`` and ``wavelength`` are
+decision-signalling fragments, #581), and ``rhetorical-patterns``
+(per-register rhetorical-move notes, #582). ``unnamed`` and ``wavelength`` are
 deferred to the CLI because they need date arithmetic the MCP shape
 should not own. The wrapper writes one audit entry per invocation
 including ``created_path`` for the resulting report file(s).
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 TOOL_NAME = "creek.report"
-_VALID_TYPES = ("tags", "voice", "decisions", "lexicon")
+_VALID_TYPES = ("tags", "voice", "decisions", "lexicon", "rhetorical-patterns")
 
 
 def report_tool(
@@ -58,6 +59,10 @@ def report_tool(
         _lexicon, written_paths = generate_lexicon(vault_path)
     elif report_type == "decisions":
         written_paths = generate_decisions(vault_path)
+    elif report_type == "rhetorical-patterns":
+        written_paths = list(
+            VoiceProfileGenerator().generate_rhetorical_patterns(vault_path),
+        )
     else:
         written_paths = list(
             VoiceProfileGenerator().generate_all_profiles(vault_path),

@@ -37,13 +37,16 @@ body as the prompt when you type `/creek <name>`.
 ### `report` types
 
 `creek report --type <type>` (MCP: `creek.report`) supports `tags`, `voice`,
-`unnamed`, `wavelength`, `fingerprint`, `lexicon`, and `decisions`:
+`unnamed`, `wavelength`, `fingerprint`, `lexicon`, `decisions`, and
+`rhetorical-patterns`:
 
 - `lexicon` — persists the voice glossary + metaphor index to
   `07-Voice/Lexicon/`.
 - `decisions` — writes draft Decision notes from decision-signalling fragments
   to `08-Decisions/Active/` (idempotent: a fragment already captured is
   skipped).
+- `rhetorical-patterns` — writes a per-register rhetorical-moves note to
+  `07-Voice/Rhetorical-Patterns/`.
 
 ### Discoverability
 

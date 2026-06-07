@@ -1341,6 +1341,30 @@ def _report_lexicon(vault_path: Path) -> None:
     )
 
 
+def _report_rhetorical_patterns(vault_path: Path) -> None:
+    """Persist per-register rhetorical-pattern notes (#582).
+
+    Writes the ontology's "### Rhetorical Moves" section per voice register to
+    ``07-Voice/Rhetorical-Patterns/``, reusing the voice subsystem's existing
+    move detection. Mirrors ``_report_voice``'s friendly "no qualifying
+    exemplars" message when the corpus is empty.
+    """
+    from creek.generate.voice import VoiceProfileGenerator
+
+    written_paths = VoiceProfileGenerator().generate_rhetorical_patterns(vault_path)
+    if not written_paths:
+        console.print(
+            "[yellow]No rhetorical patterns written: "
+            "no qualifying exemplars found.[/yellow]",
+        )
+        return
+    names = ", ".join(str(p.relative_to(vault_path)) for p in written_paths)
+    console.print(
+        f"[bold green]Rhetorical patterns written ({len(written_paths)}): "
+        f"{names}[/bold green]",
+    )
+
+
 def _report_wavelength(vault_path: Path, period: str | None) -> None:
     """Generate weekly or monthly wavelength reports."""
     from datetime import date as _date
@@ -1639,6 +1663,7 @@ _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "fingerprint": _report_fingerprint,
     "decisions": _report_decisions,
     "lexicon": _report_lexicon,
+    "rhetorical-patterns": _report_rhetorical_patterns,
 }
 
 
