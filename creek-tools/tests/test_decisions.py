@@ -56,6 +56,64 @@ def detector() -> DecisionDetector:
     return DecisionDetector()
 
 
+def _seed_fragment(vault: Path, fragment: Fragment, body: str = "body") -> None:
+    """Write *fragment* to ``01-Fragments/Conversations/`` for orchestrator tests."""
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content=body, **fragment.model_dump(mode="json"))
+    (frags / f"{fragment.id}.md").write_text(
+        frontmatter.dumps(post),
+        encoding="utf-8",
+    )
+
+
+def test_generate_decisions_writes_note(
+    vault_path: Path,
+    keyword_fragment: Fragment,
+) -> None:
+    """generate_decisions detects a candidate and writes a Decision note (#581)."""
+    from creek.generate.decisions import generate_decisions
+
+    _seed_fragment(vault_path, keyword_fragment)
+
+    written = generate_decisions(vault_path)
+
+    assert len(written) == 1
+    assert written[0].parent == vault_path / "08-Decisions" / "Active"
+    post = frontmatter.load(str(written[0]))
+    assert post["type"] == "decision"
+    assert keyword_fragment.id in post.content
+
+
+def test_generate_decisions_is_idempotent(
+    vault_path: Path,
+    keyword_fragment: Fragment,
+) -> None:
+    """A re-run writes no duplicate note for an already-captured fragment (#581)."""
+    from creek.generate.decisions import generate_decisions
+
+    _seed_fragment(vault_path, keyword_fragment)
+
+    first = generate_decisions(vault_path)
+    second = generate_decisions(vault_path)
+
+    assert len(first) == 1
+    assert second == []
+
+
+def test_generate_decisions_no_candidates(
+    vault_path: Path,
+    neutral_fragment: Fragment,
+) -> None:
+    """A vault with no decision signals yields no notes and writes nothing (#581)."""
+    from creek.generate.decisions import generate_decisions
+
+    _seed_fragment(vault_path, neutral_fragment)
+
+    assert generate_decisions(vault_path) == []
+    assert not any((vault_path / "08-Decisions" / "Active").glob("*.md"))
+
+
 @pytest.fixture()
 def keyword_fragment() -> Fragment:
     """Return a fragment containing decision keywords."""

@@ -17,6 +17,7 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 
 from creek.models import (
     Decision,
@@ -27,6 +28,7 @@ from creek.models import (
     PraxisPotential,
     _generate_decision_id,
 )
+from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -995,3 +997,73 @@ def decision_from_note(note_path: Path) -> Decision:
     else:
         metadata.pop("opened", None)
     return Decision.model_validate(metadata)
+
+
+def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
+    """Return the source fragment ids already captured by Decision notes (#581).
+
+    Scans ``08-Decisions/{Active,Archive}/`` and reads each note's first
+    ``## Source Fragments`` bullet — the source fragment id — so a re-run can
+    skip candidates whose decision note already exists. Unreadable notes are
+    skipped rather than crashing the report.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+
+    Returns:
+        The set of source fragment ids already recorded in Decision notes.
+    """
+    seen: set[str] = set()
+    decisions_dir = vault_path / "08-Decisions"
+    for subfolder in ("Active", "Archive"):
+        folder = decisions_dir / subfolder
+        if not folder.is_dir():
+            continue
+        for md_file in folder.rglob("*.md"):
+            try:
+                post = frontmatter.load(str(md_file))
+            except (OSError, ValueError, yaml.YAMLError):
+                continue
+            in_source_section = False
+            for line in post.content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("## "):
+                    in_source_section = stripped.lower() == "## source fragments"
+                    continue
+                if in_source_section and stripped.startswith("- "):
+                    seen.add(stripped[2:].strip())
+                    break
+    return seen
+
+
+def generate_decisions(vault_path: Path) -> list[Path]:
+    """Detect decision candidates across the vault and write new notes (#581).
+
+    Loads fragments via :func:`creek.vault.reader.iter_vault_fragments` (the
+    shared reader the other vault-iterating reports use), runs
+    :meth:`DecisionDetector.detect_decisions`, and writes one Decision note per
+    candidate whose source fragment is not already captured by an existing note
+    — so re-running is idempotent and never duplicates notes for one fragment.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+
+    Returns:
+        Paths of the newly written Decision notes; empty when there are no new
+        decision candidates.
+    """
+    fragments = [
+        fragment
+        for _path, fragment, _body, _raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+    ]
+    detector = DecisionDetector()
+    already = _existing_decision_fragment_ids(vault_path)
+    written: list[Path] = []
+    for candidate in detector.detect_decisions(fragments):
+        if candidate.fragment_id in already:
+            continue
+        written.append(detector.create_decision_note(candidate, vault_path))
+        already.add(candidate.fragment_id)
+    return written
