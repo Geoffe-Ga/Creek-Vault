@@ -1336,6 +1336,45 @@ def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
     assert (vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").exists()
 
 
+def test_report_mode_profiles_no_data_is_friendly(tmp_path: Path) -> None:
+    """``report --type mode-profiles`` with no classified modes is friendly (#583)."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "mode-profiles", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No mode profiles written" in result.output
+
+
+def test_report_mode_profiles_generates(tmp_path: Path) -> None:
+    """``report --type mode-profiles`` writes a per-mode note (#583)."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments"
+    frags.mkdir(parents=True)
+    (frags / "m1.md").write_text(
+        '---\ntype: fragment\nid: m1\ntitle: "Building momentum"\n'
+        "source:\n  platform: journal\n  author: self\n"
+        "wavelength:\n  mode: express\n  phase: rising\n"
+        "frequency:\n  primary: F3\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "mode-profiles", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Mode profiles written" in result.output
+    assert (vault / "05-Wavelength" / "Mode-Profiles" / "express.md").exists()
+
+
 def test_report_voice_command(tmp_path: Path) -> None:
     """Test that report --type voice generates register profiles."""
     from datetime import UTC, datetime

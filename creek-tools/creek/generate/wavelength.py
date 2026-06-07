@@ -1321,6 +1321,93 @@ def current_phase_summary(
     )
 
 
+_MODE_PROFILE_SUBPATH: tuple[str, str] = ("05-Wavelength", "Mode-Profiles")
+"""Vault subdirectory where per-mode profile notes are persisted (#583)."""
+
+_MODE_PROFILE_SAMPLE_LIMIT: int = 5
+"""Maximum sample fragments listed in a mode profile note."""
+
+
+class ModeProfileGenerator:
+    """Write per-mode engagement profiles to ``05-Wavelength/Mode-Profiles/``.
+
+    Aggregates the corpus by engagement :class:`~creek.models.Mode` — modes are
+    derived from the enum, never hardcoded — and writes one note per mode that
+    has at least one fragment, summarising its fragment count and dominant
+    frequency / phase. Modes with no fragments are skipped (no empty notes), so
+    an unclassified corpus produces no files at all (#583).
+    """
+
+    def generate_mode_profiles(self, vault_path: Path) -> list[Path]:
+        """Write one profile note per non-empty engagement mode.
+
+        Args:
+            vault_path: Path to the root of the Obsidian vault.
+
+        Returns:
+            Paths written, in canonical :class:`~creek.models.Mode` order; empty
+            when no fragment carries a classified mode.
+        """
+        by_mode: dict[str, list[Fragment]] = defaultdict(list)
+        for fragment in _load_fragments_from_vault(vault_path):
+            mode = str(fragment.wavelength.mode)
+            if mode != Mode.UNCLASSIFIED:
+                by_mode[mode].append(fragment)
+        written: list[Path] = []
+        for mode in Mode:
+            if mode is Mode.UNCLASSIFIED:
+                continue
+            fragments = by_mode.get(mode.value)
+            if fragments:
+                written.append(
+                    self._write_mode_profile(mode.value, fragments, vault_path),
+                )
+        return written
+
+    @staticmethod
+    def _write_mode_profile(
+        mode: str,
+        fragments: list[Fragment],
+        vault_path: Path,
+    ) -> Path:
+        """Render and write a single mode's profile note; return its path."""
+        target_dir = vault_path.joinpath(*_MODE_PROFILE_SUBPATH)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dominant_frequency = _most_common_classified(
+            [str(f.frequency.primary) for f in fragments],
+            Frequency.UNCLASSIFIED,
+        )
+        dominant_phase = _most_common_classified(
+            [str(f.wavelength.phase) for f in fragments],
+            Phase.UNCLASSIFIED,
+        )
+        lines = [
+            f"# Mode Profile — {mode}",
+            "",
+            f"- Fragments in this mode: {len(fragments)}",
+            f"- Dominant frequency: {dominant_frequency}",
+            f"- Dominant phase: {dominant_phase}",
+            "",
+            "## Sample Fragments",
+            "",
+            *(f"- {f.title} ({f.id})" for f in fragments[:_MODE_PROFILE_SAMPLE_LIMIT]),
+            "",
+        ]
+        post = frontmatter.Post(
+            content="\n".join(lines),
+            type="mode_profile",
+            mode=mode,
+            fragment_count=len(fragments),
+            dominant_frequency=dominant_frequency,
+            dominant_phase=dominant_phase,
+            generated_date=datetime.now(tz=UTC).isoformat(),
+            tags=["wavelength", "mode-profile", mode],
+        )
+        target = target_dir / f"{mode}.md"
+        target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return target
+
+
 __all__ = [
     "DEFAULT_CURRENT_PHASE_WINDOW_DAYS",
     "DEFAULT_ROLLING_WEEKS",
@@ -1330,6 +1417,7 @@ __all__ = [
     "PHASE_DOMAIN_MAPPINGS",
     "CurrentPhaseSummary",
     "DosageTrend",
+    "ModeProfileGenerator",
     "PhaseTransition",
     "WavelengthSnapshot",
     "WavelengthTracker",

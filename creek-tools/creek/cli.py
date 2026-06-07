@@ -1365,6 +1365,28 @@ def _report_rhetorical_patterns(vault_path: Path) -> None:
     )
 
 
+def _report_mode_profiles(vault_path: Path) -> None:
+    """Generate per-mode wavelength profiles to 05-Wavelength/Mode-Profiles/ (#583).
+
+    Writes one note per engagement mode that has fragments; prints a friendly
+    message when no fragment carries a classified mode.
+    """
+    from creek.generate.wavelength import ModeProfileGenerator
+
+    written_paths = ModeProfileGenerator().generate_mode_profiles(vault_path)
+    if not written_paths:
+        console.print(
+            "[yellow]No mode profiles written: "
+            "no classified-mode fragments found.[/yellow]",
+        )
+        return
+    names = ", ".join(str(p.relative_to(vault_path)) for p in written_paths)
+    console.print(
+        f"[bold green]Mode profiles written ({len(written_paths)}): "
+        f"{names}[/bold green]",
+    )
+
+
 def _report_wavelength(vault_path: Path, period: str | None) -> None:
     """Generate weekly or monthly wavelength reports."""
     from datetime import date as _date
@@ -1664,6 +1686,7 @@ _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "decisions": _report_decisions,
     "lexicon": _report_lexicon,
     "rhetorical-patterns": _report_rhetorical_patterns,
+    "mode-profiles": _report_mode_profiles,
 }
 
 
