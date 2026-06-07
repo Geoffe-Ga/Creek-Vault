@@ -560,6 +560,40 @@ def test_report_rhetorical_patterns_no_exemplars_returns_empty_paths(
     assert result["report_paths"] == []
 
 
+def test_report_mode_profiles_generates(vault: Path) -> None:
+    """The ``mode-profiles`` report writes a per-mode note (#583)."""
+    frags = vault / "01-Fragments" / "Notes"
+    frags.mkdir(parents=True, exist_ok=True)
+    (frags / "m1.md").write_text(
+        '---\ntype: fragment\nid: m1\ntitle: "Building momentum"\n'
+        "source:\n  platform: journal\n  author: self\n"
+        "wavelength:\n  mode: express\n  phase: rising\n"
+        "frequency:\n  primary: F3\n---\nbody\n",
+        encoding="utf-8",
+    )
+    result = report_tool(
+        vault_path=vault,
+        report_type="mode-profiles",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+    assert result["status"] == "ok"
+    assert any("05-Wavelength/Mode-Profiles" in p for p in result["report_paths"])
+    assert _read_audit(vault)[-1]["tool"] == "creek.report"
+
+
+def test_report_mode_profiles_no_data_returns_empty_paths(vault: Path) -> None:
+    """A mode-profiles report on a vault with no classified modes is ok, no paths."""
+    result = report_tool(
+        vault_path=vault,
+        report_type="mode-profiles",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+    assert result["status"] == "ok"
+    assert result["report_paths"] == []
+
+
 def _seed_voice_exemplar(vault: Path, frag_id: str, body: str) -> None:
     """Write a qualifying voice-exemplar fragment (settled + register) on disk."""
     fm = (

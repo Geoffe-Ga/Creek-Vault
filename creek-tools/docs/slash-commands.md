@@ -47,6 +47,8 @@ body as the prompt when you type `/creek <name>`.
   skipped).
 - `rhetorical-patterns` — writes a per-register rhetorical-moves note to
   `07-Voice/Rhetorical-Patterns/`.
+- `mode-profiles` — writes a per-engagement-mode profile to
+  `05-Wavelength/Mode-Profiles/`.
 
 ### Discoverability
 

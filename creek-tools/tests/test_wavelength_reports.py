@@ -15,6 +15,7 @@ import pytest
 
 from creek.generate.wavelength import (
     PHASE_DOMAIN_MAPPINGS,
+    ModeProfileGenerator,
     WavelengthTracker,
 )
 from creek.models import (
@@ -596,3 +597,74 @@ class TestGenerateMonthlyReport:
         )
         body = frontmatter.load(str(path)).content
         assert "(empty)" in body
+
+
+def _seed_fragments(vault: Path, fragments: list[Fragment]) -> None:
+    """Write *fragments* to ``01-Fragments/`` for ModeProfileGenerator tests."""
+    frags_dir = vault / "01-Fragments"
+    frags_dir.mkdir(parents=True, exist_ok=True)
+    for fragment in fragments:
+        post = frontmatter.Post(
+            content=fragment.title,
+            **fragment.model_dump(mode="json"),
+        )
+        (frags_dir / f"{fragment.id}.md").write_text(
+            frontmatter.dumps(post),
+            encoding="utf-8",
+        )
+
+
+class TestModeProfileGenerator:
+    """Per-mode profile notes under ``05-Wavelength/Mode-Profiles/`` (#583)."""
+
+    def test_writes_one_note_per_nonempty_mode(self, vault_path: Path) -> None:
+        """One note per engagement mode that has fragments; aggregates counts."""
+        base = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+        _seed_fragments(
+            vault_path,
+            [
+                _make_fragment(
+                    frag_id="m1",
+                    created=base,
+                    mode=Mode.EXPRESS,
+                    frequency=Frequency.F3,
+                    phase=Phase.RISING,
+                ),
+                _make_fragment(
+                    frag_id="m2",
+                    created=base,
+                    mode=Mode.EXPRESS,
+                    frequency=Frequency.F3,
+                    phase=Phase.RISING,
+                ),
+                _make_fragment(
+                    frag_id="m3",
+                    created=base,
+                    mode=Mode.INHABIT,
+                    frequency=Frequency.F6,
+                    phase=Phase.PEAKING,
+                ),
+            ],
+        )
+
+        written = ModeProfileGenerator().generate_mode_profiles(vault_path)
+
+        assert {p.name for p in written} == {"express.md", "inhabit.md"}
+        express = vault_path / "05-Wavelength" / "Mode-Profiles" / "express.md"
+        post = frontmatter.load(str(express))
+        assert post["type"] == "mode_profile"
+        assert post["fragment_count"] == 2
+        assert "m1" in post.content
+        assert "m2" in post.content
+
+    def test_no_classified_modes_writes_nothing(self, vault_path: Path) -> None:
+        """An all-unclassified-mode corpus produces no notes and no folder."""
+        _seed_fragments(
+            vault_path,
+            [_make_fragment(frag_id="u1", created=datetime(2026, 4, 20, tzinfo=UTC))],
+        )
+
+        written = ModeProfileGenerator().generate_mode_profiles(vault_path)
+
+        assert written == []
+        assert not (vault_path / "05-Wavelength" / "Mode-Profiles").exists()
