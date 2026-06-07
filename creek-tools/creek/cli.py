@@ -2989,12 +2989,22 @@ def _compose_author_query(query: str | None, work: Path | None) -> str:
 
     Returns:
         The effective query string to author from.
+
+    Raises:
+        ValueError: If both ``query`` and ``work`` are ``None`` — the
+            upstream-validated invariant has been violated.
     """
     if work is not None:
         derived = f"Report on the work at {work}, relating it to my threads and eddies."
         return f"{derived} {query}" if query else derived
-    # Validation guarantees a non-None query for non-book-report mediums.
-    return query or ""
+    if query is None:
+        # Unreachable via the CLI: ``_validate_author_inputs`` requires a query
+        # for every non-book-report medium, and book-report always supplies
+        # ``--work`` (handled above). Make that contract explicit instead of
+        # silently authoring from an empty query.
+        msg = "--query or --work must be provided to compose an author query."
+        raise ValueError(msg)
+    return query
 
 
 @app.command()
@@ -3011,6 +3021,9 @@ def author(
     work: Path | None = typer.Option(
         None,
         "--work",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
         help="For book-report: the 11-Other-Authors/<author>/<work> path to report on.",
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
 from typer.testing import CliRunner
 
-from creek.cli import app
+from creek.cli import _compose_author_query, app
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -130,6 +131,63 @@ def test_author_book_report_runs_from_work_without_query(tmp_path: Path) -> None
 
     assert result.exit_code == 0, result.output
     assert "verdict=" in result.output
+
+
+def test_author_book_report_rejects_missing_work(tmp_path: Path) -> None:
+    """``--work`` pointing at a non-existent path fails fast with a typer error."""
+    vault = _vault(tmp_path)
+    missing = vault / "11-Other-Authors" / "nobody" / "no-such-work"
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "book-report",
+            "--work",
+            str(missing),
+            "--vault",
+            str(vault),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--work" in result.output
+    assert "does not exist" in result.output
+
+
+def test_author_book_report_rejects_file_work(tmp_path: Path) -> None:
+    """``--work`` pointing at a file (not a work directory) is rejected."""
+    vault = _vault(tmp_path)
+    work_file = vault / "11-Other-Authors" / "naval-ravikant" / "on-leverage.md"
+    work_file.parent.mkdir(parents=True)
+    work_file.write_text("not a directory", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "book-report",
+            "--work",
+            str(work_file),
+            "--vault",
+            str(vault),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "--work" in result.output
+
+
+def test_compose_author_query_requires_query_or_work() -> None:
+    """The composer makes its upstream-validated invariant explicit.
+
+    ``_validate_author_inputs`` guarantees a non-None query for every
+    non-book-report medium (and book-report always carries ``--work``), so
+    reaching the composer with both ``None`` is a programming error — it raises
+    rather than silently authoring from an empty query.
+    """
+    with pytest.raises(ValueError, match="--query or --work"):
+        _compose_author_query(None, None)
 
 
 def test_author_max_rounds_out_of_range(tmp_path: Path) -> None:
