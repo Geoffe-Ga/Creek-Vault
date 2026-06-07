@@ -493,6 +493,39 @@ def test_report_tags_writes_audit_entry(vault: Path) -> None:
     assert entries[-1]["tool"] == "creek.report"
 
 
+def test_report_decisions_stub_returns_would_generate(vault: Path) -> None:
+    """The ``decisions`` skeleton routes to a stub: ok, no paths, writes nothing."""
+    result = report_tool(
+        vault_path=vault,
+        report_type="decisions",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+    assert result["report_type"] == "decisions"
+    assert result["report_paths"] == []
+    assert "would generate" in result["note"].lower()
+    assert "08-Decisions/" in result["note"]
+    # The invocation is still audited, but nothing was written — the audit
+    # entry omits ``created_path`` entirely when no file is produced.
+    last = _read_audit(vault)[-1]
+    assert last["tool"] == "creek.report"
+    assert "created_path" not in last
+
+
+def test_report_lexicon_stub_returns_would_generate(vault: Path) -> None:
+    """The ``lexicon`` skeleton routes to a stub: ok, no paths, writes nothing."""
+    result = report_tool(
+        vault_path=vault,
+        report_type="lexicon",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+    assert result["report_type"] == "lexicon"
+    assert result["report_paths"] == []
+    assert "would generate" in result["note"].lower()
+    assert "07-Voice/Lexicon/" in result["note"]
+
+
 # ---------------------------------------------------------------------------
 # skills.refresh
 # ---------------------------------------------------------------------------

@@ -1,9 +1,11 @@
 """``creek.report`` MCP tool — produce a vault-state report (FEAT-011).
 
-Wraps the CLI's report dispatcher. Two report types are exposed via
+Wraps the CLI's report dispatcher. Generating report types exposed via
 MCP today: ``tags`` (the tag-garden generator) and ``voice`` (the
-per-register voice profiles). ``unnamed`` and ``wavelength`` are
-deferred to the CLI because they need date arithmetic the MCP shape
+per-register voice profiles). ``decisions`` and ``lexicon`` are wired as
+skeletons (#579) — routable but not yet generating; they return a typed
+"would generate" note and write nothing. ``unnamed`` and ``wavelength``
+are deferred to the CLI because they need date arithmetic the MCP shape
 should not own. The wrapper writes one audit entry per invocation
 including ``created_path`` for the resulting report file(s).
 """
@@ -21,7 +23,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 TOOL_NAME = "creek.report"
-_VALID_TYPES = ("tags", "voice")
+_VALID_TYPES = ("tags", "voice", "decisions", "lexicon")
+
+#: Skeleton report types (#579): routing is wired, generation is not. Each maps
+#: to the human-readable target the follow-up will persist. Stubs write nothing.
+_STUB_TYPES = {
+    "decisions": "decision notes at 08-Decisions/",
+    "lexicon": "lexicon glossary at 07-Voice/Lexicon/",
+}
 
 
 def report_tool(
@@ -46,6 +55,29 @@ def report_tool(
                 f"available via MCP: {', '.join(_VALID_TYPES)}"
             ),
         )
+    if report_type in _STUB_TYPES:
+        # Skeleton tracer (#579): the type is routable but its generator is not
+        # yet wired. Audit the invocation (nothing written) and report intent.
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args={"report_type": report_type},
+            tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+            created_path=None,
+            created_tier=None,
+            affected_fragment_ids=[],
+        )
+        return {
+            "status": "ok",
+            "tool": TOOL_NAME,
+            "tier_ceiling": privacy_tier_ceiling.value,
+            "report_type": report_type,
+            "report_paths": [],
+            "note": (
+                f"would generate: {_STUB_TYPES[report_type]} "
+                "(not yet wired — see follow-up)"
+            ),
+        }
     if report_type == "tags":
         written_paths = [
             TagGardenGenerator(vault_path=vault_path).generate_garden(),

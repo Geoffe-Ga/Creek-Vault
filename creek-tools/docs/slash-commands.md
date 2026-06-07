@@ -34,6 +34,18 @@ body as the prompt when you type `/creek <name>`.
 | `/creek skills [--refresh]` | `creek.skills` / `creek.skills.refresh` | Inspect or regenerate the voice-skill tree. |
 | `/creek ingest --type ... --input ...` | `creek.ingest` | Run the ingestion pipeline on a new source. |
 
+### `report` types
+
+`creek report --type <type>` (MCP: `creek.report`) supports `tags`, `voice`,
+`unnamed`, `wavelength`, and `fingerprint`. Two further types are **available
+as skeletons** — routing is wired but generation lands in follow-ups:
+
+- `decisions` — will persist decision notes to `08-Decisions/`.
+- `lexicon` — will persist a glossary to `07-Voice/Lexicon/`.
+
+Invoking a skeleton type prints/returns a "would generate …" message and writes
+nothing.
+
 ### Discoverability
 
 `/creek explain` lists every subcommand. Bare `/creek` runs the default

@@ -1293,6 +1293,32 @@ def _report_voice(vault_path: Path) -> None:
     )
 
 
+def _report_decisions(vault_path: Path) -> None:
+    """Stub for the ``decisions`` report (skeleton; #579).
+
+    Routing tracer only — emits a typed "would generate" line and writes
+    nothing. The real ``DecisionDetector`` wiring lands in the follow-up that
+    persists ``08-Decisions/``; this proves the dispatch end-to-end first.
+    """
+    console.print(
+        "[bold green]Would generate: decision notes at 08-Decisions/ "
+        "(not yet wired — see follow-up)[/bold green]",
+    )
+
+
+def _report_lexicon(vault_path: Path) -> None:
+    """Stub for the ``lexicon`` report (skeleton; #579).
+
+    Routing tracer only — emits a typed "would generate" line and writes
+    nothing. The real ``LexiconGenerator`` wiring lands in the follow-up that
+    persists ``07-Voice/Lexicon/``; this proves the dispatch end-to-end first.
+    """
+    console.print(
+        "[bold green]Would generate: lexicon glossary at 07-Voice/Lexicon/ "
+        "(not yet wired — see follow-up)[/bold green]",
+    )
+
+
 def _report_wavelength(vault_path: Path, period: str | None) -> None:
     """Generate weekly or monthly wavelength reports."""
     from datetime import date as _date
@@ -1589,6 +1615,8 @@ _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "unnamed": _report_unnamed,
     "voice": _report_voice,
     "fingerprint": _report_fingerprint,
+    "decisions": _report_decisions,
+    "lexicon": _report_lexicon,
 }
 
 
