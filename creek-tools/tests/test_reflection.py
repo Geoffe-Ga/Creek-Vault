@@ -163,6 +163,65 @@ def test_privacy_substantive_leak_still_flags(tmp_path: Path) -> None:
     assert any(f.dimension == "privacy_compliance" for f in result.findings)
 
 
+def test_privacy_exact_threshold_fragment_flags(tmp_path: Path) -> None:
+    """A body at exactly the word threshold still flags (off-by-one guard).
+
+    The threshold is ``len(words) < _MIN_PROTECTED_LEAK_WORDS``; an accidental
+    ``<=`` would silently swallow 4-word secrets. This pins the boundary (#508).
+    """
+    secret = "four word protected secret"  # exactly _MIN_PROTECTED_LEAK_WORDS
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = f"The draft reveals: {secret}."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_reflowed_line_break_still_flags(tmp_path: Path) -> None:
+    """A verbatim leak split across a line break is caught after normalisation.
+
+    Whitespace is collapsed on both sides before matching, so reflowing the
+    protected text across a newline cannot hide an otherwise-verbatim leak from
+    the HARD gate (#508).
+    """
+    secret = "my private therapy session notes"
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "leaked here: my private therapy\nsession notes — oops"
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_no_flag_on_substring_within_larger_word(tmp_path: Path) -> None:
+    """A protected phrase embedded inside larger tokens must not flag.
+
+    Word-boundary anchoring means the snippet only counts as leaked when it
+    appears as a bounded phrase, not as a substring glued inside other text
+    (#508).
+    """
+    secret = "private session notes record"
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "Xprivate session notes recordY"  # no word boundaries around the phrase
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
 def test_privacy_open_fragment_passes(tmp_path: Path) -> None:
     """An OPEN cited fragment at the OPEN default → no privacy finding (PASS)."""
     text = "an openly publishable observation"
