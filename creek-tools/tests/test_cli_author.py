@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -13,6 +14,19 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 runner = CliRunner()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Return *text* with ANSI SGR colour escape codes removed.
+
+    typer/rich style option names per-character under a colour-forcing
+    terminal, which splits a literal like ``--work`` across escape sequences;
+    stripping them rejoins the token so substring assertions are environment
+    agnostic.
+    """
+    return _ANSI_RE.sub("", text)
 
 
 def _vault(tmp_path: Path) -> Path:
@@ -151,8 +165,12 @@ def test_author_book_report_rejects_missing_work(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2, result.output
-    assert "--work" in result.output
-    assert "does not exist" in result.output
+    # typer renders the option name with per-character ANSI styling under a
+    # colour-forcing terminal (CI), which splits the literal "--work"; strip
+    # escape codes before matching so the assertion holds in every environment.
+    plain = _strip_ansi(result.output)
+    assert "--work" in plain
+    assert "does not exist" in plain
 
 
 def test_author_book_report_rejects_file_work(tmp_path: Path) -> None:
@@ -175,7 +193,9 @@ def test_author_book_report_rejects_file_work(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2, result.output
-    assert "--work" in result.output
+    plain = _strip_ansi(result.output)
+    assert "--work" in plain
+    assert "is a file" in plain
 
 
 def test_compose_author_query_requires_query_or_work() -> None:
