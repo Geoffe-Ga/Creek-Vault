@@ -1,19 +1,21 @@
 """``creek.report`` MCP tool — produce a vault-state report (FEAT-011).
 
 Wraps the CLI's report dispatcher. Generating report types exposed via
-MCP today: ``tags`` (the tag-garden generator) and ``voice`` (the
-per-register voice profiles). ``decisions`` and ``lexicon`` are wired as
-skeletons (#579) — routable but not yet generating; they return a typed
-"would generate" note and write nothing. ``unnamed`` and ``wavelength``
-are deferred to the CLI because they need date arithmetic the MCP shape
-should not own. The wrapper writes one audit entry per invocation
-including ``created_path`` for the resulting report file(s).
+MCP today: ``tags`` (the tag-garden generator), ``voice`` (the
+per-register voice profiles), and ``lexicon`` (the voice glossary +
+metaphor index, #580). ``decisions`` is wired as a skeleton (#579) —
+routable but not yet generating; it returns a typed "would generate"
+note and writes nothing. ``unnamed`` and ``wavelength`` are deferred to
+the CLI because they need date arithmetic the MCP shape should not own.
+The wrapper writes one audit entry per invocation including
+``created_path`` for the resulting report file(s).
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from creek.generate.lexicon import generate_lexicon
 from creek.generate.tags import TagGardenGenerator
 from creek.generate.voice import VoiceProfileGenerator
 from creek_mcp.audit import MCPAuditLog
@@ -27,9 +29,9 @@ _VALID_TYPES = ("tags", "voice", "decisions", "lexicon")
 
 #: Skeleton report types (#579): routing is wired, generation is not. Each maps
 #: to the human-readable target the follow-up will persist. Stubs write nothing.
+#: ``lexicon`` graduated to real generation in #580.
 _STUB_TYPES = {
     "decisions": "decision notes at 08-Decisions/",
-    "lexicon": "lexicon glossary at 07-Voice/Lexicon/",
 }
 
 
@@ -82,6 +84,8 @@ def report_tool(
         written_paths = [
             TagGardenGenerator(vault_path=vault_path).generate_garden(),
         ]
+    elif report_type == "lexicon":
+        _lexicon, written_paths = generate_lexicon(vault_path)
     else:
         written_paths = list(
             VoiceProfileGenerator().generate_all_profiles(vault_path),

@@ -512,18 +512,52 @@ def test_report_decisions_stub_returns_would_generate(vault: Path) -> None:
     assert "created_path" not in last
 
 
-def test_report_lexicon_stub_returns_would_generate(vault: Path) -> None:
-    """The ``lexicon`` skeleton routes to a stub: ok, no paths, writes nothing."""
+def _seed_voice_exemplar(vault: Path, frag_id: str, body: str) -> None:
+    """Write a qualifying voice-exemplar fragment (settled + register) on disk."""
+    fm = (
+        f'type: fragment\nid: {frag_id}\ntitle: "T {frag_id}"\n'
+        "source:\n  platform: journal\n  author: self\n"
+        "frequency:\n  primary: F5\n"
+        "wavelength:\n  phase: rising\n  mode: express\n"
+        "voice:\n  voice_register: confessional\n  confidence: settled\n"
+        "privacy_tier: personal\n"
+    )
+    (vault / "01-Fragments" / "Notes" / f"{frag_id}.md").write_text(
+        f"---\n{fm}---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_report_lexicon_generates_glossary(vault: Path) -> None:
+    """The ``lexicon`` report now generates a real glossary (#580), not a stub."""
+    _seed_voice_exemplar(
+        vault,
+        "ex-1",
+        "The dharma teaches that the river flows; the river flows toward the sea.",
+    )
+    result = report_tool(
+        vault_path=vault,
+        report_type="lexicon",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+    assert result["status"] == "ok"
+    assert result["report_type"] == "lexicon"
+    assert any("glossary.md" in p for p in result["report_paths"])
+    assert (vault / "07-Voice" / "Lexicon" / "glossary.md").exists()
+    assert _read_audit(vault)[-1]["tool"] == "creek.report"
+
+
+def test_report_lexicon_no_exemplars_returns_empty_paths(vault: Path) -> None:
+    """A lexicon report on an exemplar-free vault is ok with no paths, no file."""
     result = report_tool(
         vault_path=vault,
         report_type="lexicon",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "ok"
-    assert result["report_type"] == "lexicon"
     assert result["report_paths"] == []
-    assert "would generate" in result["note"].lower()
-    assert "07-Voice/Lexicon/" in result["note"]
+    assert not (vault / "07-Voice" / "Lexicon").exists()
 
 
 # ---------------------------------------------------------------------------

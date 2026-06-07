@@ -1249,10 +1249,16 @@ def test_report_decisions_skeleton_stub(tmp_path: Path) -> None:
     assert not (vault / "08-Decisions").exists()
 
 
-def test_report_lexicon_skeleton_stub(tmp_path: Path) -> None:
-    """``report --type lexicon`` routes to its stub handler and writes nothing."""
+def test_report_lexicon_no_exemplars_is_friendly(tmp_path: Path) -> None:
+    """``report --type lexicon`` on a vault with no exemplars is friendly (#580).
+
+    The handler is now real (not the #579 stub), so an empty corpus prints the
+    "no qualifying exemplars" message, writes no glossary, and never falls back
+    to the old "Would generate" stub text.
+    """
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
 
     result = runner.invoke(
         app,
@@ -1260,8 +1266,8 @@ def test_report_lexicon_skeleton_stub(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "Would generate" in result.output
-    assert "07-Voice/Lexicon/" in result.output
+    assert "No lexicon generated" in result.output
+    assert "Would generate" not in result.output
     assert not (vault / "07-Voice" / "Lexicon").exists()
 
 

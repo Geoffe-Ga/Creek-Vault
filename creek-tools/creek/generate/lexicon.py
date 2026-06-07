@@ -743,6 +743,40 @@ class LexiconGenerator:
         return "\n".join(lines)
 
 
+def generate_lexicon(vault_path: Path) -> tuple[Lexicon | None, list[Path]]:
+    """Collect the voice corpus, build the lexicon, and persist it (#580).
+
+    Reuses :meth:`creek.generate.voice.VoiceExemplarCollector.collect_all_exemplars`
+    (the same eligibility gate the voice-profile report uses) so the lexicon and
+    voice reports draw on one exemplar source of truth, extracts voice patterns
+    from their bodies, builds a :class:`Lexicon`, and writes the glossary plus
+    the per-domain metaphor index under ``07-Voice/Lexicon/``.
+
+    Coinage detection is reference-corpus gated (see
+    :class:`LexiconGenerator`); with no corpus configured the glossary still
+    fills from metaphors, distinctive phrases, and borrowed terms.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+
+    Returns:
+        ``(lexicon, written_paths)``. When the vault has no qualifying
+        exemplars, returns ``(None, [])`` and writes nothing — the caller
+        renders a friendly "no exemplars" message.
+    """
+    from creek.generate.voice import VoiceExemplarCollector, VoicePatternExtractor
+
+    exemplars = VoiceExemplarCollector().collect_all_exemplars(vault_path)
+    if not exemplars:
+        return None, []
+    patterns = VoicePatternExtractor().extract_patterns([e.body for e in exemplars])
+    generator = LexiconGenerator()
+    lexicon = generator.build_lexicon(exemplars, patterns)
+    glossary_path = generator.write_lexicon(lexicon, vault_path)
+    metaphor_paths = generator.write_metaphor_index(lexicon, vault_path)
+    return lexicon, [glossary_path, *metaphor_paths]
+
+
 __all__ = [
     "TRADITION_GLOSSARIES",
     "BorrowedTermEntry",
@@ -752,4 +786,5 @@ __all__ = [
     "LexiconContext",
     "LexiconGenerator",
     "MetaphorInventory",
+    "generate_lexicon",
 ]
