@@ -459,6 +459,49 @@ def test_cli_save_thread_round_trip(tmp_path: Path) -> None:
     assert "A thoughtful synthesis." in post.content
 
 
+def test_cli_save_observation_round_trip(tmp_path: Path) -> None:
+    """Integration: --target observation files into the Observations folder (#584)."""
+    vault = _scaffold_vault(tmp_path / "vault")
+    body_file = tmp_path / "obs.md"
+    body_file.write_text("Felt the F2 to F7 turn today.", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "observation",
+            "--body",
+            str(body_file),
+            "--title",
+            "Afternoon turn",
+            "--tier",
+            "open",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written = list((vault / "05-Wavelength" / "Observations").glob("*.md"))
+    assert len(written) == 1
+    post = frontmatter.load(str(written[0]))
+    assert post["type"] == "observation"
+    assert "Felt the F2 to F7 turn today." in post.content
+
+
+def test_saved_observation_lands_in_decision_context_read_dir(tmp_path: Path) -> None:
+    """A saved observation lands exactly where DecisionContextGatherer reads (#584).
+
+    ``DecisionContextGatherer._current_wavelength`` scans
+    ``05-Wavelength/Observations/``; routing a save there closes the
+    producer→consumer loop the folder previously lacked.
+    """
+    vault = _scaffold_vault(tmp_path / "vault")
+
+    path = save_to_vault(_make_request(SaveTarget.OBSERVATION), vault_path=vault)
+
+    assert path.parent == vault / "05-Wavelength" / "Observations"
+
+
 def test_cli_save_paradox_routing(tmp_path: Path) -> None:
     """A paradox save lands in 10-Liminal/Paradoxes via the CLI too."""
     vault = _scaffold_vault(tmp_path / "vault")

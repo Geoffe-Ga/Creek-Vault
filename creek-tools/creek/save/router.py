@@ -41,6 +41,7 @@ class SaveTarget(StrEnum):
     UNNAMED = "unnamed"
     DRAFT = "draft"
     AI_AS_USER = "ai-as-user"
+    OBSERVATION = "observation"
 
 
 TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
@@ -51,6 +52,7 @@ TARGET_SUBDIRS: dict[SaveTarget, tuple[str, ...]] = {
     SaveTarget.UNNAMED: ("10-Liminal", "Unnamed"),
     SaveTarget.DRAFT: ("07-Voice", "Drafts"),
     SaveTarget.AI_AS_USER: ("11-Other-Authors", "ai-as-user"),
+    SaveTarget.OBSERVATION: ("05-Wavelength", "Observations"),
 }
 """Canonical mapping of save targets to vault subdirectories.
 
