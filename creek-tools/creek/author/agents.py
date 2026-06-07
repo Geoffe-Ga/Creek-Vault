@@ -282,21 +282,37 @@ def _wikilink_targets(
     return resolved
 
 
+def _resolve_titles(corpus: list[tuple[Fragment, str]]) -> dict[str, str]:
+    """Map each *unambiguous* title to its fragment id (collisions dropped).
+
+    A title shared by two or more corpus fragments is omitted, so a wikilink to
+    it resolves to nothing rather than silently linking the wrong fragment.
+    """
+    title_counts = Counter(fragment.title for fragment, _ in corpus)
+    return {
+        fragment.title: fragment.id
+        for fragment, _ in corpus
+        if title_counts[fragment.title] == 1
+    }
+
+
 def _build_link_graph(corpus: list[tuple[Fragment, str]]) -> dict[str, set[str]]:
     """Build an undirected adjacency map from wikilinks and parent/child edges.
 
     Wikilink targets are resolved to fragment ids by id or by title; unresolved
     targets are dropped. Edges are bidirectional so the walk follows backlinks.
 
-    Duplicate-title resolution is **last-wins**: when two corpus fragments share
-    a title, the ``by_title`` map maps that title to the id of the *last*
-    fragment in corpus order, so a ``[[Shared Title]]`` wikilink targets it.
-    Ids are always preferred over titles — :func:`_wikilink_targets` checks
-    ``by_id`` first — so an exact-id link never falls through to title lookup.
+    Duplicate-title resolution is **skip-on-collision**: when two or more corpus
+    fragments share a title, that title is omitted from the ``by_title`` map, so
+    a ``[[Shared Title]]`` wikilink resolves to nothing rather than silently
+    linking the wrong fragment. Ids are always preferred over titles —
+    :func:`_wikilink_targets` checks ``by_id`` first — so an exact-id link still
+    resolves even when the fragment's title is ambiguous.
     """
     by_id = {fragment.id for fragment, _ in corpus}
-    # Last-wins on duplicate titles (the comprehension keeps the final entry).
-    by_title = {fragment.title: fragment.id for fragment, _ in corpus}
+    # Drop ambiguous titles (see _resolve_titles): a shared title resolves to no
+    # id, since mis-linking the wrong fragment is worse than dropping the link.
+    by_title = _resolve_titles(corpus)
     graph: dict[str, set[str]] = {fragment.id: set() for fragment, _ in corpus}
     for fragment, body in corpus:
         neighbours = {fragment.parent_id, *fragment.child_ids}
@@ -322,7 +338,7 @@ def _bounded_walk(
     seen = {seed}
     frontier = [seed]
     max_depth = 0
-    for current in range(1, depth + 1):
+    for hop in range(1, depth + 1):
         candidates = sorted(
             {n for node in frontier for n in graph.get(node, set()) if n not in seen}
         )
@@ -332,7 +348,7 @@ def _bounded_walk(
         seen.update(layer)
         visited.extend(layer)
         frontier = layer
-        max_depth = current
+        max_depth = hop
     return visited, max_depth
 
 
