@@ -19,7 +19,12 @@ from creek.author.contracts import load_medium_contract
 from creek.author.models import EvidenceBundle, EvidenceClaim
 from creek.author.reflection import ReflectionNode
 from creek.author.skills import read_skill
-from creek.author.voice import VoiceAgent
+from creek.author.voice import (
+    VoiceAgent,
+    _deterministic_body,
+    _evidence_section,
+    _owner_claims,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -134,8 +139,35 @@ def test_run_grounded_and_voiced_end_to_end(tmp_path: Path) -> None:
 
     assert draft.provenance
     assert all(entry.fragment_ids for entry in draft.provenance)
-    assert draft.rendered_text == "Voiced in the owner's register."
+    # Structural / containment assertions (not exact equality) so a future
+    # body-wrapping change can't make this brittle (#503).
+    assert draft.rendered_text.strip()
+    assert "Voiced in the owner's register." in draft.rendered_text
     provider.call_with_metadata.assert_called_once()
+
+
+def test_all_borrowed_claims_yield_no_owner_voiced_material() -> None:
+    """All-borrowed evidence leaves the owner nothing of their own to voice.
+
+    When every claim carries an ``author_slug`` it is already attributed to
+    another author and must never be voiced as the owner's words, so
+    ``_owner_claims`` is empty. The deterministic body degrades to the query
+    heading alone and the evidence section to the ``(no grounded evidence)``
+    placeholder. This pins that intended degradation explicitly (#503).
+    """
+    bundle = EvidenceBundle(
+        claims=[
+            EvidenceClaim(
+                claim="A borrowed insight",
+                source_fragments=["frag-x"],
+                author_slug="naval-ravikant",
+            ),
+        ],
+    )
+
+    assert _owner_claims(bundle) == []
+    assert _deterministic_body("What do I think?", bundle) == "# What do I think?\n"
+    assert "(no grounded evidence)" in _evidence_section(bundle)
 
 
 def _sent_prompt(provider: MagicMock) -> str:
