@@ -188,6 +188,47 @@ def _resolve_cited_tiers(
     return resolved
 
 
+_MIN_PROTECTED_LEAK_WORDS = 4
+"""Shortest protected snippet that can trip the HARD privacy gate (#508).
+
+A one-to-three-word over-tier fragment body (a single common word or phrase)
+can appear verbatim in innocuous prose by coincidence; treating that as a leak
+would force a REVISE/ESCALATE on a draft that disclosed nothing. Substantive
+verbatim overlap (>= this many words) remains the deterministic leak signal;
+paraphrase and shorter snippets are left to the semantic judge (#474).
+"""
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _is_verbatim_leak(protected: str, body: str) -> bool:
+    """Return whether *protected* appears in *body* as a substantive phrase.
+
+    Tightens the prior raw-substring test to cut coincidental hits (#508):
+
+    * the protected snippet must be at least :data:`_MIN_PROTECTED_LEAK_WORDS`
+      words long (a single common word/phrase is too coincidence-prone for a
+      HARD gate), and
+    * it must match on word boundaries, so it cannot match inside a larger word.
+
+    Whitespace is normalised on both sides first, so a reflowed line break in
+    the draft cannot hide an otherwise-verbatim leak.
+
+    Args:
+        protected: The over-tier fragment's protected body text.
+        body: The drafted prose under review.
+
+    Returns:
+        ``True`` when the snippet is substantive and present as a bounded phrase.
+    """
+    if len(protected.split()) < _MIN_PROTECTED_LEAK_WORDS:
+        return False
+    normalized_protected = _WHITESPACE_RE.sub(" ", protected).strip()
+    normalized_body = _WHITESPACE_RE.sub(" ", body)
+    pattern = rf"\b{re.escape(normalized_protected)}\b"
+    return re.search(pattern, normalized_body) is not None
+
+
 def check_privacy_compliance(
     body: str,
     evidence: EvidenceBundle,
@@ -225,10 +266,11 @@ def check_privacy_compliance(
     for frag_id, (raw_tier, frag_body) in _resolve_cited_tiers(evidence, vault).items():
         tier = PrivacyTier(raw_tier)
         protected = frag_body.strip()
-        # Deterministic scope: this catches verbatim leakage of the protected
-        # body. A paraphrase of over-tier content is NOT caught here — that
-        # needs the semantic LLM judge tracked under #474.
-        if _TIER_RANK[tier] > ceiling and protected and protected in body:
+        # Deterministic scope: this catches substantive verbatim leakage of the
+        # protected body (see :func:`_is_verbatim_leak`). A paraphrase of
+        # over-tier content — or a snippet too short to be a reliable signal —
+        # is NOT caught here; that needs the semantic LLM judge (#474).
+        if _TIER_RANK[tier] > ceiling and _is_verbatim_leak(protected, body):
             findings.append(
                 ReflectionFinding(
                     dimension="privacy_compliance",

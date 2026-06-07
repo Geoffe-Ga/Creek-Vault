@@ -123,6 +123,46 @@ def test_privacy_leak_revises_with_privacy_finding(tmp_path: Path) -> None:
     assert any(f.dimension == "privacy_compliance" for f in result.findings)
 
 
+def test_privacy_short_coincidental_fragment_does_not_flag(tmp_path: Path) -> None:
+    """A short, common over-tier fragment body present by chance must NOT flag.
+
+    A one-to-three-word fragment body ("the project") can appear verbatim in
+    innocuous prose coincidentally; flagging it would force the HARD privacy
+    gate to REVISE on a draft that leaked nothing. Only substantive verbatim
+    overlap should trip the gate (#508).
+    """
+    _seed_fragment(tmp_path, "frag-a", "the project", tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "We discussed the project roadmap in an open, publishable way."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_substantive_leak_still_flags(tmp_path: Path) -> None:
+    """A substantive (>= 4-word) verbatim over-tier leak still trips the gate.
+
+    Tightening the match to dodge short-fragment false positives must not let a
+    genuine leak through — a multi-word protected snippet appearing verbatim is
+    still a HARD privacy finding (#508).
+    """
+    secret = "my private therapy session notes"
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = f"Here it is: {secret} — oops."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
 def test_privacy_open_fragment_passes(tmp_path: Path) -> None:
     """An OPEN cited fragment at the OPEN default → no privacy finding (PASS)."""
     text = "an openly publishable observation"
