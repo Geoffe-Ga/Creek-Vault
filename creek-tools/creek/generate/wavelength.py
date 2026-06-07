@@ -1348,10 +1348,15 @@ class ModeProfileGenerator:
             Paths written, in canonical :class:`~creek.models.Mode` order; empty
             when no fragment carries a classified mode.
         """
+        # ``WavelengthClassification`` sets ``use_enum_values=True``, so
+        # ``fragment.wavelength.mode`` is already the canonical slug *string*
+        # (not a ``Mode`` member). Key the buckets by that string and iterate the
+        # enum's ``.value``s below, so the comparison stays string-to-string
+        # throughout rather than mixing enum identity with string lookups.
         by_mode: dict[str, list[Fragment]] = defaultdict(list)
         for fragment in _load_fragments_from_vault(vault_path):
             mode = str(fragment.wavelength.mode)
-            if mode != Mode.UNCLASSIFIED:
+            if mode != Mode.UNCLASSIFIED.value:
                 by_mode[mode].append(fragment)
         written: list[Path] = []
         for mode in Mode:

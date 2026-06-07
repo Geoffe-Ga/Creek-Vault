@@ -588,6 +588,7 @@ def test_report_mode_profiles_no_data_returns_empty_paths(vault: Path) -> None:
         vault_path=vault,
         report_type="mode-profiles",
         privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
     )
     assert result["status"] == "ok"
     assert result["report_paths"] == []
