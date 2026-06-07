@@ -27,7 +27,7 @@ body as the prompt when you type `/creek <name>`.
 | `/creek lint [--checks ...] [--since DATE]` | `creek.lint` | Vault hygiene + drift + paradox surfacing. |
 | `/creek mine [--phase ...] [--limit N]` | `creek.mine` | Surface essay seeds. |
 | `/creek draft [--phase ...] [--index N]` | `creek.draft` | Generate a voice-faithful draft from a mined seed. |
-| `/creek save --target ...` | `creek.save` | File an answer / paradox / draft / liminal item. |
+| `/creek save --target ...` | `creek.save` | File an answer / paradox / draft / liminal item, or an `observation` (raw wavelength reflection → `05-Wavelength/Observations/`). |
 | `/creek explain [SUBCOMMAND]` | none (help) | List commands or render one in detail. |
 | `/creek phase` | `creek.state.read` | Shorthand for the wavelength snapshot only. |
 | `/creek wavelength` | `creek.state.read` | Alias for `/creek phase`. |
