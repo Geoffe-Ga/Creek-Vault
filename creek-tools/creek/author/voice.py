@@ -186,6 +186,8 @@ def _dominant_phase(evidence: EvidenceBundle) -> str | None:
     ontology = evidence.ontology
     if ontology is None or not ontology.phases:
         return None
+    # Double ``.value`` is intentional: ``WeightedDimension.value`` is the enum
+    # member (a ``Phase``), and *its* ``.value`` is the canonical slug string.
     return ontology.phases[0].value.value
 
 
@@ -194,6 +196,8 @@ def _dominant_register(evidence: EvidenceBundle) -> str | None:
     ontology = evidence.ontology
     if ontology is None or not ontology.voice_registers:
         return None
+    # Double ``.value``: the ``WeightedDimension.value`` enum member, then its
+    # ``.value`` slug — see :func:`_dominant_phase`.
     return ontology.voice_registers[0].value.value
 
 
