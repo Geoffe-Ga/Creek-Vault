@@ -1294,15 +1294,26 @@ def _report_voice(vault_path: Path) -> None:
 
 
 def _report_decisions(vault_path: Path) -> None:
-    """Stub for the ``decisions`` report (skeleton; #579).
+    """Generate draft Decision notes from decision-signalling fragments (#581).
 
-    Routing tracer only — emits a typed "would generate" line and writes
-    nothing. The real ``DecisionDetector`` wiring lands in the follow-up that
-    persists ``08-Decisions/``; this proves the dispatch end-to-end first.
+    Scans the vault's fragments for decision signals and writes a draft note per
+    *new* candidate to ``08-Decisions/Active/``; re-running is idempotent (a
+    fragment already captured by a note is skipped). Prints a friendly message
+    when there are no new candidates.
     """
+    from creek.generate.decisions import generate_decisions
+
+    written_paths = generate_decisions(vault_path)
+    if not written_paths:
+        console.print(
+            "[yellow]No decision notes generated: "
+            "no new decision candidates found.[/yellow]",
+        )
+        return
+    rels = ", ".join(str(p.relative_to(vault_path)) for p in written_paths)
     console.print(
-        "[bold green]Would generate: decision notes at 08-Decisions/ "
-        "(not yet wired — see follow-up)[/bold green]",
+        f"[bold green]Decision notes generated ({len(written_paths)}): "
+        f"{rels}[/bold green]",
     )
 
 

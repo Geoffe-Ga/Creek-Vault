@@ -493,23 +493,36 @@ def test_report_tags_writes_audit_entry(vault: Path) -> None:
     assert entries[-1]["tool"] == "creek.report"
 
 
-def test_report_decisions_stub_returns_would_generate(vault: Path) -> None:
-    """The ``decisions`` skeleton routes to a stub: ok, no paths, writes nothing."""
+def test_report_decisions_generates_note(vault: Path) -> None:
+    """The ``decisions`` report now generates a real Decision note (#581)."""
+    frags = vault / "01-Fragments" / "Notes"
+    frags.mkdir(parents=True, exist_ok=True)
+    (frags / "frag-decide50.md").write_text(
+        '---\ntype: fragment\nid: frag-decide50\ntitle: "Should I switch frameworks"\n'
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+    result = report_tool(
+        vault_path=vault,
+        report_type="decisions",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+    assert result["status"] == "ok"
+    assert result["report_type"] == "decisions"
+    assert any("08-Decisions/Active" in p for p in result["report_paths"])
+    assert _read_audit(vault)[-1]["tool"] == "creek.report"
+
+
+def test_report_decisions_no_candidates_returns_empty_paths(vault: Path) -> None:
+    """A decisions report on a signal-free vault is ok with no paths, no file."""
     result = report_tool(
         vault_path=vault,
         report_type="decisions",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "ok"
-    assert result["report_type"] == "decisions"
     assert result["report_paths"] == []
-    assert "would generate" in result["note"].lower()
-    assert "08-Decisions/" in result["note"]
-    # The invocation is still audited, but nothing was written — the audit
-    # entry omits ``created_path`` entirely when no file is produced.
-    last = _read_audit(vault)[-1]
-    assert last["tool"] == "creek.report"
-    assert "created_path" not in last
 
 
 def _seed_voice_exemplar(vault: Path, frag_id: str, body: str) -> None:

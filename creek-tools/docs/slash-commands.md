@@ -37,15 +37,13 @@ body as the prompt when you type `/creek <name>`.
 ### `report` types
 
 `creek report --type <type>` (MCP: `creek.report`) supports `tags`, `voice`,
-`unnamed`, `wavelength`, `fingerprint`, and `lexicon` — the last persists the
-voice glossary + metaphor index to `07-Voice/Lexicon/`. One further type is
-**available as a skeleton** — routing is wired but generation lands in a
-follow-up:
+`unnamed`, `wavelength`, `fingerprint`, `lexicon`, and `decisions`:
 
-- `decisions` — will persist decision notes to `08-Decisions/`.
-
-Invoking a skeleton type prints/returns a "would generate …" message and writes
-nothing.
+- `lexicon` — persists the voice glossary + metaphor index to
+  `07-Voice/Lexicon/`.
+- `decisions` — writes draft Decision notes from decision-signalling fragments
+  to `08-Decisions/Active/` (idempotent: a fragment already captured is
+  skipped).
 
 ### Discoverability
 

@@ -1232,10 +1232,16 @@ def test_report_unnamed_command(tmp_path: Path) -> None:
     assert (vault / "10-Liminal" / "Unnamed" / "Digests").is_dir()
 
 
-def test_report_decisions_skeleton_stub(tmp_path: Path) -> None:
-    """``report --type decisions`` routes to its stub handler and writes nothing."""
+def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
+    """``report --type decisions`` with no signalling fragments is friendly (#581).
+
+    The handler is now real (not the #579 stub): an empty corpus prints the
+    "no new decision candidates" message, writes nothing, and never emits the
+    old "Would generate" stub text.
+    """
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
 
     result = runner.invoke(
         app,
@@ -1243,10 +1249,30 @@ def test_report_decisions_skeleton_stub(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "Would generate" in result.output
-    assert "08-Decisions/" in result.output
-    # Scope fence: the stub creates nothing under the target folder.
-    assert not (vault / "08-Decisions").exists()
+    assert "No decision notes generated" in result.output
+    assert "Would generate" not in result.output
+
+
+def test_report_decisions_generates_note(tmp_path: Path) -> None:
+    """``report --type decisions`` writes a Decision note for a signalling fragment."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True)
+    (frags / "frag-decide99.md").write_text(
+        '---\ntype: fragment\nid: frag-decide99\ntitle: "Should I move to the coast"\n'
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Decision notes generated" in result.output
+    assert any((vault / "08-Decisions" / "Active").glob("*.md"))
 
 
 def test_report_lexicon_no_exemplars_is_friendly(tmp_path: Path) -> None:
