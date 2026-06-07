@@ -478,26 +478,36 @@ def test_retrieval_stale_cache_entry_is_recomputed(tmp_path: Path) -> None:
     assert embedded_texts == ["alpha", fragment_embedding_text(by_id["frag-a"])]
 
 
-def test_build_link_graph_duplicate_title_is_last_wins(tmp_path: Path) -> None:
-    """Duplicate titles resolve a wikilink to the LAST fragment in corpus order.
+def test_build_link_graph_skips_ambiguous_title(tmp_path: Path) -> None:
+    """A wikilink to a title shared by 2+ fragments resolves to NEITHER (#487).
 
-    ``_build_link_graph`` builds its ``by_title`` map last-wins, so a wikilink
-    to a shared title targets the final fragment declaring that title; ids are
-    always preferred over titles when both could match.
+    Silently picking one (the old last-wins behaviour) could link the wrong
+    fragment, so an ambiguous title is dropped from the resolver. An exact-id
+    wikilink still resolves even when the fragment's title is ambiguous, since
+    ids are preferred over titles.
     """
     _write(tmp_path, "01-Fragments/Notes", "frag-dup-1", "Shared Title")
     _write(tmp_path, "01-Fragments/Notes", "frag-dup-2", "Shared Title")
     _write(
         tmp_path,
         "01-Fragments/Notes",
-        "frag-link",
-        "Linker",
+        "frag-title-link",
+        "TitleLinker",
         body="[[Shared Title]]",
+    )
+    _write(
+        tmp_path,
+        "01-Fragments/Notes",
+        "frag-id-link",
+        "IdLinker",
+        body="[[frag-dup-1]]",
     )
 
     corpus = sorted(_load_corpus(tmp_path), key=lambda rec: rec[0].id)
     graph = _build_link_graph(corpus)
 
-    # corpus order is frag-dup-1, frag-dup-2, frag-link; last-wins -> dup-2.
-    assert "frag-dup-2" in graph["frag-link"]
-    assert "frag-dup-1" not in graph["frag-link"]
+    # Ambiguous title → no edge to either duplicate (no silent mis-link).
+    assert "frag-dup-1" not in graph["frag-title-link"]
+    assert "frag-dup-2" not in graph["frag-title-link"]
+    # Exact id still resolves despite the shared, ambiguous title.
+    assert "frag-dup-1" in graph["frag-id-link"]
