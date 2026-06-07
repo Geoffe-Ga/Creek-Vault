@@ -28,6 +28,7 @@ from creek.models import (
     PraxisPotential,
     _generate_decision_id,
 )
+from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1023,9 +1024,13 @@ def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
                 post = frontmatter.load(str(md_file))
             except (OSError, ValueError, yaml.YAMLError):
                 continue
+            in_source_section = False
             for line in post.content.splitlines():
                 stripped = line.strip()
-                if stripped.startswith("- "):
+                if stripped.startswith("## "):
+                    in_source_section = stripped.lower() == "## source fragments"
+                    continue
+                if in_source_section and stripped.startswith("- "):
                     seen.add(stripped[2:].strip())
                     break
     return seen
@@ -1047,8 +1052,6 @@ def generate_decisions(vault_path: Path) -> list[Path]:
         Paths of the newly written Decision notes; empty when there are no new
         decision candidates.
     """
-    from creek.vault.reader import iter_vault_fragments
-
     fragments = [
         fragment
         for _path, fragment, _body, _raw in iter_vault_fragments(
