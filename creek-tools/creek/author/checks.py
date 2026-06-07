@@ -55,6 +55,21 @@ _TIER_RANK: dict[PrivacyTier, int] = {
     PrivacyTier.UNCLASSIFIED: 3,
 }
 
+_MOST_RESTRICTIVE_RANK = max(_TIER_RANK.values())
+"""Fail-closed rank for an unranked *fragment* tier (#509).
+
+A future :class:`~creek.models.PrivacyTier` not yet added to ``_TIER_RANK`` is
+treated as the most restrictive — so an unknown cited tier still trips the
+leak gate rather than raising ``KeyError`` (consistent with the
+``UNCLASSIFIED = most-restrictive`` convention)."""
+
+_LEAST_RESTRICTIVE_RANK = min(_TIER_RANK.values())
+"""Fail-closed rank for an unranked *ceiling* tier (#509).
+
+An unrecognised contract ``default_privacy_tier`` gates as strictly as
+possible (the lowest ceiling), so more cited tiers count as over-tier rather
+than fewer — the conservative direction for a HARD gate."""
+
 #: Legacy alias keys whose presence in a body signals non-canonical taxonomy
 #: (INC-019). Maps each deprecated alias to its canonical replacement.
 _LEGACY_ALIASES: dict[str, str] = (
@@ -261,7 +276,7 @@ def check_privacy_compliance(
     # Pydantic stores tiers as the underlying str; coerce back to the enum so
     # the ordering lookup and display are well-defined.
     ceiling_tier = PrivacyTier(contract.default_privacy_tier)
-    ceiling = _TIER_RANK[ceiling_tier]
+    ceiling = _TIER_RANK.get(ceiling_tier, _LEAST_RESTRICTIVE_RANK)
     findings: list[ReflectionFinding] = []
     for frag_id, (raw_tier, frag_body) in _resolve_cited_tiers(evidence, vault).items():
         tier = PrivacyTier(raw_tier)
@@ -270,7 +285,8 @@ def check_privacy_compliance(
         # protected body (see :func:`_is_verbatim_leak`). A paraphrase of
         # over-tier content — or a snippet too short to be a reliable signal —
         # is NOT caught here; that needs the semantic LLM judge (#474).
-        if _TIER_RANK[tier] > ceiling and _is_verbatim_leak(protected, body):
+        rank = _TIER_RANK.get(tier, _MOST_RESTRICTIVE_RANK)
+        if rank > ceiling and _is_verbatim_leak(protected, body):
             findings.append(
                 ReflectionFinding(
                     dimension="privacy_compliance",
