@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from creek.author.checks import check_voice_fidelity
+import pytest
+
+from creek.author.checks import (
+    _TIER_RANK,
+    check_privacy_compliance,
+    check_voice_fidelity,
+)
 from creek.author.conductor import Conductor
 from creek.author.models import (
     EvidenceBundle,
@@ -259,6 +265,40 @@ def test_privacy_skips_cited_fragment_absent_from_vault(tmp_path: Path) -> None:
 
     assert result.decision == "PASS"
     assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_every_privacy_tier_has_a_rank() -> None:
+    """Every PrivacyTier member is ranked, so the privacy gate never KeyErrors.
+
+    Adding a tier without updating ``_TIER_RANK`` would otherwise raise at
+    review time; this fails loudly at test time instead (#509).
+    """
+    for tier in PrivacyTier:
+        assert tier in _TIER_RANK
+
+
+def test_privacy_unranked_fragment_tier_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unranked cited fragment tier fails closed to most-restrictive, not KeyError.
+
+    Simulates a future ``PrivacyTier`` missing from ``_TIER_RANK`` by deleting
+    an existing entry: the cited fragment is still treated as over-tier
+    (flagged) and the rank lookup does not raise (#509).
+    """
+    monkeypatch.delitem(_TIER_RANK, PrivacyTier.INTIMATE)
+    secret = "my private therapy session notes"
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = f"leaked: {secret}"
+
+    findings = check_privacy_compliance(body, evidence, tmp_path, contract)
+
+    assert any(f.dimension == "privacy_compliance" for f in findings)
 
 
 def test_legacy_alias_maps_have_no_key_collisions() -> None:
