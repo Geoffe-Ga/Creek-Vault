@@ -1252,3 +1252,63 @@ class TestDiscordIngestorEdgeCases:
         ingestor = DiscordIngestor()
         fragments = ingestor.parse(raw)
         assert "Reactions:" not in fragments[0].content
+
+
+def _current_msg(
+    msg_id: int,
+    contents: str,
+    timestamp: str = "2023-07-27 16:06:13",
+) -> dict[str, Any]:
+    """Build a message in Discord's CURRENT data-package schema (#593).
+
+    Capitalized flat keys, no author field — the package contains only the
+    requester's own messages.
+    """
+    return {
+        "ID": msg_id,
+        "Timestamp": timestamp,
+        "Contents": contents,
+        "Attachments": "",
+    }
+
+
+class TestCurrentDataPackageSchema:
+    """DiscordIngestor handles the current capitalized data-package schema (#593)."""
+
+    def test_normalize_message_maps_capitalized_keys(self) -> None:
+        """_normalize_message maps ID/Timestamp/Contents → id/timestamp/content."""
+        from creek.ingest.discord import _normalize_message
+
+        out = _normalize_message(_current_msg(1134154787915563169, "https://mctb.org"))
+
+        assert out["id"] == "1134154787915563169"
+        assert out["content"] == "https://mctb.org"
+        assert out["timestamp"] == "2023-07-27T16:06:13+00:00"
+        assert out["author"] == {"name": "self"}
+
+    def test_normalize_message_passes_lowercase_through(self) -> None:
+        """A canonical lowercase message is returned unchanged."""
+        from creek.ingest.discord import _normalize_message
+
+        msg = _make_msg(msg_id="m1", author="Alice", content="hi")
+        assert _normalize_message(msg) is msg
+
+    def test_pipeline_ingests_current_format(self, tmp_path: Path) -> None:
+        """End-to-end ingest of current-format messages produces fragments."""
+        _create_channel_dir(
+            tmp_path,
+            channel_id="c123",
+            channel_name="general",
+            messages=[
+                _current_msg(1, "First message"),
+                _current_msg(2, "Second message", "2023-07-27 16:06:20"),
+            ],
+        )
+
+        result = DiscordIngestor().ingest(tmp_path)
+
+        assert result.errors == []
+        assert len(result.fragments) >= 1
+        body = "\n".join(f.content for f in result.fragments)
+        assert "First message" in body
+        assert "Second message" in body
