@@ -10,15 +10,12 @@ runs (INC-006).
 from __future__ import annotations
 
 import hashlib
-import itertools
 import logging
-import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
 
 from pydantic import BaseModel
-from tqdm import tqdm
 
 # FragmentLevel is a Literal alias that Pydantic resolves at class-creation
 # time when building ``Resonance``'s field schema; moving it under
@@ -52,6 +49,13 @@ EMBEDDINGS_CACHE_FILENAME: Final[str] = "embeddings.parquet"
 
 EMBEDDINGS_CACHE_DIR: Final[str] = "00-Creek-Meta"
 """Vault subdirectory that holds the embeddings cache."""
+
+_RESONANCE_BLOCK_ROWS: Final[int] = 512
+"""Row-block size for chunked resonance similarity (#596).
+
+Similarities are computed one block of rows at a time so peak memory is
+``block_rows x N`` floats rather than the full ``N x N`` matrix — keeping
+resonance discovery tractable at ≥50k fragments."""
 
 
 class EmbeddingModelUnavailableError(RuntimeError):
@@ -683,8 +687,7 @@ class EmbeddingLinker:
 
         Returns:
             A list of :class:`Resonance` records, one per qualifying pair,
-            in the deterministic insertion order of
-            :func:`itertools.combinations`.
+            in ascending ``(i, j)`` fragment-index order.
         """
         ids = list(embeddings.keys())
         if len(ids) < 2:
@@ -702,46 +705,49 @@ class EmbeddingLinker:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-10)
         normalized = vectors / norms
-        similarity_matrix = normalized @ normalized.T
 
         ancestors, sibling_positions = _hierarchy_index(fragments)
         levels = _level_lookup(ids, fragments)
+        threshold = self.config.similarity_threshold
 
         resonances: list[Resonance] = []
         suppressed = 0
-        # OPS-004: pairwise loop is O(N²); on a 10k-fragment vault this
-        # is ~50M iterations and runs for minutes. Show tqdm in TTYs and
-        # stay silent in non-interactive runs (CI logs, pipes).
-        n_pairs = len(ids) * (len(ids) - 1) // 2
-        pair_iter = tqdm(
-            itertools.combinations(range(len(ids)), 2),
-            total=n_pairs,
-            desc="Resonances",
-            unit="pair",
-            disable=not sys.stderr.isatty(),
-        )
-        for i, j in pair_iter:
-            sim = float(similarity_matrix[i, j])
-            if sim < self.config.similarity_threshold:
-                continue
-            if _is_hierarchy_suppressed(
-                ids[i],
-                ids[j],
-                ancestors=ancestors,
-                sibling_positions=sibling_positions,
-                sibling_skip_window=sibling_skip_window,
-            ):
-                suppressed += 1
-                continue
-            resonances.append(
-                Resonance(
-                    fragment_a_id=ids[i],
-                    fragment_b_id=ids[j],
-                    similarity=sim,
-                    from_level=levels[ids[i]],
-                    to_level=levels[ids[j]],
-                ),
-            )
+        # Resonance discovery compares every pair, but similarities are computed
+        # one block of rows at a time via vectorized matmul (never materializing
+        # the full NxN matrix) and thresholded with numpy, so only
+        # above-threshold pairs reach Python. Peak memory is block_rows x N,
+        # which scales to ≥50k fragments — unlike the old full-matrix +
+        # itertools.combinations loop (OPS-004 / #596). Pairs are still emitted
+        # in ascending ``(i, j)`` index order.
+        n = len(ids)
+        for start in range(0, n, _RESONANCE_BLOCK_ROWS):
+            stop = min(start + _RESONANCE_BLOCK_ROWS, n)
+            block_sims = normalized[start:stop] @ normalized.T
+            for local_index, i in enumerate(range(start, stop)):
+                row = block_sims[local_index]
+                # Upper triangle only: fragment i against each j > i.
+                above = np.nonzero(row[i + 1 :] >= threshold)[0]
+                for offset in above:
+                    j = i + 1 + int(offset)
+                    if _is_hierarchy_suppressed(
+                        ids[i],
+                        ids[j],
+                        ancestors=ancestors,
+                        sibling_positions=sibling_positions,
+                        sibling_skip_window=sibling_skip_window,
+                    ):
+                        suppressed += 1
+                        continue
+                    resonances.append(
+                        Resonance(
+                            fragment_a_id=ids[i],
+                            fragment_b_id=ids[j],
+                            similarity=float(row[j]),
+                            from_level=levels[ids[i]],
+                            to_level=levels[ids[j]],
+                        ),
+                    )
+            del block_sims
 
         if suppressed:
             logger.info(
