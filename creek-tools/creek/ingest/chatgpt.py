@@ -327,6 +327,37 @@ def _epoch_to_la_datetime(epoch: float | None) -> datetime:
     return datetime.fromtimestamp(epoch, tz=UTC).astimezone(LA_TZ)
 
 
+def _node_create_time(mapping: dict[str, Any], node_id: str) -> float:
+    """Return a node's message ``create_time`` (``0.0`` when missing).
+
+    Used to order reconstructed children deterministically.
+    """
+    message = (mapping.get(node_id) or {}).get("message") or {}
+    create_time = message.get("create_time")
+    return float(create_time) if isinstance(create_time, (int, float)) else 0.0
+
+
+def _reconstruct_children_from_parents(mapping: dict[str, Any]) -> None:
+    """Rebuild each node's ``children`` from its ``parent`` pointer, in place.
+
+    Current ChatGPT exports omit ``children`` arrays, carrying only ``parent``
+    pointers; without reconstruction the walk in :func:`_linearize_tree` stalls
+    at the root and yields zero messages (#592). Children are ordered by message
+    ``create_time`` so the longest-branch walk stays deterministic.
+
+    Args:
+        mapping: The ``mapping`` dict from a ChatGPT conversation (mutated).
+    """
+    children: dict[str, list[str]] = {node_id: [] for node_id in mapping}
+    for node_id, node in mapping.items():
+        parent = node.get("parent")
+        if parent is not None and parent in children:
+            children[parent].append(node_id)
+    for parent_id, child_ids in children.items():
+        child_ids.sort(key=lambda cid: _node_create_time(mapping, cid))
+        mapping[parent_id]["children"] = child_ids
+
+
 def _linearize_tree(
     mapping: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -334,7 +365,9 @@ def _linearize_tree(
 
     Finds the root node (parent is None), then walks the tree
     depth-first, always choosing the child branch with the most
-    descendants when branching occurs.
+    descendants when branching occurs. When the mapping carries no
+    ``children`` arrays (current export format — parent pointers only), the
+    children are first reconstructed from the ``parent`` links (#592).
 
     Args:
         mapping: The ``mapping`` dict from a ChatGPT conversation.
@@ -342,6 +375,8 @@ def _linearize_tree(
     Returns:
         An ordered list of message dicts (excluding null messages).
     """
+    if not any(node.get("children") for node in mapping.values()):
+        _reconstruct_children_from_parents(mapping)
     root_id = _find_root_id(mapping)
     if root_id is None:
         return []

@@ -1389,3 +1389,75 @@ class TestCountDescendantsDeepTree:
 
         count = _count_descendants("node_0", mapping)
         assert count == depth
+
+
+class TestLinearizeTreeParentOnlyMapping:
+    """_linearize_tree reconstructs children from parent pointers (#592).
+
+    Current ChatGPT exports give nodes ``{id, message, parent}`` with no
+    ``children`` arrays. The walk must rebuild children from parents rather
+    than yielding 0 messages.
+    """
+
+    def test_parent_only_mapping_linearizes_in_order(self) -> None:
+        """A parent-only mapping still linearizes system -> user -> assistant."""
+        from creek.ingest.chatgpt import _linearize_tree
+
+        conv = _minimal_conversation()
+        mapping = conv["mapping"]
+        for node in mapping.values():
+            node.pop("children", None)  # mimic current export (parent-only)
+
+        ordered = _linearize_tree(mapping)
+
+        roles = [m["author"]["role"] for m in ordered]
+        assert roles == ["system", "user", "assistant"]
+
+    def test_parent_only_branch_picks_longest(self) -> None:
+        """With reconstructed children, the longest branch still wins."""
+        from creek.ingest.chatgpt import _linearize_tree
+
+        mapping: dict[str, Any] = {
+            "root": {"id": "root", "message": None, "parent": None},
+            "u1": {
+                "id": "u1",
+                "parent": "root",
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["Q"]},
+                    "create_time": 1.0,
+                },
+            },
+            "a1": {
+                "id": "a1",
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["short"]},
+                    "create_time": 2.0,
+                },
+            },
+            "a2": {
+                "id": "a2",
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["long"]},
+                    "create_time": 3.0,
+                },
+            },
+            "a3": {
+                "id": "a3",
+                "parent": "a2",
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["follow"]},
+                    "create_time": 4.0,
+                },
+            },
+        }
+
+        ordered = _linearize_tree(mapping)
+
+        texts = [m["content"]["parts"][0] for m in ordered]
+        assert texts == ["Q", "long", "follow"]
