@@ -616,6 +616,35 @@ class TestDeleteEmbeddingsCache:
 class TestFindResonances:
     """Tests for the find_resonances cosine similarity method."""
 
+    def test_resonances_found_across_chunk_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Chunked similarity still finds cross-block pairs, in (i, j) order (#596).
+
+        With a tiny block size the 5 fragments span multiple row blocks; the
+        rewrite must still find the f0/f4 pair (different blocks) and emit
+        results in ascending fragment-index order.
+        """
+        monkeypatch.setattr("creek.link.embeddings._RESONANCE_BLOCK_ROWS", 2)
+        linker = EmbeddingLinker(
+            config=EmbeddingsConfig(similarity_threshold=0.9),
+        )
+        embeddings = {
+            "f0": [1.0, 0.0],
+            "f1": [0.0, 1.0],
+            "f2": [0.0, 1.0],
+            "f3": [0.0, 1.0],
+            "f4": [1.0, 0.0],
+        }
+
+        result = linker.find_resonances(embeddings)
+
+        pairs = [(r.fragment_a_id, r.fragment_b_id) for r in result]
+        assert ("f0", "f4") in pairs  # spans block [0:2] and block [4:5]
+        # Ascending (i, j) order preserved across block boundaries.
+        assert pairs == [("f0", "f4"), ("f1", "f2"), ("f1", "f3"), ("f2", "f3")]
+
     def test_identical_vectors_have_similarity_one(self) -> None:
         """Identical vectors should have cosine similarity of 1.0."""
         linker = EmbeddingLinker(
