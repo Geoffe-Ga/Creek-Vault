@@ -528,3 +528,6 @@ class TestSubstackWithoutPostsCsv:
         }
         assert by_title["Hello world"] is not None
         assert by_title["Hello world"].date().isoformat() == "2024-03-15"
+        # The "never guessed" invariant: a post with no datePublished in its
+        # HTML must not get a fabricated date (#594).
+        assert by_title["Second essay"] is None
