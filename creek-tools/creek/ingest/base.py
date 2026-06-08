@@ -170,6 +170,13 @@ class IngestResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
     """Error messages collected during ingest."""
 
+    discovered: int = 0
+    """Count of inputs ``discover()`` found.
+
+    Lets callers distinguish "no inputs found" (``discovered == 0``) from
+    "inputs found but nothing parsed" (``discovered > 0`` yet ``fragments``
+    empty) — the latter signals an unrecognized export format (#595)."""
+
 
 # ---- Shared Utility Functions ----
 
@@ -547,6 +554,7 @@ class Ingestor(abc.ABC):
 
         # Stage 1: Discover
         raw_docs = self._discover_safe(source_path, result)
+        result.discovered = len(raw_docs)
 
         # Stages 2-4: Parse, Convert, Frontmatter
         for raw_doc in raw_docs:
