@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from creek.cli import app
+from creek.ingest.base import IngestResult
 
 runner = CliRunner()
 
@@ -3669,3 +3670,108 @@ def test_voice_check_builds_fingerprint_when_not_persisted(
 
     assert result.exit_code == 0, result.output
     assert "voice_distance" in _strip_ansi(result.output).lower()
+
+
+# ---- ingest fail-loud on 0 fragments (#595) ----
+
+
+class _ZeroFragmentIngestor:
+    """Fake ingestor: discovers inputs but parses nothing (#595)."""
+
+    def ingest(self, _source_path: Path) -> IngestResult:
+        """Return a result with inputs discovered but no fragments."""
+        return IngestResult(discovered=2, fragments=[], errors=[])
+
+
+class _NoInputIngestor:
+    """Fake ingestor: nothing discovered at all."""
+
+    def ingest(self, _source_path: Path) -> IngestResult:
+        """Return an empty result with zero discovered inputs."""
+        return IngestResult(discovered=0, fragments=[], errors=[])
+
+
+def _scaffold_min_vault(tmp_path: Path) -> Path:
+    """Create the minimal vault dirs VaultWriter requires."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+    return vault
+
+
+def test_ingest_warns_when_inputs_found_but_zero_fragments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inputs discovered but 0 fragments → loud warning, exit 0 by default (#595)."""
+    vault = _scaffold_min_vault(tmp_path)
+    src = tmp_path / "in"
+    src.mkdir()
+    monkeypatch.setattr("creek.cli._resolve_ingestor", lambda _t: _ZeroFragmentIngestor)
+
+    result = runner.invoke(
+        app,
+        ["ingest", "--type", "fake", "--input", str(src), "--vault", str(vault), "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING" in result.output
+    assert "0 fragments" in result.output
+
+
+def test_ingest_strict_exits_nonzero_on_zero_fragments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--strict makes the discovered-but-0-fragments case exit non-zero (#595)."""
+    vault = _scaffold_min_vault(tmp_path)
+    src = tmp_path / "in"
+    src.mkdir()
+    monkeypatch.setattr("creek.cli._resolve_ingestor", lambda _t: _ZeroFragmentIngestor)
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "fake",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "-y",
+            "--strict",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "WARNING" in result.output
+
+
+def test_ingest_no_warning_when_no_inputs_discovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing discovered → no false warning, exit 0 even under --strict (#595)."""
+    vault = _scaffold_min_vault(tmp_path)
+    src = tmp_path / "in"
+    src.mkdir()
+    monkeypatch.setattr("creek.cli._resolve_ingestor", lambda _t: _NoInputIngestor)
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "fake",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "-y",
+            "--strict",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING" not in result.output

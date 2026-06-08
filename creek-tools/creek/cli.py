@@ -309,7 +309,7 @@ def _run_ingest(
     source_type: str,
     input_path: Path,
     vault_path: Path,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[str], int]:
     """Run a single ingestor and persist its output to the vault.
 
     Args:
@@ -319,8 +319,9 @@ def _run_ingest(
         vault_path: Vault root for :class:`VaultWriter`.
 
     Returns:
-        Tuple of ``(written_count, errors)`` where ``errors`` is a list
-        of human-readable strings prefixed with ``[<source_type>]``.
+        Tuple of ``(written_count, errors, discovered)`` where ``errors`` is a
+        list of human-readable strings prefixed with ``[<source_type>]`` and
+        ``discovered`` is how many inputs the ingestor's ``discover()`` found.
 
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
@@ -356,7 +357,34 @@ def _run_ingest(
             continue
         written += 1
 
-    return written, errors
+    return written, errors, ingest_result.discovered
+
+
+def _warn_if_discovered_but_empty(
+    *,
+    written: int,
+    discovered: int,
+    source_type: str,
+    strict: bool,
+) -> None:
+    """Warn (and optionally exit non-zero) when inputs parsed to 0 fragments.
+
+    The silent ``Ingested 0 fragment(s)`` is the symptom that masked the
+    ChatGPT/Discord/Substack export-format bugs (#595): ``discover()`` found
+    inputs but none parsed, signalling an unrecognized format. ``--strict``
+    turns the warning into a non-zero exit for pipelines/CI.
+
+    Raises:
+        typer.Exit: With code ``1`` when *strict* and the condition holds.
+    """
+    if written > 0 or discovered == 0:
+        return
+    console.print(
+        f"[yellow]WARNING: discovered {discovered} {source_type} input(s) but "
+        "produced 0 fragments — the export format may be unrecognized.[/yellow]",
+    )
+    if strict:
+        raise typer.Exit(code=1)
 
 
 def _guard_vault_path(vault: Path, allow_in_repo: bool) -> None:
@@ -569,6 +597,14 @@ def ingest(
             "Idempotent. --type / --input are ignored."
         ),
     ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help=(
+            "Exit non-zero when inputs were discovered but produced 0 "
+            "fragments (likely an unrecognized export format)."
+        ),
+    ),
 ) -> None:
     """Ingest a specific source type into the vault.
 
@@ -612,7 +648,7 @@ def ingest(
         assume_yes=yes,
     )
 
-    written, errors = _run_ingest(
+    written, errors, discovered = _run_ingest(
         ingestor_cls=ingestor_cls,
         source_type=type,
         input_path=input,
@@ -624,6 +660,13 @@ def ingest(
         console.print(f"[yellow]Errors: {len(errors)}[/yellow]")
         for err in errors:
             console.print(f"  [dim]{err}[/dim]")
+
+    _warn_if_discovered_but_empty(
+        written=written,
+        discovered=discovered,
+        source_type=type,
+        strict=strict,
+    )
 
 
 def _run_refresh_dates(vault: Path | None) -> None:
