@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -184,6 +185,50 @@ def _is_subscriber_csv(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in SUBSCRIBER_CSV_SUFFIXES)
 
 
+_DATEPUBLISHED_RE = re.compile(r'datePublished"\s*:\s*"(\d{4}-\d{2}-\d{2})')
+
+
+def _title_from_slug(slug: str) -> str:
+    """Render a human-ish title from a post slug (``hello-world`` → ``Hello world``)."""
+    cleaned = re.sub(r"[-_]+", " ", slug).strip()
+    return f"{cleaned[:1].upper()}{cleaned[1:]}" if cleaned else "Untitled"
+
+
+def _scrape_published_date(html_file: Path) -> str:
+    """Return the HTML's ``datePublished`` date (``YYYY-MM-DD``), or ``""``."""
+    try:
+        text = html_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    match = _DATEPUBLISHED_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _derive_posts_metadata(source_path: Path) -> dict[str, dict[str, str]]:
+    """Synthesize ``posts.csv``-equivalent metadata from post HTML filenames.
+
+    Used when an export lacks ``posts.csv`` (#594): the title is derived from the
+    ``<post_id>.<slug>.html`` slug and the publication date is scraped from each
+    HTML's ``datePublished`` JSON-LD (blank when absent — never guessed). Shaped
+    identically to :func:`_parse_posts_csv` so the parse stage is unchanged.
+    """
+    metadata: dict[str, dict[str, str]] = {}
+    for html_file in sorted(source_path.rglob("*.html")):
+        if not html_file.is_file() or _is_subscriber_csv(html_file):
+            continue
+        post_id = extract_post_id(html_file.name)
+        if post_id is None:
+            continue
+        slug = html_file.name[len(post_id) + 1 : -len(".html")]
+        metadata[post_id] = {
+            "post_id": post_id,
+            "post_date": _scrape_published_date(html_file),
+            "title": _title_from_slug(slug),
+            "subtitle": "",
+        }
+    return metadata
+
+
 def _resolve_authored_at(
     row: dict[str, str] | None,
     file_path: Path,
@@ -245,10 +290,11 @@ class SubstackIngestor(Ingestor):
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Find post HTML files inside a Substack export directory.
 
-        The export root must contain ``posts.csv``; otherwise the
-        ingestor refuses to emit anything (auto-detection failed and
-        the caller likely meant ``--type document``). Subscriber-PII
-        CSVs are filtered here so the parse stage cannot see them.
+        When the export root contains ``posts.csv`` its metadata is used;
+        otherwise (current exports often omit it) metadata is derived from the
+        ``<post_id>.<slug>.html`` filenames and each HTML's ``datePublished``
+        (#594), so the posts still ingest. Subscriber-PII CSVs are filtered
+        here so the parse stage cannot see them.
 
         ``_posts_metadata`` is reset unconditionally on every call so a
         reused ingestor instance cannot leak the previous export's
@@ -261,10 +307,13 @@ class SubstackIngestor(Ingestor):
             return []
 
         csv_path = source_path / POSTS_CSV_FILENAME
-        if not csv_path.is_file():
-            return []
-
-        self._posts_metadata = _parse_posts_csv(csv_path)
+        if csv_path.is_file():
+            self._posts_metadata = _parse_posts_csv(csv_path)
+        else:
+            # Current exports often ship per-post engagement CSVs but no
+            # posts.csv; derive titles from filenames + dates from each HTML's
+            # datePublished rather than emitting nothing (#594).
+            self._posts_metadata = _derive_posts_metadata(source_path)
 
         docs: list[RawDocument] = []
         for html_file in sorted(source_path.rglob("*.html")):

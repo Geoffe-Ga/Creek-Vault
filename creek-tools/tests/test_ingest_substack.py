@@ -382,16 +382,22 @@ class TestDiscoverEdgeCases:
         result = SubstackIngestor().ingest(sole)
         assert result.fragments == []
 
-    def test_export_without_posts_csv_emits_no_fragments(
+    def test_export_without_posts_csv_derives_metadata(
         self,
         tmp_path: Path,
     ) -> None:
+        """Without posts.csv, a post_id-prefixed HTML still ingests (#594).
+
+        Title is derived from the slug; this replaces the old behaviour of
+        emitting nothing (which silently dropped whole exports).
+        """
         (tmp_path / "111.foo.html").write_text(
             "<html><body><p>hi</p></body></html>",
             encoding="utf-8",
         )
         result = SubstackIngestor().ingest(tmp_path)
-        assert result.fragments == []
+        assert len(result.fragments) == 1
+        assert assemble_ingested_fragment(result.fragments[0]).fragment.title == "Foo"
 
     def test_html_files_without_post_id_prefix_are_skipped(
         self,
@@ -467,3 +473,58 @@ class TestSubscriberCsvHelpers:
         path = tmp_path / "posts.csv"
         path.write_text("post_id\n", encoding="utf-8")
         assert _is_subscriber_csv(path) is False
+
+
+class TestSubstackWithoutPostsCsv:
+    """Ingest current Substack exports that lack ``posts.csv`` (#594)."""
+
+    @staticmethod
+    def _write_export_no_csv(tmp_path: Path) -> Path:
+        posts = tmp_path / "posts"
+        posts.mkdir()
+        (posts / "111.hello-world.html").write_text(
+            '<html><head><script type="application/ld+json">'
+            '{"datePublished":"2024-03-15T08:30:00Z"}</script></head>'
+            "<body><h1>Hello World</h1><p>Body of the hello world essay.</p>"
+            "</body></html>",
+            encoding="utf-8",
+        )
+        (posts / "222.second-essay.html").write_text(
+            "<html><body><h1>Second</h1><p>Second body here.</p></body></html>",
+            encoding="utf-8",
+        )
+        # per-post engagement CSV present; NO posts.csv at the root.
+        (posts / "111.hello-world.delivers.csv").write_text(
+            "email,delivered\nu@e.com,true\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_discover_without_posts_csv_finds_posts(self, tmp_path: Path) -> None:
+        """discover derives posts from filenames when posts.csv is absent."""
+        root = self._write_export_no_csv(tmp_path)
+        docs = SubstackIngestor().discover(root)
+        assert len(docs) == 2
+
+    def test_titles_derived_from_slug(self, tmp_path: Path) -> None:
+        """Titles come from the HTML filename slug when no posts.csv exists."""
+        root = self._write_export_no_csv(tmp_path)
+        result = SubstackIngestor().ingest(root)
+        assert result.errors == []
+        titles = sorted(
+            assemble_ingested_fragment(p).fragment.title for p in result.fragments
+        )
+        assert titles == ["Hello world", "Second essay"]
+
+    def test_authored_at_scraped_from_html_datepublished(self, tmp_path: Path) -> None:
+        """authored_at is scraped from the HTML datePublished when available."""
+        root = self._write_export_no_csv(tmp_path)
+        result = SubstackIngestor().ingest(root)
+        by_title = {
+            assemble_ingested_fragment(p).fragment.title: assemble_ingested_fragment(
+                p
+            ).fragment.authored_at
+            for p in result.fragments
+        }
+        assert by_title["Hello world"] is not None
+        assert by_title["Hello world"].date().isoformat() == "2024-03-15"
