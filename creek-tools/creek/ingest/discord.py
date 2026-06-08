@@ -162,6 +162,56 @@ def _parse_msg_timestamp(msg: dict[str, Any]) -> datetime | None:
         return None
 
 
+_SELF_AUTHOR_NAME = "self"
+"""Author name for messages from the current data package (the owner's own)."""
+
+
+def _normalize_timestamp(timestamp: str) -> str:
+    """Coerce a data-package timestamp (``"YYYY-MM-DD HH:MM:SS"``) to ISO 8601.
+
+    The current Discord data package uses a space-separated, timezone-naive
+    timestamp; :func:`datetime.fromisoformat` wants a ``T`` separator and the
+    timestamps are UTC, so a ``+00:00`` offset is appended when none is present.
+    """
+    iso = timestamp.strip()
+    if not iso:
+        return iso
+    iso = iso.replace(" ", "T", 1)
+    if "+" not in iso[10:] and "Z" not in iso[10:]:
+        iso = f"{iso}+00:00"
+    return iso
+
+
+def _normalize_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Discord message to the canonical lowercase schema (#593).
+
+    The current Discord data package uses capitalized flat keys
+    (``ID`` / ``Timestamp`` / ``Contents``) and carries no author field — the
+    package contains only the requester's own messages. Map those to the
+    ``id`` / ``timestamp`` / ``content`` / ``author`` schema the rest of the
+    ingestor reads, normalising the timestamp to ISO 8601 and attributing the
+    message to the export owner. Messages already in the lowercase schema
+    (older exports / DiscordChatExporter) are returned unchanged.
+
+    Args:
+        msg: A raw Discord message dict.
+
+    Returns:
+        The message in the canonical lowercase schema.
+    """
+    if "content" in msg or "id" in msg:
+        return msg
+    normalized = msg.copy()
+    if "Contents" in msg:
+        normalized["content"] = msg.get("Contents", "")
+    if "ID" in msg:
+        normalized["id"] = str(msg.get("ID", ""))
+    if "Timestamp" in msg:
+        normalized["timestamp"] = _normalize_timestamp(str(msg.get("Timestamp", "")))
+    normalized.setdefault("author", {"name": _SELF_AUTHOR_NAME})
+    return normalized
+
+
 # ---- Grouping logic ----
 
 
@@ -449,11 +499,11 @@ class DiscordIngestor(Ingestor):
             return []
 
         if isinstance(data, list):
-            return data
+            return [_normalize_message(m) for m in data if isinstance(m, dict)]
         if isinstance(data, dict) and "messages" in data:
             msgs = data["messages"]
             if isinstance(msgs, list):
-                return msgs
+                return [_normalize_message(m) for m in msgs if isinstance(m, dict)]
         return []
 
     def _group_to_fragment(
