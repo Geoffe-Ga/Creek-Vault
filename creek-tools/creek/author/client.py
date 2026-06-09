@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from creek.classify.llm.providers import AnthropicCompletion, AnthropicProvider
+from creek.classify.llm.providers import Completion, build_provider
 
 if TYPE_CHECKING:
+    from creek.classify.llm.base import LLMProvider
     from creek.config import AuthorConfig, LLMConfig
 
 
@@ -35,17 +36,17 @@ def resolve_voice_model(author: AuthorConfig, llm: LLMConfig) -> str:
 
 
 class AuthorLLMClient:
-    """A thin wrapper over :class:`AnthropicProvider` for author-desk calls.
+    """A thin wrapper over an :class:`LLMProvider` for author-desk calls.
 
     Attributes:
-        _provider: The underlying provider performing the SDK call.
+        _provider: The underlying provider performing the completion call.
     """
 
-    def __init__(self, provider: AnthropicProvider) -> None:
+    def __init__(self, provider: LLMProvider) -> None:
         """Store the provider this client delegates to.
 
         Args:
-            provider: The Anthropic provider performing the actual call.
+            provider: The provider performing the actual completion call.
         """
         self._provider = provider
 
@@ -54,6 +55,10 @@ class AuthorLLMClient:
         cls, config: LLMConfig, *, model: str | None = None
     ) -> AuthorLLMClient:
         """Build a client from *config*, sourcing the model id from config.
+
+        The backend is selected by :func:`build_provider` so the desk honors
+        the operator's ``provider`` choice instead of being hard-wired to
+        Anthropic (#605).
 
         Args:
             config: The LLM configuration (provider + model id come from here,
@@ -69,7 +74,7 @@ class AuthorLLMClient:
         effective = (
             config if model is None else config.model_copy(update={"model": model})
         )
-        return cls(AnthropicProvider(effective))
+        return cls(build_provider(effective))
 
     def complete(self, prompt: str, *, max_tokens: int | None = None) -> str:
         """Return the completion text for *prompt*.
@@ -81,7 +86,7 @@ class AuthorLLMClient:
         Returns:
             The provider's completion text.
         """
-        return self._provider.call_with_metadata(prompt, max_tokens=max_tokens).text
+        return self._provider.complete(prompt, max_tokens=max_tokens).text
 
     def complete_with_usage(
         self,
@@ -89,13 +94,14 @@ class AuthorLLMClient:
         *,
         system: str | None = None,
         max_tokens: int | None = None,
-    ) -> AnthropicCompletion:
+    ) -> Completion:
         """Return the full completion (text + token usage) for *prompt*.
 
         Unlike :meth:`complete` (which yields only the text and is kept stable
         for existing callers), this exposes the SDK's token usage so the desk
         can surface a run's cost and cache-hit rate. A static *system* prefix is
-        sent as an ephemeral cached block by the provider (#474).
+        sent as an ephemeral cached block by a cloud provider that supports it
+        (#474); local providers ignore it.
 
         Args:
             prompt: The dynamic user prompt.
@@ -103,10 +109,10 @@ class AuthorLLMClient:
             max_tokens: Optional output-token ceiling.
 
         Returns:
-            The provider's :class:`AnthropicCompletion`, carrying text and
-            :attr:`~AnthropicCompletion.usage`.
+            The provider's :class:`Completion`, carrying text and
+            :attr:`~Completion.usage`.
         """
-        return self._provider.call_with_metadata(
+        return self._provider.complete(
             prompt,
             system=system,
             max_tokens=max_tokens,

@@ -64,7 +64,13 @@ from creek.classify.llm.prompts import (
 )
 from creek.classify.llm.prompts import CLASSIFICATION_PROMPT
 from creek.classify.llm.prompts import _sanitise_for_prompt as _sanitise_for_prompt
-from creek.classify.llm.providers import ANTHROPIC_CLOUD_WARNING, AnthropicProvider
+from creek.classify.llm.providers import (
+    ANTHROPIC_CLOUD_WARNING,
+    AnthropicProvider,
+    OllamaProvider,
+    build_provider,
+    provider_is_cloud,
+)
 
 __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
@@ -76,4 +82,7 @@ __all__ = [
     "LLMClassificationResult",
     "LLMClassifier",
     "LLMProvider",
+    "OllamaProvider",
+    "build_provider",
+    "provider_is_cloud",
 ]

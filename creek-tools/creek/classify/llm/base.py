@@ -24,6 +24,14 @@ class LLMProvider(Protocol):
     are met, and turn a prompt into a normalized :class:`Completion`.
     """
 
+    is_cloud: bool
+    """Whether the backend sends content off-device.
+
+    Drives the cloud-egress warning and consent gate. Declared as a plain
+    class attribute on each implementation so the factory can read it without
+    instantiating (which, for cloud backends, would require credentials).
+    """
+
     @property
     def model(self) -> str:
         """The resolved model identifier used for completion calls."""

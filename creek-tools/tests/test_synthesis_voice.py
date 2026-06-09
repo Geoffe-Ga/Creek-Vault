@@ -81,7 +81,7 @@ def _mock_client(text: str) -> tuple[AuthorLLMClient, MagicMock]:
     provider = MagicMock()
     # Return a real completion (not a MagicMock) so ``usage`` is a plain
     # dict|None that ``AuthoredDraft`` accepts — caching surfaces usage now (#474).
-    provider.call_with_metadata.return_value = AnthropicCompletion(
+    provider.complete.return_value = AnthropicCompletion(
         text=text, usage={"input_tokens": 1, "cache_read_input_tokens": 0}
     )
     return AuthorLLMClient(provider), provider
@@ -143,7 +143,7 @@ def test_run_grounded_and_voiced_end_to_end(tmp_path: Path) -> None:
     # body-wrapping change can't make this brittle (#503).
     assert draft.rendered_text.strip()
     assert "Voiced in the owner's register." in draft.rendered_text
-    provider.call_with_metadata.assert_called_once()
+    provider.complete.assert_called_once()
 
 
 def test_all_borrowed_claims_yield_no_owner_voiced_material() -> None:
@@ -177,7 +177,7 @@ def _sent_prompt(provider: MagicMock) -> str:
     dynamic user prompt. The *content* the model sees is the union of both, so
     these assertions check the union — agnostic to which block carries a piece.
     """
-    call = provider.call_with_metadata.call_args
+    call = provider.complete.call_args
     static = call.kwargs.get("system") or ""
     dynamic = call.args[0]
     return f"{static}\n\n{dynamic}"
@@ -195,7 +195,7 @@ def test_voice_prompt_includes_voice_core_sentinel(tmp_path: Path) -> None:
     VoiceAgent(llm_client=client).render("q", evidence, tmp_path, medium="research")
 
     # The static voice-skill prefix is the cached ``system`` block now.
-    assert sentinel in provider.call_with_metadata.call_args.kwargs["system"]
+    assert sentinel in provider.complete.call_args.kwargs["system"]
     assert sentinel in _sent_prompt(provider)
 
 
@@ -218,7 +218,7 @@ def test_voice_prompt_includes_register_skill_sentinel(tmp_path: Path) -> None:
         "analysis", evidence, tmp_path, medium="research"
     )
 
-    assert sentinel in provider.call_with_metadata.call_args.kwargs["system"]
+    assert sentinel in provider.complete.call_args.kwargs["system"]
     assert sentinel in _sent_prompt(provider)
 
 
@@ -312,7 +312,7 @@ def test_voice_render_survives_non_utf8_voice_core(tmp_path: Path) -> None:
     provider = MagicMock()
     completion = MagicMock()
     completion.text = "Voiced."
-    provider.call_with_metadata.return_value = completion
+    provider.complete.return_value = completion
     agent = VoiceAgent(llm_client=AuthorLLMClient(provider))
     evidence = EvidenceBundle(
         claims=[EvidenceClaim(claim="A grounded claim.", source_fragments=["frag-a"])]

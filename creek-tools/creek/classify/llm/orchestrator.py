@@ -27,13 +27,13 @@ from creek.classify.llm.parsing import (
 from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
     ANTHROPIC_CLOUD_WARNING,
-    AnthropicCompletion,
-    AnthropicProvider,
-    call_ollama,
-    check_ollama_available,
+    Completion,
+    build_provider,
+    provider_is_cloud,
 )
 
 if TYPE_CHECKING:
+    from creek.classify.llm.base import LLMProvider
     from creek.config import LLMConfig
     from creek.models import Fragment
 
@@ -80,36 +80,47 @@ class LLMClassifier:
     RATE_LIMIT_DELAY: float = 0.1
     """Seconds between batch request submissions."""
 
-    REQUEST_TIMEOUT: float = 30.0
-    """HTTP request timeout in seconds."""
-
-    AVAILABILITY_TIMEOUT: float = 5.0
-    """Timeout for the Ollama health check."""
-
-    ANTHROPIC_PROVIDER: str = "anthropic"
-    """Provider identifier for the Anthropic cloud API."""
-
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the LLM classifier.
 
-        Provider availability is checked lazily on first use.  When the
-        Anthropic provider is selected, a warning is logged immediately
-        so operators see it even before the first classification call.
+        The backend is selected by :func:`build_provider` and constructed
+        lazily on first use, so a classifier can be built even when a cloud
+        provider's credentials are absent (availability then reports
+        ``False``). When a cloud provider is configured, the egress warning is
+        logged immediately — driven off the provider registry's ``is_cloud``
+        flag, never a string compare — so operators see it before the first
+        call.
 
         Args:
             config: LLM provider configuration (provider, model, URL, etc.).
         """
         self.config = config
         self._available: bool | None = None
-        self._anthropic: AnthropicProvider | None = None
-        if config.provider == self.ANTHROPIC_PROVIDER:
+        self._provider_instance: LLMProvider | None = None
+        if provider_is_cloud(config.provider):
             logger.warning(ANTHROPIC_CLOUD_WARNING)
+
+    def _provider(self) -> LLMProvider:
+        """Lazily build and cache the configured provider.
+
+        Returns:
+            The cached :class:`LLMProvider` instance.
+
+        Raises:
+            RuntimeError: If a cloud provider's prerequisites are unmet; the
+                caller (:meth:`_check_availability`) catches this to degrade
+                gracefully.
+            ValueError: If ``config.provider`` names no registered backend.
+        """
+        if self._provider_instance is None:
+            self._provider_instance = build_provider(self.config)
+        return self._provider_instance
 
     @property
     def available(self) -> bool:
         """Whether the configured LLM provider is reachable.
 
-        For Ollama, checks the HTTP health endpoint; for Anthropic,
+        For Ollama, checks the HTTP health endpoint; for a cloud provider,
         validates that the required environment variables are present.
 
         Returns:
@@ -122,42 +133,19 @@ class LLMClassifier:
     def _check_availability(self) -> bool:
         """Check if the configured LLM provider is reachable.
 
-        For the Anthropic provider this validates that the required
-        environment variables are present.  For Ollama it issues a
-        health-check HTTP request against ``/api/tags``.
+        Building a cloud provider validates its environment and may raise;
+        that is caught here and reported as unavailable rather than
+        propagating, preserving the pipeline's graceful-degradation contract.
 
         Returns:
             ``True`` if the provider is ready to service requests.
         """
-        if self.config.provider == self.ANTHROPIC_PROVIDER:
-            return self._check_anthropic_availability()
-        return check_ollama_available(
-            self.config,
-            timeout=self.AVAILABILITY_TIMEOUT,
-        )
-
-    def _check_anthropic_availability(self) -> bool:
-        """Validate that the Anthropic provider can be constructed.
-
-        Returns:
-            ``True`` when the provider initialises successfully.
-        """
         try:
-            self._get_anthropic_provider()
+            provider = self._provider()
         except RuntimeError as exc:
-            logger.warning("Anthropic provider not available: %s", exc)
+            logger.warning("LLM provider not available: %s", exc)
             return False
-        return True
-
-    def _get_anthropic_provider(self) -> AnthropicProvider:
-        """Lazily instantiate the :class:`AnthropicProvider`.
-
-        Returns:
-            The cached ``AnthropicProvider`` instance.
-        """
-        if self._anthropic is None:
-            self._anthropic = AnthropicProvider(self.config)
-        return self._anthropic
+        return provider.available
 
     def _invoke_llm(self, prompt: str) -> str:
         """Dispatch a prompt to the configured provider.
@@ -168,9 +156,7 @@ class LLMClassifier:
         Returns:
             Raw response text from the provider.
         """
-        if self.config.provider == self.ANTHROPIC_PROVIDER:
-            return self._get_anthropic_provider().call(prompt)
-        return self._call_ollama(prompt)
+        return self._provider().complete(prompt).text
 
     def invoke_prompt(self, prompt: str) -> str:
         """Public dispatch helper for callers outside classification.
@@ -192,7 +178,7 @@ class LLMClassifier:
         prompt: str,
         *,
         max_tokens: int | None = None,
-    ) -> AnthropicCompletion:
+    ) -> Completion:
         """Dispatch a prompt and return its text plus stop reason.
 
         The draft pipeline routes through this method so it can detect a
@@ -201,25 +187,18 @@ class LLMClassifier:
         :meth:`invoke_prompt`, which discards the stop reason.
 
         Ollama does not expose a stop reason, so its responses default to
-        ``"end_turn"``; only the Anthropic provider can report
-        ``"max_tokens"``.
+        ``"end_turn"``; only a cloud provider can report ``"max_tokens"``.
 
         Args:
             prompt: The fully-formatted prompt.
-            max_tokens: Maximum tokens to request from the Anthropic
-                provider. ``None`` keeps the provider's default ceiling.
-                Ignored by the Ollama path.
+            max_tokens: Maximum tokens to request from the provider.
+                ``None`` keeps the provider's default ceiling. Ignored by
+                the Ollama path.
 
         Returns:
-            An :class:`AnthropicCompletion` with the response text and the
-            stop reason.
+            A :class:`Completion` with the response text and the stop reason.
         """
-        if self.config.provider == self.ANTHROPIC_PROVIDER:
-            return self._get_anthropic_provider().call_with_metadata(
-                prompt,
-                max_tokens=max_tokens,
-            )
-        return AnthropicCompletion(text=self._call_ollama(prompt))
+        return self._provider().complete(prompt, max_tokens=max_tokens)
 
     def _build_prompt(
         self,
@@ -241,25 +220,6 @@ class LLMClassifier:
             The formatted prompt string.
         """
         return build_classification_prompt(self.config, fragment, content)
-
-    def _call_ollama(self, prompt: str) -> str:
-        """Send a prompt to Ollama and return the response text.
-
-        Args:
-            prompt: The prompt to send.
-
-        Returns:
-            The raw response text from the LLM.
-
-        Raises:
-            httpx.HTTPStatusError: On HTTP error responses.
-            httpx.HTTPError: On connection or transport errors.
-        """
-        return call_ollama(
-            self.config,
-            prompt,
-            timeout=self.REQUEST_TIMEOUT,
-        )
 
     def validate_response(self, response_text: str) -> dict[str, object]:
         """Parse and strictly validate a YAML response from the LLM.
