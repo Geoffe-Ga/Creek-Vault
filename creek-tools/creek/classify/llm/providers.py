@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import httpx
+
+from creek.classify.llm.completion import AnthropicCompletion, Completion
 
 if TYPE_CHECKING:
     import anthropic
@@ -29,30 +30,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class AnthropicCompletion:
-    """An Anthropic completion paired with its stop reason.
-
-    The classification path discards the stop reason; the draft path
-    needs it so a ``max_tokens`` ceiling can be surfaced instead of
-    truncating the essay mid-sentence without warning.
-
-    Attributes:
-        text: The concatenated textual content of the response.
-        stop_reason: The reason the model stopped generating. ``"end_turn"``
-            on a clean completion; ``"max_tokens"`` when the ceiling was hit.
-        usage: Token-usage counts from the SDK response, when available
-            (``input_tokens``, ``output_tokens`` and, when prompt caching is
-            active, ``cache_creation_input_tokens`` / ``cache_read_input_tokens``).
-            ``None`` when the SDK omitted usage. The author desk surfaces this on
-            :class:`~creek.author.models.AuthoredDraft` so a run's cost — and
-            cache-hit rate — is observable (#474).
-    """
-
-    text: str
-    stop_reason: str = "end_turn"
-    usage: dict[str, int] | None = None
+# ``AnthropicCompletion`` is the deprecated alias for :class:`Completion`,
+# imported here so the historical path
+# ``from creek.classify.llm.providers import AnthropicCompletion`` keeps
+# resolving after the type moved to :mod:`creek.classify.llm.completion` (#604).
+__all__ = [
+    "ANTHROPIC_CLOUD_WARNING",
+    "AnthropicCompletion",
+    "AnthropicProvider",
+    "Completion",
+]
 
 
 ANTHROPIC_CLOUD_WARNING: str = (
@@ -106,21 +93,50 @@ class AnthropicProvider:
                 variables are not set.
         """
         self.config = config
-        if not os.environ.get(self.API_KEY_ENV, "").strip():
-            msg = (
-                f"{self.API_KEY_ENV} environment variable is not set; "
+        unmet = self._missing_prerequisite()
+        if unmet is not None:
+            raise RuntimeError(unmet)
+        self._client: anthropic.Anthropic | None = None
+
+    @classmethod
+    def _missing_prerequisite(cls) -> str | None:
+        """Return why the Anthropic prerequisites are unmet, or ``None``.
+
+        The API key and the explicit cloud-egress consent are both read from
+        the environment at call time, so the check reflects the *current* env
+        rather than the env at construction. :meth:`__init__` raises the
+        returned message; :attr:`available` reports whether it is ``None``.
+
+        Returns:
+            A human-readable explanation when the key is missing or consent is
+            not affirmative; ``None`` when both prerequisites are satisfied.
+        """
+        if not os.environ.get(cls.API_KEY_ENV, "").strip():
+            return (
+                f"{cls.API_KEY_ENV} environment variable is not set; "
                 "required for the Anthropic provider."
             )
-            raise RuntimeError(msg)
-        consent = os.environ.get(self.CONSENT_ENV, "").strip().lower()
-        if consent not in self.CONSENT_TRUTHY:
-            msg = (
+        consent = os.environ.get(cls.CONSENT_ENV, "").strip().lower()
+        if consent not in cls.CONSENT_TRUTHY:
+            return (
                 "Anthropic cloud classification requires explicit consent. "
-                f"Set {self.CONSENT_ENV}=1 to confirm that fragment content "
+                f"Set {cls.CONSENT_ENV}=1 to confirm that fragment content "
                 "may be sent to Anthropic's servers."
             )
-            raise RuntimeError(msg)
-        self._client: anthropic.Anthropic | None = None
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Whether the Anthropic prerequisites (API key + consent) are met.
+
+        Delegates to :meth:`_missing_prerequisite`, the same check
+        :meth:`__init__` enforces, so the :class:`~creek.classify.llm.base.LLMProvider`
+        protocol's ``available`` contract reflects the live environment.
+
+        Returns:
+            ``True`` when the API key is set and consent is affirmative.
+        """
+        return self._missing_prerequisite() is None
 
     @property
     def model(self) -> str:
@@ -165,6 +181,35 @@ class AnthropicProvider:
                 its type name to avoid leaking sensitive request state.
         """
         return self.call_with_metadata(prompt).text
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Provider-neutral entry point: send *prompt*, return a ``Completion``.
+
+        Satisfies the :class:`~creek.classify.llm.base.LLMProvider` protocol by
+        delegating verbatim to :meth:`call_with_metadata`, the historical
+        Anthropic-named method existing callers still use. No behaviour change;
+        the two names are interchangeable while callers migrate (#604).
+
+        Args:
+            prompt: The dynamic, fully-formatted user prompt.
+            max_tokens: Maximum tokens to request, or ``None`` for the
+                historical :attr:`MAX_TOKENS` ceiling.
+            system: Optional static system prefix to cache, or ``None``.
+
+        Returns:
+            The :class:`Completion` produced by :meth:`call_with_metadata`.
+
+        Raises:
+            RuntimeError: Propagated from :meth:`call_with_metadata` when the
+                SDK raises; the original exception type name is preserved.
+        """
+        return self.call_with_metadata(prompt, max_tokens=max_tokens, system=system)
 
     def call_with_metadata(
         self,
