@@ -45,6 +45,7 @@ creek-tools-mcp = "creek_mcp.server:main"
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
 openai = ["openai>=1.0"]
+gemini = ["google-genai>=1.0"]
 embeddings = [
     "sentence-transformers>=2.2.0",
     "numpy>=2.4.4",
@@ -69,7 +70,7 @@ gdrive = [
 all = [
     # Self-referential extras (pip >= 21.2). Adding a new sub-extra
     # automatically flows into [all] without manual duplication.
-    "creek-tools[anthropic,openai,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
+    "creek-tools[anthropic,openai,gemini,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
 ]
 dev = [
     # `tests/conftest.py` imports numpy, `tests/test_classify.py` mocks
