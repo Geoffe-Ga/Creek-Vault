@@ -13,6 +13,7 @@ from crawdad.composer import (
 )
 from crawdad.dispatcher import ToolResult
 from crawdad.history import ConversationHistory
+from crawdad.llm.base import Completion
 from crawdad.skill_loader import VoiceSkill, VoiceSkillStack
 from crawdad.state import SessionState
 
@@ -48,30 +49,27 @@ def tool_results() -> list[ToolResult]:
     ]
 
 
-class _FakeAnthropic:
-    """Minimal stand-in for ``anthropic.AsyncAnthropic``."""
+class _FakeProvider:
+    """Minimal ``AsyncLLMProvider`` double; returns a reply or raises."""
 
     def __init__(self, reply: str | Exception) -> None:
         self._reply = reply
         self.calls: list[dict[str, Any]] = []
-        self.messages = self
 
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> Completion:
+        """Record the call and return a canned completion (or raise)."""
+        self.calls.append(
+            {"messages": messages, "model": model, "max_tokens": max_tokens}
+        )
         if isinstance(self._reply, Exception):
             raise self._reply
-        return _FakeResponse(self._reply)
-
-
-class _FakeResponse:
-    def __init__(self, text: str) -> None:
-        self.content = [_FakeBlock(text)]
-
-
-class _FakeBlock:
-    def __init__(self, text: str) -> None:
-        self.type = "text"
-        self.text = text
+        return Completion(text=self._reply)
 
 
 def test_build_composer_prompt_embeds_skills_and_results(
@@ -173,9 +171,9 @@ async def test_composer_returns_reply(
     tool_results: list[ToolResult],
 ) -> None:
     """A successful Sonnet call returns the model's text body."""
-    fake = _FakeAnthropic("Here's what's surfacing this week...")
+    fake = _FakeProvider("Here's what's surfacing this week...")
     composer = SonnetComposer(
-        anthropic_client=fake,  # type: ignore[arg-type]
+        provider=fake,
         model="claude-sonnet-test",
     )
 
@@ -195,9 +193,9 @@ async def test_composer_uses_configured_model(
     skills: VoiceSkillStack,
 ) -> None:
     """The injected model name is the one passed to the Anthropic SDK."""
-    fake = _FakeAnthropic("ok")
+    fake = _FakeProvider("ok")
     composer = SonnetComposer(
-        anthropic_client=fake,  # type: ignore[arg-type]
+        provider=fake,
         model="custom-sonnet-id",
     )
 
@@ -212,15 +210,17 @@ async def test_composer_uses_configured_model(
     assert fake.calls[0]["model"] == "custom-sonnet-id"
 
 
-async def test_composer_translates_anthropic_errors(
+async def test_composer_translates_provider_errors(
     session_state: SessionState, skills: VoiceSkillStack
 ) -> None:
-    """SDK errors surface as ``ComposerFailureError`` so the loop can recover."""
-    import anthropic
+    """Redacted provider errors surface as ``ComposerFailureError`` to recover.
 
-    fake = _FakeAnthropic(anthropic.AnthropicError("simulated rate-limit"))
+    The provider has already redacted the SDK failure to a ``RuntimeError``
+    carrying only the exception type name; the composer wraps it.
+    """
+    fake = _FakeProvider(RuntimeError("AnthropicError"))
     composer = SonnetComposer(
-        anthropic_client=fake,  # type: ignore[arg-type]
+        provider=fake,
         model="claude-sonnet-test",
     )
 
@@ -238,9 +238,9 @@ async def test_composer_handles_empty_response(
     session_state: SessionState, skills: VoiceSkillStack
 ) -> None:
     """A response with no text blocks raises ``ComposerFailureError``."""
-    fake = _FakeAnthropic("")
+    fake = _FakeProvider("")
     composer = SonnetComposer(
-        anthropic_client=fake,  # type: ignore[arg-type]
+        provider=fake,
         model="claude-sonnet-test",
     )
 
