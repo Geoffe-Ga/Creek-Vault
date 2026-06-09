@@ -26,6 +26,7 @@ from creek.classify.llm.completion import AnthropicCompletion, Completion
 if TYPE_CHECKING:
     import anthropic
 
+    from creek.classify.llm.base import LLMProvider
     from creek.config import LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ __all__ = [
     "AnthropicCompletion",
     "AnthropicProvider",
     "Completion",
+    "OllamaProvider",
+    "build_provider",
+    "provider_is_cloud",
 ]
 
 
@@ -60,6 +64,9 @@ class AnthropicProvider:
     Attributes:
         config: The LLM configuration specifying model, batch size, etc.
     """
+
+    is_cloud: bool = True
+    """Anthropic sends fragment content off-device; gated by consent."""
 
     DEFAULT_MODEL: str = "claude-sonnet-4-6"
     """Default Anthropic model when the config does not override it."""
@@ -404,3 +411,145 @@ def check_ollama_available(config: LLMConfig, *, timeout: float) -> bool:
         pass
     logger.warning("Ollama not available at %s", config.ollama_url)
     return False
+
+
+class OllamaProvider:
+    """Local Ollama provider implementing the :class:`LLMProvider` protocol.
+
+    Wraps the module-level :func:`call_ollama` / :func:`check_ollama_available`
+    HTTP helpers so the factory returns one uniform provider type. Ollama runs
+    on-device, so :attr:`is_cloud` is ``False`` and no consent is required;
+    construction performs no I/O (the health check runs on first
+    :attr:`available` access).
+
+    Attributes:
+        config: The LLM configuration carrying the Ollama URL and model name.
+    """
+
+    is_cloud: bool = False
+    """Ollama runs locally; content never leaves the device."""
+
+    REQUEST_TIMEOUT: float = 30.0
+    """HTTP request timeout for completion calls, in seconds."""
+
+    AVAILABILITY_TIMEOUT: float = 5.0
+    """Timeout for the Ollama health check, in seconds."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Store the configuration; performs no network I/O.
+
+        Args:
+            config: LLM provider configuration (Ollama URL + model name).
+        """
+        self.config = config
+
+    @property
+    def model(self) -> str:
+        """The configured Ollama model identifier.
+
+        Returns:
+            ``config.model`` verbatim — Ollama has no cloud-model fallback.
+        """
+        return self.config.model
+
+    @property
+    def available(self) -> bool:
+        """Whether the local Ollama endpoint is reachable.
+
+        Returns:
+            ``True`` when the ``/api/tags`` health check returns ``200``.
+        """
+        return check_ollama_available(
+            self.config,
+            timeout=self.AVAILABILITY_TIMEOUT,
+        )
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Send *prompt* to Ollama and return a normalized :class:`Completion`.
+
+        Ollama's generate API exposes neither a ``max_tokens`` ceiling nor a
+        cached ``system`` prefix nor token usage, so those kwargs are accepted
+        for protocol compatibility but ignored, and the result carries the
+        default ``"end_turn"`` stop reason with ``usage=None``.
+
+        Args:
+            prompt: The fully-formatted prompt.
+            max_tokens: Ignored (Ollama has no output ceiling knob here).
+            system: Ignored (Ollama has no cached system block).
+
+        Returns:
+            A :class:`Completion` wrapping the raw Ollama response text.
+
+        Raises:
+            httpx.HTTPStatusError: On HTTP error responses.
+            httpx.HTTPError: On connection or transport errors.
+        """
+        text = call_ollama(
+            self.config,
+            prompt,
+            timeout=self.REQUEST_TIMEOUT,
+        )
+        return Completion(text=text)
+
+
+#: Registry mapping the ``LLMConfig.provider`` string to its provider class.
+#: Adding a backend (OpenAI #607, Gemini #608) is a one-line entry here. The
+#: value is the concrete class (not the ``LLMProvider`` protocol) so it is both
+#: constructible and exposes the class-level ``is_cloud`` flag; widen the union
+#: as new providers land.
+_PROVIDER_REGISTRY: dict[str, type[AnthropicProvider | OllamaProvider]] = {
+    "anthropic": AnthropicProvider,
+    "ollama": OllamaProvider,
+}
+
+
+def build_provider(config: LLMConfig) -> LLMProvider:
+    """Construct the :class:`LLMProvider` selected by ``config.provider``.
+
+    The single dispatch point replacing the scattered ``== "anthropic"``
+    branching (#605). Cloud providers validate their environment in their
+    constructor and may raise; callers that want graceful degradation should
+    catch :class:`RuntimeError` (the classifier does, to report unavailability).
+
+    Args:
+        config: LLM provider configuration; ``config.provider`` selects the
+            backend.
+
+    Returns:
+        A provider instance satisfying the :class:`LLMProvider` protocol.
+
+    Raises:
+        ValueError: If ``config.provider`` names no registered backend.
+    """
+    try:
+        provider_cls = _PROVIDER_REGISTRY[config.provider]
+    except KeyError:
+        known = ", ".join(sorted(_PROVIDER_REGISTRY))
+        msg = f"unknown LLM provider {config.provider!r}; expected one of: {known}"
+        raise ValueError(msg) from None
+    return provider_cls(config)
+
+
+def provider_is_cloud(provider: str) -> bool:
+    """Report whether *provider* is a cloud backend without instantiating it.
+
+    Read from the class-level :attr:`LLMProvider.is_cloud` flag so the
+    classifier can emit the cloud-egress warning at construction time, before
+    any API key is guaranteed present (instantiating a cloud provider then
+    would raise).
+
+    Args:
+        provider: The ``LLMConfig.provider`` string.
+
+    Returns:
+        ``True`` when the named provider is registered and cloud-backed;
+        ``False`` for local or unknown providers.
+    """
+    provider_cls = _PROVIDER_REGISTRY.get(provider)
+    return bool(provider_cls is not None and provider_cls.is_cloud)

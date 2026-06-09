@@ -878,7 +878,7 @@ class TestApplyClassification:
 class TestClassify:
     """Tests for the classify method with mocked Ollama."""
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_classifies_fragment(
         self,
         mock_call: MagicMock,
@@ -904,7 +904,7 @@ class TestClassify:
         assert result.id == frag.id
         assert result.frequency.primary == Frequency.UNCLASSIFIED
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_retries_on_malformed_response(
         self,
@@ -924,7 +924,7 @@ class TestClassify:
         assert result.frequency.primary == Frequency.F3
         assert mock_call.call_count == 2
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_returns_unchanged_after_all_retries(
         self,
@@ -946,7 +946,7 @@ class TestClassify:
         # Guards the `time.sleep(self.RETRY_DELAY)` backoff against removal.
         assert mock_sleep.call_count == classifier.MAX_RETRIES - 1
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_logs_warning_when_unavailable(
         self,
         mock_call: MagicMock,
@@ -962,7 +962,7 @@ class TestClassify:
         assert any("unavailable" in r.message.lower() for r in caplog.records)
         mock_call.assert_not_called()
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_5xx_response_returns_unchanged_with_warning(
         self,
@@ -1019,7 +1019,7 @@ class TestClassify:
         # Guards the `time.sleep(self.RETRY_DELAY)` backoff against removal.
         assert mock_sleep.call_count == classifier.MAX_RETRIES - 1
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_classify_preserves_id_and_title(
         self,
         mock_call: MagicMock,
@@ -1035,7 +1035,7 @@ class TestClassify:
         assert result.id == frag.id
         assert result.title == "Keep Me"
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_classify_ignores_injected_yaml_in_body(
         self,
         mock_call: MagicMock,
@@ -1058,7 +1058,7 @@ class TestClassify:
         )
         assert result.frequency.primary == Frequency.UNCLASSIFIED
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_classify_falls_back_when_llm_returns_multi_doc(
         self,
@@ -1076,7 +1076,7 @@ class TestClassify:
         result = classifier.classify(frag, content="hi")
         assert result.frequency.primary == Frequency.UNCLASSIFIED
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_classify_falls_back_on_unexpected_top_level_keys(
         self,
@@ -1101,7 +1101,7 @@ class TestClassify:
 class TestClassifyBatch:
     """Tests for classify_batch."""
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_batch_returns_all_fragments(
         self,
@@ -1137,7 +1137,7 @@ class TestClassifyBatch:
         for orig, res in zip(frags, results, strict=True):
             assert res.id == orig.id
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_batch_classifies_fragments(
         self,
@@ -1155,7 +1155,7 @@ class TestClassifyBatch:
         for res in results:
             assert res.frequency.primary == Frequency.F3
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_batch_logs_stats(
         self,
@@ -1722,9 +1722,9 @@ class TestLLMClassifierAnthropicDispatch:
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Default ollama provider continues to use _call_ollama."""
+        """Default ollama provider continues to use _invoke_llm."""
         with patch.object(
-            LLMClassifier, "_call_ollama", return_value=_VALID_YAML_RESPONSE
+            LLMClassifier, "_invoke_llm", return_value=_VALID_YAML_RESPONSE
         ) as mock_call:
             classifier = _make_classifier_available(
                 LLMClassifier(config=LLMConfig()),
@@ -2438,7 +2438,7 @@ class TestSplitReasoningAndYaml:
 class TestClassifyWithReasoning:
     """`classify_with_reasoning` returns Fragment plus a reasoning trace."""
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_returns_reasoning_when_model_provides_one(
         self,
         mock_call: MagicMock,
@@ -2450,7 +2450,7 @@ class TestClassifyWithReasoning:
         assert result.fragment.frequency.primary == Frequency.F3
         assert "F3 because" in result.reasoning
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_returns_empty_reasoning_for_pure_yaml(
         self,
         mock_call: MagicMock,
@@ -2470,7 +2470,7 @@ class TestClassifyWithReasoning:
         assert result.fragment is frag
         assert result.reasoning == ""
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
     def test_returns_empty_reasoning_after_retries_exhausted(
         self,
@@ -2493,7 +2493,7 @@ class TestUnclassifiedBias:
         score_block = "\n".join(f"  {k}: {v}" for k, v in scores.items())
         return _VALID_YAML_RESPONSE + "confidence_scores:\n" + score_block + "\n"
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_low_mode_confidence_forces_unclassified(
         self,
         mock_call: MagicMock,
@@ -2513,7 +2513,7 @@ class TestUnclassifiedBias:
         assert result.wavelength.phase == Phase.RISING
         assert result.frequency.primary == Frequency.F3
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_high_confidence_preserves_pick(
         self,
         mock_call: MagicMock,
@@ -2532,7 +2532,7 @@ class TestUnclassifiedBias:
         assert result.wavelength.orientation == Orientation.DO
         assert result.wavelength.dosage == Dosage.MEDICINE
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_bias_applies_to_orientation_and_dosage(
         self,
         mock_call: MagicMock,
@@ -2551,7 +2551,7 @@ class TestUnclassifiedBias:
         assert result.wavelength.orientation == Orientation.UNCLASSIFIED
         assert result.wavelength.dosage == Dosage.UNCLASSIFIED
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_missing_confidence_score_keeps_model_pick(
         self,
         mock_call: MagicMock,
@@ -2565,7 +2565,7 @@ class TestUnclassifiedBias:
         assert result.wavelength.mode == Mode.EXPRESS
         assert result.wavelength.orientation == Orientation.DO
 
-    @patch.object(LLMClassifier, "_call_ollama")
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_unparseable_confidence_keeps_model_pick(
         self,
         mock_call: MagicMock,
@@ -2595,40 +2595,52 @@ class TestUnclassifiedBias:
 class TestInvokePromptWithMetadata:
     """``LLMClassifier.invoke_prompt_with_metadata`` surfaces the stop reason."""
 
-    def test_ollama_path_defaults_to_end_turn(self) -> None:
-        """The Ollama path has no stop reason, so it defaults to end_turn."""
-        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
-        with patch.object(LLMClassifier, "_call_ollama", return_value="body text"):
-            completion = classifier.invoke_prompt_with_metadata("prompt")
-        assert completion.text == "body text"
-        assert completion.stop_reason == "end_turn"
-
-    def test_anthropic_path_threads_max_tokens(
+    def test_ollama_path_defaults_to_end_turn(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The Anthropic path forwards max_tokens and returns the stop reason."""
-        from creek.classify.llm.providers import AnthropicCompletion
+        """The Ollama path has no stop reason, so it defaults to end_turn."""
+        from creek.classify.llm.completion import Completion
 
-        _set_anthropic_env(monkeypatch)
-        classifier = LLMClassifier(config=LLMConfig(provider="anthropic"))
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
 
         class _StubProvider:
-            def call_with_metadata(
+            def complete(
                 self,
                 prompt: str,
                 *,
                 max_tokens: int | None = None,
-            ) -> AnthropicCompletion:
+                system: str | None = None,
+            ) -> Completion:
+                return Completion(text="body text")
+
+        monkeypatch.setattr(classifier, "_provider", _StubProvider)
+        completion = classifier.invoke_prompt_with_metadata("prompt")
+        assert completion.text == "body text"
+        assert completion.stop_reason == "end_turn"
+
+    def test_provider_path_threads_max_tokens(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The provider receives max_tokens and its stop reason is surfaced."""
+        from creek.classify.llm.completion import Completion
+
+        classifier = LLMClassifier(config=LLMConfig(provider="anthropic"))
+
+        class _StubProvider:
+            def complete(
+                self,
+                prompt: str,
+                *,
+                max_tokens: int | None = None,
+                system: str | None = None,
+            ) -> Completion:
                 assert max_tokens == 512
                 assert prompt == "prompt"
-                return AnthropicCompletion(text="cut", stop_reason="max_tokens")
+                return Completion(text="cut", stop_reason="max_tokens")
 
-        monkeypatch.setattr(
-            classifier,
-            "_get_anthropic_provider",
-            _StubProvider,
-        )
+        monkeypatch.setattr(classifier, "_provider", _StubProvider)
         completion = classifier.invoke_prompt_with_metadata("prompt", max_tokens=512)
         assert completion.text == "cut"
         assert completion.stop_reason == "max_tokens"
