@@ -31,6 +31,7 @@ from creek.classify.llm.consent import (
 if TYPE_CHECKING:
     import anthropic
     import openai
+    from google import genai
 
     from creek.classify.llm.base import LLMProvider
     from creek.config import LLMConfig
@@ -46,6 +47,7 @@ __all__ = [
     "AnthropicCompletion",
     "AnthropicProvider",
     "Completion",
+    "GeminiProvider",
     "OllamaProvider",
     "OpenAIProvider",
     "build_provider",
@@ -763,17 +765,259 @@ def _extract_openai_usage(response: object) -> dict[str, int] | None:
     return counts or None
 
 
+#: Gemini ``finish_reason`` → normalized :class:`Completion` stop reason.
+_GEMINI_STOP_REASONS: dict[str, str] = {"STOP": "end_turn", "MAX_TOKENS": "max_tokens"}
+
+
+class GeminiProvider:
+    """Google Gemini provider for cloud-based fragment classification (#608).
+
+    Sends prompts to the Gemini ``generate_content`` API via the current
+    ``google-genai`` SDK (``from google import genai``). The API key is read by
+    the SDK from ``GOOGLE_API_KEY`` or ``GEMINI_API_KEY`` and is never stored in
+    config, logs, or error messages. Structure mirrors :class:`OpenAIProvider`
+    and :class:`AnthropicProvider` so the providers stay legible.
+
+    Attributes:
+        config: The LLM configuration specifying model, batch size, etc.
+    """
+
+    is_cloud: bool = True
+    """Gemini sends fragment content off-device; gated by consent."""
+
+    PROVIDER_NAME: str = "Gemini"
+    """Display name woven into consent and cloud-egress messages."""
+
+    DEFAULT_MODEL: str = "gemini-2.5-flash"
+    """Default Gemini model when the config does not override it."""
+
+    API_KEY_ENVS: tuple[str, ...] = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
+    """Environment variables the SDK reads for the key; either suffices."""
+
+    MAX_TOKENS: int = 1024
+    """Maximum output tokens requested from the Gemini API per call."""
+
+    _OLLAMA_DEFAULT_MODEL: str = "mistral"
+    """The ``LLMConfig`` default model name (indicates no Gemini override)."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Validate environment prerequisites and prepare the client.
+
+        The SDK client is instantiated lazily on first use. The cloud-egress
+        consent gate is shared with every cloud provider (#606).
+
+        Args:
+            config: LLM provider configuration.
+
+        Raises:
+            RuntimeError: If no key variable is set or cloud consent is missing.
+        """
+        self.config = config
+        unmet = self._missing_prerequisite()
+        if unmet is not None:
+            raise RuntimeError(unmet)
+        self._client: genai.Client | None = None
+
+    @classmethod
+    def _missing_prerequisite(cls) -> str | None:
+        """Return why the Gemini prerequisites are unmet, or ``None``.
+
+        Requires one of :attr:`API_KEY_ENVS` plus the shared cloud consent;
+        both are read from the environment at call time so :attr:`available`
+        reflects the live env.
+
+        Returns:
+            A human-readable explanation when no key is present or consent is
+            not affirmative; ``None`` when both prerequisites are satisfied.
+        """
+        if not any(os.environ.get(var, "").strip() for var in cls.API_KEY_ENVS):
+            joined = " or ".join(cls.API_KEY_ENVS)
+            return f"Neither {joined} is set; one is required for the Gemini provider."
+        if not has_cloud_consent():
+            return consent_error_message(cls.PROVIDER_NAME)
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Whether the Gemini prerequisites (a key + consent) are met.
+
+        Returns:
+            ``True`` when a key variable is set and cloud consent is affirmative.
+        """
+        return self._missing_prerequisite() is None
+
+    @property
+    def model(self) -> str:
+        """The Gemini model identifier to use for API calls.
+
+        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` still holds
+        the Ollama default (``"mistral"``) or is empty.
+
+        Returns:
+            The resolved model identifier.
+        """
+        model = self.config.model.strip()
+        if not model or model == self._OLLAMA_DEFAULT_MODEL:
+            return self.DEFAULT_MODEL
+        return model
+
+    @property
+    def client(self) -> genai.Client:
+        """The lazily-initialised ``google-genai`` client.
+
+        The SDK reads ``GOOGLE_API_KEY`` / ``GEMINI_API_KEY`` itself.
+
+        Returns:
+            A ``google.genai.Client`` instance.
+        """
+        if self._client is None:
+            from google import genai
+
+            self._client = genai.Client()
+        return self._client
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Send *prompt* to Gemini and return a normalized :class:`Completion`.
+
+        Args:
+            prompt: The dynamic, fully-formatted user prompt.
+            max_tokens: Maximum output tokens. ``None`` keeps the historical
+                :attr:`MAX_TOKENS` ceiling.
+            system: Optional system instruction. ``None`` sends none.
+
+        Returns:
+            A :class:`Completion` carrying the response text, the mapped stop
+            reason, and token usage when present.
+
+        Raises:
+            RuntimeError: If the SDK raises any ``APIError``; re-raised with
+                only the exception type name so no request state leaks.
+        """
+        from google.genai import errors
+
+        ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
+        try:
+            response = self._generate(prompt, ceiling, system)
+        except errors.APIError as exc:
+            msg = f"Gemini API call failed: {type(exc).__name__}"
+            raise RuntimeError(msg) from None
+        return Completion(
+            text=_extract_gemini_text(response),
+            stop_reason=_map_gemini_stop_reason(response),
+            usage=_extract_gemini_usage(response),
+        )
+
+    def _generate(self, prompt: str, ceiling: int, system: str | None) -> object:
+        """Call ``models.generate_content`` with a configured generation request.
+
+        Args:
+            prompt: The dynamic user prompt sent as ``contents``.
+            ceiling: The resolved ``max_output_tokens`` value.
+            system: Optional system instruction, or ``None``.
+
+        Returns:
+            The raw ``generate_content`` response object.
+        """
+        from google.genai import types
+
+        config = types.GenerateContentConfig(
+            max_output_tokens=ceiling,
+            system_instruction=system,
+        )
+        return self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=config,
+        )
+
+
+def _extract_gemini_text(response: object) -> str:
+    """Concatenate the textual parts of a Gemini response's first candidate.
+
+    Args:
+        response: A ``generate_content`` response object.
+
+    Returns:
+        The joined ``text`` of each content part, or ``""`` when absent.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return ""
+    content = getattr(candidates[0], "content", None)
+    parts = getattr(content, "parts", None) or []
+    out: list[str] = []
+    for part in parts:
+        text = getattr(part, "text", None)
+        if isinstance(text, str):
+            out.append(text)
+    return "".join(out)
+
+
+def _map_gemini_stop_reason(response: object) -> str:
+    """Map a Gemini ``finish_reason`` to a normalized stop reason.
+
+    Accepts both the SDK's ``FinishReason`` enum (via ``.name``) and a plain
+    string.
+
+    Args:
+        response: A ``generate_content`` response object.
+
+    Returns:
+        ``"end_turn"`` for ``STOP`` (and unknown/absent reasons),
+        ``"max_tokens"`` for ``MAX_TOKENS``.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return "end_turn"
+    reason = getattr(candidates[0], "finish_reason", None)
+    if reason is None:
+        return "end_turn"
+    name = getattr(reason, "name", None)
+    key = name if isinstance(name, str) else str(reason)
+    return _GEMINI_STOP_REASONS.get(key, "end_turn")
+
+
+def _extract_gemini_usage(response: object) -> dict[str, int] | None:
+    """Extract integer token-usage counts from a Gemini response.
+
+    Args:
+        response: A ``generate_content`` response object.
+
+    Returns:
+        A dict with ``input_tokens`` / ``output_tokens`` mirroring the other
+        providers' usage shape, or ``None`` when the SDK omitted usage.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return None
+    counts: dict[str, int] = {}
+    prompt_tokens = getattr(usage, "prompt_token_count", None)
+    candidate_tokens = getattr(usage, "candidates_token_count", None)
+    if isinstance(prompt_tokens, int):
+        counts["input_tokens"] = prompt_tokens
+    if isinstance(candidate_tokens, int):
+        counts["output_tokens"] = candidate_tokens
+    return counts or None
+
+
 #: Registry mapping the ``LLMConfig.provider`` string to its provider class.
-#: Adding a backend (Gemini #608) is a one-line entry here. The value is the
-#: concrete class (not the ``LLMProvider`` protocol) so it is both
-#: constructible and exposes the class-level ``is_cloud`` flag; widen the union
-#: as new providers land.
+#: The value is the concrete class (not the ``LLMProvider`` protocol) so it is
+#: both constructible and exposes the class-level ``is_cloud`` flag; widen the
+#: union as new providers land.
 _PROVIDER_REGISTRY: dict[
-    str, type[AnthropicProvider | OllamaProvider | OpenAIProvider]
+    str,
+    type[AnthropicProvider | OllamaProvider | OpenAIProvider | GeminiProvider],
 ] = {
     "anthropic": AnthropicProvider,
     "ollama": OllamaProvider,
     "openai": OpenAIProvider,
+    "gemini": GeminiProvider,
 }
 
 

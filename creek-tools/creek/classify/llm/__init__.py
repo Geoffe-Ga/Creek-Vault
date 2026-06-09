@@ -76,6 +76,7 @@ from creek.classify.llm.prompts import _sanitise_for_prompt as _sanitise_for_pro
 from creek.classify.llm.providers import (
     ANTHROPIC_CLOUD_WARNING,
     AnthropicProvider,
+    GeminiProvider,
     OllamaProvider,
     OpenAIProvider,
     build_provider,
@@ -89,6 +90,7 @@ __all__ = [
     "AnthropicProvider",
     "BatchStats",
     "Completion",
+    "GeminiProvider",
     "LLMClassificationResult",
     "LLMClassifier",
     "LLMProvider",
