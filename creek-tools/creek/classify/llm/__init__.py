@@ -37,8 +37,15 @@ import time as time
 # call time, so the patches reach the inner code paths.
 import httpx as httpx
 
+from creek.classify.llm.base import LLMProvider
 from creek.classify.llm.batch import BatchStats
 from creek.classify.llm.calibration import _BIASED_DIMENSIONS as _BIASED_DIMENSIONS
+from creek.classify.llm.completion import (
+    AnthropicCompletion as AnthropicCompletion,
+)
+from creek.classify.llm.completion import (
+    Completion as Completion,
+)
 from creek.classify.llm.orchestrator import (
     LLMClassificationResult,
     LLMClassifier,
@@ -62,8 +69,11 @@ from creek.classify.llm.providers import ANTHROPIC_CLOUD_WARNING, AnthropicProvi
 __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
     "CLASSIFICATION_PROMPT",
+    "AnthropicCompletion",
     "AnthropicProvider",
     "BatchStats",
+    "Completion",
     "LLMClassificationResult",
     "LLMClassifier",
+    "LLMProvider",
 ]
