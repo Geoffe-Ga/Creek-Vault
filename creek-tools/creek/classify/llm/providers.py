@@ -30,6 +30,7 @@ from creek.classify.llm.consent import (
 
 if TYPE_CHECKING:
     import anthropic
+    import openai
 
     from creek.classify.llm.base import LLMProvider
     from creek.config import LLMConfig
@@ -46,6 +47,7 @@ __all__ = [
     "AnthropicProvider",
     "Completion",
     "OllamaProvider",
+    "OpenAIProvider",
     "build_provider",
     "cloud_warning",
     "provider_display_name",
@@ -512,14 +514,266 @@ class OllamaProvider:
         return Completion(text=text)
 
 
+#: OpenAI ``finish_reason`` → normalized :class:`Completion` stop reason.
+_OPENAI_STOP_REASONS: dict[str, str] = {"stop": "end_turn", "length": "max_tokens"}
+
+
+class OpenAIProvider:
+    """OpenAI API provider for cloud-based fragment classification (#607).
+
+    Sends prompts to the OpenAI ``chat.completions`` API via the official SDK.
+    The API key is read exclusively from ``OPENAI_API_KEY`` by the SDK and is
+    never stored in config, logs, or error messages; an optional
+    OpenAI-compatible gateway base URL may be supplied via ``config.api_base``
+    (or the SDK's own ``OPENAI_BASE_URL``). Structure mirrors
+    :class:`AnthropicProvider` so the two stay legible.
+
+    Attributes:
+        config: The LLM configuration specifying model, batch size, etc.
+    """
+
+    is_cloud: bool = True
+    """OpenAI sends fragment content off-device; gated by consent."""
+
+    PROVIDER_NAME: str = "OpenAI"
+    """Display name woven into consent and cloud-egress messages."""
+
+    DEFAULT_MODEL: str = "gpt-4o"
+    """Default OpenAI model when the config does not override it."""
+
+    API_KEY_ENV: str = "OPENAI_API_KEY"
+    """Environment variable name for the OpenAI API key."""
+
+    MAX_TOKENS: int = 1024
+    """Maximum tokens requested from the OpenAI API per call."""
+
+    _OLLAMA_DEFAULT_MODEL: str = "mistral"
+    """The ``LLMConfig`` default model name (indicates no OpenAI override)."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Validate environment prerequisites and prepare the client.
+
+        The SDK client is instantiated lazily on first use. The cloud-egress
+        consent gate is shared with every cloud provider (#606).
+
+        Args:
+            config: LLM provider configuration.
+
+        Raises:
+            RuntimeError: If the API key is unset or cloud consent is missing.
+        """
+        self.config = config
+        unmet = self._missing_prerequisite()
+        if unmet is not None:
+            raise RuntimeError(unmet)
+        self._client: openai.OpenAI | None = None
+
+    @classmethod
+    def _missing_prerequisite(cls) -> str | None:
+        """Return why the OpenAI prerequisites are unmet, or ``None``.
+
+        The key and the shared cloud-egress consent are read from the
+        environment at call time; :meth:`__init__` raises the returned message
+        and :attr:`available` reports whether it is ``None``.
+
+        Returns:
+            A human-readable explanation when the key is missing or consent is
+            not affirmative; ``None`` when both prerequisites are satisfied.
+        """
+        if not os.environ.get(cls.API_KEY_ENV, "").strip():
+            return (
+                f"{cls.API_KEY_ENV} environment variable is not set; "
+                "required for the OpenAI provider."
+            )
+        if not has_cloud_consent():
+            return consent_error_message(cls.PROVIDER_NAME)
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Whether the OpenAI prerequisites (API key + consent) are met.
+
+        Returns:
+            ``True`` when the API key is set and cloud consent is affirmative.
+        """
+        return self._missing_prerequisite() is None
+
+    @property
+    def model(self) -> str:
+        """The OpenAI model identifier to use for API calls.
+
+        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` still holds
+        the Ollama default (``"mistral"``) or is empty.
+
+        Returns:
+            The resolved model identifier.
+        """
+        model = self.config.model.strip()
+        if not model or model == self._OLLAMA_DEFAULT_MODEL:
+            return self.DEFAULT_MODEL
+        return model
+
+    @property
+    def client(self) -> openai.OpenAI:
+        """The lazily-initialised OpenAI SDK client.
+
+        The SDK reads ``OPENAI_API_KEY`` itself; ``config.api_base`` (when set)
+        is forwarded as ``base_url`` for an OpenAI-compatible gateway.
+
+        Returns:
+            An ``openai.OpenAI`` client instance.
+        """
+        if self._client is None:
+            import openai
+
+            if self.config.api_base:
+                self._client = openai.OpenAI(base_url=self.config.api_base)
+            else:
+                self._client = openai.OpenAI()
+        return self._client
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Send *prompt* to OpenAI and return a normalized :class:`Completion`.
+
+        Args:
+            prompt: The dynamic, fully-formatted user prompt.
+            max_tokens: Maximum tokens to request. ``None`` keeps the historical
+                :attr:`MAX_TOKENS` ceiling.
+            system: Optional static system prefix sent as a leading system
+                message. ``None`` sends the user prompt alone.
+
+        Returns:
+            A :class:`Completion` carrying the response text, the mapped stop
+            reason, and token usage when present.
+
+        Raises:
+            RuntimeError: If the SDK raises any ``OpenAIError``; re-raised with
+                only the exception type name so no request state leaks.
+        """
+        import openai
+
+        ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
+        try:
+            response = self._create_chat(prompt, ceiling, system)
+        except openai.OpenAIError as exc:
+            msg = f"OpenAI API call failed: {type(exc).__name__}"
+            raise RuntimeError(msg) from None
+        return Completion(
+            text=_extract_openai_text(response),
+            stop_reason=_map_openai_stop_reason(response),
+            usage=_extract_openai_usage(response),
+        )
+
+    def _create_chat(
+        self,
+        prompt: str,
+        ceiling: int,
+        system: str | None,
+    ) -> object:
+        """Call ``chat.completions.create``, adding a system message when given.
+
+        Keeping the two message shapes as inline literals (rather than a built
+        list) preserves the SDK's typed-param inference.
+
+        Args:
+            prompt: The dynamic user prompt.
+            ceiling: The resolved ``max_tokens`` value.
+            system: Optional static system prefix, or ``None``.
+
+        Returns:
+            The raw ``chat.completions.create`` response object.
+        """
+        if system is None:
+            return self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=ceiling,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        return self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=ceiling,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+
+
+def _extract_openai_text(response: object) -> str:
+    """Concatenate the textual content of an OpenAI chat response.
+
+    Args:
+        response: A ``chat.completions.create`` response object.
+
+    Returns:
+        The first choice's message content, or ``""`` when absent/non-string.
+    """
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    content = getattr(getattr(choices[0], "message", None), "content", None)
+    return content if isinstance(content, str) else ""
+
+
+def _map_openai_stop_reason(response: object) -> str:
+    """Map an OpenAI ``finish_reason`` to a normalized stop reason.
+
+    Args:
+        response: A ``chat.completions.create`` response object.
+
+    Returns:
+        ``"end_turn"`` for ``"stop"`` (and unknown/absent reasons),
+        ``"max_tokens"`` for ``"length"``.
+    """
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return "end_turn"
+    reason = getattr(choices[0], "finish_reason", None)
+    if not isinstance(reason, str):
+        return "end_turn"
+    return _OPENAI_STOP_REASONS.get(reason, "end_turn")
+
+
+def _extract_openai_usage(response: object) -> dict[str, int] | None:
+    """Extract integer token-usage counts from an OpenAI chat response.
+
+    Args:
+        response: A ``chat.completions.create`` response object.
+
+    Returns:
+        A dict with ``input_tokens`` / ``output_tokens`` mirroring the
+        Anthropic usage shape, or ``None`` when the SDK omitted usage.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    counts: dict[str, int] = {}
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if isinstance(prompt_tokens, int):
+        counts["input_tokens"] = prompt_tokens
+    if isinstance(completion_tokens, int):
+        counts["output_tokens"] = completion_tokens
+    return counts or None
+
+
 #: Registry mapping the ``LLMConfig.provider`` string to its provider class.
-#: Adding a backend (OpenAI #607, Gemini #608) is a one-line entry here. The
-#: value is the concrete class (not the ``LLMProvider`` protocol) so it is both
+#: Adding a backend (Gemini #608) is a one-line entry here. The value is the
+#: concrete class (not the ``LLMProvider`` protocol) so it is both
 #: constructible and exposes the class-level ``is_cloud`` flag; widen the union
 #: as new providers land.
-_PROVIDER_REGISTRY: dict[str, type[AnthropicProvider | OllamaProvider]] = {
+_PROVIDER_REGISTRY: dict[
+    str, type[AnthropicProvider | OllamaProvider | OpenAIProvider]
+] = {
     "anthropic": AnthropicProvider,
     "ollama": OllamaProvider,
+    "openai": OpenAIProvider,
 }
 
 

@@ -101,6 +101,11 @@ class LLMConfig(BaseModel):
     ollama_url: str = "http://localhost:11434"
     """Base URL for the Ollama API server."""
 
+    api_base: str | None = None
+    """Optional base-URL override for a cloud provider's SDK (e.g. an
+    OpenAI-compatible gateway). ``None`` lets the SDK use its default endpoint
+    or its own ``*_BASE_URL`` environment variable. Never holds a secret."""
+
     batch_size: int = 50
     """Number of items to process per LLM batch call."""
 
