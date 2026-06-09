@@ -28,7 +28,6 @@ def patched_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CrawDadCo
 
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=vault,
         allowed_user_ids=[1],
         allowed_channel_ids=[2],

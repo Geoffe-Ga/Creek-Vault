@@ -10,12 +10,11 @@ from pydantic import ValidationError
 from crawdad.config import CrawDadConfig, load_config
 
 
-def test_config_requires_discord_token_and_anthropic_key(tmp_path: Path) -> None:
-    """Construction fails clearly when required secrets are absent."""
+def test_config_requires_discord_token(tmp_path: Path) -> None:
+    """Construction fails clearly when the Discord token is absent."""
     with pytest.raises(ValidationError):
         CrawDadConfig(
             discord_bot_token="",
-            anthropic_api_key="key",
             vault_path=tmp_path,
             allowed_user_ids=[1],
             allowed_channel_ids=[2],
@@ -26,14 +25,13 @@ def test_config_parses_full_payload(tmp_path: Path) -> None:
     """All documented fields land on the model in their declared types."""
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         mcp_server_command=("creek-tools-mcp",),
         allowed_user_ids=[111, 222],
         allowed_channel_ids=[999],
     )
     assert config.discord_bot_token == "t"
-    assert config.anthropic_api_key == "k"
+    assert config.llm_provider == "anthropic"
     assert config.vault_path == tmp_path
     assert config.mcp_server_command == ("creek-tools-mcp",)
     assert config.allowed_user_ids == (111, 222)
@@ -45,7 +43,6 @@ def test_config_rejects_empty_allowlist(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         CrawDadConfig(
             discord_bot_token="t",
-            anthropic_api_key="k",
             vault_path=tmp_path,
             allowed_user_ids=[],
             allowed_channel_ids=[999],
@@ -73,7 +70,7 @@ def test_load_config_merges_yaml_and_env(
     config = load_config(yaml_path)
 
     assert config.discord_bot_token == "from-env"
-    assert config.anthropic_api_key == "key-from-env"
+    assert config.llm_provider == "anthropic"
     assert config.vault_path == vault
     assert config.allowed_user_ids == (111,)
     assert config.allowed_channel_ids == (222,)
@@ -120,7 +117,6 @@ def test_is_allowed_user(tmp_path: Path) -> None:
     """``is_allowed`` returns True only for the configured user + channel pair."""
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],
@@ -134,7 +130,6 @@ def test_config_attachments_defaults_to_25_mib_and_inbound(tmp_path: Path) -> No
     """FEAT-027: the default attachment config matches the documented limits."""
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[1],
         allowed_channel_ids=[2],
@@ -318,7 +313,6 @@ def test_crawdad_config_carries_consent_subconfig(tmp_path: Path) -> None:
     """``CrawDadConfig`` ships with a default ``ConsentConfig`` attached."""
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[222],
@@ -367,7 +361,6 @@ def test_config_max_loop_rounds_defaults_to_module_constant(tmp_path: Path) -> N
 
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[1],
         allowed_channel_ids=[2],
@@ -380,7 +373,6 @@ def test_config_accepts_max_loop_rounds_override(tmp_path: Path) -> None:
     """An operator-supplied override survives the model boundary."""
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[1],
         allowed_channel_ids=[2],
@@ -395,7 +387,6 @@ def test_config_accepts_max_loop_rounds_boundary_values() -> None:
     for boundary in (1, 50):
         config = CrawDadConfig(
             discord_bot_token="t",
-            anthropic_api_key="k",
             vault_path=Path("."),
             allowed_user_ids=(1,),
             allowed_channel_ids=(2,),
@@ -410,7 +401,6 @@ def test_config_rejects_max_loop_rounds_below_lower_bound(tmp_path: Path) -> Non
         with pytest.raises(ValidationError):
             CrawDadConfig(
                 discord_bot_token="t",
-                anthropic_api_key="k",
                 vault_path=tmp_path,
                 allowed_user_ids=[1],
                 allowed_channel_ids=[2],
@@ -424,7 +414,6 @@ def test_config_rejects_max_loop_rounds_above_upper_bound(tmp_path: Path) -> Non
         with pytest.raises(ValidationError):
             CrawDadConfig(
                 discord_bot_token="t",
-                anthropic_api_key="k",
                 vault_path=tmp_path,
                 allowed_user_ids=[1],
                 allowed_channel_ids=[2],
@@ -475,3 +464,92 @@ def test_load_config_max_loop_rounds_defaults_when_absent(
     config = load_config(yaml_path)
 
     assert config.max_loop_rounds == MAX_LOOP_ROUNDS
+
+
+# ---- Provider selection (#610) ----
+
+
+def _write_minimal_yaml(tmp_path: Path) -> Path:
+    """Write a minimal valid crawdad.yaml and return its path."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(vault) + "\n"
+        "allowed_user_ids: [111]\n"
+        "allowed_channel_ids: [222]\n",
+        encoding="utf-8",
+    )
+    return yaml_path
+
+
+def test_load_config_defaults_to_anthropic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``CRAWDAD_PROVIDER`` selects anthropic and requires its key."""
+    monkeypatch.delenv("CRAWDAD_PROVIDER", raising=False)
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    config = load_config(_write_minimal_yaml(tmp_path))
+    assert config.llm_provider == "anthropic"
+    assert not hasattr(config, "anthropic_api_key")
+
+
+def test_load_config_selects_openai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``CRAWDAD_PROVIDER=openai`` selects openai when its key is present."""
+    monkeypatch.setenv("CRAWDAD_PROVIDER", "openai")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    config = load_config(_write_minimal_yaml(tmp_path))
+    assert config.llm_provider == "openai"
+
+
+def test_load_config_openai_missing_key_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting openai without ``OPENAI_API_KEY`` fails naming the var."""
+    monkeypatch.setenv("CRAWDAD_PROVIDER", "openai")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        load_config(_write_minimal_yaml(tmp_path))
+
+
+def test_load_config_gemini_missing_key_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting gemini without ``GOOGLE_API_KEY`` fails naming the var."""
+    monkeypatch.setenv("CRAWDAD_PROVIDER", "gemini")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="GOOGLE_API_KEY"):
+        load_config(_write_minimal_yaml(tmp_path))
+
+
+def test_load_config_unknown_provider_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown ``CRAWDAD_PROVIDER`` fails fast with a clear message."""
+    monkeypatch.setenv("CRAWDAD_PROVIDER", "frobnicate")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    with pytest.raises(RuntimeError, match="unknown CRAWDAD_PROVIDER"):
+        load_config(_write_minimal_yaml(tmp_path))
+
+
+def test_router_and_composer_models_per_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each provider resolves its own router/composer tier; env overrides win."""
+    from crawdad.config import composer_model_for, router_model_for
+
+    monkeypatch.delenv("CRAWDAD_ROUTER_MODEL", raising=False)
+    monkeypatch.delenv("CRAWDAD_COMPOSER_MODEL", raising=False)
+    assert router_model_for("openai") != router_model_for("anthropic")
+    assert composer_model_for("gemini") != composer_model_for("anthropic")
+
+    monkeypatch.setenv("CRAWDAD_ROUTER_MODEL", "override-router")
+    monkeypatch.setenv("CRAWDAD_COMPOSER_MODEL", "override-composer")
+    assert router_model_for("openai") == "override-router"
+    assert composer_model_for("anthropic") == "override-composer"
