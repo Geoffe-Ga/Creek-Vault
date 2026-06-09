@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING
 from crawdad.bot import CrawDadClient
 from crawdad.composer import SonnetComposer
 from crawdad.config import (
-    DEFAULT_COMPOSER_MODEL,
-    DEFAULT_ROUTER_MODEL,
+    composer_model_for,
     load_config,
+    router_model_for,
 )
 from crawdad.consent import PendingBatchStore
 from crawdad.history import ConversationHistory
@@ -336,12 +336,12 @@ def _build_agent_components(
     ]
     router = IntentRouter(
         provider=provider,
-        model=DEFAULT_ROUTER_MODEL,
+        model=router_model_for(config.llm_provider),
         tools=router_tools,
     )
     composer = SonnetComposer(
         provider=provider,
-        model=DEFAULT_COMPOSER_MODEL,
+        model=composer_model_for(config.llm_provider),
     )
     return _AgentComponents(
         router=router,

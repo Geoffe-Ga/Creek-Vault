@@ -34,7 +34,6 @@ def _make_config() -> CrawDadConfig:
     """Build a minimal allowlisted config for slash-command gate tests."""
     return CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=Path("vault"),
         allowed_user_ids=(_ALLOWED_USER_ID,),
         allowed_channel_ids=(_ALLOWED_CHANNEL_ID,),
