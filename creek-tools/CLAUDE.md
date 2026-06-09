@@ -190,7 +190,7 @@ pip install -e '.[dev]'         # [dev] depends on [all]; this is self-contained
 pre-commit install
 ```
 
-`[dev]` deliberately pulls in `[all]` (anthropic, embeddings, ocr, documents, spreadsheets, presentations, gdrive) because `tests/conftest.py` imports numpy, `tests/test_classify.py` mocks the anthropic SDK, and `tests/test_ingest_documents.py` parses DOCX/PDF/HTML — so the optional code paths are not optional at test-collection time (issue #206). The mypy floor in `[dev]` is pinned to the same major.minor as `uv.lock` and `.pre-commit-config.yaml` so the three install paths agree.
+`[dev]` deliberately pulls in `[all]` (anthropic, openai, gemini, embeddings, ocr, documents, spreadsheets, presentations, gdrive) because `tests/conftest.py` imports numpy, `tests/test_classify.py` / `tests/test_openai_provider.py` / `tests/test_gemini_provider.py` mock the cloud LLM SDKs, and `tests/test_ingest_documents.py` parses DOCX/PDF/HTML — so the optional code paths are not optional at test-collection time (issue #206). The selectable cloud LLM backend (`anthropic` / `openai` / `gemini`, each its own optional extra; `ollama` is the local default needing no extra) is documented in the [README's LLM providers matrix](README.md#llm-providers) and [ADR-0003](docs/architecture/ADR/0003-decoupled-provider-abstractions.md). The mypy floor in `[dev]` is pinned to the same major.minor as `uv.lock` and `.pre-commit-config.yaml` so the three install paths agree.
 
 ---
 
