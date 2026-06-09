@@ -77,6 +77,7 @@ from creek.classify.llm.providers import (
     ANTHROPIC_CLOUD_WARNING,
     AnthropicProvider,
     OllamaProvider,
+    OpenAIProvider,
     build_provider,
     provider_is_cloud,
 )
@@ -92,6 +93,7 @@ __all__ = [
     "LLMClassifier",
     "LLMProvider",
     "OllamaProvider",
+    "OpenAIProvider",
     "build_provider",
     "cloud_warning",
     "has_cloud_consent",
