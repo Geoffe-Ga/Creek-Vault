@@ -30,7 +30,11 @@ pip install -e ".[dev]"
 
 # Required env vars
 export DISCORD_BOT_TOKEN="…"
-export ANTHROPIC_API_KEY="…"
+export ANTHROPIC_API_KEY="…"          # the key for the selected provider (default: anthropic)
+
+# Optional: pick a different backend (see "LLM provider selection" below)
+# export CRAWDAD_PROVIDER=openai      # then set OPENAI_API_KEY instead
+# export CRAWDAD_PROVIDER=gemini      # then set GOOGLE_API_KEY instead
 
 # Edit crawdad.yaml — see the example below
 crawdad run --config ./crawdad.yaml
@@ -65,6 +69,22 @@ allowed_channel_ids:
 | `attachments` | no | see source | Per-attachment limits, allow/deny lists, channel privacy tiers (FEAT-027/035). |
 | `consent` | no | see source | Conversational consent tokens + TTL (FEAT-034). |
 | `max_loop_rounds` | no | `5` | FEAT-036 agent-loop round cap, bounded `[1, 50]`. Raise when a single user turn legitimately needs more router/dispatcher passes (multi-source ingest, large re-classification asks, long workflow chains); the upper bound prevents pathological runaway loops. |
+
+Secrets are **never** in `crawdad.yaml` — they come only from the environment.
+
+### LLM provider selection
+
+CrawDad's backend is chosen by the `CRAWDAD_PROVIDER` environment variable (default `anthropic`). The selected provider's API key must be present in the environment; each SDK reads its own key — CrawDad **never** stores a key on its config object or in `crawdad.yaml`.
+
+| `CRAWDAD_PROVIDER` | Required env key |
+|---|---|
+| `anthropic` (default) | `ANTHROPIC_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+| `gemini` | `GOOGLE_API_KEY` |
+
+Starting the bot with the selected provider's key unset fails fast with a message naming the missing variable. Per-provider router/composer model tiers live in `crawdad/config.py`; override globally with `CRAWDAD_ROUTER_MODEL` / `CRAWDAD_COMPOSER_MODEL`.
+
+CrawDad's provider abstraction is intentionally **decoupled** from creek-tools' (sibling packages, no shared module) — see [ADR-0003](../creek-tools/docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
 
 ## Slash commands (FEAT-016)
 

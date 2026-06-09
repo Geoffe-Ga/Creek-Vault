@@ -27,7 +27,12 @@ Optional dependencies are imported lazily, so you only need to install the ones 
 | Image OCR              | `pytesseract`, `pdf2image`, system-level `tesseract` and `poppler` |
 | Google Drive           | `google-api-python-client`, `google-auth-oauthlib` |
 | Embeddings             | `sentence-transformers`      |
-| LLM classification     | Ollama running locally, or `ANTHROPIC_API_KEY` for the cloud path |
+| LLM classification — Anthropic | `anthropic` (the `[anthropic]` extra) |
+| LLM classification — OpenAI    | `openai` (the `[openai]` extra) |
+| LLM classification — Gemini    | `google-genai` (the `[gemini]` extra) |
+| LLM classification — local     | Ollama running locally — no extra, no key |
+
+The cloud LLM backend is selectable — see [LLM providers](#llm-providers) below. `[all]` (and therefore `[dev]`) pulls in every cloud extra so the test suite can mock each SDK.
 
 To install everything required for development plus the full quality toolchain:
 
@@ -153,7 +158,7 @@ read the threat model below before doing anything else.
 
 | Section | Class | What it controls |
 |---------|-------|------------------|
-| `llm`            | `LLMConfig`            | Provider (`ollama` or `anthropic`), model name, batch size, retries. |
+| `llm`            | `LLMConfig`            | Provider (`ollama` / `anthropic` / `openai` / `gemini`), model name, optional `api_base`, batch size, retries. See [LLM providers](#llm-providers). |
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
 | `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
@@ -164,6 +169,21 @@ read the threat model below before doing anything else.
 | `cleaning`       | `CleaningConfig`       | Per-source filters (Discord, ChatGPT, Drive, Markdown) plus `validation`, `quality`, `deduplication`, `hygiene` sub-sections. |
 
 See [`docs/configuration.md`](docs/configuration.md) for the full schema with examples.
+
+### LLM providers
+
+The cloud LLM backend is selectable via `llm.provider` in `creek_config.yaml`. The default `ollama` runs fully locally and needs no key or consent. Each cloud provider's **API key is read from the environment by its SDK** — it must **never** be written into `creek_config.yaml`, committed to the repo, or logged. Cloud egress additionally requires explicit consent (Ollama is exempt).
+
+| Provider | `llm.provider` | Env key | Cloud-egress consent |
+|---|---|---|---|
+| Ollama (local) | `ollama` | — | not required |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `CREEK_CLOUD_CONSENT=1` |
+| OpenAI | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`, or `llm.api_base`) | `CREEK_CLOUD_CONSENT=1` |
+| Gemini | `gemini` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `CREEK_CLOUD_CONSENT=1` |
+
+`CREEK_CLOUD_CONSENT=1` (also accepts `true` / `yes`) acknowledges that fragment content leaves the device; the legacy `CREEK_ANTHROPIC_CONSENT` is still honored as an alias. `llm.api_base` is OpenAI-specific (an OpenAI-compatible gateway); other providers ignore it. Install the matching optional extra (`[openai]` / `[gemini]`) for the cloud SDKs — see [Install](#install).
+
+The architectural decision to keep creek-tools' and CrawDad's provider abstractions decoupled is recorded in [ADR-0003](docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
 
 ---
 
