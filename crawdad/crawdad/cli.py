@@ -14,8 +14,6 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import anthropic
-
 from crawdad.bot import CrawDadClient
 from crawdad.composer import SonnetComposer
 from crawdad.config import (
@@ -26,6 +24,7 @@ from crawdad.config import (
 from crawdad.consent import PendingBatchStore
 from crawdad.history import ConversationHistory
 from crawdad.intents import ToolInfo
+from crawdad.llm import build_async_provider
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
@@ -326,7 +325,7 @@ def _build_agent_components(
             known_tools=known_tools,
             history=history,
         )
-    anthropic_client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
+    provider = build_async_provider(config)
     router_tools = [
         ToolInfo(
             name=tool.name,
@@ -336,12 +335,12 @@ def _build_agent_components(
         for tool in tool_details
     ]
     router = IntentRouter(
-        anthropic_client=anthropic_client,
+        provider=provider,
         model=DEFAULT_ROUTER_MODEL,
         tools=router_tools,
     )
     composer = SonnetComposer(
-        anthropic_client=anthropic_client,
+        provider=provider,
         model=DEFAULT_COMPOSER_MODEL,
     )
     return _AgentComponents(
