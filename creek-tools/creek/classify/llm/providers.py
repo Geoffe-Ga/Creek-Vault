@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING
 import httpx
 
 from creek.classify.llm.completion import AnthropicCompletion, Completion
+from creek.classify.llm.consent import (
+    cloud_warning,
+    consent_error_message,
+    has_cloud_consent,
+)
 
 if TYPE_CHECKING:
     import anthropic
@@ -42,15 +47,18 @@ __all__ = [
     "Completion",
     "OllamaProvider",
     "build_provider",
+    "cloud_warning",
+    "provider_display_name",
     "provider_is_cloud",
 ]
 
 
-ANTHROPIC_CLOUD_WARNING: str = (
-    "WARNING: Cloud classification enabled. "
-    "Fragment content will be sent to Anthropic's servers."
-)
-"""Warning displayed when the Anthropic cloud provider is selected."""
+ANTHROPIC_CLOUD_WARNING: str = cloud_warning("Anthropic")
+"""Deprecated: the cloud-egress warning bound to Anthropic.
+
+Retained for back-compat; new code should call
+:func:`creek.classify.llm.consent.cloud_warning` with the active provider name.
+"""
 
 
 class AnthropicProvider:
@@ -68,6 +76,9 @@ class AnthropicProvider:
     is_cloud: bool = True
     """Anthropic sends fragment content off-device; gated by consent."""
 
+    PROVIDER_NAME: str = "Anthropic"
+    """Display name woven into consent and cloud-egress messages."""
+
     DEFAULT_MODEL: str = "claude-sonnet-4-6"
     """Default Anthropic model when the config does not override it."""
 
@@ -75,10 +86,12 @@ class AnthropicProvider:
     """Environment variable name for the Anthropic API key."""
 
     CONSENT_ENV: str = "CREEK_ANTHROPIC_CONSENT"
-    """Environment variable name for cloud-classification consent."""
+    """Deprecated: the legacy consent variable, still honored as an alias.
 
-    CONSENT_TRUTHY: frozenset[str] = frozenset({"1", "true", "yes"})
-    """String values accepted as affirmative consent."""
+    Retained so existing setups and tests that reference
+    ``AnthropicProvider.CONSENT_ENV`` keep working; the consent check itself now
+    lives in :mod:`creek.classify.llm.consent` and accepts ``CREEK_CLOUD_CONSENT``.
+    """
 
     MAX_TOKENS: int = 1024
     """Maximum tokens requested from the Anthropic API per call."""
@@ -111,8 +124,11 @@ class AnthropicProvider:
 
         The API key and the explicit cloud-egress consent are both read from
         the environment at call time, so the check reflects the *current* env
-        rather than the env at construction. :meth:`__init__` raises the
-        returned message; :attr:`available` reports whether it is ``None``.
+        rather than the env at construction. The consent half delegates to the
+        provider-neutral :mod:`creek.classify.llm.consent` gate (#606), which
+        accepts ``CREEK_CLOUD_CONSENT`` or the legacy ``CREEK_ANTHROPIC_CONSENT``.
+        :meth:`__init__` raises the returned message; :attr:`available` reports
+        whether it is ``None``.
 
         Returns:
             A human-readable explanation when the key is missing or consent is
@@ -123,13 +139,8 @@ class AnthropicProvider:
                 f"{cls.API_KEY_ENV} environment variable is not set; "
                 "required for the Anthropic provider."
             )
-        consent = os.environ.get(cls.CONSENT_ENV, "").strip().lower()
-        if consent not in cls.CONSENT_TRUTHY:
-            return (
-                "Anthropic cloud classification requires explicit consent. "
-                f"Set {cls.CONSENT_ENV}=1 to confirm that fragment content "
-                "may be sent to Anthropic's servers."
-            )
+        if not has_cloud_consent():
+            return consent_error_message(cls.PROVIDER_NAME)
         return None
 
     @property
@@ -429,6 +440,9 @@ class OllamaProvider:
     is_cloud: bool = False
     """Ollama runs locally; content never leaves the device."""
 
+    PROVIDER_NAME: str = "Ollama"
+    """Display name (local; never appears in a cloud-egress message)."""
+
     REQUEST_TIMEOUT: float = 30.0
     """HTTP request timeout for completion calls, in seconds."""
 
@@ -553,3 +567,20 @@ def provider_is_cloud(provider: str) -> bool:
     """
     provider_cls = _PROVIDER_REGISTRY.get(provider)
     return bool(provider_cls is not None and provider_cls.is_cloud)
+
+
+def provider_display_name(provider: str) -> str:
+    """Return the human-readable display name for a provider string.
+
+    Used to name the active provider in cloud-egress warnings and consent
+    errors (e.g. ``"anthropic"`` → ``"Anthropic"``).
+
+    Args:
+        provider: The ``LLMConfig.provider`` string.
+
+    Returns:
+        The registered provider's ``PROVIDER_NAME``, or *provider* verbatim
+        when it names no registered backend.
+    """
+    provider_cls = _PROVIDER_REGISTRY.get(provider)
+    return provider_cls.PROVIDER_NAME if provider_cls is not None else provider

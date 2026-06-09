@@ -46,6 +46,15 @@ from creek.classify.llm.completion import (
 from creek.classify.llm.completion import (
     Completion as Completion,
 )
+from creek.classify.llm.consent import (
+    cloud_warning as cloud_warning,
+)
+from creek.classify.llm.consent import (
+    has_cloud_consent as has_cloud_consent,
+)
+from creek.classify.llm.consent import (
+    require_cloud_consent as require_cloud_consent,
+)
 from creek.classify.llm.orchestrator import (
     LLMClassificationResult,
     LLMClassifier,
@@ -84,5 +93,8 @@ __all__ = [
     "LLMProvider",
     "OllamaProvider",
     "build_provider",
+    "cloud_warning",
+    "has_cloud_consent",
     "provider_is_cloud",
+    "require_cloud_consent",
 ]

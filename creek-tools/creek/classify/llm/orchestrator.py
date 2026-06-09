@@ -26,9 +26,10 @@ from creek.classify.llm.parsing import (
 )
 from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
-    ANTHROPIC_CLOUD_WARNING,
     Completion,
     build_provider,
+    cloud_warning,
+    provider_display_name,
     provider_is_cloud,
 )
 
@@ -98,7 +99,7 @@ class LLMClassifier:
         self._available: bool | None = None
         self._provider_instance: LLMProvider | None = None
         if provider_is_cloud(config.provider):
-            logger.warning(ANTHROPIC_CLOUD_WARNING)
+            logger.warning(cloud_warning(provider_display_name(config.provider)))
 
     def _provider(self) -> LLMProvider:
         """Lazily build and cache the configured provider.
