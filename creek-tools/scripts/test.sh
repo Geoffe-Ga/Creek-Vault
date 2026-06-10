@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test.sh - Run tests with Pytest
 # Usage: ./scripts/test.sh [--unit|--integration|--e2e|--all] [--coverage]
-#                          [--verbose] [--help]
+#                          [-k EXPRESSION] [--verbose] [--help]
 
 set -euo pipefail
 
@@ -14,6 +14,7 @@ source "$SCRIPT_DIR/_lib.sh"
 TEST_TYPE="unit"
 COVERAGE=false
 VERBOSE=false
+KEYWORD=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -38,6 +39,14 @@ while [[ $# -gt 0 ]]; do
             COVERAGE=true
             shift
             ;;
+        -k)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: -k requires an expression argument" >&2
+                exit 2
+            fi
+            KEYWORD="$2"
+            shift 2
+            ;;
         --verbose)
             VERBOSE=true
             shift
@@ -50,10 +59,11 @@ Run tests using Pytest.
 
 OPTIONS:
     --unit          Run unit tests only (default)
-    --integration   Run integration tests only
-    --e2e           Run end-to-end tests only
+    --integration   Run integration tests only (live smokes; coverage gate off)
+    --e2e           Run end-to-end tests only (coverage gate off)
     --all           Run all test types
     --coverage      Generate coverage report
+    -k EXPRESSION   Only run tests matching the pytest keyword expression
     --verbose       Show detailed output
     --help          Display this help message
 
@@ -97,16 +107,23 @@ case "$TEST_TYPE" in
         ;;
     integration)
         echo "=== Running Integration Tests ==="
-        PYTEST_ARGS+=(-m "integration")
+        # A marker-only selection runs a handful of tests, so the project-wide
+        # --cov-fail-under from pyproject addopts would always fail; live
+        # smokes are about API round-trips, not coverage.
+        PYTEST_ARGS+=(-m "integration" --no-cov)
         ;;
     e2e)
         echo "=== Running End-to-End Tests ==="
-        PYTEST_ARGS+=(-m "e2e")
+        PYTEST_ARGS+=(-m "e2e" --no-cov)
         ;;
     all)
         echo "=== Running All Tests ==="
         ;;
 esac
+
+if [[ -n "$KEYWORD" ]]; then
+    PYTEST_ARGS+=(-k "$KEYWORD")
+fi
 
 # Add coverage if requested
 if $COVERAGE; then
