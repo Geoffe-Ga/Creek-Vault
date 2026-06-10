@@ -19,7 +19,7 @@ from pathlib import Path
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "creek"
 _ALLOWED_FILE = _PACKAGE_ROOT / "classify" / "llm" / "providers.py"
 _MODEL_PATTERN = re.compile(
-    r"claude-(?:haiku|sonnet|opus)-\d|gpt-\d|gemini-\d", re.IGNORECASE
+    r"claude-(?:haiku|sonnet|opus|fable)-\d|gpt-\d|gemini-\d", re.IGNORECASE
 )
 
 

@@ -425,7 +425,7 @@ def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
             f"{config.ollama_url}/api/generate",
             json={
                 "model": _resolve_configured_model(
-                    config.model, DEFAULT_MODELS["ollama"]
+                    config.model, OllamaProvider.DEFAULT_MODEL
                 ),
                 "prompt": prompt,
                 "stream": False,

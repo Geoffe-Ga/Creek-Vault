@@ -88,7 +88,7 @@ def test_llmconfig_accepts_every_registered_provider() -> None:
 
 
 class TestDefaultModelsMatrix:
-    """Pins the #622 contract: one matrix holds every default model ID.
+    """One matrix holds every default model ID.
 
     Mirrors CrawDad's ``config.py`` model dicts — "introduce another model"
     must be a one-place edit, and the matrix can never drift from the
