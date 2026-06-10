@@ -43,7 +43,7 @@ timezone: America/Los_Angeles
 ```yaml
 llm:
   provider: ollama
-  model: mistral
+  model: mistral          # optional; omit to use the provider's own default
   ollama_url: http://localhost:11434
   batch_size: 50
   max_concurrent: 5
@@ -52,7 +52,7 @@ llm:
 | Field            | Default   | Notes |
 |------------------|-----------|-------|
 | `provider`       | `ollama`  | `ollama` or `anthropic`. |
-| `model`          | `mistral` | Model id understood by the provider. |
+| `model`          | *(unset)* | Model id understood by the provider; when omitted each provider uses its own default (`mistral` for Ollama). An explicit value is always sent verbatim. |
 | `ollama_url`     | `http://localhost:11434` | Base URL when `provider: ollama`. |
 | `batch_size`     | `50`      | Items per batch call. |
 | `max_concurrent` | `5`       | Concurrent requests in flight. |

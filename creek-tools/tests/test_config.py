@@ -43,7 +43,7 @@ class TestLLMConfig:
         """LLMConfig should have sensible defaults."""
         cfg = LLMConfig()
         assert cfg.provider == "ollama"
-        assert cfg.model == "mistral"
+        assert cfg.model is None
         assert cfg.ollama_url == "http://localhost:11434"
         assert cfg.batch_size == 50
         assert cfg.max_concurrent == 5

@@ -23,7 +23,9 @@ from creek.classify.llm.base import LLMProvider
 from creek.classify.llm.completion import Completion
 from creek.classify.llm.providers import (
     AnthropicProvider,
+    GeminiProvider,
     OllamaProvider,
+    OpenAIProvider,
     build_provider,
     provider_is_cloud,
 )
@@ -127,6 +129,28 @@ class TestOllamaProvider:
         """``model`` is the configured Ollama model verbatim."""
         assert OllamaProvider(LLMConfig(model="llama3")).model == "llama3"
 
+    def test_model_defaults_to_mistral_when_unset(self) -> None:
+        """Ollama supplies its *own* ``mistral`` default for an unset model (#621)."""
+        assert OllamaProvider.DEFAULT_MODEL == "mistral"
+        assert OllamaProvider(LLMConfig()).model == OllamaProvider.DEFAULT_MODEL
+
+    @patch("creek.classify.llm.httpx.Client")
+    def test_complete_sends_own_default_model_when_unset(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """``complete`` resolves an unset model to Ollama's own default (#621)."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"response": "ok"}
+        ctx = MagicMock()
+        ctx.post.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        OllamaProvider(LLMConfig()).complete("prompt")
+
+        payload = ctx.post.call_args.kwargs["json"]
+        assert payload["model"] == OllamaProvider.DEFAULT_MODEL
+
     @patch("creek.classify.llm.httpx.Client")
     def test_available_true_on_200(self, mock_client_cls: MagicMock) -> None:
         """``available`` is ``True`` when the Ollama health check returns 200."""
@@ -181,6 +205,33 @@ class TestOllamaProvider:
 
         result = OllamaProvider(LLMConfig()).complete("p", max_tokens=99, system="sys")
         assert result.text == "ok"
+
+
+class TestUnsetModelDecoupling:
+    """Pins the #621 contract: "unset model" is explicit, never sentinel-matched.
+
+    The old design detected "the user left ``llm.model`` alone" by comparing
+    against another module's default literal (``"mistral"``), which silently
+    broke if that default ever changed and silently overrode a legitimate
+    cloud ``model: mistral``. These tests pin the decoupled contract.
+    """
+
+    def test_cloud_providers_carry_no_ollama_sentinel(self) -> None:
+        """No cloud provider references another module's default to detect unset."""
+        for provider_cls in (AnthropicProvider, OpenAIProvider, GeminiProvider):
+            assert not hasattr(provider_cls, "_OLLAMA_DEFAULT_MODEL")
+
+    def test_unset_representation_is_independent_of_config_default(
+        self, anthropic_env: None
+    ) -> None:
+        """Cloud resolution keys off ``None``, not ``LLMConfig``'s default literal.
+
+        ``model_construct`` injects ``None`` directly, bypassing the field
+        default — so this holds even if ``LLMConfig``'s declared default
+        changes, which is exactly the regression #621 guards against.
+        """
+        config = LLMConfig.model_construct(provider="anthropic", model=None)
+        assert AnthropicProvider(config).model == AnthropicProvider.DEFAULT_MODEL
 
 
 class _FakeProvider:

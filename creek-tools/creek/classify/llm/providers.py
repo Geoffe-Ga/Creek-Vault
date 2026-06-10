@@ -66,6 +66,25 @@ Retained for back-compat; new code should call
 """
 
 
+def _resolve_configured_model(configured: str | None, default: str) -> str:
+    """Resolve a provider's model id from the config value and its own default.
+
+    "Unset" is explicit — ``None`` or blank — never a sentinel match against
+    another module's default literal, so each provider's resolution cannot be
+    broken by a change to ``LLMConfig``'s declared default and an explicit
+    model id is always honored verbatim.
+
+    Args:
+        configured: The ``LLMConfig.model`` value (``None`` means unset).
+        default: The calling provider's own default model id.
+
+    Returns:
+        *configured* stripped when it holds a non-blank value, else *default*.
+    """
+    model = (configured or "").strip()
+    return model or default
+
+
 class AnthropicProvider:
     """Anthropic API provider for cloud-based fragment classification.
 
@@ -100,9 +119,6 @@ class AnthropicProvider:
 
     MAX_TOKENS: int = 1024
     """Maximum tokens requested from the Anthropic API per call."""
-
-    _OLLAMA_DEFAULT_MODEL: str = "mistral"
-    """The ``LLMConfig`` default model name (indicates no Anthropic override)."""
 
     def __init__(self, config: LLMConfig) -> None:
         """Validate environment prerequisites and prepare the client.
@@ -165,16 +181,13 @@ class AnthropicProvider:
     def model(self) -> str:
         """The Anthropic model identifier to use for API calls.
 
-        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` still
-        holds the Ollama default (``"mistral"``) or is empty.
+        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` is unset
+        (``None`` or blank); an explicit value is honored verbatim.
 
         Returns:
             The resolved model identifier.
         """
-        model = self.config.model.strip()
-        if not model or model == self._OLLAMA_DEFAULT_MODEL:
-            return self.DEFAULT_MODEL
-        return model
+        return _resolve_configured_model(self.config.model, self.DEFAULT_MODEL)
 
     @property
     def client(self) -> anthropic.Anthropic:
@@ -377,6 +390,14 @@ def _extract_anthropic_usage(response: object) -> dict[str, int] | None:
     return counts or None
 
 
+_OLLAMA_DEFAULT_MODEL: str = "mistral"
+"""Ollama's own default model when ``config.model`` is unset.
+
+Local to the Ollama path; cloud providers each carry their own
+:attr:`DEFAULT_MODEL` and never reference this literal.
+"""
+
+
 def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
     """Send a prompt to a local Ollama instance and return the response text.
 
@@ -397,7 +418,7 @@ def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
         response = client.post(
             f"{config.ollama_url}/api/generate",
             json={
-                "model": config.model,
+                "model": _resolve_configured_model(config.model, _OLLAMA_DEFAULT_MODEL),
                 "prompt": prompt,
                 "stream": False,
             },
@@ -448,6 +469,9 @@ class OllamaProvider:
     PROVIDER_NAME: str = "Ollama"
     """Display name (local; never appears in a cloud-egress message)."""
 
+    DEFAULT_MODEL: str = _OLLAMA_DEFAULT_MODEL
+    """Default Ollama model when the config does not override it."""
+
     REQUEST_TIMEOUT: float = 30.0
     """HTTP request timeout for completion calls, in seconds."""
 
@@ -467,9 +491,10 @@ class OllamaProvider:
         """The configured Ollama model identifier.
 
         Returns:
-            ``config.model`` verbatim — Ollama has no cloud-model fallback.
+            ``config.model`` verbatim when set; :attr:`DEFAULT_MODEL` when
+            unset (``None`` or blank).
         """
-        return self.config.model
+        return _resolve_configured_model(self.config.model, self.DEFAULT_MODEL)
 
     @property
     def available(self) -> bool:
@@ -550,9 +575,6 @@ class OpenAIProvider:
     MAX_TOKENS: int = 1024
     """Maximum tokens requested from the OpenAI API per call."""
 
-    _OLLAMA_DEFAULT_MODEL: str = "mistral"
-    """The ``LLMConfig`` default model name (indicates no OpenAI override)."""
-
     def __init__(self, config: LLMConfig) -> None:
         """Validate environment prerequisites and prepare the client.
 
@@ -605,16 +627,13 @@ class OpenAIProvider:
     def model(self) -> str:
         """The OpenAI model identifier to use for API calls.
 
-        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` still holds
-        the Ollama default (``"mistral"``) or is empty.
+        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` is unset
+        (``None`` or blank); an explicit value is honored verbatim.
 
         Returns:
             The resolved model identifier.
         """
-        model = self.config.model.strip()
-        if not model or model == self._OLLAMA_DEFAULT_MODEL:
-            return self.DEFAULT_MODEL
-        return model
+        return _resolve_configured_model(self.config.model, self.DEFAULT_MODEL)
 
     @property
     def client(self) -> openai.OpenAI:
@@ -798,9 +817,6 @@ class GeminiProvider:
     MAX_TOKENS: int = 1024
     """Maximum output tokens requested from the Gemini API per call."""
 
-    _OLLAMA_DEFAULT_MODEL: str = "mistral"
-    """The ``LLMConfig`` default model name (indicates no Gemini override)."""
-
     def __init__(self, config: LLMConfig) -> None:
         """Validate environment prerequisites and prepare the client.
 
@@ -851,16 +867,13 @@ class GeminiProvider:
     def model(self) -> str:
         """The Gemini model identifier to use for API calls.
 
-        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` still holds
-        the Ollama default (``"mistral"``) or is empty.
+        Falls back to :attr:`DEFAULT_MODEL` when ``config.model`` is unset
+        (``None`` or blank); an explicit value is honored verbatim.
 
         Returns:
             The resolved model identifier.
         """
-        model = self.config.model.strip()
-        if not model or model == self._OLLAMA_DEFAULT_MODEL:
-            return self.DEFAULT_MODEL
-        return model
+        return _resolve_configured_model(self.config.model, self.DEFAULT_MODEL)
 
     @property
     def client(self) -> genai.Client:
