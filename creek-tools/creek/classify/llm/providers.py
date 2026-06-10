@@ -52,6 +52,7 @@ __all__ = [
     "OpenAIProvider",
     "build_provider",
     "cloud_warning",
+    "known_providers",
     "provider_display_name",
     "provider_is_cloud",
 ]
@@ -1065,6 +1066,19 @@ def provider_is_cloud(provider: str) -> bool:
     """
     provider_cls = _PROVIDER_REGISTRY.get(provider)
     return bool(provider_cls is not None and provider_cls.is_cloud)
+
+
+def known_providers() -> tuple[str, ...]:
+    """Return the registered provider names, sorted.
+
+    The single source of truth for "which providers exist" — config validation
+    reads this rather than re-listing the names, so the set can never drift from
+    the :data:`_PROVIDER_REGISTRY` the factory dispatches on.
+
+    Returns:
+        The registered ``LLMConfig.provider`` strings, sorted.
+    """
+    return tuple(sorted(_PROVIDER_REGISTRY))
 
 
 def provider_display_name(provider: str) -> str:

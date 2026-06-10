@@ -115,6 +115,36 @@ _COMPOSER_MODEL_DEFAULTS: dict[str, str] = {
 }
 
 
+def _resolve_model(provider: str, override_env: str, defaults: dict[str, str]) -> str:
+    """Resolve a model tier for *provider*, honoring an env override.
+
+    Raises on an unknown provider rather than silently falling back to the
+    Anthropic default — the load-time validator catches operator typos, so an
+    unknown value here is a programmer error, not something to paper over.
+
+    Args:
+        provider: The selected backend.
+        override_env: The env var that overrides the default tier when set.
+        defaults: The per-provider default model map.
+
+    Returns:
+        The override when set, else the provider's default tier.
+
+    Raises:
+        ValueError: When *provider* names no known backend.
+    """
+    override = os.environ.get(override_env)
+    if override:
+        return override
+    try:
+        return defaults[provider]
+    except KeyError:
+        known = ", ".join(sorted(defaults))
+        msg = f"unknown provider {provider!r}; expected one of: {known}"
+        # The KeyError adds no caller-useful context; suppress its chain.
+        raise ValueError(msg) from None
+
+
 def router_model_for(provider: str) -> str:
     """Resolve the router (intent-extraction) model for *provider*.
 
@@ -122,15 +152,12 @@ def router_model_for(provider: str) -> str:
         provider: The selected backend (``anthropic`` / ``openai`` / ``gemini``).
 
     Returns:
-        ``CRAWDAD_ROUTER_MODEL`` when set, else the provider's default tier
-        (falling back to the Anthropic default for an unknown provider).
+        ``CRAWDAD_ROUTER_MODEL`` when set, else the provider's default tier.
+
+    Raises:
+        ValueError: When *provider* names no known backend.
     """
-    override = os.environ.get(_ENV_ROUTER_MODEL)
-    if override:
-        return override
-    return _ROUTER_MODEL_DEFAULTS.get(
-        provider, _ROUTER_MODEL_DEFAULTS[DEFAULT_PROVIDER]
-    )
+    return _resolve_model(provider, _ENV_ROUTER_MODEL, _ROUTER_MODEL_DEFAULTS)
 
 
 def composer_model_for(provider: str) -> str:
@@ -140,15 +167,12 @@ def composer_model_for(provider: str) -> str:
         provider: The selected backend (``anthropic`` / ``openai`` / ``gemini``).
 
     Returns:
-        ``CRAWDAD_COMPOSER_MODEL`` when set, else the provider's default tier
-        (falling back to the Anthropic default for an unknown provider).
+        ``CRAWDAD_COMPOSER_MODEL`` when set, else the provider's default tier.
+
+    Raises:
+        ValueError: When *provider* names no known backend.
     """
-    override = os.environ.get(_ENV_COMPOSER_MODEL)
-    if override:
-        return override
-    return _COMPOSER_MODEL_DEFAULTS.get(
-        provider, _COMPOSER_MODEL_DEFAULTS[DEFAULT_PROVIDER]
-    )
+    return _resolve_model(provider, _ENV_COMPOSER_MODEL, _COMPOSER_MODEL_DEFAULTS)
 
 
 # History truncation knobs (ADOPT-008 hard cliff; FEAT-016 may refine).

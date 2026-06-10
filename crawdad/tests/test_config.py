@@ -553,3 +553,39 @@ def test_router_and_composer_models_per_provider(
     monkeypatch.setenv("CRAWDAD_COMPOSER_MODEL", "override-composer")
     assert router_model_for("openai") == "override-router"
     assert composer_model_for("anthropic") == "override-composer"
+
+
+def test_model_resolvers_reject_unknown_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown provider raises instead of silently downgrading to Claude (#620)."""
+    from crawdad.config import composer_model_for, router_model_for
+
+    monkeypatch.delenv("CRAWDAD_ROUTER_MODEL", raising=False)
+    monkeypatch.delenv("CRAWDAD_COMPOSER_MODEL", raising=False)
+    with pytest.raises(ValueError, match="unknown provider 'frobnicate'"):
+        router_model_for("frobnicate")
+    with pytest.raises(ValueError, match="unknown provider 'frobnicate'"):
+        composer_model_for("frobnicate")
+
+
+def test_provider_registries_stay_in_sync() -> None:
+    """All provider maps cover the same backend set — no silent drift (#620).
+
+    The config-layer key/model maps and the llm-layer builder registry must
+    list identical providers; this regression is the single anti-drift guard
+    in place of a hand-maintained second list.
+    """
+    # Private internals are imported deliberately: this guard's whole job is
+    # to pin those provider maps together, so it must reference them by name.
+    from crawdad.config import (
+        _COMPOSER_MODEL_DEFAULTS,
+        _PROVIDER_KEY_ENV,
+        _ROUTER_MODEL_DEFAULTS,
+    )
+    from crawdad.llm import _PROVIDER_BUILDERS
+
+    names = set(_PROVIDER_KEY_ENV)
+    assert set(_ROUTER_MODEL_DEFAULTS) == names
+    assert set(_COMPOSER_MODEL_DEFAULTS) == names
+    assert set(_PROVIDER_BUILDERS) == names

@@ -52,15 +52,37 @@ def test_build_provider_returns_anthropic(anthropic_env: None) -> None:
 
 
 def test_build_provider_unknown_raises_valueerror() -> None:
-    """An unknown provider string raises a clear ``ValueError``."""
+    """``build_provider`` guards unknown providers (defense-in-depth, #620).
+
+    ``LLMConfig`` now validates at construction, so bypass it with
+    ``model_construct`` to exercise the factory's own guard directly.
+    """
+    bad = LLMConfig.model_construct(provider="frobnicate")
     with pytest.raises(ValueError, match="unknown LLM provider 'frobnicate'"):
-        build_provider(LLMConfig(provider="frobnicate"))
+        build_provider(bad)
 
 
 def test_build_provider_valueerror_lists_known_providers() -> None:
     """The error names the supported providers so the operator can self-serve."""
+    bad = LLMConfig.model_construct(provider="nope")
     with pytest.raises(ValueError, match=r"anthropic.*ollama|ollama.*anthropic"):
-        build_provider(LLMConfig(provider="nope"))
+        build_provider(bad)
+
+
+def test_llmconfig_rejects_unknown_provider_at_construction() -> None:
+    """A typo'd provider fails fast at config-load, not at first classify call."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="unknown LLM provider 'anthropics'"):
+        LLMConfig(provider="anthropics")
+
+
+def test_llmconfig_accepts_every_registered_provider() -> None:
+    """Every registered provider name is a valid ``LLMConfig.provider``."""
+    from creek.classify.llm.providers import known_providers
+
+    for name in known_providers():
+        assert LLMConfig(provider=name).provider == name
 
 
 def test_provider_is_cloud_anthropic_true() -> None:
