@@ -123,8 +123,8 @@ class TestGeminiModelResolution:
     """Model resolution mirrors the other providers."""
 
     def test_default_model_literal(self) -> None:
-        """The default Gemini model literal lives on the provider."""
-        assert GeminiProvider.DEFAULT_MODEL == "gemini-2.5-flash"
+        """The default Gemini model is the current stable flash tier."""
+        assert GeminiProvider.DEFAULT_MODEL == "gemini-3.5-flash"
 
     def test_falls_back_when_model_unset(self, gemini_env: None) -> None:
         """An unset ``config.model`` (``None``) falls back to the Gemini default."""

@@ -22,11 +22,13 @@ import pytest
 from creek.classify.llm.base import LLMProvider
 from creek.classify.llm.completion import Completion
 from creek.classify.llm.providers import (
+    DEFAULT_MODELS,
     AnthropicProvider,
     GeminiProvider,
     OllamaProvider,
     OpenAIProvider,
     build_provider,
+    known_providers,
     provider_is_cloud,
 )
 from creek.config import LLMConfig
@@ -81,10 +83,28 @@ def test_llmconfig_rejects_unknown_provider_at_construction() -> None:
 
 def test_llmconfig_accepts_every_registered_provider() -> None:
     """Every registered provider name is a valid ``LLMConfig.provider``."""
-    from creek.classify.llm.providers import known_providers
-
     for name in known_providers():
         assert LLMConfig(provider=name).provider == name
+
+
+class TestDefaultModelsMatrix:
+    """One matrix holds every default model ID.
+
+    Mirrors CrawDad's ``config.py`` model dicts — "introduce another model"
+    must be a one-place edit, and the matrix can never drift from the
+    provider registry.
+    """
+
+    def test_matrix_covers_every_registered_provider(self) -> None:
+        """``DEFAULT_MODELS`` and the provider registry name the same set."""
+        assert set(DEFAULT_MODELS) == set(known_providers())
+
+    def test_provider_classes_read_from_matrix(self) -> None:
+        """Each provider class's ``DEFAULT_MODEL`` is the matrix entry."""
+        assert DEFAULT_MODELS["anthropic"] == AnthropicProvider.DEFAULT_MODEL
+        assert DEFAULT_MODELS["openai"] == OpenAIProvider.DEFAULT_MODEL
+        assert DEFAULT_MODELS["gemini"] == GeminiProvider.DEFAULT_MODEL
+        assert DEFAULT_MODELS["ollama"] == OllamaProvider.DEFAULT_MODEL
 
 
 def test_provider_is_cloud_anthropic_true() -> None:

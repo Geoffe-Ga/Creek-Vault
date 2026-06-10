@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # resolving after the type moved to :mod:`creek.classify.llm.completion` (#604).
 __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
+    "DEFAULT_MODELS",
     "AnthropicCompletion",
     "AnthropicProvider",
     "Completion",
@@ -85,6 +86,19 @@ def _resolve_configured_model(configured: str | None, default: str) -> str:
     return model or default
 
 
+# Per-provider default model IDs. This matrix is the ONLY place model literals
+# live in the package — provider classes read their ``DEFAULT_MODEL`` from it
+# and other modules read the resolved value, never a literal (enforced by
+# ``tests/test_no_model_literals.py``). Mirrors CrawDad's ``config.py`` dicts
+# so "introduce another model" is a one-place edit in both packages.
+DEFAULT_MODELS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-6",
+    "gemini": "gemini-3.5-flash",
+    "ollama": "mistral",
+    "openai": "gpt-5.4",
+}
+
+
 class AnthropicProvider:
     """Anthropic API provider for cloud-based fragment classification.
 
@@ -103,7 +117,7 @@ class AnthropicProvider:
     PROVIDER_NAME: str = "Anthropic"
     """Display name woven into consent and cloud-egress messages."""
 
-    DEFAULT_MODEL: str = "claude-sonnet-4-6"
+    DEFAULT_MODEL: str = DEFAULT_MODELS["anthropic"]
     """Default Anthropic model when the config does not override it."""
 
     API_KEY_ENV: str = "ANTHROPIC_API_KEY"
@@ -390,14 +404,6 @@ def _extract_anthropic_usage(response: object) -> dict[str, int] | None:
     return counts or None
 
 
-_OLLAMA_DEFAULT_MODEL: str = "mistral"
-"""Ollama's own default model when ``config.model`` is unset.
-
-Local to the Ollama path; cloud providers each carry their own
-:attr:`DEFAULT_MODEL` and never reference this literal.
-"""
-
-
 def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
     """Send a prompt to a local Ollama instance and return the response text.
 
@@ -418,7 +424,9 @@ def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
         response = client.post(
             f"{config.ollama_url}/api/generate",
             json={
-                "model": _resolve_configured_model(config.model, _OLLAMA_DEFAULT_MODEL),
+                "model": _resolve_configured_model(
+                    config.model, DEFAULT_MODELS["ollama"]
+                ),
                 "prompt": prompt,
                 "stream": False,
             },
@@ -469,7 +477,7 @@ class OllamaProvider:
     PROVIDER_NAME: str = "Ollama"
     """Display name (local; never appears in a cloud-egress message)."""
 
-    DEFAULT_MODEL: str = _OLLAMA_DEFAULT_MODEL
+    DEFAULT_MODEL: str = DEFAULT_MODELS["ollama"]
     """Default Ollama model when the config does not override it."""
 
     REQUEST_TIMEOUT: float = 30.0
@@ -566,7 +574,7 @@ class OpenAIProvider:
     PROVIDER_NAME: str = "OpenAI"
     """Display name woven into consent and cloud-egress messages."""
 
-    DEFAULT_MODEL: str = "gpt-4o"
+    DEFAULT_MODEL: str = DEFAULT_MODELS["openai"]
     """Default OpenAI model when the config does not override it."""
 
     API_KEY_ENV: str = "OPENAI_API_KEY"
@@ -808,7 +816,7 @@ class GeminiProvider:
     PROVIDER_NAME: str = "Gemini"
     """Display name woven into consent and cloud-egress messages."""
 
-    DEFAULT_MODEL: str = "gemini-2.5-flash"
+    DEFAULT_MODEL: str = DEFAULT_MODELS["gemini"]
     """Default Gemini model when the config does not override it."""
 
     API_KEY_ENVS: tuple[str, ...] = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
