@@ -106,8 +106,8 @@ class TestOpenAIModelResolution:
     """Model resolution mirrors the Anthropic unset-fallback logic."""
 
     def test_default_model_literal(self) -> None:
-        """The default OpenAI model literal lives on the provider."""
-        assert OpenAIProvider.DEFAULT_MODEL == "gpt-4o"
+        """The default OpenAI model is the current balanced tier (#622)."""
+        assert OpenAIProvider.DEFAULT_MODEL == "gpt-5.4"
 
     def test_falls_back_when_model_unset(self, openai_env: None) -> None:
         """An unset ``config.model`` (``None``) falls back to the OpenAI default."""
