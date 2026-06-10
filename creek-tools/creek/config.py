@@ -93,7 +93,7 @@ class LLMConfig(BaseModel):
     """LLM provider configuration."""
 
     provider: str = "ollama"
-    """LLM backend — ``ollama``, ``anthropic``, or ``openai``."""
+    """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, or ``gemini``."""
 
     model: str = "mistral"
     """Model identifier recognised by the chosen provider."""
@@ -122,6 +122,35 @@ class LLMConfig(BaseModel):
     lenient; tighten it once a calibration set exists (FEAT-017b) and
     the per-dimension agreement rate on your corpus is known.
     """
+
+    @field_validator("provider")
+    @classmethod
+    def _known_provider(cls, value: str) -> str:
+        """Fail fast at config-load on an unregistered provider (#620).
+
+        Validates against the live provider registry so a typo like
+        ``provider: anthropics`` raises here — at parse time — instead of
+        surfacing as a ``ValueError`` from ``build_provider`` mid-run. The
+        valid set is read from the registry, never re-listed, so it cannot
+        drift.
+
+        Args:
+            value: The configured provider string.
+
+        Returns:
+            *value* unchanged when it names a registered provider.
+
+        Raises:
+            ValueError: When *value* names no registered provider.
+        """
+        from creek.classify.llm.providers import known_providers
+
+        known = known_providers()
+        if value not in known:
+            joined = ", ".join(known)
+            msg = f"unknown LLM provider {value!r}; expected one of: {joined}"
+            raise ValueError(msg)
+        return value
 
 
 class EmbeddingsConfig(BaseModel):
