@@ -18,6 +18,8 @@ from pathlib import Path
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "creek"
 _ALLOWED_FILE = _PACKAGE_ROOT / "classify" / "llm" / "providers.py"
+# Known gap: OpenAI's o-series names (o1/o3/o4-mini) are not matched; widen
+# the alternation if an o-series default is ever added to the matrix.
 _MODEL_PATTERN = re.compile(
     r"claude-(?:haiku|sonnet|opus|fable)-\d|gpt-\d|gemini-\d", re.IGNORECASE
 )

@@ -93,9 +93,9 @@ def _resolve_configured_model(configured: str | None, default: str) -> str:
 # so "introduce another model" is a one-place edit in both packages.
 DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
-    "openai": "gpt-5.4",
     "gemini": "gemini-3.5-flash",
     "ollama": "mistral",
+    "openai": "gpt-5.4",
 }
 
 
@@ -425,7 +425,7 @@ def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
             f"{config.ollama_url}/api/generate",
             json={
                 "model": _resolve_configured_model(
-                    config.model, OllamaProvider.DEFAULT_MODEL
+                    config.model, DEFAULT_MODELS["ollama"]
                 ),
                 "prompt": prompt,
                 "stream": False,
