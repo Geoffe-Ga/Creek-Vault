@@ -185,6 +185,8 @@ The cloud LLM backend is selectable via `llm.provider` in `creek_config.yaml`. T
 
 The architectural decision to keep creek-tools' and CrawDad's provider abstractions decoupled is recorded in [ADR-0003](docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
 
+**Embeddings are deliberately not provider-swappable.** `llm.provider` selects the *completion* backend only; the resonance/linking path always embeds locally via sentence-transformers (`embeddings.model`), so vault text never leaves the device for linking and the vector index stays stable. The decision and its reopening criteria are recorded in [ADR-0004](docs/architecture/ADR/0004-embeddings-stay-local.md).
+
 **Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model id is only proven by a real call. With the provider's key (and consent) in the env, one command makes a single tiny live request and asserts the normalized round-trip:
 
 ```bash
