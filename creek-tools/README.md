@@ -185,6 +185,15 @@ The cloud LLM backend is selectable via `llm.provider` in `creek_config.yaml`. T
 
 The architectural decision to keep creek-tools' and CrawDad's provider abstractions decoupled is recorded in [ADR-0003](docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
 
+**Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model id is only proven by a real call. With the provider's key (and consent) in the env, one command makes a single tiny live request and asserts the normalized round-trip:
+
+```bash
+./scripts/test.sh --integration -k openai                                  # smoke the provider's default model
+CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --integration -k gemini # smoke a candidate model id
+```
+
+Each smoke skips cleanly when its key is absent, and the `integration` marker keeps them out of the default test selection and CI entirely.
+
 ---
 
 ## Source platforms
