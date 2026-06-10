@@ -5,10 +5,10 @@ until the first live run. Each test here proves the full round-trip
 (auth → request → normalized ``Completion``) against the live API using the
 composer tier resolved by :func:`crawdad.config.composer_model_for` — which
 honors the ``CRAWDAD_COMPOSER_MODEL`` env override, so onboarding a new model
-is one command::
+is one command (``test.sh`` injects ``--no-cov`` for integration runs)::
 
-    ./scripts/test.sh -m integration --no-cov -k openai
-    CRAWDAD_COMPOSER_MODEL=new-model ./scripts/test.sh -m integration --no-cov
+    ./scripts/test.sh -m integration -k openai
+    CRAWDAD_COMPOSER_MODEL=new-model ./scripts/test.sh -m integration
 
 These tests are ``integration``-marked (deselected by the default
 ``./scripts/test.sh`` run) and each skips cleanly when its provider's API key
@@ -17,6 +17,7 @@ is absent, so normal CI never runs or bills them.
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -33,18 +34,18 @@ pytestmark = pytest.mark.integration
 
 _PROMPT = "Reply with exactly the word OK and nothing else."
 
+_MESSAGES: list[dict[str, str]] = [{"role": "user", "content": _PROMPT}]
+"""The single-turn smoke payload."""
 
-def _messages() -> list[dict[str, str]]:
-    """Build the single-turn smoke payload.
-
-    Returns:
-        A one-element user message list carrying :data:`_PROMPT`.
-    """
-    return [{"role": "user", "content": _PROMPT}]
+_TIMEOUT_SECONDS = 30.0
+"""Wall-clock cap per live call so a hung endpoint cannot stall the suite."""
 
 
 def _assert_live_completion(completion: Completion) -> None:
     """Assert the normalized shape every live round-trip must produce.
+
+    All three cloud vendors report token usage on a successful completion,
+    so the smoke pins ``usage`` as populated alongside text and stop reason.
 
     Args:
         completion: The provider's normalized result for :data:`_PROMPT`.
@@ -53,6 +54,7 @@ def _assert_live_completion(completion: Completion) -> None:
     assert completion.stop_reason in {"end_turn", "max_tokens"}, (
         f"unrecognized stop reason {completion.stop_reason!r}"
     )
+    assert completion.usage is not None
 
 
 @pytest.mark.skipif(
@@ -63,8 +65,11 @@ async def test_anthropic_live_smoke() -> None:
     import anthropic
 
     provider = AnthropicAsyncProvider(anthropic.AsyncAnthropic())
-    completion = await provider.complete(
-        _messages(), model=composer_model_for("anthropic"), max_tokens=16
+    completion = await asyncio.wait_for(
+        provider.complete(
+            _MESSAGES, model=composer_model_for("anthropic"), max_tokens=16
+        ),
+        timeout=_TIMEOUT_SECONDS,
     )
     _assert_live_completion(completion)
 
@@ -77,8 +82,9 @@ async def test_openai_live_smoke() -> None:
     import openai
 
     provider = OpenAIAsyncProvider(openai.AsyncOpenAI())
-    completion = await provider.complete(
-        _messages(), model=composer_model_for("openai"), max_tokens=16
+    completion = await asyncio.wait_for(
+        provider.complete(_MESSAGES, model=composer_model_for("openai"), max_tokens=16),
+        timeout=_TIMEOUT_SECONDS,
     )
     _assert_live_completion(completion)
 
@@ -91,7 +97,8 @@ async def test_gemini_live_smoke() -> None:
     from google import genai
 
     provider = GeminiAsyncProvider(genai.Client())
-    completion = await provider.complete(
-        _messages(), model=composer_model_for("gemini"), max_tokens=16
+    completion = await asyncio.wait_for(
+        provider.complete(_MESSAGES, model=composer_model_for("gemini"), max_tokens=16),
+        timeout=_TIMEOUT_SECONDS,
     )
     _assert_live_completion(completion)

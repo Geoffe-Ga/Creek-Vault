@@ -13,4 +13,14 @@ cd "$(dirname "$SCRIPT_DIR")"
 if [[ $# -eq 0 ]]; then
     set -- -m "not integration"
 fi
+# Inject --no-cov when explicitly targeting integration tests: the
+# project-wide --cov-fail-under=90 would otherwise trip on a handful of
+# live smokes and bury their output under a coverage failure. The negated
+# default selection ("not integration") must keep its coverage gate.
+for arg in "$@"; do
+    if [[ "$arg" == *integration* && "$arg" != *"not integration"* ]]; then
+        set -- "$@" --no-cov
+        break
+    fi
+done
 pytest "$@"

@@ -89,9 +89,11 @@ CrawDad's provider abstraction is intentionally **decoupled** from creek-tools' 
 **Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model tier is only proven by a real call. With the provider's key in the env, one command makes a single tiny live request and asserts the normalized round-trip:
 
 ```bash
-./scripts/test.sh -m integration --no-cov -k openai                                       # smoke the composer's default tier
-CRAWDAD_COMPOSER_MODEL=some-new-model ./scripts/test.sh -m integration --no-cov -k gemini # smoke a candidate model id
+./scripts/test.sh -m integration -k openai                                       # smoke the composer's default tier
+CRAWDAD_COMPOSER_MODEL=some-new-model ./scripts/test.sh -m integration -k gemini # smoke a candidate model id
 ```
+
+(`test.sh` injects `--no-cov` for integration runs so the project-wide coverage gate doesn't bury the smoke output.)
 
 Each smoke skips cleanly when its key is absent; the default `./scripts/test.sh` run deselects the `integration` marker, so CI never makes (or bills) a live call.
 
