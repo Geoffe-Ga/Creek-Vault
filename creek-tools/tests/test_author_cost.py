@@ -265,6 +265,15 @@ def test_resolve_voice_model_prefers_override() -> None:
     assert resolve_voice_model(AuthorConfig(), llm) == "base-model"
 
 
+def test_resolve_voice_model_unset_means_provider_default() -> None:
+    """With neither tier set, resolution yields ``None`` = provider default (#621).
+
+    ``None`` flows into :meth:`AuthorLLMClient.from_config`, which leaves
+    ``config.model`` untouched so the provider applies its own default.
+    """
+    assert resolve_voice_model(AuthorConfig(), LLMConfig()) is None
+
+
 def test_author_client_from_config_threads_model_override() -> None:
     """``from_config(model=...)`` overrides the model id without hard-coding one."""
     from unittest.mock import patch

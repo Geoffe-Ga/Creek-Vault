@@ -126,8 +126,8 @@ class TestGeminiModelResolution:
         """The default Gemini model literal lives on the provider."""
         assert GeminiProvider.DEFAULT_MODEL == "gemini-2.5-flash"
 
-    def test_falls_back_from_ollama_default(self, gemini_env: None) -> None:
-        """The Ollama default ``mistral`` falls back to the Gemini default."""
+    def test_falls_back_when_model_unset(self, gemini_env: None) -> None:
+        """An unset ``config.model`` (``None``) falls back to the Gemini default."""
         provider = GeminiProvider(LLMConfig(provider="gemini"))
         assert provider.model == GeminiProvider.DEFAULT_MODEL
 
@@ -135,6 +135,11 @@ class TestGeminiModelResolution:
         """An explicit config model is honoured."""
         provider = GeminiProvider(LLMConfig(provider="gemini", model="gemini-x"))
         assert provider.model == "gemini-x"
+
+    def test_honors_explicit_mistral_verbatim(self, gemini_env: None) -> None:
+        """An explicit ``model: mistral`` is sent verbatim, never swapped (#621)."""
+        provider = GeminiProvider(LLMConfig(provider="gemini", model="mistral"))
+        assert provider.model == "mistral"
 
 
 class TestGeminiComplete:

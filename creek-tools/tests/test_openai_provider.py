@@ -103,14 +103,14 @@ class TestOpenAIFactoryRegistration:
 
 
 class TestOpenAIModelResolution:
-    """Model resolution mirrors the Anthropic sentinel logic."""
+    """Model resolution mirrors the Anthropic unset-fallback logic."""
 
     def test_default_model_literal(self) -> None:
         """The default OpenAI model literal lives on the provider."""
         assert OpenAIProvider.DEFAULT_MODEL == "gpt-4o"
 
-    def test_falls_back_from_ollama_default(self, openai_env: None) -> None:
-        """The Ollama default ``mistral`` falls back to the OpenAI default."""
+    def test_falls_back_when_model_unset(self, openai_env: None) -> None:
+        """An unset ``config.model`` (``None``) falls back to the OpenAI default."""
         provider = OpenAIProvider(LLMConfig(provider="openai"))
         assert provider.model == OpenAIProvider.DEFAULT_MODEL
 
@@ -118,6 +118,11 @@ class TestOpenAIModelResolution:
         """An explicit config model is honoured."""
         provider = OpenAIProvider(LLMConfig(provider="openai", model="gpt-x"))
         assert provider.model == "gpt-x"
+
+    def test_honors_explicit_mistral_verbatim(self, openai_env: None) -> None:
+        """An explicit ``model: mistral`` is sent verbatim, never swapped (#621)."""
+        provider = OpenAIProvider(LLMConfig(provider="openai", model="mistral"))
+        assert provider.model == "mistral"
 
 
 class TestOpenAIComplete:

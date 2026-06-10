@@ -95,8 +95,13 @@ class LLMConfig(BaseModel):
     provider: str = "ollama"
     """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, or ``gemini``."""
 
-    model: str = "mistral"
-    """Model identifier recognised by the chosen provider."""
+    model: str | None = None
+    """Model identifier recognised by the chosen provider.
+
+    ``None`` (the default) means "use the provider's own default model" —
+    each provider resolves it locally (e.g. ``mistral`` for Ollama). An
+    explicit value is always honored verbatim, whatever the provider.
+    """
 
     ollama_url: str = "http://localhost:11434"
     """Base URL for the Ollama API server."""

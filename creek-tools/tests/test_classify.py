@@ -1404,14 +1404,32 @@ class TestAnthropicProviderInit:
 class TestAnthropicProviderModel:
     """Tests for AnthropicProvider.model resolution."""
 
-    def test_defaults_when_config_uses_ollama_default(
+    def test_defaults_when_config_model_unset(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The Ollama default ``mistral`` should fall back to Anthropic default."""
+        """An unset ``config.model`` (``None``) falls back to the Anthropic default."""
         _set_anthropic_env(monkeypatch)
         provider = AnthropicProvider(LLMConfig(provider="anthropic"))
         assert provider.model == AnthropicProvider.DEFAULT_MODEL
+
+    def test_defaults_when_config_model_blank(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A whitespace-only ``config.model`` falls back to the Anthropic default."""
+        _set_anthropic_env(monkeypatch)
+        provider = AnthropicProvider(LLMConfig(provider="anthropic", model="   "))
+        assert provider.model == AnthropicProvider.DEFAULT_MODEL
+
+    def test_honors_explicit_mistral_verbatim(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An explicit ``model: mistral`` is sent verbatim, never swapped (#621)."""
+        _set_anthropic_env(monkeypatch)
+        provider = AnthropicProvider(LLMConfig(provider="anthropic", model="mistral"))
+        assert provider.model == "mistral"
 
     def test_uses_config_model_when_set(
         self,

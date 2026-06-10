@@ -93,7 +93,7 @@ classification:
 
 llm:
   provider: ollama                       # or "anthropic"
-  model: mistral
+  model: mistral                         # optional; omit for the provider default
   batch_size: 50
   max_concurrent: 5
   unclassified_threshold: 0.55           # FEAT-017: bias for Mode / Orientation / Dosage
@@ -185,7 +185,7 @@ ollama serve &
 ollama pull mistral
 ```
 
-Configure the model name in `LLMConfig.model` (default `mistral`). Latency on a CPU is ~2–4 s per fragment; expect a few hours for a vault of 10k fragments.
+Configure the model name in `LLMConfig.model` (when unset, Ollama defaults to `mistral`). Latency on a CPU is ~2–4 s per fragment; expect a few hours for a vault of 10k fragments.
 
 ### Anthropic API (opt-in)
 

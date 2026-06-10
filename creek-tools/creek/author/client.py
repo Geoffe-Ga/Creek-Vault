@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from creek.config import AuthorConfig, LLMConfig
 
 
-def resolve_voice_model(author: AuthorConfig, llm: LLMConfig) -> str:
+def resolve_voice_model(author: AuthorConfig, llm: LLMConfig) -> str | None:
     """Resolve the model id for the voice call from config, never hard-coded.
 
     The desk's per-agent model tiers (#474) let an operator point the voice
@@ -30,7 +30,9 @@ def resolve_voice_model(author: AuthorConfig, llm: LLMConfig) -> str:
         llm: The shared LLM config supplying the fallback model id.
 
     Returns:
-        :attr:`AuthorConfig.voice_model` when set, otherwise ``llm.model``.
+        :attr:`AuthorConfig.voice_model` when set, otherwise ``llm.model`` —
+        which may itself be ``None``, meaning "use the provider's default";
+        :meth:`AuthorLLMClient.from_config` passes ``None`` through untouched.
     """
     return author.voice_model or llm.model
 
