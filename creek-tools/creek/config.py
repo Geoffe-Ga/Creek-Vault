@@ -126,7 +126,7 @@ class LLMConfig(BaseModel):
     @field_validator("provider")
     @classmethod
     def _known_provider(cls, value: str) -> str:
-        """Fail fast at config-load on an unregistered provider (#620).
+        """Fail fast at config-load on an unregistered provider.
 
         Validates against the live provider registry so a typo like
         ``provider: anthropics`` raises here — at parse time — instead of

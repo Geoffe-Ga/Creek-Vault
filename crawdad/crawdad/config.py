@@ -118,9 +118,9 @@ _COMPOSER_MODEL_DEFAULTS: dict[str, str] = {
 def _resolve_model(provider: str, override_env: str, defaults: dict[str, str]) -> str:
     """Resolve a model tier for *provider*, honoring an env override.
 
-    Raises on an unknown provider rather than silently falling back (#620) —
-    `load_config` validates the provider, so an unknown value here is a
-    programmer error, not an operator typo to paper over.
+    Raises on an unknown provider rather than silently falling back to the
+    Anthropic default — the load-time validator catches operator typos, so an
+    unknown value here is a programmer error, not something to paper over.
 
     Args:
         provider: The selected backend.
@@ -141,6 +141,7 @@ def _resolve_model(provider: str, override_env: str, defaults: dict[str, str]) -
     except KeyError:
         known = ", ".join(sorted(defaults))
         msg = f"unknown provider {provider!r}; expected one of: {known}"
+        # The KeyError adds no caller-useful context; suppress its chain.
         raise ValueError(msg) from None
 
 

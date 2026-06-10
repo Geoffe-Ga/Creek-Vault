@@ -576,6 +576,8 @@ def test_provider_registries_stay_in_sync() -> None:
     list identical providers; this regression is the single anti-drift guard
     in place of a hand-maintained second list.
     """
+    # Private internals are imported deliberately: this guard's whole job is
+    # to pin those provider maps together, so it must reference them by name.
     from crawdad.config import (
         _COMPOSER_MODEL_DEFAULTS,
         _PROVIDER_KEY_ENV,

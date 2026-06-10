@@ -1073,7 +1073,7 @@ def known_providers() -> tuple[str, ...]:
 
     The single source of truth for "which providers exist" — config validation
     reads this rather than re-listing the names, so the set can never drift from
-    the :data:`_PROVIDER_REGISTRY` the factory dispatches on (#620).
+    the :data:`_PROVIDER_REGISTRY` the factory dispatches on.
 
     Returns:
         The registered ``LLMConfig.provider`` strings, sorted.
