@@ -159,10 +159,19 @@ class LLMConfig(BaseModel):
 
 
 class EmbeddingsConfig(BaseModel):
-    """Embedding model configuration."""
+    """Embedding model configuration.
+
+    Embeddings are local-only by design — unlike ``llm.provider``, there is no
+    cloud backend selection here, so vault text never leaves the device for
+    linking (see ``docs/architecture/ADR/0004-embeddings-stay-local.md``).
+    """
 
     model: str = "all-MiniLM-L6-v2"
-    """Sentence-transformer model used to generate embeddings."""
+    """Sentence-transformer model used to generate embeddings (always local).
+
+    Changing it invalidates the on-disk vector cache: every fragment must be
+    re-embedded and ``similarity_threshold`` re-calibrated for the new model.
+    """
 
     similarity_threshold: float = 0.75
     """Minimum cosine similarity for linking fragments."""
