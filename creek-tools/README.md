@@ -187,6 +187,12 @@ The architectural decision to keep creek-tools' and CrawDad's provider abstracti
 
 **Embeddings are deliberately not provider-swappable.** `llm.provider` selects the *completion* backend only; the resonance/linking path always embeds locally via sentence-transformers (`embeddings.model`), so vault text never leaves the device for linking and the vector index stays stable. The decision and its reopening criteria are recorded in [ADR-0004](docs/architecture/ADR/0004-embeddings-stay-local.md).
 
+**Provider capability notes.** The abstraction normalizes text, stop reason, and usage — three behaviors intentionally remain per-provider:
+
+- **Rate limits**: a vendor 429 surfaces with the server's `Retry-After` hint preserved (never request state), and the classifier's retry loop honors it instead of retrying on the fixed delay.
+- **Prompt caching** (cost asymmetry): Anthropic gets an explicit ephemeral `cache_control` block on the static system prefix; OpenAI relies on its vendor-side automatic prompt caching; Gemini sends the prefix plain (no explicit caching wired). Repeated static prefixes therefore bill differently per provider.
+- **Streaming**: the abstraction is non-streaming by design — fine for batch classification and current consumers; a token-streaming UX would need a protocol extension.
+
 **Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model id is only proven by a real call. With the provider's key (and consent) in the env, one command makes a single tiny live request and asserts the normalized round-trip:
 
 ```bash

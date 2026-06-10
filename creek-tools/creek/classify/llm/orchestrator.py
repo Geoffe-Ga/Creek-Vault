@@ -27,6 +27,7 @@ from creek.classify.llm.parsing import (
 from creek.classify.llm.prompts import build_classification_prompt
 from creek.classify.llm.providers import (
     Completion,
+    ProviderRateLimitError,
     build_provider,
     cloud_warning,
     provider_display_name,
@@ -350,7 +351,7 @@ class LLMClassifier:
                     exc,
                 )
                 if attempt < self.MAX_RETRIES - 1:
-                    time.sleep(self.RETRY_DELAY)
+                    time.sleep(self._retry_delay_for(exc))
             else:
                 # _apply_classification is a pure transform (no network I/O)
                 # and lives in the else block intentionally: a failure here
@@ -371,6 +372,25 @@ class LLMClassifier:
             fragment.title,
         )
         return LLMClassificationResult(fragment=fragment, reasoning="")
+
+    def _retry_delay_for(self, exc: Exception) -> float:
+        """Resolve the backoff before the next retry attempt.
+
+        Honors the server's ``Retry-After`` hint on a rate-limited call —
+        retrying sooner than the server asked makes the rate-limiting worse —
+        clamped to at least :attr:`RETRY_DELAY` so a tiny hint never speeds
+        retries up beyond the fixed baseline. Every other failure keeps the
+        historical fixed delay.
+
+        Args:
+            exc: The exception that failed the attempt.
+
+        Returns:
+            Seconds to sleep before the next attempt.
+        """
+        if isinstance(exc, ProviderRateLimitError) and exc.retry_after is not None:
+            return max(exc.retry_after, self.RETRY_DELAY)
+        return self.RETRY_DELAY
 
     def classify_batch(
         self,

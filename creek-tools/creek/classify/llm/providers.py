@@ -51,6 +51,7 @@ __all__ = [
     "GeminiProvider",
     "OllamaProvider",
     "OpenAIProvider",
+    "ProviderRateLimitError",
     "build_provider",
     "cloud_warning",
     "known_providers",
@@ -84,6 +85,60 @@ def _resolve_configured_model(configured: str | None, default: str) -> str:
     """
     model = (configured or "").strip()
     return model or default
+
+
+_HTTP_TOO_MANY_REQUESTS: int = 429
+"""The HTTP status code for a rate-limited request."""
+
+
+class ProviderRateLimitError(RuntimeError):
+    """A vendor rate-limit (429) response, with the server's backoff hint.
+
+    Subclasses :class:`RuntimeError` so every existing retry/except path keeps
+    catching it; the message stays redacted to the exception type name like
+    any other provider error. The only extra information carried is the
+    ``Retry-After`` value — never request state or response bodies — so the
+    retry loop can honor the server's backoff instead of retrying blind.
+
+    Attributes:
+        retry_after: Seconds the server asked clients to wait before retrying,
+            or ``None`` when the response carried no usable hint.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        """Store the redacted message and the optional backoff hint.
+
+        Args:
+            message: The redacted, provider-prefixed error message.
+            retry_after: Seconds from the response's ``Retry-After`` header,
+                or ``None`` when absent.
+        """
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(exc: object) -> float | None:
+    """Extract a ``Retry-After`` hint (in seconds) from a vendor exception.
+
+    Every supported SDK attaches the underlying ``httpx.Response`` to its
+    rate-limit exception; the header is read defensively so a missing
+    response, missing header, or HTTP-date form (which ``float`` rejects)
+    degrades to ``None`` rather than raising.
+
+    Args:
+        exc: The vendor SDK exception.
+
+    Returns:
+        The non-negative seconds value, or ``None`` when unavailable.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 # Per-provider default model IDs. This matrix is the ONLY place model literals
@@ -305,6 +360,11 @@ class AnthropicProvider:
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self._create_message(prompt, ceiling, system)
+        except anthropic.RateLimitError as exc:
+            msg = f"Anthropic API call rate-limited: {type(exc).__name__}"
+            raise ProviderRateLimitError(
+                msg, retry_after=_retry_after_seconds(exc)
+            ) from None
         except anthropic.AnthropicError as exc:
             msg = f"Anthropic API call failed: {type(exc).__name__}"
             raise RuntimeError(msg) from None
@@ -691,6 +751,11 @@ class OpenAIProvider:
         ceiling = self.MAX_TOKENS if max_tokens is None else max_tokens
         try:
             response = self._create_chat(prompt, ceiling, system)
+        except openai.RateLimitError as exc:
+            msg = f"OpenAI API call rate-limited: {type(exc).__name__}"
+            raise ProviderRateLimitError(
+                msg, retry_after=_retry_after_seconds(exc)
+            ) from None
         except openai.OpenAIError as exc:
             msg = f"OpenAI API call failed: {type(exc).__name__}"
             raise RuntimeError(msg) from None
@@ -927,6 +992,11 @@ class GeminiProvider:
         try:
             response = self._generate(prompt, ceiling, system)
         except errors.APIError as exc:
+            if getattr(exc, "code", None) == _HTTP_TOO_MANY_REQUESTS:
+                msg = f"Gemini API call rate-limited: {type(exc).__name__}"
+                raise ProviderRateLimitError(
+                    msg, retry_after=_retry_after_seconds(exc)
+                ) from None
             msg = f"Gemini API call failed: {type(exc).__name__}"
             raise RuntimeError(msg) from None
         return Completion(
