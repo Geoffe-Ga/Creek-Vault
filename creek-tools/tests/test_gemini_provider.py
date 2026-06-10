@@ -216,6 +216,47 @@ class TestGeminiComplete:
         assert "APIError" in message
         assert "secret" not in message
 
+    def test_rate_limit_surfaces_retry_after(self, gemini_env: None) -> None:
+        """A vendor 429 maps to ProviderRateLimitError carrying Retry-After."""
+        import httpx
+        from google.genai import errors
+
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        response = httpx.Response(
+            429,
+            headers={"retry-after": "11"},
+            request=httpx.Request("POST", "https://generativelanguage.googleapis.com"),
+        )
+        client = MagicMock()
+        client.models.generate_content.side_effect = errors.APIError(
+            429, {"error": {"message": "secret request payload"}}, response
+        )
+        with patch("google.genai.Client", return_value=client):
+            provider = GeminiProvider(LLMConfig(provider="gemini"))
+            with pytest.raises(ProviderRateLimitError) as exc:
+                provider.complete("p")
+        assert exc.value.retry_after == 11.0
+        assert "secret" not in str(exc.value)
+
+    def test_rate_limit_without_response_has_no_retry_after(
+        self, gemini_env: None
+    ) -> None:
+        """A 429 with no response headers still maps, with ``retry_after=None``."""
+        from google.genai import errors
+
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = errors.APIError(
+            429, {"error": {"message": "rate limited"}}
+        )
+        with patch("google.genai.Client", return_value=client):
+            provider = GeminiProvider(LLMConfig(provider="gemini"))
+            with pytest.raises(ProviderRateLimitError) as exc:
+                provider.complete("p")
+        assert exc.value.retry_after is None
+
 
 def test_gemini_end_to_end_classify(gemini_env: None) -> None:
     """A mocked end-to-end classify via provider=gemini returns a Completion."""

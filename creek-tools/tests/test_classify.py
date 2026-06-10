@@ -926,6 +926,62 @@ class TestClassify:
 
     @patch.object(LLMClassifier, "_invoke_llm")
     @patch("creek.classify.llm.time.sleep")
+    def test_rate_limited_retry_honors_server_backoff(
+        self,
+        mock_sleep: MagicMock,
+        mock_call: MagicMock,
+    ) -> None:
+        """A 429 with Retry-After sleeps the server's hint, not the fixed delay."""
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        mock_call.side_effect = [
+            ProviderRateLimitError("rate-limited", retry_after=7.5),
+            _VALID_YAML_RESPONSE,
+        ]
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        result = classifier.classify(_make_fragment())
+        assert result.frequency.primary == Frequency.F3
+        mock_sleep.assert_called_once_with(7.5)
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    @patch("creek.classify.llm.time.sleep")
+    def test_rate_limited_retry_without_hint_uses_fixed_delay(
+        self,
+        mock_sleep: MagicMock,
+        mock_call: MagicMock,
+    ) -> None:
+        """A 429 without Retry-After falls back to the fixed retry delay."""
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        mock_call.side_effect = [
+            ProviderRateLimitError("rate-limited"),
+            _VALID_YAML_RESPONSE,
+        ]
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        result = classifier.classify(_make_fragment())
+        assert result.frequency.primary == Frequency.F3
+        mock_sleep.assert_called_once_with(classifier.RETRY_DELAY)
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    @patch("creek.classify.llm.time.sleep")
+    def test_rate_limit_hint_below_fixed_delay_is_clamped(
+        self,
+        mock_sleep: MagicMock,
+        mock_call: MagicMock,
+    ) -> None:
+        """A Retry-After shorter than the fixed delay never speeds retries up."""
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        mock_call.side_effect = [
+            ProviderRateLimitError("rate-limited", retry_after=0.1),
+            _VALID_YAML_RESPONSE,
+        ]
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        classifier.classify(_make_fragment())
+        mock_sleep.assert_called_once_with(classifier.RETRY_DELAY)
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    @patch("creek.classify.llm.time.sleep")
     def test_returns_unchanged_after_all_retries(
         self,
         mock_sleep: MagicMock,
@@ -1471,6 +1527,34 @@ class TestAnthropicProviderCall:
         assert kwargs["messages"] == [
             {"role": "user", "content": "hello prompt"},
         ]
+
+    def test_rate_limit_surfaces_retry_after(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A vendor 429 maps to ProviderRateLimitError carrying Retry-After."""
+        import anthropic
+
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        _set_anthropic_env(monkeypatch)
+        response = httpx.Response(
+            429,
+            headers={"retry-after": "3.5"},
+            request=httpx.Request("POST", "https://api.anthropic.com"),
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = anthropic.RateLimitError(
+            "secret request payload", response=response, body=None
+        )
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            provider = AnthropicProvider(LLMConfig(provider="anthropic"))
+            with pytest.raises(ProviderRateLimitError) as exc:
+                provider.call("prompt")
+        assert exc.value.retry_after == 3.5
+        assert "secret" not in str(exc.value)
+        # Still a RuntimeError, so every existing retry/except path catches it.
+        assert isinstance(exc.value, RuntimeError)
 
     def test_call_concatenates_multiple_text_blocks(
         self,

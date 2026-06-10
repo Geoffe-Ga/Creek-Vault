@@ -199,6 +199,51 @@ class TestOpenAIComplete:
         assert "OpenAIError" in message
         assert "secret" not in message
 
+    def test_rate_limit_surfaces_retry_after(self, openai_env: None) -> None:
+        """A vendor 429 maps to ProviderRateLimitError carrying Retry-After."""
+        import httpx
+        import openai
+
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        response = httpx.Response(
+            429,
+            headers={"retry-after": "7"},
+            request=httpx.Request("POST", "https://api.openai.com"),
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = openai.RateLimitError(
+            "secret request payload", response=response, body=None
+        )
+        with patch("openai.OpenAI", return_value=client):
+            provider = OpenAIProvider(LLMConfig(provider="openai"))
+            with pytest.raises(ProviderRateLimitError) as exc:
+                provider.complete("p")
+        assert exc.value.retry_after == 7.0
+        assert "secret" not in str(exc.value)
+
+    def test_rate_limit_without_header_has_no_retry_after(
+        self, openai_env: None
+    ) -> None:
+        """A 429 without Retry-After still maps, with ``retry_after=None``."""
+        import httpx
+        import openai
+
+        from creek.classify.llm.providers import ProviderRateLimitError
+
+        response = httpx.Response(
+            429, request=httpx.Request("POST", "https://api.openai.com")
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = openai.RateLimitError(
+            "m", response=response, body=None
+        )
+        with patch("openai.OpenAI", return_value=client):
+            provider = OpenAIProvider(LLMConfig(provider="openai"))
+            with pytest.raises(ProviderRateLimitError) as exc:
+                provider.complete("p")
+        assert exc.value.retry_after is None
+
     def test_complete_uses_api_base_when_set(self, openai_env: None) -> None:
         """``config.api_base`` is passed to the SDK client as ``base_url``."""
         client = _make_mock_openai_client("x")
