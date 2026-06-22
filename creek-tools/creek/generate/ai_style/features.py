@@ -464,7 +464,6 @@ def one_line_fragment_density(text: str) -> float:
 
 
 FINGERPRINT_FEATURES: dict[str, Extractor] = {
-    "one_line_fragment_density": one_line_fragment_density,
     "em_dash_density": em_dash_density,
     "curly_quote_density": curly_quote_density,
     "ai_vocab_density": ai_vocab_density,
@@ -484,6 +483,7 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "didactic_disclaimer_density": didactic_disclaimer_density,
     "section_summary_density": section_summary_density,
     "comm_boilerplate_density": comm_boilerplate_density,
+    "one_line_fragment_density": one_line_fragment_density,
 }
 """The feature_key -> extractor map the fingerprint measures over the
 user's corpus. Detector tells (FEAT-040.3 through .7) query these same

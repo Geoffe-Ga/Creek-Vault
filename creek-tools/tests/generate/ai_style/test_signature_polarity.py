@@ -17,6 +17,7 @@ from creek.generate.ai_style.sanitize_typography import normalize_typography
 from creek.generate.ai_style.tells import (
     PLACEHOLDER_DATE,
     TELL_REGISTRY,
+    Tell,
     effective_polarity,
 )
 
@@ -53,9 +54,37 @@ class TestEffectivePolarity:
     """Polarity is derived from the user's rate, with locked artifacts exempt."""
 
     def test_heavy_user_makes_signature(self) -> None:
-        """A rate at/above threshold flips the concern to under-use."""
-        tell = TELL_REGISTRY[_KEY.replace("_density", "")]  # "one_line_fragment"
+        """A rate above threshold flips the concern to under-use."""
+        tell = TELL_REGISTRY["one_line_fragment"]
         assert effective_polarity(tell, 9.0, signature_threshold=3.0) == "signature"
+
+    def test_threshold_boundary_is_inclusive(self) -> None:
+        """``user_rate == threshold`` counts as a signature (``>=``, not ``>``)."""
+        tell = TELL_REGISTRY["one_line_fragment"]
+        assert effective_polarity(tell, 3.0, signature_threshold=3.0) == "signature"
+
+    def test_lock_polarity_flag_forces_declared(self) -> None:
+        """An explicit ``lock_polarity`` keeps declared polarity below threshold.
+
+        Covers the ``lock_polarity=True`` branch independently of the
+        ``margin == 0.0`` branch: without the lock this signature tell would be
+        inert (``None``) at a sub-threshold rate.
+        """
+        locked = Tell(
+            id="_test_locked_signature",
+            category="rhetorical",
+            feature_key="_test_locked",
+            handling="surface",
+            polarity="signature",
+            description="test",
+            caveat="test",
+            measure=lambda _text: 0.0,
+            locate=lambda _text: [],
+            lock_polarity=True,
+        )
+        assert locked.margin is None
+        assert locked.polarity_is_locked()
+        assert effective_polarity(locked, 0.0, signature_threshold=3.0) == "signature"
 
     def test_avoid_tell_never_reinforced(self) -> None:
         """An AI-tell stays ``avoid`` even when the user over-uses it."""
