@@ -429,6 +429,40 @@ def comm_boilerplate_density(text: str) -> float:
     return rate_per_kwords(len(COMM_BOILERPLATE_RE.findall(text)), text)
 
 
+_PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
+_ONE_LINE_MAX_WORDS = 20
+"""Word ceiling for a paragraph to count as a punchy one-line fragment.
+
+A single-line paragraph longer than this reads as a normal (merely
+un-wrapped) paragraph, not the short standalone beat the signature
+captures."""
+
+
+def one_line_fragment_density(text: str) -> float:
+    """Return short single-line paragraphs per 1000 words (#635 signature).
+
+    Counts blank-line-delimited paragraphs that are a single line of at most
+    :data:`_ONE_LINE_MAX_WORDS` words — the user's punchy single-sentence-
+    paragraph rhythm. An authentic signature: previously unmeasured, so it was
+    neither protected from scrubbing nor reinforced. Pure and deterministic.
+
+    Args:
+        text: The body of text to measure.
+
+    Returns:
+        One-line-fragment occurrences per 1000 words.
+    """
+    paragraphs = _PARAGRAPH_SPLIT_RE.split(text.strip())
+    one_liners = sum(
+        1
+        for para in paragraphs
+        if (stripped := para.strip())
+        and "\n" not in stripped
+        and len(stripped.split()) <= _ONE_LINE_MAX_WORDS
+    )
+    return rate_per_kwords(one_liners, text)
+
+
 FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "em_dash_density": em_dash_density,
     "curly_quote_density": curly_quote_density,
@@ -449,6 +483,7 @@ FINGERPRINT_FEATURES: dict[str, Extractor] = {
     "didactic_disclaimer_density": didactic_disclaimer_density,
     "section_summary_density": section_summary_density,
     "comm_boilerplate_density": comm_boilerplate_density,
+    "one_line_fragment_density": one_line_fragment_density,
 }
 """The feature_key -> extractor map the fingerprint measures over the
 user's corpus. Detector tells (FEAT-040.3 through .7) query these same

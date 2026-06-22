@@ -204,3 +204,26 @@ COMM_BOILERPLATE = register(
         margin=_STRUCTURE_MARGIN,
     ),
 )
+
+# --- Signature tell (#635): an authentic feature to reinforce, not scrub ---
+# Declared ``signature`` because its natural concern is *under*-use: a draft
+# that flattens the user's punchy single-sentence-paragraph rhythm into dense
+# blocks has lost their voice. Per-user polarity derivation still governs it —
+# it only fires as a signature once the user's own one-line-fragment rate
+# clears the signature threshold, so it never penalises a writer who does not
+# use the rhythm.
+ONE_LINE_FRAGMENT = register(
+    Tell(
+        id="one_line_fragment",
+        category="discourse",
+        feature_key="one_line_fragment_density",
+        handling="surface",
+        polarity="signature",
+        description="Short single-sentence paragraphs (the punchy one-line beat).",
+        caveat="A signature rhythm, not a defect: flagged only when you "
+        "characteristically use it and a draft strips it out.",
+        measure=features.one_line_fragment_density,
+        # Under-use has no single location; a doc-level finding is emitted.
+        locate=lambda _text: [],
+    ),
+)

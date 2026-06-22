@@ -975,6 +975,16 @@ class AIStyleConfig(BaseModel):
     Rates are per-1000-words, so ``0.5`` means "half an occurrence per
     thousand words above the user's own rate"."""
 
+    signature_polarity_threshold: float = Field(default=3.0, ge=0.0)
+    """Per-1000-words rate at or above which a feature is treated as one of
+    *this user's* signatures, deriving its polarity per-user (#635): the
+    concern flips from over-use (``avoid``) to under-use (``signature``), so a
+    draft that strips a feature the user characteristically employs raises
+    voice distance instead of lowering it. Below this rate the feature keeps
+    its declared (avoid) polarity. Never-legitimate artifacts (tells with
+    ``margin == 0.0``: placeholder dates, fabricated citations) are exempt and
+    stay ``avoid`` regardless of the user's measured rate."""
+
     min_fingerprint_fragments: int = Field(default=5, ge=1)
     """Below this many user-authored fragments the fingerprint is treated
     as thin: divergence contributions are softened toward the generic
