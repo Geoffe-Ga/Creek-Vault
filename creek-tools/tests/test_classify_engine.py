@@ -1092,3 +1092,63 @@ def test_run_classify_rules_does_not_construct_llm(
 
     mock_cls.assert_not_called()
     assert summary.classified == 1
+
+
+def _audience_of(path: Path) -> str:
+    """Return the persisted ``audience`` axis from a fragment file."""
+    return str(frontmatter.load(str(path)).metadata.get("audience"))
+
+
+def test_run_classify_stamps_audience_axis(tmp_path: Path) -> None:
+    """``creek classify`` persists the #634 audience axis to frontmatter."""
+    vault = tmp_path / "vault"
+    essay = Fragment(
+        id="frag-essay00000001",
+        title="published essay",
+        source=FragmentSource(platform=SourcePlatform.ESSAY),
+    )
+    essay_path = _write_fragment(
+        vault=vault,
+        fragment=essay,
+        body="# Heading\n\n" + ("a deliberate published sentence. " * 80),
+    )
+    journal = Fragment(
+        id="frag-journal0001",
+        title="private musing",
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+    )
+    journal_path = _write_fragment(
+        vault=vault,
+        fragment=journal,
+        body="today I felt raw and small",
+    )
+
+    run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _audience_of(essay_path) == "audience-facing"
+    assert _audience_of(journal_path) == "private"
+
+
+def test_run_classify_audience_axis_is_idempotent(tmp_path: Path) -> None:
+    """A second rules pass leaves the audience axis unchanged."""
+    vault = tmp_path / "vault"
+    essay = Fragment(
+        id="frag-essay00000002",
+        title="published essay",
+        source=FragmentSource(platform=SourcePlatform.ESSAY),
+    )
+    path = _write_fragment(
+        vault=vault,
+        fragment=essay,
+        body="# Heading\n\n" + ("a deliberate published sentence. " * 80),
+    )
+
+    run_classify(vault_path=vault, config=CreekConfig(), method="rules", force=False)
+    first = _audience_of(path)
+    run_classify(vault_path=vault, config=CreekConfig(), method="rules", force=True)
+    assert _audience_of(path) == first == "audience-facing"

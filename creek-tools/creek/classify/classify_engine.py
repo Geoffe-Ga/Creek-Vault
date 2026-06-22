@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import yaml
 
+from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
     CLASSIFICATION_REASONING_KEY,
@@ -208,6 +209,7 @@ def run_classify(
         return ClassifySummary(0, 0, 0, 0, 0, ())
 
     rules = RuleClassifier()
+    audience = AudienceClassifier()
     llm = LLMClassifier(config=config.llm) if method == "llm" else None
     if llm is not None and not llm.available:
         # Refuse to iterate when the provider is unreachable so the
@@ -248,6 +250,7 @@ def run_classify(
             method=method,
             force=force,
             rules=rules,
+            audience=audience,
             llm=llm,
             classification_config=config.classification,
             counts=counts,
@@ -307,6 +310,7 @@ def _process_file(
     method: str,
     force: bool,
     rules: RuleClassifier,
+    audience: AudienceClassifier,
     llm: LLMClassifier | None,
     classification_config: ClassificationConfig,
     counts: _RunCounts,
@@ -321,6 +325,9 @@ def _process_file(
         method: ``"rules"`` or ``"llm"``.
         force: Whether to overwrite previously-classified fragments.
         rules: Shared :class:`RuleClassifier` instance.
+        audience: Shared :class:`AudienceClassifier`; stamps the #634
+            audience axis on every (re)classified fragment, deterministically,
+            regardless of method.
         llm: Shared :class:`LLMClassifier` (when ``method == "llm"``).
         classification_config: Full FEAT-023-aware classification config.
             Drives both the LLM-vs-rules threshold and the
@@ -363,6 +370,11 @@ def _process_file(
         confidence_threshold=classification_config.confidence_threshold,
         weighted_classification=classification_config.weighted_classification,
     )
+
+    # Stamp the #634 audience axis on every (re)classified fragment. It is a
+    # deterministic heuristic independent of the frequency/phase method above,
+    # so it runs on both the rules and LLM paths and stays idempotent.
+    new_fragment = audience.classify_and_enforce(new_fragment, body)
 
     # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
     # True we run the orchestrator on the root fragment and persist any

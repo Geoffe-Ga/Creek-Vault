@@ -113,12 +113,14 @@ def _audience_factor(
 ) -> float:
     """Return the audience-authority multiplier for a fragment's frontmatter.
 
-    Combines the reliable ``source.platform`` signal (audience-facing essays
-    outrank private journals/DMs/chats) with the per-``privacy_tier`` and
-    per-``representativeness`` factors, scoping the voice fingerprint to how the
-    user writes *for an audience* (#633). Returns ``1.0`` (no scoping) when
-    *weighting* is absent or disabled, so the historical flat-average path is
-    preserved. Missing values fall back to ``1.0`` so a new enum member never
+    The primary signal is the persisted ``audience`` axis from the #634
+    classifier (``audience-facing`` dominates, ``private`` is down-weighted,
+    ``mixed`` is neutral). It is layered on top of the #633 existing-signal
+    heuristic — ``source.platform``, ``privacy_tier`` and ``representativeness``
+    — which still carries an unclassified vault (every fragment ``mixed`` →
+    ``1.0``) until the audience classifier has run. Returns ``1.0`` (no scoping)
+    when *weighting* is absent or disabled, so the historical flat-average path
+    is preserved. Missing values fall back to ``1.0`` so a new enum member never
     silently zeroes a fragment.
 
     Args:
@@ -132,6 +134,10 @@ def _audience_factor(
     """
     if weighting is None or not weighting.enabled:
         return 1.0
+    audience = weighting.audience_authority.get(
+        str(metadata.get("audience", "mixed")),
+        1.0,
+    )
     privacy = weighting.privacy_tier_authority.get(
         str(metadata.get("privacy_tier", "unclassified")),
         1.0,
@@ -141,7 +147,7 @@ def _audience_factor(
         1.0,
     )
     platform_authority = weighting.platform_authority.get(platform, 1.0)
-    return privacy * representativeness * platform_authority
+    return audience * privacy * representativeness * platform_authority
 
 
 def _eligible_texts(
