@@ -1162,6 +1162,25 @@ def _default_representativeness_authority() -> dict[str, float]:
     return {"self": 1.0, "endorsed": 0.9, "aspirational": 0.6, "reference": 0.3}
 
 
+def _default_platform_authority() -> dict[str, float]:
+    """Default per-``source.platform`` voice-authority multipliers (#633).
+
+    Audience-facing platforms (essays, Substack posts) outrank private ones
+    (journals, DMs, chats) so the voice fingerprint is built primarily from how
+    the user writes *for an audience* rather than their texting average. Missing
+    platforms fall back to ``1.0`` so a new platform never silently zeroes out.
+    """
+    return {
+        "essay": 2.0,
+        "substack": 2.0,
+        "journal": 0.1,
+        "messages": 0.4,
+        "discord": 0.4,
+        "chatgpt": 0.3,
+        "claude": 0.3,
+    }
+
+
 class VoiceAudienceWeightingConfig(BaseModel):
     """Graduated audience-authority weighting for the voice proxy.
 
@@ -1184,6 +1203,16 @@ class VoiceAudienceWeightingConfig(BaseModel):
         default_factory=_default_representativeness_authority,
     )
     """Multiplier per ``representativeness`` value (missing default to 1.0)."""
+
+    platform_authority: dict[str, float] = Field(
+        default_factory=_default_platform_authority,
+    )
+    """Multiplier per ``source.platform`` (missing platforms default to 1.0).
+
+    The reliable audience signal: audience-facing platforms (essay, substack)
+    outweigh private ones (journal, DMs, chat). Used to scope the voice
+    fingerprint to audience-facing documents (#633) on top of the
+    privacy/representativeness factors."""
 
 
 class CreekConfig(BaseSettings):
