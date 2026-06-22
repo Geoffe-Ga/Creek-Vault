@@ -18,7 +18,7 @@ from creek.generate.ai_style.distance import (
     voice_distance,
 )
 from creek.generate.ai_style.model import Finding, ScanReport, Span
-from creek.generate.ai_style.tells import get_tells
+from creek.generate.ai_style.tells import effective_polarity, get_tells
 
 if TYPE_CHECKING:
     from creek.config import AIStyleConfig
@@ -125,6 +125,61 @@ def _findings_for(
     ]
 
 
+def _score_tell(
+    tell: Tell,
+    text: str,
+    *,
+    fingerprint: VoiceFingerprint,
+    config: AIStyleConfig,
+) -> tuple[float, FeatureContribution, list[Finding]]:
+    """Score one tell against the draft, deriving per-user polarity (#635).
+
+    Args:
+        tell: The tell to score.
+        text: The draft text.
+        fingerprint: The user's voice fingerprint.
+        config: The AI-style configuration.
+
+    Returns:
+        ``(delta, contribution, findings)`` — the raw draft-minus-user delta
+        (for the report's ``deltas``), this feature's distance contribution,
+        and any findings the tell fired (empty when inert or within margin).
+    """
+    draft_rate = tell.measure(text)
+    user_rate = _resolve_user_rate(tell, fingerprint)
+    delta = draft_rate - user_rate
+    threshold = (
+        config.signature_polarity_threshold
+        if tell.signature_threshold is None
+        else tell.signature_threshold
+    )
+    polarity = effective_polarity(tell, user_rate, signature_threshold=threshold)
+    # ``None`` => the tell is inert for this user (a signature feature they do
+    # not employ): zero contribution, no finding — never fires spuriously.
+    magnitude = (
+        0.0
+        if polarity is None
+        else bad_direction_magnitude(polarity, draft_rate, user_rate)
+    )
+    contribution = FeatureContribution(
+        feature_key=tell.feature_key,
+        weight=config.weight_for(category=tell.category, feature_key=tell.feature_key),
+        magnitude=magnitude,
+    )
+    margin = config.default_margin if tell.margin is None else tell.margin
+    findings: list[Finding] = []
+    if polarity is not None and magnitude > margin:
+        direction: Direction = "over" if polarity == "avoid" else "under"
+        findings = _findings_for(
+            tell,
+            text,
+            draft_rate=draft_rate,
+            user_rate=user_rate,
+            direction=direction,
+        )
+    return delta, contribution, findings
+
+
 def scan(
     text: str,
     *,
@@ -166,37 +221,17 @@ def scan(
     for tell in get_tells(config.enabled_categories):
         if not tell.applies_in(context):
             continue
-        draft_rate = tell.measure(text)
-        user_rate = _resolve_user_rate(tell, fingerprint)
-        deltas[tell.feature_key] = draft_rate - user_rate
-        magnitude = bad_direction_magnitude(
-            tell.polarity,
-            draft_rate,
-            user_rate,
+        # Per-user polarity derivation (#635) lives in the helper to keep this
+        # loop — and scan()'s complexity — flat.
+        delta, contribution, tell_findings = _score_tell(
+            tell,
+            text,
+            fingerprint=fingerprint,
+            config=config,
         )
-        weight = config.weight_for(
-            category=tell.category,
-            feature_key=tell.feature_key,
-        )
-        contributions.append(
-            FeatureContribution(
-                feature_key=tell.feature_key,
-                weight=weight,
-                magnitude=magnitude,
-            ),
-        )
-        margin = config.default_margin if tell.margin is None else tell.margin
-        if magnitude > margin:
-            direction: Direction = "over" if tell.polarity == "avoid" else "under"
-            findings.extend(
-                _findings_for(
-                    tell,
-                    text,
-                    draft_rate=draft_rate,
-                    user_rate=user_rate,
-                    direction=direction,
-                ),
-            )
+        deltas[tell.feature_key] = delta
+        contributions.append(contribution)
+        findings.extend(tell_findings)
 
     distance = voice_distance(contributions, softening=softening)
     return ScanReport(
