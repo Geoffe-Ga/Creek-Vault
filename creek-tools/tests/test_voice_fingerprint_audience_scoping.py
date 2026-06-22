@@ -49,9 +49,17 @@ def _write_fragment(
     )
 
 
-def _em_dash_rate(vault: Path, **kwargs: object) -> float:
+def _em_dash_rate(
+    vault: Path,
+    *,
+    audience_weighting: VoiceAudienceWeightingConfig | None = None,
+) -> float:
     """Build a fingerprint and return its em_dash_density rate (0.0 if absent)."""
-    fp = build_fingerprint(vault, AIStyleConfig(), **kwargs)  # type: ignore[arg-type]
+    fp = build_fingerprint(
+        vault,
+        AIStyleConfig(),
+        audience_weighting=audience_weighting,
+    )
     stat = fp.features.get("em_dash_density")
     return stat.rate if stat is not None else 0.0
 
