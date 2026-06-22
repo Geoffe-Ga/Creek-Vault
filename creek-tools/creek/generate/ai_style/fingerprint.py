@@ -28,7 +28,7 @@ from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from creek.config import AIStyleConfig
+    from creek.config import AIStyleConfig, VoiceAudienceWeightingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -106,22 +106,65 @@ def _user_text(platform: str, body: str) -> str | None:
     return body.strip() or None
 
 
+def _audience_factor(
+    metadata: dict[str, object],
+    platform: str,
+    weighting: VoiceAudienceWeightingConfig | None,
+) -> float:
+    """Return the audience-authority multiplier for a fragment's frontmatter.
+
+    Combines the reliable ``source.platform`` signal (audience-facing essays
+    outrank private journals/DMs/chats) with the per-``privacy_tier`` and
+    per-``representativeness`` factors, scoping the voice fingerprint to how the
+    user writes *for an audience* (#633). Returns ``1.0`` (no scoping) when
+    *weighting* is absent or disabled, so the historical flat-average path is
+    preserved. Missing values fall back to ``1.0`` so a new enum member never
+    silently zeroes a fragment.
+
+    Args:
+        metadata: The fragment's frontmatter mapping.
+        platform: The fragment's ``source.platform``.
+        weighting: The audience-weighting config, or ``None`` to disable scoping.
+
+    Returns:
+        A non-negative multiplier applied on top of the platform authorship
+        weight.
+    """
+    if weighting is None or not weighting.enabled:
+        return 1.0
+    privacy = weighting.privacy_tier_authority.get(
+        str(metadata.get("privacy_tier", "unclassified")),
+        1.0,
+    )
+    representativeness = weighting.representativeness_authority.get(
+        str(metadata.get("representativeness", "self")),
+        1.0,
+    )
+    platform_authority = weighting.platform_authority.get(platform, 1.0)
+    return privacy * representativeness * platform_authority
+
+
 def _eligible_texts(
     vault_path: Path,
     config: AIStyleConfig,
     *,
     include_intimate: bool,
+    audience_weighting: VoiceAudienceWeightingConfig | None = None,
 ) -> list[tuple[float, str]]:
     """Collect ``(weight, user_text)`` pairs for self-authored fragments.
 
     Applies the authorship filter (self-authored only; conversation
     user-turn only) and the privacy policy (intimate excluded unless
-    *include_intimate*).
+    *include_intimate*). When *audience_weighting* is supplied, each fragment's
+    weight is additionally multiplied by its audience-authority factor so
+    audience-facing documents dominate the fingerprint (#633).
 
     Args:
         vault_path: Vault root.
         config: AI-style configuration (authorship weights).
         include_intimate: When ``True``, intimate-tier fragments are kept.
+        audience_weighting: When supplied and enabled, scope the fingerprint to
+            audience-facing documents; ``None`` keeps the flat-average path.
 
     Returns:
         One ``(weight, text)`` pair per eligible fragment.
@@ -149,6 +192,7 @@ def _eligible_texts(
             platform,
             config.authorship_default_weight,
         )
+        weight *= _audience_factor(post.metadata, platform, audience_weighting)
         if weight > 0.0:
             out.append((weight, text))
     return out
@@ -159,23 +203,34 @@ def build_fingerprint(
     config: AIStyleConfig,
     *,
     include_intimate: bool = False,
+    audience_weighting: VoiceAudienceWeightingConfig | None = None,
 ) -> VoiceFingerprint:
     """Build a :class:`VoiceFingerprint` from the user's own vault writing.
 
     Each feature in :data:`FINGERPRINT_FEATURES` is measured per eligible
-    fragment and combined into a platform-weighted mean — so journals and
-    posts shape the baseline more than the noisier conversation user-turns.
+    fragment and combined into a weighted mean. When *audience_weighting* is
+    supplied, audience-facing documents (essays, Substack) dominate over private
+    journals/DMs/chats, so the fingerprint encodes the user's audience-facing
+    voice rather than their texting average (#633). Omitting it preserves the
+    historical platform-only weighting.
 
     Args:
         vault_path: Vault root.
         config: AI-style configuration.
         include_intimate: When ``True``, include intimate-tier fragments.
+        audience_weighting: When supplied and enabled, scope the fingerprint to
+            audience-facing documents; ``None`` keeps the flat-average path.
 
     Returns:
         A fingerprint whose ``fragment_count`` is the number of eligible
         fragments; empty when none qualify.
     """
-    texts = _eligible_texts(vault_path, config, include_intimate=include_intimate)
+    texts = _eligible_texts(
+        vault_path,
+        config,
+        include_intimate=include_intimate,
+        audience_weighting=audience_weighting,
+    )
     if not texts:
         return VoiceFingerprint(features={}, fragment_count=0)
 

@@ -1473,8 +1473,13 @@ def _report_fingerprint(vault_path: Path) -> None:
         save_fingerprint,
     )
 
-    config = load_config().ai_style
-    fingerprint = build_fingerprint(vault_path, config)
+    full_config = load_config()
+    config = full_config.ai_style
+    fingerprint = build_fingerprint(
+        vault_path,
+        config,
+        audience_weighting=full_config.voice_audience_weighting,
+    )
     if fingerprint.fragment_count == 0:
         console.print(
             "[yellow]No voice fingerprint built: no self-authored "
