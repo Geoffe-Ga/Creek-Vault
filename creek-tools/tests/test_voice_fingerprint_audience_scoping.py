@@ -34,15 +34,18 @@ def _write_fragment(
     body: str,
     privacy_tier: str = "unclassified",
     representativeness: str = "self",
+    audience: str | None = None,
 ) -> None:
     """Write a minimal self-authored fragment markdown file into *vault*."""
     frag_dir = vault / "01-Fragments"
     frag_dir.mkdir(parents=True, exist_ok=True)
-    meta = {
+    meta: dict[str, object] = {
         "source": {"author": "self", "platform": platform},
         "privacy_tier": privacy_tier,
         "representativeness": representativeness,
     }
+    if audience is not None:
+        meta["audience"] = audience
     (frag_dir / name).write_text(
         "---\n" + yaml.safe_dump(meta, sort_keys=True) + "---\n\n" + body,
         encoding="utf-8",
@@ -107,3 +110,43 @@ def test_platform_authority_default_prefers_audience_facing() -> None:
     essay = weighting.platform_authority.get("essay", 1.0)
     journal = weighting.platform_authority.get("journal", 1.0)
     assert essay > journal
+
+
+def test_persisted_audience_axis_drives_scoping(tmp_path: Path) -> None:
+    """The #634 ``audience`` axis up-weights audience-facing over private.
+
+    Both fragments share a platform/privacy/representativeness so only the
+    classified ``audience`` axis differs — proving the fingerprint consumes the
+    real axis, not just the #633 platform heuristic.
+    """
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault,
+        "facing.md",
+        platform="markdown",
+        body=_ESSAY_BODY,
+        audience="audience-facing",
+    )
+    _write_fragment(
+        vault,
+        "private.md",
+        platform="markdown",
+        body=_JOURNAL_BODY,
+        audience="private",
+    )
+
+    scoped = _em_dash_rate(vault, audience_weighting=VoiceAudienceWeightingConfig())
+    unscoped = _em_dash_rate(vault)
+
+    # The audience-facing (em-dash-bearing) fragment dominates once the axis is
+    # consumed, lifting the rate above the flat average of the two.
+    assert scoped > unscoped > 0.0
+
+
+def test_audience_authority_default_prefers_audience_facing() -> None:
+    """The default audience-authority ranks audience-facing above private."""
+    weighting = VoiceAudienceWeightingConfig()
+    facing = weighting.audience_authority.get("audience-facing", 1.0)
+    private = weighting.audience_authority.get("private", 1.0)
+    mixed = weighting.audience_authority.get("mixed", 1.0)
+    assert facing > mixed > private

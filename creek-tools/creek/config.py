@@ -1181,6 +1181,19 @@ def _default_platform_authority() -> dict[str, float]:
     }
 
 
+def _default_audience_authority() -> dict[str, float]:
+    """Default per-``audience``-axis voice-authority multipliers (#634).
+
+    The primary audience signal once the FEAT/#634 audience classifier has
+    run: a fragment explicitly classified ``audience-facing`` dominates the
+    voice fingerprint, ``private`` material is strongly down-weighted, and
+    ``mixed`` (the unclassified default and the ambiguous verdict) is neutral
+    at ``1.0`` so legacy vaults keep relying on the platform heuristic until
+    they are re-classified. Missing values fall back to ``1.0``.
+    """
+    return {"audience-facing": 2.0, "private": 0.1, "mixed": 1.0}
+
+
 class VoiceAudienceWeightingConfig(BaseModel):
     """Graduated audience-authority weighting for the voice proxy.
 
@@ -1213,6 +1226,18 @@ class VoiceAudienceWeightingConfig(BaseModel):
     outweigh private ones (journal, DMs, chat). Used to scope the voice
     fingerprint to audience-facing documents (#633) on top of the
     privacy/representativeness factors."""
+
+    audience_authority: dict[str, float] = Field(
+        default_factory=_default_audience_authority,
+    )
+    """Multiplier per persisted ``audience`` axis (missing default to 1.0).
+
+    The primary audience signal once the #634 classifier has tagged fragments:
+    ``audience-facing`` content dominates the fingerprint, ``private`` is
+    down-weighted, ``mixed`` stays neutral. Layered on top of the #633
+    platform/privacy/representativeness factors so an unclassified vault
+    (every fragment ``mixed`` → 1.0) still falls back to the platform
+    heuristic, while a classified vault is scoped by the real axis."""
 
 
 class CreekConfig(BaseSettings):
