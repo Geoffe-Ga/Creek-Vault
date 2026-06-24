@@ -158,6 +158,89 @@ class LLMConfig(BaseModel):
         return value
 
 
+_LLM_SCALAR_STAGES = ("default", "classification", "generation", "frontend")
+"""Stages that resolve to a single :class:`LLMConfig` (``writing_desk`` is a
+role *map*, handled separately by the router in #648)."""
+
+
+class LLMRoutingConfig(BaseModel):
+    """Per-stage LLM routing (#642), backward-compatible with a flat block.
+
+    A vault's ``llm:`` block is accepted in two shapes:
+
+    * **legacy flat** — ``{provider, model, …}`` (an :class:`LLMConfig`) is
+      promoted to ``default`` so every stage resolves to it (pre-#642
+      behaviour, and the shape an env override ``CREEK_LLM='{"provider":…}'``
+      produces);
+    * **per-stage map** — ``{default, classification, generation, frontend,
+      writing_desk}``.
+
+    Unset scalar stages fall back to :attr:`default`; :attr:`default` itself
+    falls back to a plain :class:`LLMConfig` (local Ollama). The per-stage
+    *resolution* and the ``Intimate``-never-cloud rule live in
+    :class:`~creek.classify.llm.router.ModelRouter`, not here — this model only
+    holds and normalises the config.
+    """
+
+    default: LLMConfig = Field(default_factory=LLMConfig)
+    """The fallback config for any stage without its own entry."""
+
+    classification: LLMConfig | None = None
+    """Override for the classification stage; ``None`` falls back to default."""
+
+    generation: LLMConfig | None = None
+    """Override for the generation stage; ``None`` falls back to default."""
+
+    frontend: LLMConfig | None = None
+    """Reserved for the OpenClaw frontend (schema-only until it lands, #642)."""
+
+    writing_desk: dict[str, LLMConfig] = Field(default_factory=dict)
+    """Writing Desk role -> model map (resolved by the router in #648)."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_flat(cls, data: object) -> object:
+        """Promote a legacy flat ``LLMConfig`` (or its mapping) to ``default``.
+
+        A bare :class:`LLMConfig` instance — e.g.
+        ``CreekConfig(llm=LLMConfig(...))`` — or a flat mapping carrying any
+        :class:`LLMConfig` field with no per-stage key is the old single-block
+        shape; wrap it as ``{"default": <it>}`` so it keeps working unchanged.
+
+        Args:
+            data: The raw input to validation (mapping, ``LLMConfig``, or other).
+
+        Returns:
+            ``data`` unchanged, or ``{"default": data}`` when it is a legacy
+            flat block.
+        """
+        if isinstance(data, LLMConfig):
+            return {"default": data}
+        if not isinstance(data, dict):
+            return data
+        stage_keys = {*_LLM_SCALAR_STAGES, "writing_desk"}
+        legacy_keys = set(LLMConfig.model_fields)
+        keys = set(data)
+        if keys & legacy_keys and not (keys & stage_keys):
+            return {"default": data}
+        return data
+
+    def for_stage(self, stage: str) -> LLMConfig:
+        """Return the :class:`LLMConfig` for *stage*, falling back to default.
+
+        Args:
+            stage: A scalar stage name (``default`` / ``classification`` /
+                ``generation`` / ``frontend``). Any other value (including a
+                role name or a typo) safely resolves to :attr:`default`.
+
+        Returns:
+            The stage's configured :class:`LLMConfig`, or :attr:`default`.
+        """
+        if stage in _LLM_SCALAR_STAGES:
+            return getattr(self, stage) or self.default
+        return self.default
+
+
 class EmbeddingsConfig(BaseModel):
     """Embedding model configuration.
 
