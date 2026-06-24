@@ -98,6 +98,30 @@ class ModelRouter:
         """
         return self._enforce_local_for_intimate(self.routing.for_stage(stage), tier)
 
+    def resolve_role(self, role: str, tier: PrivacyTier | None = None) -> LLMConfig:
+        """Return the :class:`LLMConfig` for a Writing Desk *role* (#648).
+
+        Resolution falls back: the ``writing_desk`` role entry → the
+        ``generation`` stage → the routing ``default``. The same
+        ``Intimate``-never-cloud gate as :meth:`resolve` is applied, so every
+        subagent role inherits the privacy guarantee with no extra tier check.
+
+        Args:
+            role: The subagent role (e.g. ``outliner`` / ``voice_drafter``).
+            tier: The fragment's privacy tier (see :meth:`resolve`).
+
+        Returns:
+            The resolved config for *role*.
+
+        Raises:
+            IntimateRoutingError: When *tier* is ``Intimate``, the role is
+                cloud, and no local ``default`` exists to redirect to.
+        """
+        cfg = self.routing.writing_desk.get(role) or self.routing.for_stage(
+            "generation",
+        )
+        return self._enforce_local_for_intimate(cfg, tier)
+
     def provider_for(
         self,
         stage: str,
