@@ -14,7 +14,13 @@ from creek.classify.llm.providers import Completion, build_provider
 
 if TYPE_CHECKING:
     from creek.classify.llm.base import LLMProvider
+    from creek.classify.llm.router import ModelRouter
     from creek.config import AuthorConfig, LLMConfig
+    from creek.models import PrivacyTier
+
+_VOICE_ROLES = frozenset({"voice_drafter", "voice_line_editor"})
+"""Writing Desk roles whose model the legacy ``AuthorConfig.voice_model``
+field falls back to (#474) when the role has no ``writing_desk`` entry (#649)."""
 
 
 def resolve_voice_model(author: AuthorConfig, llm: LLMConfig) -> str | None:
@@ -77,6 +83,56 @@ class AuthorLLMClient:
             config if model is None else config.model_copy(update={"model": model})
         )
         return cls(build_provider(effective))
+
+    @classmethod
+    def for_role(
+        cls,
+        router: ModelRouter,
+        role: str,
+        *,
+        author: AuthorConfig | None = None,
+        tier: PrivacyTier | None = None,
+    ) -> AuthorLLMClient:
+        """Build a client for a Writing Desk *role* via the router (#649).
+
+        Resolves the role's provider+model through
+        :meth:`~creek.classify.llm.router.ModelRouter.resolve_role` — so the
+        role inherits the per-stage routing **and** the ``Intimate``-never-cloud
+        chokepoint. Precedence for the voice roles (decision #2): an explicit
+        ``writing_desk`` entry wins; otherwise the legacy
+        :attr:`AuthorConfig.voice_model` fills the model id; otherwise the
+        generation/default model stands. Non-voice roles have no legacy field.
+
+        Args:
+            router: The run's :class:`ModelRouter`.
+            role: The subagent role (e.g. ``outliner`` / ``voice_drafter``).
+            author: Author-subsystem config carrying the legacy per-agent model
+                overrides; ``None`` skips the legacy fallback.
+            tier: The fragment's privacy tier (gated by the chokepoint).
+
+        Returns:
+            An :class:`AuthorLLMClient` wrapping the role's resolved provider.
+
+        Raises:
+            IntimateRoutingError: Propagated from ``resolve_role`` when an
+                ``Intimate`` role is cloud with no local fallback.
+        """
+        cfg = router.resolve_role(role, tier)
+        # If the Intimate gate redirected this role to a different (local)
+        # provider, the legacy cloud ``voice_model`` id must NOT override the
+        # local model — that would build an incoherent provider+model pair and
+        # muddy the privacy redirect. Only apply voice_model when no redirect
+        # happened (provider unchanged vs the ungated resolution).
+        redirected = cfg.provider != router.resolve_role(role).provider
+        if (
+            not redirected
+            and author is not None
+            and role in _VOICE_ROLES
+            and role not in router.routing.writing_desk
+            and author.voice_model is not None
+        ):
+            cfg = cfg.model_copy(update={"model": author.voice_model})
+        return cls(build_provider(cfg))
 
     def complete(self, prompt: str, *, max_tokens: int | None = None) -> str:
         """Return the completion text for *prompt*.
