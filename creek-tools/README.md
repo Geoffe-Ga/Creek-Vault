@@ -199,11 +199,12 @@ llm:
   generation:     { provider: anthropic, model: claude-sonnet-4-6 }
   frontend:       { provider: ollama,    model: qwen3:14b }      # reserved (OpenClaw); no consumer yet
   writing_desk:                                                  # FEAT-041 subagent roles
-    outliner:       { provider: ollama,    model: qwen3:8b }
-    voice_drafter:  { provider: anthropic, model: claude-sonnet-4-6 }
+    outliner:          { provider: ollama,    model: qwen3:8b }
+    voice_drafter:     { provider: anthropic, model: claude-sonnet-4-6 }
+    voice_line_editor: { provider: anthropic, model: claude-sonnet-4-6 }  # the 2nd voice role
 ```
 
-Resolution is centralised in `ModelRouter` (`creek/classify/llm/router.py`): a stage resolves to its own config or the `default`; a Writing Desk role resolves role → `generation` → `default`. Keys remain environment-only — never put an API key in any stage.
+Stage and role routing is centralised in `ModelRouter` (`creek/classify/llm/router.py`): a stage resolves to its own config or the `default`; a Writing Desk role resolves role → `generation` → `default`. The voice-role `voice_model` model-id override (below) is applied separately by `AuthorLLMClient.for_role()` (`creek/author/client.py`). Keys remain environment-only — never put an API key in any stage.
 
 **Intimate-tier fragments never reach a cloud provider.** This is enforced at the single `ModelRouter` chokepoint: when an `Intimate` fragment would route to a cloud provider, it is **redirected to the local `default`** (with a `WARNING` for the audit trail); if even `default` is a cloud provider, the run **fails loudly** with `IntimateRoutingError` rather than egressing intimate content. The cloud-consent preflight likewise checks **every** stage, so a cloud provider configured for any stage requires `CREEK_CLOUD_CONSENT=1`.
 
