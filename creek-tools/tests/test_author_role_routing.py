@@ -118,6 +118,37 @@ class TestForRoleInheritsIntimateGate:
         AuthorLLMClient.for_role(_router(), "voice_drafter", tier=PrivacyTier.INTIMATE)
         assert captured_config["cfg"].provider == "ollama"  # redirected from openai
 
+    def test_intimate_redirect_does_not_keep_cloud_voice_model(
+        self,
+        captured_config: dict[str, LLMConfig],
+    ) -> None:
+        """A redirected voice role must not carry a cloud voice_model id.
+
+        Regression: the voice_model override used to apply AFTER the Intimate
+        gate, yielding an incoherent provider=ollama + model=<cloud id>. The
+        redirect must win — local provider AND local model.
+        """
+        router = ModelRouter(
+            LLMRoutingConfig.model_validate(
+                {
+                    "default": {"provider": "ollama", "model": "qwen3:8b"},
+                    "generation": {
+                        "provider": "anthropic",
+                        "model": "claude-sonnet-4-6",
+                    },
+                },
+            ),
+        )
+        author = AuthorConfig(voice_model="claude-opus-4-8")
+        AuthorLLMClient.for_role(
+            router,
+            "voice_line_editor",
+            author=author,
+            tier=PrivacyTier.INTIMATE,
+        )
+        assert captured_config["cfg"].provider == "ollama"
+        assert captured_config["cfg"].model == "qwen3:8b"  # NOT the cloud voice_model
+
     def test_intimate_role_raises_without_local_default(self) -> None:
         """No local fallback → fail loudly (no client built)."""
         router = ModelRouter(

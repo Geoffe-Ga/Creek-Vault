@@ -118,8 +118,15 @@ class AuthorLLMClient:
                 ``Intimate`` role is cloud with no local fallback.
         """
         cfg = router.resolve_role(role, tier)
+        # If the Intimate gate redirected this role to a different (local)
+        # provider, the legacy cloud ``voice_model`` id must NOT override the
+        # local model — that would build an incoherent provider+model pair and
+        # muddy the privacy redirect. Only apply voice_model when no redirect
+        # happened (provider unchanged vs the ungated resolution).
+        redirected = cfg.provider != router.resolve_role(role).provider
         if (
-            author is not None
+            not redirected
+            and author is not None
             and role in _VOICE_ROLES
             and role not in router.routing.writing_desk
             and author.voice_model is not None
