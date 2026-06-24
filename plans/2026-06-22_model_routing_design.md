@@ -235,11 +235,17 @@ config breaks. (Confirm precedence in #648 — flagged in §6.)
 - The two hard-wired Anthropic sites (`compile/engine.py:523`, `cli.py:4096`)
   move onto `router.resolve("generation", tier)` so they stop ignoring config.
 
-**Env-var override caveat (breaking-surface to handle).** Today
-`CREEK_LLM__PROVIDER` overrides `config.llm.provider`. Under the nested shape the
-canonical path becomes `CREEK_LLM__DEFAULT__PROVIDER`. The `_accept_legacy_flat`
-validator covers YAML but **pydantic-settings env nesting is resolved before the
-model validator**, so `CREEK_LLM__PROVIDER` may not auto-promote. Options in §6.
+**Env-var override (verified — no shim needed).** Contrary to the SPEC's
+"nested via `__`" assumption, `CREEK_LLM__PROVIDER` does **not** work today:
+`CreekConfig.model_config` (`config.py:1226`) sets `env_prefix="CREEK_"` but **no
+`env_nested_delimiter`**, so `CREEK_LLM__PROVIDER` is silently ignored (verified:
+it leaves `llm.provider` at the `ollama` default). The only working env override
+for the block is the **JSON-string form** `CREEK_LLM='{"provider":"anthropic"}'`.
+That JSON is parsed before validation and flows through `_accept_legacy_flat`,
+which promotes the flat mapping to `{default: …}` — so the real back-compat
+surface is preserved by the model validator **with no extra shim**. The new shape
+also works via JSON: `CREEK_LLM='{"default":{"provider":"anthropic"}}'`. A
+regression test pins `CREEK_LLM='{"provider":…}'` → `resolve(stage).provider`.
 
 **Tests (new, ≥90% branch coverage on new code):**
 1. `test_legacy_flat_llm_block_resolves_every_stage` — a flat `llm` config →
@@ -264,12 +270,16 @@ model validator**, so `CREEK_LLM__PROVIDER` may not auto-promote. Options in §6
 
 ## 6. Resolved decisions (maintainer-approved 2026-06-24)
 
-1. **Env-var back-compat — KEEP IT WORKING.** `CREEK_LLM__PROVIDER` (and other
-   top-level `CREEK_LLM__<LLMConfig field>` overrides) must continue to land on
-   `default`. #645 adds a pre-parse shim (a `settings_customise_sources` source
-   or an equivalent env pre-pass) that promotes top-level `CREEK_LLM__*` legacy
-   fields to `CREEK_LLM__DEFAULT__*` before validation. Covered by a regression
-   test.
+1. **Env-var back-compat — NO SHIM (premise corrected).** The approval asked to
+   "keep `CREEK_LLM__PROVIDER` working," but verification (see §5) shows it never
+   worked: no `env_nested_delimiter` is configured, so `CREEK_LLM__PROVIDER` is
+   silently ignored today. The genuine env back-compat surface is the JSON-string
+   form `CREEK_LLM='{"provider":…}'`, which `_accept_legacy_flat` already
+   preserves by promoting it to `default`. **No shim is built** (it would
+   preserve a phantom); #645 instead adds a regression test pinning the JSON-flat
+   env override. The operator's intent — "existing env-based setups keep working"
+   — is honored. (If a future `CREEK_LLM__DEFAULT__PROVIDER` nested override is
+   desired, that is a separate opt-in: set `env_nested_delimiter="__"`.)
 2. **Role vs `voice_model` precedence — ROLE WINS.** When both
    `writing_desk.voice_drafter` and `AuthorConfig.voice_model` are set, the role
    entry wins; `voice_model` is the fallback. No existing config breaks (#648).
