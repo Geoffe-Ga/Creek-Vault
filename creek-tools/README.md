@@ -158,7 +158,7 @@ read the threat model below before doing anything else.
 
 | Section | Class | What it controls |
 |---------|-------|------------------|
-| `llm`            | `LLMConfig`            | Provider (`ollama` / `anthropic` / `openai` / `gemini`), model name, optional `api_base`, batch size, retries. See [LLM providers](#llm-providers). |
+| `llm`            | `LLMRoutingConfig`     | Per-stage provider+model routing (`default` / `classification` / `generation` / `frontend` + a `writing_desk` role map), or a legacy flat `LLMConfig` block. See [LLM providers](#llm-providers). |
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
 | `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
@@ -184,6 +184,32 @@ The cloud LLM backend is selectable via `llm.provider` in `creek_config.yaml`. T
 `CREEK_CLOUD_CONSENT=1` (also accepts `true` / `yes`) acknowledges that fragment content leaves the device; the legacy `CREEK_ANTHROPIC_CONSENT` is still honored as an alias. `llm.api_base` is OpenAI-specific (an OpenAI-compatible gateway); other providers ignore it. Install the matching optional extra (`[openai]` / `[gemini]`) for the cloud SDKs — see [Install](#install).
 
 The architectural decision to keep creek-tools' and CrawDad's provider abstractions decoupled is recorded in [ADR-0003](docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
+
+#### Per-stage model routing
+
+The `llm` block routes **different pipeline stages to different backends in one run**. It accepts two shapes:
+
+- **Legacy flat block** — `{ provider, model, … }` — still valid; it is promoted to the `default` stage, so every stage uses it (pre-routing behaviour, unchanged).
+- **Per-stage map** — a `default` plus optional `classification` / `generation` / `frontend` overrides and a `writing_desk` role map. Unset stages fall back to `default`.
+
+```yaml
+llm:
+  default:        { provider: ollama,    model: qwen3:8b }       # fallback for any unset stage
+  classification: { provider: ollama,    model: qwen3:8b }       # local, Intimate-safe
+  generation:     { provider: anthropic, model: claude-sonnet-4-6 }
+  frontend:       { provider: ollama,    model: qwen3:14b }      # reserved (OpenClaw); no consumer yet
+  writing_desk:                                                  # FEAT-041 subagent roles
+    outliner:       { provider: ollama,    model: qwen3:8b }
+    voice_drafter:  { provider: anthropic, model: claude-sonnet-4-6 }
+```
+
+Resolution is centralised in `ModelRouter` (`creek/classify/llm/router.py`): a stage resolves to its own config or the `default`; a Writing Desk role resolves role → `generation` → `default`. Keys remain environment-only — never put an API key in any stage.
+
+**Intimate-tier fragments never reach a cloud provider.** This is enforced at the single `ModelRouter` chokepoint: when an `Intimate` fragment would route to a cloud provider, it is **redirected to the local `default`** (with a `WARNING` for the audit trail); if even `default` is a cloud provider, the run **fails loudly** with `IntimateRoutingError` rather than egressing intimate content. The cloud-consent preflight likewise checks **every** stage, so a cloud provider configured for any stage requires `CREEK_CLOUD_CONSENT=1`.
+
+For the Writing Desk voice roles (`voice_drafter` / `voice_line_editor`), an explicit `writing_desk` entry wins; otherwise the legacy `author.voice_model` fills the model id; otherwise the `generation` model stands.
+
+**Migration.** No action is required — a flat `llm: { provider, model }` block keeps working as the `default`. To route per-stage, replace it with the map above. Environment override uses the JSON-string form (e.g. `CREEK_LLM='{"generation":{"provider":"anthropic"}}'`); the dotted `CREEK_LLM__PROVIDER` form is not wired (no `env_nested_delimiter`), so a flat `CREEK_LLM='{"provider":"anthropic"}'` is the supported flat override and is promoted to `default`.
 
 **Embeddings are deliberately not provider-swappable.** `llm.provider` selects the *completion* backend only; the resonance/linking path always embeds locally via sentence-transformers (`embeddings.model`), so vault text never leaves the device for linking and the vector index stays stable. The decision and its reopening criteria are recorded in [ADR-0004](docs/architecture/ADR/0004-embeddings-stay-local.md).
 

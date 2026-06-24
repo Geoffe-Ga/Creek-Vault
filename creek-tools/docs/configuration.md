@@ -59,6 +59,8 @@ llm:
 
 When `provider: anthropic`, set `ANTHROPIC_API_KEY` in the environment. Local Ollama models require nothing in the environment beyond the server being running.
 
+The flat block above is the `default` stage. The `llm` block also accepts **per-stage routing** — a `default` plus optional `classification` / `generation` / `frontend` overrides and a `writing_desk` role map — so classification can run locally while generation uses a cloud model, with `Intimate`-tier fragments guaranteed never to reach a cloud provider. The flat block keeps working unchanged. See [Per-stage model routing](../README.md#per-stage-model-routing) for the full shape, the privacy guarantee, and migration notes.
+
 ## `embeddings` — semantic similarity
 
 ```yaml
