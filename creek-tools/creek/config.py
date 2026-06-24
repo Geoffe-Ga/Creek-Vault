@@ -12,12 +12,15 @@ file — they must come from environment variables.
 import logging
 import os
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from creek.classify.llm.router import ModelRouter
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +242,23 @@ class LLMRoutingConfig(BaseModel):
         if stage in _LLM_SCALAR_STAGES:
             return getattr(self, stage) or self.default
         return self.default
+
+    def all_configs(self) -> list[LLMConfig]:
+        """Return every distinct :class:`LLMConfig` this routing can resolve.
+
+        Used by the cloud-consent preflight so a cloud provider configured for
+        *any* stage (not just ``default``) is caught before the run starts.
+
+        Returns:
+            ``default`` plus each set scalar-stage override and every
+            ``writing_desk`` role config.
+        """
+        configs = [self.default]
+        for stage in _LLM_SCALAR_STAGES:
+            if stage != "default" and (cfg := getattr(self, stage)) is not None:
+                configs.append(cfg)
+        configs.extend(self.writing_desk.values())
+        return configs
 
 
 class EmbeddingsConfig(BaseModel):
@@ -1354,8 +1374,10 @@ class CreekConfig(BaseSettings):
     timezone: str = "America/Los_Angeles"
     """IANA timezone for timestamp normalisation."""
 
-    llm: LLMConfig = Field(default_factory=LLMConfig)
-    """LLM provider settings."""
+    llm: LLMRoutingConfig = Field(default_factory=LLMRoutingConfig)
+    """Per-stage LLM routing (#642). A legacy flat ``llm`` block is promoted to
+    ``default`` by :class:`LLMRoutingConfig`, so existing configs keep working;
+    resolve a stage's provider+model via :attr:`model_router`."""
 
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     """Embedding model settings."""
@@ -1431,6 +1453,18 @@ class CreekConfig(BaseSettings):
             msg = f"Invalid timezone: {v}"
             raise ValueError(msg) from exc
         return v
+
+    @property
+    def model_router(self) -> "ModelRouter":
+        """Return a :class:`~creek.classify.llm.router.ModelRouter` for this run.
+
+        The single resolver every LLM call site uses to map a pipeline stage
+        (and, from #647, a fragment tier) to a provider+model. Imported lazily
+        to avoid a config<->router import cycle.
+        """
+        from creek.classify.llm.router import ModelRouter
+
+        return ModelRouter(self.llm)
 
 
 def load_config(
