@@ -512,16 +512,25 @@ def _resolve_target_path(
 
 
 def default_llm(config: LLMConfig) -> CompileLLM:
-    """Return the default cloud LLM client for the CLI entry point.
+    """Return the generation LLM client for the CLI entry point.
 
-    Tests monkeypatch this hook to inject a deterministic stub. The
-    production path constructs an Anthropic client lazily so the import
-    cost (and the API-key check) stays out of the unit-test surface.
+    Tests monkeypatch this hook to inject a deterministic stub. The production
+    path builds the provider lazily via the factory (#646) so the generation
+    stage honors the configured provider (Anthropic, Ollama, …) rather than
+    being hard-wired to Anthropic; the import cost (and any API-key check) stays
+    out of the unit-test surface.
     """
-    from creek.classify.llm import AnthropicProvider
+    from creek.classify.llm import build_provider
 
-    provider = AnthropicProvider(config)
-    return provider.call
+    provider = build_provider(config)
+
+    def _complete(prompt: str) -> str:
+        # ``complete`` is the provider-neutral protocol method (every provider
+        # implements it); ``.call`` is Anthropic-only, so routing to Ollama/etc.
+        # must go through ``complete`` to stay backend-agnostic (#646).
+        return provider.complete(prompt).text
+
+    return _complete
 
 
 def _load_existing_provenance(target_path: Path) -> list[ProvenanceEntry]:

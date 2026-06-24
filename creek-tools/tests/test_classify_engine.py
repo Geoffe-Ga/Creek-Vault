@@ -952,7 +952,7 @@ def test_run_classify_llm_unavailable_message_names_provider(
         body="content",
     )
     config = CreekConfig()
-    config.llm.provider = "anthropic"
+    config.llm.default.provider = "anthropic"
 
     with (
         patch.object(

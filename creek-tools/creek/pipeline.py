@@ -166,7 +166,9 @@ class Pipeline:
         self.no_llm = no_llm
         self.scanner = RedactionScanner(config=config.redaction)
         self.rule_classifier = RuleClassifier()
-        self.llm_classifier = LLMClassifier(config=config.llm)
+        self.llm_classifier = LLMClassifier(
+            config=config.model_router.resolve("classification"),
+        )
         self.review_generator = ReviewQueueGenerator(config=config.classification)
         self.linking_pipeline = LinkingPipeline(
             config=config.embeddings,

@@ -210,7 +210,10 @@ def run_classify(
 
     rules = RuleClassifier()
     audience = AudienceClassifier()
-    llm = LLMClassifier(config=config.llm) if method == "llm" else None
+    # Per-stage routing (#646): the classifier uses the classification stage's
+    # resolved provider+model, not the global block.
+    classify_llm = config.model_router.resolve("classification")
+    llm = LLMClassifier(config=classify_llm) if method == "llm" else None
     if llm is not None and not llm.available:
         # Refuse to iterate when the provider is unreachable so the
         # vault is never stamped with ``classification_method: llm``
@@ -220,8 +223,8 @@ def run_classify(
         # we capture it here for the operator-facing message so the
         # remediation hint is not buried in stderr.
         raise LLMProviderUnavailableError(
-            provider=config.llm.provider,
-            detail=_describe_llm_unavailability(config.llm.provider),
+            provider=classify_llm.provider,
+            detail=_describe_llm_unavailability(classify_llm.provider),
         )
     counts = _RunCounts()
     progress_path: Path | None = None

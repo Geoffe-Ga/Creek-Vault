@@ -886,16 +886,27 @@ def _preflight_cloud_consent(config: CreekConfig) -> None:
         provider_is_cloud,
     )
 
-    provider = config.llm.provider.strip().lower()
-    if not provider_is_cloud(provider):
+    # Per-stage routing (#646): a cloud provider configured for ANY stage
+    # (not just the global default) requires consent — check them all, and name
+    # the offending stage so the operator looks at the right config key.
+    cloud_stage = next(
+        (
+            (label, cfg.provider.strip().lower())
+            for label, cfg in config.llm.iter_stage_configs()
+            if provider_is_cloud(cfg.provider.strip().lower())
+        ),
+        None,
+    )
+    if cloud_stage is None:
         return
     if has_cloud_consent():
         return
+    stage_label, provider = cloud_stage
     name = provider_display_name(provider)
     console.print(
-        f"[red]{name} provider selected in creek_config.yaml "
-        f"(llm.provider: {provider}), but cloud classification requires "
-        "explicit consent.[/red]",
+        f"[red]{name} provider configured for the '{stage_label}' LLM stage "
+        f"in creek_config.yaml (llm.{stage_label}.provider: {provider}), but "
+        "cloud processing requires explicit consent.[/red]",
     )
     console.print(
         f"[yellow]Set [bold]{CLOUD_CONSENT_ENV}=1[/bold] "
@@ -1142,7 +1153,7 @@ def _run_calibration_cli(
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
-    classifier = LLMClassifier(config=config.llm)
+    classifier = LLMClassifier(config=config.model_router.resolve("classification"))
     report = run_calibration(classifier, load_fixture(resolved))
     console.print(report.render())
 
@@ -1296,7 +1307,7 @@ def compile_(
         target_kind=kind,
         target_id=target_id,
         target_title=target_title,
-        llm=default_llm(config.llm),
+        llm=default_llm(config.model_router.resolve("generation")),
     )
     console.print(
         f"[bold green]Compiled {fragment_id} -> {written}[/bold green]",
@@ -2498,7 +2509,7 @@ def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
     effective_max_tokens = (
         max_tokens if max_tokens is not None else config.draft.max_tokens
     )
-    classifier = LLMClassifier(config.llm)
+    classifier = LLMClassifier(config.model_router.resolve("classification"))
     if not classifier.available:
         console.print(
             "[red]LLM provider unavailable; cannot generate draft. "
@@ -2597,7 +2608,7 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
     config = _load_config_for_vault(vault)
 
     def _detect(prompt: str) -> PromptOntology:
-        return detect_ontology(prompt, config.llm)
+        return detect_ontology(prompt, config.model_router.resolve("classification"))
 
     return _detect
 
@@ -4092,8 +4103,13 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     from creek.classify.llm import AnthropicProvider
     from creek.generate.compost_verifier import LLMCompostVerifier
 
+    # Per-stage routing (#646): resolve the generation stage so the verifier
+    # uses the generation model. The verifier itself is still Anthropic-specific
+    # (it calls the Anthropic-only ``.call``); making it fully provider-neutral
+    # is a follow-up. Feeding the resolved config keeps the credential-fallback
+    # behaviour (AnthropicProvider raises without a key → embedding-only).
     try:
-        provider = AnthropicProvider(config=config.llm)
+        provider = AnthropicProvider(config=config.model_router.resolve("generation"))
     except RuntimeError as exc:
         console.print(
             f"[yellow]Skipping LLM verifier — provider unavailable: {exc}[/yellow]",
