@@ -105,13 +105,23 @@ class TestModelRouter:
         assert router.resolve("generation").provider == "anthropic"
         assert router.resolve("classification").provider == "ollama"
 
-    def test_tier_arg_is_accepted_but_not_yet_enforced(self) -> None:
-        """The tier arg is part of the signature now; enforcement is #647."""
-        router = ModelRouter(LLMConfig(provider="anthropic"))
-        # Skeleton: tier does not yet redirect (the Intimate chokepoint is #647).
-        assert router.resolve("generation", PrivacyTier.INTIMATE).provider == (
-            "anthropic"
+    def test_tier_gates_intimate_off_cloud(self) -> None:
+        """The tier arg now enforces Intimate-never-cloud (#647).
+
+        Full enforcement semantics live in ``test_intimate_routing.py``; this
+        pins that the router's own ``resolve`` honors the tier.
+        """
+        router = ModelRouter(
+            LLMRoutingConfig.model_validate(
+                {
+                    "default": {"provider": "ollama"},
+                    "generation": {"provider": "anthropic"},
+                },
+            ),
         )
+        # Non-intimate keeps the cloud provider; Intimate redirects to local.
+        assert router.resolve("generation").provider == "anthropic"
+        assert router.resolve("generation", PrivacyTier.INTIMATE).provider == "ollama"
 
     def test_resolve_returns_an_llmconfig(self) -> None:
         """The resolved value is an ``LLMConfig`` ready for ``build_provider``."""
