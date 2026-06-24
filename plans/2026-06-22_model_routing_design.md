@@ -1,10 +1,13 @@
 # Per-stage LLM model routing — design (Issue #644)
 
 **SPEC:** `plan/2026-06-22_CREEK_VAULT_MODEL_ROUTING_PLAN.md` · **Epic:** #642 ·
-**Status:** awaiting maintainer approval (gates #645–#650).
+**Status:** approved 2026-06-24 (gates #645–#650).
 
-All paths are relative to `creek-tools/`. Every claim is `file:line`-cited
-against the tree at the time of writing; verify before implementing.
+The SPEC is a separate local planning artifact under `plan/` (untracked staging,
+not committed); this design doc under `plans/` is the committed deliverable.
+All code paths below are relative to `creek-tools/`. Every claim is
+`file:line`-cited against the tree at the time of writing; verify before
+implementing.
 
 ---
 
@@ -48,7 +51,7 @@ predicate the Intimate-never-cloud rule will use.**
 **Tier flow today.** Privacy tier does **not** reach any provider constructor.
 Two upstream gates already exist:
 - Classification: `privacy_filter.py` drops `INTIMATE` fragments *before* the LLM
-  call (`creek/classify/llm/privacy_filter.py:134`: `if tier == PrivacyTier.INTIMATE
+  call (`creek/classify/privacy_filter.py:134`: `if tier == PrivacyTier.INTIMATE
   and not _allows_intimate(override): continue`).
 - Generation/voice: `Fragment.voice_proxy_eligible` (`creek/models.py:821`) is
   `False` for `INTIMATE`, and `generate/voice.py:228` excludes it.
@@ -76,7 +79,7 @@ the type of `CreekConfig.llm`. `LLMConfig` itself is unchanged.
 ```python
 # creek/config.py — new model; LLMConfig (config.py:92) stays as-is.
 
-_STAGE_KEYS = ("default", "classification", "generation", "frontend")
+_LLM_SCALAR_STAGES = ("default", "classification", "generation", "frontend")
 
 class LLMRoutingConfig(BaseModel):
     """Per-stage LLM routing (#642). Backward-compatible with a flat llm block.
@@ -108,15 +111,27 @@ class LLMRoutingConfig(BaseModel):
         """
         if not isinstance(data, dict):
             return data
-        stage_keys = set(_STAGE_KEYS) | {"writing_desk"}
+        stage_keys = set(_LLM_SCALAR_STAGES) | {"writing_desk"}
         legacy_keys = set(LLMConfig.model_fields)
         if data.keys() & legacy_keys and not (data.keys() & stage_keys):
             return {"default": data}
+        # Edge case: a block mixing legacy AND stage keys (an operator mistake)
+        # passes through as the per-stage shape — the stray legacy keys are
+        # dropped by LLMConfig validation. Documented, not silently "fixed".
         return data
 
     def for_stage(self, stage: str) -> LLMConfig:
-        """Resolve a stage to its LLMConfig, falling back to `default`."""
-        return getattr(self, stage, None) or self.default
+        """Resolve a SCALAR stage to its LLMConfig, falling back to `default`.
+
+        Only the scalar stages are valid here; `writing_desk` is a
+        `dict[str, LLMConfig]` (handled by `resolve_role`), and any other value
+        — a role name, a typo — safely falls through to `default`. Enumerating
+        the allowlist keeps the `-> LLMConfig` return type honest (a bare
+        `getattr(self, stage)` would return the `writing_desk` dict).
+        """
+        if stage in _LLM_SCALAR_STAGES:   # ("default","classification","generation","frontend")
+            return getattr(self, stage) or self.default
+        return self.default
 ```
 
 `CreekConfig.llm` changes type only:
@@ -184,7 +199,9 @@ class ModelRouter:
             return local
         return cfg
 
-    def provider_for(self, stage: str, tier: PrivacyTier | None = None):
+    def provider_for(
+        self, stage: str, tier: PrivacyTier | None = None
+    ) -> LLMProvider:
         return build_provider(self.resolve(stage, tier))
 ```
 
@@ -192,8 +209,14 @@ Enforcement semantics (SPEC §3, Requirements): when an `INTIMATE` fragment hits
 stage configured for a cloud provider, the router **redirects to the local
 default**; if even the default is cloud, it **raises loudly** (`IntimateRoutingError`)
 rather than silently egressing. The decision uses the existing
-`provider_is_cloud` (`providers.py:1143`) — no new cloud/local list. This is the
-*single* place tier influences provider choice; call sites never re-check tier.
+`provider_is_cloud` (`providers.py:1143`) — no new cloud/local list.
+`_enforce_local_for_intimate` re-checks `provider_is_cloud` on the fallback
+`default` before returning it, so the redirect can never itself leak.
+**`ModelRouter` is the *only* place `PrivacyTier.INTIMATE` influences provider
+selection.** Call sites must never re-check tier: a second tier gate at a call
+site is a bypass surface (it can disagree with the chokepoint and silently
+egress). Implementers pass the tier *to* `resolve`/`resolve_role` and trust the
+returned config.
 
 ---
 
@@ -237,7 +260,7 @@ config breaks. (Confirm precedence in #648 — flagged in §6.)
 
 **Env-var override (verified — no shim needed).** Contrary to the SPEC's
 "nested via `__`" assumption, `CREEK_LLM__PROVIDER` does **not** work today:
-`CreekConfig.model_config` (`config.py:1226`) sets `env_prefix="CREEK_"` but **no
+`CreekConfig.model_config` (`config.py:1261`) sets `env_prefix="CREEK_"` but **no
 `env_nested_delimiter`**, so `CREEK_LLM__PROVIDER` is silently ignored (verified:
 it leaves `llm.provider` at the `ollama` default). The only working env override
 for the block is the **JSON-string form** `CREEK_LLM='{"provider":"anthropic"}'`.
