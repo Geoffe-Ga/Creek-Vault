@@ -9,15 +9,13 @@ working unchanged.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pytest
+import typer
 
 from creek.classify.llm.providers import OllamaProvider, build_provider
 from creek.classify.llm.router import ModelRouter
 from creek.compile.engine import default_llm
 from creek.config import CreekConfig, LLMConfig
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class TestCreekConfigRouting:
@@ -78,6 +76,42 @@ class TestPreflightEnumeratesStages:
         )
         providers = {cfg.provider for cfg in config.llm.all_configs()}
         assert providers == {"ollama", "anthropic", "openai"}
+
+    def test_preflight_exits_on_cloud_in_nondefault_stage(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cloud provider on a NON-default stage still triggers the gate."""
+        from creek import cli as cli_module
+
+        monkeypatch.delenv("CREEK_CLOUD_CONSENT", raising=False)
+        monkeypatch.delenv("CREEK_ANTHROPIC_CONSENT", raising=False)
+        config = CreekConfig.model_validate(
+            {
+                "llm": {
+                    "default": {"provider": "ollama"},
+                    "classification": {"provider": "anthropic"},
+                },
+            },
+        )
+        with pytest.raises(typer.Exit) as exc:
+            cli_module._preflight_cloud_consent(config)
+        assert exc.value.exit_code == 1
+
+    def test_preflight_noops_when_every_stage_is_local(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """All-local stages never gate, even without consent set."""
+        from creek import cli as cli_module
+
+        monkeypatch.delenv("CREEK_CLOUD_CONSENT", raising=False)
+        monkeypatch.delenv("CREEK_ANTHROPIC_CONSENT", raising=False)
+        config = CreekConfig.model_validate(
+            {"llm": {"default": {"provider": "ollama"}}},
+        )
+        # Must not raise.
+        cli_module._preflight_cloud_consent(config)
 
 
 class TestGenerationFollowsConfig:

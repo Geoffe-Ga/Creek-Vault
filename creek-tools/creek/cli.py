@@ -887,24 +887,26 @@ def _preflight_cloud_consent(config: CreekConfig) -> None:
     )
 
     # Per-stage routing (#646): a cloud provider configured for ANY stage
-    # (not just the global default) requires consent — check them all.
-    provider = next(
+    # (not just the global default) requires consent — check them all, and name
+    # the offending stage so the operator looks at the right config key.
+    cloud_stage = next(
         (
-            cfg.provider.strip().lower()
-            for cfg in config.llm.all_configs()
+            (label, cfg.provider.strip().lower())
+            for label, cfg in config.llm.iter_stage_configs()
             if provider_is_cloud(cfg.provider.strip().lower())
         ),
         None,
     )
-    if provider is None:
+    if cloud_stage is None:
         return
     if has_cloud_consent():
         return
+    stage_label, provider = cloud_stage
     name = provider_display_name(provider)
     console.print(
-        f"[red]{name} provider selected in creek_config.yaml "
-        f"(llm.provider: {provider}), but cloud classification requires "
-        "explicit consent.[/red]",
+        f"[red]{name} provider configured for the '{stage_label}' LLM stage "
+        f"in creek_config.yaml (llm.{stage_label}.provider: {provider}), but "
+        "cloud processing requires explicit consent.[/red]",
     )
     console.print(
         f"[yellow]Set [bold]{CLOUD_CONSENT_ENV}=1[/bold] "

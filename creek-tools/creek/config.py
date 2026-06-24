@@ -11,6 +11,7 @@ file — they must come from environment variables.
 
 import logging
 import os
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
@@ -20,6 +21,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from creek.classify.llm.router import ModelRouter
 
 logger = logging.getLogger(__name__)
@@ -243,6 +246,23 @@ class LLMRoutingConfig(BaseModel):
             return getattr(self, stage) or self.default
         return self.default
 
+    def iter_stage_configs(self) -> "Iterator[tuple[str, LLMConfig]]":
+        """Yield ``(stage_label, LLMConfig)`` for every configured stage.
+
+        ``default`` first, then each set scalar-stage override, then every
+        ``writing_desk`` role (labelled ``writing_desk.<role>``). The label lets
+        callers name the offending stage in messages.
+
+        Yields:
+            ``(label, config)`` pairs across all configured stages.
+        """
+        yield "default", self.default
+        for stage in _LLM_SCALAR_STAGES:
+            if stage != "default" and (cfg := getattr(self, stage)) is not None:
+                yield stage, cfg
+        for role, cfg in self.writing_desk.items():
+            yield f"writing_desk.{role}", cfg
+
     def all_configs(self) -> list[LLMConfig]:
         """Return every distinct :class:`LLMConfig` this routing can resolve.
 
@@ -253,12 +273,7 @@ class LLMRoutingConfig(BaseModel):
             ``default`` plus each set scalar-stage override and every
             ``writing_desk`` role config.
         """
-        configs = [self.default]
-        for stage in _LLM_SCALAR_STAGES:
-            if stage != "default" and (cfg := getattr(self, stage)) is not None:
-                configs.append(cfg)
-        configs.extend(self.writing_desk.values())
-        return configs
+        return [cfg for _, cfg in self.iter_stage_configs()]
 
 
 class EmbeddingsConfig(BaseModel):
@@ -1454,13 +1469,14 @@ class CreekConfig(BaseSettings):
             raise ValueError(msg) from exc
         return v
 
-    @property
+    @cached_property
     def model_router(self) -> "ModelRouter":
         """Return a :class:`~creek.classify.llm.router.ModelRouter` for this run.
 
         The single resolver every LLM call site uses to map a pipeline stage
         (and, from #647, a fragment tier) to a provider+model. Imported lazily
-        to avoid a config<->router import cycle.
+        to avoid a config<->router import cycle, and cached so the several call
+        sites in one command share one router instance.
         """
         from creek.classify.llm.router import ModelRouter
 
