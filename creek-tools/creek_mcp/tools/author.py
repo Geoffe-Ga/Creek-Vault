@@ -13,6 +13,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from creek.author import plan_author, require_supported_medium, run_author
+from creek.author.client import AuthorLLMClient
+from creek.config import load_config
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling
 
@@ -138,8 +140,21 @@ def author_tool(
                 "plan": plan["plan"],
                 "evidence": plan["evidence"],
             }
+        # #658: build the router-resolved voice client so the desk renders live
+        # voicing; ``for_voice_or_none`` returns ``None`` (deterministic stub)
+        # when the provider is unavailable, so the tool never hard-fails on a
+        # missing/unconsented backend.
+        config = load_config()
+        voice_client = AuthorLLMClient.for_voice_or_none(
+            config.model_router,
+            author=config.author,
+        )
         draft = run_author(
-            medium=medium, query=query, vault=vault_path, max_rounds=max_rounds
+            medium=medium,
+            query=query,
+            vault=vault_path,
+            max_rounds=max_rounds,
+            llm_client=voice_client,
         )
     except Exception as exc:
         return _error_response(

@@ -134,6 +134,48 @@ class AuthorLLMClient:
             cfg = cfg.model_copy(update={"model": author.voice_model})
         return cls(build_provider(cfg))
 
+    @classmethod
+    def for_voice_or_none(
+        cls,
+        router: ModelRouter,
+        *,
+        author: AuthorConfig | None = None,
+        tier: PrivacyTier | None = None,
+    ) -> AuthorLLMClient | None:
+        """Build the voice-drafter client, or ``None`` when it is unusable.
+
+        Resolves the ``voice_drafter`` role via :meth:`for_role` (so it inherits
+        per-stage routing and the ``Intimate``-never-cloud gate), then returns it
+        only when its provider is :attr:`available` (key + consent for a cloud
+        provider, a reachable server for Ollama). When unavailable it returns
+        ``None`` so the desk falls back to deterministic rendering rather than
+        erroring — enabling live voicing when a provider is configured while
+        preserving the historical stub behaviour otherwise (#658).
+
+        Args:
+            router: The run's :class:`ModelRouter`.
+            author: Author-subsystem config for the ``voice_model`` fallback.
+            tier: The fragment's privacy tier (gated by the chokepoint).
+
+        Returns:
+            A usable :class:`AuthorLLMClient`, or ``None``.
+
+        Raises:
+            IntimateRoutingError: Propagated from :meth:`for_role` when an
+                ``Intimate`` role is cloud with no local fallback.
+        """
+        client = cls.for_role(router, "voice_drafter", author=author, tier=tier)
+        return client if client.available else None
+
+    @property
+    def available(self) -> bool:
+        """Whether the wrapped provider can serve a call right now.
+
+        Delegates to the provider's own readiness check (API key + cloud
+        consent, or a reachable local server).
+        """
+        return self._provider.available
+
     def complete(self, prompt: str, *, max_tokens: int | None = None) -> str:
         """Return the completion text for *prompt*.
 
