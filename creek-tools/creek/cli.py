@@ -3232,22 +3232,10 @@ def author(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     rounds = max_rounds if max_rounds is not None else config.author.max_author_rounds
-    # #658: build the router-resolved voice client for live voicing. Falls back
-    # to ``None`` (deterministic stub) when the provider is unavailable, so the
-    # command still works without a reachable/consented backend.
-    voice_client = AuthorLLMClient.for_voice_or_none(
-        config.model_router,
-        author=config.author,
-    )
-    if voice_client is None and not dry_run:
-        console.print(
-            "[dim]No LLM provider available — rendering the deterministic "
-            "stub. Configure llm.generation (and consent for a cloud provider) "
-            "for live voicing.[/dim]",
-        )
-    conductor = build_default_conductor(max_rounds=rounds, llm_client=voice_client)
 
     if dry_run:
+        # The dry run only plans + gathers evidence; no voicing, so no client.
+        conductor = build_default_conductor(max_rounds=rounds)
         evidence = conductor.gather_evidence(effective_query, vault_path)
         console.print(f"PLAN: {' → '.join(conductor.plan())}")
         console.print(
@@ -3256,7 +3244,23 @@ def author(
         )
         return
 
-    draft_result = conductor.run(medium=medium, query=effective_query, vault=vault_path)
+    # #658: build the router-resolved voice client for live voicing. Falls back
+    # to ``None`` (deterministic stub) when the provider is unavailable, so the
+    # command still works without a reachable/consented backend.
+    voice_client = AuthorLLMClient.for_voice_or_none(
+        config.model_router,
+        author=config.author,
+    )
+    if voice_client is None:
+        console.print(
+            "[dim]No LLM provider available — rendering the deterministic "
+            "stub. Configure llm.generation (and consent for a cloud provider) "
+            "for live voicing.[/dim]",
+        )
+    draft_result = build_default_conductor(
+        max_rounds=rounds,
+        llm_client=voice_client,
+    ).run(medium=medium, query=effective_query, vault=vault_path)
     console.print(
         f"medium={draft_result.medium} verdict={draft_result.verdict} "
         f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",

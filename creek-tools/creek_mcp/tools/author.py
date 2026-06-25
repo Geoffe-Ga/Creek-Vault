@@ -13,6 +13,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from creek.author import plan_author, require_supported_medium, run_author
+from creek.author.client import AuthorLLMClient
+from creek.config import load_config
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling
 
@@ -142,9 +144,6 @@ def author_tool(
         # voicing; ``for_voice_or_none`` returns ``None`` (deterministic stub)
         # when the provider is unavailable, so the tool never hard-fails on a
         # missing/unconsented backend.
-        from creek.author.client import AuthorLLMClient
-        from creek.config import load_config
-
         config = load_config()
         voice_client = AuthorLLMClient.for_voice_or_none(
             config.model_router,

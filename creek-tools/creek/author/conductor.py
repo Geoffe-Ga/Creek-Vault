@@ -149,8 +149,11 @@ class Conductor:
         voice: The agent that renders evidence into a draft.
         reflection: The node that judges each drafted body.
         max_rounds: Upper bound on voice/reflect rounds.
-        llm_client: Optional network seam; unused by the stub collaborators
-            but injected here so issue #460 can wire real LLM calls.
+        llm_client: Optional voice client; when set,
+            :func:`build_default_conductor` threads it into the voice agent so
+            the desk renders live voicing (#658). ``None`` keeps the
+            deterministic stub. The specialists and reflection node remain
+            deterministic and do not use it.
         contract: The medium contract driving this run; its reflection rubric
             is exposed to the reflection node (FEAT-041 #459).
     """
