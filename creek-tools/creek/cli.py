@@ -3224,6 +3224,7 @@ def author(
     requires ``--query``.
     """
     from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
+    from creek.author.client import AuthorLLMClient
 
     _validate_author_inputs(medium, query, work, SUPPORTED_MEDIUMS)
     effective_query = _compose_author_query(query, work)
@@ -3231,7 +3232,20 @@ def author(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     rounds = max_rounds if max_rounds is not None else config.author.max_author_rounds
-    conductor = build_default_conductor(max_rounds=rounds)
+    # #658: build the router-resolved voice client for live voicing. Falls back
+    # to ``None`` (deterministic stub) when the provider is unavailable, so the
+    # command still works without a reachable/consented backend.
+    voice_client = AuthorLLMClient.for_voice_or_none(
+        config.model_router,
+        author=config.author,
+    )
+    if voice_client is None and not dry_run:
+        console.print(
+            "[dim]No LLM provider available — rendering the deterministic "
+            "stub. Configure llm.generation (and consent for a cloud provider) "
+            "for live voicing.[/dim]",
+        )
+    conductor = build_default_conductor(max_rounds=rounds, llm_client=voice_client)
 
     if dry_run:
         evidence = conductor.gather_evidence(effective_query, vault_path)

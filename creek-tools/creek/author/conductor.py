@@ -376,8 +376,11 @@ def build_default_conductor(
         A ready-to-run :class:`Conductor`.
     """
     return Conductor(
+        # #658: thread the client into the voice agent — the only collaborator
+        # that calls the LLM — so an injected client produces live voicing
+        # instead of the deterministic stub. ``None`` keeps the stub.
         specialists=default_specialists(),
-        voice=VoiceAgent(),
+        voice=VoiceAgent(llm_client=llm_client),
         reflection=ReflectionNode(),
         max_rounds=max_rounds,
         llm_client=llm_client,
@@ -391,6 +394,7 @@ def run_author(
     query: str,
     vault: Path,
     max_rounds: int | None = None,
+    llm_client: AuthorLLMClient | None = None,
 ) -> AuthoredDraft:
     """Author *query* for *medium* against *vault* with the default desk.
 
@@ -400,6 +404,8 @@ def run_author(
         vault: The vault to author from.
         max_rounds: Optional override for the round bound; defaults to the
             ``author.max_author_rounds`` config default.
+        llm_client: Optional voice client (#658). When supplied, the desk
+            renders live voicing; ``None`` keeps the deterministic stub.
 
     Returns:
         The shaped :class:`AuthoredDraft`.
@@ -409,9 +415,11 @@ def run_author(
     require_supported_medium(medium)
     contract = load_medium_contract(medium, vault)
     rounds = max_rounds if max_rounds is not None else AuthorConfig().max_author_rounds
-    draft = build_default_conductor(max_rounds=rounds, contract=contract).run(
-        medium=medium, query=query, vault=vault
-    )
+    draft = build_default_conductor(
+        max_rounds=rounds,
+        llm_client=llm_client,
+        contract=contract,
+    ).run(medium=medium, query=query, vault=vault)
     return _enforce_chat_ceiling(draft)
 
 
