@@ -22,6 +22,8 @@ from creek.vault.writer import VaultWriter
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def _make_vault(tmp_path: Path) -> Path:
     """Scaffold a minimal vault for ingest + tomb/restore."""
@@ -200,3 +202,84 @@ class TestOrphanLifecycle:
 
         assert len(_journal_files(vault)) == 2  # b untouched
         assert _orphan_files(vault) == []
+
+    def test_reappear_with_unchanged_content_restores_without_rewrite(
+        self, tmp_path: Path
+    ) -> None:
+        """A re-added unit with identical content is restored, not rewritten."""
+        vault = _make_vault(tmp_path)
+        journal = vault / "personal" / "journal"
+        entry = journal / "2026-06-26.md"
+        body = "---\ndate: 2026-06-26\n---\nUnchanging entry.\n"
+        entry.write_text(body, encoding="utf-8")
+        _ingest(vault, journal)
+        frag_id = frontmatter.load(str(_journal_files(vault)[0]))["id"]
+
+        entry.unlink()
+        _ingest(vault, journal)  # tomb
+        assert len(_orphan_files(vault)) == 1
+
+        # Re-add with IDENTICAL content -> restore-only branch (no rewrite).
+        entry.write_text(body, encoding="utf-8")
+        _, errors, _ = _ingest(vault, journal)
+        assert errors == []
+        live = _journal_files(vault)
+        assert len(live) == 1
+        post = frontmatter.load(str(live[0]))
+        assert post["id"] == frag_id
+        assert "Unchanging entry" in post.content
+        assert _orphan_files(vault) == []
+
+    def test_reappear_after_orphan_file_lost_recreates_with_preserved_id(
+        self, tmp_path: Path
+    ) -> None:
+        """If the tombstone file vanished, a re-add recreates under the same id."""
+        vault = _make_vault(tmp_path)
+        journal = vault / "personal" / "journal"
+        entry = journal / "2026-06-26.md"
+        entry.write_text("---\ndate: 2026-06-26\n---\nOriginal.\n", encoding="utf-8")
+        _ingest(vault, journal)
+        frag_id = frontmatter.load(str(_journal_files(vault)[0]))["id"]
+
+        entry.unlink()
+        _ingest(vault, journal)  # tomb
+        # The tombstone file is lost out of band, but the ledger still says tombed.
+        _orphan_files(vault)[0].unlink()
+
+        entry.write_text("---\ndate: 2026-06-26\n---\nReborn.\n", encoding="utf-8")
+        _, errors, _ = _ingest(vault, journal)
+        assert errors == []
+        live = _journal_files(vault)
+        assert len(live) == 1
+        post = frontmatter.load(str(live[0]))
+        assert post["id"] == frag_id  # fresh write under the preserved id
+        assert "Reborn" in post.content
+        ledger = SourceLedger.load(vault, source="markdown")
+        rec = ledger.get("personal/journal/2026-06-26.md")
+        assert rec is not None
+        assert rec.tombed is False  # ledger self-corrected
+
+    def test_tomb_oserror_is_collected_not_raised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tomb that fails on I/O is collected as an error, not propagated."""
+        vault = _make_vault(tmp_path)
+        journal = vault / "personal" / "journal"
+        entry = journal / "2026-06-26.md"
+        entry.write_text("---\ndate: 2026-06-26\n---\nDoomed.\n", encoding="utf-8")
+        _ingest(vault, journal)
+
+        def _boom(_self: VaultWriter, _fragment_id: str) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(VaultWriter, "tomb_fragment", _boom)
+        entry.unlink()
+        _, errors, _ = _ingest(vault, journal)  # must not raise
+
+        assert any("failed to tomb" in e for e in errors)
+        # Tomb failed -> the fragment is left live, ledger keeps it untombed.
+        assert len(_journal_files(vault)) == 1
+        ledger = SourceLedger.load(vault, source="markdown")
+        rec = ledger.get("personal/journal/2026-06-26.md")
+        assert rec is not None
+        assert rec.tombed is False

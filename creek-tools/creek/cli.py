@@ -377,18 +377,22 @@ def _restore_tombed(
     fragment: Fragment,
     record: LedgerRecord,
     body: str,
+    new_hash: str,
 ) -> Path | None:
     """Un-tomb a re-appeared source unit and apply its body (#674).
 
-    Reuses the preserved fragment id, moves the tombed fragment back into its
-    routing directory, then rewrites the (possibly edited) body in place.
-    Returns ``None`` when no tombed file maps to the id, so the caller falls
-    back to a fresh write under the preserved id.
+    Reuses the preserved fragment id and moves the tombed fragment back into
+    its routing directory. Only when the content actually changed does it
+    rewrite the body in place — an unchanged re-appearance restores without a
+    redundant write. Returns ``None`` when no tombed file maps to the id, so
+    the caller falls back to a fresh write under the preserved id.
     """
     fragment.id = record.fragment_id
     restored = writer.restore_fragment(fragment)
     if restored is None:
         return None
+    if new_hash == record.content_hash:
+        return restored
     updated = writer.update_fragment(fragment, body)
     return updated if updated is not None else restored
 
@@ -413,11 +417,12 @@ def _write_fragment_idempotent(
     # returns None for a missing ledger); the explicit guard narrows for mypy.
     if record is None or ledger is None:
         return writer.write_fragment(fragment, body=body)
+    new_hash = ledger.content_hash(parsed.content)
     if record.tombed:
-        restored = _restore_tombed(writer, fragment, record, body)
+        restored = _restore_tombed(writer, fragment, record, body, new_hash)
         if restored is not None:
             return restored
-    elif record.content_hash != ledger.content_hash(parsed.content):
+    elif record.content_hash != new_hash:
         fragment.id = record.fragment_id
         updated = writer.update_fragment(fragment, body)
         if updated is not None:
@@ -430,12 +435,18 @@ def _tomb_missing_units(
     writer: VaultWriter,
     input_path: Path,
     seen_keys: set[str],
+    errors: list[str],
+    source_type: str,
 ) -> None:
     """Soft-tomb ledgered units absent from a full-source pass (#674).
 
     Only a directory (full-source) input computes a gone set; a single-file
     ``--input`` run never tombs — that guards the incremental epic from
     tombing every other unit when re-ingesting one file.
+
+    A tomb that fails on I/O is collected into *errors* (matching the
+    per-fragment write path) and the unit is left live in the ledger so the
+    next full-source pass retries it, rather than crashing the whole run.
     """
     if ledger is None or not input_path.is_dir():
         return
@@ -443,7 +454,13 @@ def _tomb_missing_units(
         record = ledger.get(source_key)
         if record is None:
             continue
-        writer.tomb_fragment(record.fragment_id)
+        try:
+            writer.tomb_fragment(record.fragment_id)
+        except (OSError, KeyError) as exc:
+            errors.append(
+                f"[{source_type}] failed to tomb {record.fragment_id}: {exc}",
+            )
+            continue
         ledger.record(
             source_key,
             record.fragment_id,
@@ -522,7 +539,7 @@ def _run_ingest(
         _record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
 
-    _tomb_missing_units(ledger, writer, input_path, seen_keys)
+    _tomb_missing_units(ledger, writer, input_path, seen_keys, errors, source_type)
     return written, errors, ingest_result.discovered
 
 
