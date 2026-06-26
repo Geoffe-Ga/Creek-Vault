@@ -16,7 +16,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
-from creek.author.agents import Specialist, default_specialists
+from creek.author.agents import Specialist, default_specialists, fragment_tier_map
 from creek.author.contracts import CHAT_MAX_CHARS, load_medium_contract
 from creek.author.models import (
     AuthoredDraft,
@@ -30,9 +30,10 @@ from creek.author.models import (
 from creek.author.reflection import ReflectionNode
 from creek.author.voice import VoiceAgent
 from creek.compile.provenance import ProvenanceEntry
+from creek.models import PrivacyTier
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from creek.author.client import AuthorLLMClient
@@ -41,7 +42,40 @@ if TYPE_CHECKING:
     from creek.generate.ai_style.model import VoiceFingerprint
     from creek.models import MediumContract
 
+    #: A callable that builds the voice client for a run's content tier (#661).
+    VoiceClientFactory = Callable[[PrivacyTier | None], "AuthorLLMClient | None"]
+
 logger = logging.getLogger(__name__)
+
+
+def _content_tier(
+    evidence: EvidenceBundle,
+    vault: Path,
+    override: PrivacyTierOverride | None,
+) -> PrivacyTier | None:
+    """Return the most-sensitive tier among the evidence's fragments (#661).
+
+    The voice call sends the evidence to the LLM, so its routing tier is the
+    highest ``privacy_tier`` actually cited. ``INTIMATE`` outranks ``PERSONAL``
+    outranks ``OPEN``; ``None`` when the evidence cites no known fragment.
+
+    Args:
+        evidence: The gathered evidence.
+        vault: Vault root (to look up fragment tiers).
+        override: The admission ceiling used when gathering (same corpus view).
+
+    Returns:
+        The content tier, or ``None`` for empty/untraceable evidence.
+    """
+    tier_map = fragment_tier_map(vault, override)
+    tiers = {
+        tier_map[fid] for fid in evidence.all_source_fragments() if fid in tier_map
+    }
+    for tier in (PrivacyTier.INTIMATE, PrivacyTier.PERSONAL, PrivacyTier.OPEN):
+        if tier in tiers:
+            return tier
+    return None
+
 
 #: Mediums the conductor will run. ``research``/``chat``/``essay``/
 #: ``research-piece``/``book-report``/``how-to`` are all wired — ``how-to``
@@ -73,8 +107,13 @@ class VoiceRenderer(Protocol):
         *,
         medium: Medium | None = None,
         contract: MediumContract | None = None,
+        client: AuthorLLMClient | None = None,
     ) -> str:
-        """Return draft prose for *query* from *evidence* (in the owner's voice)."""
+        """Return draft prose for *query* from *evidence* (in the owner's voice).
+
+        *client* (#661) overrides the agent's own client for this render — the
+        conductor passes the tier-routed voice client; ``None`` falls back.
+        """
         ...
 
 
@@ -167,9 +206,16 @@ class Conductor:
         *,
         max_rounds: int,
         llm_client: AuthorLLMClient | None = None,
+        voice_client_factory: VoiceClientFactory | None = None,
         contract: MediumContract | None = None,
     ) -> None:
         """Store collaborators, the round bound, and the medium contract.
+
+        Args:
+            voice_client_factory: When set (#661), the conductor builds the
+                voice client *after* gathering evidence, passing the run's
+                content tier so the ``Intimate``-never-cloud chokepoint fires on
+                the actual content. Takes precedence over a static *llm_client*.
 
         Raises:
             ValueError: When *max_rounds* is below 1 — the voice/reflect loop
@@ -185,6 +231,7 @@ class Conductor:
         self.reflection = reflection
         self.max_rounds = max_rounds
         self.llm_client = llm_client
+        self.voice_client_factory = voice_client_factory
         self.contract = contract
 
     def plan(self) -> list[str]:
@@ -331,6 +378,15 @@ class Conductor:
         """
         validated = require_supported_medium(medium)
         evidence = self.gather_evidence(query, vault, override=override)
+        # #661: route the voice call by the evidence's content tier so Intimate
+        # content is redirected to a local provider by the chokepoint. The
+        # factory (built per content tier) takes precedence over a static client.
+        if self.voice_client_factory is not None:
+            voice_client = self.voice_client_factory(
+                _content_tier(evidence, vault, override),
+            )
+        else:
+            voice_client = self.llm_client
         rubric = self.contract.reflection_rubric if self.contract else None
         # Voice-fidelity is wired from the owner's persisted fingerprint (#506):
         # loaded once before the loop. When no fingerprint has been built the
@@ -345,7 +401,12 @@ class Conductor:
         for attempt in range(1, self.max_rounds + 1):
             rounds = attempt
             body = self.voice.render(
-                query, evidence, vault, medium=validated, contract=self.contract
+                query,
+                evidence,
+                vault,
+                medium=validated,
+                contract=self.contract,
+                client=voice_client,
             )
             result = self.reflection.review(
                 body,
@@ -388,6 +449,7 @@ def build_default_conductor(
     *,
     max_rounds: int,
     llm_client: AuthorLLMClient | None = None,
+    voice_client_factory: VoiceClientFactory | None = None,
     contract: MediumContract | None = None,
 ) -> Conductor:
     """Build a conductor wired with the default stub collaborators.
@@ -395,6 +457,8 @@ def build_default_conductor(
     Args:
         max_rounds: Upper bound on voice/reflect rounds.
         llm_client: Optional network seam passed through to the conductor.
+        voice_client_factory: Optional tier-aware voice-client factory (#661);
+            takes precedence over a static *llm_client*.
         contract: Optional medium contract passed through to the conductor.
 
     Returns:
@@ -409,6 +473,7 @@ def build_default_conductor(
         reflection=ReflectionNode(),
         max_rounds=max_rounds,
         llm_client=llm_client,
+        voice_client_factory=voice_client_factory,
         contract=contract,
     )
 
@@ -420,6 +485,7 @@ def run_author(
     vault: Path,
     max_rounds: int | None = None,
     llm_client: AuthorLLMClient | None = None,
+    voice_client_factory: VoiceClientFactory | None = None,
     override: PrivacyTierOverride | None = None,
 ) -> AuthoredDraft:
     """Author *query* for *medium* against *vault* with the default desk.
@@ -447,6 +513,7 @@ def run_author(
     draft = build_default_conductor(
         max_rounds=rounds,
         llm_client=llm_client,
+        voice_client_factory=voice_client_factory,
         contract=contract,
     ).run(medium=medium, query=query, vault=vault, override=override)
     return _enforce_chat_ceiling(draft)

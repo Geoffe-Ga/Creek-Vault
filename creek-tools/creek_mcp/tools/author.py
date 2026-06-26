@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author import AuthoredDraft
+    from creek.models import PrivacyTier
 
 TOOL_NAME = "creek.author"
 
@@ -150,21 +151,28 @@ def author_tool(
                 "plan": plan["plan"],
                 "evidence": plan["evidence"],
             }
-        # #658: build the router-resolved voice client so the desk renders live
-        # voicing; ``for_voice_or_none`` returns ``None`` (deterministic stub)
-        # when the provider is unavailable, so the tool never hard-fails on a
-        # missing/unconsented backend.
+        # #658/#661: build the router-resolved voice client per the run's content
+        # tier so live voicing of Intimate content is redirected to a local
+        # provider by the chokepoint. ``for_voice_or_none`` returns ``None``
+        # (deterministic stub) when the provider is unavailable, so the tool
+        # never hard-fails on a missing/unconsented backend.
         config = load_config()
-        voice_client = AuthorLLMClient.for_voice_or_none(
-            config.model_router,
-            author=config.author,
-        )
+        router = config.model_router
+        author_config = config.author
+
+        def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+            return AuthorLLMClient.for_voice_or_none(
+                router,
+                author=author_config,
+                tier=tier,
+            )
+
         draft = run_author(
             medium=medium,
             query=query,
             vault=vault_path,
             max_rounds=max_rounds,
-            llm_client=voice_client,
+            voice_client_factory=_voice_client,
             override=override,
         )
     except Exception as exc:

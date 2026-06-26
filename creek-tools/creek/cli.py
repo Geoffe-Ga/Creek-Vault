@@ -3268,14 +3268,18 @@ def author(
         )
         return
 
-    # #658: build the router-resolved voice client for live voicing. Falls back
-    # to ``None`` (deterministic stub) when the provider is unavailable, so the
-    # command still works without a reachable/consented backend.
-    voice_client = AuthorLLMClient.for_voice_or_none(
-        config.model_router,
-        author=config.author,
-    )
-    if voice_client is None:
+    # #658/#661: build the router-resolved voice client *per the run's content
+    # tier* so live voicing of Intimate content is redirected to a local
+    # provider by the chokepoint. The factory falls back to ``None``
+    # (deterministic stub) when the provider is unavailable.
+    def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+        return AuthorLLMClient.for_voice_or_none(
+            config.model_router,
+            author=config.author,
+            tier=tier,
+        )
+
+    if _voice_client(None) is None:
         console.print(
             "[dim]No LLM provider available — rendering the deterministic "
             "stub. Configure llm.generation (and consent for a cloud provider) "
@@ -3283,7 +3287,7 @@ def author(
         )
     draft_result = build_default_conductor(
         max_rounds=rounds,
-        llm_client=voice_client,
+        voice_client_factory=_voice_client,
     ).run(
         medium=medium,
         query=effective_query,

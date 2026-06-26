@@ -36,7 +36,15 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
-from creek.models import Confidence, Dosage, Frequency, Mode, Phase, VoiceRegister
+from creek.models import (
+    Confidence,
+    Dosage,
+    Frequency,
+    Mode,
+    Phase,
+    PrivacyTier,
+    VoiceRegister,
+)
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -107,6 +115,29 @@ def _load_corpus(
             if tier_within_override(fragment.privacy_tier, override):
                 records.append((fragment, body))
     return records
+
+
+def fragment_tier_map(
+    vault: Path,
+    override: PrivacyTierOverride | None = None,
+) -> dict[str, PrivacyTier]:
+    """Return a ``{fragment_id: privacy_tier}`` map for the admitted corpus (#661).
+
+    Built from the same override-filtered corpus the specialists gather from, so
+    the desk can derive a run's *content tier* (the most-sensitive tier actually
+    in the evidence) and route the voice call accordingly.
+
+    Args:
+        vault: Vault root.
+        override: The privacy admission ceiling (matches the gather override).
+
+    Returns:
+        A mapping of admitted fragment id to its :class:`PrivacyTier`.
+    """
+    return {
+        fragment.id: fragment.privacy_tier
+        for fragment, _ in _load_corpus(vault, override)
+    }
 
 
 def _fragment_claim(fragment: Fragment) -> EvidenceClaim:

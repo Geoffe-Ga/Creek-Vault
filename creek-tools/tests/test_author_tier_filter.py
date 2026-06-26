@@ -97,3 +97,50 @@ def test_gather_evidence_threads_override(tmp_path: Path) -> None:
         override=PrivacyTierOverride.ALL,
     )
     assert "frag-int" in _ids(everything)
+
+
+def test_conductor_routes_voice_by_content_tier(tmp_path: Path) -> None:
+    """The voice-client factory receives the evidence's content tier (#661).
+
+    With an INTIMATE fragment admitted (override=ALL), the factory is called
+    with INTIMATE so the chokepoint can redirect the voice call to local.
+    """
+    from creek.author.conductor import build_default_conductor
+    from creek.models import PrivacyTier
+
+    _seed(tmp_path, "frag-int", "Intimate note about q", tier="intimate")
+
+    seen: dict[str, object] = {}
+
+    def _factory(tier: object) -> None:
+        seen["tier"] = tier
+        return None  # deterministic render; we only assert the tier threaded
+
+    build_default_conductor(max_rounds=1, voice_client_factory=_factory).run(
+        medium="research",
+        query="q",
+        vault=tmp_path,
+        override=PrivacyTierOverride.ALL,
+    )
+    assert seen["tier"] == PrivacyTier.INTIMATE
+
+
+def test_content_tier_open_when_no_sensitive_evidence(tmp_path: Path) -> None:
+    """With only OPEN/unclassified evidence, the factory gets a non-INTIMATE tier."""
+    from creek.author.conductor import build_default_conductor
+    from creek.models import PrivacyTier
+
+    _seed(tmp_path, "frag-open", "Open note about q")
+
+    seen: dict[str, object] = {}
+
+    def _factory(tier: object) -> None:
+        seen["tier"] = tier
+        return None
+
+    build_default_conductor(max_rounds=1, voice_client_factory=_factory).run(
+        medium="research",
+        query="q",
+        vault=tmp_path,
+    )
+    assert seen["tier"] != PrivacyTier.INTIMATE
