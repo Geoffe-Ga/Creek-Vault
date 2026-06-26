@@ -636,6 +636,12 @@ class FragmentSource(BaseModel):
     kind: SourceKind = SourceKind.UNCLASSIFIED
     original_file: str | None = None
     original_encoding: str | None = None
+    # Issue #672 / SPEC R1: stable vault-relative identity of a *mutable*
+    # source unit (e.g. a journal ``.md``), keyed by the SourceLedger so a
+    # re-ingested edit can update the same fragment in place rather than mint
+    # a new id. ``None`` for sources that don't set it — append-only event
+    # sources keep their content-hashed ids.
+    origin_key: str | None = None
     conversation_id: str | None = None
     channel: str | None = None
     interlocutor: str | None = None

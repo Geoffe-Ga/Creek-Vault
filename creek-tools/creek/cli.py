@@ -44,9 +44,10 @@ if TYPE_CHECKING:
         SeedSpec,
     )
     from creek.generate.mining import MiningRunReport
-    from creek.ingest.base import Ingestor
+    from creek.ingest.base import Ingestor, ParsedFragment
+    from creek.ingest.ledger import SourceLedger
     from creek.link.link_engine import LinkSummary
-    from creek.models import CompileTargetKind, Frequency, Mode, Phase
+    from creek.models import CompileTargetKind, Fragment, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 
@@ -303,6 +304,60 @@ def _resolve_ingestor(type_name: str) -> type[Ingestor]:
     return cls
 
 
+def _derive_source_key(source_path: str, vault_path: Path) -> str:
+    """Return a stable vault-relative ``source_key`` for a source file (#672).
+
+    Prefers the path relative to the vault root (the stable identity a
+    re-ingested edit is matched on); falls back to the bare filename when the
+    source lives outside the vault.
+    """
+    candidate = Path(source_path)
+    try:
+        return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
+    except ValueError:
+        return candidate.name
+
+
+def _ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None:
+    """Load the source ledger for mutable sources, else ``None`` (#672).
+
+    Only the markdown (journal) source is ledger-wired in this skeleton;
+    append-only event sources keep their content-hashed ids untouched.
+    """
+    if source_type != "markdown":
+        return None
+    from creek.ingest.ledger import SourceLedger
+
+    return SourceLedger.load(vault_path, source=source_type)
+
+
+def _attach_origin_key(
+    ledger: SourceLedger | None,
+    parsed: ParsedFragment,
+    fragment: Fragment,
+    vault_path: Path,
+) -> None:
+    """Stamp the fragment's ``source.origin_key`` before it is written (#672)."""
+    if ledger is None:
+        return
+    fragment.source.origin_key = _derive_source_key(parsed.source_path, vault_path)
+
+
+def _record_in_ledger(
+    ledger: SourceLedger | None,
+    parsed: ParsedFragment,
+    fragment: Fragment,
+) -> None:
+    """Record the written fragment in the source ledger (no-op skeleton, #672)."""
+    if ledger is None or fragment.source.origin_key is None:
+        return
+    ledger.record(
+        fragment.source.origin_key,
+        fragment.id,
+        ledger.content_hash(parsed.content),
+    )
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -336,6 +391,7 @@ def _run_ingest(
         raise typer.Exit(code=1) from exc
 
     ingest_result = ingestor_cls().ingest(input_path)
+    ledger = _ledger_for_source(source_type, vault_path)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
@@ -348,6 +404,7 @@ def _run_ingest(
                 f"{parsed.source_path}: {exc}",
             )
             continue
+        _attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
         try:
             writer.write_fragment(assembled.fragment, body=assembled.body)
         except (OSError, KeyError) as exc:
@@ -355,6 +412,7 @@ def _run_ingest(
                 f"[{source_type}] failed to write {assembled.fragment.id}: {exc}",
             )
             continue
+        _record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
 
     return written, errors, ingest_result.discovered
