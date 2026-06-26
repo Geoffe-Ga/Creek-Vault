@@ -418,8 +418,8 @@ def test_author_tool_returns_draft_envelope(vault: Path) -> None:
     assert result["body"].strip()
     assert result["dry_run"] is False
     assert result["rounds"] >= 1
-    # The echo is explicitly marked non-enforcing until #463 lands.
-    assert result["tier_ceiling_enforced"] is False
+    # #660: the ceiling is now enforced — the specialists tier-filter retrieval.
+    assert result["tier_ceiling_enforced"] is True
 
 
 def test_author_tool_rejects_unknown_medium(vault: Path) -> None:

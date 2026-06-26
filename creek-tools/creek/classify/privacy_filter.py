@@ -96,6 +96,46 @@ def _allows_full_personal_body(override: PrivacyTierOverride | None) -> bool:
     )
 
 
+_TIER_RANK: dict[PrivacyTier, int] = {
+    PrivacyTier.OPEN: 0,
+    PrivacyTier.UNCLASSIFIED: 0,
+    PrivacyTier.PERSONAL: 1,
+    PrivacyTier.INTIMATE: 2,
+}
+
+_OVERRIDE_RANK: dict[PrivacyTierOverride, int] = {
+    PrivacyTierOverride.OPEN: 0,
+    PrivacyTierOverride.PERSONAL: 1,
+    PrivacyTierOverride.INTIMATE: 2,
+    PrivacyTierOverride.ALL: 3,
+}
+
+
+def tier_within_override(
+    tier: PrivacyTier,
+    override: PrivacyTierOverride | None,
+) -> bool:
+    """Return whether a *tier* fragment is admitted under *override* (hard cutoff).
+
+    Unlike :func:`filter_fragments` — which *summarises* ``PERSONAL`` bodies and
+    only drops ``INTIMATE`` — this is a strict rank cutoff that **excludes**
+    anything above the override entirely. The Writing Desk needs its evidence to
+    omit above-ceiling fragments outright (#660), not carry summaries. ``None``
+    defaults to ``OPEN`` (the most restrictive); ``ALL`` admits every tier.
+
+    Args:
+        tier: The fragment's privacy tier.
+        override: The admission ceiling, or ``None`` for ``OPEN``.
+
+    Returns:
+        ``True`` when the fragment may enter the evidence.
+    """
+    effective = override or PrivacyTierOverride.OPEN
+    if effective is PrivacyTierOverride.ALL:
+        return True
+    return _TIER_RANK[tier] <= _OVERRIDE_RANK[effective]
+
+
 def filter_fragments_by_tier(
     fragments: Iterable[tuple[Fragment, str]],
     *,
