@@ -662,6 +662,258 @@ def revoke_token(config: GoogleDriveConfig) -> RevokeResult:
     )
 
 
+# ---- Read-only doctor (issue #681) -------------------------------------
+
+
+@dataclass(frozen=True)
+class TokenInspection:
+    """Local, non-secret view of a cached OAuth token.
+
+    Carries only presence / validity / expiry — never the token, refresh
+    token, or client secret. ``valid`` is ``None`` when validity cannot be
+    determined locally (file absent, unparseable, or no ``expiry`` field);
+    in that case reachability is decided by the live probe instead.
+
+    Attributes:
+        present: Whether a token file exists at the configured path.
+        valid: ``True`` when well-formed and not yet expired, ``False``
+            when expired, ``None`` when undeterminable locally.
+        refreshable: Whether the token carries a refresh token (so the
+            real downloader could refresh it non-interactively).
+        expiry: The parsed expiry instant, or ``None`` when absent.
+    """
+
+    present: bool
+    valid: bool | None
+    refreshable: bool
+    expiry: datetime | None
+
+
+def _parse_token_expiry(raw: object) -> datetime | None:
+    """Parse a token ``expiry`` string into an aware UTC datetime.
+
+    Returns ``None`` for a missing or unparseable value. A trailing ``Z``
+    is normalised to ``+00:00`` and naive timestamps are assumed UTC,
+    matching the format google-auth writes.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def inspect_token(
+    token_path: Path,
+    *,
+    now: datetime | None = None,
+) -> TokenInspection:
+    """Inspect a cached OAuth token file without exposing its contents.
+
+    Reads only enough of the token file to report presence, local
+    validity (well-formed and not expired), refreshability, and expiry.
+    The token, refresh token, and client secret are never read into the
+    return value or logged.
+
+    Args:
+        token_path: Path to the cached ``token.json``.
+        now: Reference time for the expiry comparison; defaults to the
+            current UTC time. Injected by tests for determinism.
+
+    Returns:
+        A :class:`TokenInspection` summarising local token state.
+    """
+    if not token_path.exists():
+        return TokenInspection(
+            present=False,
+            valid=None,
+            refreshable=False,
+            expiry=None,
+        )
+    try:
+        data = json.loads(token_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return TokenInspection(
+            present=True,
+            valid=None,
+            refreshable=False,
+            expiry=None,
+        )
+    if not isinstance(data, dict):
+        return TokenInspection(
+            present=True,
+            valid=None,
+            refreshable=False,
+            expiry=None,
+        )
+    refreshable = bool(data.get("refresh_token"))
+    expiry = _parse_token_expiry(data.get("expiry"))
+    if expiry is None:
+        return TokenInspection(
+            present=True,
+            valid=None,
+            refreshable=refreshable,
+            expiry=None,
+        )
+    reference = now if now is not None else datetime.now(UTC)
+    return TokenInspection(
+        present=True,
+        valid=expiry > reference,
+        refreshable=refreshable,
+        expiry=expiry,
+    )
+
+
+@dataclass(frozen=True)
+class DriveDoctorReport:
+    """Read-only diagnostic snapshot of the Drive connector's auth state.
+
+    Produced by :func:`check_drive`. Every field is a boolean, count, or
+    derived status string — never a secret. ``drive_reachable`` and
+    ``listed_file_count`` are ``None`` when the live probe was skipped
+    (no locally-valid token, or the optional libraries are missing).
+
+    Attributes:
+        credentials_present: Whether the OAuth client-secrets file exists.
+        credentials_path: Configured path to that file (paths only).
+        token_present: Whether a cached token file exists.
+        token_path: Configured path to the token file.
+        token_valid: Local token validity (see :class:`TokenInspection`).
+        token_refreshable: Whether the token carries a refresh token.
+        token_expiry: Parsed token expiry, or ``None``.
+        libs_available: Whether the optional Google libraries import.
+        drive_reachable: Result of the dry-run listing probe, or ``None``
+            when the probe was skipped.
+        listed_file_count: Number of files seen by the dry-run listing, or
+            ``None`` when skipped.
+        notes: Human-readable, secret-free status lines for display.
+    """
+
+    credentials_present: bool
+    credentials_path: str
+    token_present: bool
+    token_path: str
+    token_valid: bool | None
+    token_refreshable: bool
+    token_expiry: datetime | None
+    libs_available: bool
+    drive_reachable: bool | None
+    listed_file_count: int | None
+    notes: tuple[str, ...]
+
+
+def _token_note(token: TokenInspection, token_path: str) -> str:
+    """Render a secret-free human-readable status line for the token."""
+    if not token.present:
+        return (
+            f"Token ({token_path}): absent — run "
+            "`creek gdrive --download` once to authorise"
+        )
+    if token.valid is True:
+        until = token.expiry.isoformat() if token.expiry else "unknown"
+        return f"Token ({token_path}): present, valid until {until}"
+    if token.valid is False:
+        suffix = (
+            " (refreshable — run `creek gdrive --download`)"
+            if token.refreshable
+            else ""
+        )
+        return f"Token ({token_path}): present but EXPIRED{suffix}"
+    return f"Token ({token_path}): present but unreadable (no parseable expiry)"
+
+
+def check_drive(
+    config: GoogleDriveConfig,
+    *,
+    client: DriveClient,
+    now: datetime | None = None,
+) -> DriveDoctorReport:
+    """Probe Drive auth + reachability read-only, downloading nothing.
+
+    Reports credentials/token presence, local token validity, optional-
+    library availability, and — only when a locally-valid token and the
+    libraries are both present — a dry-run reachability listing via
+    :meth:`DriveClient.list_files`. :meth:`DriveClient.download_to` is
+    never called, and when no locally-valid token is present the live
+    probe is skipped entirely, so no OAuth browser flow is triggered and
+    nothing egresses.
+
+    Args:
+        config: The Drive configuration (paths + scopes). Only paths are
+            read; file contents (tokens/secrets) are never surfaced.
+        client: The read-only Drive backend. Injected so tests (and the
+            CLI) can probe without the optional Google libraries.
+        now: Reference time for token-expiry checks; defaults to current
+            UTC time.
+
+    Returns:
+        A :class:`DriveDoctorReport` summarising the connector's state.
+    """
+    credentials_path = config.credentials_file
+    token_path = config.token_file
+    credentials_present = Path(credentials_path).exists()
+    token = inspect_token(Path(token_path), now=now)
+    libs_available = client.is_available()
+
+    notes: list[str] = [
+        f"Credentials ({credentials_path}): "
+        + ("present" if credentials_present else "MISSING"),
+        _token_note(token, token_path),
+    ]
+
+    drive_reachable: bool | None = None
+    listed_file_count: int | None = None
+    if not token.present:
+        notes.append("Drive reachable: skipped (no token)")
+    elif token.valid is not True:
+        notes.append(
+            "Drive reachable: skipped (token not valid; run --download to refresh)",
+        )
+    elif not libs_available:
+        notes.append(
+            "Drive reachable: skipped (google libraries not installed)",
+        )
+    else:
+        try:
+            files = client.list_files()
+        except Exception as exc:
+            # Mirror the download-loop pattern: the Drive read surface
+            # spans HttpError (quota/rate/revoked), network IOErrors, and
+            # OAuth failures, none importable at module top-level. Catch
+            # broadly, log, and report unreachable rather than raising.
+            logger.warning("Drive reachability probe failed: %s", exc)
+            drive_reachable = False
+            notes.append(f"Drive reachable: NO ({type(exc).__name__})")
+        else:
+            drive_reachable = True
+            listed_file_count = len(files)
+            notes.append(
+                f"Drive reachable: yes ({listed_file_count} files listed, "
+                "dry-run — nothing downloaded)",
+            )
+
+    return DriveDoctorReport(
+        credentials_present=credentials_present,
+        credentials_path=credentials_path,
+        token_present=token.present,
+        token_path=token_path,
+        token_valid=token.valid,
+        token_refreshable=token.refreshable,
+        token_expiry=token.expiry,
+        libs_available=libs_available,
+        drive_reachable=drive_reachable,
+        listed_file_count=listed_file_count,
+        notes=tuple(notes),
+    )
+
+
 # ---- Routing helper ----------------------------------------------------
 
 

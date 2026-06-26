@@ -1995,6 +1995,33 @@ def _gdrive_revoke() -> None:
         )
 
 
+def _gdrive_check() -> None:
+    """Run the read-only Drive doctor and print a secret-free report.
+
+    Reports credentials/token presence, local token validity, optional-
+    library availability, and a dry-run reachability listing. Downloads
+    nothing and triggers no OAuth browser flow; when no locally-valid
+    token is present the live probe is skipped so nothing egresses
+    (issue #681). The report surfaces only paths and derived status —
+    never a token, refresh token, or client secret.
+    """
+    from creek.ingest.gdrive import GoogleApiDriveClient, check_drive
+
+    config = load_config()
+    client = GoogleApiDriveClient(config.google_drive)
+    report = check_drive(config.google_drive, client=client)
+    for line in report.notes:
+        console.print(line)
+    if report.drive_reachable is None:
+        console.print(
+            "\n[dim]No network calls were made. Nothing was downloaded.[/dim]",
+        )
+    else:
+        console.print(
+            "\n[dim]Read-only listing only. Nothing was downloaded.[/dim]",
+        )
+
+
 @app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
@@ -2003,31 +2030,43 @@ def gdrive(
         "--revoke",
         help="Revoke the cached OAuth token and delete the local token file",
     ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Read-only doctor: report auth/token/reachability, download nothing",
+    ),
     staging: Path | None = typer.Option(None, help="Staging directory"),
 ) -> None:
-    """Download files from Google Drive or revoke the cached OAuth token.
+    """Download from Google Drive, revoke the token, or run the doctor.
 
     ``--download`` mirrors files into a local staging directory
     (read-only; subsequent runs are incremental). ``--revoke`` runs the
     SEC-008 hygiene path: it best-effort calls Google's revocation
     endpoint, then erases the local token file with a zero-byte pass
-    before unlinking. The two flags are mutually exclusive.
+    before unlinking. ``--check`` is a read-only doctor (issue #681): it
+    reports credentials/token presence, local token validity, library
+    availability, and a dry-run reachability listing — downloading
+    nothing and triggering no OAuth flow. The three flags are mutually
+    exclusive.
 
     First ``--download`` run opens a browser for OAuth authorisation;
     the refresh token is cached at ``GoogleDriveConfig.token_file``
     (mode ``0o600``) so subsequent runs are non-interactive.
     """
-    if download and revoke:
+    if sum([download, revoke, check]) > 1:
         console.print(
-            "[red]Specify exactly one of --download or --revoke.[/red]",
+            "[red]Specify exactly one of --download, --revoke, or --check.[/red]",
         )
         raise typer.Exit(code=2)
+    if check:
+        _gdrive_check()
+        return
     if revoke:
         _gdrive_revoke()
         return
     if not download:
         console.print(
-            "[yellow]Nothing to do. Pass --download or --revoke.[/yellow]",
+            "[yellow]Nothing to do. Pass --download, --revoke, or --check.[/yellow]",
         )
         return
 
