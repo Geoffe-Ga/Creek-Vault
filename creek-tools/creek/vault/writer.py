@@ -17,6 +17,7 @@ Obsidian-compatible markdown files with YAML frontmatter. It handles:
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
 import logging
 import os
@@ -390,6 +391,35 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 tmp_path.unlink()
 
 
+def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
+    """Return ``True`` when an edit changed the body materially (#675).
+
+    A positive *threshold* compares old vs new body with ``difflib``; a
+    similarity ratio below the threshold is a material change. A non-positive
+    threshold never flags (every edit is treated as trivial).
+    """
+    if threshold <= 0.0:
+        return False
+    ratio = difflib.SequenceMatcher(None, old_body, new_body).ratio()
+    return ratio < threshold
+
+
+def _clear_classification(post: frontmatter.Post) -> None:
+    """Drop classification frontmatter so OPS-001 re-classifies on next pass."""
+    from creek.classify.constants import (
+        CLASSIFICATION_METHOD_KEY,
+        CLASSIFICATION_REASONING_KEY,
+        CLASSIFIED_AT_KEY,
+    )
+
+    for key in (
+        CLASSIFICATION_METHOD_KEY,
+        CLASSIFIED_AT_KEY,
+        CLASSIFICATION_REASONING_KEY,
+    ):
+        post.metadata.pop(key, None)
+
+
 def _apply_other_author_attribution(
     fragment: Fragment,
     manifest: AuthorManifest,
@@ -569,15 +599,29 @@ class VaultWriter:
         subfolder = _PLATFORM_SUBFOLDER[str(fragment.source.platform)]
         return self.vault_path / "01-Fragments" / subfolder
 
-    def update_fragment(self, fragment: Fragment, body: str) -> Path | None:
+    def update_fragment(
+        self,
+        fragment: Fragment,
+        body: str,
+        *,
+        reclassify_threshold: float = 0.0,
+    ) -> Path | None:
         """Rewrite an existing fragment's body in place, or return ``None``.
 
         Locates the file already mapped to ``fragment.id`` (via the per-dir
         id index) and rewrites **only its body**, preserving the on-disk
-        frontmatter verbatim — id, classifications (OPS-001), resonance links,
-        and ``source.origin_key``. This is the changed-branch of idempotent
+        frontmatter — id, classifications (OPS-001), resonance links, and
+        ``source.origin_key``. This is the changed-branch of idempotent
         mutable-source ingest (#673): an edited journal entry updates the same
         fragment instead of minting a new id and orphaning the old one.
+
+        When *reclassify_threshold* is positive (#675) the new body is compared
+        to the prior one; a **material** change (``difflib`` ratio below the
+        threshold) clears the fragment's ``classification_method`` /
+        ``classified_at`` / ``classification_reasoning`` so the next classify
+        pass re-does only this fragment (OPS-001, no global ``--force``). A
+        trivial edit (ratio at/above the threshold) preserves classifications.
+        The default ``0.0`` never flags — every edit preserves.
 
         Returns ``None`` when no file is mapped to ``fragment.id`` (e.g. the
         file was removed out of band), so the caller can fall back to a fresh
@@ -588,6 +632,8 @@ class VaultWriter:
                 whose platform/slug routes the lookup directory.
             body: The new markdown body to write below the preserved
                 frontmatter.
+            reclassify_threshold: Body-similarity floor below which the edit is
+                material and classifications are cleared for re-classification.
 
         Returns:
             Path to the rewritten file, or ``None`` when no existing file
@@ -599,6 +645,8 @@ class VaultWriter:
             if existing is None:
                 return None
             post = frontmatter.load(str(existing))
+            if _is_material_change(post.content, body, reclassify_threshold):
+                _clear_classification(post)
             post.content = body
             _atomic_write_text(existing, frontmatter.dumps(post))
             # Record the in-place edit in the provenance log too, so the audit

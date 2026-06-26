@@ -378,6 +378,7 @@ def _restore_tombed(
     record: LedgerRecord,
     body: str,
     new_hash: str,
+    reclassify_threshold: float,
 ) -> Path | None:
     """Un-tomb a re-appeared source unit and apply its body (#674).
 
@@ -393,7 +394,9 @@ def _restore_tombed(
         return None
     if new_hash == record.content_hash:
         return restored
-    updated = writer.update_fragment(fragment, body)
+    updated = writer.update_fragment(
+        fragment, body, reclassify_threshold=reclassify_threshold
+    )
     return updated if updated is not None else restored
 
 
@@ -403,31 +406,39 @@ def _write_fragment_idempotent(
     parsed: ParsedFragment,
     fragment: Fragment,
     body: str,
-) -> Path:
-    """Write the fragment, or update the existing one in place on edit (#673).
+    reclassify_threshold: float,
+) -> str:
+    """Write or update the fragment; return ``"created"`` or ``"updated"``.
 
     When the ledger already maps this source unit to a fragment and the
     content has *changed*, reuse that fragment id and rewrite it in place
-    (preserving classifications/links). Unchanged content falls through to
-    the normal write, where the deterministic id makes it an idempotent
-    no-op. A new unit is written fresh.
+    (preserving classifications/links, flagging re-classification on a material
+    change per *reclassify_threshold*). Unchanged content falls through to the
+    normal write, where the deterministic id makes it an idempotent no-op. A
+    new unit (no prior ledger record) is written fresh and reported as created.
     """
     record = _ledger_record(ledger, fragment)
     # `record is not None` guarantees `ledger is not None` (_ledger_record
     # returns None for a missing ledger); the explicit guard narrows for mypy.
     if record is None or ledger is None:
-        return writer.write_fragment(fragment, body=body)
+        writer.write_fragment(fragment, body=body)
+        return "created"
     new_hash = ledger.content_hash(parsed.content)
     if record.tombed:
-        restored = _restore_tombed(writer, fragment, record, body, new_hash)
+        restored = _restore_tombed(
+            writer, fragment, record, body, new_hash, reclassify_threshold
+        )
         if restored is not None:
-            return restored
+            return "updated"
     elif record.content_hash != new_hash:
         fragment.id = record.fragment_id
-        updated = writer.update_fragment(fragment, body)
+        updated = writer.update_fragment(
+            fragment, body, reclassify_threshold=reclassify_threshold
+        )
         if updated is not None:
-            return updated
-    return writer.write_fragment(fragment, body=body)
+            return "updated"
+    writer.write_fragment(fragment, body=body)
+    return "updated"
 
 
 def _tomb_missing_units(
@@ -437,7 +448,7 @@ def _tomb_missing_units(
     seen_keys: set[str],
     errors: list[str],
     source_type: str,
-) -> None:
+) -> int:
     """Soft-tomb ledgered units absent from a full-source pass (#674).
 
     Only a directory (full-source) input computes a gone set; a single-file
@@ -447,9 +458,12 @@ def _tomb_missing_units(
     A tomb that fails on I/O is collected into *errors* (matching the
     per-fragment write path) and the unit is left live in the ledger so the
     next full-source pass retries it, rather than crashing the whole run.
+
+    Returns the number of units actually tombed.
     """
     if ledger is None or not input_path.is_dir():
-        return
+        return 0
+    tombed = 0
     for source_key in sorted(ledger.live_keys() - seen_keys):
         record = ledger.get(source_key)
         if record is None:
@@ -468,6 +482,8 @@ def _tomb_missing_units(
             last_seen=record.last_seen,
             tombed=True,
         )
+        tombed += 1
+    return tombed
 
 
 def _run_ingest(
@@ -476,6 +492,8 @@ def _run_ingest(
     source_type: str,
     input_path: Path,
     vault_path: Path,
+    reclassify_threshold: float = 0.0,
+    print_summary: bool = False,
 ) -> tuple[int, list[str], int]:
     """Run a single ingestor and persist its output to the vault.
 
@@ -484,6 +502,11 @@ def _run_ingest(
         source_type: Registry key, used to prefix error messages.
         input_path: Source directory or file to ingest.
         vault_path: Vault root for :class:`VaultWriter`.
+        reclassify_threshold: Body-similarity floor below which a materially
+            edited mutable unit is flagged for re-classification (#675). ``0.0``
+            (the default, used by tests/internal callers) always preserves.
+        print_summary: When ``True``, print a created/updated/tombed summary
+            line (the ``creek ingest`` surface; #675).
 
     Returns:
         Tuple of ``(written_count, errors, discovered)`` where ``errors`` is a
@@ -507,6 +530,8 @@ def _run_ingest(
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
+    created = 0
+    updated = 0
     seen_keys: set[str] = set()
     for parsed in ingest_result.fragments:
         try:
@@ -522,14 +547,13 @@ def _run_ingest(
         if origin_key is not None:
             seen_keys.add(origin_key)
         try:
-            # The written/updated path is intentionally unused — callers only
-            # need the written count and error list.
-            _ = _write_fragment_idempotent(
+            action = _write_fragment_idempotent(
                 ledger,
                 writer,
                 parsed,
                 assembled.fragment,
                 assembled.body,
+                reclassify_threshold,
             )
         except (OSError, KeyError) as exc:
             errors.append(
@@ -538,8 +562,19 @@ def _run_ingest(
             continue
         _record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
+        if action == "created":
+            created += 1
+        else:
+            updated += 1
 
-    _tomb_missing_units(ledger, writer, input_path, seen_keys, errors, source_type)
+    tombed = _tomb_missing_units(
+        ledger, writer, input_path, seen_keys, errors, source_type
+    )
+    if print_summary:
+        console.print(
+            f"[dim]Ingest summary: {created} created, {updated} updated, "
+            f"{tombed} tombed[/dim]",
+        )
     return written, errors, ingest_result.discovered
 
 
@@ -836,6 +871,8 @@ def ingest(
         source_type=type,
         input_path=input,
         vault_path=vault_path,
+        reclassify_threshold=config.classification.reclassify_on_edit_threshold,
+        print_summary=True,
     )
 
     console.print(f"[bold green]Ingested {written} fragment(s).[/bold green]")
