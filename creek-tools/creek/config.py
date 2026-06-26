@@ -1380,6 +1380,47 @@ class VoiceAudienceWeightingConfig(BaseModel):
     heuristic, while a classified vault is scoped by the real axis."""
 
 
+def _default_sync_sources() -> dict[str, bool]:
+    """Default per-source enable toggles for ``creek sync`` (#676).
+
+    The journal and Google Drive are the regularly-updated sources enabled
+    by default; the rest are present-but-off so an operator opts in per source.
+    """
+    return {
+        "journal": True,
+        "gdrive": True,
+        "discord": False,
+        "chatgpt": False,
+        "claude": False,
+        "essays": False,
+    }
+
+
+class SyncConfig(BaseModel):
+    """Scheduling configuration for ``creek sync`` (#676 / SPEC R3).
+
+    Holds the per-source enable toggles and the two-tier cadence. The cadence
+    values are config-tunable (decision #5) even though the skeleton command
+    does not schedule anything yet — a later issue emits the launchd/systemd
+    units that read them.
+    """
+
+    tier_a_interval_minutes: int = Field(default=30, ge=1)
+    """How often the cheap Tier-A pass (pull → incremental ingest → rules
+    classify) should run, in minutes (default 30)."""
+
+    tier_b_hour: int = Field(default=3, ge=0, le=23)
+    """Local hour (0-23) for the nightly Tier-B pass (LLM classify -> link ->
+    index); default 3 (~03:00)."""
+
+    sources: dict[str, bool] = Field(default_factory=_default_sync_sources)
+    """Per-source enable toggles; only enabled sources are pulled in Tier A."""
+
+    def enabled_sources(self) -> list[str]:
+        """Return the enabled source names in stable (sorted) order."""
+        return sorted(name for name, on in self.sources.items() if on)
+
+
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
 
@@ -1459,6 +1500,9 @@ class CreekConfig(BaseSettings):
 
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
+
+    sync: SyncConfig = Field(default_factory=SyncConfig)
+    """Scheduling config for ``creek sync`` — per-source toggles + cadence."""
 
     @field_validator("timezone")
     @classmethod
