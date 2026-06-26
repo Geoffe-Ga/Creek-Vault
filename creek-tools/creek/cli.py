@@ -45,10 +45,11 @@ if TYPE_CHECKING:
     )
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor, ParsedFragment
-    from creek.ingest.ledger import SourceLedger
+    from creek.ingest.ledger import LedgerRecord, SourceLedger
     from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Fragment, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
+    from creek.vault.writer import VaultWriter
 
 
 _INCLUDE_TIER_HELP = (
@@ -358,6 +359,50 @@ def _record_in_ledger(
     )
 
 
+def _ledger_record(
+    ledger: SourceLedger | None,
+    fragment: Fragment,
+) -> LedgerRecord | None:
+    """Return the prior ledger record for this fragment's source unit (#673)."""
+    if ledger is None:
+        return None
+    origin_key = fragment.source.origin_key
+    if origin_key is None:
+        return None
+    return ledger.get(origin_key)
+
+
+def _write_fragment_idempotent(
+    ledger: SourceLedger | None,
+    writer: VaultWriter,
+    parsed: ParsedFragment,
+    fragment: Fragment,
+    body: str,
+) -> Path:
+    """Write the fragment, or update the existing one in place on edit (#673).
+
+    When the ledger already maps this source unit to a fragment and the
+    content has *changed*, reuse that fragment id and rewrite it in place
+    (preserving classifications/links). Unchanged content falls through to
+    the normal write, where the deterministic id makes it an idempotent
+    no-op. A new unit is written fresh.
+    """
+    record = _ledger_record(ledger, fragment)
+    if (
+        record is not None
+        # `ledger is not None` is guaranteed when record is not None
+        # (_ledger_record returns None for a missing ledger); kept for mypy
+        # narrowing of the `ledger.content_hash` call below.
+        and ledger is not None
+        and record.content_hash != ledger.content_hash(parsed.content)
+    ):
+        fragment.id = record.fragment_id
+        updated = writer.update_fragment(fragment, body)
+        if updated is not None:
+            return updated
+    return writer.write_fragment(fragment, body=body)
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -406,7 +451,15 @@ def _run_ingest(
             continue
         _attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
         try:
-            writer.write_fragment(assembled.fragment, body=assembled.body)
+            # The written/updated path is intentionally unused — callers only
+            # need the written count and error list.
+            _ = _write_fragment_idempotent(
+                ledger,
+                writer,
+                parsed,
+                assembled.fragment,
+                assembled.body,
+            )
         except (OSError, KeyError) as exc:
             errors.append(
                 f"[{source_type}] failed to write {assembled.fragment.id}: {exc}",

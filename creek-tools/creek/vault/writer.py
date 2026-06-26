@@ -540,6 +540,7 @@ class VaultWriter:
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
+        target_dir = self._fragment_target_dir(fragment)
         slug = fragment.source.author_slug
         if slug:
             # The helper returns a stamped copy, so the caller's Fragment is
@@ -547,12 +548,60 @@ class VaultWriter:
             # attribution (#470).
             manifest = load_author_manifest_or_default(self.vault_path, slug)
             stamped = _apply_other_author_attribution(fragment, manifest)
-            target_dir = self.vault_path / OTHER_AUTHORS_DIR / slug
             return self._write_model(stamped, target_dir, body=body)
-        platform = fragment.source.platform
-        subfolder = _PLATFORM_SUBFOLDER[str(platform)]
-        target_dir = self.vault_path / "01-Fragments" / subfolder
         return self._write_model(fragment, target_dir, body=body)
+
+    def _fragment_target_dir(self, fragment: Fragment) -> Path:
+        """Return the vault directory a fragment routes to (#673).
+
+        The single source of truth for fragment routing, used by both
+        :meth:`write_fragment` and :meth:`update_fragment`: a borrowed
+        fragment (``source.author_slug`` set) lives under
+        ``11-Other-Authors/<slug>/``; a native fragment routes by source
+        platform into ``01-Fragments/<subfolder>/``.
+        """
+        slug = fragment.source.author_slug
+        if slug:
+            return self.vault_path / OTHER_AUTHORS_DIR / slug
+        subfolder = _PLATFORM_SUBFOLDER[str(fragment.source.platform)]
+        return self.vault_path / "01-Fragments" / subfolder
+
+    def update_fragment(self, fragment: Fragment, body: str) -> Path | None:
+        """Rewrite an existing fragment's body in place, or return ``None``.
+
+        Locates the file already mapped to ``fragment.id`` (via the per-dir
+        id index) and rewrites **only its body**, preserving the on-disk
+        frontmatter verbatim — id, classifications (OPS-001), resonance links,
+        and ``source.origin_key``. This is the changed-branch of idempotent
+        mutable-source ingest (#673): an edited journal entry updates the same
+        fragment instead of minting a new id and orphaning the old one.
+
+        Returns ``None`` when no file is mapped to ``fragment.id`` (e.g. the
+        file was removed out of band), so the caller can fall back to a fresh
+        :meth:`write_fragment`.
+
+        Args:
+            fragment: The fragment whose id locates the existing file and
+                whose platform/slug routes the lookup directory.
+            body: The new markdown body to write below the preserved
+                frontmatter.
+
+        Returns:
+            Path to the rewritten file, or ``None`` when no existing file
+            maps to the id.
+        """
+        target_dir = self._fragment_target_dir(fragment)
+        with self._lock:
+            existing = self._find_existing_locked(fragment.id, target_dir)
+            if existing is None:
+                return None
+            post = frontmatter.load(str(existing))
+            post.content = body
+            _atomic_write_text(existing, frontmatter.dumps(post))
+            # Record the in-place edit in the provenance log too, so the audit
+            # trail captures subsequent rewrites — not just the original write.
+            self._log_provenance_locked(fragment.id, fragment.type, existing)
+        return existing
 
     def write_thread(self, thread: Thread) -> Path:
         """Write a Thread to 02-Threads/{status}/.
