@@ -78,6 +78,9 @@ _PLATFORM_SUBFOLDER: dict[str, str] = {
     SourcePlatform.OTHER: "Unsorted",
 }
 
+# Destination for soft-tombed fragments whose source unit has vanished (#674).
+_ORPHANED_RELPARTS: tuple[str, ...] = ("10-Liminal", "Orphaned")
+
 # Map an AuthorManifest.author_kind -> the fragment's Authorship axis (#470).
 # Any unrecognised kind (the manifest already fails closed to ``human_source``)
 # resolves to OTHER via ``.get(..., Authorship.OTHER)`` at the call site.
@@ -602,6 +605,90 @@ class VaultWriter:
             # trail captures subsequent rewrites — not just the original write.
             self._log_provenance_locked(fragment.id, fragment.type, existing)
         return existing
+
+    def _find_in_fragments_locked(self, fragment_id: str) -> Path | None:
+        """Return the live fragment file for *fragment_id* under 01-Fragments.
+
+        Caller must hold ``self._lock``. Scans each platform subfolder's id
+        index so a tomb does not need to know which subfolder a fragment
+        landed in.
+        """
+        fragments_root = self.vault_path / "01-Fragments"
+        if not fragments_root.is_dir():
+            return None
+        for subdir in sorted(p for p in fragments_root.iterdir() if p.is_dir()):
+            found = self._find_existing_locked(fragment_id, subdir)
+            if found is not None:
+                return found
+        return None
+
+    def tomb_fragment(self, fragment_id: str) -> Path | None:
+        """Soft-tomb a fragment: move it to ``10-Liminal/Orphaned/`` (#674).
+
+        Relocates the live fragment file for *fragment_id* into the orphaned
+        directory and stamps ``lifecycle: orphaned`` + ``orphaned_at`` into its
+        frontmatter, so a deleted source unit is reflected without hard-deleting
+        the fragment. Returns the tombed path, or ``None`` when no live fragment
+        maps to the id (already moved/removed).
+
+        Args:
+            fragment_id: Id of the fragment to soft-tomb.
+
+        Returns:
+            Path to the tombed file, or ``None`` if no live fragment was found.
+        """
+        orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
+        with self._lock:
+            existing = self._find_in_fragments_locked(fragment_id)
+            if existing is None:
+                return None
+            post = frontmatter.load(str(existing))
+            post["lifecycle"] = "orphaned"
+            post["orphaned_at"] = datetime.now(UTC).isoformat()
+            orphan_dir.mkdir(parents=True, exist_ok=True)
+            dest = orphan_dir / existing.name
+            _atomic_write_text(dest, frontmatter.dumps(post))
+            existing.unlink()
+            index = self._load_index_locked(orphan_dir)
+            index[fragment_id] = dest.name
+            self._append_index_entry(orphan_dir, fragment_id, dest.name)
+            self._log_provenance_locked(fragment_id, "fragment", dest)
+        return dest
+
+    def restore_fragment(self, fragment: Fragment) -> Path | None:
+        """Un-tomb a fragment: move it back from ``10-Liminal/Orphaned/`` (#674).
+
+        Relocates the tombed file for ``fragment.id`` back to its routing
+        directory and clears the ``lifecycle``/``orphaned_at`` marker, so a
+        re-appeared source unit becomes a live fragment again under its
+        preserved id. Returns the restored path, or ``None`` when no tombed
+        file maps to the id.
+
+        Args:
+            fragment: The fragment whose id locates the tombed file and whose
+                platform/slug routes the restore destination.
+
+        Returns:
+            Path to the restored file, or ``None`` if no tombed file was found.
+        """
+        orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
+        target_dir = self._fragment_target_dir(fragment)
+        with self._lock:
+            existing = self._find_existing_locked(fragment.id, orphan_dir)
+            if existing is None:
+                return None
+            post = frontmatter.load(str(existing))
+            post.metadata.pop("lifecycle", None)
+            post.metadata.pop("orphaned_at", None)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dest = target_dir / existing.name
+            _atomic_write_text(dest, frontmatter.dumps(post))
+            existing.unlink()
+            index = self._load_index_locked(target_dir)
+            index[fragment.id] = dest.name
+            self._append_index_entry(target_dir, fragment.id, dest.name)
+            self._log_provenance_locked(fragment.id, fragment.type, dest)
+        return dest
 
     def write_thread(self, thread: Thread) -> Path:
         """Write a Thread to 02-Threads/{status}/.

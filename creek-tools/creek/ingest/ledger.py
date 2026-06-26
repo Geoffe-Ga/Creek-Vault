@@ -36,12 +36,16 @@ class LedgerRecord:
         fragment_id: The fragment id that unit currently maps to.
         content_hash: SHA-256 of the source content at last ingest.
         last_seen: ISO-8601 timestamp of the last ingest of this unit.
+        tombed: ``True`` when the source unit has vanished and its fragment
+            was soft-tombed to ``10-Liminal/Orphaned/`` (#674). Excluded from
+            :meth:`SourceLedger.live_keys`; a re-appearance restores it.
     """
 
     source_key: str
     fragment_id: str
     content_hash: str
     last_seen: str
+    tombed: bool = False
 
 
 class SourceLedger:
@@ -123,6 +127,7 @@ class SourceLedger:
             fragment_id=fragment_id,
             content_hash=content_hash,
             last_seen=last_seen,
+            tombed=bool(data.get("tombed", False)),
         )
 
     @classmethod
@@ -143,6 +148,10 @@ class SourceLedger:
         """Return the current record for *source_key*, or ``None``."""
         return self._records.get(source_key)
 
+    def live_keys(self) -> set[str]:
+        """Return the tracked source keys that are not tombed (#674)."""
+        return {key for key, rec in self._records.items() if not rec.tombed}
+
     def __len__(self) -> int:
         """Return the number of distinct source keys tracked."""
         return len(self._records)
@@ -158,6 +167,7 @@ class SourceLedger:
         content_hash: str,
         *,
         last_seen: str | None = None,
+        tombed: bool = False,
     ) -> LedgerRecord:
         """Upsert a source unit's state, appending a line and updating memory.
 
@@ -167,6 +177,7 @@ class SourceLedger:
             content_hash: SHA-256 of the source content (see
                 :meth:`content_hash`).
             last_seen: ISO timestamp; defaults to the current UTC time.
+            tombed: Whether the unit is soft-tombed (vanished from source).
 
         Returns:
             The :class:`LedgerRecord` that was written.
@@ -176,6 +187,7 @@ class SourceLedger:
             fragment_id=fragment_id,
             content_hash=content_hash,
             last_seen=last_seen or datetime.now(UTC).isoformat(),
+            tombed=tombed,
         )
         self._records[source_key] = record
         self._append(record)
@@ -190,6 +202,7 @@ class SourceLedger:
                 "fragment_id": record.fragment_id,
                 "content_hash": record.content_hash,
                 "last_seen": record.last_seen,
+                "tombed": record.tombed,
             },
         )
         with self._path.open("a", encoding="utf-8") as handle:
