@@ -1,0 +1,99 @@
+"""Writing Desk tier-filters retrieval against the privacy override (#660).
+
+#463 shipped the real Graph/Retrieval agents but not the tier-filtering its own
+comments promised. These tests pin that a fragment whose ``privacy_tier``
+exceeds the run's override is **absent** from the evidence, while one at/below it
+is present — and that the override threads from the conductor.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from creek.author.agents import GraphSpecialist
+from creek.author.conductor import build_default_conductor
+from creek.classify.privacy_filter import PrivacyTierOverride
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from creek.author.models import EvidenceBundle
+
+
+def _seed(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    tier: str | None = None,
+    body: str = "body",
+) -> None:
+    """Write a minimal fragment file, optionally with a ``privacy_tier``."""
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    tier_line = f"privacy_tier: {tier}\n" if tier else ""
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"source:\n  platform: journal\n  author: self\n{tier_line}---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def _ids(bundle: EvidenceBundle) -> set[str]:
+    return {f for c in bundle.claims for f in c.source_fragments}
+
+
+def test_graph_specialist_excludes_above_override(tmp_path: Path) -> None:
+    """Default (OPEN) drops an INTIMATE fragment; ALL keeps it.
+
+    The open fragment links to the intimate one, so the walk *would* reach it —
+    the tier filter is what keeps it out of the evidence.
+    """
+    _seed(tmp_path, "frag-open", "Open note about q", body="[[frag-int]] body")
+    _seed(tmp_path, "frag-int", "Intimate note about q", tier="intimate")
+
+    default = GraphSpecialist().gather("q", tmp_path)
+    assert "frag-int" not in _ids(default)
+    assert "frag-open" in _ids(default)
+
+    everything = GraphSpecialist().gather(
+        "q",
+        tmp_path,
+        override=PrivacyTierOverride.ALL,
+    )
+    assert "frag-int" in _ids(everything)
+
+
+def test_personal_excluded_under_open_admitted_under_personal(
+    tmp_path: Path,
+) -> None:
+    """A PERSONAL fragment is gated by the override rank, not summarised."""
+    _seed(tmp_path, "frag-open", "Open about q", body="[[frag-pers]] body")
+    _seed(tmp_path, "frag-pers", "Personal about q", tier="personal")
+
+    under_open = GraphSpecialist().gather("q", tmp_path)
+    assert "frag-pers" not in _ids(under_open)
+
+    under_personal = GraphSpecialist().gather(
+        "q",
+        tmp_path,
+        override=PrivacyTierOverride.PERSONAL,
+    )
+    assert "frag-pers" in _ids(under_personal)
+
+
+def test_gather_evidence_threads_override(tmp_path: Path) -> None:
+    """The conductor passes the override down to the specialists."""
+    _seed(tmp_path, "frag-open", "Open about q")
+    _seed(tmp_path, "frag-int", "Intimate about q", tier="intimate")
+
+    conductor = build_default_conductor(max_rounds=1)
+    default = conductor.gather_evidence("q", tmp_path)
+    assert "frag-int" not in _ids(default)
+
+    everything = conductor.gather_evidence(
+        "q",
+        tmp_path,
+        override=PrivacyTierOverride.ALL,
+    )
+    assert "frag-int" in _ids(everything)

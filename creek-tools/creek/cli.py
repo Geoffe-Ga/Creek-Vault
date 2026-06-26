@@ -3213,6 +3213,15 @@ def author(
             "the vault's author.max_author_rounds config (3)."
         ),
     ),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=(
+            "Privacy ceiling for retrieved evidence: open (default) / personal "
+            "/ intimate / all. Fragments above the ceiling are excluded from "
+            "the desk's evidence (#660)."
+        ),
+    ),
 ) -> None:
     """Author a piece with the Creek Writing Desk (stub skeleton).
 
@@ -3232,11 +3241,26 @@ def author(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     rounds = max_rounds if max_rounds is not None else config.author.max_author_rounds
+    # #660: the privacy ceiling for retrieved evidence (default OPEN).
+    override = _parse_include_tier(include_tier)
 
     if dry_run:
         # The dry run only plans + gathers evidence; no voicing, so no client.
         conductor = build_default_conductor(max_rounds=rounds)
-        evidence = conductor.gather_evidence(effective_query, vault_path)
+        evidence = conductor.gather_evidence(
+            effective_query,
+            vault_path,
+            override=override,
+        )
+        # #660: an elevated --include-tier admits above-OPEN fragments into the
+        # evidence; record that operator decision in the privacy audit (no-op
+        # for None/OPEN). Mirrors the other --include-tier callers.
+        _audit_privacy_override_if_needed(
+            vault_path=vault_path,
+            command="author",
+            override=override,
+            fragment_ids=evidence.all_source_fragments(),
+        )
         console.print(f"PLAN: {' → '.join(conductor.plan())}")
         console.print(
             f"EVIDENCE (stub): {len(evidence.claims)} claims, "
@@ -3260,7 +3284,22 @@ def author(
     draft_result = build_default_conductor(
         max_rounds=rounds,
         llm_client=voice_client,
-    ).run(medium=medium, query=effective_query, vault=vault_path)
+    ).run(
+        medium=medium,
+        query=effective_query,
+        vault=vault_path,
+        override=override,
+    )
+    # #660: audit the elevated access using the fragments actually cited in the
+    # draft's provenance (no-op for None/OPEN).
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="author",
+        override=override,
+        fragment_ids=[
+            fid for entry in draft_result.provenance for fid in entry.fragment_ids
+        ],
+    )
     console.print(
         f"medium={draft_result.medium} verdict={draft_result.verdict} "
         f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author.client import AuthorLLMClient
+    from creek.classify.privacy_filter import PrivacyTierOverride
     from creek.config import AIStyleConfig
     from creek.generate.ai_style.model import VoiceFingerprint
     from creek.models import MediumContract
@@ -190,17 +191,29 @@ class Conductor:
         """Return the ordered pipeline step names for display/dry-run."""
         return [s.name for s in self.specialists] + list(_DOWNSTREAM_STEPS)
 
-    def gather_evidence(self, query: str, vault: Path) -> EvidenceBundle:
+    def gather_evidence(
+        self,
+        query: str,
+        vault: Path,
+        *,
+        override: PrivacyTierOverride | None = None,
+    ) -> EvidenceBundle:
         """Run the specialist roster then the synthesize step.
 
         Args:
             query: The user query.
             vault: The vault the specialists read from.
+            override: The privacy admission ceiling (#660) threaded to every
+                specialist so above-ceiling fragments never enter the evidence.
+                ``None`` defaults to ``OPEN``.
 
         Returns:
             The synthesized :class:`EvidenceBundle`.
         """
-        bundles = [specialist.gather(query, vault) for specialist in self.specialists]
+        bundles = [
+            specialist.gather(query, vault, override=override)
+            for specialist in self.specialists
+        ]
         return self.synthesize(bundles)
 
     def synthesize(self, bundles: Sequence[EvidenceBundle]) -> EvidenceBundle:
@@ -291,13 +304,22 @@ class Conductor:
             return (ai_style, None)
         return (ai_style, fingerprint)
 
-    def run(self, *, medium: str, query: str, vault: Path) -> AuthoredDraft:
+    def run(
+        self,
+        *,
+        medium: str,
+        query: str,
+        vault: Path,
+        override: PrivacyTierOverride | None = None,
+    ) -> AuthoredDraft:
         """Run the full author pipeline and return a shaped draft.
 
         Args:
             medium: The requested medium (only ``research`` is wired).
             query: The user query.
             vault: The vault to author from.
+            override: The privacy admission ceiling (#660); above-ceiling
+                fragments are excluded from the evidence. ``None`` => ``OPEN``.
 
         Returns:
             The :class:`AuthoredDraft` with mock provenance and a verdict. A
@@ -308,7 +330,7 @@ class Conductor:
             ValueError: When *medium* is unsupported.
         """
         validated = require_supported_medium(medium)
-        evidence = self.gather_evidence(query, vault)
+        evidence = self.gather_evidence(query, vault, override=override)
         rubric = self.contract.reflection_rubric if self.contract else None
         # Voice-fidelity is wired from the owner's persisted fingerprint (#506):
         # loaded once before the loop. When no fingerprint has been built the
@@ -398,6 +420,7 @@ def run_author(
     vault: Path,
     max_rounds: int | None = None,
     llm_client: AuthorLLMClient | None = None,
+    override: PrivacyTierOverride | None = None,
 ) -> AuthoredDraft:
     """Author *query* for *medium* against *vault* with the default desk.
 
@@ -409,6 +432,9 @@ def run_author(
             ``author.max_author_rounds`` config default.
         llm_client: Optional voice client (#658). When supplied, the desk
             renders live voicing; ``None`` keeps the deterministic stub.
+        override: The privacy admission ceiling (#660) threaded to the
+            specialists; above-ceiling fragments are excluded. ``None`` =>
+            ``OPEN``.
 
     Returns:
         The shaped :class:`AuthoredDraft`.
@@ -422,7 +448,7 @@ def run_author(
         max_rounds=rounds,
         llm_client=llm_client,
         contract=contract,
-    ).run(medium=medium, query=query, vault=vault)
+    ).run(medium=medium, query=query, vault=vault, override=override)
     return _enforce_chat_ceiling(draft)
 
 
@@ -438,7 +464,13 @@ class AuthorPlan(TypedDict):
     evidence: dict[str, int]
 
 
-def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
+def plan_author(
+    *,
+    medium: str,
+    query: str,
+    vault: Path,
+    override: PrivacyTierOverride | None = None,
+) -> AuthorPlan:
     """Return the pipeline plan + evidence summary without authoring (dry run).
 
     A lightweight preview for ``creek author --dry-run`` and the MCP verb's
@@ -449,6 +481,8 @@ def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
         medium: The requested medium.
         query: The user query.
         vault: The vault to gather evidence from.
+        override: The privacy admission ceiling (#660); above-ceiling fragments
+            are excluded from the previewed evidence. ``None`` => ``OPEN``.
 
     Returns:
         An :class:`AuthorPlan` with the step plan and evidence counts.
@@ -459,7 +493,7 @@ def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
     require_supported_medium(medium)
     contract = load_medium_contract(medium, vault)
     conductor = build_default_conductor(max_rounds=1, contract=contract)
-    evidence = conductor.gather_evidence(query, vault)
+    evidence = conductor.gather_evidence(query, vault, override=override)
     return {
         "plan": conductor.plan(),
         "evidence": {

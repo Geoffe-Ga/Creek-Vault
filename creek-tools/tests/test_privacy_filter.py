@@ -20,6 +20,7 @@ from creek.classify.privacy_filter import (
     override_elevates,
     parse_include_tier,
     record_privacy_override,
+    tier_within_override,
 )
 from creek.models import (
     Authorship,
@@ -230,3 +231,26 @@ def test_parse_include_tier_handles_known_and_unknown() -> None:
     assert parse_include_tier("ALL") is PrivacyTierOverride.ALL
     with pytest.raises(ValueError, match="--include-tier"):
         parse_include_tier("nope")
+
+
+@pytest.mark.parametrize(
+    ("tier", "override", "expected"),
+    [
+        (PrivacyTier.OPEN, PrivacyTierOverride.OPEN, True),
+        (PrivacyTier.UNCLASSIFIED, PrivacyTierOverride.OPEN, True),
+        (PrivacyTier.PERSONAL, PrivacyTierOverride.OPEN, False),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.OPEN, False),
+        (PrivacyTier.PERSONAL, PrivacyTierOverride.PERSONAL, True),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.PERSONAL, False),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.INTIMATE, True),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.ALL, True),
+        (PrivacyTier.INTIMATE, None, False),  # None defaults to OPEN
+    ],
+)
+def test_tier_within_override(
+    tier: PrivacyTier,
+    override: PrivacyTierOverride | None,
+    expected: bool,
+) -> None:
+    """The hard rank cutoff admits a tier iff it is at/below the override (#660)."""
+    assert tier_within_override(tier, override) is expected
