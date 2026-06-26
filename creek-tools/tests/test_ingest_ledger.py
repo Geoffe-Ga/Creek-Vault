@@ -127,6 +127,27 @@ class TestSourceLedger:
         ledger = SourceLedger.load(tmp_path, source="markdown")
         assert ledger.get("a/b.md") is not None
 
+    def test_records_missing_required_fields_are_rejected(self, tmp_path: Path) -> None:
+        """A row missing a required field (e.g. content_hash) is not loaded."""
+        path = SourceLedger.path_for(tmp_path, "markdown")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = json.dumps(
+            {"source_key": "a/b.md", "fragment_id": "frag-aaa", "last_seen": "t"}
+        )
+        empty_hash = json.dumps(
+            {
+                "source_key": "c/d.md",
+                "fragment_id": "frag-bbb",
+                "content_hash": "",
+                "last_seen": "t",
+            }
+        )
+        path.write_text(f"{partial}\n{empty_hash}\n", encoding="utf-8")
+        ledger = SourceLedger.load(tmp_path, source="markdown")
+        assert ledger.get("a/b.md") is None  # missing content_hash
+        assert ledger.get("c/d.md") is None  # empty content_hash
+        assert len(ledger) == 0
+
 
 # ---- Markdown ingest wiring (no-op pass-through) -----------------------
 

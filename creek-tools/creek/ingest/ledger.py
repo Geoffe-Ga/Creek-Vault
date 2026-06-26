@@ -92,7 +92,41 @@ class SourceLedger:
         return cls(path, records)
 
     @staticmethod
-    def _parse_line(line: str) -> LedgerRecord | None:
+    def _nonempty_str(value: object) -> str | None:
+        """Return *value* when it is a non-empty string, else ``None``."""
+        return value if isinstance(value, str) and value else None
+
+    @classmethod
+    def _record_from_dict(cls, data: dict[str, object]) -> LedgerRecord | None:
+        """Build a record from a parsed object, requiring every field.
+
+        A record is only accepted when ``source_key``, ``fragment_id``,
+        ``content_hash`` and ``last_seen`` are all present, non-empty
+        strings. Rejecting partial rows keeps a truncated or hand-edited
+        line from masquerading as a valid mapping — an empty ``content_hash``
+        would otherwise make the changed-check in #673 read every re-ingest
+        as "changed".
+        """
+        source_key = cls._nonempty_str(data.get("source_key"))
+        fragment_id = cls._nonempty_str(data.get("fragment_id"))
+        content_hash = cls._nonempty_str(data.get("content_hash"))
+        last_seen = cls._nonempty_str(data.get("last_seen"))
+        if (
+            source_key is None
+            or fragment_id is None
+            or content_hash is None
+            or last_seen is None
+        ):
+            return None
+        return LedgerRecord(
+            source_key=source_key,
+            fragment_id=fragment_id,
+            content_hash=content_hash,
+            last_seen=last_seen,
+        )
+
+    @classmethod
+    def _parse_line(cls, line: str) -> LedgerRecord | None:
         """Parse one JSONL line into a record, or ``None`` if malformed."""
         text = line.strip()
         if not text:
@@ -101,15 +135,9 @@ class SourceLedger:
             data = json.loads(text)
         except json.JSONDecodeError:
             return None
-        source_key = data.get("source_key") if isinstance(data, dict) else None
-        if not isinstance(source_key, str):
+        if not isinstance(data, dict):
             return None
-        return LedgerRecord(
-            source_key=source_key,
-            fragment_id=str(data.get("fragment_id", "")),
-            content_hash=str(data.get("content_hash", "")),
-            last_seen=str(data.get("last_seen", "")),
-        )
+        return cls._record_from_dict(data)
 
     def get(self, source_key: str) -> LedgerRecord | None:
         """Return the current record for *source_key*, or ``None``."""

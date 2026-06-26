@@ -351,12 +351,10 @@ def _record_in_ledger(
     """Record the written fragment in the source ledger (no-op skeleton, #672)."""
     if ledger is None or fragment.source.origin_key is None:
         return
-    from creek.ingest.ledger import SourceLedger
-
     ledger.record(
         fragment.source.origin_key,
         fragment.id,
-        SourceLedger.content_hash(parsed.content),
+        ledger.content_hash(parsed.content),
     )
 
 
