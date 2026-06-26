@@ -382,6 +382,18 @@ class ClassificationConfig(BaseModel):
     confidence_threshold: float = 0.7
     """Minimum confidence score for automatic classification."""
 
+    reclassify_on_edit_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    """Body-similarity floor below which an edited mutable source unit is
+    flagged for re-classification (#675 / SPEC R1).
+
+    When a journal/markdown fragment is updated in place, its body is compared
+    to the prior version (``difflib`` ratio in ``[0, 1]``). At/above this
+    threshold the edit is *trivial* (typo, whitespace) and classifications are
+    preserved; below it the change is *material* and the fragment's
+    ``classification_method`` is cleared so the next classify pass re-does only
+    that fragment (cooperating with OPS-001, no global ``--force``). ``0.0``
+    disables flagging (always preserve)."""
+
     auto_classify_sources: list[str] = Field(
         default_factory=lambda: ["claude", "chatgpt", "discord"],
     )
