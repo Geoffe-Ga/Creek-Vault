@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
     import pytest
 
+# difflib ratios vs _TRIVIAL: _TYPO ~0.99 (one dropped char, well above 0.9);
+# _MATERIAL ~0.27 (a full rewrite, well below 0.9). The wide margins keep the
+# tests robust to small threshold changes.
 _TRIVIAL = "A reflection on quiet mornings and slow pours of coffee at dawn."
 _TYPO = "A reflection on quiet morning and slow pours of coffee at dawn."
 _MATERIAL = "Thunderous chaos erupted across the crowded city streets at noon."
@@ -174,6 +177,10 @@ class TestIngestSummary:
         entry.write_text("---\ndate: 2026-06-26\n---\nFirst entry.\n", encoding="utf-8")
         _ingest(vault, journal, print_summary=True)
         assert "1 created, 0 updated, 0 tombed" in capsys.readouterr().out
+
+        # Re-run with NO changes: an unchanged no-op must not inflate any counter.
+        _ingest(vault, journal, print_summary=True)
+        assert "0 created, 0 updated, 0 tombed" in capsys.readouterr().out
 
         entry.write_text(
             "---\ndate: 2026-06-26\n---\nFirst entry, now meaningfully revised.\n",

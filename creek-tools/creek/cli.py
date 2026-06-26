@@ -428,17 +428,24 @@ def _write_fragment_idempotent(
         restored = _restore_tombed(
             writer, fragment, record, body, new_hash, reclassify_threshold
         )
-        if restored is not None:
-            return "updated"
-    elif record.content_hash != new_hash:
+        if restored is None:
+            # Tombstone lost out of band: recreate under the preserved id.
+            writer.write_fragment(fragment, body=body)
+        return "updated"
+    if record.content_hash != new_hash:
         fragment.id = record.fragment_id
         updated = writer.update_fragment(
             fragment, body, reclassify_threshold=reclassify_threshold
         )
-        if updated is not None:
-            return "updated"
+        if updated is None:
+            # File gone out of band: recreate under the preserved id.
+            writer.write_fragment(fragment, body=body)
+        return "updated"
+    # Known unit, content unchanged: idempotent no-op (the deterministic id
+    # dedups the write). Reported as unchanged so it never inflates the
+    # updated counter in the ingest summary.
     writer.write_fragment(fragment, body=body)
-    return "updated"
+    return "unchanged"
 
 
 def _tomb_missing_units(
@@ -564,8 +571,9 @@ def _run_ingest(
         written += 1
         if action == "created":
             created += 1
-        else:
+        elif action == "updated":
             updated += 1
+        # "unchanged" is an idempotent no-op — excluded from both counters.
 
     tombed = _tomb_missing_units(
         ledger, writer, input_path, seen_keys, errors, source_type

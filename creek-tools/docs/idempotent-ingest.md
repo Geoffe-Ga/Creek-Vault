@@ -71,6 +71,7 @@ Ingest summary: 3 created, 1 updated, 1 tombed
 ```
 
 - **created** — source units with no prior ledger record (new fragments).
-- **updated** — units that already had a ledger record (in-place updates,
-  restores, and unchanged no-ops).
+- **updated** — units whose content changed (in-place updates and restores).
+  Unchanged re-ingests are idempotent no-ops and are **not** counted here, so
+  the summary reflects only what actually changed.
 - **tombed** — units soft-tombed this run because their source vanished.

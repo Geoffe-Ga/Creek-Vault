@@ -406,6 +406,11 @@ def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
 
 def _clear_classification(post: frontmatter.Post) -> None:
     """Drop classification frontmatter so OPS-001 re-classifies on next pass."""
+    # Deferred import: `creek.classify.classify_engine` imports `VaultWriter`
+    # from this module, so a module-level import of `creek.classify.constants`
+    # here would close a load-time cycle. The constants are pure `Final[str]`;
+    # extracting them to a dependency-free module would let this move to the top
+    # (tracked as a follow-up).
     from creek.classify.constants import (
         CLASSIFICATION_METHOD_KEY,
         CLASSIFICATION_REASONING_KEY,
