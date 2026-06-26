@@ -390,6 +390,9 @@ def _write_fragment_idempotent(
     record = _ledger_record(ledger, fragment)
     if (
         record is not None
+        # `ledger is not None` is guaranteed when record is not None
+        # (_ledger_record returns None for a missing ledger); kept for mypy
+        # narrowing of the `ledger.content_hash` call below.
         and ledger is not None
         and record.content_hash != ledger.content_hash(parsed.content)
     ):
@@ -448,7 +451,9 @@ def _run_ingest(
             continue
         _attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
         try:
-            _write_fragment_idempotent(
+            # The written/updated path is intentionally unused — callers only
+            # need the written count and error list.
+            _ = _write_fragment_idempotent(
                 ledger,
                 writer,
                 parsed,

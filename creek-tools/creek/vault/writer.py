@@ -540,6 +540,7 @@ class VaultWriter:
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
+        target_dir = self._fragment_target_dir(fragment)
         slug = fragment.source.author_slug
         if slug:
             # The helper returns a stamped copy, so the caller's Fragment is
@@ -547,20 +548,17 @@ class VaultWriter:
             # attribution (#470).
             manifest = load_author_manifest_or_default(self.vault_path, slug)
             stamped = _apply_other_author_attribution(fragment, manifest)
-            target_dir = self.vault_path / OTHER_AUTHORS_DIR / slug
             return self._write_model(stamped, target_dir, body=body)
-        platform = fragment.source.platform
-        subfolder = _PLATFORM_SUBFOLDER[str(platform)]
-        target_dir = self.vault_path / "01-Fragments" / subfolder
         return self._write_model(fragment, target_dir, body=body)
 
     def _fragment_target_dir(self, fragment: Fragment) -> Path:
         """Return the vault directory a fragment routes to (#673).
 
-        Mirrors :meth:`write_fragment`: a borrowed fragment
-        (``source.author_slug`` set) lives under ``11-Other-Authors/<slug>/``;
-        a native fragment routes by source platform into
-        ``01-Fragments/<subfolder>/``.
+        The single source of truth for fragment routing, used by both
+        :meth:`write_fragment` and :meth:`update_fragment`: a borrowed
+        fragment (``source.author_slug`` set) lives under
+        ``11-Other-Authors/<slug>/``; a native fragment routes by source
+        platform into ``01-Fragments/<subfolder>/``.
         """
         slug = fragment.source.author_slug
         if slug:
@@ -600,6 +598,9 @@ class VaultWriter:
             post = frontmatter.load(str(existing))
             post.content = body
             _atomic_write_text(existing, frontmatter.dumps(post))
+            # Record the in-place edit in the provenance log too, so the audit
+            # trail captures subsequent rewrites — not just the original write.
+            self._log_provenance_locked(fragment.id, fragment.type, existing)
         return existing
 
     def write_thread(self, thread: Thread) -> Path:

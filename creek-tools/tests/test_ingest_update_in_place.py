@@ -103,6 +103,27 @@ class TestUpdateFragment:
         writer = VaultWriter(vault_path=vault)
         assert writer.update_fragment(ghost, body="x") is None
 
+    def test_target_dir_routes_native_and_borrowed(self, tmp_path: Path) -> None:
+        """Routing is the single source of truth for native + borrowed authors."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        native = Fragment(
+            id="frag-n",
+            title="N",
+            source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        )
+        borrowed = Fragment(
+            id="frag-b",
+            title="B",
+            source=FragmentSource(platform=SourcePlatform.JOURNAL, author_slug="ada"),
+        )
+        assert writer._fragment_target_dir(native) == (
+            vault / "01-Fragments" / "Journal"
+        )
+        assert writer._fragment_target_dir(borrowed) == (
+            vault / "11-Other-Authors" / "ada"
+        )
+
 
 # ---- End-to-end: ledger-driven changed branch --------------------------
 
@@ -118,7 +139,8 @@ class TestEditedJournalUpdatesInPlace:
             "---\ndate: 2026-06-26\n---\nFirst draft of today.\n",
             encoding="utf-8",
         )
-        _ingest(vault, entry)
+        _, errors, _ = _ingest(vault, entry)
+        assert errors == []
 
         files = _journal_files(vault)
         assert len(files) == 1
@@ -131,7 +153,8 @@ class TestEditedJournalUpdatesInPlace:
             "---\ndate: 2026-06-26\n---\nSecond, revised draft of today.\n",
             encoding="utf-8",
         )
-        _ingest(vault, entry)
+        _, errors, _ = _ingest(vault, entry)
+        assert errors == []
 
         files_after = _journal_files(vault)
         assert len(files_after) == 1  # no duplicate, no orphan
@@ -161,3 +184,45 @@ class TestEditedJournalUpdatesInPlace:
         files = _journal_files(vault)
         assert len(files) == 1
         assert frontmatter.load(str(files[0]))["id"] == first
+
+    def test_edit_after_out_of_band_delete_recreates_with_preserved_id(
+        self, tmp_path: Path
+    ) -> None:
+        """If the vault fragment vanished, an edit re-creates it with the same id.
+
+        Exercises the ``update_fragment → None`` fallback: the ledger still maps
+        the source unit to its id, the file is gone, and the changed-branch must
+        fall back to a fresh write under the *preserved* id (not a new one).
+        """
+        vault = _make_vault(tmp_path)
+        entry = vault / "personal" / "journal" / "2026-06-26.md"
+        entry.write_text(
+            "---\ndate: 2026-06-26\n---\nFirst draft.\n",
+            encoding="utf-8",
+        )
+        _, errors, _ = _ingest(vault, entry)
+        assert errors == []
+        original_id = frontmatter.load(str(_journal_files(vault)[0]))["id"]
+
+        # The vault fragment disappears out of band (the ledger still knows it).
+        _journal_files(vault)[0].unlink()
+        assert _journal_files(vault) == []
+
+        # Edit the source and re-ingest -> fallback write under the preserved id.
+        entry.write_text(
+            "---\ndate: 2026-06-26\n---\nRewritten after loss.\n",
+            encoding="utf-8",
+        )
+        _, errors, _ = _ingest(vault, entry)
+        assert errors == []
+
+        files = _journal_files(vault)
+        assert len(files) == 1
+        post = frontmatter.load(str(files[0]))
+        assert post["id"] == original_id  # preserved id, not a new hash
+        assert "Rewritten after loss" in post.content
+
+        ledger = SourceLedger.load(vault, source="markdown")
+        rec = ledger.get("personal/journal/2026-06-26.md")
+        assert rec is not None
+        assert rec.fragment_id == original_id
