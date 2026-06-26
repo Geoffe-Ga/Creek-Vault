@@ -7,8 +7,8 @@ description: >-
   writing desk", "route classification local and writing to Sonnet", "wire up
   per-stage routing", or "pull the ollama models for creek". The skill detects
   the current `llm:` block, the environment (key presence + cloud consent), and
-  Ollama reachability; writes the per-stage `llm:` block into
-  `<vault>/00-Creek-Meta/creek_config.yaml` (config only); guides the user to
+  Ollama reachability; writes the per-stage `llm:` block into the vault's
+  00-Creek-Meta/creek_config.yaml (config only); guides the user to
   set `ANTHROPIC_API_KEY` / `CREEK_CLOUD_CONSENT` in their environment; and
   offers to `ollama pull` the local models. It NEVER reads, echoes, logs, or
   writes an API key into any file. Do NOT use to edit routing source/tests
@@ -85,7 +85,10 @@ user knows where consent + key are required) and which are local.
    the model ids `qwen3:8b` / `qwen3:14b` / `mistral` / `claude-sonnet-4-6` (and
    `claude-haiku-4-5` only if the user explicitly opts in). **Never invent ids.**
 3. Get explicit confirmation, then **round-trip the YAML** so every unrelated
-   key survives — only the `llm:` block changes. There is no key field in the
+   key survives — only the `llm:` block changes. Prefer `ruamel.yaml`, which
+   preserves the file's existing formatting and comments; plain PyYAML works but
+   silently rewrites inline `{ }` blocks into expanded block style (harmless,
+   just noisier diffs — say so if you use it). There is no key field in the
    config; if a step ever tempts you to add one, STOP (see anti-bypass).
 
 ## Step 4 — Guide secrets into the environment (never YAML)
@@ -106,9 +109,12 @@ Then verify **presence only**:
 echo "CREEK_CLOUD_CONSENT=${CREEK_CLOUD_CONSENT:-unset}"
 ```
 For a persistent setup, point the user at their shell profile (`~/.zshrc`) — you
-may *suggest* the lines, but they add them. Tell the user that in a Claude Code
-session they can prefix a command with `! ` to run an interactive `export` so
-its effect lands in this session without the skill ever seeing the value.
+may *suggest* the lines, but they add them. The reliable path: have the user run
+the `export`s in **their own terminal tab/shell** (or add them to the profile)
+**before** starting the Creek pipeline, so the key is present in the environment
+that `creek` inherits — the skill never needs to see it. (Do not rely on running
+`export` inside a one-off command here: that runs in an ephemeral subshell, so it
+would not persist to later steps or to a separately launched `creek` process.)
 
 ## Step 5 — Local provider (Ollama)
 
@@ -126,9 +132,11 @@ system package without asking.
 1. Per-stage availability: the configured cloud stages are usable only when the
    key + consent are present; local stages need a reachable Ollama. Surface any
    stage that would fall back.
-2. Optional live smoke (only with the key + consent set), per the README:
-   `cd creek-tools && ./scripts/test.sh --integration -k anthropic` (or
-   `CREEK_SMOKE_MODEL=<id> ... -k <provider>`).
+2. Optional live smoke (only with the key + consent set), per the README — run
+   it from the `creek-tools/` subproject directory (the `scripts/` live there,
+   not at the repo root):
+   `cd <repo>/creek-tools && ./scripts/test.sh --integration -k anthropic` (or
+   `CREEK_SMOKE_MODEL=<id> ./scripts/test.sh --integration -k <provider>`).
 3. Print a **per-stage summary table**: stage → provider → model → ready? Then
    tell the user the Intimate guarantee below is already in force.
 
