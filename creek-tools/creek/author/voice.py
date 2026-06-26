@@ -72,6 +72,7 @@ class VoiceAgent:
         *,
         medium: Medium | None = None,
         contract: MediumContract | None = None,
+        client: AuthorLLMClient | None = None,
     ) -> str:
         """Render *evidence* into draft prose for *query* in the owner's voice.
 
@@ -84,6 +85,9 @@ class VoiceAgent:
                 (research = light touch).
             contract: The medium contract whose ``structure`` orders the
                 grounded evidence in the prompt.
+            client: A per-render client override (#661) — the conductor passes
+                the tier-routed voice client here. ``None`` falls back to the
+                agent's own :attr:`llm_client`.
 
         Returns:
             The voiced draft body. The LLM output when a client and vault are
@@ -93,11 +97,12 @@ class VoiceAgent:
         # Reset first so a deterministic render never leaks a prior LLM call's
         # usage if this agent instance is reused (#474 review).
         self.last_usage = None
+        effective_client = client if client is not None else self.llm_client
         deterministic = _deterministic_body(query, evidence)
-        if self.llm_client is None or vault is None:
+        if effective_client is None or vault is None:
             return deterministic
         static, dynamic = _split_voice_prompt(query, evidence, vault, medium, contract)
-        completion = self.llm_client.complete_with_usage(dynamic, system=static)
+        completion = effective_client.complete_with_usage(dynamic, system=static)
         self.last_usage = completion.usage
         voiced = completion.text.strip()
         return voiced or deterministic
