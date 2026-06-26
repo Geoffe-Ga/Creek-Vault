@@ -137,9 +137,29 @@ class TestSyncCommand:
         assert "tier" in result.output.lower()
 
     def test_unknown_source_errors(self, tmp_path: Path) -> None:
-        """An unknown --source exits non-zero."""
+        """An unknown --source exits non-zero with a source-specific message."""
         vault = _make_vault(tmp_path)
         result = runner.invoke(
             app, ["sync", "--tier", "A", "--source", "nope", "--vault", str(vault)]
         )
         assert result.exit_code != 0
+        assert "source" in result.output.lower()
+
+    def test_tier_b_with_source_errors(self, tmp_path: Path) -> None:
+        """--source is rejected with Tier B (it is a Tier-A concept)."""
+        vault = _make_vault(tmp_path)
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "B", "--source", "journal", "--vault", str(vault)],
+        )
+        assert result.exit_code != 0
+        assert "source" in result.output.lower()
+
+    def test_second_run_reports_previous(self, tmp_path: Path) -> None:
+        """A second run echoes the prior recorded run."""
+        vault = _make_vault(tmp_path)
+        runner.invoke(app, ["sync", "--tier", "A", "--vault", str(vault)])
+        result = runner.invoke(app, ["sync", "--tier", "B", "--vault", str(vault)])
+        assert result.exit_code == 0, result.output
+        assert "previous run" in result.output.lower()
+        assert _state(vault)["tier"] == "B"

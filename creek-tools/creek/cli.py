@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -23,7 +25,12 @@ from creek.classify.privacy_filter import (
 from creek.config import AIStyleConfig, load_config, resolve_config_path
 from creek.consent import ConsentManager
 from creek.models import PrivacyTier
-from creek.pipeline import Pipeline, RedactionRequiredError
+from creek.pipeline import (
+    Pipeline,
+    RedactionRequiredError,
+    resolve_tier_a_plan,
+    resolve_tier_b_plan,
+)
 from creek.save import SaveTarget
 
 logger = logging.getLogger(__name__)
@@ -713,11 +720,13 @@ def init(
         )
 
 
-def _write_sync_state(vault_path: Path, tier: str) -> dict[str, object] | None:
+def _write_sync_state(
+    vault_path: Path,
+    tier: str,
+    *,
+    dry_run: bool,
+) -> dict[str, object] | None:
     """Write the sync last-run state, returning the prior state if any (#676)."""
-    import json
-    from datetime import UTC, datetime
-
     state_path = vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
     prior: dict[str, object] | None = None
     if state_path.exists():
@@ -727,7 +736,7 @@ def _write_sync_state(vault_path: Path, tier: str) -> dict[str, object] | None:
         except (OSError, json.JSONDecodeError):
             prior = None
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state = {"tier": tier, "at": datetime.now(UTC).isoformat(), "dry_run": True}
+    state = {"tier": tier, "at": datetime.now(UTC).isoformat(), "dry_run": dry_run}
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     return prior
 
@@ -736,9 +745,7 @@ def _sync_tier_a(
     enabled_sources: list[str],
     source: str | None,
 ) -> None:
-    """Echo the Tier-A per-source plan (#676 dry-run skeleton)."""
-    from creek.pipeline import resolve_tier_a_plan
-
+    """Echo the Tier-A per-source plan (dry-run skeleton)."""
     sources = [source] if source is not None else enabled_sources
     console.print(
         f"[sync] tier=A (dry-run) enabled sources: "
@@ -750,9 +757,7 @@ def _sync_tier_a(
 
 
 def _sync_tier_b() -> None:
-    """Echo the Tier-B global plan (#676 dry-run skeleton)."""
-    from creek.pipeline import resolve_tier_b_plan
-
+    """Echo the Tier-B global plan (dry-run skeleton)."""
     console.print("[sync] tier=B (dry-run) global passes")
     console.print(f"[sync] plan: {' -> '.join(resolve_tier_b_plan())}")
 
@@ -790,6 +795,11 @@ def sync(
             "[/yellow]",
         )
 
+    if tier_norm == "B" and source is not None:
+        # --source is a Tier-A concept; Tier B always runs the global passes.
+        console.print("[red]--source is not supported with --tier B.[/red]")
+        raise typer.Exit(code=2)
+
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
 
@@ -805,7 +815,7 @@ def sync(
     else:
         _sync_tier_b()
 
-    prior = _write_sync_state(vault_path, tier_norm)
+    prior = _write_sync_state(vault_path, tier_norm, dry_run=True)
     if prior is not None:
         console.print(
             f"[sync] (previous run: tier={prior.get('tier')} at {prior.get('at')})",

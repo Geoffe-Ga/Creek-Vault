@@ -52,7 +52,7 @@ from creek.vault.writer import VaultWriter
 logger = logging.getLogger(__name__)
 
 
-# Map a ``creek sync`` source name -> the ingestor type it routes to (#676).
+# Map a ``creek sync`` source name -> the ingestor type it routes to.
 _SYNC_INGEST_TYPE: dict[str, str] = {
     "journal": "markdown",
     "gdrive": "gdrive",
