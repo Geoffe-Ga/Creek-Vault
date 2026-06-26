@@ -372,6 +372,31 @@ def _ledger_record(
     return ledger.get(origin_key)
 
 
+def _restore_tombed(
+    writer: VaultWriter,
+    fragment: Fragment,
+    record: LedgerRecord,
+    body: str,
+    new_hash: str,
+) -> Path | None:
+    """Un-tomb a re-appeared source unit and apply its body (#674).
+
+    Reuses the preserved fragment id and moves the tombed fragment back into
+    its routing directory. Only when the content actually changed does it
+    rewrite the body in place — an unchanged re-appearance restores without a
+    redundant write. Returns ``None`` when no tombed file maps to the id, so
+    the caller falls back to a fresh write under the preserved id.
+    """
+    fragment.id = record.fragment_id
+    restored = writer.restore_fragment(fragment)
+    if restored is None:
+        return None
+    if new_hash == record.content_hash:
+        return restored
+    updated = writer.update_fragment(fragment, body)
+    return updated if updated is not None else restored
+
+
 def _write_fragment_idempotent(
     ledger: SourceLedger | None,
     writer: VaultWriter,
@@ -388,19 +413,61 @@ def _write_fragment_idempotent(
     no-op. A new unit is written fresh.
     """
     record = _ledger_record(ledger, fragment)
-    if (
-        record is not None
-        # `ledger is not None` is guaranteed when record is not None
-        # (_ledger_record returns None for a missing ledger); kept for mypy
-        # narrowing of the `ledger.content_hash` call below.
-        and ledger is not None
-        and record.content_hash != ledger.content_hash(parsed.content)
-    ):
+    # `record is not None` guarantees `ledger is not None` (_ledger_record
+    # returns None for a missing ledger); the explicit guard narrows for mypy.
+    if record is None or ledger is None:
+        return writer.write_fragment(fragment, body=body)
+    new_hash = ledger.content_hash(parsed.content)
+    if record.tombed:
+        restored = _restore_tombed(writer, fragment, record, body, new_hash)
+        if restored is not None:
+            return restored
+    elif record.content_hash != new_hash:
         fragment.id = record.fragment_id
         updated = writer.update_fragment(fragment, body)
         if updated is not None:
             return updated
     return writer.write_fragment(fragment, body=body)
+
+
+def _tomb_missing_units(
+    ledger: SourceLedger | None,
+    writer: VaultWriter,
+    input_path: Path,
+    seen_keys: set[str],
+    errors: list[str],
+    source_type: str,
+) -> None:
+    """Soft-tomb ledgered units absent from a full-source pass (#674).
+
+    Only a directory (full-source) input computes a gone set; a single-file
+    ``--input`` run never tombs — that guards the incremental epic from
+    tombing every other unit when re-ingesting one file.
+
+    A tomb that fails on I/O is collected into *errors* (matching the
+    per-fragment write path) and the unit is left live in the ledger so the
+    next full-source pass retries it, rather than crashing the whole run.
+    """
+    if ledger is None or not input_path.is_dir():
+        return
+    for source_key in sorted(ledger.live_keys() - seen_keys):
+        record = ledger.get(source_key)
+        if record is None:
+            continue
+        try:
+            writer.tomb_fragment(record.fragment_id)
+        except (OSError, KeyError) as exc:
+            errors.append(
+                f"[{source_type}] failed to tomb {record.fragment_id}: {exc}",
+            )
+            continue
+        ledger.record(
+            source_key,
+            record.fragment_id,
+            record.content_hash,
+            last_seen=record.last_seen,
+            tombed=True,
+        )
 
 
 def _run_ingest(
@@ -440,6 +507,7 @@ def _run_ingest(
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
+    seen_keys: set[str] = set()
     for parsed in ingest_result.fragments:
         try:
             assembled = assemble_ingested_fragment(parsed)
@@ -450,6 +518,9 @@ def _run_ingest(
             )
             continue
         _attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
+        origin_key = assembled.fragment.source.origin_key
+        if origin_key is not None:
+            seen_keys.add(origin_key)
         try:
             # The written/updated path is intentionally unused — callers only
             # need the written count and error list.
@@ -468,6 +539,7 @@ def _run_ingest(
         _record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
 
+    _tomb_missing_units(ledger, writer, input_path, seen_keys, errors, source_type)
     return written, errors, ingest_result.discovered
 
 
