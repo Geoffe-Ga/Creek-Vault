@@ -52,6 +52,42 @@ from creek.vault.writer import VaultWriter
 logger = logging.getLogger(__name__)
 
 
+# Map a ``creek sync`` source name -> the ingestor type it routes to.
+_SYNC_INGEST_TYPE: dict[str, str] = {
+    "journal": "markdown",
+    "gdrive": "gdrive",
+    "discord": "discord",
+    "chatgpt": "chatgpt",
+    "claude": "claude",
+    "essays": "substack",
+}
+
+
+def resolve_tier_a_plan(source: str) -> list[str]:
+    """Return the ordered Tier-A subcommand plan for *source* (#676).
+
+    Tier A is the cheap, per-source pass: pull the source, incrementally
+    ingest it, then run the offline rules classifier. This is a *plan* (an
+    ordered list of human-readable step strings) — the skeleton command echoes
+    it; real execution lands in a later issue.
+    """
+    ingest_type = _SYNC_INGEST_TYPE.get(source, source)
+    return [
+        "pull",
+        f"ingest --type {ingest_type} --since <ledger>",
+        "classify --method rules",
+    ]
+
+
+def resolve_tier_b_plan() -> list[str]:
+    """Return the ordered Tier-B subcommand plan (#676).
+
+    Tier B is the nightly, global pass: LLM classification then the expensive
+    link + index rebuilds. Returned as an ordered list of step strings.
+    """
+    return ["classify --method llm", "link", "index"]
+
+
 class RedactionRequiredError(RuntimeError):
     """Raised when ``creek process`` finds unresolved redaction matches.
 

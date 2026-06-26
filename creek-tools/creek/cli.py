@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -23,7 +25,12 @@ from creek.classify.privacy_filter import (
 from creek.config import AIStyleConfig, load_config, resolve_config_path
 from creek.consent import ConsentManager
 from creek.models import PrivacyTier
-from creek.pipeline import Pipeline, RedactionRequiredError
+from creek.pipeline import (
+    Pipeline,
+    RedactionRequiredError,
+    resolve_tier_a_plan,
+    resolve_tier_b_plan,
+)
 from creek.save import SaveTarget
 
 logger = logging.getLogger(__name__)
@@ -711,6 +718,111 @@ def init(
             f"[bold green]Refreshed canonical templates in {vault}.[/bold green] "
             f"(skills: {result.skills_synced})",
         )
+
+
+def _write_sync_state(
+    vault_path: Path,
+    tier: str,
+    *,
+    dry_run: bool,
+) -> dict[str, object] | None:
+    """Write the sync last-run state, returning the prior state if any (#676)."""
+    state_path = vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
+    prior: dict[str, object] | None = None
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            prior = loaded if isinstance(loaded, dict) else None
+        except (OSError, json.JSONDecodeError):
+            prior = None
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {"tier": tier, "at": datetime.now(UTC).isoformat(), "dry_run": dry_run}
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return prior
+
+
+def _sync_tier_a(
+    enabled_sources: list[str],
+    source: str | None,
+) -> None:
+    """Echo the Tier-A per-source plan (dry-run skeleton)."""
+    sources = [source] if source is not None else enabled_sources
+    console.print(
+        f"[sync] tier=A (dry-run) enabled sources: "
+        f"{', '.join(sources) if sources else '(none)'}",
+    )
+    for name in sources:
+        plan = " -> ".join(resolve_tier_a_plan(name))
+        console.print(f"[sync] plan ({name}): {plan}")
+
+
+def _sync_tier_b() -> None:
+    """Echo the Tier-B global plan (dry-run skeleton)."""
+    console.print("[sync] tier=B (dry-run) global passes")
+    console.print(f"[sync] plan: {' -> '.join(resolve_tier_b_plan())}")
+
+
+@app.command()
+def sync(
+    tier: str = typer.Option(
+        "A", "--tier", help="A (cheap, per-source) or B (nightly)"
+    ),
+    source: str | None = typer.Option(
+        None, "--source", help="Limit a Tier-A run to a single source"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Echo the plan without executing (current default)"
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Plan a scheduled sync pass (#676 -- dry-run skeleton).
+
+    ``--tier A`` resolves the cheap per-source plan (pull -> incremental ingest
+    -> rules classify) for each enabled source; ``--tier B`` resolves the
+    nightly global plan (LLM classify -> link -> index). This skeleton only
+    **echoes** the ordered plan and records
+    ``00-Creek-Meta/State/sync/last-run.json`` -- real pulling/ingesting/
+    scheduling land in later issues (#677-#680).
+    """
+    tier_norm = tier.upper()
+    if tier_norm not in {"A", "B"}:
+        console.print("[red]--tier must be A or B[/red]")
+        raise typer.Exit(code=2)
+    if not dry_run:
+        # Real execution lands in #678; until then every run plans only.
+        console.print(
+            "[yellow][sync] skeleton supports planning only; running as dry-run."
+            "[/yellow]",
+        )
+
+    if tier_norm == "B" and source is not None:
+        # --source is a Tier-A concept; Tier B always runs the global passes.
+        console.print("[red]--source is not supported with --tier B.[/red]")
+        raise typer.Exit(code=2)
+
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+
+    if source is not None and source not in config.sync.sources:
+        known = ", ".join(sorted(config.sync.sources))
+        console.print(
+            f"[red]Unknown --source '{source}'. Known sources: {known}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+    if tier_norm == "A":
+        _sync_tier_a(config.sync.enabled_sources(), source)
+    else:
+        _sync_tier_b()
+
+    prior = _write_sync_state(vault_path, tier_norm, dry_run=True)
+    if prior is not None:
+        console.print(
+            f"[sync] (previous run: tier={prior.get('tier')} at {prior.get('at')})",
+        )
+    console.print(
+        f"[sync] last-run.json: wrote tier={tier_norm} (skeleton; no units processed)",
+    )
 
 
 @app.command()
