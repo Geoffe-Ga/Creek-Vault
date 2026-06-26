@@ -234,3 +234,41 @@ def test_skills_help_mentions_include_tier() -> None:
     result = runner.invoke(app, ["skills", "generate", "--help"])
     assert result.exit_code == 0
     assert "--include-tier" in _plain(result.output)
+
+
+def test_author_with_include_tier_writes_audit(tmp_path: Path) -> None:
+    """``creek author --include-tier intimate`` writes a privacy audit entry (#660)."""
+    vault = _make_mining_vault(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--vault",
+            str(vault),
+            "--query",
+            "what is the thread about",
+            "--include-tier",
+            "intimate",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    audit_path = vault / PRIVACY_AUDIT_RELPATH
+    assert audit_path.exists()
+    entries = list(AuditLog(audit_path).read())
+    assert any(
+        e["command"] == "author" and e["include_tier"] == "intimate" for e in entries
+    )
+
+
+def test_author_default_writes_no_audit(tmp_path: Path) -> None:
+    """Default ``creek author`` (OPEN ceiling) writes no privacy audit entry."""
+    vault = _make_mining_vault(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["author", "--vault", str(vault), "--query", "what is the thread about"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not (vault / PRIVACY_AUDIT_RELPATH).exists()

@@ -3252,6 +3252,15 @@ def author(
             vault_path,
             override=override,
         )
+        # #660: an elevated --include-tier admits above-OPEN fragments into the
+        # evidence; record that operator decision in the privacy audit (no-op
+        # for None/OPEN). Mirrors the other --include-tier callers.
+        _audit_privacy_override_if_needed(
+            vault_path=vault_path,
+            command="author",
+            override=override,
+            fragment_ids=evidence.all_source_fragments(),
+        )
         console.print(f"PLAN: {' → '.join(conductor.plan())}")
         console.print(
             f"EVIDENCE (stub): {len(evidence.claims)} claims, "
@@ -3280,6 +3289,16 @@ def author(
         query=effective_query,
         vault=vault_path,
         override=override,
+    )
+    # #660: audit the elevated access using the fragments actually cited in the
+    # draft's provenance (no-op for None/OPEN).
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="author",
+        override=override,
+        fragment_ids=[
+            fid for entry in draft_result.provenance for fid in entry.fragment_ids
+        ],
     )
     console.print(
         f"medium={draft_result.medium} verdict={draft_result.verdict} "
