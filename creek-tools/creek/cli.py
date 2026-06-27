@@ -1246,6 +1246,12 @@ def _run_discord_data_package(vault_path: Path, package: Path) -> None:
     if not package.exists():
         console.print(f"[red]Data Package path does not exist: {package}[/red]")
         raise typer.Exit(code=1)
+    if not package.is_dir():
+        console.print(
+            f"[red]Data Package must be the unzipped export directory, "
+            f"not a file: {package}[/red]"
+        )
+        raise typer.Exit(code=1)
     new_count = run_discord_data_package(vault_path, package)
     console.print(
         f"[green][discord] data_package ingested {new_count} new fragment(s).[/green]"

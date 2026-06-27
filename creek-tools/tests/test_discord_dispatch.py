@@ -238,6 +238,33 @@ class TestDiscordDataPackageCli:
         assert result.exit_code == 1
         assert "does not exist" in result.output
 
+    def test_package_that_is_a_file_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file (e.g. an un-unzipped .zip) instead of a dir errors clearly."""
+        from creek.config import CreekConfig
+
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig()
+        )
+        pkg_file = tmp_path / "package.zip"
+        pkg_file.write_text("not unzipped", encoding="utf-8")
+
+        result = runner.invoke(
+            app,
+            [
+                "discord",
+                "--mode",
+                "data_package",
+                "--package",
+                str(pkg_file),
+                "--vault",
+                str(tmp_path),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "directory" in result.output
+
     def test_disabled_mode_with_package_exits_nonzero(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

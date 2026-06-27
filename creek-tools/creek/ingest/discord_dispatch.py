@@ -1,8 +1,10 @@
-"""Discord ingest-mode dispatch — skeleton stubs (#685).
+"""Discord ingest-mode dispatch + the opt-in user-token DM exporter (#685/#686).
 
 Resolves a configured Discord mode (``data_package`` | ``exporter`` |
-``bot_capture``) to a handler that echoes the pull-then-ingest plan. **No
-network, no exporter binary, no bot capture** — those are issues #686/#687/#688.
+``bot_capture``) to a handler that echoes its plan. The real ingest paths now
+exist: the user-token DM :class:`ExporterConnector` lives here (#686); the
+Data Package helper (``run_discord_data_package``, #688) and the bot-capture
+consumer (``ingest_capture_dir``, #687) live in :mod:`creek.ingest.discord`.
 
 A bot cannot read DMs (Discord API limit), so the three modes differ by coverage
 and compliance (SPEC R5, decision #3). The ``exporter`` mode is OFF by default

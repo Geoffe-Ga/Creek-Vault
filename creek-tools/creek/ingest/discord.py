@@ -814,9 +814,12 @@ def stage_capture_as_data_package(capture_dir: Path, staging_dir: Path) -> None:
 def _write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     """Assemble + write every parsed fragment; return the written vault paths.
 
-    Shared by the bot-capture and Data-Package ingest paths. Writing is
-    idempotent on the deterministic ``frag-<sha>`` id, so re-writing an
-    already-present fragment overwrites the same file in place.
+    Shared by the bot-capture and Data-Package ingest paths. This **always**
+    writes each fragment — it does not skip existing files — but the path is
+    deterministic (``frag-<sha>``), so re-writing an already-present fragment
+    overwrites the same file in place. Callers that need a "new only" count diff
+    the returned paths against a pre-run snapshot (see
+    :func:`run_discord_data_package`).
 
     Args:
         result: The ingestor's result carrying the parsed fragments.
