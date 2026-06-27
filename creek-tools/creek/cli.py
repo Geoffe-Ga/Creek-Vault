@@ -1235,14 +1235,32 @@ def _run_discord_exporter(
     console.print("[green][discord] exporter run complete; staged + ingested.[/green]")
 
 
+def _run_discord_data_package(vault_path: Path, package: Path) -> None:
+    """Ingest a downloaded Discord Data Package incrementally (#688).
+
+    The clean, always-available compliant path — no token, no ToS concern. Stable
+    Discord ids make a re-pointed package a clean no-op (only new messages cost).
+    """
+    from creek.ingest.discord import run_discord_data_package
+
+    if not package.exists():
+        console.print(f"[red]Data Package path does not exist: {package}[/red]")
+        raise typer.Exit(code=1)
+    new_count = run_discord_data_package(vault_path, package)
+    console.print(
+        f"[green][discord] data_package ingested {new_count} new fragment(s).[/green]"
+    )
+
+
 def _dispatch_discord(
     selected: DiscordMode,
     config: CreekConfig,
     vault_path: Path,
     *,
     dry_run: bool,
+    package: Path | None = None,
 ) -> None:
-    """Run the real exporter, or echo the stub plan for the selected mode (#686)."""
+    """Run the exporter / Data Package helper, else echo the mode plan (#686/#688)."""
     from creek.ingest.discord_dispatch import (
         DiscordMode,
         ModeDisabledError,
@@ -1258,6 +1276,14 @@ def _dispatch_discord(
     ):
         _run_discord_exporter(config, vault_path, binary)
         return
+    if (
+        selected is DiscordMode.DATA_PACKAGE
+        and config.discord.data_package.enabled
+        and package is not None
+        and not dry_run
+    ):
+        _run_discord_data_package(vault_path, package)
+        return
 
     try:
         handler = resolve_discord_handler(selected, config.discord)
@@ -1270,8 +1296,9 @@ def _dispatch_discord(
         console.print(line)
     if not dry_run:
         console.print(
-            "[dim][discord] echo only — set discord.exporter_binary to run the "
-            "exporter, or run #687/#688 paths.[/dim]",
+            "[dim][discord] echo only — pass --package <path> for data_package, "
+            "set discord.exporter_binary for the exporter, or run the bot for "
+            "bot_capture.[/dim]",
         )
 
 
@@ -1283,21 +1310,26 @@ def discord(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Echo the plan without running"
     ),
+    package: Path | None = typer.Option(
+        None, "--package", help="Path to a downloaded Discord Data Package to ingest"
+    ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Dispatch a Discord ingest mode (#685/#686).
+    """Dispatch a Discord ingest mode (#685/#686/#688).
 
     Resolves ``--mode`` against the configured Discord toggles. When
     ``exporter`` is enabled and ``discord.exporter_binary`` is set (and not
-    ``--dry-run``), runs the real opt-in user-token DM exporter; otherwise
+    ``--dry-run``), runs the real opt-in user-token DM exporter. When
+    ``data_package`` is selected with ``--package <path>`` (and not
+    ``--dry-run``), incrementally ingests the downloaded Data Package. Otherwise
     echoes the mode's plan. The ``exporter`` mode is opt-in (off by default) and
     prints a Terms-of-Service caveat. The Discord token lives in the
-    environment, never in config (bot capture is #687; Data Package is #688).
+    environment, never in config; the Data Package path carries no token.
     """
     selected = _parse_discord_mode(mode)
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
-    _dispatch_discord(selected, config, vault_path, dry_run=dry_run)
+    _dispatch_discord(selected, config, vault_path, dry_run=dry_run, package=package)
 
 
 @app.command()

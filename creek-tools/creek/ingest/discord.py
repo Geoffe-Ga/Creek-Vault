@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
 from creek.ingest.base import (
     Ingestor,
+    IngestResult,
     ParsedFragment,
     RawDocument,
     normalize_timestamp,
@@ -810,6 +811,31 @@ def stage_capture_as_data_package(capture_dir: Path, staging_dir: Path) -> None:
         )
 
 
+def _write_fragments(result: IngestResult, vault: Path) -> list[Path]:
+    """Assemble + write every parsed fragment; return the written vault paths.
+
+    Shared by the bot-capture and Data-Package ingest paths. Writing is
+    idempotent on the deterministic ``frag-<sha>`` id, so re-writing an
+    already-present fragment overwrites the same file in place.
+
+    Args:
+        result: The ingestor's result carrying the parsed fragments.
+        vault: The Creek vault to write into.
+
+    Returns:
+        The vault path written for each fragment, in order.
+    """
+    from creek.ingest.base import assemble_ingested_fragment
+    from creek.vault.writer import VaultWriter
+
+    writer = VaultWriter(vault_path=vault)
+    paths: list[Path] = []
+    for parsed in result.fragments:
+        assembled = assemble_ingested_fragment(parsed)
+        paths.append(writer.write_fragment(assembled.fragment, body=assembled.body))
+    return paths
+
+
 def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
     """Stage + ingest a bot-capture dir into *vault*; return fragments written.
 
@@ -825,9 +851,6 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
     Returns:
         The number of fragments written this run.
     """
-    from creek.ingest.base import assemble_ingested_fragment
-    from creek.vault.writer import VaultWriter
-
     # Stable, deterministic staging path (not a random tempdir) so the
     # source-path-derived fragment id stays constant across runs. A kill between
     # the rmtree and ingest leaves an empty/partial staging dir and writes zero
@@ -838,11 +861,35 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
     stage_capture_as_data_package(capture_dir, staging)
-    result = DiscordIngestor().ingest(staging)
-    writer = VaultWriter(vault_path=vault)
-    count = 0
-    for parsed in result.fragments:
-        assembled = assemble_ingested_fragment(parsed)
-        writer.write_fragment(assembled.fragment, body=assembled.body)
-        count += 1
-    return count
+    return len(_write_fragments(DiscordIngestor().ingest(staging), vault))
+
+
+def run_discord_data_package(vault: Path, package: Path) -> int:
+    """Ingest a downloaded Discord Data Package into *vault*; return new count (#688).
+
+    The clean, always-available compliant path. The existing
+    :class:`DiscordIngestor` reads the package in place (``messages/<channel>/``)
+    with no reshape and no parser rewrite. Stable Discord message ids make a
+    re-pointed or overlapping package a clean **no-op**: only fragments whose
+    vault file did not already exist are counted as ingested, so there is no
+    LLM/link re-spend on already-seen messages. The token-bearing modes
+    (exporter/bot-capture) are unaffected — this path carries no secret.
+
+    Args:
+        vault: The Creek vault to write fragments into.
+        package: Path to the downloaded Discord Data Package root (the dir
+            containing ``messages/``).
+
+    Returns:
+        The number of **newly created** fragments this run (overwrites of
+        already-present fragments are not counted).
+    """
+    fragments_root = vault / "01-Fragments"
+    before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()
+    written = _write_fragments(DiscordIngestor().ingest(package), vault)
+    new = 0
+    for path in written:
+        if path not in before:
+            before.add(path)
+            new += 1
+    return new

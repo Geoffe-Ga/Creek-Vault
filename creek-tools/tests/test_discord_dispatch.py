@@ -132,3 +132,97 @@ class TestDiscordCommand:
         )
         assert result.exit_code != 0
         assert "mode" in result.output.lower()
+
+
+class TestDiscordDataPackageCli:
+    """`creek discord --mode data_package --package` routes to the helper (#688)."""
+
+    def test_package_runs_helper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """data_package + --package (no --dry-run) calls the real helper."""
+        from creek.config import CreekConfig
+
+        called: list[tuple[Path, Path]] = []
+        monkeypatch.setattr(
+            "creek.cli._run_discord_data_package",
+            lambda vault, package: called.append((vault, package)),
+        )
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig()
+        )
+        pkg = tmp_path / "discord-export"
+        pkg.mkdir()
+
+        result = runner.invoke(
+            app,
+            [
+                "discord",
+                "--mode",
+                "data_package",
+                "--package",
+                str(pkg),
+                "--vault",
+                str(tmp_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert called == [(tmp_path, pkg)]
+
+    def test_dry_run_echoes_not_runs_helper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--dry-run echoes the plan and does NOT invoke the helper."""
+        from creek.config import CreekConfig
+
+        called: list[object] = []
+        monkeypatch.setattr(
+            "creek.cli._run_discord_data_package",
+            lambda vault, package: called.append((vault, package)),
+        )
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig()
+        )
+        pkg = tmp_path / "discord-export"
+        pkg.mkdir()
+
+        result = runner.invoke(
+            app,
+            [
+                "discord",
+                "--mode",
+                "data_package",
+                "--package",
+                str(pkg),
+                "--dry-run",
+                "--vault",
+                str(tmp_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert called == []  # dry-run -> stub echo, helper not called
+        assert "data_package" in result.output
+
+    def test_missing_package_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pointed-at package that does not exist exits non-zero."""
+        from creek.config import CreekConfig
+
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig()
+        )
+        result = runner.invoke(
+            app,
+            [
+                "discord",
+                "--mode",
+                "data_package",
+                "--package",
+                str(tmp_path / "absent"),
+                "--vault",
+                str(tmp_path),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "does not exist" in result.output
