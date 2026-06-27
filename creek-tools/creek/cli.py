@@ -781,14 +781,27 @@ def init(
         )
 
 
+def _sync_state_path(vault_path: Path) -> Path:
+    """Return the sync last-run state file path."""
+    return vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
+
+
 def _write_sync_state(
     vault_path: Path,
     tier: str,
     *,
     dry_run: bool,
+    source_counts: dict[str, int] | None = None,
 ) -> dict[str, object] | None:
-    """Write the sync last-run state, returning the prior state if any (#676)."""
-    state_path = vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
+    """Write the sync last-run state, returning the prior state if any (#676).
+
+    Keeps the #676 top-level keys (``tier``/``at``/``dry_run``) and adds a
+    backward-compatible per-source ``sources`` block (#680): each enabled source
+    records its last ``{tier, at, ingested}``. Sources untouched by this run
+    keep their prior entry, so ``--status`` always reflects the latest run of
+    each source.
+    """
+    state_path = _sync_state_path(vault_path)
     prior: dict[str, object] | None = None
     if state_path.exists():
         try:
@@ -796,10 +809,47 @@ def _write_sync_state(
             prior = loaded if isinstance(loaded, dict) else None
         except (OSError, json.JSONDecodeError):
             prior = None
+    now = datetime.now(UTC).isoformat()
+    prior_sources = prior.get("sources", {}) if isinstance(prior, dict) else {}
+    # Guard against a corrupted file where "sources" is not a dict.
+    sources = dict(prior_sources) if isinstance(prior_sources, dict) else {}
+    for name, ingested in (source_counts or {}).items():
+        sources[name] = {"tier": tier, "at": now, "ingested": ingested}
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state = {"tier": tier, "at": datetime.now(UTC).isoformat(), "dry_run": dry_run}
+    state = {"tier": tier, "at": now, "dry_run": dry_run, "sources": sources}
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     return prior
+
+
+def _sync_status(vault_path: Path) -> None:
+    """Print the per-source last-run + counts from last-run.json (#680)."""
+    state_path = _sync_state_path(vault_path)
+    if not state_path.exists():
+        console.print("[yellow]No sync has run yet (no last-run.json).[/yellow]")
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        console.print("[red]last-run.json is unreadable.[/red]")
+        return
+    dry = " (dry-run)" if state.get("dry_run") else ""
+    console.print(
+        f"[bold]Last sync:[/bold] tier={state.get('tier')}{dry} at {state.get('at')}",
+    )
+    sources = state.get("sources", {})
+    if not isinstance(sources, dict) or not sources:
+        console.print("[dim](no per-source runs recorded yet)[/dim]")
+        return
+    table = Table("source", "last tier", "last run", "ingested")
+    for name, entry in sorted(sources.items()):
+        cells = entry if isinstance(entry, dict) else {}
+        table.add_row(
+            name,
+            str(cells.get("tier", "")),
+            str(cells.get("at", "")),
+            str(cells.get("ingested", "")),
+        )
+    console.print(table)
 
 
 def _sync_tier_a(
@@ -860,23 +910,28 @@ def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
     )
 
 
-def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> None:
-    """Incrementally ingest one Tier-A source via its mapped ingestor (#678)."""
+def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> int:
+    """Incrementally ingest one Tier-A source; return the units processed (#678).
+
+    Returns ``0`` when the source has no ingestor (e.g. gdrive) or its path is
+    missing — both are logged so a scheduled run's no-ops are diagnosable.
+    """
     from creek.ingest import INGESTOR_REGISTRY
     from creek.pipeline import sync_ingest_type
 
     ingest_type = sync_ingest_type(source)
     ingestor_cls = INGESTOR_REGISTRY.get(ingest_type)
     if ingestor_cls is None:
-        return  # e.g. gdrive is a downloader, not an ingestor
+        return 0  # e.g. gdrive is a downloader, not an ingestor
     input_path = _sync_source_input(source, config)
     if input_path is None or not input_path.exists():
         console.print(
             f"[yellow][sync] skipping {source}: source path not found "
             f"({input_path}).[/yellow]",
         )
-        return
-    _run_ingest(
+        logger.info("sync.tier_a.skip source=%s reason=path-missing", source)
+        return 0
+    written, _errors, _discovered = _run_ingest(
         ingestor_cls=ingestor_cls,
         source_type=ingest_type,
         input_path=input_path,
@@ -884,6 +939,8 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> N
         reclassify_threshold=config.classification.reclassify_on_edit_threshold,
         incremental=True,
     )
+    logger.info("sync.tier_a.ingest source=%s ingested=%d", source, written)
+    return written
 
 
 def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> None:
@@ -911,16 +968,20 @@ def _sync_run_tier_a(
     config: CreekConfig,
     vault_path: Path,
     sources: list[str],
-) -> None:
-    """Execute Tier A: per source pull + incremental ingest, then rules classify.
+) -> dict[str, int]:
+    """Execute Tier A; return per-source ingested counts (#678/#680).
 
+    Per source: pull + incremental ingest, then one rules-classify pass.
     Linking and indexing are **never** invoked here (R6: they are O(n²)/global
     and belong to Tier B).
     """
+    counts: dict[str, int] = {}
     for source in sources:
         _sync_pull(source, config, vault_path)
-        _sync_ingest_source(source, config, vault_path)
+        counts[source] = _sync_ingest_source(source, config, vault_path)
     _sync_classify(vault_path, config, "rules")
+    logger.info("sync.tier_a.done count=%d", len(sources))
+    return counts
 
 
 def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
@@ -928,6 +989,7 @@ def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
     _sync_classify(vault_path, config, "llm")
     _sync_link(vault_path, config)
     _sync_index(vault_path)
+    logger.info("sync.tier_b.done")
 
 
 def _sync_dispatch(
@@ -937,20 +999,25 @@ def _sync_dispatch(
     config: CreekConfig,
     vault_path: Path,
     source: str | None,
-) -> None:
-    """Echo (dry-run) or execute the chosen sync tier (#678)."""
+) -> dict[str, int] | None:
+    """Echo (dry-run) or execute the chosen sync tier; return Tier-A counts.
+
+    Returns the per-source ingested counts for a real Tier-A run (for the
+    status file), or ``None`` for dry-run / Tier-B runs.
+    """
     if tier_norm == "A":
         if dry_run:
             _sync_tier_a(config.sync.enabled_sources(), source)
-        else:
-            # An explicit --source overrides the enable toggle (the operator
-            # asked for it by name); otherwise run the enabled set.
-            sources = [source] if source is not None else config.sync.enabled_sources()
-            _sync_run_tier_a(config, vault_path, sources)
-    elif dry_run:
+            return None
+        # An explicit --source overrides the enable toggle (the operator
+        # asked for it by name); otherwise run the enabled set.
+        sources = [source] if source is not None else config.sync.enabled_sources()
+        return _sync_run_tier_a(config, vault_path, sources)
+    if dry_run:
         _sync_tier_b()
     else:
         _sync_run_tier_b(config, vault_path)
+    return None
 
 
 def _install_launchd(
@@ -1027,6 +1094,26 @@ def _install_schedule(host: str, vault: Path | None, out_dir: Path | None) -> No
     )
 
 
+def _sync_validate_source(
+    tier_norm: str,
+    source: str | None,
+    config: CreekConfig,
+) -> None:
+    """Reject a Tier-B ``--source`` or an unknown source name (exits 2)."""
+    if source is None:
+        return
+    if tier_norm == "B":
+        # --source is a Tier-A concept; Tier B always runs the global passes.
+        console.print("[red]--source is not supported with --tier B.[/red]")
+        raise typer.Exit(code=2)
+    if source not in config.sync.sources:
+        known = ", ".join(sorted(config.sync.sources))
+        console.print(
+            f"[red]Unknown --source '{source}'. Known sources: {known}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+
 @app.command()
 def sync(
     tier: str = typer.Option(
@@ -1050,9 +1137,14 @@ def sync(
         "--schedule-out-dir",
         help="Directory to write emitted schedule units (default: host standard)",
     ),
+    status: bool = typer.Option(
+        False,
+        "--status",
+        help="Show the per-source last run + counts from last-run.json and exit",
+    ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Run a scheduled sync pass (#676/#678) or emit schedule units.
+    """Run a scheduled sync pass, emit schedule units, or show status.
 
     ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
     rules classify) for each enabled source; ``--tier B`` is the nightly global
@@ -1061,10 +1153,15 @@ def sync(
     records ``00-Creek-Meta/State/sync/last-run.json``; because every step is
     idempotent, a missed tick self-heals on the next run (no catch-up queue).
 
-    ``--install-schedule launchd|systemd`` emits the host's schedule units
-    (parametrised by the configured cadence) and exits without running a tier;
-    activating them is the operator's manual step (see docs/sync-scheduling.md).
+    ``--install-schedule launchd|systemd`` emits the host's schedule units and
+    exits; ``--status`` prints the per-source last-run table and exits.
     """
+    if status:
+        # Status only needs the vault path; avoid loading (and possibly failing
+        # on) the config when --vault is explicitly given.
+        _sync_status(vault or _load_config_for_vault(None).vault_path)
+        return
+
     if install_schedule is not None:
         _install_schedule(install_schedule, vault, schedule_out_dir)
         return
@@ -1074,22 +1171,11 @@ def sync(
         console.print("[red]--tier must be A or B[/red]")
         raise typer.Exit(code=2)
 
-    if tier_norm == "B" and source is not None:
-        # --source is a Tier-A concept; Tier B always runs the global passes.
-        console.print("[red]--source is not supported with --tier B.[/red]")
-        raise typer.Exit(code=2)
-
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
+    _sync_validate_source(tier_norm, source, config)
 
-    if source is not None and source not in config.sync.sources:
-        known = ", ".join(sorted(config.sync.sources))
-        console.print(
-            f"[red]Unknown --source '{source}'. Known sources: {known}.[/red]",
-        )
-        raise typer.Exit(code=2)
-
-    _sync_dispatch(
+    source_counts = _sync_dispatch(
         tier_norm,
         dry_run=dry_run,
         config=config,
@@ -1097,7 +1183,9 @@ def sync(
         source=source,
     )
 
-    prior = _write_sync_state(vault_path, tier_norm, dry_run=dry_run)
+    prior = _write_sync_state(
+        vault_path, tier_norm, dry_run=dry_run, source_counts=source_counts
+    )
     if prior is not None:
         console.print(
             f"[sync] (previous run: tier={prior.get('tier')} at {prior.get('at')})",
