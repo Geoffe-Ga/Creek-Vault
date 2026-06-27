@@ -1,8 +1,10 @@
-"""Discord ingest-mode dispatch — skeleton stubs (#685).
+"""Discord ingest-mode dispatch + the opt-in user-token DM exporter (#685/#686).
 
 Resolves a configured Discord mode (``data_package`` | ``exporter`` |
-``bot_capture``) to a handler that echoes the pull-then-ingest plan. **No
-network, no exporter binary, no bot capture** — those are issues #686/#687/#688.
+``bot_capture``) to a handler that echoes its plan. The real ingest paths now
+exist: the user-token DM :class:`ExporterConnector` lives here (#686); the
+Data Package helper (``run_discord_data_package``, #688) and the bot-capture
+consumer (``ingest_capture_dir``, #687) live in :mod:`creek.ingest.discord`.
 
 A bot cannot read DMs (Discord API limit), so the three modes differ by coverage
 and compliance (SPEC R5, decision #3). The ``exporter`` mode is OFF by default
@@ -78,7 +80,11 @@ class DiscordHandler:
 
 
 class DataPackageHandler(DiscordHandler):
-    """Stub for the clean Data Package import path (#685)."""
+    """Echo handler for the clean Data Package import path (#685/#688).
+
+    The real ingest is implemented (``run_discord_data_package``); this plan is
+    the echo shown when no ``--package`` is supplied (or under ``--dry-run``).
+    """
 
     mode = DiscordMode.DATA_PACKAGE
 
@@ -86,8 +92,9 @@ class DataPackageHandler(DiscordHandler):
         """Echo the Data Package ingest plan."""
         return [
             "[discord] mode=data_package (clean fallback: a downloaded export)",
-            "[discord] would ingest discord-export/ via the DiscordIngestor",
-            "[discord] no network performed (skeleton stub)",
+            "[discord] run with --package <path> to ingest the export "
+            "via the DiscordIngestor",
+            "[discord] incremental: stable ids make a re-pointed package a no-op",
         ]
 
 
