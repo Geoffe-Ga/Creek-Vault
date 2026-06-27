@@ -834,13 +834,14 @@ def _sync_source_input(source: str, config: CreekConfig) -> Path | None:
     return config.source_drive / rel
 
 
-def _sync_pull(source: str, config: CreekConfig, vault_path: Path) -> None:
+def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
     """Pull a remote source into staging (Tier A, #678).
 
     Only Google Drive has a pull step today (it mirrors files into a local
     staging directory via the existing read-only downloader); local sources
     such as the journal are already on disk and no-op here. Connector
-    generalisation is a later epic.
+    generalisation is a later epic. (``_vault_path`` is unused but kept so all
+    step helpers share a uniform ``(source, config, vault_path)`` shape.)
     """
     if source != "gdrive":
         return
@@ -870,6 +871,10 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> N
         return  # e.g. gdrive is a downloader, not an ingestor
     input_path = _sync_source_input(source, config)
     if input_path is None or not input_path.exists():
+        console.print(
+            f"[yellow][sync] skipping {source}: source path not found "
+            f"({input_path}).[/yellow]",
+        )
         return
     _run_ingest(
         ingestor_cls=ingestor_cls,
@@ -935,10 +940,12 @@ def _sync_dispatch(
 ) -> None:
     """Echo (dry-run) or execute the chosen sync tier (#678)."""
     if tier_norm == "A":
-        sources = [source] if source is not None else config.sync.enabled_sources()
         if dry_run:
             _sync_tier_a(config.sync.enabled_sources(), source)
         else:
+            # An explicit --source overrides the enable toggle (the operator
+            # asked for it by name); otherwise run the enabled set.
+            sources = [source] if source is not None else config.sync.enabled_sources()
             _sync_run_tier_a(config, vault_path, sources)
     elif dry_run:
         _sync_tier_b()
@@ -952,7 +959,9 @@ def sync(
         "A", "--tier", help="A (cheap, per-source) or B (nightly)"
     ),
     source: str | None = typer.Option(
-        None, "--source", help="Limit a Tier-A run to a single source"
+        None,
+        "--source",
+        help="Limit a Tier-A run to one source (explicitly overrides its toggle)",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Echo the plan without executing (current default)"

@@ -18,6 +18,7 @@ from creek.cli import (
     _sync_ingest_source,
     _sync_link,
     _sync_pull,
+    _sync_source_input,
     app,
 )
 from creek.config import CreekConfig, SyncConfig
@@ -123,6 +124,29 @@ class TestTierOrchestration:
         )
         assert calls == []
 
+    def test_explicit_source_overrides_disabled_toggle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit --source runs even when that source is toggled off."""
+        calls = _spy_steps(monkeypatch)
+        cfg = _fake_config(tmp_path / "v", tmp_path / "src", {"discord": False})
+        monkeypatch.setattr("creek.cli._load_config_for_vault", lambda _v: cfg)
+
+        result = runner.invoke(
+            app,
+            [
+                "sync",
+                "--tier",
+                "A",
+                "--source",
+                "discord",
+                "--vault",
+                str(tmp_path / "v"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert calls == ["pull:discord", "ingest:discord", "classify:rules"]
+
 
 # ---- Step helper delegation --------------------------------------------
 
@@ -203,6 +227,15 @@ class TestStepHelpers:
         _sync_ingest_source("journal", cfg, tmp_path / "v")
         assert seen["incremental"] is True
         assert seen["source_type"] == "markdown"
+        assert seen["vault_path"] == tmp_path / "v"
+
+    def test_source_input_resolution(self, tmp_path: Path) -> None:
+        """_sync_source_input joins source_drive + the configured relative path."""
+        src = tmp_path / "src"
+        cfg = _fake_config(tmp_path / "v", src, {})
+        assert _sync_source_input("journal", cfg) == src / "personal" / "journal"
+        # A name that is not a SourcePaths attribute resolves to None.
+        assert _sync_source_input("not_a_real_source", cfg) is None
 
 
 # ---- Real Tier-A idempotency -------------------------------------------
