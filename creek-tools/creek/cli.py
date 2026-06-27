@@ -1207,31 +1207,56 @@ def _parse_discord_mode(mode: str) -> DiscordMode:
         raise typer.Exit(code=2) from None
 
 
-@app.command()
-def discord(
-    mode: str = typer.Option(
-        ..., "--mode", help="data_package | exporter | bot_capture"
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Echo the plan (the only behaviour in the skeleton)"
-    ),
-    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+def _run_discord_exporter(
+    config: CreekConfig,
+    vault_path: Path,
+    binary: str,
 ) -> None:
-    """Dispatch a Discord ingest mode (#685 — skeleton stub).
+    """Run the real opt-in DM exporter connector (#686)."""
+    import subprocess
 
-    Resolves the selected ``--mode`` against the configured Discord toggles and
-    echoes its pull-then-ingest plan. Performs **no network I/O**: the real
-    exporter, bot-capture, and Data Package paths land in #686/#687/#688. The
-    ``exporter`` mode is opt-in (off by default) and prints a Terms-of-Service
-    caveat on use. The Discord token lives in the environment, never in config.
-    """
     from creek.ingest.discord_dispatch import (
+        ExporterConnector,
+        SubprocessExporterRunner,
+        TokenMissingError,
+    )
+
+    runner = SubprocessExporterRunner(binary)
+    try:
+        ExporterConnector(config.discord, runner, vault_path).run()
+    except TokenMissingError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]Discord exporter failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print("[green][discord] exporter run complete; staged + ingested.[/green]")
+
+
+def _dispatch_discord(
+    selected: DiscordMode,
+    config: CreekConfig,
+    vault_path: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    """Run the real exporter, or echo the stub plan for the selected mode (#686)."""
+    from creek.ingest.discord_dispatch import (
+        DiscordMode,
         ModeDisabledError,
         resolve_discord_handler,
     )
 
-    selected = _parse_discord_mode(mode)
-    config = _load_config_for_vault(vault)
+    binary = config.discord.exporter_binary
+    if (
+        selected is DiscordMode.EXPORTER
+        and config.discord.exporter.enabled
+        and binary
+        and not dry_run
+    ):
+        _run_discord_exporter(config, vault_path, binary)
+        return
+
     try:
         handler = resolve_discord_handler(selected, config.discord)
     except ModeDisabledError as exc:
@@ -1243,8 +1268,34 @@ def discord(
         console.print(line)
     if not dry_run:
         console.print(
-            "[dim][discord] skeleton: stub only — no pull/ingest performed yet.[/dim]",
+            "[dim][discord] echo only — set discord.exporter_binary to run the "
+            "exporter, or run #687/#688 paths.[/dim]",
         )
+
+
+@app.command()
+def discord(
+    mode: str = typer.Option(
+        ..., "--mode", help="data_package | exporter | bot_capture"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Echo the plan without running"
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Dispatch a Discord ingest mode (#685/#686).
+
+    Resolves ``--mode`` against the configured Discord toggles. When
+    ``exporter`` is enabled and ``discord.exporter_binary`` is set (and not
+    ``--dry-run``), runs the real opt-in user-token DM exporter; otherwise
+    echoes the mode's plan. The ``exporter`` mode is opt-in (off by default) and
+    prints a Terms-of-Service caveat. The Discord token lives in the
+    environment, never in config (bot capture is #687; Data Package is #688).
+    """
+    selected = _parse_discord_mode(mode)
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    _dispatch_discord(selected, config, vault_path, dry_run=dry_run)
 
 
 @app.command()

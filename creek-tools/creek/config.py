@@ -1453,6 +1453,12 @@ class DiscordSourceConfig(BaseModel):
     exporter: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
     """User-token exporter — OFF by default (decision #3); ToS-caveated."""
 
+    exporter_binary: str | None = None
+    """Path to the operator-provided user-token exporter binary (#686).
+
+    Non-secret. The exporter is invoked read-only with the Discord token passed
+    via the environment only, never on the command line or in this config."""
+
     bot_capture: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
     """Bot message capture for servers/channels — off by default."""
 
