@@ -2804,7 +2804,7 @@ def gdrive(
         staging if staging is not None else Path(config.google_drive.staging_dir)
     )
 
-    from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
+    from creek.ingest.gdrive import GoogleApiDriveClient, build_drive_connector
 
     client = GoogleApiDriveClient(config.google_drive)
     if not client.is_available():
@@ -2815,9 +2815,13 @@ def gdrive(
         )
         raise typer.Exit(code=1)
 
-    downloader = GoogleDriveDownloader(client=client, config=config.google_drive)
+    # Route the download through the source-agnostic connector (#683); fetch_to
+    # delegates to download_all, so observable behaviour is unchanged.
+    connector = build_drive_connector(
+        config.google_drive, client=client, staging=staging_dir
+    )
     try:
-        result = downloader.download_all(staging_dir)
+        result = connector.fetch_to(staging_dir)
     except Exception as exc:
         # Drive surface includes GoogleApiUnavailableError (missing
         # optional deps), HttpError (quota / rate limit / revoked

@@ -1040,6 +1040,23 @@ class GoogleDriveDownloader:
             errors=tuple(errors),
         )
 
+    def changed_files(self, staging_dir: Path) -> list[DriveFile]:
+        """Return Drive files not already up-to-date in *staging_dir* (#683).
+
+        The incremental set surfaced via the connector's
+        ``list_changed_since`` — the same staging-mtime predicate
+        :meth:`download_all` uses to skip unchanged files, expressed as a
+        standalone listing (no download side effects).
+        """
+        return [
+            drive_file
+            for drive_file in self.list_files()
+            if not self._is_up_to_date(
+                self._target_path(drive_file, staging_dir),
+                drive_file,
+            )
+        ]
+
     def _resolve(self, file_id: str) -> DriveFile:
         """Return the :class:`DriveFile` for *file_id* from the cached listing."""
         if self._listing_cache is None:
@@ -1134,6 +1151,61 @@ class GoogleDriveDownloader:
         return target.with_name(target.stem + suffix)
 
 
+# ---- RemoteSourceConnector adapter (#683) ------------------------------
+
+
+class GoogleDriveConnector:
+    """Adapt the read-only Drive downloader to ``RemoteSourceConnector`` (#683).
+
+    Wraps a :class:`GoogleDriveDownloader` (and its staging directory) so Drive
+    satisfies the source-agnostic connector contract without changing any
+    download behaviour. ``list_changed_since`` reuses the downloader's
+    staging-mtime skip; ``fetch_to`` delegates to ``download_all``.
+    """
+
+    def __init__(self, downloader: GoogleDriveDownloader, staging: Path) -> None:
+        """Bind the connector to a downloader and its staging directory."""
+        self._downloader = downloader
+        self._staging = staging
+
+    def is_available(self) -> bool:
+        """Report whether the optional Drive libraries are installed."""
+        return self._downloader.client.is_available()
+
+    def list_changed_since(self, cursor: object = None) -> list[DriveFile]:
+        """Return Drive files not yet current in staging (the changed set).
+
+        *cursor* is reserved for the persisted-ledger wiring in #684; today the
+        change set is driven entirely by the staging-mtime skip, so ``cursor``
+        of ``None`` (first pass) and a subsequent same-cursor call differ only
+        because :meth:`fetch_to` stamped the staged files in between.
+        """
+        del cursor  # mtime-driven for now; persisted cursor lands in #684
+        return self._downloader.changed_files(self._staging)
+
+    def fetch_to(self, staging: Path) -> DownloadResult:
+        """Download the changed files into *staging* (delegates to download_all)."""
+        return self._downloader.download_all(staging)
+
+
+def build_drive_connector(
+    config: GoogleDriveConfig,
+    *,
+    client: DriveClient | None = None,
+    staging: Path | None = None,
+) -> GoogleDriveConnector:
+    """Build a Drive :class:`GoogleDriveConnector` from *config* (#683).
+
+    Uses the provided *client* (or a fresh :class:`GoogleApiDriveClient`) and
+    *staging* (or ``config.staging_dir``). The returned object satisfies the
+    :class:`~creek.ingest.connectors.RemoteSourceConnector` protocol.
+    """
+    drive_client = client if client is not None else GoogleApiDriveClient(config)
+    downloader = GoogleDriveDownloader(client=drive_client, config=config)
+    resolved_staging = staging if staging is not None else Path(config.staging_dir)
+    return GoogleDriveConnector(downloader, resolved_staging)
+
+
 __all__ = [
     "GOOGLE_DOCS_MIME",
     "GOOGLE_SHEETS_MIME",
@@ -1143,6 +1215,8 @@ __all__ = [
     "DriveFile",
     "GoogleApiDriveClient",
     "GoogleApiUnavailableError",
+    "GoogleDriveConnector",
     "GoogleDriveDownloader",
+    "build_drive_connector",
     "route_to_ingestor",
 ]
