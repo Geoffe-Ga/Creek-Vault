@@ -84,3 +84,20 @@ class RemoteSourceConnector(Protocol):
         ``DownloadResult``); callers route the staged files through
         ``route_to_ingestor``.
         """
+
+    def load_cursor(self) -> object:
+        """Return the persisted incremental cursor, or ``None`` if none (#684).
+
+        The cursor is a durable bookmark (e.g. the last-seen modified time) so a
+        fresh process or a new host resumes incrementally — it is *not* tied to
+        in-process state. It stores only non-secret bookkeeping, never
+        credentials.
+        """
+
+    def save_cursor(self, fetched: Sequence[RemoteFile]) -> None:
+        """Advance the persisted cursor past *fetched* (#684).
+
+        Called after a successful :meth:`fetch_to`; subsequent
+        :meth:`list_changed_since` calls against the reloaded cursor exclude the
+        already-fetched files.
+        """

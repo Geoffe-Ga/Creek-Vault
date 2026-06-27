@@ -1292,8 +1292,8 @@ class TestRemoteSourceConnector:
         )
         assert connector.is_available() is True
 
-    def test_list_changed_since_matches_mtime_skip(self, tmp_path: Path) -> None:
-        """cursor=None lists all; after fetch_to the same cursor yields none."""
+    def test_list_changed_since_advances_with_cursor(self, tmp_path: Path) -> None:
+        """cursor=None lists all; after save_cursor the reloaded cursor yields none."""
         files = [
             _file(fid="a", name="a.md", mime="text/markdown"),
             _file(fid="b", name="b.md", mime="text/markdown"),
@@ -1303,11 +1303,12 @@ class TestRemoteSourceConnector:
             GoogleDriveConfig(), client=stub, staging=tmp_path
         )
 
-        changed = connector.list_changed_since(cursor=None)
+        changed = connector.list_changed_since(cursor=connector.load_cursor())
         assert [f.id for f in changed] == ["a", "b"]
 
-        connector.fetch_to(tmp_path)  # stage them, stamping mtime
-        assert connector.list_changed_since(cursor=None) == []  # mtime skip
+        connector.fetch_to(tmp_path)
+        connector.save_cursor(changed)
+        assert connector.list_changed_since(cursor=connector.load_cursor()) == []
 
     def test_fetch_to_stages_and_returns_result(self, tmp_path: Path) -> None:
         """fetch_to downloads the file and returns the DownloadResult."""
