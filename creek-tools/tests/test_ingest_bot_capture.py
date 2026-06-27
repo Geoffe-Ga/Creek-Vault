@@ -42,7 +42,9 @@ def _capture_line(*, msg_id: str, ts: str, content: str) -> str:
     )
 
 
-def _write_capture(capture_dir: Path, channel: str, date: str, lines: list[str]) -> None:
+def _write_capture(
+    capture_dir: Path, channel: str, date: str, lines: list[str]
+) -> None:
     """Append capture *lines* to ``<capture_dir>/<channel>/<date>.jsonl``."""
     path = capture_dir / channel / f"{date}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,7 +95,9 @@ class TestStageCaptureAsDataPackage:
             "general",
             "2026-06-26",
             [
-                _capture_line(msg_id="100", ts="2026-06-26T10:00:00+00:00", content="hi"),
+                _capture_line(
+                    msg_id="100", ts="2026-06-26T10:00:00+00:00", content="hi"
+                ),
                 _capture_line(
                     msg_id="098", ts="2026-06-26T09:58:00+00:00", content="earlier"
                 ),

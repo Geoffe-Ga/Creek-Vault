@@ -28,8 +28,10 @@ import logging
 import re
 import shutil
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
 from creek.ingest.base import (
