@@ -287,15 +287,9 @@ class ExporterConnector:
 
     def _ingest(self, staging: Path) -> None:
         """Ingest the staged Data Package via the existing DiscordIngestor."""
-        from creek.ingest.base import assemble_ingested_fragment
-        from creek.ingest.discord import DiscordIngestor
-        from creek.vault.writer import VaultWriter
+        from creek.ingest.discord import DiscordIngestor, write_fragments
 
-        writer = VaultWriter(vault_path=self._vault)
-        result = DiscordIngestor().ingest(staging)
-        for parsed in result.fragments:
-            assembled = assemble_ingested_fragment(parsed)
-            writer.write_fragment(assembled.fragment, body=assembled.body)
+        write_fragments(DiscordIngestor().ingest(staging), self._vault)
 
     def load_cursor(self) -> str | None:
         """Return the persisted ``--after`` cursor, or ``None`` if unset."""

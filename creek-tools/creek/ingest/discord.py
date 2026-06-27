@@ -811,14 +811,16 @@ def stage_capture_as_data_package(capture_dir: Path, staging_dir: Path) -> None:
         )
 
 
-def _write_fragments(result: IngestResult, vault: Path) -> list[Path]:
+def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     """Assemble + write every parsed fragment; return the written vault paths.
 
-    Shared by the bot-capture and Data-Package ingest paths. This **always**
-    writes each fragment — it does not skip existing files — but the path is
-    deterministic (``frag-<sha>``), so re-writing an already-present fragment
-    overwrites the same file in place. Callers that need a "new only" count diff
-    the returned paths against a pre-run snapshot (see
+    The shared writer for all three Discord ingest paths — bot-capture
+    (:func:`ingest_capture_dir`), Data Package (:func:`run_discord_data_package`),
+    and the user-token exporter (:meth:`ExporterConnector._ingest`). This
+    **always** writes each fragment — it does not skip existing files — but the
+    path is deterministic (``frag-<sha>``), so re-writing an already-present
+    fragment overwrites the same file in place. Callers that need a "new only"
+    count diff the returned paths against a pre-run snapshot (see
     :func:`run_discord_data_package`).
 
     Args:
@@ -864,7 +866,7 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
     stage_capture_as_data_package(capture_dir, staging)
-    return len(_write_fragments(DiscordIngestor().ingest(staging), vault))
+    return len(write_fragments(DiscordIngestor().ingest(staging), vault))
 
 
 def run_discord_data_package(vault: Path, package: Path) -> int:
@@ -889,7 +891,7 @@ def run_discord_data_package(vault: Path, package: Path) -> int:
     """
     fragments_root = vault / "01-Fragments"
     before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()
-    written = _write_fragments(DiscordIngestor().ingest(package), vault)
+    written = write_fragments(DiscordIngestor().ingest(package), vault)
     # New = distinct written paths that did not pre-exist. `set(written)` also
     # collapses any duplicate path emitted within a single run, so a fragment is
     # counted at most once.
