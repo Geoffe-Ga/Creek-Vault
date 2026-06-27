@@ -100,8 +100,10 @@ class TestStatusCommand:
 
         result = runner.invoke(app, ["sync", "--status", "--vault", str(vault)])
         assert result.exit_code == 0, result.output
+        # The status table renders the journal row (the count itself is asserted
+        # against the state file above — `"2" in output` would match dates too).
         assert "journal" in result.output
-        assert "2" in result.output
+        assert "ingested" in result.output  # the table header rendered
 
     def test_status_with_no_prior_run(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -115,6 +117,31 @@ class TestStatusCommand:
         result = runner.invoke(app, ["sync", "--status", "--vault", str(vault)])
         assert result.exit_code == 0, result.output
         assert "no sync has run" in result.output.lower()
+
+    def test_status_without_vault_uses_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without --vault, --status falls back to the config's vault path."""
+        vault = tmp_path / "v"
+        (vault / "00-Creek-Meta").mkdir(parents=True)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig(vault_path=vault)
+        )
+        result = runner.invoke(app, ["sync", "--status"])  # no --vault
+        assert result.exit_code == 0, result.output
+        assert "no sync has run" in result.output.lower()
+
+    def test_status_marks_dry_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dry-run last recorded shows (dry-run) in the status header."""
+        vault, src = _vault_with_journal(tmp_path, entries=1)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: _fake_config(vault, src)
+        )
+        runner.invoke(app, ["sync", "--tier", "A", "--dry-run", "--vault", str(vault)])
+        result = runner.invoke(app, ["sync", "--status", "--vault", str(vault)])
+        assert "(dry-run)" in result.output
 
 
 # ---- structured logging -------------------------------------------------

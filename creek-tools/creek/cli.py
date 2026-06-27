@@ -811,6 +811,7 @@ def _write_sync_state(
             prior = None
     now = datetime.now(UTC).isoformat()
     prior_sources = prior.get("sources", {}) if isinstance(prior, dict) else {}
+    # Guard against a corrupted file where "sources" is not a dict.
     sources = dict(prior_sources) if isinstance(prior_sources, dict) else {}
     for name, ingested in (source_counts or {}).items():
         sources[name] = {"tier": tier, "at": now, "ingested": ingested}
@@ -831,8 +832,9 @@ def _sync_status(vault_path: Path) -> None:
     except (OSError, json.JSONDecodeError):
         console.print("[red]last-run.json is unreadable.[/red]")
         return
+    dry = " (dry-run)" if state.get("dry_run") else ""
     console.print(
-        f"[bold]Last sync:[/bold] tier={state.get('tier')} at {state.get('at')}",
+        f"[bold]Last sync:[/bold] tier={state.get('tier')}{dry} at {state.get('at')}",
     )
     sources = state.get("sources", {})
     if not isinstance(sources, dict) or not sources:
@@ -978,7 +980,7 @@ def _sync_run_tier_a(
         _sync_pull(source, config, vault_path)
         counts[source] = _sync_ingest_source(source, config, vault_path)
     _sync_classify(vault_path, config, "rules")
-    logger.info("sync.tier_a.done sources=%d", len(sources))
+    logger.info("sync.tier_a.done count=%d", len(sources))
     return counts
 
 
@@ -1155,8 +1157,9 @@ def sync(
     exits; ``--status`` prints the per-source last-run table and exits.
     """
     if status:
-        config = _load_config_for_vault(vault)
-        _sync_status(vault or config.vault_path)
+        # Status only needs the vault path; avoid loading (and possibly failing
+        # on) the config when --vault is explicitly given.
+        _sync_status(vault or _load_config_for_vault(None).vault_path)
         return
 
     if install_schedule is not None:
