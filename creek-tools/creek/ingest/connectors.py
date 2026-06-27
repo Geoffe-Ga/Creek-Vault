@@ -8,9 +8,11 @@ construction exposes no write/update/delete surface.
 
 Google Drive is the reference implementation (``creek.ingest.gdrive``); future
 sources (Substack, Notion, an RSS feed, a prose git repo) implement the same
-three methods and reuse the stage -> route -> ingest machinery. The persisted
-cursor (tying ``list_changed_since`` to Epic A's ledger) is wired in #684; here
-the cursor is a thin parameter over the existing staging-mtime skip.
+methods and reuse the stage -> route -> ingest machinery. ``list_changed_since``
+is incremental against a **persisted cursor** (a durable, non-secret bookmark
+such as the last-seen modified time) so a fresh process or a new host resumes
+correctly — :meth:`RemoteSourceConnector.load_cursor` /
+:meth:`RemoteSourceConnector.save_cursor` read and advance it.
 """
 
 from __future__ import annotations
@@ -71,10 +73,10 @@ class RemoteSourceConnector(Protocol):
     def list_changed_since(self, cursor: object) -> Sequence[RemoteFile]:
         """Return the files changed since *cursor* (the incremental set).
 
-        *cursor* of ``None`` means "everything not already current in staging"
-        — the first-pass case. After :meth:`fetch_to` stages the files, a
-        second call with the same cursor yields nothing (the staging mtime
-        skip). The persisted-ledger cursor lands in #684.
+        *cursor* (as :meth:`load_cursor` returns) of ``None`` means the first
+        pass — everything. After :meth:`fetch_to` + :meth:`save_cursor`, the
+        reloaded cursor excludes the already-fetched files, so the next call
+        returns only what is genuinely new.
         """
 
     def fetch_to(self, staging: Path) -> object:
@@ -83,4 +85,21 @@ class RemoteSourceConnector(Protocol):
         The return is the implementation's own result object (e.g. Drive's
         ``DownloadResult``); callers route the staged files through
         ``route_to_ingestor``.
+        """
+
+    def load_cursor(self) -> object:
+        """Return the persisted incremental cursor, or ``None`` if none (#684).
+
+        The cursor is a durable bookmark (e.g. the last-seen modified time) so a
+        fresh process or a new host resumes incrementally — it is *not* tied to
+        in-process state. It stores only non-secret bookkeeping, never
+        credentials.
+        """
+
+    def save_cursor(self, fetched: Sequence[RemoteFile]) -> None:
+        """Advance the persisted cursor past *fetched* (#684).
+
+        Called after a successful :meth:`fetch_to`; subsequent
+        :meth:`list_changed_since` calls against the reloaded cursor exclude the
+        already-fetched files.
         """

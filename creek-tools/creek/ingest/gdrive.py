@@ -48,6 +48,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 import httpx
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from creek.config import GoogleDriveConfig
 
 
@@ -1159,33 +1161,85 @@ class GoogleDriveConnector:
 
     Wraps a :class:`GoogleDriveDownloader` (and its staging directory) so Drive
     satisfies the source-agnostic connector contract without changing any
-    download behaviour. ``list_changed_since`` reuses the downloader's
-    staging-mtime skip; ``fetch_to`` delegates to ``download_all``.
+    download behaviour. ``fetch_to`` delegates to ``download_all`` (whose own
+    staging-mtime skip is unchanged); ``list_changed_since`` is driven by a
+    **persisted cursor** (#684) — the last-seen Drive ``modified_time`` — so a
+    fresh process or new host resumes incrementally. The cursor stores only a
+    timestamp, never a credential.
     """
 
-    def __init__(self, downloader: GoogleDriveDownloader, staging: Path) -> None:
-        """Bind the connector to a downloader and its staging directory."""
+    def __init__(
+        self,
+        downloader: GoogleDriveDownloader,
+        staging: Path,
+        cursor_path: Path,
+    ) -> None:
+        """Bind the connector to a downloader, staging dir, and cursor file."""
         self._downloader = downloader
         self._staging = staging
+        self._cursor_path = cursor_path
 
     def is_available(self) -> bool:
         """Report whether the optional Drive libraries are installed."""
         return self._downloader.client.is_available()
 
     def list_changed_since(self, cursor: object = None) -> list[DriveFile]:
-        """Return Drive files not yet current in staging (the changed set).
+        """Return Drive files modified strictly after *cursor* (#684).
 
-        *cursor* is reserved for the persisted-ledger wiring in #684; today the
-        change set is driven entirely by the staging-mtime skip, so ``cursor``
-        of ``None`` (first pass) and a subsequent same-cursor call differ only
-        because :meth:`fetch_to` stamped the staged files in between.
+        *cursor* is an ISO-8601 timestamp string (as :meth:`load_cursor`
+        returns) or ``None`` for the first pass (everything). After
+        :meth:`fetch_to` + :meth:`save_cursor`, the reloaded cursor equals the
+        newest fetched ``modified_time``, so the next call returns nothing new.
         """
-        del cursor  # mtime-driven for now; persisted cursor lands in #684
-        return self._downloader.changed_files(self._staging)
+        if cursor is None:
+            return self._downloader.list_files()
+        threshold = datetime.fromisoformat(str(cursor))
+        # Strict ">": files exactly at the cursor were fetched on the pass that
+        # set it. A true tie at the newest modified_time is astronomically
+        # unlikely given Drive's timestamp precision.
+        return [
+            drive_file
+            for drive_file in self._downloader.list_files()
+            if drive_file.modified_time > threshold
+        ]
 
     def fetch_to(self, staging: Path) -> DownloadResult:
         """Download the changed files into *staging* (delegates to download_all)."""
         return self._downloader.download_all(staging)
+
+    def load_cursor(self) -> str | None:
+        """Return the persisted cursor timestamp, or ``None`` if unset/invalid.
+
+        Any read failure, non-string value, or non-ISO timestamp (e.g. a
+        hand-edited cursor file) falls back to ``None`` — a full re-scan —
+        rather than raising later in :meth:`list_changed_since`.
+        """
+        if not self._cursor_path.exists():
+            return None
+        try:
+            data = json.loads(self._cursor_path.read_text(encoding="utf-8"))
+            cursor = data.get("cursor") if isinstance(data, dict) else None
+            if not isinstance(cursor, str):
+                return None
+            datetime.fromisoformat(cursor)  # validate shape only
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        return cursor
+
+    def save_cursor(self, fetched: Sequence[DriveFile]) -> None:
+        """Advance the persisted cursor to the newest *fetched* modified_time.
+
+        An empty *fetched* leaves the cursor untouched (nothing newer was
+        seen). Written atomically (temp + ``os.replace``) and storing only the
+        timestamp — no credentials.
+        """
+        if not fetched:
+            return
+        newest = max(item.modified_time for item in fetched)
+        self._cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._cursor_path.with_name(self._cursor_path.name + ".tmp")
+        tmp.write_text(json.dumps({"cursor": newest.isoformat()}), encoding="utf-8")
+        os.replace(tmp, self._cursor_path)
 
 
 def build_drive_connector(
@@ -1193,17 +1247,24 @@ def build_drive_connector(
     *,
     client: DriveClient | None = None,
     staging: Path | None = None,
+    cursor_path: Path | None = None,
 ) -> GoogleDriveConnector:
-    """Build a Drive :class:`GoogleDriveConnector` from *config* (#683).
+    """Build a Drive :class:`GoogleDriveConnector` from *config* (#683/#684).
 
-    Uses the provided *client* (or a fresh :class:`GoogleApiDriveClient`) and
-    *staging* (or ``config.staging_dir``). The returned object satisfies the
-    :class:`~creek.ingest.connectors.RemoteSourceConnector` protocol.
+    Uses the provided *client* (or a fresh :class:`GoogleApiDriveClient`),
+    *staging* (or ``config.staging_dir``), and *cursor_path* (or
+    ``<staging>/.creek-connector-cursor.json``). The returned object satisfies
+    the :class:`~creek.ingest.connectors.RemoteSourceConnector` protocol.
     """
     drive_client = client if client is not None else GoogleApiDriveClient(config)
     downloader = GoogleDriveDownloader(client=drive_client, config=config)
     resolved_staging = staging if staging is not None else Path(config.staging_dir)
-    return GoogleDriveConnector(downloader, resolved_staging)
+    resolved_cursor = (
+        cursor_path
+        if cursor_path is not None
+        else resolved_staging / ".creek-connector-cursor.json"
+    )
+    return GoogleDriveConnector(downloader, resolved_staging, resolved_cursor)
 
 
 __all__ = [

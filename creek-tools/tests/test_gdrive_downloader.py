@@ -1292,8 +1292,8 @@ class TestRemoteSourceConnector:
         )
         assert connector.is_available() is True
 
-    def test_list_changed_since_matches_mtime_skip(self, tmp_path: Path) -> None:
-        """cursor=None lists all; after fetch_to the same cursor yields none."""
+    def test_list_changed_since_advances_with_cursor(self, tmp_path: Path) -> None:
+        """cursor=None lists all; after save_cursor the reloaded cursor yields none."""
         files = [
             _file(fid="a", name="a.md", mime="text/markdown"),
             _file(fid="b", name="b.md", mime="text/markdown"),
@@ -1303,11 +1303,12 @@ class TestRemoteSourceConnector:
             GoogleDriveConfig(), client=stub, staging=tmp_path
         )
 
-        changed = connector.list_changed_since(cursor=None)
+        changed = connector.list_changed_since(cursor=connector.load_cursor())
         assert [f.id for f in changed] == ["a", "b"]
 
-        connector.fetch_to(tmp_path)  # stage them, stamping mtime
-        assert connector.list_changed_since(cursor=None) == []  # mtime skip
+        connector.fetch_to(tmp_path)
+        connector.save_cursor(changed)
+        assert connector.list_changed_since(cursor=connector.load_cursor()) == []
 
     def test_fetch_to_stages_and_returns_result(self, tmp_path: Path) -> None:
         """fetch_to downloads the file and returns the DownloadResult."""
@@ -1321,6 +1322,26 @@ class TestRemoteSourceConnector:
         result = connector.fetch_to(tmp_path)
         assert len(result.downloaded) == 1
         assert (tmp_path / "a.md").read_bytes() == b"hello"
+
+    def test_corrupt_cursor_falls_back_to_full_scan(self, tmp_path: Path) -> None:
+        """A non-JSON or non-ISO cursor file degrades to a full scan, not a crash."""
+        cursor_path = tmp_path / "c.json"
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"A"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path, cursor_path=cursor_path
+        )
+
+        cursor_path.write_text("not json at all", encoding="utf-8")
+        assert connector.load_cursor() is None
+
+        cursor_path.write_text('{"cursor": "not-a-date"}', encoding="utf-8")
+        assert connector.load_cursor() is None  # valid JSON, invalid ISO
+        # list_changed_since(None) is a full scan — no ValueError.
+        changed = connector.list_changed_since(cursor=connector.load_cursor())
+        assert [f.id for f in changed] == ["a"]
 
 
 if __name__ == "__main__":
