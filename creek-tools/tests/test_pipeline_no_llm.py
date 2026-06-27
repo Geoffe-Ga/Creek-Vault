@@ -94,7 +94,9 @@ class TestNoLLMFlagSkipsLLMClassifier:
                 "classify",
                 side_effect=lambda f, content="": f,
             ),
-            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+            patch.object(
+                pipeline.tier_classifiers.non_intimate, "classify"
+            ) as mock_llm,
         ):
             pipeline._run_classification([item], vault_path, PipelineResult())
 
@@ -116,7 +118,7 @@ class TestNoLLMFlagSkipsLLMClassifier:
                 side_effect=lambda f, content="": f,
             ),
             patch.object(
-                pipeline.llm_classifier,
+                pipeline.tier_classifiers.non_intimate,
                 "classify",
                 side_effect=lambda f, content="": f,
             ) as mock_llm,
@@ -142,7 +144,9 @@ class TestNoLLMOverridesAnthropicProvider:
                 "classify",
                 side_effect=lambda f, content="": f,
             ),
-            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+            patch.object(
+                pipeline.tier_classifiers.non_intimate, "classify"
+            ) as mock_llm,
         ):
             pipeline._run_classification([item], vault_path, PipelineResult())
 
