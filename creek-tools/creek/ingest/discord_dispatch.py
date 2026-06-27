@@ -12,15 +12,40 @@ lives in the **environment only** — never in config, never echoed or logged.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import subprocess
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from rich.console import Console
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from creek.config import DiscordSourceConfig
 
 console = Console()
+logger = logging.getLogger(__name__)
+
+_TOKEN_ENV_VAR = "DISCORD_USER_TOKEN"
+_EPOCH_CURSOR = "1970-01-01T00:00:00+00:00"
+
+
+def announce_exporter_caveat() -> None:
+    """Print the user-token exporter's Terms-of-Service caveat (#685/#686).
+
+    Short lines keep each phrase intact regardless of terminal width.
+    """
+    console.print("[yellow][discord] DM exporter caveat:[/yellow]")
+    console.print("[yellow]- A user token drives your account.[/yellow]")
+    console.print("[yellow]- The Discord Terms of Service prohibit this.[/yellow]")
+    console.print("[yellow]- The real stake is account suspension.[/yellow]")
+    console.print(
+        "[yellow]- Use it read-only, for your own DMs, at a low rate.[/yellow]",
+    )
 
 
 class DiscordMode(StrEnum):
@@ -88,17 +113,8 @@ class ExporterHandler(DiscordHandler):
     mode = DiscordMode.EXPORTER
 
     def announce(self) -> None:
-        """Print the Terms-of-Service caveat before any (future) export.
-
-        Short lines keep each asserted phrase intact (no terminal-width wrap).
-        """
-        console.print("[yellow][discord] DM exporter caveat:[/yellow]")
-        console.print("[yellow]- A user token drives your account.[/yellow]")
-        console.print("[yellow]- The Discord Terms of Service prohibit this.[/yellow]")
-        console.print("[yellow]- The real stake is account suspension.[/yellow]")
-        console.print(
-            "[yellow]- Use it read-only, for your own DMs, at a low rate.[/yellow]",
-        )
+        """Print the Terms-of-Service caveat before any (future) export."""
+        announce_exporter_caveat()
 
     def plan(self) -> list[str]:
         """Echo the exporter plan."""
@@ -145,3 +161,149 @@ def resolve_discord_handler(
         msg = f"Discord mode {mode.value!r} is disabled; enable it in config."
         raise ModeDisabledError(msg)
     return _HANDLERS[mode]()
+
+
+# ---- Real opt-in user-token DM exporter connector (#686) ---------------
+
+
+class TokenMissingError(RuntimeError):
+    """Raised when the exporter is enabled but the token env var is unset."""
+
+
+@runtime_checkable
+class ExporterRunner(Protocol):
+    """Mockable seam over the operator-provided user-token exporter binary."""
+
+    def run(self, *, argv: list[str], token: str, out_dir: Path) -> None:
+        """Run the exporter with *argv*, staging Data-Package JSON into *out_dir*.
+
+        The caller creates *out_dir* before calling; implementations may assume
+        it exists. The token is passed out-of-band (not in *argv*) so it never
+        lands in a logged command line.
+        """
+
+
+class SubprocessExporterRunner:
+    """Shell out to an operator-provided exporter binary, read-only (#686).
+
+    The binary is invoked with a fixed argument list (``shell=False``) and the
+    Discord token supplied via the child process environment — never on the
+    command line — so it cannot leak into process listings or logs. A *timeout*
+    bounds a hung binary.
+    """
+
+    def __init__(self, binary: str, *, timeout_seconds: int = 600) -> None:
+        """Bind to the operator-provided exporter binary path + a timeout."""
+        self._binary = binary
+        self._timeout_seconds = timeout_seconds
+
+    def run(self, *, argv: list[str], token: str, out_dir: Path) -> None:
+        """Run ``<binary> <argv...>`` with the token in the child env only.
+
+        *out_dir* is created by the caller (the connector) before this runs.
+        """
+        env = os.environ | {_TOKEN_ENV_VAR: token}
+        # Fixed argv (no shell, no untrusted interpolation); token via env only.
+        subprocess.run(
+            [self._binary, *argv],
+            check=True,
+            env=env,
+            timeout=self._timeout_seconds,
+        )
+
+
+class ExporterConnector:
+    """Opt-in user-token DM exporter -> stage -> ingest, incrementally (#686).
+
+    Runs only when ``exporter`` mode is enabled (else raises). Prints the ToS
+    caveat, reads the token from the environment (never config/logs), invokes
+    the exporter ``--after <cursor> --scope dms-only --read-only`` into a local
+    staging dir, ingests the staged Data-Package JSON via the existing
+    ``DiscordIngestor`` (append-only, idempotent on Discord's stable ids), and
+    advances a persisted cursor so a re-run resumes rather than re-exports.
+    """
+
+    def __init__(
+        self,
+        config: DiscordSourceConfig,
+        runner: ExporterRunner,
+        vault: Path,
+        *,
+        cursor_path: Path | None = None,
+        token_env_var: str = _TOKEN_ENV_VAR,
+    ) -> None:
+        """Bind config, the (mockable) exporter runner, vault, and cursor file."""
+        self._config = config
+        self._runner = runner
+        self._vault = vault
+        self._token_env_var = token_env_var
+        self._cursor_path = cursor_path or (
+            vault / "00-Creek-Meta" / "State" / "discord" / "cursor.json"
+        )
+
+    def run(self, after_cursor: str | None = None) -> None:
+        """Export since *after_cursor* (or the persisted cursor), stage, ingest.
+
+        Raises:
+            ExporterDisabledError: When exporter mode is off (no work done).
+            TokenMissingError: When the token env var is unset.
+        """
+        if not self._config.exporter.enabled:
+            msg = "Discord exporter mode is disabled; it is opt-in and OFF by default."
+            raise ExporterDisabledError(msg)
+        announce_exporter_caveat()
+        token = os.environ.get(self._token_env_var)
+        if not token:
+            msg = (
+                f"{self._token_env_var} is not set. The Discord token is read "
+                "from the environment only, never from config."
+            )
+            raise TokenMissingError(msg)
+
+        cursor = after_cursor or self.load_cursor() or _EPOCH_CURSOR
+        staging = self._vault / "discord-export"
+        staging.mkdir(parents=True, exist_ok=True)
+        argv = [
+            "--after",
+            cursor,
+            "--scope",
+            "dms-only",
+            "--read-only",
+            "--output",
+            str(staging),
+        ]
+        # Log the plan WITHOUT the token (it is passed out-of-band to the runner).
+        logger.info("discord.exporter run after=%s scope=dms-only read-only", cursor)
+        self._runner.run(argv=argv, token=token, out_dir=staging)
+        self._ingest(staging)
+        self.save_cursor(datetime.now(UTC).isoformat())
+
+    def _ingest(self, staging: Path) -> None:
+        """Ingest the staged Data Package via the existing DiscordIngestor."""
+        from creek.ingest.base import assemble_ingested_fragment
+        from creek.ingest.discord import DiscordIngestor
+        from creek.vault.writer import VaultWriter
+
+        writer = VaultWriter(vault_path=self._vault)
+        result = DiscordIngestor().ingest(staging)
+        for parsed in result.fragments:
+            assembled = assemble_ingested_fragment(parsed)
+            writer.write_fragment(assembled.fragment, body=assembled.body)
+
+    def load_cursor(self) -> str | None:
+        """Return the persisted ``--after`` cursor, or ``None`` if unset."""
+        if not self._cursor_path.exists():
+            return None
+        try:
+            data = json.loads(self._cursor_path.read_text(encoding="utf-8"))
+            cursor = data.get("cursor") if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+        return cursor if isinstance(cursor, str) else None
+
+    def save_cursor(self, cursor: str) -> None:
+        """Persist the ``--after`` cursor atomically (no secrets)."""
+        self._cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._cursor_path.with_name(self._cursor_path.name + ".tmp")
+        tmp.write_text(json.dumps({"cursor": cursor}), encoding="utf-8")
+        os.replace(tmp, self._cursor_path)

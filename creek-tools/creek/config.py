@@ -1453,8 +1453,27 @@ class DiscordSourceConfig(BaseModel):
     exporter: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
     """User-token exporter — OFF by default (decision #3); ToS-caveated."""
 
+    exporter_binary: str | None = None
+    """Absolute path to the operator-provided user-token exporter binary (#686).
+
+    Non-secret. The exporter is invoked read-only with the Discord token passed
+    via the environment only, never on the command line or in this config."""
+
+    exporter_timeout_seconds: int = Field(default=600, ge=1)
+    """Hard timeout for the exporter subprocess so a hung binary cannot block
+    the run indefinitely (#686)."""
+
     bot_capture: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
     """Bot message capture for servers/channels — off by default."""
+
+    @field_validator("exporter_binary")
+    @classmethod
+    def _validate_exporter_binary(cls, value: str | None) -> str | None:
+        """Require an absolute path so the binary resolves predictably (#686)."""
+        if value is not None and not Path(value).is_absolute():
+            msg = f"exporter_binary must be an absolute path, got {value!r}."
+            raise ValueError(msg)
+        return value
 
 
 class CreekConfig(BaseSettings):
