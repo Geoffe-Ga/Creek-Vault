@@ -22,6 +22,8 @@ from creek.pipeline import Pipeline, PipelineResult
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.models import PrivacyTier
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -149,10 +151,10 @@ class TestPipelineInit:
         pipeline = Pipeline(config=config)
         assert pipeline.rule_classifier is not None
 
-    def test_creates_llm_classifier(self, config):
-        """Test that Pipeline initialises an LLMClassifier."""
+    def test_creates_tier_classifiers(self, config):
+        """Test that Pipeline initialises the per-tier classifiers (#706)."""
         pipeline = Pipeline(config=config)
-        assert pipeline.llm_classifier is not None
+        assert pipeline.tier_classifiers.non_intimate is not None
 
     def test_creates_review_generator(self, config):
         """Test that Pipeline initialises a ReviewQueueGenerator."""
@@ -945,7 +947,9 @@ class TestPipelineClassificationGating:
                 "confidence_score",
                 return_value=0.95,
             ),
-            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+            patch.object(
+                pipeline.tier_classifiers.non_intimate, "classify"
+            ) as mock_llm,
         ):
             pipeline._run_classification([item], vault_path, PipelineResult())
 
@@ -974,7 +978,7 @@ class TestPipelineClassificationGating:
                 return_value=0.1,
             ),
             patch.object(
-                pipeline.llm_classifier,
+                pipeline.tier_classifiers.non_intimate,
                 "classify",
                 side_effect=lambda f, content="": f,
             ) as mock_llm,
@@ -995,7 +999,7 @@ class TestPipelineClassificationGating:
                 side_effect=lambda f, content="": f,
             ),
             patch.object(
-                pipeline.llm_classifier,
+                pipeline.tier_classifiers.non_intimate,
                 "classify",
                 side_effect=lambda f, content="": f,
             ) as mock_llm,
@@ -1017,8 +1021,85 @@ class TestPipelineClassificationGating:
                 "classify",
                 side_effect=lambda f, content="": f,
             ),
-            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+            patch.object(
+                pipeline.tier_classifiers.non_intimate, "classify"
+            ) as mock_llm,
         ):
             pipeline._run_classification([item], vault_path, PipelineResult())
 
         mock_llm.assert_not_called()
+
+
+class TestPipelineTierRouting:
+    """`creek process` classifies each fragment by its privacy tier (#706).
+
+    Closes the Intimate-never-cloud gap for the pipeline: an Intimate fragment is
+    classified by the local provider even when ``classification`` is cloud.
+    """
+
+    @staticmethod
+    def _cloud_classification_local_default() -> CreekConfig:
+        """Config with a cloud ``classification`` stage + a local ``default``."""
+        from creek.config import LLMConfig, LLMRoutingConfig
+
+        return CreekConfig(
+            llm=LLMRoutingConfig(
+                default=LLMConfig(provider="ollama", model="qwen3:8b"),
+                classification=LLMConfig(
+                    provider="anthropic", model="claude-haiku-4-5"
+                ),
+            )
+        )
+
+    @staticmethod
+    def _ingested(frag_id: str, tier: PrivacyTier):
+        """An IngestedFragment at *tier* with a known id."""
+        from creek.ingest.base import IngestedFragment
+        from creek.models import Fragment, FragmentSource, SourcePlatform
+
+        fragment = Fragment(
+            id=frag_id,
+            title=frag_id,
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            privacy_tier=tier,
+        )
+        return IngestedFragment(fragment=fragment, body="a note worth classifying")
+
+    def test_intimate_routes_local_nonintimate_cloud(self, vault_path, monkeypatch):
+        """Intimate → the local classifier; Open → the configured cloud one."""
+        from creek.models import PrivacyTier
+
+        pipeline = Pipeline(config=self._cloud_classification_local_default())
+        # Cloud classification + local default → the tier classifiers are distinct.
+        assert (
+            pipeline.tier_classifiers.intimate
+            is not pipeline.tier_classifiers.non_intimate
+        )
+        # Force the LLM path: rules leave each fragment unclassified.
+        monkeypatch.setattr(
+            pipeline.rule_classifier, "classify", lambda f, content="": f
+        )
+
+        seen: dict[str, list[str]] = {"local": [], "cloud": []}
+        monkeypatch.setattr(
+            pipeline.tier_classifiers.intimate,
+            "classify",
+            lambda f, content="": (seen["local"].append(f.id), f)[1],
+        )
+        monkeypatch.setattr(
+            pipeline.tier_classifiers.non_intimate,
+            "classify",
+            lambda f, content="": (seen["cloud"].append(f.id), f)[1],
+        )
+
+        pipeline._run_classification(
+            [
+                self._ingested("frag-intimatexx", PrivacyTier.INTIMATE),
+                self._ingested("frag-openxxxxxxx", PrivacyTier.OPEN),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert seen["local"] == ["frag-intimatexx"]  # Intimate → local provider
+        assert seen["cloud"] == ["frag-openxxxxxxx"]  # non-Intimate → cloud provider

@@ -37,7 +37,8 @@ from creek.audit.yield_summary import (
     format_yield_line,
     write_yield_summary,
 )
-from creek.classify.llm import LLMClassifier
+from creek.classify.classify_engine import build_tier_classifiers
+from creek.classify.privacy_filter import tier_of
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
@@ -217,7 +218,8 @@ class Pipeline:
         config: The Creek configuration governing all subsystems.
         scanner: The redaction scanner for PII detection.
         rule_classifier: Keyword-based classifier.
-        llm_classifier: LLM-based classifier stub.
+        tier_classifiers: Per-tier LLM classifiers (#666/#706) — the fragment's
+            privacy tier selects the provider so Intimate stays local.
         review_generator: Review queue generator for uncertain fragments.
         linking_pipeline: Orchestrator for all four linking stages.
         consent_manager: Optional consent manager for gating processing.
@@ -239,7 +241,7 @@ class Pipeline:
             no_llm: When ``True``, skip Pass 3 (LLM classification)
                 entirely. The deterministic and local-model passes still
                 run; the run summary records ``no_llm: true`` and the
-                pipeline never invokes ``llm_classifier.classify`` —
+                pipeline never invokes the LLM classifier —
                 guaranteeing zero network egress along the LLM path.
                 The flag wins over ``LLMConfig.provider`` so passing
                 ``no_llm=True`` with ``provider: anthropic`` is safe.
@@ -249,9 +251,12 @@ class Pipeline:
         self.no_llm = no_llm
         self.scanner = RedactionScanner(config=config.redaction)
         self.rule_classifier = RuleClassifier()
-        self.llm_classifier = LLMClassifier(
-            config=config.model_router.resolve("classification"),
-        )
+        # Per-tier routing (#666/#706): each fragment is classified by the
+        # provider its privacy tier resolves to — Intimate stays local even when
+        # ``classification`` is cloud. Building here is safe with any config:
+        # build_tier_classifiers defers IntimateRoutingError (it never raises at
+        # construction), so a rules-only or all-cloud ``process`` run is fine.
+        self.tier_classifiers = build_tier_classifiers(config)
         self.review_generator = ReviewQueueGenerator(config=config.classification)
         self.linking_pipeline = LinkingPipeline(
             config=config.embeddings,
@@ -528,7 +533,8 @@ class Pipeline:
             if self._needs_llm(frag, item.body):
                 result.residue += 1
                 if not self.no_llm:
-                    frag = self.llm_classifier.classify(frag, content=item.body)
+                    classifier = self.tier_classifiers.for_tier(tier_of(frag))
+                    frag = classifier.classify(frag, content=item.body)
             else:
                 result.deterministic_classified += 1
             classified.append(IngestedFragment(fragment=frag, body=item.body))

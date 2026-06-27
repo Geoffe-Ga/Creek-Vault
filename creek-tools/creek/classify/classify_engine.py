@@ -181,7 +181,7 @@ class _RunCounts:
 
 
 @dataclass(frozen=True)
-class _TierClassifiers:
+class TierClassifiers:
     """Per-tier LLM classifiers for one classify run (#666).
 
     ``non_intimate`` serves OPEN / PERSONAL / UNCLASSIFIED fragments with the
@@ -233,7 +233,7 @@ class _TierClassifiers:
         return self.routing_error
 
 
-def _build_tier_classifiers(config: CreekConfig) -> _TierClassifiers:
+def build_tier_classifiers(config: CreekConfig) -> TierClassifiers:
     """Build the per-tier classifiers via the ModelRouter chokepoint (#666).
 
     Resolves ``classification`` tier-less for non-Intimate fragments and with
@@ -242,21 +242,21 @@ def _build_tier_classifiers(config: CreekConfig) -> _TierClassifiers:
     ``classification`` stage), a single classifier instance is shared — identical
     to the pre-#666 behaviour. When no local backend exists, the resulting
     :class:`IntimateRoutingError` is captured and **deferred** (see
-    :class:`_TierClassifiers`) rather than failing a run that has no Intimate
+    :class:`TierClassifiers`) rather than failing a run that has no Intimate
     content.
 
     Args:
         config: The loaded Creek configuration (carrying the model router).
 
     Returns:
-        The :class:`_TierClassifiers` for this run.
+        The :class:`TierClassifiers` for this run.
     """
     router = config.model_router
     non_intimate = LLMClassifier(config=router.resolve("classification"))
     try:
         intimate_cfg = router.resolve("classification", PrivacyTier.INTIMATE)
     except IntimateRoutingError as exc:
-        return _TierClassifiers(
+        return TierClassifiers(
             non_intimate=non_intimate, intimate=None, routing_error=exc
         )
     intimate = (
@@ -264,7 +264,7 @@ def _build_tier_classifiers(config: CreekConfig) -> _TierClassifiers:
         if intimate_cfg == non_intimate.config
         else LLMClassifier(config=intimate_cfg)
     )
-    return _TierClassifiers(
+    return TierClassifiers(
         non_intimate=non_intimate, intimate=intimate, routing_error=None
     )
 
@@ -306,7 +306,7 @@ def run_classify(
     # to a local provider by the ModelRouter chokepoint (Intimate-never-cloud,
     # #647). Resolving here also fails the run loudly (IntimateRoutingError) when
     # classification is cloud and no local default exists to route Intimate to.
-    tier_classifiers = _build_tier_classifiers(config) if method == LLM_METHOD else None
+    tier_classifiers = build_tier_classifiers(config) if method == LLM_METHOD else None
     if tier_classifiers is not None:
         for classifier in tier_classifiers.distinct():
             if not classifier.available:
@@ -408,7 +408,7 @@ def _process_file(
     force: bool,
     rules: RuleClassifier,
     audience: AudienceClassifier,
-    tier_classifiers: _TierClassifiers | None,
+    tier_classifiers: TierClassifiers | None,
     classification_config: ClassificationConfig,
     counts: _RunCounts,
     progress_path: Path | None,
