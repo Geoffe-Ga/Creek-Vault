@@ -500,6 +500,49 @@ def _tomb_missing_units(
     return tombed
 
 
+def _parse_since_arg(text: str) -> datetime:
+    """Parse a ``--since`` argument as an ISO timestamp or a duration (#677).
+
+    Accepts an ISO-8601 timestamp (e.g. ``2026-06-25T00:00:00``, as the ledger
+    records ``last_seen``) or a ``creek lint``-style duration (``7d``, ``1w``,
+    ``1mo``). Naive ISO timestamps are treated as UTC. Exits with code 2 on an
+    unparseable value.
+    """
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        from creek.lint import parse_since  # public re-export of runner.parse_since
+
+        try:
+            return parse_since(text)
+        except ValueError as exc:
+            console.print(
+                f"[red]Invalid --since {text!r}: expected an ISO timestamp "
+                "(2026-06-25T00:00:00) or a duration (7d, 1w, 1mo).[/red]",
+            )
+            raise typer.Exit(code=2) from exc
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _should_skip_unit(
+    *,
+    filtering: bool,
+    ledger: SourceLedger | None,
+    parsed: ParsedFragment,
+    fragment: Fragment,
+    since: datetime | None,
+) -> bool:
+    """Return whether incremental mode should skip this unchanged unit (#677)."""
+    if not filtering:
+        return False
+    # Deferred import: creek.pipeline pulls heavy stage deps; keep CLI startup light.
+    from creek.pipeline import unit_is_changed
+
+    record = _ledger_record(ledger, fragment)
+    content_hash = ledger.content_hash(parsed.content) if ledger is not None else ""
+    return not unit_is_changed(parsed.timestamp, content_hash, record, since)
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -508,6 +551,8 @@ def _run_ingest(
     vault_path: Path,
     reclassify_threshold: float = 0.0,
     print_summary: bool = False,
+    since: datetime | None = None,
+    incremental: bool = False,
 ) -> tuple[int, list[str], int]:
     """Run a single ingestor and persist its output to the vault.
 
@@ -521,6 +566,11 @@ def _run_ingest(
             (the default, used by tests/internal callers) always preserves.
         print_summary: When ``True``, print a created/updated/tombed summary
             line (the ``creek ingest`` surface; #675).
+        since: Incremental cutoff (#677). When set, only units newer than this
+            timestamp are processed; older units are skipped.
+        incremental: Ledger-driven incremental mode (#677). When ``True`` and
+            *since* is ``None``, units whose ledger content-hash is unchanged
+            are skipped. Ignored for sources without a ledger.
 
     Returns:
         Tuple of ``(written_count, errors, discovered)`` where ``errors`` is a
@@ -541,11 +591,12 @@ def _run_ingest(
 
     ingest_result = ingestor_cls().ingest(input_path)
     ledger = _ledger_for_source(source_type, vault_path)
+    filtering = since is not None or incremental
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
-    created = 0
-    updated = 0
+    skipped = 0
+    counts: dict[str, int] = {}
     seen_keys: set[str] = set()
     for parsed in ingest_result.fragments:
         try:
@@ -558,8 +609,19 @@ def _run_ingest(
             continue
         _attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
         origin_key = assembled.fragment.source.origin_key
+        # Record the key as seen BEFORE any incremental skip, so an unchanged
+        # unit is never mistaken for a deleted one and tombed (#674/#677).
         if origin_key is not None:
             seen_keys.add(origin_key)
+        if _should_skip_unit(
+            filtering=filtering,
+            ledger=ledger,
+            parsed=parsed,
+            fragment=assembled.fragment,
+            since=since,
+        ):
+            skipped += 1
+            continue
         try:
             action = _write_fragment_idempotent(
                 ledger,
@@ -576,19 +638,18 @@ def _run_ingest(
             continue
         _record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
-        if action == "created":
-            created += 1
-        elif action == "updated":
-            updated += 1
-        # "unchanged" is an idempotent no-op — excluded from both counters.
+        # Tally every action (created/updated/unchanged); only created/updated
+        # are surfaced in the summary line — "unchanged" is an idempotent no-op.
+        counts[action] = counts.get(action, 0) + 1
 
     tombed = _tomb_missing_units(
         ledger, writer, input_path, seen_keys, errors, source_type
     )
     if print_summary:
         console.print(
-            f"[dim]Ingest summary: {created} created, {updated} updated, "
-            f"{tombed} tombed[/dim]",
+            f"[dim]Ingest summary: {counts.get('created', 0)} created, "
+            f"{counts.get('updated', 0)} updated, {tombed} tombed, "
+            f"{skipped} skipped[/dim]",
         )
     return written, errors, ingest_result.discovered
 
@@ -943,6 +1004,22 @@ def ingest(
             "fragments (likely an unrecognized export format)."
         ),
     ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help=(
+            "Incremental: only process units newer than this ISO timestamp "
+            "(e.g. 2026-06-25T00:00:00) or duration (e.g. 7d, 1w)."
+        ),
+    ),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        help=(
+            "Incremental: skip units whose content is unchanged vs the ledger "
+            "(ledger-driven; overridden by --since)."
+        ),
+    ),
 ) -> None:
     """Ingest a specific source type into the vault.
 
@@ -986,6 +1063,8 @@ def ingest(
         assume_yes=yes,
     )
 
+    since_dt = _parse_since_arg(since) if since is not None else None
+
     written, errors, discovered = _run_ingest(
         ingestor_cls=ingestor_cls,
         source_type=type,
@@ -993,6 +1072,8 @@ def ingest(
         vault_path=vault_path,
         reclassify_threshold=config.classification.reclassify_on_edit_threshold,
         print_summary=True,
+        since=since_dt,
+        incremental=incremental,
     )
 
     console.print(f"[bold green]Ingested {written} fragment(s).[/bold green]")

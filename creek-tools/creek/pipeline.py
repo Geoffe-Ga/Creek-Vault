@@ -27,6 +27,7 @@ The pipeline runs in three named passes (FEAT-005):
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -44,6 +45,7 @@ from creek.consent import ConsentManager
 from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.base import IngestedFragment, assemble_ingested_fragment
+from creek.ingest.ledger import LedgerRecord
 from creek.link.linker import LinkingPipeline
 from creek.models import Fragment, Frequency
 from creek.redact.scanner import RedactionScanner
@@ -86,6 +88,46 @@ def resolve_tier_b_plan() -> list[str]:
     link + index rebuilds. Returned as an ordered list of step strings.
     """
     return ["classify --method llm", "link", "index"]
+
+
+def _as_aware(value: datetime) -> datetime:
+    """Return *value* as an aware datetime, assuming UTC when naive."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def unit_is_changed(
+    timestamp: datetime,
+    content_hash: str,
+    record: LedgerRecord | None,
+    since: datetime | None,
+) -> bool:
+    """Return whether a source unit should be (re)processed by incremental ingest.
+
+    Two cursors, used by the two incremental modes (#677):
+
+    * ``since`` given (``creek ingest --since``): a unit is changed when its
+      timestamp is strictly newer than the cutoff (mtime-style, generalising
+      the Drive mtime-skip to every file source). Naive timestamps are treated
+      as UTC.
+    * ``since`` is ``None`` (``--incremental``, ledger-driven): a unit is
+      changed when the ledger has no record for it, or its recorded
+      ``content_hash`` differs from *content_hash* — so a touch-without-edit
+      (same hash) is still skipped.
+
+    Args:
+        timestamp: The source unit's timestamp (fragment mtime/authored time).
+        content_hash: SHA-256 of the unit's current content.
+        record: The prior ledger record for this unit, or ``None``.
+        since: Explicit cutoff datetime, or ``None`` for ledger-driven mode.
+
+    Returns:
+        ``True`` when the unit should be processed; ``False`` to skip it.
+    """
+    if since is not None:
+        return _as_aware(timestamp) > _as_aware(since)
+    if record is not None:
+        return record.content_hash != content_hash
+    return True
 
 
 class RedactionRequiredError(RuntimeError):
