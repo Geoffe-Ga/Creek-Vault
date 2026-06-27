@@ -113,7 +113,9 @@ class TestSyncCommand:
     def test_tier_a_lists_enabled_sources_only(self, tmp_path: Path) -> None:
         """Default-enabled journal+gdrive appear; off-by-default discord does not."""
         vault = _make_vault(tmp_path)
-        result = runner.invoke(app, ["sync", "--tier", "A", "--vault", str(vault)])
+        result = runner.invoke(
+            app, ["sync", "--tier", "A", "--dry-run", "--vault", str(vault)]
+        )
         assert result.exit_code == 0, result.output
         assert "journal" in result.output
         assert "gdrive" in result.output
@@ -123,7 +125,17 @@ class TestSyncCommand:
         """--source limits Tier A to a single source."""
         vault = _make_vault(tmp_path)
         result = runner.invoke(
-            app, ["sync", "--tier", "A", "--source", "journal", "--vault", str(vault)]
+            app,
+            [
+                "sync",
+                "--tier",
+                "A",
+                "--source",
+                "journal",
+                "--dry-run",
+                "--vault",
+                str(vault),
+            ],
         )
         assert result.exit_code == 0, result.output
         assert "ingest --type markdown" in result.output
@@ -158,8 +170,10 @@ class TestSyncCommand:
     def test_second_run_reports_previous(self, tmp_path: Path) -> None:
         """A second run echoes the prior recorded run."""
         vault = _make_vault(tmp_path)
-        runner.invoke(app, ["sync", "--tier", "A", "--vault", str(vault)])
-        result = runner.invoke(app, ["sync", "--tier", "B", "--vault", str(vault)])
+        runner.invoke(app, ["sync", "--tier", "A", "--dry-run", "--vault", str(vault)])
+        result = runner.invoke(
+            app, ["sync", "--tier", "B", "--dry-run", "--vault", str(vault)]
+        )
         assert result.exit_code == 0, result.output
         assert "previous run" in result.output.lower()
         assert _state(vault)["tier"] == "B"

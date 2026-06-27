@@ -65,6 +65,11 @@ _SYNC_INGEST_TYPE: dict[str, str] = {
 }
 
 
+def sync_ingest_type(source: str) -> str:
+    """Return the ingestor type a ``creek sync`` source routes to (#676)."""
+    return _SYNC_INGEST_TYPE.get(source, source)
+
+
 def resolve_tier_a_plan(source: str) -> list[str]:
     """Return the ordered Tier-A subcommand plan for *source* (#676).
 
@@ -73,7 +78,7 @@ def resolve_tier_a_plan(source: str) -> list[str]:
     ordered list of human-readable step strings) — the skeleton command echoes
     it; real execution lands in a later issue.
     """
-    ingest_type = _SYNC_INGEST_TYPE.get(source, source)
+    ingest_type = sync_ingest_type(source)
     return [
         "pull",
         f"ingest --type {ingest_type} --since <ledger>",

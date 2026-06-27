@@ -823,38 +823,164 @@ def _sync_tier_b() -> None:
     console.print(f"[sync] plan: {' -> '.join(resolve_tier_b_plan())}")
 
 
+# ---- creek sync: real tier execution (#678) ----------------------------
+
+
+def _sync_source_input(source: str, config: CreekConfig) -> Path | None:
+    """Resolve the local input path for a Tier-A source, or ``None`` (#678)."""
+    rel = getattr(config.sources, source, None)
+    if not isinstance(rel, str):
+        return None
+    return config.source_drive / rel
+
+
+def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
+    """Pull a remote source into staging (Tier A, #678).
+
+    Only Google Drive has a pull step today (it mirrors files into a local
+    staging directory via the existing read-only downloader); local sources
+    such as the journal are already on disk and no-op here. Connector
+    generalisation is a later epic. (``_vault_path`` is unused but kept so all
+    step helpers share a uniform ``(source, config, vault_path)`` shape.)
+    """
+    if source != "gdrive":
+        return
+    from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
+
+    client = GoogleApiDriveClient(config.google_drive)
+    if not client.is_available():
+        console.print(
+            "[yellow][sync] Google Drive libraries unavailable; skipping pull."
+            "[/yellow]",
+        )
+        return
+    staging = config.source_drive / config.google_drive.staging_dir
+    GoogleDriveDownloader(client=client, config=config.google_drive).download_all(
+        staging,
+    )
+
+
+def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> None:
+    """Incrementally ingest one Tier-A source via its mapped ingestor (#678)."""
+    from creek.ingest import INGESTOR_REGISTRY
+    from creek.pipeline import sync_ingest_type
+
+    ingest_type = sync_ingest_type(source)
+    ingestor_cls = INGESTOR_REGISTRY.get(ingest_type)
+    if ingestor_cls is None:
+        return  # e.g. gdrive is a downloader, not an ingestor
+    input_path = _sync_source_input(source, config)
+    if input_path is None or not input_path.exists():
+        console.print(
+            f"[yellow][sync] skipping {source}: source path not found "
+            f"({input_path}).[/yellow]",
+        )
+        return
+    _run_ingest(
+        ingestor_cls=ingestor_cls,
+        source_type=ingest_type,
+        input_path=input_path,
+        vault_path=vault_path,
+        reclassify_threshold=config.classification.reclassify_on_edit_threshold,
+        incremental=True,
+    )
+
+
+def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> None:
+    """Run a classify pass for a sync tier (#678)."""
+    from creek.classify.classify_engine import run_classify
+
+    run_classify(vault_path=vault_path, config=config, method=method, force=False)
+
+
+def _sync_link(vault_path: Path, config: CreekConfig) -> None:
+    """Run the embeddings linker — Tier B only (R6, #678)."""
+    from creek.link.link_engine import run_link
+
+    run_link(vault_path=vault_path, config=config, method="embeddings", rebuild=False)
+
+
+def _sync_index(vault_path: Path) -> None:
+    """Regenerate index notes — Tier B only (R6, #678)."""
+    from creek.generate.indexes import IndexGenerator
+
+    IndexGenerator(vault_path=vault_path).generate_all()
+
+
+def _sync_run_tier_a(
+    config: CreekConfig,
+    vault_path: Path,
+    sources: list[str],
+) -> None:
+    """Execute Tier A: per source pull + incremental ingest, then rules classify.
+
+    Linking and indexing are **never** invoked here (R6: they are O(n²)/global
+    and belong to Tier B).
+    """
+    for source in sources:
+        _sync_pull(source, config, vault_path)
+        _sync_ingest_source(source, config, vault_path)
+    _sync_classify(vault_path, config, "rules")
+
+
+def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
+    """Execute Tier B globally: llm classify -> link -> index (#678)."""
+    _sync_classify(vault_path, config, "llm")
+    _sync_link(vault_path, config)
+    _sync_index(vault_path)
+
+
+def _sync_dispatch(
+    tier_norm: str,
+    *,
+    dry_run: bool,
+    config: CreekConfig,
+    vault_path: Path,
+    source: str | None,
+) -> None:
+    """Echo (dry-run) or execute the chosen sync tier (#678)."""
+    if tier_norm == "A":
+        if dry_run:
+            _sync_tier_a(config.sync.enabled_sources(), source)
+        else:
+            # An explicit --source overrides the enable toggle (the operator
+            # asked for it by name); otherwise run the enabled set.
+            sources = [source] if source is not None else config.sync.enabled_sources()
+            _sync_run_tier_a(config, vault_path, sources)
+    elif dry_run:
+        _sync_tier_b()
+    else:
+        _sync_run_tier_b(config, vault_path)
+
+
 @app.command()
 def sync(
     tier: str = typer.Option(
         "A", "--tier", help="A (cheap, per-source) or B (nightly)"
     ),
     source: str | None = typer.Option(
-        None, "--source", help="Limit a Tier-A run to a single source"
+        None,
+        "--source",
+        help="Limit a Tier-A run to one source (explicitly overrides its toggle)",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Echo the plan without executing (current default)"
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Plan a scheduled sync pass (#676 -- dry-run skeleton).
+    """Run a scheduled sync pass (#676/#678).
 
-    ``--tier A`` resolves the cheap per-source plan (pull -> incremental ingest
-    -> rules classify) for each enabled source; ``--tier B`` resolves the
-    nightly global plan (LLM classify -> link -> index). This skeleton only
-    **echoes** the ordered plan and records
-    ``00-Creek-Meta/State/sync/last-run.json`` -- real pulling/ingesting/
-    scheduling land in later issues (#677-#680).
+    ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
+    rules classify) for each enabled source; ``--tier B`` is the nightly global
+    pass (LLM classify -> link -> index). Linking and indexing run only in Tier
+    B (R6). ``--dry-run`` echoes the ordered plan without executing. Every run
+    records ``00-Creek-Meta/State/sync/last-run.json``; because every step is
+    idempotent, a missed tick self-heals on the next run (no catch-up queue).
     """
     tier_norm = tier.upper()
     if tier_norm not in {"A", "B"}:
         console.print("[red]--tier must be A or B[/red]")
         raise typer.Exit(code=2)
-    if not dry_run:
-        # Real execution lands in #678; until then every run plans only.
-        console.print(
-            "[yellow][sync] skeleton supports planning only; running as dry-run."
-            "[/yellow]",
-        )
 
     if tier_norm == "B" and source is not None:
         # --source is a Tier-A concept; Tier B always runs the global passes.
@@ -871,19 +997,21 @@ def sync(
         )
         raise typer.Exit(code=2)
 
-    if tier_norm == "A":
-        _sync_tier_a(config.sync.enabled_sources(), source)
-    else:
-        _sync_tier_b()
+    _sync_dispatch(
+        tier_norm,
+        dry_run=dry_run,
+        config=config,
+        vault_path=vault_path,
+        source=source,
+    )
 
-    prior = _write_sync_state(vault_path, tier_norm, dry_run=True)
+    prior = _write_sync_state(vault_path, tier_norm, dry_run=dry_run)
     if prior is not None:
         console.print(
             f"[sync] (previous run: tier={prior.get('tier')} at {prior.get('at')})",
         )
-    console.print(
-        f"[sync] last-run.json: wrote tier={tier_norm} (skeleton; no units processed)",
-    )
+    mode = "planned" if dry_run else "ran"
+    console.print(f"[sync] {mode} tier={tier_norm}; wrote last-run.json")
 
 
 @app.command()
