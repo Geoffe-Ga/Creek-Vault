@@ -61,6 +61,19 @@ class TestLaunchd:
         assert "link" not in plists.tier_a
         assert "index" not in plists.tier_a
 
+    def test_vault_with_spaces_stays_one_string(self) -> None:
+        """A spaced vault path is a single <string>, not word-split."""
+        spaced = Path("/Users/me/My Notes")
+        plists = render_launchd_plists(vault=spaced)
+        assert "<string>/Users/me/My Notes</string>" in plists.tier_a
+        assert "<string>Notes</string>" not in plists.tier_a  # not split
+
+    def test_xml_special_chars_are_escaped(self) -> None:
+        """A vault path with XML metacharacters stays well-formed."""
+        plists = render_launchd_plists(vault=Path("/Users/me/A&B"))
+        ET.fromstring(plists.tier_a)
+        assert "<string>/Users/me/A&amp;B</string>" in plists.tier_a
+
 
 # ---- systemd ------------------------------------------------------------
 
@@ -75,10 +88,10 @@ class TestSystemd:
         assert "OnCalendar=*-*-* 03:00:00" in units.tier_b_timer
 
     def test_service_embeds_command(self) -> None:
-        """Each service ExecStart runs the right tier against the vault."""
+        """Each service ExecStart runs the right tier against the (quoted) vault."""
         units = render_systemd_units(vault=_VAULT)
-        assert f"creek sync --tier A --vault {_VAULT}" in units.tier_a_service
-        assert f"creek sync --tier B --vault {_VAULT}" in units.tier_b_service
+        assert f'creek sync --tier A --vault "{_VAULT}"' in units.tier_a_service
+        assert f'creek sync --tier B --vault "{_VAULT}"' in units.tier_b_service
 
     def test_tier_a_service_has_no_link_or_index(self) -> None:
         """R6: the Tier-A unit never references link/index."""
@@ -92,6 +105,14 @@ class TestSystemd:
         assert "OnCalendar=*:0/15" in units.tier_a_timer
         assert "OnCalendar=*-*-* 05:00:00" in units.tier_b_timer
 
+    def test_vault_with_spaces_is_quoted(self) -> None:
+        """A spaced vault path is quoted in ExecStart (one --vault argument)."""
+        spaced = Path("/Users/me/My Notes")
+        units = render_systemd_units(vault=spaced)
+        assert 'ExecStart=creek sync --tier A --vault "/Users/me/My Notes"' in (
+            units.tier_a_service
+        )
+
 
 # ---- cron ---------------------------------------------------------------
 
@@ -102,8 +123,13 @@ class TestCron:
     def test_crontab_schedule_and_command(self) -> None:
         """Tier A every 30 min, Tier B nightly at hour 3, against the vault."""
         cron = render_crontab(vault=_VAULT, tier_a_minutes=30, tier_b_hour=3)
-        assert f"*/30 * * * * creek sync --tier A --vault {_VAULT}" in cron
-        assert f"0 3 * * * creek sync --tier B --vault {_VAULT}" in cron
+        assert f'*/30 * * * * creek sync --tier A --vault "{_VAULT}"' in cron
+        assert f'0 3 * * * creek sync --tier B --vault "{_VAULT}"' in cron
+
+    def test_vault_with_spaces_is_quoted(self) -> None:
+        """A spaced vault path is quoted in the cron command."""
+        cron = render_crontab(vault=Path("/Users/me/My Notes"))
+        assert 'creek sync --tier A --vault "/Users/me/My Notes"' in cron
 
 
 # ---- CLI: --install-schedule -------------------------------------------
@@ -135,6 +161,27 @@ class TestInstallScheduleCli:
         assert result.exit_code == 0, result.output
         assert (out / "com.creek.sync.tier-a.plist").exists()
         assert (out / "com.creek.sync.tier-b.plist").exists()
+        # The written content targets the chosen vault.
+        plist = (out / "com.creek.sync.tier-a.plist").read_text(encoding="utf-8")
+        assert f"<string>{tmp_path / 'v'}</string>" in plist
+
+    def test_default_output_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without --schedule-out-dir, launchd plists land in ~/Library/LaunchAgents."""
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig()
+        )
+        home = tmp_path / "home"
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)
+        result = runner.invoke(
+            app,
+            ["sync", "--install-schedule", "launchd", "--vault", str(tmp_path / "v")],
+        )
+        assert result.exit_code == 0, result.output
+        assert (
+            home / "Library" / "LaunchAgents" / "com.creek.sync.tier-a.plist"
+        ).exists()
 
     def test_systemd_writes_four_units(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

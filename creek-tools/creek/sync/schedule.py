@@ -1,4 +1,4 @@
-"""Render launchd / systemd / cron schedule artifacts for ``creek sync`` (#679).
+"""Render launchd / systemd / cron schedule artifacts for ``creek sync``.
 
 Each renderer is a pure function: given a vault path and the config-tunable
 cadence (Tier-A interval in minutes, Tier-B nightly hour), it returns the unit
@@ -9,10 +9,16 @@ operator's manual step (SPEC decision #4 — BUILD BOTH host adapters).
 Tier A runs the cheap per-source pass (`creek sync --tier A`); Tier B runs the
 nightly global pass (`creek sync --tier B`). The embedded commands never contain
 `link`/`index` directly — those run inside Tier B only (R6).
+
+Vault paths may contain spaces (common on macOS, e.g. ``~/Documents/My
+Notes``): launchd receives the command as an argument *list* (one ``<string>``
+per token, so the path stays whole), while systemd ``ExecStart`` and the cron
+line *quote* the path.
 """
 
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -24,14 +30,19 @@ if TYPE_CHECKING:
 _CREEK = "creek"
 
 
-def _tier_command(vault: Path, tier: str) -> str:
-    """Return the ``creek sync`` command line for *tier* against *vault*."""
-    return f"{_CREEK} sync --tier {tier} --vault {vault}"
+def _tier_args(vault: Path, tier: str) -> list[str]:
+    """Return the ``creek sync`` argv for *tier* (path kept as one token)."""
+    return [_CREEK, "sync", "--tier", tier, "--vault", str(vault)]
+
+
+def _tier_command_quoted(vault: Path, tier: str) -> str:
+    """Return the ``creek sync`` command line with the vault path quoted."""
+    return f'{_CREEK} sync --tier {tier} --vault "{vault}"'
 
 
 @dataclass(frozen=True)
 class LaunchdPlists:
-    """Rendered launchd plist contents for both tiers (macOS, #679)."""
+    """Rendered launchd plist contents for both tiers (macOS)."""
 
     tier_a: str
     tier_b: str
@@ -41,7 +52,7 @@ class LaunchdPlists:
 
 @dataclass(frozen=True)
 class SystemdUnits:
-    """Rendered systemd service+timer contents for both tiers (Linux, #679)."""
+    """Rendered systemd service+timer contents for both tiers (Linux)."""
 
     tier_a_service: str
     tier_a_timer: str
@@ -53,10 +64,14 @@ class SystemdUnits:
     tier_b_timer_filename: str = "creek-sync-tier-b.timer"
 
 
-def _plist(label: str, command: str, schedule_xml: str) -> str:
-    """Render one launchd plist with *schedule_xml* as the cadence element."""
+def _plist(label: str, args: list[str], schedule_xml: str) -> str:
+    """Render one launchd plist with *schedule_xml* as the cadence element.
+
+    Each argv token becomes one ``<string>`` element (so a vault path with
+    spaces stays intact), XML-escaped to stay well-formed for any path.
+    """
     program_args = "".join(
-        f"        <string>{arg}</string>\n" for arg in command.split()
+        f"        <string>{html.escape(arg)}</string>\n" for arg in args
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -84,7 +99,7 @@ def render_launchd_plists(
     tier_a_minutes: int = 30,
     tier_b_hour: int = 3,
 ) -> LaunchdPlists:
-    """Render the Tier-A and Tier-B launchd plists for *vault* (#679).
+    """Render the Tier-A and Tier-B launchd plists for *vault*.
 
     Tier A uses ``StartInterval`` (the configured minutes, in seconds); Tier B
     uses ``StartCalendarInterval`` at the configured nightly hour.
@@ -104,12 +119,12 @@ def render_launchd_plists(
     return LaunchdPlists(
         tier_a=_plist(
             "com.creek.sync.tier-a",
-            _tier_command(vault, "A"),
+            _tier_args(vault, "A"),
             tier_a_schedule,
         ),
         tier_b=_plist(
             "com.creek.sync.tier-b",
-            _tier_command(vault, "B"),
+            _tier_args(vault, "B"),
             tier_b_schedule,
         ),
     )
@@ -146,7 +161,7 @@ def render_systemd_units(
     tier_a_minutes: int = 30,
     tier_b_hour: int = 3,
 ) -> SystemdUnits:
-    """Render the Tier-A/B systemd service + timer units for *vault* (#679).
+    """Render the Tier-A/B systemd service + timer units for *vault*.
 
     Tier A fires every ``tier_a_minutes`` (``OnCalendar=*:0/N``); Tier B fires
     nightly at ``tier_b_hour`` (``OnCalendar=*-*-* HH:00:00``). ``Persistent``
@@ -155,7 +170,7 @@ def render_systemd_units(
     units = SystemdUnits(
         tier_a_service=_service(
             "Creek sync (Tier A: pull/ingest/rules-classify)",
-            _tier_command(vault, "A"),
+            _tier_command_quoted(vault, "A"),
         ),
         tier_a_timer=_timer(
             "Creek sync Tier A schedule",
@@ -164,7 +179,7 @@ def render_systemd_units(
         ),
         tier_b_service=_service(
             "Creek sync (Tier B: llm-classify/link/index)",
-            _tier_command(vault, "B"),
+            _tier_command_quoted(vault, "B"),
         ),
         tier_b_timer=_timer(
             "Creek sync Tier B schedule",
@@ -181,9 +196,9 @@ def render_crontab(
     tier_a_minutes: int = 30,
     tier_b_hour: int = 3,
 ) -> str:
-    """Render a two-line crontab for the Tier-A/B sync passes (#679)."""
-    tier_a = f"*/{tier_a_minutes} * * * * {_tier_command(vault, 'A')}"
-    tier_b = f"0 {tier_b_hour} * * * {_tier_command(vault, 'B')}"
+    """Render a two-line crontab for the Tier-A/B sync passes."""
+    tier_a = f"*/{tier_a_minutes} * * * * {_tier_command_quoted(vault, 'A')}"
+    tier_b = f"0 {tier_b_hour} * * * {_tier_command_quoted(vault, 'B')}"
     return (
         "# Creek sync schedule (crontab) — install with `crontab -e`\n"
         f"{tier_a}\n"

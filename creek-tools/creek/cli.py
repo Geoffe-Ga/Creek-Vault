@@ -959,7 +959,7 @@ def _install_launchd(
     hour: int,
     out_dir: Path | None,
 ) -> None:
-    """Write both launchd plists and print activation instructions (#679)."""
+    """Write both launchd plists and print activation instructions."""
     from creek.sync import render_launchd_plists
 
     plists = render_launchd_plists(
@@ -982,7 +982,7 @@ def _install_systemd(
     hour: int,
     out_dir: Path | None,
 ) -> None:
-    """Write systemd service+timer units (and print the cron alternative, #679)."""
+    """Write systemd service+timer units (and print the cron alternative)."""
     from creek.sync import render_crontab, render_systemd_units
 
     units = render_systemd_units(
@@ -1052,7 +1052,7 @@ def sync(
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Run a scheduled sync pass (#676/#678) or emit schedule units (#679).
+    """Run a scheduled sync pass (#676/#678) or emit schedule units.
 
     ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
     rules classify) for each enabled source; ``--tier B`` is the nightly global

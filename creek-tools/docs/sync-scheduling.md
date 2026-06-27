@@ -66,3 +66,7 @@ lines — paste them into `crontab -e`.
 > The emitted units invoke `creek` from `PATH`. If `creek` is not on the
 > scheduler's `PATH` (e.g. it lives in a `uv`/virtualenv), edit the unit to use
 > the absolute path to the `creek` binary before activating.
+
+> Vault paths containing spaces (e.g. `~/Documents/My Notes`) are handled
+> correctly: launchd passes the path as a single argument, and the systemd/cron
+> commands quote it.
