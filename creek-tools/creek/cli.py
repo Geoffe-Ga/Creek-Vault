@@ -1252,6 +1252,38 @@ def _run_discord_data_package(vault_path: Path, package: Path) -> None:
     )
 
 
+def _run_real_discord_mode(
+    selected: DiscordMode,
+    config: CreekConfig,
+    vault_path: Path,
+    *,
+    dry_run: bool,
+    package: Path | None,
+) -> bool:
+    """Run the exporter / Data Package helper if its gate is met (#686/#688).
+
+    Returns ``True`` when a real ingest ran (the caller should stop), ``False``
+    when no real path applies and the caller should fall back to the echo plan.
+    """
+    from creek.ingest.discord_dispatch import DiscordMode
+
+    if dry_run:
+        return False
+    discord = config.discord
+    binary = discord.exporter_binary
+    if selected is DiscordMode.EXPORTER and discord.exporter.enabled and binary:
+        _run_discord_exporter(config, vault_path, binary)
+        return True
+    if (
+        selected is DiscordMode.DATA_PACKAGE
+        and discord.data_package.enabled
+        and package is not None
+    ):
+        _run_discord_data_package(vault_path, package)
+        return True
+    return False
+
+
 def _dispatch_discord(
     selected: DiscordMode,
     config: CreekConfig,
@@ -1261,28 +1293,11 @@ def _dispatch_discord(
     package: Path | None = None,
 ) -> None:
     """Run the exporter / Data Package helper, else echo the mode plan (#686/#688)."""
-    from creek.ingest.discord_dispatch import (
-        DiscordMode,
-        ModeDisabledError,
-        resolve_discord_handler,
-    )
+    from creek.ingest.discord_dispatch import ModeDisabledError, resolve_discord_handler
 
-    binary = config.discord.exporter_binary
-    if (
-        selected is DiscordMode.EXPORTER
-        and config.discord.exporter.enabled
-        and binary
-        and not dry_run
+    if _run_real_discord_mode(
+        selected, config, vault_path, dry_run=dry_run, package=package
     ):
-        _run_discord_exporter(config, vault_path, binary)
-        return
-    if (
-        selected is DiscordMode.DATA_PACKAGE
-        and config.discord.data_package.enabled
-        and package is not None
-        and not dry_run
-    ):
-        _run_discord_data_package(vault_path, package)
         return
 
     try:
