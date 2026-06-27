@@ -6,6 +6,11 @@ contribute summaries (not full bodies). This module owns the *one*
 implementation of that promise so ``mine``, ``draft``, ``report``, and
 ``skills`` cannot drift out of agreement with each other.
 
+:func:`tier_of` is the shared, fail-closed tier-extraction primitive (it maps an
+unrecognised ``privacy_tier`` to ``INTIMATE``). It is also used outside
+generation — per-tier classification routing (#666) calls it to decide whether a
+fragment must be classified locally — so keep it public and behaviour-stable.
+
 The filter accepts an optional :class:`PrivacyTierOverride` representing
 the operator-supplied ``--include-tier`` flag. When the override raises
 the included tier above the default, the caller is responsible for
@@ -170,7 +175,7 @@ def filter_fragments_by_tier(
             ``--include-tier``.
     """
     for fragment, body in fragments:
-        tier = _tier_of(fragment)
+        tier = tier_of(fragment)
         if tier == PrivacyTier.INTIMATE and not _allows_intimate(override):
             continue
         if tier == PrivacyTier.PERSONAL and not _allows_full_personal_body(override):
@@ -179,7 +184,7 @@ def filter_fragments_by_tier(
         yield fragment, body
 
 
-def _tier_of(fragment: Fragment) -> PrivacyTier:
+def tier_of(fragment: Fragment) -> PrivacyTier:
     """Return the fragment's privacy tier as a :class:`PrivacyTier`.
 
     Pydantic's :class:`~creek.models.Fragment` validator constrains
