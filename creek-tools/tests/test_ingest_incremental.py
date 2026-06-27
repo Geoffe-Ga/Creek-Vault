@@ -207,3 +207,37 @@ class TestIncrementalIngest:
 
         _ingest(vault, journal, print_summary=True)  # no flags
         assert "0 skipped" in capsys.readouterr().out
+
+    def test_incremental_on_fresh_vault_processes_all(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--incremental on a vault with no prior ledger processes everything."""
+        vault = _make_vault(tmp_path)
+        journal = vault / "personal" / "journal"
+        _two_entries(journal)
+        _ingest(vault, journal, incremental=True, print_summary=True)
+        out = capsys.readouterr().out
+        assert "2 created" in out
+        assert "0 skipped" in out
+
+    def test_since_takes_priority_over_incremental(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With both flags, --since (mtime) wins over the ledger hash check."""
+        vault = _make_vault(tmp_path)
+        journal = vault / "personal" / "journal"
+        _two_entries(journal)
+        _ingest(vault, journal)  # populate ledger
+        capsys.readouterr()
+
+        # Both flags + a far-future cutoff: --since wins, so all are skipped
+        # (the ledger-hash path would also skip unchanged units, but this pins
+        # the documented priority: mtime-only when --since is set).
+        _ingest(
+            vault,
+            journal,
+            since=datetime(2099, 1, 1, tzinfo=UTC),
+            incremental=True,
+            print_summary=True,
+        )
+        assert "2 skipped" in capsys.readouterr().out

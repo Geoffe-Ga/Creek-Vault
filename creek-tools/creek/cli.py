@@ -511,7 +511,7 @@ def _parse_since_arg(text: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
-        from creek.lint.runner import parse_since
+        from creek.lint import parse_since  # public re-export of runner.parse_since
 
         try:
             return parse_since(text)
@@ -535,6 +535,7 @@ def _should_skip_unit(
     """Return whether incremental mode should skip this unchanged unit (#677)."""
     if not filtering:
         return False
+    # Deferred import: creek.pipeline pulls heavy stage deps; keep CLI startup light.
     from creek.pipeline import unit_is_changed
 
     record = _ledger_record(ledger, fragment)
@@ -637,7 +638,8 @@ def _run_ingest(
             continue
         _record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
-        # "created"/"updated" are counted; "unchanged" is an idempotent no-op.
+        # Tally every action (created/updated/unchanged); only created/updated
+        # are surfaced in the summary line — "unchanged" is an idempotent no-op.
         counts[action] = counts.get(action, 0) + 1
 
     tombed = _tomb_missing_units(
