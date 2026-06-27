@@ -1466,12 +1466,30 @@ class DiscordSourceConfig(BaseModel):
     bot_capture: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
     """Bot message capture for servers/channels — off by default."""
 
+    capture_subpath: str = "discord-capture"
+    """Vault-relative dir the bot-capture path writes and Tier-A ingest reads (#687).
+
+    The bot appends ``<capture_subpath>/<channel>/<date>.jsonl`` (relative to the
+    vault root) in the lowercase Discord message schema the ``DiscordIngestor``
+    already reads; ``creek sync`` reshapes it into the Data-Package layout. Must
+    be vault-relative — never absolute, never parent-traversing."""
+
     @field_validator("exporter_binary")
     @classmethod
     def _validate_exporter_binary(cls, value: str | None) -> str | None:
         """Require an absolute path so the binary resolves predictably (#686)."""
         if value is not None and not Path(value).is_absolute():
             msg = f"exporter_binary must be an absolute path, got {value!r}."
+            raise ValueError(msg)
+        return value
+
+    @field_validator("capture_subpath")
+    @classmethod
+    def _validate_capture_subpath(cls, value: str) -> str:
+        """Refuse absolute or parent-traversing capture paths — stay in vault (#687)."""
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            msg = f"capture_subpath must be vault-relative, got {value!r}."
             raise ValueError(msg)
         return value
 
