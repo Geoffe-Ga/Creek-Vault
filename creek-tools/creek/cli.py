@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     )
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor, ParsedFragment
+    from creek.ingest.discord_dispatch import DiscordMode
     from creek.ingest.ledger import LedgerRecord, SourceLedger
     from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Fragment, Frequency, Mode, Phase
@@ -1192,6 +1193,58 @@ def sync(
         )
     mode = "planned" if dry_run else "ran"
     console.print(f"[sync] {mode} tier={tier_norm}; wrote last-run.json")
+
+
+def _parse_discord_mode(mode: str) -> DiscordMode:
+    """Parse a ``--mode`` string into a :class:`DiscordMode`, or exit 2 (#685)."""
+    from creek.ingest.discord_dispatch import DiscordMode
+
+    try:
+        return DiscordMode(mode)
+    except ValueError:
+        valid = ", ".join(m.value for m in DiscordMode)
+        console.print(f"[red]Unknown --mode '{mode}'. Valid: {valid}.[/red]")
+        raise typer.Exit(code=2) from None
+
+
+@app.command()
+def discord(
+    mode: str = typer.Option(
+        ..., "--mode", help="data_package | exporter | bot_capture"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Echo the plan (the only behaviour in the skeleton)"
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Dispatch a Discord ingest mode (#685 — skeleton stub).
+
+    Resolves the selected ``--mode`` against the configured Discord toggles and
+    echoes its pull-then-ingest plan. Performs **no network I/O**: the real
+    exporter, bot-capture, and Data Package paths land in #686/#687/#688. The
+    ``exporter`` mode is opt-in (off by default) and prints a Terms-of-Service
+    caveat on use. The Discord token lives in the environment, never in config.
+    """
+    from creek.ingest.discord_dispatch import (
+        ModeDisabledError,
+        resolve_discord_handler,
+    )
+
+    selected = _parse_discord_mode(mode)
+    config = _load_config_for_vault(vault)
+    try:
+        handler = resolve_discord_handler(selected, config.discord)
+    except ModeDisabledError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    handler.announce()
+    for line in handler.plan():
+        console.print(line)
+    if not dry_run:
+        console.print(
+            "[dim][discord] skeleton: stub only — no pull/ingest performed yet.[/dim]",
+        )
 
 
 @app.command()

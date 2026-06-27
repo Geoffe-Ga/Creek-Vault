@@ -1421,6 +1421,42 @@ class SyncConfig(BaseModel):
         return sorted(name for name, on in self.sources.items() if on)
 
 
+class DiscordModeToggle(BaseModel):
+    """On/off toggle for one Discord ingest mode (#685)."""
+
+    enabled: bool = False
+    """Whether this mode is enabled. Opt-in per mode."""
+
+
+class DiscordSourceConfig(BaseModel):
+    """How Discord content reaches the vault — three explicit modes (#685).
+
+    A bot **cannot** read DMs (Discord API limit), so the modes differ by
+    coverage and compliance (SPEC R5, decision #3):
+
+    * ``data_package`` — ingest a manually-downloaded Data Package. The clean,
+      ToS-compliant fallback; on by default.
+    * ``exporter`` — a user-token exporter (DMs + servers). **Off by default**;
+      enabling it is a ToS-caveated, opt-in choice.
+    * ``bot_capture`` — a bot logging the servers/channels it is in. Clean, but
+      cannot see DMs. Off by default.
+
+    Config holds only the mode toggles — the Discord token lives in the
+    environment, never here.
+    """
+
+    data_package: DiscordModeToggle = Field(
+        default_factory=lambda: DiscordModeToggle(enabled=True),
+    )
+    """The clean Data Package fallback — enabled by default."""
+
+    exporter: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
+    """User-token exporter — OFF by default (decision #3); ToS-caveated."""
+
+    bot_capture: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
+    """Bot message capture for servers/channels — off by default."""
+
+
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
 
@@ -1503,6 +1539,9 @@ class CreekConfig(BaseSettings):
 
     sync: SyncConfig = Field(default_factory=SyncConfig)
     """Scheduling config for ``creek sync`` — per-source toggles + cadence."""
+
+    discord: DiscordSourceConfig = Field(default_factory=DiscordSourceConfig)
+    """Discord ingest mode toggles (data_package | exporter | bot_capture)."""
 
     @field_validator("timezone")
     @classmethod
