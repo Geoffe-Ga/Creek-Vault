@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from creek.config import GoogleDriveConfig
+from creek.ingest.connectors import RemoteSourceConnector
 from creek.ingest.gdrive import (
     GOOGLE_DOCS_MIME,
     GOOGLE_SHEETS_MIME,
@@ -17,6 +18,7 @@ from creek.ingest.gdrive import (
     GoogleApiDriveClient,
     GoogleApiUnavailableError,
     GoogleDriveDownloader,
+    build_drive_connector,
     route_to_ingestor,
 )
 
@@ -1267,6 +1269,58 @@ class TestAstReadOnlyAudit:
         )
         with pytest.raises(AssertionError, match="delete"):
             _audit_no_write_calls(sample)
+
+
+class TestRemoteSourceConnector:
+    """Drive conforms to RemoteSourceConnector, behaviour-preservingly (#683)."""
+
+    def test_drive_satisfies_protocol(self, tmp_path: Path) -> None:
+        """The built Drive connector is a RemoteSourceConnector."""
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"hi"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path
+        )
+        assert isinstance(connector, RemoteSourceConnector)
+
+    def test_is_available_reflects_client(self, tmp_path: Path) -> None:
+        """is_available delegates to the underlying client."""
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=StubDriveClient(files=[]), staging=tmp_path
+        )
+        assert connector.is_available() is True
+
+    def test_list_changed_since_matches_mtime_skip(self, tmp_path: Path) -> None:
+        """cursor=None lists all; after fetch_to the same cursor yields none."""
+        files = [
+            _file(fid="a", name="a.md", mime="text/markdown"),
+            _file(fid="b", name="b.md", mime="text/markdown"),
+        ]
+        stub = StubDriveClient(files=files, media={"a": b"A", "b": b"B"})
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path
+        )
+
+        changed = connector.list_changed_since(cursor=None)
+        assert [f.id for f in changed] == ["a", "b"]
+
+        connector.fetch_to(tmp_path)  # stage them, stamping mtime
+        assert connector.list_changed_since(cursor=None) == []  # mtime skip
+
+    def test_fetch_to_stages_and_returns_result(self, tmp_path: Path) -> None:
+        """fetch_to downloads the file and returns the DownloadResult."""
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"hello"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path
+        )
+        result = connector.fetch_to(tmp_path)
+        assert len(result.downloaded) == 1
+        assert (tmp_path / "a.md").read_bytes() == b"hello"
 
 
 if __name__ == "__main__":

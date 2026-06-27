@@ -1,0 +1,86 @@
+"""Source-agnostic remote-connector protocol (#683 / SPEC R4).
+
+A ``RemoteSourceConnector`` is a **read-only** pull adapter for a remote
+source: it reports availability, lists the files that changed since a cursor,
+and fetches them into a local staging directory (where the regular ingestors
+then pick them up via ``route_to_ingestor``). It does **not** ingest, and by
+construction exposes no write/update/delete surface.
+
+Google Drive is the reference implementation (``creek.ingest.gdrive``); future
+sources (Substack, Notion, an RSS feed, a prose git repo) implement the same
+three methods and reuse the stage -> route -> ingest machinery. The persisted
+cursor (tying ``list_changed_since`` to Epic A's ledger) is wired in #684; here
+the cursor is a thin parameter over the existing staging-mtime skip.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from datetime import datetime
+    from pathlib import Path
+
+
+@runtime_checkable
+class RemoteFile(Protocol):
+    """Structural descriptor for one remote file.
+
+    The concrete :class:`creek.ingest.gdrive.DriveFile` conforms to this
+    without inheritance — any connector's file type that carries these
+    read-only attributes satisfies the contract.
+    """
+
+    @property
+    def id(self) -> str:
+        """Stable remote id (used to fetch the file)."""
+
+    @property
+    def name(self) -> str:
+        """File name as the remote reports it."""
+
+    @property
+    def modified_time(self) -> datetime:
+        """Remote last-modified timestamp (drives the incremental skip)."""
+
+    @property
+    def size(self) -> int:
+        """File size in bytes (0 for export-only/native files)."""
+
+    @property
+    def parent_path(self) -> str:
+        """Slash-separated logical parent path, mirrored under staging."""
+
+
+@runtime_checkable
+class RemoteSourceConnector(Protocol):
+    """Read-only pull connector for a remote source (#683).
+
+    By construction there is **no** write/update/delete method — a connector
+    only reads and downloads. Implementations adapt an existing client; the
+    protocol is what the future sync machinery depends on.
+    """
+
+    def is_available(self) -> bool:
+        """Report whether the backend can serve requests (capability only).
+
+        Never reads or returns credentials — presence/capability only.
+        """
+
+    def list_changed_since(self, cursor: object) -> Sequence[RemoteFile]:
+        """Return the files changed since *cursor* (the incremental set).
+
+        *cursor* of ``None`` means "everything not already current in staging"
+        — the first-pass case. After :meth:`fetch_to` stages the files, a
+        second call with the same cursor yields nothing (the staging mtime
+        skip). The persisted-ledger cursor lands in #684.
+        """
+
+    def fetch_to(self, staging: Path) -> object:
+        """Download the changed files into *staging*, returning a result.
+
+        The return is the implementation's own result object (e.g. Drive's
+        ``DownloadResult``); callers route the staged files through
+        ``route_to_ingestor``.
+        """
