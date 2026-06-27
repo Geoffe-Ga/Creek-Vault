@@ -106,10 +106,13 @@ class TestPerTierRouting:
     """Intimate goes local; non-Intimate uses the configured cloud model."""
 
     def test_intimate_local_nonintimate_cloud(self, tmp_path: Path) -> None:
-        """One run: Intimate classified by ollama, Open by anthropic."""
+        """One run: only Intimate goes local; Open + Unclassified use the cloud."""
         vault = tmp_path / "vault"
         _write(vault, "frag-intimateaaa", PrivacyTier.INTIMATE)
         _write(vault, "frag-openbbbbbbb", PrivacyTier.OPEN)
+        # UNCLASSIFIED is not INTIMATE, so it routes with the non-Intimate cloud
+        # provider (same path as OPEN) — pin that contract explicitly.
+        _write(vault, "frag-unclassifd", PrivacyTier.UNCLASSIFIED)
 
         run_classify(
             vault_path=vault,
@@ -120,6 +123,7 @@ class TestPerTierRouting:
 
         assert _provider_for("frag-intimateaaa") == "ollama"  # redirected local
         assert _provider_for("frag-openbbbbbbb") == "anthropic"  # configured cloud
+        assert _provider_for("frag-unclassifd") == "anthropic"  # not Intimate → cloud
 
     def test_local_classification_is_backward_compatible(self, tmp_path: Path) -> None:
         """A local classification stage classifies every tier with that provider."""

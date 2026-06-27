@@ -48,7 +48,7 @@ from creek.classify.constants import (
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.llm.router import IntimateRoutingError
-from creek.classify.privacy_filter import _tier_of
+from creek.classify.privacy_filter import tier_of
 from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
@@ -454,10 +454,10 @@ def _process_file(
     fragment, body, raw = record
 
     # Per-tier routing (#666): pick the classifier for this fragment's privacy
-    # tier. ``_tier_of`` fails closed to INTIMATE for an unrecognised tier, so an
+    # tier. ``tier_of`` fails closed to INTIMATE for an unrecognised tier, so an
     # unknown fragment is classified locally rather than risking cloud egress.
     llm = (
-        tier_classifiers.for_tier(_tier_of(fragment))
+        tier_classifiers.for_tier(tier_of(fragment))
         if tier_classifiers is not None
         else None
     )

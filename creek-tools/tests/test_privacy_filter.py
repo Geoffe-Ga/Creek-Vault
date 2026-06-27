@@ -135,14 +135,14 @@ def test_tier_of_unknown_string_fails_closed_to_intimate(
     """Fragments carrying an unrecognised tier string fail closed.
 
     Regression for PR #193 review (comment 4367360694 LOW): the prior
-    ``_tier_of`` did ``PrivacyTier(fragment.privacy_tier)`` with no
+    ``tier_of`` did ``PrivacyTier(fragment.privacy_tier)`` with no
     safety net, so a hand-edited or schema-migrated vault with an
     unknown tier string would crash generation flows. The new helper
     catches the :class:`ValueError`, logs a warning that names the
     fragment ID, and returns :data:`PrivacyTier.INTIMATE` so the
     fragment is excluded from the default-policy output.
     """
-    from creek.classify.privacy_filter import _tier_of
+    from creek.classify.privacy_filter import tier_of
 
     # ``model_construct`` skips Pydantic validation, allowing us to
     # plant a bogus tier value the same way a hand-edited markdown file
@@ -161,7 +161,7 @@ def test_tier_of_unknown_string_fails_closed_to_intimate(
     )
 
     with caplog.at_level("WARNING", logger="creek.classify.privacy_filter"):
-        tier = _tier_of(bogus)
+        tier = tier_of(bogus)
 
     assert tier is PrivacyTier.INTIMATE
     assert any(
