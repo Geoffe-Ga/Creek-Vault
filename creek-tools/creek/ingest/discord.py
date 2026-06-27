@@ -887,9 +887,7 @@ def run_discord_data_package(vault: Path, package: Path) -> int:
     fragments_root = vault / "01-Fragments"
     before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()
     written = _write_fragments(DiscordIngestor().ingest(package), vault)
-    new = 0
-    for path in written:
-        if path not in before:
-            before.add(path)
-            new += 1
-    return new
+    # New = distinct written paths that did not pre-exist. `set(written)` also
+    # collapses any duplicate path emitted within a single run, so a fragment is
+    # counted at most once.
+    return len(set(written) - before)

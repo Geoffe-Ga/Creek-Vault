@@ -77,16 +77,27 @@ class TestResolveHandler:
         assert "your own DMs" in out
         assert "read-only" in out
 
-    def test_each_mode_resolves_and_plans_without_network(self) -> None:
-        """data_package + bot_capture resolve and echo a plan (no I/O)."""
+    def test_each_mode_resolves_and_plans(self) -> None:
+        """data_package + bot_capture resolve and echo a non-empty plan (no I/O)."""
         cfg = DiscordSourceConfig(
             data_package={"enabled": True}, bot_capture={"enabled": True}
         )
         for mode in (DiscordMode.DATA_PACKAGE, DiscordMode.BOT_CAPTURE):
             handler = resolve_discord_handler(mode, cfg)
-            plan = handler.plan()
-            assert plan  # echoes a plan
-            assert any("no network performed" in line for line in plan)
+            assert handler.plan()  # echoes a plan
+
+    def test_data_package_plan_points_to_package_flag(self) -> None:
+        """The data_package plan tells the operator to pass --package (#688)."""
+        handler = resolve_discord_handler(
+            DiscordMode.DATA_PACKAGE, DiscordSourceConfig()
+        )
+        assert any("--package" in line for line in handler.plan())
+
+    def test_bot_capture_plan_does_no_network(self) -> None:
+        """The bot_capture plan is still an echo-only stub (no network)."""
+        cfg = DiscordSourceConfig(bot_capture={"enabled": True})
+        handler = resolve_discord_handler(DiscordMode.BOT_CAPTURE, cfg)
+        assert any("no network performed" in line for line in handler.plan())
 
 
 # ---- CLI: creek discord --mode -----------------------------------------
@@ -226,3 +237,56 @@ class TestDiscordDataPackageCli:
         )
         assert result.exit_code == 1
         assert "does not exist" in result.output
+
+    def test_disabled_mode_with_package_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """data_package disabled + --package does not silently ingest — it exits 2."""
+        from creek.config import CreekConfig, DiscordSourceConfig
+
+        cfg = CreekConfig(discord=DiscordSourceConfig(data_package={"enabled": False}))
+        monkeypatch.setattr("creek.cli._load_config_for_vault", lambda _v: cfg)
+        ran: list[object] = []
+        monkeypatch.setattr(
+            "creek.cli._run_discord_data_package",
+            lambda vault, package: ran.append((vault, package)),
+        )
+        pkg = tmp_path / "discord-export"
+        pkg.mkdir()
+
+        result = runner.invoke(
+            app,
+            [
+                "discord",
+                "--mode",
+                "data_package",
+                "--package",
+                str(pkg),
+                "--vault",
+                str(tmp_path),
+            ],
+        )
+        assert result.exit_code != 0  # disabled mode refuses, does not ingest
+        assert ran == []
+
+    def test_no_package_echoes_next_step(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """data_package without --package echoes the --package hint, ingests nothing."""
+        from creek.config import CreekConfig
+
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault", lambda _v: CreekConfig()
+        )
+        ran: list[object] = []
+        monkeypatch.setattr(
+            "creek.cli._run_discord_data_package",
+            lambda vault, package: ran.append((vault, package)),
+        )
+
+        result = runner.invoke(
+            app, ["discord", "--mode", "data_package", "--vault", str(tmp_path)]
+        )
+        assert result.exit_code == 0, result.output
+        assert ran == []  # no package -> nothing ingested
+        assert "--package" in result.output
