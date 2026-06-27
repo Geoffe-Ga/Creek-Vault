@@ -1194,6 +1194,9 @@ class GoogleDriveConnector:
         if cursor is None:
             return self._downloader.list_files()
         threshold = datetime.fromisoformat(str(cursor))
+        # Strict ">": files exactly at the cursor were fetched on the pass that
+        # set it. A true tie at the newest modified_time is astronomically
+        # unlikely given Drive's timestamp precision.
         return [
             drive_file
             for drive_file in self._downloader.list_files()
@@ -1205,30 +1208,38 @@ class GoogleDriveConnector:
         return self._downloader.download_all(staging)
 
     def load_cursor(self) -> str | None:
-        """Return the persisted cursor timestamp, or ``None`` if unset (#684)."""
+        """Return the persisted cursor timestamp, or ``None`` if unset/invalid.
+
+        Any read failure, non-string value, or non-ISO timestamp (e.g. a
+        hand-edited cursor file) falls back to ``None`` — a full re-scan —
+        rather than raising later in :meth:`list_changed_since`.
+        """
         if not self._cursor_path.exists():
             return None
         try:
             data = json.loads(self._cursor_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            cursor = data.get("cursor") if isinstance(data, dict) else None
+            if not isinstance(cursor, str):
+                return None
+            datetime.fromisoformat(cursor)  # validate shape only
+        except (OSError, json.JSONDecodeError, ValueError):
             return None
-        cursor = data.get("cursor") if isinstance(data, dict) else None
-        return cursor if isinstance(cursor, str) else None
+        return cursor
 
     def save_cursor(self, fetched: Sequence[DriveFile]) -> None:
         """Advance the persisted cursor to the newest *fetched* modified_time.
 
         An empty *fetched* leaves the cursor untouched (nothing newer was
-        seen). Stores only the timestamp — no credentials.
+        seen). Written atomically (temp + ``os.replace``) and storing only the
+        timestamp — no credentials.
         """
         if not fetched:
             return
         newest = max(item.modified_time for item in fetched)
         self._cursor_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cursor_path.write_text(
-            json.dumps({"cursor": newest.isoformat()}),
-            encoding="utf-8",
-        )
+        tmp = self._cursor_path.with_name(self._cursor_path.name + ".tmp")
+        tmp.write_text(json.dumps({"cursor": newest.isoformat()}), encoding="utf-8")
+        os.replace(tmp, self._cursor_path)
 
 
 def build_drive_connector(

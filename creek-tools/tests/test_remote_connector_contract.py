@@ -110,3 +110,13 @@ class TestRemoteConnectorContract:
 
         second = make_connector(staging=tmp_path)
         assert list(second.list_changed_since(cursor=second.load_cursor())) == []
+
+    def test_save_cursor_empty_is_noop(
+        self,
+        make_connector: ConnectorFactory,
+        tmp_path: Path,
+    ) -> None:
+        """Saving an empty fetch set leaves the cursor unset."""
+        conn = make_connector(staging=tmp_path)
+        conn.save_cursor([])
+        assert conn.load_cursor() is None

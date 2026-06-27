@@ -1323,6 +1323,26 @@ class TestRemoteSourceConnector:
         assert len(result.downloaded) == 1
         assert (tmp_path / "a.md").read_bytes() == b"hello"
 
+    def test_corrupt_cursor_falls_back_to_full_scan(self, tmp_path: Path) -> None:
+        """A non-JSON or non-ISO cursor file degrades to a full scan, not a crash."""
+        cursor_path = tmp_path / "c.json"
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"A"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path, cursor_path=cursor_path
+        )
+
+        cursor_path.write_text("not json at all", encoding="utf-8")
+        assert connector.load_cursor() is None
+
+        cursor_path.write_text('{"cursor": "not-a-date"}', encoding="utf-8")
+        assert connector.load_cursor() is None  # valid JSON, invalid ISO
+        # list_changed_since(None) is a full scan — no ValueError.
+        changed = connector.list_changed_since(cursor=connector.load_cursor())
+        assert [f.id for f in changed] == ["a"]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
