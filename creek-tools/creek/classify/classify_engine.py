@@ -47,6 +47,8 @@ from creek.classify.constants import (
     RULES_METHOD,
 )
 from creek.classify.llm import LLMClassifier
+from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.privacy_filter import _tier_of
 from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
@@ -178,6 +180,95 @@ class _RunCounts:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class _TierClassifiers:
+    """Per-tier LLM classifiers for one classify run (#666).
+
+    ``non_intimate`` serves OPEN / PERSONAL / UNCLASSIFIED fragments with the
+    configured ``classification`` provider; ``intimate`` serves INTIMATE
+    fragments, redirected off any cloud provider to a local one by the
+    :class:`~creek.classify.llm.router.ModelRouter` chokepoint (Intimate-never-
+    cloud, #647). The two are the **same instance** when the configured
+    ``classification`` provider is already local — the backward-compatible case.
+
+    When ``classification`` is cloud and no local ``default`` exists, the Intimate
+    route cannot be honoured: ``intimate`` is ``None`` and ``routing_error`` holds
+    the :class:`IntimateRoutingError`, **deferred** so it fires only if an actual
+    Intimate fragment is reached — a run with no Intimate content stays valid.
+    """
+
+    non_intimate: LLMClassifier
+    intimate: LLMClassifier | None
+    routing_error: IntimateRoutingError | None
+
+    def for_tier(self, tier: PrivacyTier) -> LLMClassifier:
+        """Return the classifier for *tier* — the local one for INTIMATE.
+
+        Raises:
+            IntimateRoutingError: For an INTIMATE fragment when the config has no
+                local backend to route it to (the deferred build-time error).
+        """
+        if tier is not PrivacyTier.INTIMATE:
+            return self.non_intimate
+        if self.intimate is None:
+            raise self._deferred_routing_error()
+        return self.intimate
+
+    def distinct(self) -> tuple[LLMClassifier, ...]:
+        """The unique classifiers to availability-check before iterating.
+
+        Excludes the Intimate classifier when it shares the configured instance
+        or is deferred (``None``) — the non-Intimate fail-fast is unchanged from
+        the pre-#666 single-provider check.
+        """
+        if self.intimate is None or self.intimate is self.non_intimate:
+            return (self.non_intimate,)
+        return (self.non_intimate, self.intimate)
+
+    def _deferred_routing_error(self) -> IntimateRoutingError:
+        """Return the captured deferred routing error (invariant: set here)."""
+        if self.routing_error is None:  # pragma: no cover - defensive invariant
+            msg = "Intimate route unavailable but no routing error was captured."
+            raise RuntimeError(msg)
+        return self.routing_error
+
+
+def _build_tier_classifiers(config: CreekConfig) -> _TierClassifiers:
+    """Build the per-tier classifiers via the ModelRouter chokepoint (#666).
+
+    Resolves ``classification`` tier-less for non-Intimate fragments and with
+    ``PrivacyTier.INTIMATE`` for Intimate ones, so the Intimate route is
+    redirected to a local provider. When both resolve to the same config (a local
+    ``classification`` stage), a single classifier instance is shared — identical
+    to the pre-#666 behaviour. When no local backend exists, the resulting
+    :class:`IntimateRoutingError` is captured and **deferred** (see
+    :class:`_TierClassifiers`) rather than failing a run that has no Intimate
+    content.
+
+    Args:
+        config: The loaded Creek configuration (carrying the model router).
+
+    Returns:
+        The :class:`_TierClassifiers` for this run.
+    """
+    router = config.model_router
+    non_intimate = LLMClassifier(config=router.resolve("classification"))
+    try:
+        intimate_cfg = router.resolve("classification", PrivacyTier.INTIMATE)
+    except IntimateRoutingError as exc:
+        return _TierClassifiers(
+            non_intimate=non_intimate, intimate=None, routing_error=exc
+        )
+    intimate = (
+        non_intimate
+        if intimate_cfg == non_intimate.config
+        else LLMClassifier(config=intimate_cfg)
+    )
+    return _TierClassifiers(
+        non_intimate=non_intimate, intimate=intimate, routing_error=None
+    )
+
+
 def run_classify(
     *,
     vault_path: Path,
@@ -210,22 +301,25 @@ def run_classify(
 
     rules = RuleClassifier()
     audience = AudienceClassifier()
-    # Per-stage routing (#646): the classifier uses the classification stage's
-    # resolved provider+model, not the global block.
-    classify_llm = config.model_router.resolve("classification")
-    llm = LLMClassifier(config=classify_llm) if method == "llm" else None
-    if llm is not None and not llm.available:
-        # Refuse to iterate when the provider is unreachable so the
-        # vault is never stamped with ``classification_method: llm``
-        # for fragments the LLM never actually saw. The orchestrator
-        # already logged the provider-specific reason (missing API
-        # key, missing consent env var, Ollama down) as a WARNING;
-        # we capture it here for the operator-facing message so the
-        # remediation hint is not buried in stderr.
-        raise LLMProviderUnavailableError(
-            provider=classify_llm.provider,
-            detail=_describe_llm_unavailability(classify_llm.provider),
-        )
+    # Per-stage + per-tier routing (#646/#666): non-Intimate fragments use the
+    # configured ``classification`` provider; Intimate fragments are redirected
+    # to a local provider by the ModelRouter chokepoint (Intimate-never-cloud,
+    # #647). Resolving here also fails the run loudly (IntimateRoutingError) when
+    # classification is cloud and no local default exists to route Intimate to.
+    tier_classifiers = _build_tier_classifiers(config) if method == LLM_METHOD else None
+    if tier_classifiers is not None:
+        for classifier in tier_classifiers.distinct():
+            if not classifier.available:
+                # Refuse to iterate when a provider is unreachable so the vault
+                # is never stamped with ``classification_method: llm`` for
+                # fragments the LLM never actually saw. The orchestrator already
+                # logged the provider-specific reason (missing API key, missing
+                # consent env var, Ollama down) as a WARNING; we capture it here
+                # so the remediation hint is not buried in stderr.
+                raise LLMProviderUnavailableError(
+                    provider=classifier.config.provider,
+                    detail=_describe_llm_unavailability(classifier.config.provider),
+                )
     counts = _RunCounts()
     progress_path: Path | None = None
     trace_log_path: Path | None = None
@@ -254,7 +348,7 @@ def run_classify(
             force=force,
             rules=rules,
             audience=audience,
-            llm=llm,
+            tier_classifiers=tier_classifiers,
             classification_config=config.classification,
             counts=counts,
             progress_path=progress_path,
@@ -314,7 +408,7 @@ def _process_file(
     force: bool,
     rules: RuleClassifier,
     audience: AudienceClassifier,
-    llm: LLMClassifier | None,
+    tier_classifiers: _TierClassifiers | None,
     classification_config: ClassificationConfig,
     counts: _RunCounts,
     progress_path: Path | None,
@@ -331,7 +425,9 @@ def _process_file(
         audience: Shared :class:`AudienceClassifier`; stamps the #634
             audience axis on every (re)classified fragment, deterministically,
             regardless of method.
-        llm: Shared :class:`LLMClassifier` (when ``method == "llm"``).
+        tier_classifiers: Per-tier :class:`LLMClassifier` set (when
+            ``method == "llm"``); the fragment's tier selects the provider so
+            Intimate content is classified locally (#666). ``None`` for rules.
         classification_config: Full FEAT-023-aware classification config.
             Drives both the LLM-vs-rules threshold and the
             ``reatomize`` opt-in.
@@ -356,6 +452,15 @@ def _process_file(
     if record is None:
         return
     fragment, body, raw = record
+
+    # Per-tier routing (#666): pick the classifier for this fragment's privacy
+    # tier. ``_tier_of`` fails closed to INTIMATE for an unrecognised tier, so an
+    # unknown fragment is classified locally rather than risking cloud egress.
+    llm = (
+        tier_classifiers.for_tier(_tier_of(fragment))
+        if tier_classifiers is not None
+        else None
+    )
 
     # Skip fragments whose previous run already settled the classification.
     # Tracked on distinct counters so the CLI summary can label "manual

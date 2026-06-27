@@ -151,17 +151,31 @@ loudly with `IntimateRoutingError` rather than egressing. **Explain this; never
 ask the user to enforce it.** Keep `default` local (`ollama`) so the redirect
 always has somewhere safe to land.
 
-## Known gap — per-tier classification routing (do NOT promise it)
+## Per-tier classification routing (shipped, #666)
 
-Assignment #1 wants "Haiku for non-Intimate, local for Intimate" in one classify
-run. **This is not yet wired.** Every classification call site resolves the stage
-with **no tier** (`resolve("classification")`, tier `None`), so the chokepoint
-never fires per fragment during classification. Configure `classification` to a
-single safe local model (`qwen3:8b`) and **say so honestly** — the per-fragment
-tier threading is the same work the author-desk issues **#660** (tier-filter
-retrieval) and **#661** (route the voice call by content tier) did for voicing;
-classification needs the analogous wiring before a tier split is possible. Do
-**not** write a config that pretends to split classification by tier.
+Assignment #1 — "Haiku for non-Intimate, local for Intimate" in one classify
+run — **is wired** as of #666. `creek classify --method llm` routes each fragment
+by its `privacy_tier` through the same `ModelRouter` chokepoint: an `Intimate`
+fragment is classified by the local `default` even when `classification` is a
+cloud model, while non-`Intimate` fragments use the configured `classification`
+model. So this config does exactly what it says:
+
+```yaml
+llm:
+  default:        { provider: ollama,    model: qwen3:8b }       # Intimate-safe
+  classification: { provider: anthropic, model: claude-haiku-4-5 }
+```
+
+If `classification` is cloud **and** `default` is also cloud, an `Intimate`
+fragment fails loudly with `IntimateRoutingError` — deferred until an Intimate
+fragment is actually reached, so an all-cloud run with no Intimate content still
+classifies. This mirrors the author-desk precedent (**#660** tier-filter
+retrieval, **#661** route the voice call by content tier).
+
+**Still tier-less (follow-up #706):** the `creek process` pipeline classify loop
+and the `draft` / `calibrate` classifier builds resolve `classification` with no
+tier. So the per-tier guarantee is complete for `creek classify` but not yet for
+`creek process` — don't promise per-tier classification on the pipeline path.
 
 ## "Five assignments, four listed"
 
