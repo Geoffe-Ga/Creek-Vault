@@ -5086,25 +5086,32 @@ def _run_compost_calibration(
 def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None:
     """Construct the production LLM verifier, or ``None`` if it can't be built.
 
-    ``creek compost calibrate`` runs in environments where the
-    Anthropic credentials may or may not be present; rather than fail
-    loud, fall back to embedding-only scoring with a console note so
-    the operator can re-run with the verifier once credentials are in
-    place.
+    ``creek compost calibrate`` runs in environments where the configured
+    ``generation`` provider's credentials (or local host) may or may not be
+    present; rather than fail loud, fall back to embedding-only scoring with a
+    console note so the operator can re-run with the verifier once the provider
+    is ready.
     """
-    from creek.classify.llm import AnthropicProvider
+    from creek.classify.llm import build_provider
     from creek.generate.compost_verifier import LLMCompostVerifier
 
-    # Per-stage routing (#646): resolve the generation stage so the verifier
-    # uses the generation model. The verifier itself is still Anthropic-specific
-    # (it calls the Anthropic-only ``.call``); making it fully provider-neutral
-    # is a follow-up. Feeding the resolved config keeps the credential-fallback
-    # behaviour (AnthropicProvider raises without a key → embedding-only).
+    # Provider-neutral (#667): build the configured ``generation`` provider
+    # (#646) and gate on availability so any backend (Ollama / OpenAI / Gemini /
+    # Anthropic) degrades the same way. A cloud provider validates its env in the
+    # constructor and may raise (build_provider contract); a local provider
+    # constructs but reports ``available is False`` when its host is down — both
+    # fall back to embedding-only scoring.
     try:
-        provider = AnthropicProvider(config=config.model_router.resolve("generation"))
+        provider = build_provider(config.model_router.resolve("generation"))
     except RuntimeError as exc:
         console.print(
             f"[yellow]Skipping LLM verifier — provider unavailable: {exc}[/yellow]",
+        )
+        return None
+    if not provider.available:
+        console.print(
+            "[yellow]Skipping LLM verifier — provider prerequisites unmet "
+            "(missing key/consent, or local host unreachable).[/yellow]",
         )
         return None
     return LLMCompostVerifier(provider=provider)
