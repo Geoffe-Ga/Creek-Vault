@@ -405,6 +405,39 @@ class CrawDadConfig(BaseModel):
     max_loop_rounds: int = Field(default=MAX_LOOP_ROUNDS, ge=1, le=50)
     """Operator override for the FEAT-015 agent-loop round cap."""
 
+    capture_enabled: bool = Field(default=False)
+    """Bot-capture toggle (#687) — OFF by default; opt-in per deployment.
+
+    When ``True`` the bot logs each message in the servers/channels it is in to
+    ``<vault>/<capture_subpath>/<channel>/<date>.jsonl`` for Tier-A ingest. The
+    bot cannot read DMs (a hard Discord API limit), so this covers channels only.
+    """
+
+    capture_subpath: Path = Field(default=Path("discord-capture"))
+    """Vault-relative dir the bot-capture writer appends to (#687).
+
+    Mirrors the creek-side ``DiscordSourceConfig.capture_subpath`` default so the
+    bot writes exactly where Tier-A ingest reads. Must stay inside the vault.
+    """
+
+    @field_validator("capture_subpath")
+    @classmethod
+    def _refuse_absolute_capture_subpath(cls, value: Path) -> Path:
+        """Refuse absolute / ``..`` capture paths — must stay in the vault (#687)."""
+        if value.is_absolute():
+            msg = (
+                f"capture_subpath {value!r} must be vault-relative; "
+                "absolute paths could escape the vault root."
+            )
+            raise ValueError(msg)
+        if ".." in value.parts:
+            msg = (
+                f"capture_subpath {value!r} must not contain '..'; "
+                "parent-directory segments could escape the vault root."
+            )
+            raise ValueError(msg)
+        return value
+
     @field_validator("allowed_user_ids", "allowed_channel_ids")
     @classmethod
     def _non_empty(cls, value: tuple[int, ...]) -> tuple[int, ...]:

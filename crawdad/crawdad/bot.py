@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from crawdad.attachments import _AttachmentLike
+    from crawdad.capture import MessageCapture
     from crawdad.composer import SonnetComposer
     from crawdad.config import CrawDadConfig
     from crawdad.mcp_client import MCPClient
@@ -777,6 +778,7 @@ class CrawDadClient(discord.Client):
         pending_batches: PendingBatchStore | None = None,
         workflow_lister: Callable[[], list[str]] | None = None,
         workflow_runner: WorkflowRunner | None = None,
+        message_capture: MessageCapture | None = None,
         intents: discord.Intents | None = None,
     ) -> None:
         """Store config + agent-loop components; init the parent ``Client``.
@@ -820,6 +822,7 @@ class CrawDadClient(discord.Client):
         self._loop_runner = loop_runner
         self._pending_batches = pending_batches
         self._workflow_runner = workflow_runner
+        self._message_capture = message_capture
         self.tree = app_commands.CommandTree(self)
         if loop_runner is not None:
             # discord.py's ``CommandTree.command`` signature is wider than
@@ -858,10 +861,11 @@ class CrawDadClient(discord.Client):
         _LOGGER.info("crawdad connected as %s", self.user)
 
     async def on_message(self, message: discord.Message) -> None:
-        """Forward Discord messages to :func:`handle_message`."""
+        """Capture the message (best-effort), then forward to :func:`handle_message`."""
         if self.user is None:
             _LOGGER.debug("on_message before client ready; dropping event")
             return
+        await self._capture_message(message)
         await handle_message(
             cast("_MessageLike", message),
             config=self._config,
@@ -877,3 +881,20 @@ class CrawDadClient(discord.Client):
             pending_batches=self._pending_batches,
             workflow_runner=self._workflow_runner,
         )
+
+    async def _capture_message(self, message: discord.Message) -> None:
+        """Append the message to the bot-capture log, never disturbing commands.
+
+        No-op when capture is disabled. The bot's own messages are skipped (it
+        would only re-capture its own replies). A capture write failure is logged
+        and swallowed — capture is best-effort and must never break the command
+        path (#687).
+        """
+        if self._message_capture is None:
+            return
+        if self.user is not None and message.author.id == self.user.id:
+            return
+        try:
+            await self._message_capture.on_message(message)
+        except OSError:
+            _LOGGER.exception("bot-capture write failed; continuing command path")

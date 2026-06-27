@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from crawdad.bot import CrawDadClient
+from crawdad.capture import MessageCapture
 from crawdad.composer import SonnetComposer
 from crawdad.config import (
     composer_model_for,
@@ -138,8 +139,20 @@ def run_bot(config: CrawDadConfig) -> None:
         pending_batches=pending_batches,
         workflow_lister=_build_workflow_lister(workflow_registry),
         workflow_runner=workflow_runner,
+        message_capture=_build_message_capture(config),
     )
     client.run(config.discord_bot_token)
+
+
+def _build_message_capture(config: CrawDadConfig) -> MessageCapture | None:
+    """Build the bot-capture writer when enabled, else ``None`` (#687).
+
+    The capture dir is the vault-relative ``capture_subpath`` joined onto the
+    vault root, mirroring where creek's Tier-A ingest reads.
+    """
+    if not config.capture_enabled:
+        return None
+    return MessageCapture(capture_dir=config.vault_path / config.capture_subpath)
 
 
 def _build_workflow_lister(
