@@ -953,6 +953,80 @@ def _sync_dispatch(
         _sync_run_tier_b(config, vault_path)
 
 
+def _install_launchd(
+    vault_path: Path,
+    minutes: int,
+    hour: int,
+    out_dir: Path | None,
+) -> None:
+    """Write both launchd plists and print activation instructions."""
+    from creek.sync import render_launchd_plists
+
+    plists = render_launchd_plists(
+        vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour
+    )
+    base = out_dir or (Path.home() / "Library" / "LaunchAgents")
+    base.mkdir(parents=True, exist_ok=True)
+    tier_a = base / plists.tier_a_filename
+    tier_b = base / plists.tier_b_filename
+    tier_a.write_text(plists.tier_a, encoding="utf-8")
+    tier_b.write_text(plists.tier_b, encoding="utf-8")
+    console.print(f"# wrote {tier_a}")
+    console.print(f"# wrote {tier_b}")
+    console.print(f"# To activate: launchctl load {tier_a} && launchctl load {tier_b}")
+
+
+def _install_systemd(
+    vault_path: Path,
+    minutes: int,
+    hour: int,
+    out_dir: Path | None,
+) -> None:
+    """Write systemd service+timer units (and print the cron alternative)."""
+    from creek.sync import render_crontab, render_systemd_units
+
+    units = render_systemd_units(
+        vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour
+    )
+    base = out_dir or (Path.home() / ".config" / "systemd" / "user")
+    base.mkdir(parents=True, exist_ok=True)
+    for fname, content in (
+        (units.tier_a_service_filename, units.tier_a_service),
+        (units.tier_a_timer_filename, units.tier_a_timer),
+        (units.tier_b_service_filename, units.tier_b_service),
+        (units.tier_b_timer_filename, units.tier_b_timer),
+    ):
+        (base / fname).write_text(content, encoding="utf-8")
+        console.print(f"# wrote {base / fname}")
+    console.print(
+        "# To activate: systemctl --user enable --now "
+        "creek-sync-tier-a.timer creek-sync-tier-b.timer",
+    )
+    console.print("# Or as cron (crontab -e):")
+    cron = render_crontab(vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour)
+    for line in cron.splitlines():
+        console.print(f"#   {line}")
+
+
+def _install_schedule(host: str, vault: Path | None, out_dir: Path | None) -> None:
+    """Emit schedule units for *host* (launchd|systemd), parametrised by config."""
+    if host not in {"launchd", "systemd"}:
+        console.print("[red]--install-schedule must be launchd or systemd[/red]")
+        raise typer.Exit(code=2)
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    minutes = config.sync.tier_a_interval_minutes
+    hour = config.sync.tier_b_hour
+    if host == "launchd":
+        _install_launchd(vault_path, minutes, hour, out_dir)
+    else:
+        _install_systemd(vault_path, minutes, hour, out_dir)
+    console.print(
+        "# Tokens (OAuth) read from this host's keychain/env; "
+        "see docs/sync-scheduling.md",
+    )
+
+
 @app.command()
 def sync(
     tier: str = typer.Option(
@@ -966,9 +1040,19 @@ def sync(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Echo the plan without executing (current default)"
     ),
+    install_schedule: str | None = typer.Option(
+        None,
+        "--install-schedule",
+        help="Emit schedule units for a host (launchd|systemd) and exit",
+    ),
+    schedule_out_dir: Path | None = typer.Option(
+        None,
+        "--schedule-out-dir",
+        help="Directory to write emitted schedule units (default: host standard)",
+    ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Run a scheduled sync pass (#676/#678).
+    """Run a scheduled sync pass (#676/#678) or emit schedule units.
 
     ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
     rules classify) for each enabled source; ``--tier B`` is the nightly global
@@ -976,7 +1060,15 @@ def sync(
     B (R6). ``--dry-run`` echoes the ordered plan without executing. Every run
     records ``00-Creek-Meta/State/sync/last-run.json``; because every step is
     idempotent, a missed tick self-heals on the next run (no catch-up queue).
+
+    ``--install-schedule launchd|systemd`` emits the host's schedule units
+    (parametrised by the configured cadence) and exits without running a tier;
+    activating them is the operator's manual step (see docs/sync-scheduling.md).
     """
+    if install_schedule is not None:
+        _install_schedule(install_schedule, vault, schedule_out_dir)
+        return
+
     tier_norm = tier.upper()
     if tier_norm not in {"A", "B"}:
         console.print("[red]--tier must be A or B[/red]")
