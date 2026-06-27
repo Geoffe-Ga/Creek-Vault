@@ -804,9 +804,7 @@ def stage_capture_as_data_package(capture_dir: Path, staging_dir: Path) -> None:
         channel = channel_dir.name
         out_dir = staging_dir / "messages" / channel
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "messages.json").write_text(
-            json.dumps(messages), encoding="utf-8"
-        )
+        (out_dir / "messages.json").write_text(json.dumps(messages), encoding="utf-8")
         (out_dir / "channel.json").write_text(
             json.dumps({"id": channel, "name": channel}), encoding="utf-8"
         )
@@ -831,7 +829,10 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
     from creek.vault.writer import VaultWriter
 
     # Stable, deterministic staging path (not a random tempdir) so the
-    # source-path-derived fragment id stays constant across runs.
+    # source-path-derived fragment id stays constant across runs. A kill between
+    # the rmtree and ingest leaves an empty/partial staging dir and writes zero
+    # fragments — self-healing: the next run re-stages from the intact capture
+    # dir, so a one-off "0 fragments" in the logs is not data loss.
     staging = vault / "00-Creek-Meta" / "State" / "discord" / "capture-staging"
     if staging.exists():
         shutil.rmtree(staging)

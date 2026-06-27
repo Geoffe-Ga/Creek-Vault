@@ -83,15 +83,20 @@ def _reference_id(message: _MessageLike) -> str | None:
 
 
 def _channel_label(channel: object) -> str:
-    """A filesystem-safe channel folder name (``name`` if present, else id).
+    """A filesystem-safe channel folder name (``name`` if usable, else id).
 
     Discord text-channel names are already restricted, but path separators are
-    stripped defensively so a channel folder can never escape the capture root.
+    stripped and a bare ``.`` / ``..`` name is refused (falling back to the
+    channel id) so a channel folder can never escape the capture root — even
+    from a mocked channel or if Discord's naming rules ever loosen.
     """
     name = getattr(channel, "name", None)
     raw = name if isinstance(name, str) and name.strip() else None
-    label = (raw or str(getattr(channel, "id", "unknown"))).replace("/", "_")
-    return label.replace("\\", "_").strip() or "unknown"
+    fallback = str(getattr(channel, "id", "unknown"))
+    label = (raw or fallback).replace("/", "_").replace("\\", "_").strip()
+    if not label or label in {".", ".."}:
+        return fallback or "unknown"
+    return label
 
 
 def _record_for(message: _MessageLike) -> dict[str, object]:
@@ -117,7 +122,14 @@ class MessageCapture:
     """
 
     def __init__(self, capture_dir: Path) -> None:
-        """Bind the capture root; per-channel seen-id sets load lazily from disk."""
+        """Bind the capture root; per-channel seen-id sets load lazily from disk.
+
+        ``_seen`` caches every captured message id per channel for the bot's
+        lifetime — fine for the personal-use deployment target; a very high
+        volume server running for months could grow it to tens of thousands of
+        ids per channel, at which point a bounded/evicting cache would be worth
+        adding.
+        """
         self._dir = capture_dir
         self._seen: dict[str, set[str]] = {}
 

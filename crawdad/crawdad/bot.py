@@ -896,5 +896,7 @@ class CrawDadClient(discord.Client):
             return
         try:
             await self._message_capture.on_message(message)
-        except OSError:
-            _LOGGER.exception("bot-capture write failed; continuing command path")
+        except Exception:
+            # Best-effort capture: any failure (bad message shape, disk error)
+            # is logged and swallowed so it can never break the command path.
+            _LOGGER.exception("bot-capture failed; continuing command path")

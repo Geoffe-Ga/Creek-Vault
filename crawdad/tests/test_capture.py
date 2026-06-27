@@ -53,12 +53,14 @@ class _FakeHistoryChannel:
     name: str
     history_messages: list[_FakeMessage]
     id: int = 1
+    received_after: datetime | None = None
 
     def history(
         self, *, after: datetime | None, oldest_first: bool
     ) -> AsyncIterator[_FakeMessage]:
-        """Replay the canned history (the fake ignores *after*; ingest dedupes)."""
+        """Record the *after* cursor, then replay the canned history."""
         assert oldest_first is True
+        self.received_after = after
         messages = self.history_messages
 
         async def _gen() -> AsyncIterator[_FakeMessage]:
@@ -158,6 +160,25 @@ class TestOnMessage:
         await capture.on_message(msg)
         assert (tmp_path / "cap" / "a_b" / "2026-06-26.jsonl").is_file()
 
+    async def test_parent_traversal_channel_name_falls_back_to_id(
+        self, tmp_path: Path
+    ) -> None:
+        """A ``..`` channel name writes under the channel id, never the parent."""
+        capture = MessageCapture(capture_dir=tmp_path / "cap" / "root")
+        msg = _FakeMessage(
+            id=1,
+            content="a note worth keeping in the vault",
+            created_at=datetime.fromisoformat("2026-06-26T10:00:00").replace(
+                tzinfo=UTC
+            ),
+            author=_FakeAuthor(name="Ada"),
+            channel=_FakeChannel(name="..", id=4242),
+        )
+        await capture.on_message(msg)
+        # Written under the id folder inside the root — not the escaped parent.
+        assert (tmp_path / "cap" / "root" / "4242" / "2026-06-26.jsonl").is_file()
+        assert not (tmp_path / "cap" / "2026-06-26.jsonl").exists()
+
 
 class TestBackfill:
     """Backfill replays channel history and overlaps dedupe by message id."""
@@ -182,6 +203,36 @@ class TestBackfill:
         records = _read_jsonl(tmp_path / "cap" / "general" / "2026-06-26.jsonl")
         ids = sorted(str(r["id"]) for r in records)
         assert ids == ["100", "98"]  # gap filled once; the duplicate skipped
+
+    async def test_backfill_passes_latest_timestamp_as_after(
+        self, tmp_path: Path
+    ) -> None:
+        """Backfill bounds the history pull at the newest captured timestamp."""
+        capture = MessageCapture(capture_dir=tmp_path / "cap")
+        await capture.on_message(
+            _message(msg_id=10, content="older", ts="2026-06-26T09:00:00")
+        )
+        await capture.on_message(
+            _message(msg_id=11, content="newer", ts="2026-06-26T10:30:00")
+        )
+        channel = _FakeHistoryChannel(name="general", history_messages=[])
+
+        await capture.backfill(channel)
+
+        assert channel.received_after == datetime.fromisoformat(
+            "2026-06-26T10:30:00"
+        ).replace(tzinfo=UTC)
+
+    async def test_backfill_after_is_none_when_channel_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """With nothing captured yet, backfill pulls the full history (after=None)."""
+        capture = MessageCapture(capture_dir=tmp_path / "cap")
+        channel = _FakeHistoryChannel(name="general", history_messages=[])
+
+        await capture.backfill(channel)
+
+        assert channel.received_after is None
 
     async def test_tolerates_malformed_and_odd_lines(self, tmp_path: Path) -> None:
         """Blank/malformed/non-dict lines and bad timestamps are skipped, not fatal."""

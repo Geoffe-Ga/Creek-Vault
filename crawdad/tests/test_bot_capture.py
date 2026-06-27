@@ -162,6 +162,28 @@ async def test_capture_failure_does_not_break_commands(
     assert handled == [400]  # command path survived the capture failure
 
 
+async def test_non_oserror_capture_failure_is_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-OSError (e.g. a bad message shape) also never breaks commands."""
+    handled: list[int] = []
+
+    async def _fake_handle(message: _MessageLike, **_kwargs: object) -> None:
+        handled.append(message.id)
+
+    monkeypatch.setattr("crawdad.bot.handle_message", _fake_handle)
+
+    class _BrokenCapture(MessageCapture):
+        async def on_message(self, message: _MessageLike) -> None:
+            raise ValueError("unexpected message shape")
+
+    client = _client(tmp_path, _BrokenCapture(capture_dir=tmp_path / "cap"))
+
+    await client.on_message(_message(msg_id=401, author_id=111))
+
+    assert handled == [401]  # the broadened catch kept the command path alive
+
+
 async def test_on_message_before_ready_drops_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
