@@ -1221,7 +1221,9 @@ def _run_discord_exporter(
         TokenMissingError,
     )
 
-    runner = SubprocessExporterRunner(binary)
+    runner = SubprocessExporterRunner(
+        binary, timeout_seconds=config.discord.exporter_timeout_seconds
+    )
     try:
         ExporterConnector(config.discord, runner, vault_path).run()
     except TokenMissingError as exc:

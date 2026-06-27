@@ -198,3 +198,63 @@ class TestSubprocessExporterRunner:
         env = captured["env"]
         assert isinstance(env, dict)
         assert env["DISCORD_USER_TOKEN"] == "secret-zzz"
+
+
+class TestDiscordExporterCli:
+    """`creek discord --mode exporter` routes to the connector vs. the echo stub."""
+
+    def test_enabled_with_binary_runs_connector(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Enabled exporter + binary (no --dry-run) calls the real connector."""
+        from typer.testing import CliRunner
+
+        from creek.cli import app
+        from creek.config import CreekConfig
+
+        called: list[str] = []
+        monkeypatch.setattr(
+            "creek.cli._run_discord_exporter",
+            lambda _c, _v, binary: called.append(binary),
+        )
+        cfg = CreekConfig(
+            discord=DiscordSourceConfig(
+                exporter={"enabled": True}, exporter_binary="/abs/exporter"
+            )
+        )
+        monkeypatch.setattr("creek.cli._load_config_for_vault", lambda _v: cfg)
+
+        result = CliRunner().invoke(
+            app, ["discord", "--mode", "exporter", "--vault", str(tmp_path)]
+        )
+        assert result.exit_code == 0, result.output
+        assert called == ["/abs/exporter"]
+
+    def test_dry_run_echoes_not_runs_connector(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--dry-run echoes the plan and does NOT invoke the connector."""
+        from typer.testing import CliRunner
+
+        from creek.cli import app
+        from creek.config import CreekConfig
+
+        called: list[str] = []
+        monkeypatch.setattr(
+            "creek.cli._run_discord_exporter",
+            lambda _c, _v, binary: called.append(binary),
+        )
+        cfg = CreekConfig(
+            discord=DiscordSourceConfig(
+                exporter={"enabled": True}, exporter_binary="/abs/exporter"
+            )
+        )
+        monkeypatch.setattr("creek.cli._load_config_for_vault", lambda _v: cfg)
+
+        result = CliRunner().invoke(
+            app,
+            ["discord", "--mode", "exporter", "--dry-run", "--vault", str(tmp_path)],
+        )
+        assert result.exit_code == 0, result.output
+        assert called == []  # dry-run -> stub echo, connector not called
+        assert "exporter" in result.output.lower()

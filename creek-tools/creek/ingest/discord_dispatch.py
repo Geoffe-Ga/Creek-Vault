@@ -177,8 +177,9 @@ class ExporterRunner(Protocol):
     def run(self, *, argv: list[str], token: str, out_dir: Path) -> None:
         """Run the exporter with *argv*, staging Data-Package JSON into *out_dir*.
 
-        The token is passed out-of-band (not in *argv*) so it never lands in a
-        logged command line.
+        The caller creates *out_dir* before calling; implementations may assume
+        it exists. The token is passed out-of-band (not in *argv*) so it never
+        lands in a logged command line.
         """
 
 
@@ -187,19 +188,28 @@ class SubprocessExporterRunner:
 
     The binary is invoked with a fixed argument list (``shell=False``) and the
     Discord token supplied via the child process environment — never on the
-    command line — so it cannot leak into process listings or logs.
+    command line — so it cannot leak into process listings or logs. A *timeout*
+    bounds a hung binary.
     """
 
-    def __init__(self, binary: str) -> None:
-        """Bind to the operator-provided exporter binary path."""
+    def __init__(self, binary: str, *, timeout_seconds: int = 600) -> None:
+        """Bind to the operator-provided exporter binary path + a timeout."""
         self._binary = binary
+        self._timeout_seconds = timeout_seconds
 
     def run(self, *, argv: list[str], token: str, out_dir: Path) -> None:
-        """Run ``<binary> <argv...>`` with the token in the child env only."""
-        out_dir.mkdir(parents=True, exist_ok=True)
+        """Run ``<binary> <argv...>`` with the token in the child env only.
+
+        *out_dir* is created by the caller (the connector) before this runs.
+        """
         env = os.environ | {_TOKEN_ENV_VAR: token}
         # Fixed argv (no shell, no untrusted interpolation); token via env only.
-        subprocess.run([self._binary, *argv], check=True, env=env)
+        subprocess.run(
+            [self._binary, *argv],
+            check=True,
+            env=env,
+            timeout=self._timeout_seconds,
+        )
 
 
 class ExporterConnector:
