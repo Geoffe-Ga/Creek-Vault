@@ -2689,10 +2689,14 @@ def report(
     if type == "wavelength":
         _report_wavelength(vault_path, period)
         return
+    # Unknown/missing type: fail loudly with the valid list rather than silently
+    # no-op (#716). The list is derived from the dispatch table (+ the
+    # special-cased ``wavelength``) so it never drifts from the real handlers.
+    valid = ", ".join([*_REPORT_DISPATCH, "wavelength"])
     console.print(
-        f"[bold green]Would report: type={type}, "
-        f"period={period}, vault={vault_path}[/bold green]",
+        f"[red]Unknown report type {type!r}. Valid types: {valid}.[/red]",
     )
+    raise typer.Exit(code=2)
 
 
 @app.command()
