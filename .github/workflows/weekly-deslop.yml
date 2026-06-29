@@ -82,12 +82,17 @@ jobs:
           # --model opus: this is a judgment-heavy audit (architecture,
           #   duplication, AI-slop, verbosity) — Sonnet, the action default,
           #   ran the first audit too leniently. Opus does the deep reading.
-          # --max-turns 240: a real reading pass fans out across every feature
-          #   area; the lean 80-turn budget bailed out after a shallow scan.
+          # --max-turns 300: the reading pass now PARTITIONS the full
+          #   source-inventory.txt (every file, ~250+) across feature-area
+          #   subagents plus a catch-all for the long tail, then reconciles a
+          #   file-coverage ledger (examined vs total). The extra catch-all
+          #   partition and the reconciliation step need headroom over the prior
+          #   240; the partition is deterministic (no re-reading), so 300 is a
+          #   modest bump, not an open-ended one.
           claude_args: >-
             --allowed-tools "Bash,Read,Grep,Glob,Write,Skill,Task"
             --model opus
-            --max-turns 240
+            --max-turns 300
 
           prompt: |
             Run a comprehensive weekly code-quality audit of this repository
@@ -108,14 +113,22 @@ jobs:
             theater tests. Finding those requires READING THE CODE, not parsing
             tool JSON. The evidence bundle is a starting map, not the territory.
 
-            Mandatory reading pass (this is what was skipped last time): after
-            collecting evidence, fan out with the Task tool — spawn a subagent
-            per feature area (the creek-tools/creek pipeline stages — ingestion,
-            classification, linking, voice — plus creek_mcp and the crawdad
-            Discord bot) that actually READS the source against the full
-            13-family taxonomy in references/slop-taxonomy.md and reports
-            corroborated candidates. Do not conclude "clean" from a 5-minute
-            single-threaded scan of linter output.
+            Mandatory EXHAUSTIVE reading pass: after collecting evidence, the
+            bundle's `source-inventory.txt` lists EVERY source file under the
+            audited roots. Fan out with the Task tool and PARTITION THE WHOLE
+            INVENTORY across subagents so every file is assigned to exactly one
+            reader — partition by feature area (the creek-tools/creek pipeline
+            stages — ingestion, classification, linking, voice — plus creek_mcp
+            and the crawdad Discord bot), AND add a catch-all subagent for every
+            remaining inventory file (small, stable, low-churn modules and the
+            scripts/ shell tooling) so nothing is skipped because it is small or
+            hasn't changed recently. Each subagent READS its assigned files
+            against the full 13-family taxonomy in references/slop-taxonomy.md and
+            returns corroborated candidates plus the list of files it actually
+            read. churn.txt / reading-targets.txt only ORDER the reading (where to
+            start); they never bound which files are read — the inventory does.
+            Do NOT conclude "clean" from a sampled hotspot scan: a clean verdict
+            requires that every inventory file was read (see the coverage ledger).
 
             Hard requirements (the skill enforces these — do not deviate):
             - Corroborate every finding with TWO independent signals before
@@ -139,13 +152,23 @@ jobs:
             summary — append it to the file at $GITHUB_STEP_SUMMARY (e.g.
             `cat >> "$GITHUB_STEP_SUMMARY"`) — containing: counts by severity,
             issues/epics filed (with numbers), findings dropped and why,
-            findings deduped, AND a coverage ledger: a table with one row per
-            taxonomy family (all 13) listing which areas/files you examined for
-            it and the verdict (clean / candidates / filed). The ledger is how
-            we verify the whole taxonomy was actually traversed rather than
-            assumed clean. This is the durable record, linked to the workflow
-            run, and never touches the issue tracker. A clean run (nothing
-            filed) writes "codebase is clean against the taxonomy this week" to
-            the job summary and files NO issue. Only open a separate `de-slop` +
-            `report` issue when at least one finding was filed — never on a clean
-            run (a weekly report issue every Monday would flood the tracker).
+            findings deduped, AND TWO ledgers:
+            (a) a FILE-COVERAGE ledger reconciling the reading pass against
+            `source-inventory.txt` — report examined vs total files and list any
+            deliberately excluded files with a justification (only NOT-slop
+            guard-list categories: generated code, vendored, lockfiles). It must
+            show `examined == total − justified-exclusions`; if any inventory
+            file was not read, list those under "Unreached" and the run is
+            PARTIAL, not clean;
+            (b) a taxonomy ledger: one row per family (all 13) listing which
+            areas/files you examined and the verdict (clean / candidates / filed).
+            The ledgers are how we verify the whole codebase AND the whole
+            taxonomy were actually traversed rather than assumed clean. This is
+            the durable record, linked to the workflow run, and never touches the
+            issue tracker. A clean run may write "codebase is clean against the
+            taxonomy this week" ONLY when the file-coverage ledger shows full
+            coverage (no Unreached files) and the taxonomy ledger covers all 13
+            families; a partial pass instead reports what was not reached. A clean
+            run files NO issue. Only open a separate `de-slop` + `report` issue
+            when at least one finding was filed — never on a clean run (a weekly
+            report issue every Monday would flood the tracker).
