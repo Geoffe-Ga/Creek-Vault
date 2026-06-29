@@ -43,7 +43,6 @@ from creek.models import Fragment
 from creek.time import effective_authored_at, effective_authored_date
 
 if TYPE_CHECKING:
-    from datetime import date
     from pathlib import Path
 
     from creek.link.embeddings import EmbeddingLinker
@@ -83,6 +82,10 @@ class _HistoryEntry:
         Returns:
             Dictionary with all history entry fields.
         """
+        # ``generated_at`` is stamped live here (not stored on the dataclass) so
+        # a genuinely new/changed week records when it was written; an unchanged
+        # week's stamp is preserved by ``_upsert_history_entry`` to stay
+        # byte-idempotent.
         return {
             "week_start": self.week_start,
             "fragment_count": self.fragment_count,
@@ -514,7 +517,11 @@ def _upsert_history_entry(
     if prior is not None and all(
         prior.get(key) == new_entry.get(key) for key in _HISTORY_DATA_KEYS
     ):
-        new_entry["generated_at"] = prior.get("generated_at", new_entry["generated_at"])
+        # Copy rather than mutate the caller's dict (no surprising side-effect).
+        new_entry = {
+            **new_entry,
+            "generated_at": prior.get("generated_at", new_entry["generated_at"]),
+        }
     merged = [e for e in entries if e.get("week_start") != week]
     merged.append(new_entry)
     merged.sort(key=lambda e: str(e.get("week_start", "")))
