@@ -4211,14 +4211,19 @@ def author(
         ),
     ),
 ) -> None:
-    """Author a piece with the Creek Writing Desk (stub skeleton).
+    """Author a piece with the Creek Writing Desk.
 
-    Drives an end-to-end author desk — stub Graph/Retrieval/Ontology
-    specialists, a stub Voice agent, and a stub Reflection node — and prints a
-    shaped :class:`~creek.author.models.AuthoredDraft`. ``--dry-run`` prints the
-    plan and a stub evidence summary instead. ``book-report`` takes ``--work``
-    (the 11-Other-Authors path) instead of ``--query``; every other medium
-    requires ``--query``.
+    Drives an end-to-end author desk. The Graph, Retrieval, and Ontology
+    specialists and the Reflection node do **real, deterministic** work — a
+    link-graph walk, embedding-based retrieval, rule-based ontology grounding,
+    and quality-gate judging. The Voice node renders **live via the configured
+    ``generation`` provider** when one is available (routed by content tier so
+    Intimate stays local, #661), and falls back to a deterministic rendering when
+    no provider is configured/available. Returns a shaped
+    :class:`~creek.author.models.AuthoredDraft`. ``--dry-run`` plans and gathers
+    real evidence only (no voicing or reflection). ``book-report`` takes
+    ``--work`` (the 11-Other-Authors path) instead of ``--query``; every other
+    medium requires ``--query``.
     """
     from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
     from creek.author.client import AuthorLLMClient
@@ -4251,7 +4256,7 @@ def author(
         )
         console.print(f"PLAN: {' → '.join(conductor.plan())}")
         console.print(
-            f"EVIDENCE (stub): {len(evidence.claims)} claims, "
+            f"EVIDENCE: {len(evidence.claims)} claims, "
             f"{len(evidence.all_source_fragments())} source_fragments",
         )
         return

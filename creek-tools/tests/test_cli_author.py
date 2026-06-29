@@ -1,4 +1,4 @@
-"""CLI tests for ``creek author`` (FEAT-041 Writing Desk skeleton, #455)."""
+"""CLI tests for ``creek author`` (FEAT-041 Writing Desk)."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _vault(tmp_path: Path) -> Path:
 
 
 def test_author_dry_run_prints_plan_and_evidence(tmp_path: Path) -> None:
-    """``--dry-run`` prints the pipeline plan and a stub evidence summary."""
+    """``--dry-run`` prints the pipeline plan and a (real) evidence summary."""
     result = runner.invoke(
         app,
         [
@@ -56,13 +56,45 @@ def test_author_dry_run_prints_plan_and_evidence(tmp_path: Path) -> None:
     assert "PLAN:" in result.output
     assert "graph" in result.output
     assert "reflect" in result.output
-    assert "EVIDENCE (stub):" in result.output
+    assert "EVIDENCE:" in result.output  # real evidence, not a stub (#712)
+    assert "(stub)" not in result.output
     assert "claims" in result.output
     assert "source_fragments" in result.output
 
 
+def test_author_command_surface_is_not_stale_stub_text() -> None:
+    """The author surface no longer mislabels the live desk as an all-stub (#712).
+
+    Graph/Retrieval/Ontology specialists + Reflection are live deterministic work;
+    Voice is live-when-a-provider-is-available. The command docstring + the
+    author package docstrings must reflect that, not the original #455 scaffold.
+    """
+    import creek.author as author_pkg
+    from creek.author import client as author_client
+    from creek.author.conductor import Conductor, build_default_conductor
+    from creek.cli import author as author_cmd
+
+    surfaces = (
+        author_cmd.__doc__,
+        author_pkg.__doc__,
+        author_client.__doc__,
+        Conductor.__doc__,
+        build_default_conductor.__doc__,
+    )
+    for doc in surfaces:
+        assert doc is not None
+        low = doc.lower()
+        assert "stub skeleton" not in low
+        assert "stub specialist" not in low
+        assert "pure stubs" not in low
+        assert "typed stubs" not in low
+        assert "stub collaborators" not in low
+    # The command docstring states the desk does real, deterministic work.
+    assert "real, deterministic" in author_cmd.__doc__.lower()
+
+
 def test_author_run_prints_verdict(tmp_path: Path) -> None:
-    """A full (stub) run prints the verdict and a body."""
+    """A full author run prints the verdict and a body."""
     result = runner.invoke(
         app,
         ["author", "--query", "q", "--vault", str(_vault(tmp_path))],

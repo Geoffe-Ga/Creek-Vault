@@ -3,8 +3,10 @@
 These are the shapes that flow through the author desk: specialists emit
 :class:`EvidenceClaim` records (a claim traced to its source fragments),
 the conductor aggregates them into an :class:`EvidenceBundle`, and one run
-yields an :class:`AuthoredDraft`. Real retrieval/synthesis/judging fill these
-shapes in later FEAT-041 issues; the skeleton populates them with mock data.
+yields an :class:`AuthoredDraft`. The desk's deterministic
+retrieval/synthesis/judging populate these shapes with real data; the voice
+agent fills the draft body live when a provider is available and with a
+deterministic rendering otherwise.
 """
 
 from typing import Literal
@@ -199,7 +201,7 @@ class AuthoredDraft(BaseModel):
     Attributes:
         medium: The medium the draft was authored for.
         query: The originating user query.
-        body: The drafted prose (mock text in the skeleton).
+        body: The drafted prose.
         provenance: Per-claim provenance entries, reusing the compile-layer
             :class:`~creek.compile.provenance.ProvenanceEntry` shape.
         verdict: The reflection node's verdict for this draft.

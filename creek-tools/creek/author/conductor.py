@@ -5,9 +5,11 @@ evidence, the bundles are synthesized, the voice agent renders a draft, and the
 reflection node judges it — looping on ``REVISE`` up to ``max_rounds``. A draft
 still in ``REVISE`` once the round budget is exhausted is escalated to a human
 (``ESCALATE``) rather than shipped (#473), then returned as a shaped
-:class:`~creek.author.models.AuthoredDraft`. The reflection node is a real
-deterministic judge; the remaining collaborators are typed stubs that later
-issues swap behind these same seams.
+:class:`~creek.author.models.AuthoredDraft`. The specialists (graph, retrieval,
+ontology) and the reflection node do real, deterministic work; the voice agent
+renders live through the router-resolved provider when one is available
+(tier-routed so Intimate content stays local, #658/#661), falling back to a
+deterministic rendering otherwise.
 """
 
 from __future__ import annotations
@@ -145,7 +147,7 @@ def require_supported_medium(medium: str) -> Medium:
         The validated medium literal.
 
     Raises:
-        ValueError: When *medium* is not wired in the skeleton.
+        ValueError: When *medium* is not wired in the Writing Desk.
     """
     if medium not in SUPPORTED_MEDIUMS:
         wired = ", ".join(repr(m) for m in sorted(SUPPORTED_MEDIUMS))
@@ -160,7 +162,7 @@ def require_supported_medium(medium: str) -> Medium:
 
 
 def _claims_to_provenance(claims: Sequence[EvidenceClaim]) -> list[ProvenanceEntry]:
-    """Render evidence *claims* into mock provenance entries.
+    """Render evidence *claims* into provenance entries.
 
     Args:
         claims: The claims to trace.
@@ -192,7 +194,7 @@ class Conductor:
         llm_client: Optional voice client; when set,
             :func:`build_default_conductor` threads it into the voice agent so
             the desk renders live voicing (#658). ``None`` keeps the
-            deterministic stub. The specialists and reflection node remain
+            deterministic rendering. The specialists and reflection node are
             deterministic and do not use it.
         contract: The medium contract driving this run; its reflection rubric
             is exposed to the reflection node (FEAT-041 #459).
@@ -452,7 +454,7 @@ def build_default_conductor(
     voice_client_factory: VoiceClientFactory | None = None,
     contract: MediumContract | None = None,
 ) -> Conductor:
-    """Build a conductor wired with the default stub collaborators.
+    """Build a conductor wired with the default desk collaborators.
 
     Args:
         max_rounds: Upper bound on voice/reflect rounds.
@@ -467,7 +469,7 @@ def build_default_conductor(
     return Conductor(
         # #658: thread the client into the voice agent — the only collaborator
         # that calls the LLM — so an injected client produces live voicing
-        # instead of the deterministic stub. ``None`` keeps the stub.
+        # instead of the deterministic rendering. ``None`` keeps it.
         specialists=default_specialists(),
         voice=VoiceAgent(llm_client=llm_client),
         reflection=ReflectionNode(),
@@ -497,7 +499,7 @@ def run_author(
         max_rounds: Optional override for the round bound; defaults to the
             ``author.max_author_rounds`` config default.
         llm_client: Optional voice client (#658). When supplied, the desk
-            renders live voicing; ``None`` keeps the deterministic stub.
+            renders live voicing; ``None`` keeps the deterministic rendering.
         override: The privacy admission ceiling (#660) threaded to the
             specialists; above-ceiling fragments are excluded. ``None`` =>
             ``OPEN``.
