@@ -1,4 +1,4 @@
-"""CLI tests for ``creek author`` (FEAT-041 Writing Desk skeleton, #455)."""
+"""CLI tests for ``creek author`` (FEAT-041 Writing Desk)."""
 
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ def test_author_command_surface_is_not_stale_stub_text() -> None:
 
 
 def test_author_run_prints_verdict(tmp_path: Path) -> None:
-    """A full (stub) run prints the verdict and a body."""
+    """A full author run prints the verdict and a body."""
     result = runner.invoke(
         app,
         ["author", "--query", "q", "--vault", str(_vault(tmp_path))],
