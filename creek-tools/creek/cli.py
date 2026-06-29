@@ -2149,6 +2149,30 @@ def _format_link_summary(summary: LinkSummary) -> str:
     return f"[bold green]{body}[/bold green]"
 
 
+@app.command()
+def index(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Regenerate the Dataview index notes without running the full pipeline.
+
+    Runs only the index stage: rebuilds the per-frequency indexes under
+    ``06-Frequencies/``, the master thread index, the eddy map, and the temporal
+    and source indexes from whatever fragments and threads already live in the
+    vault. Deterministic and local — no ingest, redact, classify, link, or LLM —
+    so operators who added fragments or re-linked can refresh the indexes in
+    place instead of re-running all of ``process``. Re-running overwrites each
+    note with identical content (idempotent).
+    """
+    from creek.generate.indexes import IndexGenerator
+
+    vault_path = _resolve_vault(vault)
+    generated = IndexGenerator(vault_path=vault_path).generate_all()
+    rel = ", ".join(str(path.relative_to(vault_path)) for path in generated)
+    console.print(
+        f"[bold green]Wrote {len(generated)} index note(s): {rel}[/bold green]",
+    )
+
+
 @app.command(name="compile")
 def compile_(
     fragment_id: str = typer.Argument(..., help="Source fragment ID to roll up"),
