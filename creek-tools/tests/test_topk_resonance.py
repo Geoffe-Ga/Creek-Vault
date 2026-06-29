@@ -10,18 +10,41 @@ plus a scale test proving the O(n·k) bound.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 from creek.config import EmbeddingsConfig
 from creek.link.embeddings import EmbeddingLinker
+from creek.models import Fragment, FragmentSource, SourcePlatform
+
+if TYPE_CHECKING:
+    from creek.models import FragmentLevel
 
 
 def _fan(degrees: float) -> list[float]:
     """Return a 2-D unit vector at *degrees* from the x-axis."""
     radians = math.radians(degrees)
     return [math.cos(radians), math.sin(radians)]
+
+
+def _hier_fragment(
+    fid: str,
+    *,
+    parent_id: str | None = None,
+    child_ids: list[str] | None = None,
+    level: FragmentLevel = "document",
+) -> Fragment:
+    """Build a Fragment with explicit hierarchy fields for suppression tests."""
+    return Fragment(
+        id=fid,
+        title=fid,
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        parent_id=parent_id,
+        child_ids=child_ids or [],
+        level=level,
+    )
 
 
 # A fan where cosine similarity = cos(angle gap). Gaps widen (4°,6°,8°) so there
@@ -36,7 +59,9 @@ _FAN_EMBEDDINGS = {
 }
 
 
-def _pairs(linker: EmbeddingLinker, embeddings: dict[str, list[float]]) -> list:
+def _pairs(
+    linker: EmbeddingLinker, embeddings: dict[str, list[float]]
+) -> list[tuple[str, str]]:
     """Return resonance edges as ``(a_id, b_id)`` tuples."""
     return [
         (r.fragment_a_id, r.fragment_b_id) for r in linker.find_resonances(embeddings)
@@ -109,6 +134,49 @@ def test_topk_preserves_ascending_index_order() -> None:
     )
     pairs = _pairs(linker, _FAN_EMBEDDINGS)
     assert pairs == sorted(pairs)
+
+
+def test_topk_suppresses_hierarchy_trivial_pairs() -> None:
+    """A parent/child pair is never emitted by the top-k path either.
+
+    Exercises the ``suppressed`` branch in ``_resonances_topk``: the two
+    fragments are identical (cosine 1.0, so each is the other's top neighbour),
+    but they are ancestor/descendant, so FEAT-024 suppression must drop the edge
+    — matching the exact path.
+    """
+    linker = EmbeddingLinker(
+        config=EmbeddingsConfig(
+            similarity_threshold=0.5,
+            resonance_method="topk",
+            resonance_top_k=5,
+        ),
+    )
+    fragments = {
+        "p": _hier_fragment("p", child_ids=["c1"], level="document"),
+        "c1": _hier_fragment("c1", parent_id="p", level="paragraph"),
+    }
+    embeddings = {"p": [1.0, 0.0], "c1": [1.0, 0.0]}
+
+    assert linker.find_resonances(embeddings, fragments) == []
+
+
+def test_topk_edge_count_is_bounded_small() -> None:
+    """A CI-visible bound check: edges never exceed n·k (the core guarantee)."""
+    n, k = 60, 3
+    rng = np.random.default_rng(13)
+    vectors = rng.standard_normal((n, 8)).astype(np.float32)
+    embeddings = {f"f{i:03d}": vectors[i].tolist() for i in range(n)}
+
+    linker = EmbeddingLinker(
+        config=EmbeddingsConfig(
+            similarity_threshold=0.0,  # every pair qualifies
+            resonance_method="topk",
+            resonance_top_k=k,
+        ),
+    )
+    resonances = linker.find_resonances(embeddings)
+
+    assert 0 < len(resonances) <= n * k
 
 
 @pytest.mark.slow

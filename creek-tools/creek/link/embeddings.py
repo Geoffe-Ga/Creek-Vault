@@ -369,6 +369,11 @@ def _top_k_neighbours(
     *c* is the candidate count. The returned indices are unordered — the caller
     re-sorts the final edge list into the canonical ``(i, j)`` order.
 
+    Tie-breaking is implementation-defined: ``argpartition`` is not stable, so
+    when more than *top_k* candidates share the same similarity, which of the
+    tied neighbours fall inside the cap is unspecified (and may differ across
+    numpy versions). Edges above the cut are always exact and above threshold.
+
     Args:
         row: Cosine similarities of fragment *i* against every fragment.
         i: The query fragment's index (excluded from its own neighbours).
@@ -751,10 +756,9 @@ class EmbeddingLinker:
         threshold = self.config.similarity_threshold
 
         # ``exact`` (default) emits every above-threshold pair; ``topk`` keeps
-        # only each fragment's k best neighbours (#722). Both compute
-        # similarities one row-block at a time via vectorized matmul (never the
-        # full NxN matrix; OPS-004 / #596) and emit pairs in ascending
-        # ``(i, j)`` index order.
+        # only each fragment's k best neighbours. Both compute similarities one
+        # row-block at a time via vectorized matmul (never the full NxN matrix;
+        # OPS-004 / #596) and emit pairs in ascending ``(i, j)`` index order.
         if self.config.resonance_method == "topk":
             resonances, suppressed = self._resonances_topk(
                 ids=ids,

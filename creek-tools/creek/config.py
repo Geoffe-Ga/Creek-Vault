@@ -295,7 +295,7 @@ class EmbeddingsConfig(BaseModel):
     """Minimum cosine similarity for linking fragments."""
 
     resonance_method: Literal["exact", "topk"] = "exact"
-    """Resonance-discovery strategy (#722).
+    """Resonance-discovery strategy.
 
     ``exact`` (default) emits every above-``similarity_threshold`` pair — the
     validated, exhaustive path. ``topk`` keeps only each fragment's
@@ -305,7 +305,7 @@ class EmbeddingsConfig(BaseModel):
     """
 
     resonance_top_k: int = Field(default=10, ge=1)
-    """Per-fragment neighbour cap for ``resonance_method = "topk"`` (#722)."""
+    """Per-fragment neighbour cap when ``resonance_method = "topk"``."""
 
     cache_dir: str | None = None
     """Local directory for caching downloaded models."""
