@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import frontmatter
 
@@ -31,12 +31,30 @@ from creek.link.embeddings import (
     fragment_embedding_text,
 )
 from creek.link.temporal import TemporalLinker
+from creek.link.threads import ThreadDetector
 from creek.vault.reader import iter_vault_fragments
 from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
     from creek.config import CreekConfig
-    from creek.models import Eddy, Fragment
+    from creek.models import Fragment
+
+
+class _Materialisable(Protocol):
+    """A detected link model that can be written to the vault as a page.
+
+    Both :class:`~creek.models.Eddy` and :class:`~creek.models.Thread` satisfy
+    this — the generic materialiser only needs an ``id`` and ``title`` for
+    logging.
+    """
+
+    id: str
+    title: str
+
+
+_M = TypeVar("_M", bound=_Materialisable)
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +87,15 @@ class LinkSummary:
             ``eddies_detected`` when every write succeeds; smaller when
             duplicate-id collisions short-circuit a write or the writer
             fails. Only populated for ``method == "eddies"``.
-        member_fragments_updated: Fragments whose on-disk ``eddies:``
-            frontmatter was rewritten to include a new wiki-link. Only
-            populated for ``method == "eddies"``.
+        member_fragments_updated: Fragments whose on-disk ``eddies:`` or
+            ``threads:`` frontmatter was rewritten to include a new wiki-link.
+            Populated for ``method == "eddies"`` and ``method == "threads"``.
+        threads_detected: Narrative threads returned by the detector. Only
+            populated for ``method == "threads"``.
+        threads_written: Thread markdown pages persisted under
+            ``02-Threads/{status}/`` by the materialisation step. Equal to
+            ``threads_detected`` when every write succeeds; smaller when a
+            write fails. Only populated for ``method == "threads"``.
     """
 
     method: str
@@ -81,6 +105,8 @@ class LinkSummary:
     eddies_detected: int = 0
     eddies_written: int = 0
     member_fragments_updated: int = 0
+    threads_detected: int = 0
+    threads_written: int = 0
 
 
 def run_link(
@@ -140,6 +166,13 @@ def run_link(
             fragment_count=len(fragments),
             link_count=len(links),
         )
+    if method == "threads":
+        return _run_threads(
+            fragments=fragments,
+            config=config,
+            cache_path=cache_path,
+            vault_path=vault_path,
+        )
 
     # method == "eddies"
     return _run_eddies(
@@ -147,6 +180,80 @@ def run_link(
         config=config,
         cache_path=cache_path,
         vault_path=vault_path,
+    )
+
+
+def _run_threads(
+    *,
+    fragments: list[Fragment],
+    config: CreekConfig,
+    cache_path: Path,
+    vault_path: Path,
+) -> LinkSummary:
+    """Detect narrative threads and materialise one page per thread inline.
+
+    Mirrors :func:`_run_eddies`: the existing :class:`ThreadDetector` already
+    produces fully-formed :class:`~creek.models.Thread` models and a membership
+    map, and :meth:`VaultWriter.write_thread` already routes a page under
+    ``02-Threads/{Active,Dormant,Resolved}/`` by the thread's status. The only
+    missing step was the bulk filesystem write — previously a page existed only
+    when an operator ran ``creek compile`` per thread, leaving 02-Threads
+    near-empty while fragments carried ``threads:`` links to non-existent pages.
+
+    Detection semantics are unchanged — embeddings are loaded from cache to feed
+    the detector's semantic topic-consistency exactly as the pipeline does, and
+    ``thread_min_fragments`` comes from config. The function then writes one page
+    per thread and rewrites each member fragment's ``threads:`` frontmatter so
+    the wiki-links resolve to the pages now on disk.
+
+    Args:
+        fragments: Fragments loaded from the vault.
+        config: Loaded Creek configuration.
+        cache_path: Embeddings parquet path.
+        vault_path: Vault root.
+
+    Returns:
+        A populated :class:`LinkSummary` for the threads method.
+    """
+    embeddings = _load_or_compute_embeddings(
+        fragments=fragments,
+        config=config,
+        cache_path=cache_path,
+    )
+    detector = ThreadDetector(embeddings=embeddings)
+    threads = detector.detect_threads(
+        fragments,
+        min_fragments=config.linking.thread_min_fragments,
+    )
+
+    if not threads:
+        return LinkSummary(
+            method="threads",
+            fragment_count=len(fragments),
+            link_count=0,
+        )
+
+    updated_fragments = detector.assign_fragments_to_threads(fragments, threads)
+    written_paths = _materialise_link_models(
+        threads,
+        vault_path,
+        kind="thread",
+        write=lambda writer, thread: writer.write_thread(thread),
+    )
+    fragments_updated = _persist_fragment_link_updates(
+        original=fragments,
+        updated=updated_fragments,
+        vault_path=vault_path,
+        changed=lambda before, after: before.threads != after.threads,
+    )
+
+    return LinkSummary(
+        method="threads",
+        fragment_count=len(fragments),
+        link_count=len(threads),
+        threads_detected=len(threads),
+        threads_written=len(written_paths),
+        member_fragments_updated=fragments_updated,
     )
 
 
@@ -209,11 +316,17 @@ def _run_eddies(
         )
 
     updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
-    written_paths = _write_eddy_files(eddies, vault_path)
-    fragments_updated = _persist_fragment_eddy_updates(
+    written_paths = _materialise_link_models(
+        eddies,
+        vault_path,
+        kind="eddy",
+        write=lambda writer, eddy: writer.write_eddy(eddy),
+    )
+    fragments_updated = _persist_fragment_link_updates(
         original=fragments,
         updated=updated_fragments,
         vault_path=vault_path,
+        changed=lambda before, after: before.eddies != after.eddies,
     )
 
     return LinkSummary(
@@ -226,21 +339,34 @@ def _run_eddies(
     )
 
 
-def _write_eddy_files(eddies: list[Eddy], vault_path: Path) -> list[Path]:
-    """Persist each eddy as a markdown file under ``03-Eddies/``.
+def _materialise_link_models(
+    models: Sequence[_M],
+    vault_path: Path,
+    *,
+    kind: str,
+    write: Callable[[VaultWriter, _M], Path],
+) -> list[Path]:
+    """Persist each detected link *model* as a markdown page via *write*.
 
-    Uses :class:`VaultWriter` so per-directory ID indexing, atomic
-    create, and provenance logging all behave consistently with the rest
-    of the pipeline. A failed write (``OSError`` from a full disk or
-    read-only volume) is logged and the remaining eddies are still
-    attempted — losing one eddy file should not break the others.
+    Shared by the eddies and threads linkers: both already produce
+    fully-formed models and own a :class:`VaultWriter` page-writer
+    (:meth:`~VaultWriter.write_eddy` / :meth:`~VaultWriter.write_thread`), so
+    the only generic step is the filesystem write. Using :class:`VaultWriter`
+    keeps per-directory ID indexing, atomic create, and provenance logging
+    consistent with the rest of the pipeline. A failed write (``OSError`` from a
+    full disk or read-only volume) is logged and the remaining models are still
+    attempted — losing one page should not break the others.
 
     Args:
-        eddies: Eddies returned by :meth:`EddyDetector.detect_eddies`.
+        models: Detected models to write (each carries ``id`` + ``title``).
         vault_path: Vault root.
+        kind: Human-readable model kind for log messages (``"eddy"`` /
+            ``"thread"``).
+        write: The :class:`VaultWriter` method that persists one model and
+            returns its path.
 
     Returns:
-        Paths of the eddy files that were successfully written.
+        Paths of the pages that were successfully written.
     """
     try:
         writer = VaultWriter(vault_path=vault_path)
@@ -250,21 +376,23 @@ def _write_eddy_files(eddies: list[Eddy], vault_path: Path) -> list[Path]:
         # whatever the operator points at; we shouldn't crash on a
         # half-set-up vault when there's nothing to materialise into.
         logger.warning(
-            "Skipping eddy materialisation: vault %s is missing required dirs",
+            "Skipping %s materialisation: vault %s is missing required dirs",
+            kind,
             vault_path,
         )
         return []
 
     written: list[Path] = []
-    for eddy in eddies:
+    for model in models:
         try:
-            path = writer.write_eddy(eddy)
+            path = write(writer, model)
         except OSError as exc:
             logger.warning(
-                "Failed to write eddy %s (%s) under %s: %s",
-                eddy.id,
-                eddy.title,
-                vault_path / "03-Eddies",
+                "Failed to write %s %s (%s) under %s: %s",
+                kind,
+                model.id,
+                model.title,
+                vault_path,
                 exc,
             )
             continue
@@ -272,26 +400,28 @@ def _write_eddy_files(eddies: list[Eddy], vault_path: Path) -> list[Path]:
     return written
 
 
-def _persist_fragment_eddy_updates(
+def _persist_fragment_link_updates(
     *,
     original: list[Fragment],
     updated: list[Fragment],
     vault_path: Path,
+    changed: Callable[[Fragment, Fragment], bool],
 ) -> int:
-    """Rewrite fragment frontmatter when the ``eddies:`` list changed.
+    """Rewrite fragment frontmatter when a link list (eddies/threads) changed.
 
     Re-reads each fragment file so non-Fragment frontmatter keys (e.g.
     operator-applied tags, ``classification_method``) are preserved
     verbatim — the same approach the classify engine uses for in-place
-    fragment rewrites. Only fragments whose ``eddies`` list actually
-    grew are touched.
+    fragment rewrites. Only fragments for which *changed* reports a difference
+    between the loaded and the assigned copy are touched.
 
     Args:
         original: Fragments as loaded from disk.
-        updated: Fragments returned by
-            :meth:`EddyDetector.assign_fragments_to_eddies`. Must be
-            the same length as *original* and in the same order.
+        updated: Fragments returned by the detector's ``assign_*`` method. Must
+            be the same length as *original* and in the same order.
         vault_path: Vault root.
+        changed: Predicate deciding whether a fragment's relevant link list
+            (``eddies`` or ``threads``) differs and so needs rewriting.
 
     Returns:
         Number of fragment files that were successfully rewritten.
@@ -306,7 +436,7 @@ def _persist_fragment_eddy_updates(
 
     written = 0
     for before, after in zip(original, updated, strict=True):
-        if before.eddies == after.eddies:
+        if not changed(before, after):
             continue
         md_path = path_by_id.get(after.id)
         if md_path is None:

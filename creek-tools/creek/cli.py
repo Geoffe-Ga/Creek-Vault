@@ -1728,7 +1728,7 @@ def redact(
 
 
 _CLASSIFY_METHODS = ("rules", "llm")
-_LINK_METHODS = ("embeddings", "temporal", "eddies")
+_LINK_METHODS = ("embeddings", "temporal", "eddies", "threads")
 _REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
 
 
@@ -2059,7 +2059,7 @@ def link(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     method: str = typer.Option(
         "embeddings",
-        help="Linking method (embeddings|temporal|eddies)",
+        help="Linking method (embeddings|temporal|eddies|threads)",
     ),
     rebuild: bool = typer.Option(
         False,
@@ -2142,6 +2142,15 @@ def _format_link_summary(summary: LinkSummary) -> str:
     elif summary.method == "temporal":
         body = (
             f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
+        )
+    elif summary.method == "threads":
+        body = (
+            f"Threads linker: {fragments} fragment(s) scanned, "
+            f"{summary.threads_detected} thread(s) detected, "
+            f"{summary.threads_written} page(s) written to "
+            f"02-Threads/{{Active,Dormant,Resolved}}/, "
+            f"{summary.member_fragments_updated} fragment(s) updated with "
+            f"`threads:` wiki-links."
         )
     else:
         msg = f"Unknown link method: {summary.method!r}"
