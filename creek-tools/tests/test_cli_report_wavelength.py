@@ -155,9 +155,8 @@ def test_wavelength_unpopulated_dimension_is_informative(tmp_path: Path) -> None
 
     assert result.exit_code == 0, result.output
     assert _phase_maps(vault) == []
-    assert "wavelength" in result.output.lower()
-    # Informative, not a silent empty file.
-    assert "no" in result.output.lower()
+    # Informative, not a silent empty file — pin to the actual message.
+    assert "no wavelength phase-map written" in result.output.lower()
 
 
 def test_wavelength_invalid_period_exits_two(tmp_path: Path) -> None:

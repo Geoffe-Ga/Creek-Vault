@@ -2394,24 +2394,22 @@ def _resolve_wavelength_period(period: str | None) -> tuple[str, date] | None:
         date inside the target window, or ``None`` when *period* is missing or
         unparseable (the caller surfaces the error).
     """
-    from datetime import date as _date
-
-    if period in {"weekly", "monthly"}:
-        return (period, _date.today())
     if period is None:
         return None
+    if period in {"weekly", "monthly"}:
+        return (period, date.today())
     week_match = _WAVELENGTH_ISO_WEEK_RE.match(period)
     if week_match:
         year, week = int(week_match.group(1)), int(week_match.group(2))
         try:
-            return ("weekly", _date.fromisocalendar(year, week, 1))
+            return ("weekly", date.fromisocalendar(year, week, 1))
         except ValueError:
             return None
     month_match = _WAVELENGTH_MONTH_RE.match(period)
     if month_match:
         year, month = int(month_match.group(1)), int(month_match.group(2))
         try:
-            return ("monthly", _date(year, month, 1))
+            return ("monthly", date(year, month, 1))
         except ValueError:
             return None
     return None
@@ -2421,8 +2419,7 @@ def _wavelength_dimension_populated(fragments: list[Fragment]) -> bool:
     """Return whether any *fragments* carry a classified wavelength phase."""
     from creek.models import Phase as _Phase
 
-    unclassified = _Phase.UNCLASSIFIED.value
-    return any(str(f.wavelength.phase) != unclassified for f in fragments)
+    return any(f.wavelength.phase != _Phase.UNCLASSIFIED for f in fragments)
 
 
 def _report_wavelength(vault_path: Path, period: str | None) -> None:
@@ -2437,7 +2434,7 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
     """
     from creek.generate.wavelength import (
         WavelengthTracker,
-        _load_fragments_from_vault,
+        load_fragments_from_vault,
     )
 
     resolved = _resolve_wavelength_period(period)
@@ -2449,7 +2446,7 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
         raise typer.Exit(code=2)
     mode, anchor = resolved
 
-    fragments = _load_fragments_from_vault(vault_path)
+    fragments = load_fragments_from_vault(vault_path)
     if not _wavelength_dimension_populated(fragments):
         console.print(
             "[yellow]No wavelength phase-map written: no fragment carries a "
