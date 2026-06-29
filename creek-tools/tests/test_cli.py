@@ -1233,6 +1233,43 @@ def test_report_unnamed_command(tmp_path: Path) -> None:
     assert (vault / "10-Liminal" / "Unnamed" / "Digests").is_dir()
 
 
+def _report_vault(tmp_path: Path) -> Path:
+    """Minimal vault for a report-command invocation."""
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "00-Creek-Meta/Processing-Log", "01-Fragments"):
+        (vault / d).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+def test_report_unknown_type_errors(tmp_path: Path) -> None:
+    """`report --type <unknown>` errors with the valid list, not a no-op (#716)."""
+    vault = _report_vault(tmp_path)
+    result = runner.invoke(app, ["report", "--type", "paradoxx", "--vault", str(vault)])
+    assert result.exit_code == 2, result.output  # Unix invalid-argument convention
+    assert "paradoxx" in result.output  # names the bad type
+    assert "decisions" in result.output  # lists real valid types
+    assert "unnamed" in result.output
+    assert "Would report" not in result.output  # the silent no-op is gone
+
+
+def test_report_missing_type_errors(tmp_path: Path) -> None:
+    """`report` with no --type errors with a human-readable message (#716)."""
+    vault = _report_vault(tmp_path)
+    result = runner.invoke(app, ["report", "--vault", str(vault)])
+    assert result.exit_code == 2, result.output
+    assert "--type is required" in result.output  # not a leaked Python "None"
+    assert "None" not in result.output
+    assert "Would report" not in result.output
+
+
+def test_report_known_type_still_dispatches(tmp_path: Path) -> None:
+    """A valid --type still runs its handler (no regression) (#716)."""
+    vault = _report_vault(tmp_path)
+    (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
+    result = runner.invoke(app, ["report", "--type", "unnamed", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+
+
 def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     """``report --type decisions`` with no signalling fragments is friendly (#581).
 
@@ -1496,7 +1533,7 @@ def test_report_wavelength_unknown_period_errors(tmp_path: Path) -> None:
 
 
 def test_report_command() -> None:
-    """Test that report command runs with required args."""
+    """An unrecognised report type (`summary`) errors with the valid list (#716)."""
     result = runner.invoke(
         app,
         [
@@ -1509,7 +1546,9 @@ def test_report_command() -> None:
             "/fake/vault",
         ],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 2
+    assert "summary" in result.output
+    assert "Would report" not in result.output
 
 
 def test_review_help() -> None:
