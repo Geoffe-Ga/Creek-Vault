@@ -103,7 +103,7 @@ def test_link_threads_writes_one_page_per_detected_thread(tmp_path: Path) -> Non
 
     assert summary.method == "threads"
     assert summary.fragment_count == 3
-    assert summary.threads_detected >= 1
+    assert summary.threads_detected == 1
     assert summary.threads_written == summary.threads_detected
     pages = _thread_pages(vault)
     assert len(pages) == summary.threads_written
@@ -167,6 +167,41 @@ def test_link_threads_is_idempotent(tmp_path: Path) -> None:
     assert second.threads_written == len(pages)
     for path, original in snapshot.items():
         assert path.read_bytes() == original, f"{path} changed on re-run"
+
+
+def test_link_threads_no_detection_is_a_clean_noop(tmp_path: Path) -> None:
+    """When no thread forms, the linker writes nothing and reports zeros.
+
+    Three ``UNCLASSIFIED`` fragments share no frequency, so the detector's
+    topic-consistency check never unions them — exercising the ``if not
+    threads`` early-return branch in ``_run_threads``.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=f"frag-loner00000{i:03d}",
+                title=f"Loner {i}",
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+                authored_at=now_la() - timedelta(days=i),
+                # No frequency -> UNCLASSIFIED -> no topic overlap -> no thread.
+            ),
+            body=f"Unrelated note {i}.",
+        )
+
+    summary = run_link(
+        vault_path=vault, config=CreekConfig(), method="threads", rebuild=False
+    )
+
+    assert summary.method == "threads"
+    assert summary.fragment_count == 3
+    assert summary.threads_detected == 0
+    assert summary.threads_written == 0
+    assert summary.member_fragments_updated == 0
+    assert summary.link_count == 0
+    assert _thread_pages(vault) == []
 
 
 def test_link_threads_cli_reports_pages(tmp_path: Path) -> None:

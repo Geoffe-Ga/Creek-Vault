@@ -2148,9 +2148,9 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"Threads linker: {fragments} fragment(s) scanned, "
             f"{summary.threads_detected} thread(s) detected, "
             f"{summary.threads_written} page(s) written to "
-            f"02-Threads/{{Active,Dormant,Resolved}}/, "
+            "02-Threads/{Active,Dormant,Resolved}/, "
             f"{summary.member_fragments_updated} fragment(s) updated with "
-            f"`threads:` wiki-links."
+            "`threads:` wiki-links."
         )
     else:
         msg = f"Unknown link method: {summary.method!r}"

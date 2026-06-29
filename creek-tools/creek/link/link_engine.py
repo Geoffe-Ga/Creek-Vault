@@ -1,16 +1,16 @@
 """Vault-driven linking engine for the ``creek link`` command.
 
 Loads every fragment from ``<vault>/01-Fragments/``, dispatches to the
-chosen linker stage (embeddings, temporal, or eddies), and reports the
-resulting link count back to the CLI. Honours ``--rebuild`` by deleting
+chosen linker stage (embeddings, temporal, eddies, or threads), and reports
+the resulting link count back to the CLI. Honours ``--rebuild`` by deleting
 the cached embeddings parquet so the embedding linker recomputes from
 scratch.
 
-The eddies linker materialises its output inline — it writes an
-``Eddy`` markdown file per detected cluster under ``03-Eddies/`` and
-updates each member fragment's ``eddies:`` frontmatter with the
-corresponding wiki-link, so the CLI's summary counts match what
-operators see on disk.
+The eddies and threads linkers materialise their output inline — they write
+one markdown page per detected cluster/thread (under ``03-Eddies/`` /
+``02-Threads/{status}/``) and update each member fragment's ``eddies:`` /
+``threads:`` frontmatter with the corresponding wiki-link, so the CLI's
+summary counts match what operators see on disk.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class LinkSummary:
 
     Attributes:
         method: Linker that was run (``embeddings`` / ``temporal`` /
-            ``eddies``).
+            ``eddies`` / ``threads``).
         fragment_count: Number of fragments loaded from the vault.
         link_count: Generic count for back-compat; mirrors the
             method-specific count (resonance edges, temporal links, or
@@ -121,7 +121,8 @@ def run_link(
     Args:
         vault_path: Vault root.
         config: Loaded Creek configuration.
-        method: ``"embeddings"``, ``"temporal"``, or ``"eddies"``.
+        method: ``"embeddings"``, ``"temporal"``, ``"eddies"``, or
+            ``"threads"``.
         rebuild: When ``True`` and ``method == "embeddings"``, delete
             the cached embeddings parquet before recomputing.
 
