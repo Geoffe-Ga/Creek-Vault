@@ -757,8 +757,8 @@ class EmbeddingLinker:
 
         # ``exact`` (default) emits every above-threshold pair; ``topk`` keeps
         # only each fragment's k best neighbours. Both compute similarities one
-        # row-block at a time via vectorized matmul (never the full NxN matrix;
-        # OPS-004 / #596) and emit pairs in ascending ``(i, j)`` index order.
+        # row-block at a time via vectorized matmul (never the full NxN matrix)
+        # and emit pairs in ascending ``(i, j)`` index order.
         if self.config.resonance_method == "topk":
             resonances, suppressed = self._resonances_topk(
                 ids=ids,

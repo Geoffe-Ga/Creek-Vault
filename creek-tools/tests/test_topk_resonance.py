@@ -1,4 +1,4 @@
-"""Top-k nearest-neighbour resonance discovery (#722).
+"""Top-k nearest-neighbour resonance discovery.
 
 The exact all-pairs path stays the default; ``resonance_method = "topk"`` keeps
 only each fragment's ``resonance_top_k`` best above-threshold neighbours,
@@ -169,7 +169,9 @@ def test_topk_edge_count_is_bounded_small() -> None:
 
     linker = EmbeddingLinker(
         config=EmbeddingsConfig(
-            similarity_threshold=0.0,  # every pair qualifies
+            # A wide-open gate: every non-negatively-similar pair qualifies, so
+            # the top-k cap (not the threshold) is what bounds the output.
+            similarity_threshold=0.0,
             resonance_method="topk",
             resonance_top_k=k,
         ),
@@ -181,7 +183,13 @@ def test_topk_edge_count_is_bounded_small() -> None:
 
 @pytest.mark.slow
 def test_topk_edge_count_is_bounded_at_scale() -> None:
-    """Top-k caps the edge set at O(n·k) even when every pair is above threshold."""
+    """Top-k caps the edge set at O(n·k) at a larger N than the routine gate.
+
+    ``test_topk_edge_count_is_bounded_small`` is the always-on CI guard for the
+    bound; this ``slow``-marked variant exercises a bigger N for extra
+    confidence. The ``slow`` marker is descriptive — ``addopts`` does not
+    auto-deselect it, and at n=800 it is still a sub-second numpy test.
+    """
     n, k = 800, 5
     rng = np.random.default_rng(20260629)
     vectors = rng.standard_normal((n, 16)).astype(np.float32)
@@ -189,7 +197,9 @@ def test_topk_edge_count_is_bounded_at_scale() -> None:
 
     linker = EmbeddingLinker(
         config=EmbeddingsConfig(
-            similarity_threshold=0.0,  # every pair qualifies → exact would be O(n²)
+            # Wide-open gate (every non-negative-cosine pair qualifies) so exact
+            # would be ~O(n²); only the top-k cap keeps the output bounded.
+            similarity_threshold=0.0,
             resonance_method="topk",
             resonance_top_k=k,
         ),
