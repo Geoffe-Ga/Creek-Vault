@@ -36,9 +36,11 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any, cast
 
 import stats
@@ -129,13 +131,18 @@ def _gh_headers(token: str) -> dict[str, str]:
     }
 
 
-def _gh_get_paged(path: str, *, token: str, params: dict[str, str], max_items: int) -> list[dict[str, Any]]:
+def _gh_get_paged(
+    path: str, *, token: str, params: dict[str, str], max_items: int
+) -> list[dict[str, Any]]:
     """GET a paginated GitHub list endpoint, stopping at max_items."""
     headers = _gh_headers(token)
     out: list[dict[str, Any]] = []
     page = 1
     while len(out) < max_items:
-        query = "&".join(f"{k}={v}" for k, v in {**params, "per_page": "100", "page": str(page)}.items())
+        query = "&".join(
+            f"{k}={v}"
+            for k, v in {**params, "per_page": "100", "page": str(page)}.items()
+        )
         url = f"{GITHUB_API}{path}?{query}"
         chunk = cast("list[dict[str, Any]]", _request_json(url, headers=headers))
         if not chunk:
@@ -152,7 +159,9 @@ def _gh_get_paged(path: str, *, token: str, params: dict[str, str], max_items: i
 # --------------------------------------------------------------------------- #
 
 
-def _gh_search_issues(query: str, *, token: str, max_items: int) -> list[dict[str, Any]]:
+def _gh_search_issues(
+    query: str, *, token: str, max_items: int
+) -> list[dict[str, Any]]:
     """Run a GitHub issue/PR search, paging up to max_items results.
 
     Search responses wrap the hits in an `items` array (unlike the list
@@ -182,11 +191,16 @@ def count_merged_total(repo: str, *, token: str) -> int:
     instead of pinning at the number of PRs we happened to pull this run.
     """
     qs = urllib.parse.urlencode({"q": f"repo:{repo} is:pr is:merged", "per_page": "1"})
-    data = cast("dict[str, Any]", _request_json(f"{GITHUB_API}/search/issues?{qs}", headers=_gh_headers(token)))
+    data = cast(
+        "dict[str, Any]",
+        _request_json(f"{GITHUB_API}/search/issues?{qs}", headers=_gh_headers(token)),
+    )
     return int(data.get("total_count", 0))
 
 
-def fetch_recent_merged_prs(repo: str, *, token: str, since: dt.date, max_prs: int) -> list[dict[str, Any]]:
+def fetch_recent_merged_prs(
+    repo: str, *, token: str, since: dt.date, max_prs: int
+) -> list[dict[str, Any]]:
     """Return PRs merged on/after `since` (newest merge first), capped at max_prs.
 
     Uses search so the window is filtered server-side; each hit carries its
@@ -195,7 +209,9 @@ def fetch_recent_merged_prs(repo: str, *, token: str, since: dt.date, max_prs: i
     """
     query = f"repo:{repo} is:pr is:merged merged:>={since.isoformat()}"
     items = _gh_search_issues(query, token=token, max_items=max_prs)
-    items.sort(key=lambda it: cast("str", it["pull_request"]["merged_at"]), reverse=True)
+    items.sort(
+        key=lambda it: cast("str", it["pull_request"]["merged_at"]), reverse=True
+    )
     return items
 
 
@@ -239,22 +255,51 @@ def fetch_pr_verdicts(repo: str, number: int, *, token: str) -> list[str]:
     return verdicts
 
 
-def fetch_repo_net_lines(repo: str, *, token: str, attempts: int = 3) -> int | None:
+def fetch_repo_net_lines(
+    repo: str,
+    *,
+    token: str,
+    attempts: int = 4,
+    sleep: Callable[[float], None] = time.sleep,
+    base_delay: float = 2.0,
+) -> int | None:
     """Return net lines of code across the whole repo via the code-frequency stats API.
 
     GitHub computes the per-week additions/deletions stats asynchronously and
-    answers 202 with an empty body on a cold cache, so retry a few times. Any
-    failure (still warming, or an HTTP/transport error) returns None so the recap
-    shows a placeholder for the full-repo figure instead of failing outright.
+    answers ``202`` with an **empty body** on a cold cache. That empty body parses
+    to ``None`` (vs an HTTP 200 returning a real list — possibly an empty ``[]``
+    for a genuinely empty history). So:
+
+    - ``None`` => still warming; wait with exponential backoff and retry, giving
+      the cache time to compute rather than firing all attempts in milliseconds.
+    - a list (rows or a genuine ``[]``) => final; sum it (``[]`` nets to 0).
+
+    Any HTTP/transport error, or exhausting the attempts while still warming,
+    returns ``None`` so the recap shows a placeholder for the full-repo figure
+    instead of failing outright.
+
+    Args:
+        repo: ``owner/name`` slug.
+        token: GitHub token.
+        attempts: Maximum fetches before giving up (default 4).
+        sleep: Delay function between attempts; injectable so tests don't sleep.
+        base_delay: First backoff in seconds; doubles each retry (2s, 4s, 8s).
+
+    Returns:
+        The repo's net lines of code, or ``None`` if the stats never warmed.
     """
     url = f"{GITHUB_API}/repos/{repo}/stats/code_frequency"
-    for _ in range(attempts):
+    for attempt in range(attempts):
         try:
             data = _request_json(url, headers=_gh_headers(token))
         except (urllib.error.HTTPError, urllib.error.URLError):
             return None
-        if data:
+        if data is not None:
             return stats.net_lines_from_code_frequency(cast("list[list[int]]", data))
+        # Empty body => HTTP 202, stats still computing. Back off before the next
+        # attempt; the final attempt skips the sleep since we give up after it.
+        if attempt < attempts - 1:
+            sleep(base_delay * (2.0**attempt))
     return None
 
 
@@ -341,8 +386,12 @@ def generate_headline(title: str, body: str) -> str:
             output_config={"effort": "low"},
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(block.text for block in response.content if block.type == "text").strip()
-    except Exception:  # any SDK/API failure degrades to the heuristic, never fails the recap
+        text = "".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip()
+    except (
+        Exception
+    ):  # any SDK/API failure degrades to the heuristic, never fails the recap
         return _heuristic_headline(title)
     return text or _heuristic_headline(title)
 
@@ -390,7 +439,9 @@ def _open_to_merge_hours(pr: dict[str, Any]) -> float:
     return max((merged - opened).total_seconds() / 3600.0, 0.0)
 
 
-def build_recap(repo: str, *, token: str, max_prs: int, now: dt.datetime) -> dict[str, Any] | None:
+def build_recap(
+    repo: str, *, token: str, max_prs: int, now: dt.datetime
+) -> dict[str, Any] | None:
     """Gather data and assemble the Discord embed payload.
 
     The headline total is the true all-time merged count; the activity and
@@ -439,14 +490,22 @@ def build_recap(repo: str, *, token: str, max_prs: int, now: dt.datetime) -> dic
     day_ago = now - dt.timedelta(hours=stats.HOURS_PER_DAY)
     latest_churn = stats.churn_totals(churn[:1])
     loc_7d = stats.churn_totals(churn)
-    loc_24h = stats.churn_totals([c for c, ts in zip(churn, merged_at) if ts >= day_ago])
+    loc_24h = stats.churn_totals(
+        [c for c, ts in zip(churn, merged_at) if ts >= day_ago]
+    )
     repo_net = fetch_repo_net_lines(repo, token=token)
 
-    headline = generate_headline(str(latest.get("title", "")), str(latest.get("body") or ""))
+    headline = generate_headline(
+        str(latest.get("title", "")), str(latest.get("body") or "")
+    )
 
     # Per-PR (this-merge) figures, kept distinct from the windowed dataset above.
     latest_ttm_hours = _open_to_merge_hours(latest)
-    latest_tick_hours = (merged_at[0] - merged_at[1]).total_seconds() / 3600.0 if len(merged_at) >= 2 else None
+    latest_tick_hours = (
+        (merged_at[0] - merged_at[1]).total_seconds() / 3600.0
+        if len(merged_at) >= 2
+        else None
+    )
 
     return _render_embed(
         repo=repo,
@@ -502,7 +561,9 @@ def _this_pr_iter_line(latest_iterations: int | None) -> str:
     return f"**{latest_iterations}** {plural} to LGTM"
 
 
-def _loc_line(loc_24h: dict[str, int], loc_7d: dict[str, int], repo_net: int | None) -> str:
+def _loc_line(
+    loc_24h: dict[str, int], loc_7d: dict[str, int], repo_net: int | None
+) -> str:
     """Lines-of-code churn over the 24h and 7d windows, plus the full-repo net."""
 
     def churn(totals: dict[str, int]) -> str:
@@ -562,11 +623,27 @@ def _render_embed(
         {"name": BLANK, "value": BLANK, "inline": False},
         {"name": THIS_PR_HEADER, "value": BLANK, "inline": False},
         {"name": "🔓 Unlock", "value": f"*{headline}*", "inline": False},
-        {"name": "🔗 Link", "value": f"[#{pr_number} — {latest.get('title', '')}]({pr_url})", "inline": False},
+        {
+            "name": "🔗 Link",
+            "value": f"[#{pr_number} — {latest.get('title', '')}]({pr_url})",
+            "inline": False,
+        },
         {"name": "🧮 Footprint", "value": footprint, "inline": True},
-        {"name": "🔁 Review iterations", "value": _this_pr_iter_line(latest_iterations), "inline": True},
-        {"name": "⏱️ Time for review", "value": _this_pr_review_line(latest_ttm_hours), "inline": True},
-        {"name": "🔄 Tick length", "value": _this_pr_tick_line(latest_tick_hours), "inline": True},
+        {
+            "name": "🔁 Review iterations",
+            "value": _this_pr_iter_line(latest_iterations),
+            "inline": True,
+        },
+        {
+            "name": "⏱️ Time for review",
+            "value": _this_pr_review_line(latest_ttm_hours),
+            "inline": True,
+        },
+        {
+            "name": "🔄 Tick length",
+            "value": _this_pr_tick_line(latest_tick_hours),
+            "inline": True,
+        },
         {"name": BLANK, "value": BLANK, "inline": False},
         {"name": LOOP_HEADER, "value": BLANK, "inline": False},
         {"name": "🔥 Busiest day (7d)", "value": busy_line, "inline": True},
@@ -575,7 +652,11 @@ def _render_embed(
             "value": f"{int(rate['last_24h'])} in 24h · {int(rate['last_7_days'])} in 7d · **{total_merged}** all-time",
             "inline": True,
         },
-        {"name": "📈 LoC", "value": _loc_line(loc_24h, loc_7d, repo_net), "inline": False},
+        {
+            "name": "📈 LoC",
+            "value": _loc_line(loc_24h, loc_7d, repo_net),
+            "inline": False,
+        },
         {
             "name": "⚡ Merge rate",
             "value": f"**{rate['per_hour']:.2f}**/hr (24h) · {rate['per_day']:.1f}/day (7d)",
@@ -616,7 +697,9 @@ def post_to_discord(channel_id: str, token: str, payload: dict[str, Any]) -> Non
         "Content-Type": "application/json",
         "User-Agent": "DiscordBot (ralph-recap, 1.0)",
     }
-    _request_json(url, headers=headers, method="POST", body=json.dumps(payload).encode("utf-8"))
+    _request_json(
+        url, headers=headers, method="POST", body=json.dumps(payload).encode("utf-8")
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -638,14 +721,18 @@ def _gather(repo: str, gh_token: str, max_prs: int) -> dict[str, Any] | None:
 def _deliver(channel_id: str | None, payload: dict[str, Any]) -> None:
     """Post the payload to Discord, mapping failures to RecapError."""
     if not channel_id:
-        raise RecapError("RALPH_CHANNEL_ID (or --channel-id) is required to post", code=2)
+        raise RecapError(
+            "RALPH_CHANNEL_ID (or --channel-id) is required to post", code=2
+        )
     discord_token = os.environ.get("DISCORD_BOT_TOKEN")
     if not discord_token:
         raise RecapError("DISCORD_BOT_TOKEN is required to post", code=2)
     try:
         post_to_discord(channel_id, discord_token, payload)
     except urllib.error.HTTPError as exc:
-        raise RecapError(f"Discord API request failed: {exc.code} {exc.reason}") from exc
+        raise RecapError(
+            f"Discord API request failed: {exc.code} {exc.reason}"
+        ) from exc
     except urllib.error.URLError as exc:
         raise RecapError(f"network failure talking to Discord: {exc.reason}") from exc
 
@@ -671,11 +758,17 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/repo slug")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/repo slug"
+    )
     parser.add_argument("--channel-id", default=os.environ.get("RALPH_CHANNEL_ID"))
     parser.add_argument("--max-prs", type=int, default=DEFAULT_MAX_PRS)
-    parser.add_argument("--dry-run", action="store_true", help="print the embed instead of posting")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print the embed instead of posting"
+    )
     args = parser.parse_args(argv)
     try:
         return _run(args)
