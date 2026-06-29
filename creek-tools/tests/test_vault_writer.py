@@ -496,6 +496,23 @@ class TestWriteThread:
         assert "id: thread-test001" in content
         assert "type: thread" in content
 
+    def test_write_thread_aliases_title_for_link_resolution(
+        self,
+        writer: VaultWriter,
+        sample_thread: Thread,
+    ) -> None:
+        """The page aliases its bare title so ``[[<title>]]`` resolves.
+
+        The bulk threads linker writes ``[[Test Active Thread]]`` onto member
+        fragments, while the page lands at ``{date}-Test-Active-Thread.md``; the
+        ``aliases`` entry bridges that gap for stock-Obsidian link resolution.
+        """
+        import frontmatter
+
+        result = writer.write_thread(sample_thread)
+        post = frontmatter.loads(result.read_text(encoding="utf-8"))
+        assert sample_thread.title in post.get("aliases", [])
+
 
 # ---- write_eddy ----
 
@@ -523,6 +540,23 @@ class TestWriteEddy:
         content = result.read_text(encoding="utf-8")
         assert "id: eddy-test0001" in content
         assert "type: eddy" in content
+
+    def test_write_eddy_aliases_title_for_link_resolution(
+        self,
+        writer: VaultWriter,
+        sample_eddy: Eddy,
+    ) -> None:
+        """The page aliases its bare title so ``[[<title>]]`` resolves.
+
+        Symmetric with threads: the eddies linker writes ``[[Test Eddy
+        Cluster]]`` onto fragments while the file is ``{date}-Test-Eddy-
+        Cluster.md``; the ``aliases`` entry makes the link resolve.
+        """
+        import frontmatter
+
+        result = writer.write_eddy(sample_eddy)
+        post = frontmatter.loads(result.read_text(encoding="utf-8"))
+        assert sample_eddy.title in post.get("aliases", [])
 
 
 # ---- write_praxis ----
