@@ -535,6 +535,39 @@ class TestGenerateWeeklyDigest:
         assert history[0]["fragment_count"] == 1
         assert history[0]["total_unnamed"] == 1
 
+    def test_regenerating_same_week_is_byte_idempotent(
+        self,
+        generator: UnnamedDigestGenerator,
+        vault: Path,
+    ) -> None:
+        """Re-running the same week rewrites neither the digest nor the history.
+
+        Guards two non-idempotency sources fixed for #736: the wall-clock
+        ``generated`` stamp (now preserved when content is unchanged) and the
+        self-referential growth section (history now excludes the current week
+        and upserts its row instead of appending a duplicate).
+        """
+        week_start = _week_start()
+        _write_unnamed_fragment(
+            vault,
+            "alpha",
+            created=datetime.combine(week_start, datetime.min.time(), tzinfo=UTC),
+        )
+        history_path = (
+            vault / "00-Creek-Meta" / "Processing-Log" / "unnamed-history.json"
+        )
+
+        first = generator.generate_weekly_digest(vault, week_start)
+        digest_bytes = first.read_bytes()
+        history_bytes = history_path.read_bytes()
+
+        second = generator.generate_weekly_digest(vault, week_start)
+
+        assert second == first
+        assert second.read_bytes() == digest_bytes  # digest unchanged on re-run
+        assert history_path.read_bytes() == history_bytes  # history did not grow
+        assert len(json.loads(history_path.read_text(encoding="utf-8"))) == 1
+
     def test_reports_growth_against_previous_week(
         self,
         generator: UnnamedDigestGenerator,

@@ -32,10 +32,11 @@ import itertools
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 from pydantic import ValidationError
 
 from creek.models import Fragment
@@ -91,6 +92,46 @@ class _HistoryEntry:
         }
 
 
+def _stable_digest_generated(
+    path: Path,
+    body: str,
+    week_start_iso: str,
+    week_end_iso: str,
+) -> str:
+    """Return the ``generated`` stamp for a digest, idempotent across re-runs.
+
+    Reuses the existing digest's ``generated`` value when its body and week
+    bounds are unchanged, so re-running the report writes byte-identical output
+    instead of bumping a fresh wall-clock timestamp. Returns a current UTC
+    timestamp when there is no prior digest or its content differs.
+
+    Args:
+        path: Target digest file (may not yet exist).
+        body: The freshly rendered digest body.
+        week_start_iso: ISO date of the week's Monday.
+        week_end_iso: ISO date of the week's Sunday.
+
+    Returns:
+        An ISO-8601 timestamp string for the ``generated`` frontmatter field.
+    """
+    if path.exists():
+        try:
+            existing = frontmatter.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, yaml.YAMLError):
+            existing = None
+        if (
+            existing is not None
+            # frontmatter normalises trailing whitespace on round-trip, so
+            # compare stripped bodies (the rewrite below renders identically).
+            and existing.content.strip() == body.strip()
+            and existing.get("week_start") == week_start_iso
+            and existing.get("week_end") == week_end_iso
+            and isinstance(existing.get("generated"), str)
+        ):
+            return str(existing["generated"])
+    return datetime.now(tz=UTC).isoformat()
+
+
 class UnnamedDigestGenerator:
     """Generate weekly digest notes for the ``10-Liminal/Unnamed/`` folder.
 
@@ -142,7 +183,7 @@ class UnnamedDigestGenerator:
         all_unnamed = self.load_unnamed_fragments(vault_path)
         this_week = self.filter_fragments_in_week(all_unnamed, week_start)
         clusters = self.detect_unnamed_clusters(this_week)
-        previous = self._load_history(vault_path)
+        previous = self._load_history(vault_path, week_start)
         body = self._render_body(
             vault_path,
             this_week,
@@ -344,14 +385,19 @@ class UnnamedDigestGenerator:
         iso_year, iso_week, _ = week_start.isocalendar()
         filename = f"{iso_year}-W{iso_week:02d}.md"
         week_end = week_start + timedelta(days=_WEEK_LENGTH_DAYS - 1)
+        digest_path = digests_dir / filename
         post = frontmatter.Post(
             content=body,
             type="unnamed-digest",
             week_start=week_start.isoformat(),
             week_end=week_end.isoformat(),
-            generated=datetime.now(tz=UTC).isoformat(),
+            # Reuse the prior stamp when nothing else changed so a re-run is
+            # byte-idempotent (a fresh wall-clock stamp every run would otherwise
+            # rewrite an unchanged digest).
+            generated=_stable_digest_generated(
+                digest_path, body, week_start.isoformat(), week_end.isoformat()
+            ),
         )
-        digest_path = digests_dir / filename
         digest_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return digest_path
 
@@ -367,38 +413,33 @@ class UnnamedDigestGenerator:
         """
         return vault_path.joinpath(*_HISTORY_SUBPATH)
 
-    def _load_history(self, vault_path: Path) -> _HistoryEntry | None:
-        """Load the most recent history entry, if any.
+    def _load_history(self, vault_path: Path, before: date) -> _HistoryEntry | None:
+        """Load the most recent history entry for a week strictly before *before*.
+
+        Excluding the current week is what keeps a re-run idempotent: the run
+        records the current week in history, so without this filter a second
+        ``generate`` would read its own entry back as the "previous week" and
+        rewrite the digest's growth section.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
+            before: The current week's Monday; only earlier weeks are considered.
 
         Returns:
-            The last recorded :class:`_HistoryEntry`, or ``None`` when
-            the history file is missing or empty.
+            The most recent prior-week :class:`_HistoryEntry`, or ``None`` when
+            no earlier week was recorded.
         """
-        path = self._history_path(vault_path)
-        if not path.exists():
+        entries = _read_history_entries(self._history_path(vault_path))
+        cutoff = before.isoformat()
+        prior = [e for e in entries if str(e.get("week_start", "")) < cutoff]
+        if not prior:
             return None
-        raw = path.read_text(encoding="utf-8").strip()
-        if not raw:
-            return None
-        try:
-            entries = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning(
-                "Corrupt unnamed history at %s; treating as no prior data",
-                path,
-            )
-            return None
-        if not entries:
-            return None
-        last = entries[-1]
+        last = max(prior, key=lambda e: str(e.get("week_start", "")))
         return _HistoryEntry(
             week_start=str(last.get("week_start", "")),
-            fragment_count=int(last.get("fragment_count", 0)),
-            total_unnamed=int(last.get("total_unnamed", 0)),
-            cluster_count=int(last.get("cluster_count", 0)),
+            fragment_count=int(str(last.get("fragment_count", 0))),
+            total_unnamed=int(str(last.get("total_unnamed", 0))),
+            cluster_count=int(str(last.get("cluster_count", 0))),
         )
 
     def _append_history(
@@ -406,7 +447,7 @@ class UnnamedDigestGenerator:
         vault_path: Path,
         entry: _HistoryEntry,
     ) -> None:
-        """Append *entry* to the history log.
+        """Record *entry*, upserting this week's row so a re-run stays idempotent.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
@@ -414,23 +455,70 @@ class UnnamedDigestGenerator:
         """
         path = self._history_path(vault_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        entries: list[dict[str, object]] = []
-        if path.exists():
-            raw = path.read_text(encoding="utf-8").strip()
-            if raw:
-                try:
-                    entries = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Corrupt unnamed history at %s; overwriting with fresh log",
-                        path,
-                    )
-                    entries = []
-        entries.append(entry.to_dict())
-        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        merged = _upsert_history_entry(_read_history_entries(path), entry.to_dict())
+        path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 
 # ---- Module-level helpers ----
+
+
+_HISTORY_DATA_KEYS = ("fragment_count", "total_unnamed", "cluster_count")
+"""History fields whose equality means a week's data is unchanged (so its
+``generated_at`` stamp is preserved on a re-run, keeping the log byte-stable)."""
+
+
+def _read_history_entries(path: Path) -> list[dict[str, object]]:
+    """Return the unnamed-history JSON as a list of entry dicts.
+
+    Yields an empty list when the file is missing, empty, corrupt, or not a JSON
+    list — the same fail-soft behaviour both the read and append paths relied on.
+
+    Args:
+        path: The history JSON path.
+
+    Returns:
+        The recorded entries, or an empty list.
+    """
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Corrupt unnamed history at %s; treating as no prior data", path)
+        return []
+    return loaded if isinstance(loaded, list) else []
+
+
+def _upsert_history_entry(
+    entries: list[dict[str, object]],
+    new_entry: dict[str, object],
+) -> list[dict[str, object]]:
+    """Return *entries* with *new_entry*'s week replaced (not duplicated), sorted.
+
+    When the prior row for the same week carries identical data fields, its
+    ``generated_at`` stamp is preserved so a re-run leaves the history file
+    byte-identical (idempotent).
+
+    Args:
+        entries: Existing history rows.
+        new_entry: The row to upsert (keyed by ``week_start``).
+
+    Returns:
+        The merged, week-sorted list of rows.
+    """
+    week = new_entry.get("week_start")
+    prior = next((e for e in entries if e.get("week_start") == week), None)
+    if prior is not None and all(
+        prior.get(key) == new_entry.get(key) for key in _HISTORY_DATA_KEYS
+    ):
+        new_entry["generated_at"] = prior.get("generated_at", new_entry["generated_at"])
+    merged = [e for e in entries if e.get("week_start") != week]
+    merged.append(new_entry)
+    merged.sort(key=lambda e: str(e.get("week_start", "")))
+    return merged
 
 
 def _load_fragment(md_file: Path) -> Fragment | None:
