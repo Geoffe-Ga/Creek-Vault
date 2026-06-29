@@ -174,3 +174,20 @@ class TestGenerateSynchronicities:
             body="body",
         )
         assert generate_synchronicities(vault, EmbeddingsConfig()) == []
+
+    def test_existing_pairs_skips_unreadable_note(self, tmp_path: Path) -> None:
+        """An undecodable note is skipped by the dedup scan, not raised (#726).
+
+        ``_existing_synchronicity_pairs`` reads each note via
+        ``read_text(encoding="utf-8")``; an invalid-UTF-8 file raises
+        ``UnicodeDecodeError`` (a ``ValueError`` subclass), which the scan's
+        ``except (OSError, ValueError)`` swallows so one corrupt note cannot
+        abort the idempotency bookkeeping.
+        """
+        from creek.generate.synchronicity import _existing_synchronicity_pairs
+
+        sync_dir = tmp_path / "10-Liminal" / "Synchronicities"
+        sync_dir.mkdir(parents=True)
+        (sync_dir / "corrupt.md").write_bytes(b"\xff\xfe not valid utf-8")
+
+        assert _existing_synchronicity_pairs(tmp_path) == set()
