@@ -758,7 +758,14 @@ class VaultWriter:
         """
         status_folder = str(thread.status).capitalize()
         target_dir = self.vault_path / "02-Threads" / status_folder
-        return self._write_model(thread, target_dir, body=_render_thread_body(thread))
+        return self._write_model(
+            thread,
+            target_dir,
+            body=_render_thread_body(thread),
+            # Alias the bare title so fragments' ``[[<title>]]`` thread links
+            # resolve to the date-prefixed page filename in stock Obsidian.
+            extra_frontmatter={"aliases": [thread.title]},
+        )
 
     def write_eddy(self, eddy: Eddy) -> Path:
         """Write an Eddy to 03-Eddies/.
@@ -773,7 +780,14 @@ class VaultWriter:
             Path to the written (or existing duplicate) markdown file.
         """
         target_dir = self.vault_path / "03-Eddies"
-        return self._write_model(eddy, target_dir, body=_render_eddy_body(eddy))
+        return self._write_model(
+            eddy,
+            target_dir,
+            body=_render_eddy_body(eddy),
+            # Alias the bare title so fragments' ``[[<title>]]`` eddy links
+            # resolve to the date-prefixed page filename in stock Obsidian.
+            extra_frontmatter={"aliases": [eddy.title]},
+        )
 
     def write_praxis(self, praxis: Praxis) -> Path:
         """Write a Praxis to 04-Praxis/{type}/.
@@ -861,6 +875,7 @@ class VaultWriter:
         target_dir: Path,
         *,
         body: str = "",
+        extra_frontmatter: dict[str, object] | None = None,
     ) -> Path:
         """Serialise a model to markdown with YAML frontmatter and write to disk.
 
@@ -873,6 +888,10 @@ class VaultWriter:
             model: The Pydantic model to serialise.
             target_dir: The vault directory to write the file to.
             body: Markdown body to render below the frontmatter block.
+            extra_frontmatter: Optional non-model keys merged into the YAML
+                frontmatter (e.g. ``aliases`` so an Obsidian ``[[Title]]`` link
+                resolves to a ``{date}-{title}`` filename). Keys here override
+                model-dumped keys of the same name.
 
         Returns:
             Path to the written (or existing duplicate) file.
@@ -896,6 +915,10 @@ class VaultWriter:
             base_name = self._compute_base_name(model)
 
             data = model.model_dump(mode="json")
+            if extra_frontmatter:
+                # Non-model frontmatter (e.g. ``aliases`` so an Obsidian
+                # ``[[Title]]`` link resolves to a ``{date}-{title}`` filename).
+                data.update(extra_frontmatter)
             post = frontmatter.Post(content=body, **data)
             content = frontmatter.dumps(post)
 
