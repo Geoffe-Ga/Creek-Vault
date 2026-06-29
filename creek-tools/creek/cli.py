@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from creek.classify.privacy_filter import (
@@ -2689,13 +2690,16 @@ def report(
     if type == "wavelength":
         _report_wavelength(vault_path, period)
         return
-    # Unknown/missing type: fail loudly with the valid list rather than silently
-    # no-op (#716). The list is derived from the dispatch table (+ the
-    # special-cased ``wavelength``) so it never drifts from the real handlers.
+    # Unknown/missing type: fail loudly with the valid list, not a no-op (#716).
     valid = ", ".join([*_REPORT_DISPATCH, "wavelength"])
-    console.print(
-        f"[red]Unknown report type {type!r}. Valid types: {valid}.[/red]",
-    )
+    if type is None:
+        console.print(f"[red]--type is required. Valid types: {valid}.[/red]")
+    else:
+        # escape the operator-supplied value so it can't inject Rich markup.
+        console.print(
+            f"[red]Unknown report type '{escape(str(type))}'. "
+            f"Valid types: {valid}.[/red]",
+        )
     raise typer.Exit(code=2)
 
 
