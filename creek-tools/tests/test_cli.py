@@ -1270,6 +1270,28 @@ def test_report_known_type_still_dispatches(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
 
 
+def test_report_paradox_is_wired(tmp_path: Path) -> None:
+    """`report --type paradox` runs the generator, not the unknown-type error (#711)."""
+    vault = _report_vault(tmp_path)
+    (vault / "10-Liminal" / "Paradoxes").mkdir(parents=True, exist_ok=True)
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "Unknown report type" not in result.output  # now a real handler
+    assert "paradox" in result.output.lower()
+
+
+def test_report_synchronicity_is_wired(tmp_path: Path) -> None:
+    """`report --type synchronicity` runs the generator, not the error (#711)."""
+    vault = _report_vault(tmp_path)
+    (vault / "10-Liminal" / "Synchronicities").mkdir(parents=True, exist_ok=True)
+    result = runner.invoke(
+        app, ["report", "--type", "synchronicity", "--vault", str(vault)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "Unknown report type" not in result.output
+    assert "synchronicity" in result.output.lower()
+
+
 def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     """``report --type decisions`` with no signalling fragments is friendly (#581).
 

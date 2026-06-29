@@ -34,6 +34,7 @@ from creek.time import effective_authored_at
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.config import EmbeddingsConfig
     from creek.models import Fragment, FragmentLevel
 
 logger = logging.getLogger(__name__)
@@ -390,3 +391,45 @@ class SynchronicityDetector:
             "#synchronicity",
         ]
         return "\n".join(lines)
+
+
+def generate_synchronicities(
+    vault_path: Path,
+    embeddings_config: EmbeddingsConfig,
+) -> list[Path]:
+    """Surface surprising cross-source resonances as Synchronicity notes (#711).
+
+    The runnable wiring for ``creek report --type synchronicity``: loads the
+    vault's fragments and their cached embeddings, computes resonance pairs via
+    :class:`~creek.link.embeddings.EmbeddingLinker`, filters them through
+    :class:`SynchronicityDetector`, and writes one note per qualifying pair into
+    ``10-Liminal/Synchronicities/``. Idempotent — each note's path is
+    ``{sync.id}.md``, stable per pair. An empty embeddings cache yields no
+    resonances and therefore no notes (no crash).
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        embeddings_config: Embeddings config (model + cache) used to load the
+            per-vault vector cache and resolve the similarity threshold.
+
+    Returns:
+        Paths of the synchronicity notes written this run (empty when none).
+    """
+    from creek.link.embeddings import EmbeddingLinker, embeddings_cache_path
+    from creek.vault.reader import iter_vault_fragments
+
+    fragments = {
+        fragment.id: fragment
+        for _path, fragment, _body, _raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+    }
+    linker = EmbeddingLinker(embeddings_config)
+    cache = linker.load_cache(embeddings_cache_path(vault_path))
+    embeddings = {fid: cached.vector for fid, cached in cache.items()}
+    resonances = linker.find_resonances(embeddings, fragments) if embeddings else []
+    detector = SynchronicityDetector()
+    return [
+        detector.create_synchronicity_note(sync, fragments, vault_path)
+        for sync in detector.detect_synchronicities(resonances, fragments)
+    ]
