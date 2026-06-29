@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -2375,26 +2375,99 @@ def _report_mode_profiles(vault_path: Path) -> None:
     )
 
 
+_WAVELENGTH_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+_WAVELENGTH_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
+def _resolve_wavelength_period(period: str | None) -> tuple[str, date] | None:
+    """Resolve a ``--period`` string to a ``(mode, anchor-date)`` pair.
+
+    Accepts the relative keywords ``weekly`` / ``monthly`` (anchored on today)
+    and explicit ``YYYY-Www`` (ISO week) / ``YYYY-MM`` (calendar month) periods,
+    so an operator can regenerate a historical phase-map deterministically.
+
+    Args:
+        period: The raw ``--period`` value.
+
+    Returns:
+        ``("weekly", anchor)`` or ``("monthly", anchor)`` where *anchor* is any
+        date inside the target window, or ``None`` when *period* is missing or
+        unparseable (the caller surfaces the error).
+    """
+    if period is None:
+        return None
+    if period in {"weekly", "monthly"}:
+        return (period, date.today())
+    week_match = _WAVELENGTH_ISO_WEEK_RE.match(period)
+    if week_match:
+        year, week = int(week_match.group(1)), int(week_match.group(2))
+        try:
+            return ("weekly", date.fromisocalendar(year, week, 1))
+        except ValueError:
+            return None
+    month_match = _WAVELENGTH_MONTH_RE.match(period)
+    if month_match:
+        year, month = int(month_match.group(1)), int(month_match.group(2))
+        try:
+            return ("monthly", date(year, month, 1))
+        except ValueError:
+            return None
+    return None
+
+
+def _wavelength_dimension_populated(fragments: list[Fragment]) -> bool:
+    """Return whether any *fragments* carry a classified wavelength phase."""
+    # Local import: cli.py defers model imports to keep CLI startup fast.
+    from creek.models import Phase
+
+    return any(f.wavelength.phase != Phase.UNCLASSIFIED for f in fragments)
+
+
 def _report_wavelength(vault_path: Path, period: str | None) -> None:
-    """Generate weekly or monthly wavelength reports."""
-    from datetime import date as _date
+    """Generate a descriptive wavelength phase-map to ``05-Wavelength/Phase-Maps/``.
 
-    from creek.generate.wavelength import WavelengthTracker
+    Wires the deterministic :class:`WavelengthTracker` weekly/monthly generators
+    to the report surface. Supports ``--period weekly|monthly`` (today) and
+    explicit ``YYYY-Www`` / ``YYYY-MM`` periods. When no fragment carries a
+    classified wavelength phase the dimension is unpopulated, so it prints an
+    informative message instead of writing a silent empty file. Wavelength
+    output is descriptive only — it never prescribes action.
+    """
+    from creek.generate.wavelength import (
+        WavelengthTracker,
+        load_fragments_from_vault,
+    )
 
-    if period not in {"weekly", "monthly"}:
+    resolved = _resolve_wavelength_period(period)
+    if resolved is None:
         console.print(
-            "[red]--period must be 'weekly' or 'monthly' for wavelength reports.[/red]",
+            "[red]--period must be 'weekly', 'monthly', an ISO week "
+            "(YYYY-Www), or a month (YYYY-MM) for wavelength reports.[/red]",
         )
         raise typer.Exit(code=2)
+    mode, anchor = resolved
+
+    fragments = load_fragments_from_vault(vault_path)
+    if not _wavelength_dimension_populated(fragments):
+        console.print(
+            "[yellow]No wavelength phase-map written: no fragment carries a "
+            "classified wavelength phase. Classify the wavelength dimension "
+            "first (see #319).[/yellow]",
+        )
+        return
+
     tracker = WavelengthTracker()
-    today = _date.today()
-    if period == "weekly":
-        wavelength_path = tracker.generate_weekly_report(vault_path, week_of=today)
+    if mode == "weekly":
+        wavelength_path = tracker.generate_weekly_report(
+            vault_path, week_of=anchor, fragments=fragments
+        )
     else:
-        wavelength_path = tracker.generate_monthly_report(vault_path, month=today)
+        wavelength_path = tracker.generate_monthly_report(
+            vault_path, month=anchor, fragments=fragments
+        )
     console.print(
-        f"[bold green]Wavelength {period} report generated: "
-        f"{wavelength_path}[/bold green]",
+        f"[bold green]Wrote {wavelength_path.relative_to(vault_path)} "
+        "(descriptive; non-prescriptive)[/bold green]",
     )
 
 

@@ -190,7 +190,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
         return None
 
 
-def _load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
+def load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
     """Load every classified fragment from ``01-Fragments/`` under *vault_path*.
 
     Files that fail to parse or that lack the ``type: fragment`` marker
@@ -740,7 +740,7 @@ class WavelengthTracker:
         loaded = (
             fragments
             if fragments is not None
-            else _load_fragments_from_vault(vault_path)
+            else load_fragments_from_vault(vault_path)
         )
         start = _week_start(week_of)
         end = start + timedelta(days=6)
@@ -796,7 +796,7 @@ class WavelengthTracker:
         loaded = (
             fragments
             if fragments is not None
-            else _load_fragments_from_vault(vault_path)
+            else load_fragments_from_vault(vault_path)
         )
         start, end = _month_bounds(month)
         in_window = [f for f in loaded if _fragment_in_window(f, start, end)]
@@ -1304,7 +1304,7 @@ def current_phase_summary(
     """
     anchor = today or datetime.now(tz=UTC).date()
     start = anchor - timedelta(days=window_days - 1)
-    fragments = _load_fragments_from_vault(vault_path)
+    fragments = load_fragments_from_vault(vault_path)
     fragments = select_by_policy(fragments, level_policy)
     tracker = WavelengthTracker()
     snapshot = tracker.analyze_period(fragments, start, anchor)
@@ -1354,7 +1354,7 @@ class ModeProfileGenerator:
         # enum's ``.value``s below, so the comparison stays string-to-string
         # throughout rather than mixing enum identity with string lookups.
         by_mode: dict[str, list[Fragment]] = defaultdict(list)
-        for fragment in _load_fragments_from_vault(vault_path):
+        for fragment in load_fragments_from_vault(vault_path):
             mode = str(fragment.wavelength.mode)
             if mode != Mode.UNCLASSIFIED.value:
                 by_mode[mode].append(fragment)
@@ -1427,4 +1427,5 @@ __all__ = [
     "WavelengthSnapshot",
     "WavelengthTracker",
     "current_phase_summary",
+    "load_fragments_from_vault",
 ]

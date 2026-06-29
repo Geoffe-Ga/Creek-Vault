@@ -1524,10 +1524,35 @@ def test_report_voice_command(tmp_path: Path) -> None:
     assert (vault / "07-Voice" / "confessional-profile.md").is_file()
 
 
+def _write_wavelength_fragment(vault: Path, frag_id: str) -> None:
+    """Write one fragment carrying a classified wavelength phase (#719)."""
+    from creek.models import (
+        Fragment,
+        FragmentSource,
+        Phase,
+        SourcePlatform,
+        WavelengthClassification,
+    )
+    from creek.time import now_la
+    from tests.helpers import write_fragment_file
+
+    write_fragment_file(
+        vault=vault,
+        fragment=Fragment(
+            id=frag_id,
+            title="Wavelength note",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            authored_at=now_la(),
+            wavelength=WavelengthClassification(phase=Phase.RISING),
+        ),
+        body="A reflective entry.",
+    )
+
+
 def test_report_wavelength_weekly_command(tmp_path: Path) -> None:
-    """Test that report --type wavelength --period weekly produces a file."""
+    """report --type wavelength --period weekly writes a descriptive phase-map."""
     vault = tmp_path / "vault"
-    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    _write_wavelength_fragment(vault, "frag-wavecli00001")
     result = runner.invoke(
         app,
         [
@@ -1541,14 +1566,14 @@ def test_report_wavelength_weekly_command(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Wavelength weekly report generated" in result.output
+    assert "non-prescriptive" in result.output.lower()
     assert list((vault / "05-Wavelength" / "Phase-Maps").glob("*.md"))
 
 
 def test_report_wavelength_monthly_command(tmp_path: Path) -> None:
-    """Test that report --type wavelength --period monthly produces a file."""
+    """report --type wavelength --period monthly writes a descriptive phase-map."""
     vault = tmp_path / "vault"
-    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    _write_wavelength_fragment(vault, "frag-wavecli00002")
     result = runner.invoke(
         app,
         [
@@ -1562,7 +1587,8 @@ def test_report_wavelength_monthly_command(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Wavelength monthly report generated" in result.output
+    assert "non-prescriptive" in result.output.lower()
+    assert list((vault / "05-Wavelength" / "Phase-Maps").glob("*.md"))
 
 
 def test_report_wavelength_unknown_period_errors(tmp_path: Path) -> None:
