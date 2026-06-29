@@ -1,9 +1,11 @@
-"""Thin, mockable Anthropic client wrapper for the author desk (FEAT-041, #455).
+"""Thin, mockable provider wrapper for the author desk (FEAT-041).
 
 The Writing Desk's only seam onto the network goes through this wrapper, so
-unit tests inject a mock provider and never make a live call. The skeleton's
-specialists/voice/reflection are pure stubs and do not yet call it; issue #460
-wires it into the real Conductor.
+unit tests inject a mock provider and never make a live call. It is router-built
+and wired into the live Conductor (#460/#658): the **voice** node calls it for
+live LLM rendering when a provider is available (tier-routed by #661), falling
+back to a deterministic rendering otherwise. The graph/retrieval/ontology
+specialists and the reflection node are deterministic and do not use it.
 """
 
 from __future__ import annotations
