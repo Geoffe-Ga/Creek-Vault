@@ -1272,24 +1272,55 @@ def test_report_known_type_still_dispatches(tmp_path: Path) -> None:
 
 def test_report_paradox_is_wired(tmp_path: Path) -> None:
     """`report --type paradox` runs the generator, not the unknown-type error (#711)."""
-    vault = _report_vault(tmp_path)
-    (vault / "10-Liminal" / "Paradoxes").mkdir(parents=True, exist_ok=True)
+    vault = _report_vault(tmp_path)  # note-writer mkdirs its own folder
     result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
     assert result.exit_code == 0, result.output
     assert "Unknown report type" not in result.output  # now a real handler
-    assert "paradox" in result.output.lower()
+    assert "no paradox notes generated" in result.output.lower()  # empty vault path
 
 
 def test_report_synchronicity_is_wired(tmp_path: Path) -> None:
     """`report --type synchronicity` runs the generator, not the error (#711)."""
     vault = _report_vault(tmp_path)
-    (vault / "10-Liminal" / "Synchronicities").mkdir(parents=True, exist_ok=True)
     result = runner.invoke(
         app, ["report", "--type", "synchronicity", "--vault", str(vault)]
     )
     assert result.exit_code == 0, result.output
     assert "Unknown report type" not in result.output
-    assert "synchronicity" in result.output.lower()
+    assert "no synchronicity notes generated" in result.output.lower()
+
+
+def test_report_paradox_writes_notes(tmp_path: Path) -> None:
+    """`report --type paradox` writes notes + reports success when found (#711)."""
+    from creek.models import (
+        Confidence,
+        Fragment,
+        FragmentSource,
+        SourcePlatform,
+        VoiceClassification,
+    )
+    from tests.helpers import write_fragment_file
+
+    vault = _report_vault(tmp_path)
+    for fid, conf in (
+        ("frag-cli-parax-aa", Confidence.MUSING),
+        ("frag-cli-parax-bb", Confidence.SETTLED),
+    ):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="career ambitions",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                voice=VoiceClassification(confidence=conf),
+                threads=["thread-career"],
+            ),
+            body="a contradiction worth holding",
+        )
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "paradox notes generated" in result.output.lower()  # success branch
+    assert sorted((vault / "10-Liminal" / "Paradoxes").glob("*.md"))
 
 
 def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:

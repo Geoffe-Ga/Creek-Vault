@@ -92,6 +92,9 @@ def _share_project(title_a: str, title_b: str) -> bool:
 _LEGACY_TUPLE_ARITY: int = 3
 """Pre-FEAT-024 resonance tuple shape: (id_a, id_b, similarity)."""
 
+_PAIR_SIZE: int = 2
+"""A synchronicity links exactly two fragments (its idempotency key)."""
+
 
 def _normalise_resonance(
     resonance: Resonance | tuple[str, str, float],
@@ -403,9 +406,11 @@ def generate_synchronicities(
     vault's fragments and their cached embeddings, computes resonance pairs via
     :class:`~creek.link.embeddings.EmbeddingLinker`, filters them through
     :class:`SynchronicityDetector`, and writes one note per qualifying pair into
-    ``10-Liminal/Synchronicities/``. Idempotent — each note's path is
-    ``{sync.id}.md``, stable per pair. An empty embeddings cache yields no
-    resonances and therefore no notes (no crash).
+    ``10-Liminal/Synchronicities/``. **Idempotent**: a fragment pair already
+    captured by an existing note is skipped, so re-running never duplicates —
+    necessary because :attr:`Synchronicity.id` is a fresh ``uuid`` per record,
+    so the filename alone is not stable across runs. An empty embeddings cache
+    yields no resonances and therefore no notes (no crash).
 
     Args:
         vault_path: Root of the Obsidian vault.
@@ -429,7 +434,36 @@ def generate_synchronicities(
     embeddings = {fid: cached.vector for fid, cached in cache.items()}
     resonances = linker.find_resonances(embeddings, fragments) if embeddings else []
     detector = SynchronicityDetector()
-    return [
-        detector.create_synchronicity_note(sync, fragments, vault_path)
-        for sync in detector.detect_synchronicities(resonances, fragments)
-    ]
+    already = _existing_synchronicity_pairs(vault_path)
+    written: list[Path] = []
+    for sync in detector.detect_synchronicities(resonances, fragments):
+        pair = frozenset({sync.fragment_a_id, sync.fragment_b_id})
+        if pair in already:
+            continue
+        written.append(detector.create_synchronicity_note(sync, fragments, vault_path))
+        already.add(pair)
+    return written
+
+
+def _existing_synchronicity_pairs(vault_path: Path) -> set[frozenset[str]]:
+    """Return the fragment pairs already captured by synchronicity notes.
+
+    Reads each note's ``fragments: ["[[a]]", "[[b]]"]`` frontmatter so a re-run
+    can skip pairs already written — the idempotency key, since the note's
+    ``sync-<uuid>`` filename is not stable across runs.
+    """
+    pairs: set[frozenset[str]] = set()
+    sync_dir = vault_path / "10-Liminal" / "Synchronicities"
+    if not sync_dir.is_dir():
+        return pairs
+    for note in sync_dir.glob("*.md"):
+        try:
+            post = frontmatter.loads(note.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw = post.get("fragments")
+        if not isinstance(raw, list) or len(raw) < _PAIR_SIZE:
+            continue
+        ids = [re.sub(r"[\[\]]", "", str(item)).strip() for item in raw[:_PAIR_SIZE]]
+        pairs.add(frozenset(ids))
+    return pairs

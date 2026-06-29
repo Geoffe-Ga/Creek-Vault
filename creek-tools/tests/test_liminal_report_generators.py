@@ -108,55 +108,58 @@ class TestGenerateParadoxes:
         assert generate_paradoxes(vault, EmbeddingsConfig()) == []
 
 
+def _seed_synchronicity_vault(tmp_path: Path) -> tuple[Path, EmbeddingsConfig]:
+    """A vault with a cross-source pair + a crafted identical-embedding cache."""
+    vault = _vault(tmp_path)
+    pairs = (
+        ("frag-synx-aaaa", SourcePlatform.DISCORD, datetime(2025, 1, 5, tzinfo=UTC)),
+        ("frag-synx-bbbb", SourcePlatform.JOURNAL, datetime(2025, 4, 20, tzinfo=UTC)),
+    )
+    for fid, platform, created in pairs:
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="the river remembers every stone it has touched",
+                source=FragmentSource(platform=platform),
+                created=created,
+                authored_at=created,  # the gap filter reads effective_authored_at
+            ),
+            body="a near-identical meaning arriving from a different source",
+        )
+    # Identical vectors → cosine 1.0 > the 0.9 synchronicity threshold.
+    config = EmbeddingsConfig()
+    now = datetime.now(tz=UTC)
+    entries = {
+        fid: CachedEmbedding(
+            fragment_id=fid,
+            content_hash="h",
+            model_name=config.model,
+            vector=[1.0, 0.0, 0.0, 0.0],
+            computed_at=now,
+        )
+        for fid, _platform, _created in pairs
+    }
+    EmbeddingLinker(config).save_cache(entries, embeddings_cache_path(vault))
+    return vault, config
+
+
 class TestGenerateSynchronicities:
     """`generate_synchronicities` wires SynchronicityDetector + embeddings."""
 
     def test_writes_note_for_cross_source_resonance(self, tmp_path: Path) -> None:
         """Cross-source, >30-day, identical-embedding pair → a synchronicity note."""
-        vault = _vault(tmp_path)
-        pairs = (
-            (
-                "frag-synx-aaaa",
-                SourcePlatform.DISCORD,
-                datetime(2025, 1, 5, tzinfo=UTC),
-            ),
-            (
-                "frag-synx-bbbb",
-                SourcePlatform.JOURNAL,
-                datetime(2025, 4, 20, tzinfo=UTC),
-            ),
-        )
-        for fid, platform, created in pairs:
-            write_fragment_file(
-                vault=vault,
-                fragment=Fragment(
-                    id=fid,
-                    title="the river remembers every stone it has touched",
-                    source=FragmentSource(platform=platform),
-                    created=created,
-                    authored_at=created,  # the gap filter reads effective_authored_at
-                ),
-                body="a near-identical meaning arriving from a different source",
-            )
-        # Craft an embeddings cache with identical vectors (cosine 1.0 > 0.9).
-        config = EmbeddingsConfig()
-        now = datetime.now(tz=UTC)
-        entries = {
-            fid: CachedEmbedding(
-                fragment_id=fid,
-                content_hash="h",
-                model_name=config.model,
-                vector=[1.0, 0.0, 0.0, 0.0],
-                computed_at=now,
-            )
-            for fid, _platform, _created in pairs
-        }
-        EmbeddingLinker(config).save_cache(entries, embeddings_cache_path(vault))
-
+        vault, config = _seed_synchronicity_vault(tmp_path)
         written = generate_synchronicities(vault, config)
-
         assert len(written) == 1
         assert len(_sync_notes(vault)) == 1
+
+    def test_idempotent(self, tmp_path: Path) -> None:
+        """Re-running writes the same {sync.id}.md in place (no duplicate)."""
+        vault, config = _seed_synchronicity_vault(tmp_path)
+        generate_synchronicities(vault, config)
+        generate_synchronicities(vault, config)
+        assert len(_sync_notes(vault)) == 1  # stable path → overwrite
 
     def test_no_embeddings_cache_no_notes(self, tmp_path: Path) -> None:
         """With no embeddings cache there are no resonances, so no notes."""
