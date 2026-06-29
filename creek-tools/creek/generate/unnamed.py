@@ -518,8 +518,7 @@ def _upsert_history_entry(
         prior.get(key) == new_entry.get(key) for key in _HISTORY_DATA_KEYS
     ):
         # Copy rather than mutate the caller's dict (no surprising side-effect).
-        new_entry = {
-            **new_entry,
+        new_entry = new_entry | {
             "generated_at": prior.get("generated_at", new_entry["generated_at"]),
         }
     merged = [e for e in entries if e.get("week_start") != week]
