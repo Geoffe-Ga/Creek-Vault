@@ -38,6 +38,7 @@ from creek.models import Confidence, Dosage, Phase
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from creek.config import EmbeddingsConfig
     from creek.models import Fragment
 
 
@@ -530,3 +531,44 @@ class ParadoxDetector:
         stem = "-".join(paradox.fragment_ids[:2]) or "paradox"
         sanitized = _FILENAME_SANITIZER.sub("-", stem).strip("-")
         return f"{iso}-{sanitized}.md"
+
+
+def generate_paradoxes(
+    vault_path: Path,
+    embeddings_config: EmbeddingsConfig,
+) -> list[Path]:
+    """Detect contradictory fragment pairs and write paradox notes (#711).
+
+    The runnable wiring for ``creek report --type paradox``: loads the vault's
+    fragments and their cached embeddings, runs :class:`ParadoxDetector`, and
+    writes one note per paradox into ``10-Liminal/Paradoxes/``. Idempotent — each
+    note's path is stable per paradox, so re-running overwrites in place rather
+    than duplicating. Embeddings sharpen the topic-sharing rules; when the cache
+    is empty only the thread/frequency rules can match (still useful, no crash).
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        embeddings_config: Embeddings config (model + cache) used to load the
+            per-vault vector cache for the topic-similarity rules.
+
+    Returns:
+        Paths of the paradox notes written this run (empty when none are found).
+    """
+    from creek.link.embeddings import EmbeddingLinker, embeddings_cache_path
+    from creek.vault.reader import iter_vault_fragments
+
+    fragments = [
+        fragment
+        for _path, fragment, _body, _raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+    ]
+    cache = EmbeddingLinker(embeddings_config).load_cache(
+        embeddings_cache_path(vault_path),
+    )
+    embeddings = {fid: cached.vector for fid, cached in cache.items()}
+    detector = ParadoxDetector()
+    return [
+        detector.create_paradox_note(paradox, vault_path)
+        for paradox in detector.detect_paradoxes(fragments, embeddings=embeddings)
+    ]

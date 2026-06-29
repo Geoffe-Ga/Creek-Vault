@@ -2638,6 +2638,53 @@ def voice_authenticity(
         console.print(report.summary_line(), markup=False)
 
 
+def _report_paradox(vault_path: Path) -> None:
+    """Write Paradox notes for contradictory fragment pairs (#711).
+
+    Wires the implemented ``ParadoxDetector`` to a runnable command: scans the
+    vault for contradictory pairs and writes one neutral note per paradox into
+    ``10-Liminal/Paradoxes/``. Idempotent; deterministic (no LLM).
+    """
+    from creek.generate.paradox import generate_paradoxes
+
+    config = _load_config_for_vault(vault_path)
+    written = generate_paradoxes(vault_path, config.embeddings)
+    if not written:
+        console.print(
+            "[yellow]No paradox notes generated: "
+            "no contradictory fragment pairs found.[/yellow]",
+        )
+        return
+    console.print(
+        f"[bold green]Paradox notes generated ({len(written)}) "
+        f"in 10-Liminal/Paradoxes/[/bold green]",
+    )
+
+
+def _report_synchronicity(vault_path: Path) -> None:
+    """Write Synchronicity notes for surprising cross-source resonances (#711).
+
+    Wires the implemented ``SynchronicityDetector`` to a runnable command: loads
+    embeddings, computes resonances, filters for cross-source >0.9-similarity
+    >30-day pairs, and writes one note per pair into
+    ``10-Liminal/Synchronicities/``. Idempotent; deterministic (no LLM).
+    """
+    from creek.generate.synchronicity import generate_synchronicities
+
+    config = _load_config_for_vault(vault_path)
+    written = generate_synchronicities(vault_path, config.embeddings)
+    if not written:
+        console.print(
+            "[yellow]No synchronicity notes generated: "
+            "no qualifying cross-source resonances found.[/yellow]",
+        )
+        return
+    console.print(
+        f"[bold green]Synchronicity notes generated ({len(written)}) "
+        f"in 10-Liminal/Synchronicities/[/bold green]",
+    )
+
+
 _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "tags": _report_tags,
     "unnamed": _report_unnamed,
@@ -2647,6 +2694,8 @@ _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "lexicon": _report_lexicon,
     "rhetorical-patterns": _report_rhetorical_patterns,
     "mode-profiles": _report_mode_profiles,
+    "paradox": _report_paradox,
+    "synchronicity": _report_synchronicity,
 }
 
 
