@@ -20,6 +20,7 @@ thread merges when two threads appear to cover the same topic.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import sys
@@ -294,6 +295,28 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return float(np.dot(va, vb) / (na * nb))
 
 
+def _stable_thread_id(frags: list[Fragment]) -> str:
+    """Return a deterministic ``thread-<8hex>`` id for a cluster of *frags*.
+
+    Thread identity is derived from the sorted member fragment ids so that
+    re-detecting the same cluster on the same corpus yields the same id — and
+    therefore the same page filename, which lets :meth:`VaultWriter.write_thread`
+    recognise the existing page and makes bulk page materialisation idempotent
+    (#718). A random uuid (the historical default) produced a fresh page on every
+    run. Membership *changes* deliberately yield a new id: the cluster is a
+    different thread, and the stale page is a documented re-detection edge.
+
+    Args:
+        frags: The fragments composing the thread (non-empty).
+
+    Returns:
+        A stable ``thread-`` prefixed id, 8 hex chars of a SHA-256 digest.
+    """
+    member_key = ",".join(sorted(f.id for f in frags))
+    digest = hashlib.sha256(member_key.encode("utf-8")).hexdigest()[:8]
+    return f"thread-{digest}"
+
+
 class ThreadDetector:
     """Detect narrative threads via sliding time window plus topic consistency.
 
@@ -524,6 +547,7 @@ class ThreadDetector:
         first_seen = min(effective_authored_date(f) for f in frags)
         last_seen = max(effective_authored_date(f) for f in frags)
         return Thread(
+            id=_stable_thread_id(frags),
             title=self._generate_title(frags),
             status=self._compute_status(last_seen),
             first_seen=first_seen,
