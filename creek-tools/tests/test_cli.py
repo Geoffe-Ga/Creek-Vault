@@ -1244,9 +1244,7 @@ def _report_vault(tmp_path: Path) -> Path:
 def test_report_unknown_type_errors(tmp_path: Path) -> None:
     """`report --type <unknown>` errors with the valid list, not a no-op (#716)."""
     vault = _report_vault(tmp_path)
-    result = runner.invoke(
-        app, ["report", "--type", "paradoxx", "--vault", str(vault)]
-    )
+    result = runner.invoke(app, ["report", "--type", "paradoxx", "--vault", str(vault)])
     assert result.exit_code != 0, result.output
     assert "paradoxx" in result.output  # names the bad type
     assert "decisions" in result.output  # lists real valid types
@@ -1266,9 +1264,7 @@ def test_report_known_type_still_dispatches(tmp_path: Path) -> None:
     """A valid --type still runs its handler (no regression) (#716)."""
     vault = _report_vault(tmp_path)
     (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
-    result = runner.invoke(
-        app, ["report", "--type", "unnamed", "--vault", str(vault)]
-    )
+    result = runner.invoke(app, ["report", "--type", "unnamed", "--vault", str(vault)])
     assert result.exit_code == 0, result.output
 
 
