@@ -71,16 +71,26 @@ def test_author_command_surface_is_not_stale_stub_text() -> None:
     """
     import creek.author as author_pkg
     from creek.author import client as author_client
+    from creek.author.conductor import Conductor, build_default_conductor
     from creek.cli import author as author_cmd
 
-    for doc in (author_cmd.__doc__, author_pkg.__doc__, author_client.__doc__):
+    surfaces = (
+        author_cmd.__doc__,
+        author_pkg.__doc__,
+        author_client.__doc__,
+        Conductor.__doc__,
+        build_default_conductor.__doc__,
+    )
+    for doc in surfaces:
         assert doc is not None
         low = doc.lower()
         assert "stub skeleton" not in low
         assert "stub specialist" not in low
         assert "pure stubs" not in low
-    # The command docstring states the desk does real work.
-    assert "real" in author_cmd.__doc__.lower()
+        assert "typed stubs" not in low
+        assert "stub collaborators" not in low
+    # The command docstring states the desk does real, deterministic work.
+    assert "real, deterministic" in author_cmd.__doc__.lower()
 
 
 def test_author_run_prints_verdict(tmp_path: Path) -> None:
