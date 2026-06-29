@@ -2182,6 +2182,141 @@ def index(
     )
 
 
+_FILL_SUMMARY_FOLDERS: tuple[str, ...] = (
+    "02-Threads",
+    "03-Eddies",
+    "04-Praxis",
+    "05-Wavelength",
+    "06-Frequencies",
+    "08-Decisions",
+    "09-Reference",
+    "10-Liminal",
+)
+"""Vault folders whose markdown population ``creek fill`` reports in its summary."""
+
+
+def _build_fill_steps(
+    vault_path: Path,
+    config: CreekConfig,
+    *,
+    with_compost: bool,
+) -> list[tuple[str, Callable[[], object]]]:
+    """Build the ordered ``(label, action)`` plan for ``creek fill``.
+
+    Pure orchestration: each action calls an existing step command/function in
+    dependency order — embeddings/temporal/eddies/thread-page links first (links
+    must precede the thread and eddy pages), then the deterministic reports, then
+    the index regeneration. ``--with-compost`` appends the deterministic compost
+    overview report. No generator logic lives here.
+
+    Args:
+        vault_path: Vault root.
+        config: Loaded Creek configuration (threaded into the link steps).
+        with_compost: When ``True`` append the compost overview report step.
+
+    Returns:
+        The ordered list of ``(label, zero-arg callable)`` steps.
+    """
+    from creek.generate.indexes import IndexGenerator
+    from creek.link.link_engine import run_link
+
+    def _link(method: str) -> Callable[[], object]:
+        return lambda: run_link(
+            vault_path=vault_path, config=config, method=method, rebuild=False
+        )
+
+    steps: list[tuple[str, Callable[[], object]]] = [
+        ("link/embeddings", _link("embeddings")),
+        ("link/temporal", _link("temporal")),
+        ("link/eddies", _link("eddies")),
+        ("link/threads", _link("threads")),
+        ("report/decisions", lambda: _report_decisions(vault_path)),
+        ("report/unnamed", lambda: _report_unnamed(vault_path)),
+        ("report/paradox", lambda: _report_paradox(vault_path)),
+        ("report/synchronicity", lambda: _report_synchronicity(vault_path)),
+        ("report/mode-profiles", lambda: _report_mode_profiles(vault_path)),
+        ("report/wavelength", lambda: _report_wavelength(vault_path, "weekly")),
+        ("index", lambda: IndexGenerator(vault_path=vault_path).generate_all()),
+    ]
+    if with_compost:
+        steps.append(("compost/report", lambda: _fill_compost_report(vault_path)))
+    return steps
+
+
+def _fill_compost_report(vault_path: Path) -> object:
+    """Run the deterministic compost overview report (the opt-in fill step)."""
+    from creek.generate.compost import CompostTracker
+
+    return CompostTracker().generate_compost_report(vault_path)
+
+
+def _count_markdown(folder: Path) -> int:
+    """Count non-hidden markdown files under *folder* (0 when it is absent)."""
+    if not folder.exists():
+        return 0
+    return sum(1 for p in folder.rglob("*.md") if not p.name.startswith("."))
+
+
+def _format_fill_summary(vault_path: Path) -> str:
+    """Render the per-folder population summary line for ``creek fill``."""
+    parts = [
+        f"{name} {_count_markdown(vault_path / name)}" for name in _FILL_SUMMARY_FOLDERS
+    ]
+    return "[bold green][fill] done. " + " | ".join(parts) + "[/bold green]"
+
+
+@app.command()
+def fill(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the plan without running any step."
+    ),
+    with_compost: bool = typer.Option(
+        False,
+        "--with-compost",
+        help="Also run the compost overview report (off by default).",
+    ),
+) -> None:
+    """Run the deterministic vault-population sequence in dependency order.
+
+    An umbrella over the existing per-generator steps: it runs the link stages
+    (embeddings, temporal, eddies, thread-pages), the deterministic reports
+    (decisions, unnamed, paradox, synchronicity, mode-profiles, wavelength), and
+    the index regeneration — so an already-classified, already-embedded vault
+    becomes prod-ready from one command. Classification and embedding are
+    preconditions, not run here.
+
+    Each step is non-fatal: a failure is logged and the sequence continues, so
+    one bad step cannot abort the rest. ``--dry-run`` prints the plan and runs
+    nothing. ``--with-compost`` appends the deterministic compost overview
+    report (the only compost vault-write currently wired). Every underlying step
+    is idempotent, so a second ``creek fill`` is a clean no-op.
+    """
+    config = _load_config_for_vault(vault)
+    vault_path = _resolve_vault(vault)
+    steps = _build_fill_steps(vault_path, config, with_compost=with_compost)
+
+    if dry_run:
+        console.print("[bold]creek fill plan (dry-run, nothing run):[/bold]")
+        for index_, (label, _action) in enumerate(steps, start=1):
+            console.print(f"  {index_:>2}. {label}")
+        return
+
+    for label, action in steps:
+        console.print(f"[dim][fill] {label} …[/dim]")
+        try:
+            action()
+        except Exception as exc:
+            # Orchestrator contract: a single failing step (missing embedding
+            # model, empty dimension, I/O error) must not abort the remaining
+            # steps. Catch broadly, log, and carry on; the final summary shows
+            # what actually populated.
+            logger.warning("fill step %s failed: %s", label, exc)
+            console.print(f"[yellow][fill] {label} failed: {exc}[/yellow]")
+
+    console.print(_format_fill_summary(vault_path))
+
+
 @app.command(name="compile")
 def compile_(
     fragment_id: str = typer.Argument(..., help="Source fragment ID to roll up"),
