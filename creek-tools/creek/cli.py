@@ -2417,9 +2417,10 @@ def _resolve_wavelength_period(period: str | None) -> tuple[str, date] | None:
 
 def _wavelength_dimension_populated(fragments: list[Fragment]) -> bool:
     """Return whether any *fragments* carry a classified wavelength phase."""
-    from creek.models import Phase as _Phase
+    # Local import: cli.py defers model imports to keep CLI startup fast.
+    from creek.models import Phase
 
-    return any(f.wavelength.phase != _Phase.UNCLASSIFIED for f in fragments)
+    return any(f.wavelength.phase != Phase.UNCLASSIFIED for f in fragments)
 
 
 def _report_wavelength(vault_path: Path, period: str | None) -> None:

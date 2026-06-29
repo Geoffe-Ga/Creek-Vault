@@ -25,13 +25,25 @@ from creek.time import now_la
 from tests.helpers import write_fragment_file
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from pathlib import Path
 
 runner = CliRunner()
 
 
-def _classified_vault(vault: Path, *, classified: bool = True) -> None:
-    """Write three fragments, with or without a classified wavelength phase."""
+def _classified_vault(
+    vault: Path,
+    *,
+    classified: bool = True,
+    authored_at: datetime | None = None,
+) -> None:
+    """Write three fragments, with or without a classified wavelength phase.
+
+    *authored_at* anchors every fragment's authored date so a test can place
+    them inside a specific target window (e.g. an explicit ISO week); it
+    defaults to now.
+    """
+    when = authored_at if authored_at is not None else now_la()
     phases = [Phase.RISING, Phase.PEAKING, Phase.WITHDRAWAL]
     for i in range(3):
         wavelength = (
@@ -45,7 +57,7 @@ def _classified_vault(vault: Path, *, classified: bool = True) -> None:
                 id=f"frag-wave00000{i:03d}",
                 title=f"Wave note {i}",
                 source=FragmentSource(platform=SourcePlatform.MARKDOWN),
-                authored_at=now_la(),
+                authored_at=when,
                 wavelength=wavelength,
             ),
             body=f"Reflective entry {i}.",
@@ -100,9 +112,12 @@ def test_wavelength_monthly_writes_phase_map(tmp_path: Path) -> None:
 
 
 def test_wavelength_explicit_iso_week_period(tmp_path: Path) -> None:
-    """An explicit ``YYYY-Www`` period names the report for that ISO week."""
+    """An explicit ``YYYY-Www`` period regenerates that ISO week from its data."""
     vault = tmp_path / "vault"
-    _classified_vault(vault)
+    # Anchor the fragments inside ISO week 2026-W26 (Mon 2026-06-22) so the
+    # historical report actually aggregates them, not just names the file.
+    in_week = now_la().replace(year=2026, month=6, day=23)
+    _classified_vault(vault, authored_at=in_week)
 
     result = runner.invoke(
         app,
@@ -118,13 +133,18 @@ def test_wavelength_explicit_iso_week_period(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert (vault / "05-Wavelength" / "Phase-Maps" / "2026-W26-wavelength.md").is_file()
+    assert "non-prescriptive" in result.output.lower()
+    page = vault / "05-Wavelength" / "Phase-Maps" / "2026-W26-wavelength.md"
+    assert page.is_file()
+    # The in-window fragments make the report non-trivial, not an empty shell.
+    assert "Wave note" in page.read_text(encoding="utf-8")
 
 
 def test_wavelength_explicit_month_period(tmp_path: Path) -> None:
-    """An explicit ``YYYY-MM`` period names the report for that month."""
+    """An explicit ``YYYY-MM`` period regenerates that month from its data."""
     vault = tmp_path / "vault"
-    _classified_vault(vault)
+    in_month = now_la().replace(year=2026, month=6, day=15)
+    _classified_vault(vault, authored_at=in_month)
 
     result = runner.invoke(
         app,
@@ -140,7 +160,10 @@ def test_wavelength_explicit_month_period(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert (vault / "05-Wavelength" / "Phase-Maps" / "2026-06-wavelength.md").is_file()
+    assert "non-prescriptive" in result.output.lower()
+    page = vault / "05-Wavelength" / "Phase-Maps" / "2026-06-wavelength.md"
+    assert page.is_file()
+    assert "Wave note" in page.read_text(encoding="utf-8")
 
 
 def test_wavelength_unpopulated_dimension_is_informative(tmp_path: Path) -> None:
