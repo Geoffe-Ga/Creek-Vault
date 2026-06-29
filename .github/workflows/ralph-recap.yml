@@ -1,0 +1,50 @@
+name: Ralph Recap
+
+# Posts a Ralph tick-loop recap to Discord every time a pull request is merged.
+#
+# Required configuration in the repo:
+#   secret   DISCORD_BOT_TOKEN  - bot token with Send Messages on the channel
+#   secret   RALPH_CHANNEL_ID   - target Discord channel ID (all digits)
+#   secret   ANTHROPIC_API_KEY  - optional; enables the Claude-written headline
+#
+# Each value is read from `secrets` first, falling back to a same-named repo
+# `vars` entry, so it resolves whether you store it as a Secret or a Variable.
+#
+# The built-in GITHUB_TOKEN supplies the merge history (read-only). See
+# scripts/ralph/RECAP.md for setup, the metric definitions, and tuning.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  recap:
+    name: Post merge recap
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Anthropic SDK (for the headline)
+        # Pinned floor guarantees the installed SDK supports output_config /
+        # effort (used by generate_headline); a fresh install resolves to the
+        # newest release in range.
+        run: pip install 'anthropic>=0.69,<1'
+
+      - name: Post Ralph recap to Discord
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN || vars.DISCORD_BOT_TOKEN }}
+          RALPH_CHANNEL_ID: ${{ secrets.RALPH_CHANNEL_ID || vars.RALPH_CHANNEL_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || vars.ANTHROPIC_API_KEY }}
+        run: |
+          python scripts/ralph/recap.py --repo "${{ github.repository }}"

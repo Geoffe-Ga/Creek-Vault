@@ -1,0 +1,151 @@
+name: Weekly De-Slop
+
+# Runs the `de-slopify` skill on a schedule: a comprehensive, evidence-based
+# code-quality audit that files corroborated findings as Ralph-ready GitHub
+# issues (and decomposed epics for large work). It NEVER writes to the repo —
+# the job's GITHUB_TOKEN is `contents: read` / `issues: write`, so the only
+# durable output is new issues. False positives are the enemy: the skill files
+# nothing it cannot corroborate with two independent signals, and a clean run
+# (zero issues) is a valid, expected outcome.
+#
+# Trigger: every Sunday 00:00 America/Los_Angeles, or manually via the Actions
+# tab.
+#
+# Required configuration:
+#   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
+
+on:
+  schedule:
+    # Sundays at 08:00 UTC == Sunday 00:00 PST (midnight Pacific). GitHub cron is
+    # UTC with no DST handling, so during PDT (summer) this lands at 01:00 PT.
+    # GitHub may also delay scheduled runs under load.
+    - cron: "0 8 * * 0"
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "Optional area to focus the audit on (e.g. 'creek-tools/creek/classify', 'crawdad'). Blank = whole repo."
+        required: false
+        default: ""
+
+# Avoid overlapping audits.
+concurrency:
+  group: weekly-deslop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  # OIDC token for the claude action's auth exchange (mirrors claude.yml).
+  id-token: write
+
+jobs:
+  deslop:
+    name: Detect slop and file backlog issues
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history for churn analysis)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Full history so git-churn / hotspot detection has signal.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install creek-tools toolbox (read-only analyzers)
+        run: |
+          python -m venv .venv
+          # shellcheck disable=SC1091
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          # Editable install of creek-tools with all + dev extras provisions the
+          # read-only analyzers the evidence collector runs (ruff, mypy, radon,
+          # xenon, bandit[toml], vulture, interrogate, pip-audit, detect-secrets).
+          pip install -e "creek-tools/.[all,dev]"
+
+      - name: Run de-slopify audit
+        uses: anthropics/claude-code-action@521136812280ae7ef256e06045655b9da02793f0  # v1.0.158
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Surface the agent's transcript in the run log so the audit is
+          # auditable: you can verify the skill was invoked and the whole
+          # taxonomy traversed. Safe on a private repo with read-only contents.
+          show_full_output: true
+
+          # The skill files issues via gh; expose the analyzers it relies on.
+          # Security boundary is the job's GITHUB_TOKEN (contents: read /
+          # issues: write) — Claude cannot push code, only open issues.
+          #
+          # --model opus: this is a judgment-heavy audit (architecture,
+          #   duplication, AI-slop, verbosity) — Sonnet, the action default,
+          #   ran the first audit too leniently. Opus does the deep reading.
+          # --max-turns 240: a real reading pass fans out across every feature
+          #   area; the lean 80-turn budget bailed out after a shallow scan.
+          claude_args: >-
+            --allowed-tools "Bash,Read,Grep,Glob,Write,Skill,Task"
+            --model opus
+            --max-turns 240
+
+          prompt: |
+            Run a comprehensive weekly code-quality audit of this repository
+            using the `de-slopify` skill. Invoke the skill and follow its
+            instructions exactly.
+
+            Focus area (blank means the whole repo): "${{ github.event.inputs.focus }}"
+
+            Linters are TABLE STAKES, not the audit. This repo already passes
+            ruff, mypy (strict), radon, xenon, bandit, and interrogate in
+            pre-commit and CI on every commit, so anything those tools gate is
+            ALREADY enforced
+            and CANNOT be a finding — do not report complexity grades, lint
+            rules, or type errors as slop. Your value is the slop those tools
+            are blind to: dead/stubbed/orphaned code, duplication, bad
+            architecture and layering violations, lying feature flags, needless
+            verbosity, comment slop, AI-generated tells, and weak/coverage-
+            theater tests. Finding those requires READING THE CODE, not parsing
+            tool JSON. The evidence bundle is a starting map, not the territory.
+
+            Mandatory reading pass (this is what was skipped last time): after
+            collecting evidence, fan out with the Task tool — spawn a subagent
+            per feature area (the creek-tools/creek pipeline stages — ingestion,
+            classification, linking, voice — plus creek_mcp and the crawdad
+            Discord bot) that actually READS the source against the full
+            13-family taxonomy in references/slop-taxonomy.md and reports
+            corroborated candidates. Do not conclude "clean" from a 5-minute
+            single-threaded scan of linter output.
+
+            Hard requirements (the skill enforces these — do not deviate):
+            - Corroborate every finding with TWO independent signals before
+              filing. For any correctness/bug claim, write and run a reproducing
+              test first; if it does not reproduce, DROP the finding.
+            - Discard everything in the skill's NOT-slop guard list (generated
+              code, migrations, lockfiles, justified suppressions, framework
+              boilerplate, test fixtures, deliberate conventions).
+            - Dedup against existing open and recently-closed issues before
+              filing anything (`gh issue list`, `gh search issues`).
+            - File standalone findings as Ralph-ready issues (Template A) and
+              large coordinated work as an `epic`-labeled umbrella with
+              decomposed sub-issues (Template B); use the `triage-and-plan`
+              skill when an epic needs more than ~3 sub-issues.
+            - Create any missing labels first. Write issue bodies to files and
+              file with `gh issue create --body-file`.
+            - A run that files NOTHING because the code is clean is a SUCCESS.
+              Do not invent work to look productive.
+
+            End by writing a concise run summary to the GitHub Actions job
+            summary — append it to the file at $GITHUB_STEP_SUMMARY (e.g.
+            `cat >> "$GITHUB_STEP_SUMMARY"`) — containing: counts by severity,
+            issues/epics filed (with numbers), findings dropped and why,
+            findings deduped, AND a coverage ledger: a table with one row per
+            taxonomy family (all 13) listing which areas/files you examined for
+            it and the verdict (clean / candidates / filed). The ledger is how
+            we verify the whole taxonomy was actually traversed rather than
+            assumed clean. This is the durable record, linked to the workflow
+            run, and never touches the issue tracker. A clean run (nothing
+            filed) writes "codebase is clean against the taxonomy this week" to
+            the job summary and files NO issue. Only open a separate `de-slop` +
+            `report` issue when at least one finding was filed — never on a clean
+            run (a weekly report issue every Monday would flood the tracker).

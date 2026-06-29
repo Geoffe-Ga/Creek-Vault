@@ -1,0 +1,35 @@
+name: Ralph Recap Tests
+
+# Unit tests for the Ralph recap tooling (scripts/ralph/). The recap scripts
+# live outside backend/, so the backend-scoped lint/coverage gates don't cover
+# them — this workflow keeps the pure stats math and the backlog filter honest.
+
+on:
+  push:
+    paths:
+      - "scripts/ralph/**"
+      - ".github/workflows/ralph-recap-tests.yml"
+  pull_request:
+    paths:
+      - "scripts/ralph/**"
+      - ".github/workflows/ralph-recap-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  recap-tests:
+    name: Recap unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run recap tests
+        run: python -m pytest scripts/ralph -q
