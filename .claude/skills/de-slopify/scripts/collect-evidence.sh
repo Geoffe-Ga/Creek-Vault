@@ -102,6 +102,14 @@ if command -v rg >/dev/null 2>&1; then
 fi
 SEARCH_PATHS=("${PY_DIRS[@]}")
 
+# Inventory roots: the COMPLETE audited surface (Python packages + shell
+# tooling). The reading pass must cover every file under these — churn and size
+# only choose where to START, never the set to read.
+INVENTORY_PATHS=("${PY_DIRS[@]}")
+for d in creek-tools/scripts crawdad/scripts scripts; do
+  [[ -d "$d" ]] && INVENTORY_PATHS+=("$d")
+done
+
 greps() {
   local out="$1" pat="$2"
   if [[ ${#SEARCH_PATHS[@]} -eq 0 ]]; then return 0; fi
@@ -117,7 +125,31 @@ greps grep-swallow.txt      'except (Exception|BaseException)?\s*:|catch\s*\([^)
 greps grep-commented.txt    '^\s*#\s*(def |class |return |if |for |while |import |from )'
 greps grep-any.txt          ':\s*any\b|<any>|as any'
 
-# Git churn / hotspots (top 30 most-changed files in the last 90 days).
+# Source inventory: the COMPLETE set of files the reading pass must cover — the
+# authoritative denominator for the coverage ledger. One line per file, no
+# headers, so ``wc -l < source-inventory.txt`` is the exact total. churn.txt and
+# reading-targets.txt below are ONLY ordering hints (where to start); they are
+# never the set of files to read.
+{
+  if [[ ${#INVENTORY_PATHS[@]} -gt 0 ]]; then
+    find "${INVENTORY_PATHS[@]}" -type f \( -name '*.py' -o -name '*.sh' \) \
+      -not -path '*/node_modules/*' -not -path '*/.venv/*' -print0 2>/dev/null \
+      | sort -z \
+      | while IFS= read -r -d '' f; do
+          loc="$(wc -l <"$f" 2>/dev/null | tr -d ' ')"
+          case "$f" in
+            *.py) lang="python" ;;
+            *.sh) lang="shell" ;;
+            *)    lang="other" ;;
+          esac
+          printf '%s\t%s\t%s\n' "${loc:-0}" "$lang" "$f"
+        done
+  fi
+} >"$OUT/source-inventory.txt"
+
+# Git churn / hotspots — an ORDERING HINT ONLY (top 30 most-changed files in the
+# last 90 days). It says where to START reading, never which files to read; the
+# full set is source-inventory.txt.
 if command -v git >/dev/null 2>&1; then
   git log --since="90 days ago" --format= --name-only 2>/dev/null \
     | grep -E '^(creek-tools|crawdad)/' \
@@ -125,11 +157,13 @@ if command -v git >/dev/null 2>&1; then
     || echo "(churn unavailable)" >"$OUT/churn.txt"
 fi
 
-# Reading targets: the largest source files by line count. These — together
-# with churn.txt — are where the reading pass should start, because size and
-# change-frequency are where bloaters, duplication, and god-objects accumulate.
+# Reading-START hints: the largest source files by line count. Together with
+# churn.txt these are where the reading pass should START (size and change-
+# frequency are where bloaters, duplication, and god-objects accumulate) — but
+# they only ORDER the pass; every file in source-inventory.txt must still be
+# read regardless of size or churn.
 {
-  echo "# Largest source files (LoC) — prime reading-pass targets"
+  echo "# Largest source files (LoC) — reading-pass START hints, NOT the read set"
   if [[ ${#SEARCH_PATHS[@]} -gt 0 ]]; then
     find "${SEARCH_PATHS[@]}" -type f \
       -name '*.py' \
@@ -147,7 +181,9 @@ fi
   echo "Out:     $OUT"
   echo
   echo "## Files"
-  ls -1 "$OUT" | sed 's/^/  - /'
+  for f in "$OUT"/*; do
+    [[ -e "$f" ]] && echo "  - $(basename "$f")"
+  done
   echo
   echo "Each *.json / *.txt holds raw tool or grep output. Every entry is a"
   echo "CANDIDATE only — apply the Two-Signal Rule from detection-playbook.md"
@@ -157,10 +193,20 @@ fi
   echo "The linter outputs (ruff/mypy/radon/bandit/eslint/tsc) are TABLE STAKES:"
   echo "the repo already passes them in pre-commit and CI, so they cannot be"
   echo "findings. Do NOT file complexity grades, lint rules, or type errors."
-  echo "Use churn.txt + reading-targets.txt to drive a Task fan-out that READS"
-  echo "the source for what linters cannot see (dead/stubbed/orphaned code,"
-  echo "duplication, architecture, lying flags, verbosity, comment slop, AI"
-  echo "tells, weak tests). That reading pass is the actual audit."
+  echo
+  echo "## Reading pass — cover EVERY file (exhaustive, not sampled)"
+  echo "source-inventory.txt is the AUTHORITATIVE, COMPLETE set of source files"
+  echo "(one '<loc> <lang> <path>' per line; total = wc -l). The reading fan-out"
+  echo "MUST partition this whole inventory across subagents so every file is"
+  echo "assigned to exactly one reader. churn.txt + reading-targets.txt only"
+  echo "ORDER the pass (where to start); they are NOT the set of files to read."
+  echo "A run may report 'clean against the taxonomy' ONLY when the coverage"
+  echo "ledger shows examined == total - justified-exclusions; otherwise it must"
+  echo "report which files were not reached. The reading pass (dead/stubbed/"
+  echo "orphaned code, duplication, architecture, lying flags, verbosity, comment"
+  echo "slop, AI tells, weak tests) is the actual audit."
+  printf 'Inventory size: %s file(s)\n' \
+    "$(wc -l <"$OUT/source-inventory.txt" 2>/dev/null | tr -d ' ')"
 } >"$OUT/README.txt"
 
 log "evidence collected in $OUT"

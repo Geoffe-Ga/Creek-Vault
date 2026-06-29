@@ -77,9 +77,13 @@ EVID=$(bash .claude/skills/de-slopify/scripts/collect-evidence.sh | tail -1)
 
 This runs ruff, vulture, radon, mypy, bandit, interrogate, pip-audit, and
 detect-secrets over the Python source (`creek-tools/creek`, `creek-tools/
-creek_mcp`, `crawdad/crawdad`); the grep heuristics; and git churn — capturing
-each into `$EVID`. It never modifies files and never aborts on a tool error. Read
-`$EVID/README.txt`, then work through every output file. Supplement with
+creek_mcp`, `crawdad/crawdad`); the grep heuristics; git churn; and a complete
+`source-inventory.txt` enumerating **every** source file under the audited roots
+(the authoritative denominator for the Step 8 coverage ledger) — capturing each
+into `$EVID`. It never modifies files and never aborts on a tool error. Read
+`$EVID/README.txt`, then work through every output file. Treat
+`source-inventory.txt` as the full set the Step 4 reading pass must cover;
+churn.txt and reading-targets.txt only order where to start. Supplement with
 targeted `Grep`/`Read` as candidates emerge.
 
 ### Step 3 — Triage candidates against the guard list
@@ -95,25 +99,41 @@ constants, deliberate repo conventions, and unmeasured "could be faster" claims.
 This is the step that finds the slop linters cannot see, and the step the first
 audit skipped. Do not conclude "clean" without it.
 
-Fan out with the **Task tool**: spawn one subagent per feature area so the whole
-codebase is actually read in parallel, not skimmed by one thread. A good split:
+**Coverage is exhaustive, not sampled.** `$EVID/source-inventory.txt` is the
+authoritative, COMPLETE list of source files (one `<loc> <lang> <path>` per
+line). **Every file in it must be assigned to exactly one reading subagent — no
+file may be left unread.** churn.txt and reading-targets.txt only *order* the
+work (where to start within a partition); they are never the set of files to
+read. A clean verdict is only legitimate when every inventory file was actually
+read against the full taxonomy (see the Step 8 ledger).
+
+Fan out with the **Task tool**: **partition the whole `source-inventory.txt`**
+across subagents so the entire codebase is read in parallel, not skimmed by one
+thread. Partition by feature area for coherence, but the union of the partitions
+must equal the inventory — track assigned files so none is dropped:
 
 - one subagent per creek pipeline stage (`creek-tools/creek/{ingest,classify,
   link,author,generate,...}/*`) — these are the real feature areas,
 - one for the MCP server surface (`creek-tools/creek_mcp/*`),
 - one for the crawdad Discord bot (`crawdad/crawdad/*`, incl. `llm/` and
   `builtin_workflows/`),
-- one for the shared/util/config grab-bags (prime duplication + dead-code sites).
+- one for the shared/util/config grab-bags (prime duplication + dead-code sites),
+- one (or more) for **every remaining inventory file** not claimed above —
+  small, stable, low-churn modules and the `scripts/` shell tooling included, so
+  nothing hides simply because it is small or hasn't changed in 90 days.
 
-Give each subagent the **full 13-family taxonomy** (`slop-taxonomy.md`) and this
-brief: *read the actual source in your area and return corroborated candidates
-for every family, with file:line evidence — focus on what linters miss: dead/
+Give each subagent the **full 13-family taxonomy** (`slop-taxonomy.md`), the
+explicit list of inventory paths it owns, and this brief: *read the actual
+source of every file assigned to you and return corroborated candidates for
+every family, with file:line evidence — focus on what linters miss: dead/
 stubbed/orphaned code, duplication (here and against the rest of the repo),
 architecture/layering violations, lying flags, verbosity, comment slop, AI-slop
 tells, and weak tests. Ignore anything ruff/mypy/radon/eslint already gates.*
 
-Use the `$EVID` bundle's churn and largest-file lists to prioritize. Collect all
-subagent candidates before corroborating.
+Use churn.txt + reading-targets.txt only to order the reading within a partition
+(start with the hot/large files); they do NOT bound which files you read — the
+inventory does. Collect all subagent candidates, and the per-subagent list of
+files actually read, before corroborating.
 
 ### Step 5 — Corroborate each survivor (the gate)
 
@@ -169,10 +189,33 @@ Emit a concise run summary: counts by severity, what was filed (with issue
 numbers/links), what was **dropped and why** (failed corroboration / guard
 list), and what was **deduped**.
 
-Then add a **coverage ledger** — a table with one row per taxonomy family (all
+Then add **two ledgers**.
+
+**(a) File-coverage ledger — proves exhaustiveness.** Reconcile the reading pass
+against `$EVID/source-inventory.txt`: report `examined` vs `total` files and list
+any **deliberately excluded** files explicitly with a justification (generated
+code, vendored deps, lockfiles — only the NOT-slop guard-list categories). The
+identity that must hold for a clean verdict is:
+
+```
+examined == total − justified-exclusions
+```
+
+Show it as a short reconciliation, e.g.:
+
+```
+File coverage: 253 examined + 2 excluded (generated: _pb2.py; vendored) = 255 total ✓
+Unreached: none
+```
+
+If any inventory file was **not** read, list those files under `Unreached:` —
+the run is then **partial**, not clean, and the summary must say so rather than
+claim the codebase is clean.
+
+**(b) Taxonomy-family ledger** — a table with one row per taxonomy family (all
 13) recording which areas/files you examined for it and the verdict
-(clean / candidates / filed). This is how a reader verifies the whole taxonomy
-was actually traversed in the reading pass, not assumed clean:
+(clean / candidates / filed). This verifies the whole taxonomy was actually
+traversed, not assumed clean:
 
 ```
 | Family | Areas examined | Verdict |
@@ -182,10 +225,12 @@ was actually traversed in the reading pass, not assumed clean:
 | ... | ... | ... |
 ```
 
-If nothing met the bar, say so plainly — *"No corroborated slop this run —
-codebase is clean against the taxonomy"* — but the ledger must still show the
-13 families were each looked at. A clean verdict with an empty ledger means the
-reading pass was skipped; that is a failed run, not a clean one.
+A clean verdict — *"No corroborated slop this run — codebase is clean against
+the taxonomy"* — is only legitimate when **both** the file-coverage ledger shows
+`examined == total − justified-exclusions` (no `Unreached` files) **and** the
+family ledger shows all 13 families were looked at. A clean claim from a partial
+file pass, or with an empty family ledger, means the reading pass was incomplete;
+that is a failed run, not a clean one — report what was not reached instead.
 
 ## What this skill must never do
 
