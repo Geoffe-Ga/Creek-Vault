@@ -17,6 +17,7 @@ from creek_mcp.tools.purge import (
     purge_vault_tool,
 )
 from creek_mcp.tools.redact import redact_scan_tool
+from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
 from creek_mcp.tools.save import save_tool
 from creek_mcp.tools.skills import skills_refresh_tool
@@ -39,6 +40,7 @@ __all__ = [
     "purge_source_tool",
     "purge_vault_tool",
     "redact_scan_tool",
+    "reflect_tool",
     "report_tool",
     "save_tool",
     "skills_refresh_tool",
