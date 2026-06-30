@@ -216,6 +216,40 @@ class TestGeminiComplete:
         assert "APIError" in message
         assert "secret" not in message
 
+    def test_complete_4xx_surfaces_api_message(self, gemini_env: None) -> None:
+        """A 4xx surfaces Gemini's own error message (the actionable cause; #745)."""
+        from google.genai import errors
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = errors.APIError(
+            400, {"error": {"message": "quota exceeded for this project"}}
+        )
+        with patch("google.genai.Client", return_value=client):
+            provider = GeminiProvider(LLMConfig(provider="gemini"))
+            with pytest.raises(RuntimeError) as exc:
+                provider.complete("p")
+        message = str(exc.value)
+        assert "quota exceeded" in message
+        assert "HTTP 400" in message
+
+    def test_complete_5xx_withholds_body_and_suppresses_chain(
+        self, gemini_env: None
+    ) -> None:
+        """A 5xx is status-only; its chain is suppressed (no body via `__cause__`)."""
+        from google.genai import errors
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = errors.APIError(
+            503, {"error": {"message": "secret internal detail"}}
+        )
+        with patch("google.genai.Client", return_value=client):
+            provider = GeminiProvider(LLMConfig(provider="gemini"))
+            with pytest.raises(RuntimeError) as exc:
+                provider.complete("p")
+        assert "secret internal detail" not in str(exc.value)
+        assert "HTTP 503" in str(exc.value)
+        assert exc.value.__cause__ is None
+
     def test_rate_limit_surfaces_retry_after(self, gemini_env: None) -> None:
         """A vendor 429 maps to ProviderRateLimitError carrying Retry-After."""
         import httpx

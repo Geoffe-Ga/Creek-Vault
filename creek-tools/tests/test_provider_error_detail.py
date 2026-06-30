@@ -94,10 +94,10 @@ def test_non_string_message_falls_back_to_status_only() -> None:
 
 def test_chain_is_safe_only_for_4xx() -> None:
     """The exception chain may be kept only for 4xx (whose body we surface)."""
-    assert _chain_is_safe(_FakeError("c", status_code=400)) is True
-    assert _chain_is_safe(_FakeError("c", code=404)) is True
-    assert _chain_is_safe(_FakeError("c", status_code=499)) is True
+    assert _chain_is_safe(_FakeError("c", status_code=400))
+    assert _chain_is_safe(_FakeError("c", code=404))
+    assert _chain_is_safe(_FakeError("c", status_code=499))
     # 5xx and unknown withhold the body, so the chain must be suppressed.
-    assert _chain_is_safe(_FakeError("c", status_code=500)) is False
-    assert _chain_is_safe(_FakeError("c", status_code=503)) is False
-    assert _chain_is_safe(_FakeError("c")) is False
+    assert not _chain_is_safe(_FakeError("c", status_code=500))
+    assert not _chain_is_safe(_FakeError("c", status_code=503))
+    assert not _chain_is_safe(_FakeError("c"))
