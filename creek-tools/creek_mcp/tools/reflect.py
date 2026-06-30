@@ -15,7 +15,14 @@ Three guarantees this module enforces:
   ``_enforce_local_for_intimate`` chokepoint redirects an INTIMATE call to the
   local ``default`` model — or raises :class:`IntimateRoutingError` rather than
   egressing. This module never picks a provider or re-checks the tier itself; it
-  only derives the routing tier (failing closed to INTIMATE) and hands it over.
+  only derives the routing tier and hands it over. The routing tier is the
+  **more sensitive** of the entry's own classified ``privacy_tier`` (when it came
+  from a vault fragment via ``entry_ref``) and the ceiling-derived tier — so an
+  INTIMATE fragment routes local even under a low ceiling. Raw inline ``content``
+  carries no classification, so there the guarantee is bounded by the caller's
+  declared ceiling (a caller cannot mark intimate content ``open`` and also have
+  it treated as intimate without classifying it first). Both fail closed to
+  INTIMATE on anything unrecognised.
 - **Quotes are verbatim.** Every returned ``quote`` is validated to be a
   substring of the entry (whitespace-normalised). Model-supplied spans that are
   not are dropped — the client re-anchors verbatim quotes to character offsets
@@ -61,11 +68,6 @@ class _LLMFactory(Protocol):
         """Return an LLM callable routed for *tier* (may raise to refuse)."""
 
 
-# A retrieval callable: ``(query, vault, override) -> grounding snippets``.
-_Retrieve = "Callable[[str, Path, object], list[str]]"
-# A care guard: ``(entry_text) -> escalation reason or None``.
-_CareGuard = "Callable[[str], str | None]"
-
 # ``ALL`` admits intimate content, so a reflection under it must route as INTIMATE.
 _CEILING_ROUTING_TIER: dict[TierCeiling, PrivacyTier] = {
     TierCeiling.OPEN: PrivacyTier.OPEN,
@@ -74,15 +76,43 @@ _CEILING_ROUTING_TIER: dict[TierCeiling, PrivacyTier] = {
     TierCeiling.ALL: PrivacyTier.INTIMATE,
 }
 
+# Sensitivity rank for picking the more-restrictive of two tiers (mirrors the
+# canonical ranking in :mod:`creek_mcp.tier_ceiling`): open/unclassified < personal
+# < intimate. An unranked value is treated as the most sensitive (fail closed).
+_TIER_SENSITIVITY: dict[PrivacyTier, int] = {
+    PrivacyTier.OPEN: 0,
+    PrivacyTier.UNCLASSIFIED: 0,
+    PrivacyTier.PERSONAL: 1,
+    PrivacyTier.INTIMATE: 2,
+}
 
-def _routing_tier(ceiling: TierCeiling) -> PrivacyTier:
-    """Map a ceiling to the routing tier, failing closed to INTIMATE.
+
+def _sensitivity(tier: PrivacyTier) -> int:
+    """Return the routing sensitivity of *tier*, defaulting to the most restrictive."""
+    return _TIER_SENSITIVITY.get(tier, _TIER_SENSITIVITY[PrivacyTier.INTIMATE])
+
+
+def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> PrivacyTier:
+    """Pick the routing tier — never below the entry's *actual* classification.
 
     The router's cloud gate keys on :class:`PrivacyTier`, never on
-    :class:`TierCeiling`, so the ceiling is translated to the most-sensitive
-    tier it admits. An unrecognised ceiling routes as INTIMATE (local-only).
+    :class:`TierCeiling`. Two signals are reconciled by taking the **more
+    sensitive**:
+
+    - *entry_tier* — the entry's own classified ``privacy_tier`` when it came
+      from a vault fragment (``None`` for raw inline ``content``, which carries
+      no classification). This is the load-bearing signal: an INTIMATE fragment
+      must route local even if the caller declared a lower ceiling.
+    - the *ceiling*-derived tier (its most-sensitive admitted tier), which is the
+      only signal available for raw ``content``.
+
+    Failing closed: an unrecognised ceiling, or an *entry_tier* outside the known
+    ranks, routes as INTIMATE (local-only).
     """
-    return _CEILING_ROUTING_TIER.get(ceiling, PrivacyTier.INTIMATE)
+    ceiling_tier = _CEILING_ROUTING_TIER.get(ceiling, PrivacyTier.INTIMATE)
+    if entry_tier is None:
+        return ceiling_tier
+    return max(ceiling_tier, entry_tier, key=_sensitivity)
 
 
 def _normalise(text: str) -> str:
@@ -106,6 +136,8 @@ def _parse_notes(response_text: str) -> tuple[list[dict[str, Any]], str | None]:
     """
     import json
 
+    import yaml
+
     text = response_text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -115,10 +147,11 @@ def _parse_notes(response_text: str) -> tuple[list[dict[str, Any]], str | None]:
         data = json.loads(text)
     except (ValueError, TypeError):
         try:
-            import yaml
-
             data = yaml.safe_load(text)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, yaml.YAMLError):
+            # ``yaml.YAMLError`` (ScannerError/ParserError) is NOT a ValueError,
+            # so it must be caught explicitly or malformed YAML would crash the
+            # tool across the MCP boundary, breaking the never-raises contract.
             return [], None
     if not isinstance(data, dict):
         return [], None
@@ -175,15 +208,37 @@ def _build_prompt(entry: str, grounding: list[str]) -> str:
     )
 
 
-def _resolve_entry(content: str | None, entry_ref: str | None, vault_path: Path) -> str:
-    """Return the entry text from raw *content* or a fragment *entry_ref*.
+def _fragment_tier(metadata: dict[str, Any]) -> PrivacyTier:
+    """Return a fragment's classified ``privacy_tier``, failing closed to INTIMATE.
 
-    ``entry_ref`` is resolved to a fragment markdown file under ``01-Fragments``;
-    its body becomes the entry. A blank result (no usable source) yields ``""``,
-    which the caller turns into a refusal.
+    Mirrors :func:`creek.classify.privacy_filter.tier_of`: a recognised value
+    (including ``unclassified``) is honoured; anything unrecognised — or a
+    missing field — is treated as the most-restrictive tier so an unknown
+    classification is never routed to a cloud provider.
+    """
+    raw = metadata.get("privacy_tier")
+    if raw is None:
+        return PrivacyTier.INTIMATE
+    try:
+        return PrivacyTier(str(raw))
+    except ValueError:
+        return PrivacyTier.INTIMATE
+
+
+def _resolve_entry(
+    content: str | None, entry_ref: str | None, vault_path: Path
+) -> tuple[str, PrivacyTier | None]:
+    """Return the entry text plus its *classified* tier (``None`` for raw content).
+
+    Raw *content* carries no classification, so its tier is ``None`` and the
+    caller falls back to the ceiling. An *entry_ref* is resolved to a fragment
+    markdown file under ``01-Fragments``; its body becomes the entry **and its
+    persisted ``privacy_tier`` becomes the routing tier** — this is what stops an
+    INTIMATE fragment being reflected through a cloud model under a low ceiling.
+    A blank result yields ``("", None)``, which the caller turns into a refusal.
     """
     if content and content.strip():
-        return content
+        return content, None
     if entry_ref:
         import frontmatter
 
@@ -191,8 +246,8 @@ def _resolve_entry(content: str | None, entry_ref: str | None, vault_path: Path)
             post = frontmatter.load(path)
             if str(post.metadata.get("id", "")) == entry_ref:
                 body: str = post.content
-                return body
-    return ""
+                return body, _fragment_tier(post.metadata)
+    return "", None
 
 
 def reflect_tool(
@@ -237,25 +292,24 @@ def reflect_tool(
         consumer=consumer,
     )
 
-    entry = _resolve_entry(content, entry_ref, vault_path)
+    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path)
     if not entry.strip():
+        reason = "entry_ref not found" if entry_ref else "no entry content supplied"
         return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            reason="no entry content supplied",
+            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=reason
         )
 
     if care_guard is not None:
-        reason = care_guard(entry)
-        if reason:
+        care_reason = care_guard(entry)
+        if care_reason:
             return {
                 "status": "escalate",
                 "tool": TOOL_NAME,
                 "tier_ceiling": privacy_tier_ceiling.value,
-                "reason": reason,
+                "reason": care_reason,
             }
 
-    tier = _routing_tier(privacy_tier_ceiling)
+    tier = _routing_tier(privacy_tier_ceiling, entry_tier)
     override = to_privacy_override(privacy_tier_ceiling)
     grounder = retrieve if retrieve is not None else _default_retrieve
     grounding = grounder(entry, vault_path, override)

@@ -359,3 +359,56 @@ def test_unparseable_response_yields_no_notes(tmp_path: Path) -> None:
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["notes"] == []
+
+
+def test_entry_ref_intimate_fragment_routes_local_despite_open_ceiling(
+    tmp_path: Path,
+) -> None:
+    """An INTIMATE fragment routes at INTIMATE even under an OPEN ceiling (#751 review).
+
+    The routing tier follows the entry's *actual* classified ``privacy_tier``,
+    never the (possibly lower) caller-declared ceiling — so genuinely intimate
+    journal content can never be reflected through a cloud model.
+    """
+    vault = _vault(tmp_path)
+    frag_dir = vault / "01-Fragments" / "Notes"
+    frag_dir.mkdir(parents=True)
+    body = "the garden grew while I slept"
+    (frag_dir / "f.md").write_text(
+        f"---\nid: frag-intimate\nprivacy_tier: intimate\n---\n{body}\n",
+        encoding="utf-8",
+    )
+    factory = _RecordingFactory(_notes_payload())
+    reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-intimate",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert factory.asked_tier is PrivacyTier.INTIMATE
+
+
+def test_malformed_yaml_response_does_not_crash(tmp_path: Path) -> None:
+    """A non-JSON, non-YAML response degrades to no notes (catches YAMLError)."""
+    result = reflect_tool(
+        vault_path=_vault(tmp_path),
+        content=_ENTRY,
+        llm_factory=_RecordingFactory("{notes: [oops, unbalanced"),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["notes"] == []
+
+
+def test_entry_ref_not_found_has_a_distinct_reason(tmp_path: Path) -> None:
+    """A missing ``entry_ref`` refuses with a debuggable, distinct reason."""
+    result = reflect_tool(
+        vault_path=_vault(tmp_path),
+        entry_ref="does-not-exist",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == "entry_ref not found"
