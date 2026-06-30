@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-from creek.classify.llm.router import IntimateRoutingError
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
@@ -317,7 +316,10 @@ def reflect_tool(
     try:
         llm = llm_factory(tier)
         response_text = llm(_build_prompt(entry, grounding))
-    except (IntimateRoutingError, RuntimeError) as exc:
+    except RuntimeError as exc:
+        # Covers a missing/unavailable provider AND ``IntimateRoutingError``
+        # (a RuntimeError subclass) — the router raises the latter rather than
+        # egressing intimate content when no local backend exists.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
