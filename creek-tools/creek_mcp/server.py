@@ -37,6 +37,7 @@ from creek_mcp.tools import (
     purge_source_tool,
     purge_vault_tool,
     redact_scan_tool,
+    reflect_tool,
     report_tool,
     save_tool,
     skills_refresh_tool,
@@ -47,6 +48,9 @@ from creek_mcp.tools.draft import draft_tool
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from creek.models import PrivacyTier
+    from creek_mcp.tools.reflect import _LLM, _LLMFactory
 
 SERVER_NAME = "creek-tools-mcp"
 
@@ -97,11 +101,40 @@ def _build_compile_llm() -> Callable[[str], str]:
     return _engine_default_llm(load_config().llm)
 
 
+def _build_reflect_llm_factory() -> _LLMFactory:
+    """Return a tier-keyed LLM factory for ``creek.reflect``.
+
+    The returned ``factory(tier)`` resolves the ``generation`` stage through the
+    config's :class:`~creek.classify.llm.router.ModelRouter` for *tier*, so an
+    INTIMATE reflection is forced onto the local ``default`` model (or the router
+    raises ``IntimateRoutingError`` rather than egressing). Lazy imports keep the
+    server bootable without a provider — only a ``creek.reflect`` call then fails,
+    surfacing as a structured refusal.
+    """
+    from creek.classify.llm.providers import build_provider
+
+    router = load_config().model_router
+
+    def _factory(tier: PrivacyTier) -> _LLM:
+        cfg = router.resolve("generation", tier)
+        provider = build_provider(cfg)
+        if not provider.available:
+            msg = (
+                "LLM provider unavailable for reflection. "
+                "Check Ollama or ANTHROPIC_API_KEY configuration."
+            )
+            raise RuntimeError(msg)
+        return lambda prompt: provider.complete(prompt).text
+
+    return _factory
+
+
 def build_server(
     *,
     vault_path: Path | None = None,
     draft_llm_factory: Callable[[], Callable[[str], str]] | None = None,
     compile_llm_factory: Callable[[], Callable[[str], str]] | None = None,
+    reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
@@ -115,12 +148,16 @@ def build_server(
         compile_llm_factory: Optional factory for the compile LLM.
             Invoked lazily so only ``creek.compile`` needs an LLM
             provider.
+        reflect_llm_factory: Optional thunk returning the tier-keyed LLM
+            factory for ``creek.reflect``. Invoked lazily per call so only
+            ``creek.reflect`` needs an LLM provider.
     """
     server: FastMCP = FastMCP(SERVER_NAME)
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
     factory = draft_llm_factory or _build_draft_llm
     compile_factory = compile_llm_factory or _build_compile_llm
+    reflect_factory = reflect_llm_factory or _build_reflect_llm_factory
 
     @server.tool(name="creek.handshake")
     async def _handshake(
@@ -132,6 +169,22 @@ def build_server(
             vault_path=vault,
             capabilities=sorted(tool.name for tool in tools),
             server_name=SERVER_NAME,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.reflect")
+    def _reflect(
+        content: str | None = None,
+        entry_ref: str | None = None,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Return anchored Higher-Self margin notes on a single journal entry."""
+        return reflect_tool(
+            vault_path=vault,
+            llm_factory=reflect_factory(),
+            content=content,
+            entry_ref=entry_ref,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )

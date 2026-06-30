@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 EXPECTED_TOOLS = {
     "creek.handshake",
+    "creek.reflect",
     "creek.state.read",
     "creek.state.render",
     "creek.lint",
@@ -105,6 +106,33 @@ def test_call_tool_handshake_reflects_registered_tools(vault: Path) -> None:
     assert set(structured["capabilities"]) == registered  # type: ignore[arg-type]
     for expected in ("creek.handshake", "creek.ingest", "creek.classify"):
         assert expected in structured["capabilities"]  # type: ignore[operator]
+
+
+def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
+    """End-to-end: ``creek.reflect`` returns verbatim-quoted notes (injected factory).
+
+    The tier-keyed LLM factory is injected (no live provider); the registered
+    tool wires it through ``reflect_tool``, whose verbatim-quote guard keeps only
+    spans copied from the entry.
+    """
+    entry = "I rest sometimes and the work survives."
+    note = '{"quote": "I rest sometimes", "kind": "reframe", "note": "Yours."}'
+    payload = '{"notes": [' + note + "]}"
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+        reflect_llm_factory=lambda: lambda tier: lambda prompt: payload,
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.reflect",
+            {"content": entry, "privacy_tier_ceiling": "open"},
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["tool"] == "creek.reflect"
+    assert structured["notes"][0]["quote"] == "I rest sometimes"  # type: ignore[index]
 
 
 def test_call_tool_save_through_mcp(vault: Path) -> None:
@@ -400,3 +428,56 @@ def test_main_without_config_flag_leaves_env_var_untouched(
     server_module.main([])
 
     assert CONFIG_PATH_ENV_VAR not in os.environ
+
+
+def test_build_reflect_llm_factory_routes_then_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reflect factory returns a working callable, and raises when no provider.
+
+    Exercises the production INTIMATE-routing seam without a live model: the
+    router + provider are stubbed so both the available path (a usable callable)
+    and the unavailable path (a clean ``RuntimeError`` the tool turns into a
+    refusal) are covered.
+    """
+    from creek.models import PrivacyTier
+    from creek_mcp import server as server_mod
+
+    class _Cfg:
+        provider = "ollama"
+        model = "m"
+
+    class _Router:
+        def resolve(self, stage: str, tier: object) -> _Cfg:
+            return _Cfg()
+
+    class _Config:
+        model_router = _Router()
+
+    monkeypatch.setattr(server_mod, "load_config", lambda: _Config())
+
+    class _Completion:
+        text = "reflected"
+
+    class _Provider:
+        available = True
+
+        def complete(self, prompt: str) -> _Completion:
+            return _Completion()
+
+    monkeypatch.setattr(
+        "creek.classify.llm.providers.build_provider",
+        lambda cfg: _Provider(),
+    )
+    factory = server_mod._build_reflect_llm_factory()
+    assert factory(PrivacyTier.OPEN)("p") == "reflected"
+
+    class _Unavailable:
+        available = False
+
+    monkeypatch.setattr(
+        "creek.classify.llm.providers.build_provider",
+        lambda cfg: _Unavailable(),
+    )
+    with pytest.raises(RuntimeError):
+        server_mod._build_reflect_llm_factory()(PrivacyTier.OPEN)
