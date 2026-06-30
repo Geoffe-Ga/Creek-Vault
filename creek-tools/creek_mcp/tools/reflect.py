@@ -28,8 +28,10 @@ Three guarantees this module enforces:
   not are dropped — the client re-anchors verbatim quotes to character offsets
   itself, so a hallucinated span must never reach it.
 - **Care boundary (#753).** A ``care_guard`` seam is injected; when it flags the
-  entry, the tool escalates and never calls the model. The real guard lands in
-  #753; until then the seam is unset (no gating) but wired.
+  entry, the tool escalates (returning the structured ``CARE_SIGNAL`` pointing to
+  human support) and never calls the model. The production guard is
+  :func:`creek.care.guardrail.acute_distress_guard`, threaded in by
+  ``build_server``; the seam stays injectable so tests can substitute their own.
 
 The LLM and retrieval are injected so the tool is unit-testable with no live
 calls; ``build_server`` supplies the production factory + retrieval.

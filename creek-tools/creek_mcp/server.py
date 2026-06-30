@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
+from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import (
@@ -181,8 +182,6 @@ def build_server(
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
         """Return anchored Higher-Self margin notes on a single journal entry."""
-        from creek.care.guardrail import acute_distress_guard
-
         return reflect_tool(
             vault_path=vault,
             llm_factory=reflect_factory(),

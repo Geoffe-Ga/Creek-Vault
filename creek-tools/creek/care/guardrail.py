@@ -43,6 +43,11 @@ CARE_POLICY: Final[str] = (
 # ("the deadline is killing me"), so ordinary dark/reflective journaling does
 # not trip the guard. Biased toward false negatives by design — Adepthood runs
 # the primary acute pre-check; this is Creek's safe-by-construction backstop.
+#
+# This matches ONLY these literal patterns — it is NOT a comprehensive classifier.
+# Paraphrase ("gonna kill myself"), typos, and non-English phrasing slip through
+# by design; do not mistake this backstop for the primary defense. Broadening it
+# is fine, but the safety guarantee rests on the primary pre-check, not this set.
 _ACUTE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bkill(?:ing)?\s+myself\b", re.IGNORECASE),
     re.compile(r"\b(?:end|ending|take|taking)\s+my\s+(?:own\s+)?life\b", re.IGNORECASE),
