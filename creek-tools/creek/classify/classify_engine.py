@@ -663,6 +663,13 @@ def _classify_one(
     if weighted_classification:
         return _classify_one_weighted(rule_result, body, llm.config)
     llm_result = llm.classify_with_reasoning(rule_result, content=body)
+    if not llm_result.succeeded:
+        # The LLM call failed (provider unavailable / retries exhausted) and
+        # returned the fragment unchanged. Treat it like the rules-sufficed skip
+        # so the write path stamps ``rules`` (the result that actually stands),
+        # NOT a lying ``classification_method: llm`` — and the fragment stays
+        # eligible for a later re-classify rather than being skipped (#744).
+        return llm_result.fragment, True, ""
     return llm_result.fragment, False, llm_result.reasoning
 
 
