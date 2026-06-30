@@ -199,6 +199,48 @@ class TestOpenAIComplete:
         assert "OpenAIError" in message
         assert "secret" not in message
 
+    def test_complete_4xx_surfaces_api_message(self, openai_env: None) -> None:
+        """A 4xx surfaces OpenAI's own error message (the actionable cause; #745)."""
+        import httpx
+        import openai
+
+        response = httpx.Response(
+            400, request=httpx.Request("POST", "https://api.openai.com")
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = openai.BadRequestError(
+            message="You exceeded your current quota", response=response, body=None
+        )
+        with patch("openai.OpenAI", return_value=client):
+            provider = OpenAIProvider(LLMConfig(provider="openai"))
+            with pytest.raises(RuntimeError) as exc:
+                provider.complete("p")
+        message = str(exc.value)
+        assert "exceeded your current quota" in message
+        assert "HTTP 400" in message
+
+    def test_complete_5xx_withholds_body_and_suppresses_chain(
+        self, openai_env: None
+    ) -> None:
+        """A 5xx is status-only; its chain is suppressed (no body via `__cause__`)."""
+        import httpx
+        import openai
+
+        response = httpx.Response(
+            503, request=httpx.Request("POST", "https://api.openai.com")
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = openai.InternalServerError(
+            message="secret internal detail", response=response, body=None
+        )
+        with patch("openai.OpenAI", return_value=client):
+            provider = OpenAIProvider(LLMConfig(provider="openai"))
+            with pytest.raises(RuntimeError) as exc:
+                provider.complete("p")
+        assert "secret internal detail" not in str(exc.value)
+        assert "HTTP 503" in str(exc.value)
+        assert exc.value.__cause__ is None
+
     def test_rate_limit_surfaces_retry_after(self, openai_env: None) -> None:
         """A vendor 429 maps to ProviderRateLimitError carrying Retry-After."""
         import httpx

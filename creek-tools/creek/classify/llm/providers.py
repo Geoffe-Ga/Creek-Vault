@@ -141,6 +141,92 @@ def _retry_after_seconds(exc: object) -> float | None:
         return None
 
 
+_ERROR_DETAIL_MAX_CHARS: int = 500
+"""Cap on the API error message surfaced in a wrapped ``RuntimeError``."""
+
+_CLIENT_ERROR_MIN: int = 400
+"""Inclusive lower bound of the HTTP client-error (4xx) range."""
+
+_SERVER_ERROR_MIN: int = 500
+"""Exclusive upper bound of the 4xx range / start of the 5xx server range."""
+
+
+def _error_status(exc: Exception) -> int | None:
+    """Return the integer HTTP status of a provider SDK error, if it exposes one.
+
+    Reads ``status_code`` (Anthropic / OpenAI) then ``code`` (Gemini); anything
+    non-integer (or absent) yields ``None`` so callers fail closed to the most
+    redacted form.
+
+    Args:
+        exc: The vendor SDK exception.
+
+    Returns:
+        The HTTP status as an ``int``, or ``None`` when unavailable.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    return status if isinstance(status, int) else None
+
+
+def _error_detail(exc: Exception) -> str:
+    """Return a redaction-safe detail string for a provider SDK error.
+
+    Two tiers, by HTTP status:
+
+    - **4xx client errors** — the API's own ``message`` is surfaced (collapsed
+      and length-capped) after the status. A 4xx message is an API-side
+      description of what is wrong with the *request or account* — "credit
+      balance too low", an invalid model id, a bad parameter — never the prompt
+      or fragment content, and never the API key (which lives only in request
+      headers). This is what turns an opaque ``BadRequestError`` into an
+      actionable cause.
+    - **5xx / unknown** — status only (or nothing). Server-error bodies are
+      opaque and may carry unredacted internals, so they stay redacted.
+
+    Args:
+        exc: The vendor SDK exception.
+
+    Returns:
+        A suffix ready to append after the exception type name — one of
+        ``" (HTTP <s>): <message>"``, ``" (HTTP <s>)"``, or ``""``.
+    """
+    status = _error_status(exc)
+    if status is None:
+        return ""
+    if not _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN:
+        return f" (HTTP {status})"
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or not message.strip():
+        return f" (HTTP {status})"
+    collapsed = " ".join(message.split())
+    if len(collapsed) > _ERROR_DETAIL_MAX_CHARS:
+        collapsed = collapsed[:_ERROR_DETAIL_MAX_CHARS] + "…"
+    return f" (HTTP {status}): {collapsed}"
+
+
+def _chain_is_safe(exc: Exception) -> bool:
+    """Whether the SDK error may remain as the wrapped ``RuntimeError.__cause__``.
+
+    True only for 4xx client errors — the same tier whose ``message``
+    :func:`_error_detail` already surfaces, so the chain exposes nothing the
+    message does not. For 5xx / unknown errors the body is deliberately
+    withheld, so the caller suppresses the chain (``raise … from None``) to keep
+    that redaction airtight even if a future caller logs with
+    ``logging.exception`` / ``exc_info=True`` (which would otherwise render
+    ``__cause__``).
+
+    Args:
+        exc: The vendor SDK exception.
+
+    Returns:
+        ``True`` when *exc* carries a 4xx status, else ``False``.
+    """
+    status = _error_status(exc)
+    return status is not None and _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN
+
+
 # Per-provider default model IDs. This matrix is the ONLY place model literals
 # live in the package — provider classes read their ``DEFAULT_MODEL`` from it
 # and other modules read the resolved value, never a literal (enforced by
@@ -281,9 +367,11 @@ class AnthropicProvider:
             The concatenated text content of the API response.
 
         Raises:
-            RuntimeError: If the SDK raises any ``AnthropicError``; the
-                original exception is re-raised as ``RuntimeError`` with
-                its type name to avoid leaking sensitive request state.
+            RuntimeError: If the SDK raises any ``AnthropicError``; re-raised
+                as ``RuntimeError`` with the exception type name and, for 4xx
+                client errors, the API's own error message (see
+                :func:`_error_detail`). 5xx / unknown bodies are withheld and
+                their exception chain suppressed to avoid leaking request state.
         """
         return self.call_with_metadata(prompt).text
 
@@ -351,9 +439,11 @@ class AnthropicProvider:
             and the SDK's token :attr:`~AnthropicCompletion.usage` when present.
 
         Raises:
-            RuntimeError: If the SDK raises any ``AnthropicError``; the
-                original exception is re-raised as ``RuntimeError`` with
-                its type name to avoid leaking sensitive request state.
+            RuntimeError: If the SDK raises any ``AnthropicError``; re-raised
+                as ``RuntimeError`` with the exception type name and, for 4xx
+                client errors, the API's own error message (see
+                :func:`_error_detail`). 5xx / unknown bodies are withheld and
+                their exception chain suppressed to avoid leaking request state.
         """
         import anthropic
 
@@ -366,8 +456,9 @@ class AnthropicProvider:
                 msg, retry_after=_retry_after_seconds(exc)
             ) from None
         except anthropic.AnthropicError as exc:
-            msg = f"Anthropic API call failed: {type(exc).__name__}"
-            raise RuntimeError(msg) from None
+            detail = _error_detail(exc)
+            msg = f"Anthropic API call failed: {type(exc).__name__}{detail}"
+            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
         stop_reason = getattr(response, "stop_reason", None) or "end_turn"
         return AnthropicCompletion(
             text=_extract_anthropic_text(response),
@@ -744,7 +835,10 @@ class OpenAIProvider:
 
         Raises:
             RuntimeError: If the SDK raises any ``OpenAIError``; re-raised with
-                only the exception type name so no request state leaks.
+                the exception type name and, for 4xx client errors, the API's
+                own error message (see :func:`_error_detail`). 5xx / unknown
+                bodies are withheld and their chain suppressed so no request
+                state leaks.
         """
         import openai
 
@@ -757,8 +851,8 @@ class OpenAIProvider:
                 msg, retry_after=_retry_after_seconds(exc)
             ) from None
         except openai.OpenAIError as exc:
-            msg = f"OpenAI API call failed: {type(exc).__name__}"
-            raise RuntimeError(msg) from None
+            msg = f"OpenAI API call failed: {type(exc).__name__}{_error_detail(exc)}"
+            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
         return Completion(
             text=_extract_openai_text(response),
             stop_reason=_map_openai_stop_reason(response),
@@ -984,7 +1078,10 @@ class GeminiProvider:
 
         Raises:
             RuntimeError: If the SDK raises any ``APIError``; re-raised with
-                only the exception type name so no request state leaks.
+                the exception type name and, for 4xx client errors, the API's
+                own error message (see :func:`_error_detail`). 5xx / unknown
+                bodies are withheld and their chain suppressed so no request
+                state leaks.
         """
         from google.genai import errors
 
@@ -997,8 +1094,8 @@ class GeminiProvider:
                 raise ProviderRateLimitError(
                     msg, retry_after=_retry_after_seconds(exc)
                 ) from None
-            msg = f"Gemini API call failed: {type(exc).__name__}"
-            raise RuntimeError(msg) from None
+            msg = f"Gemini API call failed: {type(exc).__name__}{_error_detail(exc)}"
+            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
         return Completion(
             text=_extract_gemini_text(response),
             stop_reason=_map_gemini_stop_reason(response),
