@@ -43,6 +43,7 @@ from creek_mcp.tools import (
     skills_refresh_tool,
     state_read_tool,
     state_render_tool,
+    wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
 
@@ -185,6 +186,17 @@ def build_server(
             llm_factory=reflect_factory(),
             content=content,
             entry_ref=entry_ref,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.wheel")
+    def _wheel(
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Return a per-frequency balance read of the corpus for the Map."""
+        return wheel_tool(
+            vault_path=vault,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 EXPECTED_TOOLS = {
     "creek.handshake",
     "creek.reflect",
+    "creek.wheel",
     "creek.state.read",
     "creek.state.render",
     "creek.lint",
@@ -133,6 +134,26 @@ def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
     assert structured["status"] == "ok"
     assert structured["tool"] == "creek.reflect"
     assert structured["notes"][0]["quote"] == "I rest sometimes"  # type: ignore[index]
+
+
+def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None:
+    """End-to-end: ``creek.wheel`` returns a complete F1-F10 balance map.
+
+    Even with an empty corpus the wheel is present and all-zero (the new-user
+    case), proving the read-only aggregation is reachable through the registry.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["tool"] == "creek.wheel"
+    assert list(structured["wheel"].keys()) == [f"F{n}" for n in range(1, 11)]  # type: ignore[union-attr]
+    assert structured["total_classified"] == 0
 
 
 def test_call_tool_save_through_mcp(vault: Path) -> None:
