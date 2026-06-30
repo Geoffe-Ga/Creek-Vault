@@ -55,10 +55,16 @@ class LLMClassificationResult:
             pre-FEAT-017 response shape) or the call short-circuited.
             Truncation / tier-routing is the engine's responsibility,
             not this dataclass's — the raw trace lives here.
+        succeeded: ``True`` when the LLM actually classified the
+            fragment; ``False`` when the call short-circuited (provider
+            unavailable or all retries exhausted) and ``fragment`` is the
+            input returned unchanged. Lets the engine avoid stamping
+            ``classification_method: llm`` on a failed call (#744).
     """
 
     fragment: Fragment
     reasoning: str
+    succeeded: bool = True
 
 
 class LLMClassifier:
@@ -321,7 +327,9 @@ class LLMClassifier:
                 "LLM provider unavailable — returning fragment '%s' unchanged",
                 fragment.title,
             )
-            return LLMClassificationResult(fragment=fragment, reasoning="")
+            return LLMClassificationResult(
+                fragment=fragment, reasoning="", succeeded=False
+            )
 
         prompt = self._build_prompt(fragment, content)
 
@@ -371,7 +379,7 @@ class LLMClassifier:
             self.MAX_RETRIES,
             fragment.title,
         )
-        return LLMClassificationResult(fragment=fragment, reasoning="")
+        return LLMClassificationResult(fragment=fragment, reasoning="", succeeded=False)
 
     def _retry_delay_for(self, exc: Exception) -> float:
         """Resolve the backoff before the next retry attempt.
