@@ -282,7 +282,10 @@ def reflect_tool(
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with ``notes`` (+ optional
-        ``essay``), ``escalate`` with a ``reason``, or a structured refusal.
+        ``essay``), ``escalate`` with a ``reason``, or a structured refusal. Each
+        ``notes[].quote`` is a verified verbatim span of the entry; the optional
+        ``essay`` is free model prose and is **not** grounding-checked, flagged by
+        ``essay_grounded: False`` so a client never treats it as grounded.
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
@@ -334,6 +337,9 @@ def reflect_tool(
         "tier_ceiling": privacy_tier_ceiling.value,
         "routed_tier": tier.value,
         "notes": notes,
+        # ``essay`` is free model prose and is NOT verbatim/grounding-checked the
+        # way ``notes[].quote`` is — a client must not treat it as grounded.
+        "essay_grounded": False,
     }
     if essay is not None:
         result["essay"] = essay

@@ -116,6 +116,19 @@ def test_open_ceiling_requests_the_open_tier(tmp_path: Path) -> None:
     assert factory.asked_tier is PrivacyTier.OPEN
 
 
+def test_personal_ceiling_requests_the_personal_tier(tmp_path: Path) -> None:
+    """A PERSONAL ceiling routes at the PERSONAL tier (pins the middle mapping)."""
+    factory = _RecordingFactory(_notes_payload())
+    reflect_tool(
+        vault_path=_vault(tmp_path),
+        content=_ENTRY,
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert factory.asked_tier is PrivacyTier.PERSONAL
+
+
 def test_all_ceiling_fails_closed_to_intimate_routing(tmp_path: Path) -> None:
     """``ALL`` admits intimate content, so routing must fail closed to INTIMATE."""
     factory = _RecordingFactory(_notes_payload())
