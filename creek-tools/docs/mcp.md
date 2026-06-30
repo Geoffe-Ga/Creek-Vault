@@ -17,6 +17,21 @@ interactively will appear to hang, which is correct.
 
 ## Tools
 
+### Handshake (epic #748)
+
+| Tool              | Purpose                                                                   |
+|-------------------|---------------------------------------------------------------------------|
+| `creek.handshake` | Negotiate vault presence, contract/ontology versions, tier model, and the live capability list. |
+
+A connecting client (the Adepthood app) calls `creek.handshake` first. It is
+read-only and needs no LLM provider, so the negotiation succeeds on any host and
+even on a fresh/absent vault. It returns at least `available`,
+`contract_version`, `ontology_version`, `tiers` (`open`/`personal`/`intimate`),
+and `capabilities` (the names of the tools actually registered), plus the
+`tier_model` and `transport`. Versions come from `creek_mcp/contract.py`; the
+cross-repo contract is
+[`docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md`](../../docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md).
+
 ### Read tools (FEAT-010)
 
 | Tool                  | Purpose                                                    |

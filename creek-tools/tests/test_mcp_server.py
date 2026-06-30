@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.server import SERVER_NAME, build_server
 
 if TYPE_CHECKING:
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 
 
 EXPECTED_TOOLS = {
+    "creek.handshake",
     "creek.state.read",
     "creek.state.render",
     "creek.lint",
@@ -77,6 +79,32 @@ def test_build_server_registers_all_tools(vault: Path) -> None:
     tools = asyncio.run(server.list_tools())
     names = {tool.name for tool in tools}
     assert names == EXPECTED_TOOLS
+
+
+def test_call_tool_handshake_reflects_registered_tools(vault: Path) -> None:
+    """End-to-end: ``creek.handshake`` negotiates versions + the live tool list.
+
+    Its ``capabilities`` must equal the names of the tools actually registered
+    (not a hardcoded list), proving the #750 acceptance criterion through the
+    registered async handler rather than only the unit-level helper.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    registered = {tool.name for tool in asyncio.run(server.list_tools())}
+    result = asyncio.run(
+        server.call_tool("creek.handshake", {"privacy_tier_ceiling": "open"}),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["available"] is True
+    assert structured["contract_version"] == CONTRACT_VERSION
+    assert structured["ontology_version"] == ONTOLOGY_VERSION
+    assert structured["tiers"] == ["open", "personal", "intimate"]
+    assert set(structured["capabilities"]) == registered  # type: ignore[arg-type]
+    for expected in ("creek.handshake", "creek.ingest", "creek.classify"):
+        assert expected in structured["capabilities"]  # type: ignore[operator]
 
 
 def test_call_tool_save_through_mcp(vault: Path) -> None:

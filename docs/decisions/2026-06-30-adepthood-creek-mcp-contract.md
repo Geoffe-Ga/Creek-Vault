@@ -80,31 +80,37 @@ not this version.
 
 | Capability Adepthood depends on | Status | MCP tool | Tracking |
 |---|---|---|---|
-| Handshake / capabilities (+ contract & ontology version, tier model) | **Planned** | `creek.handshake` | [#750](https://github.com/Geoffe-Ga/Creek-Vault/issues/750) |
+| Handshake / capabilities (+ contract & ontology version, tier model) | **Exists** | `creek.handshake` | [#750](https://github.com/Geoffe-Ga/Creek-Vault/issues/750) |
 | Ingest — journal entry → fragment | **Exists** (generic) + dedicated path *planned* | `creek.ingest` | [#754](https://github.com/Geoffe-Ga/Creek-Vault/issues/754) (Adepthood-journal path) |
 | Classify a fragment | **Exists** | `creek.classify` | — |
 | Reflect — Higher-Self margin notes on one entry | **Planned** | `creek.reflect` | [#751](https://github.com/Geoffe-Ga/Creek-Vault/issues/751) |
 | Wheel — per-frequency balance read for the Map | **Planned** | `creek.wheel` | [#752](https://github.com/Geoffe-Ga/Creek-Vault/issues/752) |
 | Tier ceiling — INTIMATE never egresses | **Exists** | (parameter on every tool) | — |
 
-### Handshake / capabilities — *Planned* (#750)
+### Handshake / capabilities — *Exists* (#750)
 
-A no-side-effect tool that lets a consumer discover, in one call: the
-**contract version** (`0.1.0`), the **ontology version**
-(`aptitude-wavelength/2026-05-23`), the list of available tools with their
-shapes, and the **tier model** (the `TierCeiling` values and the
-INTIMATE-never-egresses guarantee). Adepthood calls this first to confirm both
-sides speak the same contract before any read/write. Proposed return shape:
+A read-only, LLM-free tool that lets a consumer discover, in one call: whether a
+vault is present (`available`), the **contract version** (`0.1.0`, from
+`creek_mcp/contract.py`), the **ontology version**
+(`aptitude-wavelength/2026-05-23`), the **tier model** (the `TierCeiling`
+ceilings and the INTIMATE-never-egresses guarantee), and the **capabilities**
+list — the names of the tools actually registered, sourced live from
+`server.list_tools()` so it cannot drift. Adepthood calls this first to confirm
+both sides speak the same contract before any read/write. Return shape:
 
 ```jsonc
 {
+  "status": "ok",
+  "tool": "creek.handshake",
   "server": "creek-tools-mcp",
+  "transport": "stdio",
+  "available": true,
   "contract_version": "0.1.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
-  "transport": "stdio",
+  "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
                   "default": "open", "intimate_never_egresses": true },
-  "tools": ["creek.ingest", "creek.classify", "creek.reflect", "creek.wheel", "..."]
+  "capabilities": ["creek.classify", "creek.handshake", "creek.ingest", "..."]
 }
 ```
 

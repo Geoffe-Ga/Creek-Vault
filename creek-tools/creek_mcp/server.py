@@ -26,6 +26,7 @@ from creek_mcp.tools import (
     author_tool,
     classify_tool,
     compile_tool,
+    handshake_tool,
     ingest_tool,
     link_tool,
     lint_tool,
@@ -120,6 +121,19 @@ def build_server(
     consumer = _consumer_from_env()
     factory = draft_llm_factory or _build_draft_llm
     compile_factory = compile_llm_factory or _build_compile_llm
+
+    @server.tool(name="creek.handshake")
+    async def _handshake(
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Negotiate vault presence, versions, tier model, and capabilities."""
+        tools = await server.list_tools()
+        return handshake_tool(
+            vault_path=vault,
+            capabilities=sorted(tool.name for tool in tools),
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
 
     @server.tool(name="creek.state.read")
     def _state_read(
