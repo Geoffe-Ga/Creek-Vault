@@ -326,3 +326,34 @@ def test_interactive_prompt_no_is_noop(
     _maybe_upgrade_classification(tmp_path, _cloud_config(), upgrade=False)
 
     assert not ran
+
+
+def test_upgrade_check_is_non_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detection error is swallowed — fill is never crashed by the upgrade check."""
+
+    def _boom(*_a: object) -> object:
+        raise RuntimeError("provider boom")
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", _boom)
+    ran: list[bool] = []
+    monkeypatch.setattr(cli_mod, "_run_classify_upgrade", lambda *_a: ran.append(True))
+
+    # Must not raise, even with --upgrade requested.
+    _maybe_upgrade_classification(tmp_path, _cloud_config(), upgrade=True)
+
+    assert not ran
+
+
+def test_upgrade_flag_noop_when_nothing_upgradeable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--upgrade` with no upgradeable fragments runs nothing (clean early exit)."""
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    ran: list[bool] = []
+    monkeypatch.setattr(cli_mod, "_run_classify_upgrade", lambda *_a: ran.append(True))
+
+    _maybe_upgrade_classification(tmp_path, _cloud_config(), upgrade=True)
+
+    assert not ran

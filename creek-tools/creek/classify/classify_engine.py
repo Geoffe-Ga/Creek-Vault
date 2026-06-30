@@ -565,7 +565,7 @@ def _finalise_fragment_write(
     raw: dict[str, object],
     reasoning: str,
     method: str,
-    provider: str | None,
+    provider: str | None = None,
     was_skipped: bool,
     counts: _RunCounts,
     progress_path: Path | None,
