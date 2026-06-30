@@ -17,11 +17,15 @@ if TYPE_CHECKING:
 
 
 class _StubProvider:
-    """Minimal provider double with controllable availability + cloud flag."""
+    """Minimal provider double — only ``available`` is read by the fidelity probe.
 
-    def __init__(self, *, available: bool, is_cloud: bool) -> None:
+    The cloud/local rung is decided from ``config.provider`` (the configured
+    name), not the built provider, so the stub deliberately carries no
+    ``is_cloud`` flag.
+    """
+
+    def __init__(self, *, available: bool) -> None:
         self.available = available
-        self.is_cloud = is_cloud
 
 
 def _config(*, classification: dict[str, str], default: dict[str, str]) -> CreekConfig:
@@ -66,9 +70,7 @@ def test_best_available_caps_intimate_at_local(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         fid,
         "build_provider",
-        lambda cfg: _StubProvider(
-            available=True, is_cloud=fid.provider_is_cloud(cfg.provider)
-        ),
+        lambda cfg: _StubProvider(available=True),
     )
     config = _config(
         classification={"provider": "anthropic", "model": "claude-haiku-4-5"},
@@ -89,7 +91,7 @@ def test_best_available_falls_back_to_rules_when_unavailable(
     monkeypatch.setattr(
         fid,
         "build_provider",
-        lambda cfg: _StubProvider(available=False, is_cloud=True),
+        lambda cfg: _StubProvider(available=False),
     )
     config = _config(
         classification={"provider": "anthropic", "model": "x"},
@@ -108,7 +110,7 @@ def test_best_available_local_classification_is_local_both_tiers(
     monkeypatch.setattr(
         fid,
         "build_provider",
-        lambda cfg: _StubProvider(available=True, is_cloud=False),
+        lambda cfg: _StubProvider(available=True),
     )
     config = _config(
         classification={"provider": "ollama", "model": "qwen3:8b"},

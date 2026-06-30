@@ -37,23 +37,10 @@ RANK_LLM_LOCAL: int = 2
 RANK_LLM_CLOUD: int = 3
 RANK_MANUAL: int = 4
 
-_RANK_LABELS: dict[int, str] = {
-    RANK_UNCLASSIFIED: "unclassified",
-    RANK_RULES: "rules",
-    RANK_LLM_LOCAL: "local LLM",
-    RANK_LLM_CLOUD: "cloud LLM",
-    RANK_MANUAL: "manual",
-}
-
 
 def provider_is_cloud(provider: str | None) -> bool:
     """Return whether *provider* names a cloud backend."""
     return bool(provider) and provider in CLOUD_PROVIDERS
-
-
-def rank_label(rank: int) -> str:
-    """Return a human label for a fidelity *rank*."""
-    return _RANK_LABELS.get(rank, "unknown")
 
 
 def method_rank(method: str | None, provider: str | None) -> int:

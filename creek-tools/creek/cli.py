@@ -2378,7 +2378,14 @@ def _maybe_upgrade_classification(
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
     """
-    offer = _detect_classify_upgrade(vault_path, config)
+    try:
+        offer = _detect_classify_upgrade(vault_path, config)
+    except Exception as exc:
+        # The upgrade check is best-effort: a provider/config hiccup (an
+        # unexpected build_provider error, a malformed routing block) must not
+        # crash fill before any step runs. Skip the offer and carry on.
+        logger.warning("fill: skipping classify-upgrade check: %s", exc)
+        return
     if offer is None:
         return
     if upgrade:
