@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -2265,6 +2266,144 @@ def _format_fill_summary(vault_path: Path) -> str:
     return "[bold green][fill] done. " + " | ".join(parts) + "[/bold green]"
 
 
+@dataclass(frozen=True)
+class _ClassifyUpgradeOffer:
+    """A quality-aware classification upgrade ``creek fill`` can offer (#736).
+
+    Attributes:
+        count: Number of ``rules``-classified fragments that a now-available
+            higher-fidelity method would improve.
+        non_intimate_label: ``provider/model`` the non-Intimate route would use.
+        intimate_label: ``provider/model`` the Intimate route would use (always
+            local — Intimate is never proposed a cloud upgrade).
+    """
+
+    count: int
+    non_intimate_label: str
+    intimate_label: str
+
+    def context(self) -> str:
+        """The bold context line printed before the prompt."""
+        return (
+            f"[yellow][fill] {self.count} fragment(s) were classified by `rules`; "
+            "a higher-fidelity method is now available "
+            f"({self.non_intimate_label} for non-Intimate; "
+            f"{self.intimate_label} for Intimate, kept local).[/yellow]"
+        )
+
+    def hint(self) -> str:
+        """The non-interactive hint (printed when no upgrade is performed)."""
+        return (
+            f"[dim][fill] {self.count} `rules`-classified fragment(s) could be "
+            f"upgraded ({self.non_intimate_label} / {self.intimate_label}); "
+            "re-run with --upgrade to apply (Intimate stays local).[/dim]"
+        )
+
+
+def _classification_route_label(config: CreekConfig, *, intimate: bool) -> str:
+    """Return a ``provider/model`` label for the classification route."""
+    from creek.classify.llm.router import IntimateRoutingError
+    from creek.models import PrivacyTier
+
+    router = config.model_router
+    try:
+        cfg = router.resolve(
+            "classification", PrivacyTier.INTIMATE if intimate else None
+        )
+    except IntimateRoutingError:
+        return "rules (no local backend)"
+    return f"{cfg.provider}/{cfg.model}" if cfg.model else cfg.provider
+
+
+def _detect_classify_upgrade(
+    vault_path: Path, config: CreekConfig
+) -> _ClassifyUpgradeOffer | None:
+    """Return an upgrade offer when ``rules`` artifacts could now do better.
+
+    A fragment is upgradeable when it was classified by ``rules`` and its tier's
+    best-available method (per the fidelity ladder) outranks ``rules`` — i.e. an
+    LLM is now reachable. Returns ``None`` when no LLM is available or no
+    ``rules`` fragment would benefit (so the offer never appears spuriously).
+    """
+    from creek.classify.constants import (
+        CLASSIFICATION_METHOD_KEY,
+        RULES_METHOD,
+    )
+    from creek.classify.fidelity import RANK_RULES, best_available
+    from creek.classify.privacy_filter import tier_of
+    from creek.vault.reader import iter_vault_fragments
+
+    best = best_available(config)
+    if not best.any_llm_available():
+        return None
+    upgradeable = 0
+    for _path, fragment, _body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments"
+    ):
+        if raw.get(CLASSIFICATION_METHOD_KEY) != RULES_METHOD:
+            continue
+        if best.for_tier(tier_of(fragment)) > RANK_RULES:
+            upgradeable += 1
+    if upgradeable == 0:
+        return None
+    return _ClassifyUpgradeOffer(
+        count=upgradeable,
+        non_intimate_label=_classification_route_label(config, intimate=False),
+        intimate_label=_classification_route_label(config, intimate=True),
+    )
+
+
+def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
+    """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
+
+    Runs ``classify --method llm`` WITHOUT ``--force``: the resume-skip leaves
+    ``llm``/``manual`` fragments untouched, so only the ``rules`` ones are
+    upgraded, and the per-tier ModelRouter keeps Intimate content local.
+    """
+    from creek.classify.classify_engine import run_classify
+
+    console.print(
+        "[bold green][fill] upgrading classify: rules → LLM "
+        "(non-Intimate per config; Intimate kept local) …[/bold green]"
+    )
+    run_classify(vault_path=vault_path, config=config, method="llm", force=False)
+
+
+def _maybe_upgrade_classification(
+    vault_path: Path, config: CreekConfig, *, upgrade: bool
+) -> None:
+    """Surface / apply a quality-aware classification upgrade before filling.
+
+    Non-interactive default is a safe no-op (never silently overwrites, never
+    silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
+    without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
+    """
+    try:
+        offer = _detect_classify_upgrade(vault_path, config)
+    except Exception as exc:
+        # The upgrade check is best-effort: a provider/config hiccup (an
+        # unexpected build_provider error, a malformed routing block) must not
+        # crash fill before any step runs. Skip the offer and carry on.
+        logger.warning("fill: skipping classify-upgrade check: %s", exc)
+        return
+    if offer is None:
+        return
+    if upgrade:
+        _run_classify_upgrade(vault_path, config)
+        return
+    if not sys.stdin.isatty():
+        console.print(offer.hint())
+        return
+    console.print(offer.context())
+    if typer.confirm("Re-run classification to upgrade?", default=False):
+        _run_classify_upgrade(vault_path, config)
+    else:
+        console.print(
+            "[dim][fill] declined — existing classifications kept "
+            "(second run is a clean no-op).[/dim]"
+        )
+
+
 @app.command()
 def fill(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
@@ -2275,6 +2414,15 @@ def fill(
         False,
         "--with-compost",
         help="Also run the compost overview report (off by default).",
+    ),
+    upgrade: bool = typer.Option(
+        False,
+        "--upgrade",
+        help=(
+            "Re-classify `rules`-stamped fragments with the best LLM now "
+            "available before filling (Intimate stays local). Non-interactive "
+            "opt-in; without it a TTY is prompted and other runs are a no-op."
+        ),
     ),
 ) -> None:
     """Run the deterministic vault-population sequence in dependency order.
@@ -2301,6 +2449,11 @@ def fill(
         for index_, (label, _action) in enumerate(steps, start=1):
             console.print(f"  {index_:>2}. {label}")
         return
+
+    # Quality-aware upgrade (#736): offer/apply re-classification of `rules`
+    # fragments before the steps consume them. Safe no-op unless --upgrade or an
+    # interactive yes; the ModelRouter keeps Intimate content local.
+    _maybe_upgrade_classification(vault_path, config, upgrade=upgrade)
 
     for label, action in steps:
         console.print(f"[dim][fill] {label} …[/dim]")

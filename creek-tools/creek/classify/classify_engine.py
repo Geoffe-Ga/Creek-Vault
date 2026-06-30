@@ -38,6 +38,7 @@ import yaml
 from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
+    CLASSIFICATION_PROVIDER_KEY,
     CLASSIFICATION_REASONING_KEY,
     CLASSIFICATION_REASONING_MAX_CHARS,
     CLASSIFIED_AT_KEY,
@@ -508,6 +509,10 @@ def _process_file(
         raw=raw,
         reasoning=reasoning,
         method=method,
+        # The fragment's tier picked the classifier (#666); record its provider
+        # so a later quality-aware run can rank local-LLM vs cloud-LLM. Only an
+        # actual ``llm`` write keeps it (the writer clears it otherwise).
+        provider=llm.config.provider if llm is not None else None,
         was_skipped=was_skipped,
         counts=counts,
         progress_path=progress_path,
@@ -560,6 +565,7 @@ def _finalise_fragment_write(
     raw: dict[str, object],
     reasoning: str,
     method: str,
+    provider: str | None = None,
     was_skipped: bool,
     counts: _RunCounts,
     progress_path: Path | None,
@@ -591,6 +597,7 @@ def _finalise_fragment_write(
             method=write_method,
             raw=raw,
             reasoning=reasoning_for_frontmatter,
+            provider=provider,
         )
     except OSError as exc:
         counts.errors.append(f"failed to update {md_file}: {exc}")
@@ -974,6 +981,7 @@ def _write_fragment(
     method: str,
     raw: dict[str, object],
     reasoning: str,
+    provider: str | None = None,
 ) -> None:
     """Persist updated fragment metadata back to its file.
 
@@ -995,6 +1003,11 @@ def _write_fragment(
         reasoning: Per-FEAT-017 ``classification_reasoning`` value
             already truncated / tier-routed by :func:`_route_reasoning`.
             Empty string clears the field on disk.
+        provider: The LLM provider behind an ``llm`` classification
+            (e.g. ``anthropic`` / ``ollama``). Stamped as
+            ``classification_provider`` for ``llm`` writes so a
+            quality-aware re-run can tell local-LLM from cloud-LLM;
+            cleared for ``rules`` / ``manual`` so no stale value lingers.
     """
     new_metadata = raw.copy()
     new_metadata.update(fragment.model_dump(mode="json"))
@@ -1004,6 +1017,10 @@ def _write_fragment(
     # timestamp written to disk uses the same code path as every
     # other LA-anchored timestamp in the pipeline.
     new_metadata[CLASSIFIED_AT_KEY] = now_la().isoformat()
+    if method == LLM_METHOD and provider:
+        new_metadata[CLASSIFICATION_PROVIDER_KEY] = provider
+    else:
+        new_metadata.pop(CLASSIFICATION_PROVIDER_KEY, None)
     if reasoning:
         new_metadata[CLASSIFICATION_REASONING_KEY] = reasoning
     else:
