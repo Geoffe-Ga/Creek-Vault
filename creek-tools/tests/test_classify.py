@@ -1628,6 +1628,73 @@ class TestAnthropicProviderCall:
             provider.call("prompt")
         assert "sk-test-not-real" not in str(exc_info.value)
 
+    def test_call_4xx_surfaces_api_message_not_just_type(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The motivating case (#745): a budget 400 surfaces its actionable cause.
+
+        A real ``BadRequestError`` carrying the credit-balance message must
+        propagate that message (and the status) through ``call`` — not just the
+        opaque ``BadRequestError`` type — while never exposing the API key.
+        """
+        import anthropic
+        import httpx
+
+        _set_anthropic_env(monkeypatch)
+        credit_msg = (
+            "Your credit balance is too low to access the Anthropic API. "
+            "Please go to Plans & Billing to upgrade or purchase credits."
+        )
+        response = httpx.Response(
+            400, request=httpx.Request("POST", "https://api.anthropic.com")
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = anthropic.BadRequestError(
+            message=credit_msg, response=response, body=None
+        )
+        with (
+            patch("anthropic.Anthropic", return_value=mock_client),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            AnthropicProvider(LLMConfig(provider="anthropic")).call("prompt")
+        message = str(exc_info.value)
+        assert "credit balance is too low" in message  # the actionable cause
+        assert "HTTP 400" in message
+        assert "sk-test-not-real" not in message  # key never leaks
+
+    def test_call_5xx_withholds_body_and_suppresses_chain(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 5xx body is withheld AND its exception chain suppressed (#745).
+
+        For server errors the message is opaque and may carry internals, so it
+        is redacted to status-only. Crucially the chain is also suppressed
+        (``__cause__ is None``) so the withheld body cannot resurface via a
+        future ``logging.exception`` / ``exc_info=True`` call.
+        """
+        import anthropic
+        import httpx
+
+        _set_anthropic_env(monkeypatch)
+        response = httpx.Response(
+            500, request=httpx.Request("POST", "https://api.anthropic.com")
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = anthropic.InternalServerError(
+            message="secret internal detail", response=response, body=None
+        )
+        with (
+            patch("anthropic.Anthropic", return_value=mock_client),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            AnthropicProvider(LLMConfig(provider="anthropic")).call("prompt")
+        message = str(exc_info.value)
+        assert "secret internal detail" not in message  # body withheld
+        assert "HTTP 500" in message  # status only
+        assert exc_info.value.__cause__ is None  # chain suppressed
+
     def test_client_cached_across_calls(
         self,
         monkeypatch: pytest.MonkeyPatch,

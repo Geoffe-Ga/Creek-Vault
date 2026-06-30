@@ -206,6 +206,27 @@ def _error_detail(exc: Exception) -> str:
     return f" (HTTP {status}): {collapsed}"
 
 
+def _chain_is_safe(exc: Exception) -> bool:
+    """Whether the SDK error may remain as the wrapped ``RuntimeError.__cause__``.
+
+    True only for 4xx client errors — the same tier whose ``message``
+    :func:`_error_detail` already surfaces, so the chain exposes nothing the
+    message does not. For 5xx / unknown errors the body is deliberately
+    withheld, so the caller suppresses the chain (``raise … from None``) to keep
+    that redaction airtight even if a future caller logs with
+    ``logging.exception`` / ``exc_info=True`` (which would otherwise render
+    ``__cause__``).
+
+    Args:
+        exc: The vendor SDK exception.
+
+    Returns:
+        ``True`` when *exc* carries a 4xx status, else ``False``.
+    """
+    status = _error_status(exc)
+    return status is not None and _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN
+
+
 # Per-provider default model IDs. This matrix is the ONLY place model literals
 # live in the package — provider classes read their ``DEFAULT_MODEL`` from it
 # and other modules read the resolved value, never a literal (enforced by
@@ -346,9 +367,11 @@ class AnthropicProvider:
             The concatenated text content of the API response.
 
         Raises:
-            RuntimeError: If the SDK raises any ``AnthropicError``; the
-                original exception is re-raised as ``RuntimeError`` with
-                its type name to avoid leaking sensitive request state.
+            RuntimeError: If the SDK raises any ``AnthropicError``; re-raised
+                as ``RuntimeError`` with the exception type name and, for 4xx
+                client errors, the API's own error message (see
+                :func:`_error_detail`). 5xx / unknown bodies are withheld and
+                their exception chain suppressed to avoid leaking request state.
         """
         return self.call_with_metadata(prompt).text
 
@@ -416,9 +439,11 @@ class AnthropicProvider:
             and the SDK's token :attr:`~AnthropicCompletion.usage` when present.
 
         Raises:
-            RuntimeError: If the SDK raises any ``AnthropicError``; the
-                original exception is re-raised as ``RuntimeError`` with
-                its type name to avoid leaking sensitive request state.
+            RuntimeError: If the SDK raises any ``AnthropicError``; re-raised
+                as ``RuntimeError`` with the exception type name and, for 4xx
+                client errors, the API's own error message (see
+                :func:`_error_detail`). 5xx / unknown bodies are withheld and
+                their exception chain suppressed to avoid leaking request state.
         """
         import anthropic
 
@@ -433,7 +458,7 @@ class AnthropicProvider:
         except anthropic.AnthropicError as exc:
             detail = _error_detail(exc)
             msg = f"Anthropic API call failed: {type(exc).__name__}{detail}"
-            raise RuntimeError(msg) from exc
+            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
         stop_reason = getattr(response, "stop_reason", None) or "end_turn"
         return AnthropicCompletion(
             text=_extract_anthropic_text(response),
@@ -810,7 +835,10 @@ class OpenAIProvider:
 
         Raises:
             RuntimeError: If the SDK raises any ``OpenAIError``; re-raised with
-                only the exception type name so no request state leaks.
+                the exception type name and, for 4xx client errors, the API's
+                own error message (see :func:`_error_detail`). 5xx / unknown
+                bodies are withheld and their chain suppressed so no request
+                state leaks.
         """
         import openai
 
@@ -824,7 +852,7 @@ class OpenAIProvider:
             ) from None
         except openai.OpenAIError as exc:
             msg = f"OpenAI API call failed: {type(exc).__name__}{_error_detail(exc)}"
-            raise RuntimeError(msg) from exc
+            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
         return Completion(
             text=_extract_openai_text(response),
             stop_reason=_map_openai_stop_reason(response),
@@ -1050,7 +1078,10 @@ class GeminiProvider:
 
         Raises:
             RuntimeError: If the SDK raises any ``APIError``; re-raised with
-                only the exception type name so no request state leaks.
+                the exception type name and, for 4xx client errors, the API's
+                own error message (see :func:`_error_detail`). 5xx / unknown
+                bodies are withheld and their chain suppressed so no request
+                state leaks.
         """
         from google.genai import errors
 
@@ -1064,7 +1095,7 @@ class GeminiProvider:
                     msg, retry_after=_retry_after_seconds(exc)
                 ) from None
             msg = f"Gemini API call failed: {type(exc).__name__}{_error_detail(exc)}"
-            raise RuntimeError(msg) from exc
+            raise RuntimeError(msg) from (exc if _chain_is_safe(exc) else None)
         return Completion(
             text=_extract_gemini_text(response),
             stop_reason=_map_gemini_stop_reason(response),

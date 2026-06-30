@@ -17,7 +17,11 @@ prompt / fragment content appear.
 
 from __future__ import annotations
 
-from creek.classify.llm.providers import _error_detail, _error_status
+from creek.classify.llm.providers import (
+    _chain_is_safe,
+    _error_detail,
+    _error_status,
+)
 
 
 class _FakeError(Exception):
@@ -86,3 +90,14 @@ def test_non_string_message_falls_back_to_status_only() -> None:
     err = _FakeError("ignored", status_code=400)
     err.message = None  # type: ignore[assignment]  # simulate an SDK with no message
     assert _error_detail(err) == " (HTTP 400)"
+
+
+def test_chain_is_safe_only_for_4xx() -> None:
+    """The exception chain may be kept only for 4xx (whose body we surface)."""
+    assert _chain_is_safe(_FakeError("c", status_code=400)) is True
+    assert _chain_is_safe(_FakeError("c", code=404)) is True
+    assert _chain_is_safe(_FakeError("c", status_code=499)) is True
+    # 5xx and unknown withhold the body, so the chain must be suppressed.
+    assert _chain_is_safe(_FakeError("c", status_code=500)) is False
+    assert _chain_is_safe(_FakeError("c", status_code=503)) is False
+    assert _chain_is_safe(_FakeError("c")) is False
