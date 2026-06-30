@@ -181,11 +181,14 @@ def build_server(
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
         """Return anchored Higher-Self margin notes on a single journal entry."""
+        from creek.care.guardrail import acute_distress_guard
+
         return reflect_tool(
             vault_path=vault,
             llm_factory=reflect_factory(),
             content=content,
             entry_ref=entry_ref,
+            care_guard=acute_distress_guard,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
+from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
@@ -198,7 +199,9 @@ def _build_prompt(entry: str, grounding: list[str]) -> str:
         "Every quote MUST be copied verbatim from the ENTRY."
     )
     return (
-        "You are the writer's own Higher Self leaving warm, second-person margin "
+        CARE_POLICY
+        + "\n\n"
+        + "You are the writer's own Higher Self leaving warm, second-person margin "
         "notes on their journal entry. Mirror their wisdom back; never advise from "
         "above, never diagnose, never console with platitudes. Ground every note in "
         "their own words and the source fragments below.\n\n"
@@ -309,6 +312,7 @@ def reflect_tool(
                 "tool": TOOL_NAME,
                 "tier_ceiling": privacy_tier_ceiling.value,
                 "reason": care_reason,
+                "care_signal": CARE_SIGNAL,
             }
 
     tier = _routing_tier(privacy_tier_ceiling, entry_tier)

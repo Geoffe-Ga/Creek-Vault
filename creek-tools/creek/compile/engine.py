@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.audit import AuditLog
+from creek.care.guardrail import CARE_POLICY
 from creek.compile.provenance import ProvenanceEntry, merge_provenance
 from creek.hierarchy import (
     LevelPolicy,
@@ -345,6 +346,7 @@ def _build_prompt(
     """
     lookup: dict[str, Fragment] = by_id or {f.id: f for f, _ in pairs}
     sections: list[str] = [
+        CARE_POLICY,
         f"You are compiling a {target_kind} note titled {target_title!r}.",
         "Return JSON with two arrays: 'claims' (each having 'id', 'text', "
         "'fragment_ids') and 'paradoxes' (each having 'description', "

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from creek.care.guardrail import CARE_SIGNAL
 from creek.classify.llm.router import IntimateRoutingError
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
@@ -274,6 +275,22 @@ def test_care_guard_escalation_skips_the_llm(tmp_path: Path) -> None:
     assert result["status"] == "escalate"
     assert "reason" in result
     assert factory.asked_tier is None  # the LLM was never reached
+
+
+def test_escalation_carries_the_structured_care_signal(tmp_path: Path) -> None:
+    """Escalation never dead-ends: it returns the human-support care signal (#753)."""
+    result = reflect_tool(
+        vault_path=_vault(tmp_path),
+        content="a hard entry",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        care_guard=lambda text: "acute_distress_markers",
+    )
+    assert result["status"] == "escalate"
+    assert result["care_signal"] == CARE_SIGNAL
+    assert result["care_signal"]["kind"] == "acute_distress"
+    assert result["care_signal"]["resources"]  # points to human/professional support
 
 
 def test_empty_content_is_refused(tmp_path: Path) -> None:

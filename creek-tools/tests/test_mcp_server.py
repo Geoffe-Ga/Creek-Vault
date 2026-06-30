@@ -136,6 +136,32 @@ def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
     assert structured["notes"][0]["quote"] == "I rest sometimes"  # type: ignore[index]
 
 
+def test_call_tool_reflect_escalates_on_acute_distress(vault: Path) -> None:
+    """The registered ``creek.reflect`` wires the real care guard (#753).
+
+    Acute-distress content must escalate with the structured care signal and
+    never reach the (injected) LLM — proving ``server.py`` threads
+    ``acute_distress_guard`` into ``reflect_tool``.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+        reflect_llm_factory=lambda: lambda tier: lambda prompt: '{"notes": []}',
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.reflect",
+            {
+                "content": "I am going to kill myself tonight.",
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "escalate"
+    assert structured["care_signal"]["kind"] == "acute_distress"  # type: ignore[index]
+
+
 def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None:
     """End-to-end: ``creek.wheel`` returns a complete F1-F10 balance map.
 
