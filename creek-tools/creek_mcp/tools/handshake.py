@@ -23,10 +23,6 @@ from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.tier_ceiling import TierCeiling
 
 TOOL_NAME = "creek.handshake"
-SERVER_NAME = "creek-tools-mcp"
-"""Mirrors ``creek_mcp.server.SERVER_NAME``; duplicated to avoid a circular import
-(``server`` imports this module)."""
-
 _CREEK_MARKER = Path("00-Creek-Meta")
 TRANSPORT = "stdio"
 
@@ -45,6 +41,7 @@ def handshake_tool(
     *,
     vault_path: Path,
     capabilities: list[str],
+    server_name: str,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
 ) -> dict[str, Any]:
@@ -61,6 +58,8 @@ def handshake_tool(
             determines ``available``.
         capabilities: The tool names the server actually registered — supplied
             by ``build_server`` so the list cannot drift.
+        server_name: The MCP server's name, injected by ``build_server`` (its
+            ``SERVER_NAME``) so this module need not duplicate the literal.
         privacy_tier_ceiling: The ceiling the caller declared; recorded and
             echoed. Handshake returns no fragment content, so the ceiling does
             not gate anything here, but it is audited like every other call.
@@ -83,7 +82,7 @@ def handshake_tool(
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": privacy_tier_ceiling.value,
-        "server": SERVER_NAME,
+        "server": server_name,
         "transport": TRANSPORT,
         "available": available,
         "contract_version": CONTRACT_VERSION,

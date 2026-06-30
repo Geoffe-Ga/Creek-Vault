@@ -131,6 +131,7 @@ def build_server(
         return handshake_tool(
             vault_path=vault,
             capabilities=sorted(tool.name for tool in tools),
+            server_name=SERVER_NAME,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )
