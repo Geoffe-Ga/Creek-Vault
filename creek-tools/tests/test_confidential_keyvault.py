@@ -24,8 +24,14 @@ from typing import TYPE_CHECKING
 import pytest
 
 from creek.confidential.keyvault import (
+    _AAD_PASSPHRASE,
+    _AAD_RECOVERY,
     KeyVault,
     UnlockError,
+    _decode_recovery,
+    _derive_passphrase_kek,
+    _derive_recovery_kek,
+    _unwrap,
     create_key_vault,
     load_key_vault,
     save_key_vault,
@@ -145,6 +151,57 @@ def test_from_dict_accepts_in_bounds_params_and_unlocks() -> None:
     reloaded = KeyVault.from_dict(json.loads(json.dumps(setup.vault.to_dict())))
     vmk = unlock_with_passphrase(reloaded, _PASSPHRASE)
     assert unlock_with_recovery(reloaded, setup.recovery_key) == vmk
+
+
+def test_swapping_wrapped_copies_fails_closed() -> None:
+    """Moving a wrapped copy into the other unwrap slot is rejected (AAD binding).
+
+    Each wrapped VMK copy is bound to a distinct AEAD AAD, so a passphrase-wrapped
+    ciphertext placed in the recovery slot (and vice versa) cannot be unwrapped by
+    either path — it fails closed with ``UnlockError``.
+    """
+    setup = create_key_vault(_PASSPHRASE)
+    data = json.loads(json.dumps(setup.vault.to_dict()))
+    data["passphrase_wrapped"], data["recovery_wrapped"] = (
+        data["recovery_wrapped"],
+        data["passphrase_wrapped"],
+    )
+    swapped = KeyVault.from_dict(data)
+    with pytest.raises(UnlockError):
+        unlock_with_passphrase(swapped, _PASSPHRASE)
+    with pytest.raises(UnlockError):
+        unlock_with_recovery(swapped, setup.recovery_key)
+
+
+def test_aad_domain_separation_holds_even_with_the_correct_kek() -> None:
+    """The AAD alone separates the paths: the *right* KEK + the *wrong* AAD fails.
+
+    This isolates the AAD from the KEK — each wrapped copy is unwrapped with its
+    genuine key-encryption key, but with the *other* path's AAD, and must still
+    fail closed. That proves the domain separation comes from the AAD, not merely
+    from the two paths using different KEKs.
+    """
+    setup = create_key_vault(_PASSPHRASE)
+    vault = setup.vault
+
+    passphrase_kek = _derive_passphrase_kek(
+        _PASSPHRASE,
+        vault.salt,
+        time_cost=vault.time_cost,
+        lanes=vault.lanes,
+        memory_kib=vault.memory_kib,
+    )
+    recovery_kek = _derive_recovery_kek(_decode_recovery(setup.recovery_key))
+
+    # Sanity: each genuine (KEK, AAD) pairing unwraps to the same VMK.
+    vmk = _unwrap(passphrase_kek, vault.passphrase_wrapped, _AAD_PASSPHRASE)
+    assert _unwrap(recovery_kek, vault.recovery_wrapped, _AAD_RECOVERY) == vmk
+
+    # Correct KEK, but the other path's AAD → fails closed (domain separation).
+    with pytest.raises(UnlockError):
+        _unwrap(passphrase_kek, vault.passphrase_wrapped, _AAD_RECOVERY)
+    with pytest.raises(UnlockError):
+        _unwrap(recovery_kek, vault.recovery_wrapped, _AAD_PASSPHRASE)
 
 
 def test_empty_passphrase_is_rejected() -> None:
