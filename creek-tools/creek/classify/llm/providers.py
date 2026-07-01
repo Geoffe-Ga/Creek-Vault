@@ -18,9 +18,12 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import secrets
 from typing import TYPE_CHECKING
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from creek.classify.llm.completion import AnthropicCompletion, Completion
 from creek.classify.llm.consent import (
@@ -711,14 +714,32 @@ class OllamaProvider:
 ENCLAVE_ATTESTATION_PATH: str = "/attestation"
 ENCLAVE_GENERATE_PATH: str = "/generate"
 
+#: Bytes of entropy in the per-call attestation nonce (anti-replay challenge).
+_ENCLAVE_NONCE_BYTES: int = 32
+
 # Fixed refusal messages, kept out of the ``raise`` sites so the exception carries
 # a stable string and no long literal sits at the raise (tryceratops TRY003).
 _ENCLAVE_NO_URL = "enclave provider requires enclave_url; refusing to send data"
+_ENCLAVE_INSECURE = (
+    "enclave_url must use https:// (attestation and prompts require TLS); "
+    "refusing to send data"
+)
 _ENCLAVE_NO_POLICY = (
     "enclave provider requires enclave_expected_measurement (attestation policy); "
     "refusing to send data"
 )
+_ENCLAVE_NO_TRUST_ROOT = (
+    "enclave provider requires enclave_attestation_pubkey (trust root); "
+    "refusing to send data"
+)
 _ENCLAVE_UNVERIFIED = "enclave attestation could not be verified; refusing to send data"
+_ENCLAVE_STALE = (
+    "enclave attestation nonce mismatch (stale/replayed quote); refusing to send data"
+)
+_ENCLAVE_BAD_SIGNATURE = (
+    "enclave attestation signature is not valid under the configured trust root; "
+    "refusing to send data"
+)
 _ENCLAVE_MISMATCH = "enclave attestation measurement mismatch; refusing to send data"
 
 
@@ -732,43 +753,143 @@ class EnclaveAttestationError(RuntimeError):
     """
 
 
-def verify_enclave_attestation(config: LLMConfig, *, timeout: float) -> None:
-    """Verify the enclave's remote attestation *before* any prompt egress.
+def _attestation_signed_payload(measurement: str, nonce: str) -> bytes:
+    """Return the exact bytes the enclave signs: measurement bound to the nonce.
 
-    This is the "attest, then mount" gate that lets the enclave be classified
-    ``is_cloud=False``: it fetches the enclave's attestation quote from
-    ``{enclave_url}/attestation`` and requires the attested measurement to equal
-    ``config.enclave_expected_measurement`` (constant-time compare). It refuses —
-    raising :class:`EnclaveAttestationError`, never returning — when the endpoint
-    or policy is unconfigured, the quote is unreachable, or the measurement does
-    not match. Callers MUST invoke this before sending any prompt so a failure
-    can never fall back to plaintext egress.
+    Domain-separated (newline between fields) so a measurement value can never be
+    reinterpreted as part of the nonce or vice versa.
+    """
+    return f"creek-enclave-attestation\n{measurement}\n{nonce}".encode()
+
+
+def _load_attestation_pubkey(pubkey_hex: str) -> Ed25519PublicKey:
+    """Load the configured hex-encoded Ed25519 trust-root public key."""
+    return Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+
+
+def _fetch_attestation_quote(
+    url: str, nonce: str, *, timeout: float
+) -> dict[str, object]:
+    """Challenge the enclave with *nonce* and return its attestation quote.
 
     Args:
-        config: LLM configuration carrying ``enclave_url`` and
-            ``enclave_expected_measurement``.
-        timeout: HTTP timeout for the attestation fetch, in seconds.
+        url: The enclave base URL (already validated as ``https://``).
+        nonce: The fresh anti-replay challenge sent to the enclave.
+        timeout: HTTP timeout, in seconds.
+
+    Returns:
+        The parsed attestation quote (``measurement`` / ``nonce`` / ``signature``).
 
     Raises:
-        EnclaveAttestationError: On any unconfigured, unreachable, or mismatched
-            attestation — egress is refused.
+        EnclaveAttestationError: When the quote cannot be fetched or parsed.
     """
-    if not config.enclave_url:
-        raise EnclaveAttestationError(_ENCLAVE_NO_URL)
-    if not config.enclave_expected_measurement:
-        raise EnclaveAttestationError(_ENCLAVE_NO_POLICY)
     try:
         with httpx.Client(timeout=timeout) as client:
-            resp = client.get(f"{config.enclave_url}{ENCLAVE_ATTESTATION_PATH}")
+            resp = client.get(
+                f"{url}{ENCLAVE_ATTESTATION_PATH}", params={"nonce": nonce}
+            )
             resp.raise_for_status()
             quote = resp.json()
     except httpx.HTTPError as exc:
         raise EnclaveAttestationError(_ENCLAVE_UNVERIFIED) from exc
-    measured = str(quote.get("measurement", "")) if isinstance(quote, dict) else ""
-    if not measured or not hmac.compare_digest(
-        measured, config.enclave_expected_measurement
-    ):
+    if not isinstance(quote, dict):
+        raise EnclaveAttestationError(_ENCLAVE_UNVERIFIED)
+    return quote
+
+
+def _verify_attestation_quote(
+    quote: dict[str, object],
+    *,
+    sent_nonce: str,
+    expected_measurement: str,
+    pubkey_hex: str,
+) -> None:
+    """Cryptographically verify a fetched attestation quote, or refuse.
+
+    In order: the quote must echo the fresh nonce (freshness / anti-replay); its
+    signature over ``measurement || nonce`` must validate under the configured
+    trust-root key (authenticity / integrity — an impersonator without the
+    private key cannot forge this); and the attested measurement must equal the
+    configured expectation (the enclave is the expected image).
+
+    Args:
+        quote: The parsed attestation quote from the enclave.
+        sent_nonce: The fresh nonce this client challenged the enclave with.
+        expected_measurement: The configured measurement the enclave must present.
+        pubkey_hex: The configured hex Ed25519 trust-root public key.
+
+    Raises:
+        EnclaveAttestationError: On a stale nonce, an invalid signature, or a
+            measurement mismatch — egress is refused.
+    """
+    measurement = str(quote.get("measurement", ""))
+    returned_nonce = str(quote.get("nonce", ""))
+    signature_hex = str(quote.get("signature", ""))
+
+    if not returned_nonce or not hmac.compare_digest(returned_nonce, sent_nonce):
+        raise EnclaveAttestationError(_ENCLAVE_STALE)
+
+    try:
+        pubkey = _load_attestation_pubkey(pubkey_hex)
+        pubkey.verify(
+            bytes.fromhex(signature_hex),
+            _attestation_signed_payload(measurement, returned_nonce),
+        )
+    except (InvalidSignature, ValueError) as exc:
+        raise EnclaveAttestationError(_ENCLAVE_BAD_SIGNATURE) from exc
+
+    if not measurement or not hmac.compare_digest(measurement, expected_measurement):
         raise EnclaveAttestationError(_ENCLAVE_MISMATCH)
+
+
+def verify_enclave_attestation(config: LLMConfig, *, timeout: float) -> None:
+    """Cryptographically verify the enclave's attestation *before* any egress.
+
+    This is the "attest, then mount" gate that justifies classifying the enclave
+    ``is_cloud=False``. It challenges the enclave with a fresh random nonce over
+    an ``https://`` channel, fetches the signed attestation quote, and refuses —
+    raising :class:`EnclaveAttestationError`, never returning — unless **all** of
+    the following hold, so a failure can never fall back to plaintext egress:
+
+    - ``enclave_url`` is configured and uses ``https://`` (TLS-protected);
+    - an attestation policy (``enclave_expected_measurement``) and a trust root
+      (``enclave_attestation_pubkey``) are configured;
+    - the quote echoes the fresh nonce (freshness — an old quote cannot be
+      replayed);
+    - the quote's signature over ``measurement || nonce`` validates under the
+      configured Ed25519 trust-root key (authenticity — an impersonator without
+      the private key cannot forge it);
+    - the attested measurement equals the configured expectation.
+
+    The trust root is the operator-provisioned public key, not a full vendor
+    certificate chain; see ADR-0006 for the trust model and its boundaries.
+
+    Args:
+        config: LLM configuration carrying the enclave URL, attestation policy,
+            and trust-root public key.
+        timeout: HTTP timeout for the attestation fetch, in seconds.
+
+    Raises:
+        EnclaveAttestationError: On any missing prerequisite, insecure transport,
+            unreachable quote, stale nonce, bad signature, or measurement
+            mismatch — egress is refused.
+    """
+    if not config.enclave_url:
+        raise EnclaveAttestationError(_ENCLAVE_NO_URL)
+    if not config.enclave_url.lower().startswith("https://"):
+        raise EnclaveAttestationError(_ENCLAVE_INSECURE)
+    if not config.enclave_expected_measurement:
+        raise EnclaveAttestationError(_ENCLAVE_NO_POLICY)
+    if not config.enclave_attestation_pubkey:
+        raise EnclaveAttestationError(_ENCLAVE_NO_TRUST_ROOT)
+    nonce = secrets.token_hex(_ENCLAVE_NONCE_BYTES)
+    quote = _fetch_attestation_quote(config.enclave_url, nonce, timeout=timeout)
+    _verify_attestation_quote(
+        quote,
+        sent_nonce=nonce,
+        expected_measurement=config.enclave_expected_measurement,
+        pubkey_hex=config.enclave_attestation_pubkey,
+    )
 
 
 def call_enclave(
@@ -820,11 +941,13 @@ class EnclaveProvider:
 
     Sends prompts to a remote confidential-compute endpoint, yet is classified
     ``is_cloud=False`` because :func:`verify_enclave_attestation` runs before
-    every :meth:`complete` call: remote attestation proves the enclave is the
-    expected, operator-unreadable image before any prompt or key leaves the
-    device. This is what lets INTIMATE-tier content get GPU-quality voice output
-    without egressing to a readable cloud — the attestation gate, not a bare
-    flag, is the security boundary (issue #760, decision #757/#755).
+    every :meth:`complete` call: it cryptographically verifies — over ``https``,
+    against an operator-configured Ed25519 trust root, bound to a fresh nonce —
+    that the enclave is the expected confidential-compute image before any prompt
+    or key leaves the device. This is what lets INTIMATE-tier content get
+    GPU-quality voice output without egressing to a readable cloud — the
+    attestation gate, not a bare flag, is the security boundary (issue #760,
+    decision #757/#755; trust model in ADR-0006).
 
     Attributes:
         config: The LLM configuration carrying the enclave URL, attestation

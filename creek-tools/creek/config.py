@@ -133,6 +133,18 @@ class LLMConfig(BaseModel):
     content because the measurement gate stands in front of every call. ``None``
     means no attestation policy is configured, and the provider fails closed."""
 
+    enclave_attestation_pubkey: str | None = None
+    """Hex-encoded Ed25519 **public** key that anchors the enclave attestation.
+
+    The root of trust: the enclave signs each attestation quote (its measurement
+    bound to a fresh, caller-supplied nonce) with the matching private key, and
+    the provider verifies that signature against this public key before any prompt
+    egresses. This is what makes the attestation *cryptographic* rather than a
+    bare string match — an impersonator without the private key cannot forge a
+    quote, and the nonce defeats replay. It is a **public** key, so it is not a
+    secret; ``None`` means no trust anchor is configured and the provider fails
+    closed. See ADR-0006."""
+
     batch_size: int = 50
     """Number of items to process per LLM batch call."""
 
