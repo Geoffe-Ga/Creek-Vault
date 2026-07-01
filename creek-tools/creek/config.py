@@ -117,6 +117,22 @@ class LLMConfig(BaseModel):
     OpenAI-compatible gateway). ``None`` lets the SDK use its default endpoint
     or its own ``*_BASE_URL`` environment variable. Never holds a secret."""
 
+    enclave_url: str | None = None
+    """Base URL of the attested GPU-CC enclave endpoint (provider ``enclave``).
+
+    The enclave provider verifies remote attestation at ``{enclave_url}/attestation``
+    before sending any prompt to ``{enclave_url}/generate``. ``None`` means the
+    enclave is unconfigured and the provider refuses to run. Never holds a secret."""
+
+    enclave_expected_measurement: str | None = None
+    """The attestation measurement the enclave must present before any egress.
+
+    This is the "attest, then mount" policy: the ``enclave`` provider refuses to
+    send a prompt unless the enclave's attested measurement equals this value, so
+    ``is_cloud=False`` is defended in code — a mis-set flag cannot leak intimate
+    content because the measurement gate stands in front of every call. ``None``
+    means no attestation policy is configured, and the provider fails closed."""
+
     batch_size: int = 50
     """Number of items to process per LLM batch call."""
 

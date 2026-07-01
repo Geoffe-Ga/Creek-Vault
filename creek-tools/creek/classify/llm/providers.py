@@ -15,6 +15,7 @@ exception handling.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -48,15 +49,19 @@ __all__ = [
     "AnthropicCompletion",
     "AnthropicProvider",
     "Completion",
+    "EnclaveAttestationError",
+    "EnclaveProvider",
     "GeminiProvider",
     "OllamaProvider",
     "OpenAIProvider",
     "ProviderRateLimitError",
     "build_provider",
+    "call_enclave",
     "cloud_warning",
     "known_providers",
     "provider_display_name",
     "provider_is_cloud",
+    "verify_enclave_attestation",
 ]
 
 
@@ -234,6 +239,7 @@ def _chain_is_safe(exc: Exception) -> bool:
 # so "introduce another model" is a one-place edit in both packages.
 DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
+    "enclave": "llama-3.3-70b",
     "gemini": "gemini-3.5-flash",
     "ollama": "mistral",
     "openai": "gpt-5.4",
@@ -697,6 +703,217 @@ class OllamaProvider:
             self.config,
             prompt,
             timeout=self.REQUEST_TIMEOUT,
+        )
+        return Completion(text=text)
+
+
+#: Endpoint paths on the attested GPU-CC enclave (#760).
+ENCLAVE_ATTESTATION_PATH: str = "/attestation"
+ENCLAVE_GENERATE_PATH: str = "/generate"
+
+# Fixed refusal messages, kept out of the ``raise`` sites so the exception carries
+# a stable string and no long literal sits at the raise (tryceratops TRY003).
+_ENCLAVE_NO_URL = "enclave provider requires enclave_url; refusing to send data"
+_ENCLAVE_NO_POLICY = (
+    "enclave provider requires enclave_expected_measurement (attestation policy); "
+    "refusing to send data"
+)
+_ENCLAVE_UNVERIFIED = "enclave attestation could not be verified; refusing to send data"
+_ENCLAVE_MISMATCH = "enclave attestation measurement mismatch; refusing to send data"
+
+
+class EnclaveAttestationError(RuntimeError):
+    """Raised when the GPU-CC enclave cannot be attested — egress is refused.
+
+    A subclass of :class:`RuntimeError` so the classifier's existing
+    retry/degradation handling (which catches ``RuntimeError``) treats a failed
+    attestation as provider-unavailable rather than crashing — but the fail is
+    always *closed*: no prompt is ever sent when this is raised.
+    """
+
+
+def verify_enclave_attestation(config: LLMConfig, *, timeout: float) -> None:
+    """Verify the enclave's remote attestation *before* any prompt egress.
+
+    This is the "attest, then mount" gate that lets the enclave be classified
+    ``is_cloud=False``: it fetches the enclave's attestation quote from
+    ``{enclave_url}/attestation`` and requires the attested measurement to equal
+    ``config.enclave_expected_measurement`` (constant-time compare). It refuses —
+    raising :class:`EnclaveAttestationError`, never returning — when the endpoint
+    or policy is unconfigured, the quote is unreachable, or the measurement does
+    not match. Callers MUST invoke this before sending any prompt so a failure
+    can never fall back to plaintext egress.
+
+    Args:
+        config: LLM configuration carrying ``enclave_url`` and
+            ``enclave_expected_measurement``.
+        timeout: HTTP timeout for the attestation fetch, in seconds.
+
+    Raises:
+        EnclaveAttestationError: On any unconfigured, unreachable, or mismatched
+            attestation — egress is refused.
+    """
+    if not config.enclave_url:
+        raise EnclaveAttestationError(_ENCLAVE_NO_URL)
+    if not config.enclave_expected_measurement:
+        raise EnclaveAttestationError(_ENCLAVE_NO_POLICY)
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(f"{config.enclave_url}{ENCLAVE_ATTESTATION_PATH}")
+            resp.raise_for_status()
+            quote = resp.json()
+    except httpx.HTTPError as exc:
+        raise EnclaveAttestationError(_ENCLAVE_UNVERIFIED) from exc
+    measured = str(quote.get("measurement", "")) if isinstance(quote, dict) else ""
+    if not measured or not hmac.compare_digest(
+        measured, config.enclave_expected_measurement
+    ):
+        raise EnclaveAttestationError(_ENCLAVE_MISMATCH)
+
+
+def call_enclave(
+    config: LLMConfig,
+    prompt: str,
+    *,
+    timeout: float,
+    max_tokens: int | None = None,
+    system: str | None = None,
+) -> str:
+    """Send *prompt* to the attested enclave's generate endpoint and return text.
+
+    The caller (:meth:`EnclaveProvider.complete`) MUST have verified attestation
+    first; this helper performs no gating of its own.
+
+    Args:
+        config: LLM configuration carrying ``enclave_url`` and model name.
+        prompt: The fully-formatted prompt.
+        timeout: HTTP request timeout, in seconds.
+        max_tokens: Optional output ceiling forwarded to the enclave.
+        system: Optional system prompt forwarded to the enclave.
+
+    Returns:
+        The raw response text from the enclave.
+
+    Raises:
+        httpx.HTTPError: On connection, transport, or HTTP error responses.
+    """
+    payload: dict[str, object] = {
+        "model": _resolve_configured_model(config.model, DEFAULT_MODELS["enclave"]),
+        "prompt": prompt,
+        "stream": False,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if system is not None:
+        payload["system"] = system
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(
+            f"{config.enclave_url}{ENCLAVE_GENERATE_PATH}", json=payload
+        )
+        response.raise_for_status()
+        data = response.json()
+        return str(data.get("response", ""))
+
+
+class EnclaveProvider:
+    """Attested GPU-CC enclave provider — ``is_cloud=False`` via attest-then-mount.
+
+    Sends prompts to a remote confidential-compute endpoint, yet is classified
+    ``is_cloud=False`` because :func:`verify_enclave_attestation` runs before
+    every :meth:`complete` call: remote attestation proves the enclave is the
+    expected, operator-unreadable image before any prompt or key leaves the
+    device. This is what lets INTIMATE-tier content get GPU-quality voice output
+    without egressing to a readable cloud — the attestation gate, not a bare
+    flag, is the security boundary (issue #760, decision #757/#755).
+
+    Attributes:
+        config: The LLM configuration carrying the enclave URL, attestation
+            policy, and model name.
+    """
+
+    is_cloud: bool = False
+    """The enclave is operator-unreadable once attested; content stays private."""
+
+    PROVIDER_NAME: str = "Enclave (GPU-CC)"
+    """Display name for the confidential-compute endpoint."""
+
+    DEFAULT_MODEL: str = DEFAULT_MODELS["enclave"]
+    """Default model served by the enclave when the config does not override it."""
+
+    REQUEST_TIMEOUT: float = 120.0
+    """HTTP request timeout for completion calls, in seconds."""
+
+    ATTESTATION_TIMEOUT: float = 10.0
+    """Timeout for the attestation-quote fetch, in seconds."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Store the configuration; performs no network I/O.
+
+        Attestation runs at call time (in :meth:`complete`/:attr:`available`) so
+        each egress is gated on a fresh quote — an enclave can be replaced
+        between calls, so a single construction-time check would be stale.
+
+        Args:
+            config: LLM provider configuration (enclave URL + attestation policy).
+        """
+        self.config = config
+
+    @property
+    def model(self) -> str:
+        """The configured enclave model identifier.
+
+        Returns:
+            ``config.model`` verbatim when set; :attr:`DEFAULT_MODEL` when unset.
+        """
+        return _resolve_configured_model(self.config.model, self.DEFAULT_MODEL)
+
+    @property
+    def available(self) -> bool:
+        """Whether the enclave is configured and currently attests successfully.
+
+        Returns:
+            ``True`` when a fresh attestation verifies; ``False`` otherwise (the
+            provider then reports unavailable rather than sending any data).
+        """
+        try:
+            verify_enclave_attestation(self.config, timeout=self.ATTESTATION_TIMEOUT)
+        except EnclaveAttestationError:
+            return False
+        return True
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Attest the enclave, then send *prompt* and return a :class:`Completion`.
+
+        Attestation is verified **first**; on any attestation failure this raises
+        :class:`EnclaveAttestationError` and no prompt is sent — there is no
+        plaintext fallback. Only after attestation succeeds does the prompt leave
+        the device.
+
+        Args:
+            prompt: The fully-formatted prompt.
+            max_tokens: Optional output ceiling forwarded to the enclave.
+            system: Optional system prompt forwarded to the enclave.
+
+        Returns:
+            A :class:`Completion` wrapping the enclave's response text.
+
+        Raises:
+            EnclaveAttestationError: When attestation fails — egress is refused.
+            httpx.HTTPError: On a transport/HTTP error of the generate call.
+        """
+        verify_enclave_attestation(self.config, timeout=self.ATTESTATION_TIMEOUT)
+        text = call_enclave(
+            self.config,
+            prompt,
+            timeout=self.REQUEST_TIMEOUT,
+            max_tokens=max_tokens,
+            system=system,
         )
         return Completion(text=text)
 
@@ -1201,12 +1418,19 @@ def _extract_gemini_usage(response: object) -> dict[str, int] | None:
 #: union as new providers land.
 _PROVIDER_REGISTRY: dict[
     str,
-    type[AnthropicProvider | OllamaProvider | OpenAIProvider | GeminiProvider],
+    type[
+        AnthropicProvider
+        | OllamaProvider
+        | OpenAIProvider
+        | GeminiProvider
+        | EnclaveProvider
+    ],
 ] = {
     "anthropic": AnthropicProvider,
     "ollama": OllamaProvider,
     "openai": OpenAIProvider,
     "gemini": GeminiProvider,
+    "enclave": EnclaveProvider,
 }
 
 
