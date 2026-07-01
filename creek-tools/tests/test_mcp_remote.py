@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from mcp.server.auth.provider import AccessToken
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.testclient import TestClient
 
 from creek_mcp import server as server_mod
@@ -275,3 +276,122 @@ def test_streamable_http_rejects_unauthenticated_request(vault: Path) -> None:
         headers={**headers, "Authorization": "Bearer wrong"},
     )
     assert bad_token.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Over-the-wire happy path: a valid bearer drives a full tools/call through the
+# REAL streamable-http + auth middleware (not a monkeypatched context var).
+# --------------------------------------------------------------------------- #
+
+_WIRE_TOKEN = "over-the-wire-consumer-secret"  # fake test literal, not a real key
+
+
+def _network_server(vault: Path, token: str) -> object:
+    """Build a network server; disable DNS-rebinding host-check for the in-test host.
+
+    The host validation is a separate concern from the auth path under test here,
+    and TestClient's synthetic ``testserver`` host would otherwise be rejected
+    before the request reaches the auth middleware.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+        token_verifier=ConsumerTokenVerifier({"adepthood": token}),
+    )
+    server.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
+    return server
+
+
+def _sse_result(body: str) -> dict[str, object]:
+    """Extract the JSON-RPC ``result`` from a streamable-http SSE response body."""
+    payloads = [
+        line[len("data:") :].strip()
+        for line in body.splitlines()
+        if line.startswith("data:")
+    ]
+    return json.loads(payloads[-1])["result"]  # type: ignore[no-any-return]
+
+
+def _open_authenticated_session(
+    client: TestClient, path: str, token: str
+) -> dict[str, str]:
+    """Run the MCP ``initialize`` handshake; return headers carrying the session id."""
+    base = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    init = client.post(
+        path,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        },
+        headers=base,
+    )
+    assert init.status_code == 200
+    headers = {**base, "mcp-session-id": init.headers["mcp-session-id"]}
+    ack = client.post(
+        path,
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        headers=headers,
+    )
+    assert ack.status_code == 202
+    return headers
+
+
+def _wire_call(
+    client: TestClient, path: str, headers: dict[str, str], ceiling: str
+) -> dict[str, object]:
+    """Invoke ``creek.wheel`` over the wire at *ceiling*; return the structured part."""
+    resp = client.post(
+        path,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "creek.wheel",
+                "arguments": {"privacy_tier_ceiling": ceiling},
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    result = _sse_result(resp.text)
+    return result["structuredContent"]  # type: ignore[index, return-value]
+
+
+def test_authenticated_tools_call_dispatches_over_the_wire(vault: Path) -> None:
+    """A valid bearer + open ceiling dispatches a real tools/call through middleware."""
+    server = _network_server(vault, _WIRE_TOKEN)
+    path = server.settings.streamable_http_path  # type: ignore[attr-defined]
+    with TestClient(server.streamable_http_app()) as client:  # type: ignore[attr-defined]
+        headers = _open_authenticated_session(client, path, _WIRE_TOKEN)
+        structured = _wire_call(client, path, headers, "open")
+    assert structured["tool"] == "creek.wheel"  # dispatched, not refused
+    assert structured.get("status") != "refused"
+
+
+def test_remote_intimate_is_refused_over_the_wire(vault: Path) -> None:
+    """The ceiling cap engages on the *real* auth path: remote intimate is refused.
+
+    ``get_access_token()`` is populated by the SDK's ``RequireAuthMiddleware`` from
+    the verified bearer — no monkeypatch — so ``_BoundedFastMCP.call_tool`` refuses
+    the over-ceiling request end-to-end, exactly as it would in production.
+    """
+    server = _network_server(vault, _WIRE_TOKEN)
+    path = server.settings.streamable_http_path  # type: ignore[attr-defined]
+    with TestClient(server.streamable_http_app()) as client:  # type: ignore[attr-defined]
+        headers = _open_authenticated_session(client, path, _WIRE_TOKEN)
+        structured = _wire_call(client, path, headers, "intimate")
+    assert structured["status"] == "refused"
+    assert "not reachable over the network" in structured["reason"]
