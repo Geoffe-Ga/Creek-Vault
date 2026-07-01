@@ -83,11 +83,16 @@ class ConsumerTokenVerifier(TokenVerifier):
         """Return the consumer's :class:`AccessToken` for a valid token, else ``None``.
 
         Iterates the whole map with constant-time compares (never a dict lookup)
-        so verification time does not depend on which token was supplied.
+        so verification time does not depend on which token was supplied. The
+        operands are compared as **UTF-8 bytes**, not ``str``: ``compare_digest``
+        raises ``TypeError`` on a non-ASCII ``str`` but compares cleanly on
+        ``bytes``, so a non-ASCII bearer is *rejected* (returns ``None``) rather
+        than crashing verification (#776).
         """
+        supplied = token.encode("utf-8")
         matched: str | None = None
         for consumer, known in self._tokens.items():
-            if hmac.compare_digest(token, known):
+            if hmac.compare_digest(supplied, known.encode("utf-8")):
                 matched = consumer
         if matched is None:
             return None

@@ -109,7 +109,16 @@ class _BoundedFastMCP(FastMCP):
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> Sequence[ContentBlock] | dict[str, Any]:
-        """Refuse over-ceiling remote calls, else dispatch normally."""
+        """Refuse over-ceiling remote calls, else dispatch normally.
+
+        Note: this ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
+        they declare no ``privacy_tier_ceiling`` parameter, so ``arguments.get``
+        below always falls back to ``OPEN`` (admitted) for them. That is
+        intentional: purge is not tier-scoped and is instead gated, fail-closed,
+        by ``CREEK_MCP_ELEVATED_TOKEN`` (see ``creek_mcp.auth.is_elevated`` and the
+        purge tools), which a per-consumer bearer alone does not satisfy. Do not
+        rely on this gate for purge protection.
+        """
         if _current_access_token() is not None:
             raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
             try:

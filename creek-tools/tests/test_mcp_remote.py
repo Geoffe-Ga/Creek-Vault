@@ -126,6 +126,14 @@ def test_verify_token_rejects_against_empty_map() -> None:
     assert asyncio.run(verifier.verify_token("anything")) is None
 
 
+def test_verify_token_rejects_non_ascii_bearer_cleanly() -> None:
+    """A non-ASCII bearer is rejected (``None``), never a ``TypeError`` (#776)."""
+    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    # hmac.compare_digest raises TypeError on a non-ASCII str; the byte-compare
+    # must reject cleanly instead of crashing verification.
+    assert asyncio.run(verifier.verify_token("nön-ascii-tökén")) is None
+
+
 # --------------------------------------------------------------------------- #
 # _effective_consumer — per-consumer identity
 # --------------------------------------------------------------------------- #
