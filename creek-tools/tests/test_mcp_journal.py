@@ -193,3 +193,62 @@ def test_refused_intimate_attempt_is_audited_with_tier(tmp_path: Path) -> None:
     last = _audit(vault)[-1]
     assert last["tool"] == TOOL_NAME
     assert last["args_summary"]["tier"] == "intimate"  # the attempted tier is recorded
+
+
+def test_slug_colliding_external_ids_stay_distinct(tmp_path: Path) -> None:
+    """Distinct external ids that slugify identically stay distinct (#754 review).
+
+    ``"a/b"`` and ``"a-b"`` both slug to ``a-b``; the stable stem's id hash keeps
+    them apart, so the idempotency key never collides.
+    """
+    vault = _vault(tmp_path)
+    first = journal_ingest_tool(
+        vault_path=vault,
+        content="entry A",
+        external_id="a/b",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    second = journal_ingest_tool(
+        vault_path=vault,
+        content="entry B",
+        external_id="a-b",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert first["fragment_id"] != second["fragment_id"]
+    assert len(_fragments(vault)) == 2
+
+
+def test_ingest_failure_is_refused_and_audited(tmp_path: Path) -> None:
+    """A failure inside run_ingest refuses AND leaves an audit trace (#754 review)."""
+    from creek.ingest.pipeline import IngestRunResult
+
+    def _failing_runner(**_kwargs: object) -> IngestRunResult:
+        return IngestRunResult(
+            written=0,
+            errors=["boom"],
+            discovered=1,
+            created=0,
+            updated=0,
+            unchanged=0,
+            tombed=0,
+            skipped=0,
+        )
+
+    vault = _vault(tmp_path)
+    result = journal_ingest_tool(
+        vault_path=vault,
+        content="an entry",
+        external_id="adep-009",
+        timestamp=_TS,
+        tier="personal",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+        consumer="adepthood",
+        run=_failing_runner,
+    )
+    assert result["status"] == "refused"
+    last = _audit(vault)[-1]
+    assert last["tool"] == TOOL_NAME
+    assert last["args_summary"]["tier"] == "personal"
+    assert last["created_tier"] == "personal"

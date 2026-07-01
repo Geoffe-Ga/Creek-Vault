@@ -21,6 +21,7 @@ an INTIMATE entry is stored intimate and never admitted under a lower ceiling.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,7 +36,13 @@ from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, write_tier_allowed
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from creek.ingest.pipeline import IngestRunResult
+
+    # The ingest runner seam — production is ``run_ingest``; tests inject a stub
+    # to exercise the failure path.
+    _Runner = Callable[..., IngestRunResult]
 
 TOOL_NAME = "creek.journal"
 _SOURCE_TYPE = "markdown"
@@ -50,13 +57,18 @@ _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _safe_stem(external_id: str) -> str:
-    """Return a filesystem-safe, stable stem for *external_id*.
+    """Return a filesystem-safe, *collision-free*, stable stem for *external_id*.
 
-    The mapping is deterministic so the same external id always resolves to the
-    same staged path (hence the same ledger source-key → idempotent).
+    A readable slug prefix aids debugging, but the trailing hash of the RAW
+    external id is what guarantees the mapping is injective — two distinct ids
+    that slug to the same string (e.g. ``"a/b"`` and ``"a-b"``) still get
+    distinct stems, so the idempotency key never collides. Deterministic, so the
+    same external id always resolves to the same staged path (hence the same
+    ledger source-key → idempotent re-send / edit-in-place).
     """
-    stem = _SLUG_RE.sub("-", external_id).strip("-")
-    return stem or "entry"
+    slug = _SLUG_RE.sub("-", external_id).strip("-")[:80]
+    digest = hashlib.sha256(external_id.encode("utf-8")).hexdigest()[:12]
+    return f"{slug}-{digest}" if slug else digest
 
 
 def _stage_entry(
@@ -102,6 +114,7 @@ def journal_ingest_tool(
     tier: str = "open",
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
+    run: _Runner | None = None,
 ) -> dict[str, Any]:
     """Ingest one Adepthood journal entry as a vault fragment (idempotently).
 
@@ -156,8 +169,9 @@ def journal_ingest_tool(
 
     ts = timestamp or datetime.now(UTC).isoformat()
     staged = _stage_entry(vault_path, external_id, content, ts, entry_tier)
+    runner = run if run is not None else run_ingest
     try:
-        result = run_ingest(
+        result = runner(
             ingestor_cls=MarkdownIngestor,
             source_type=_SOURCE_TYPE,
             input_path=staged,
@@ -168,6 +182,15 @@ def journal_ingest_tool(
             tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason="vault unavailable"
         )
     if result.errors:
+        # Content was staged and tier-allowed but the write failed — audit the
+        # attempt (with its tier) so the failure leaves a trace, like ingest_tool.
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args=audit_args,
+            tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+            created_tier=entry_tier.value,
+        )
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
