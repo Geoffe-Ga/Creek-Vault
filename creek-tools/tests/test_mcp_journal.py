@@ -158,17 +158,38 @@ def test_empty_content_is_refused(tmp_path: Path) -> None:
     assert result["status"] == "refused"
 
 
-def test_journal_is_audit_logged(tmp_path: Path) -> None:
-    """The ingest is audit-logged with the tool name and consumer."""
+def test_journal_success_audit_records_tier_and_fragment(tmp_path: Path) -> None:
+    """The success audit records the tier and the fragment it wrote (#754 review)."""
     vault = _vault(tmp_path)
-    journal_ingest_tool(
+    result = journal_ingest_tool(
         vault_path=vault,
         content="an entry",
         external_id="adep-007",
         timestamp=_TS,
+        tier="personal",
         privacy_tier_ceiling=TierCeiling.PERSONAL,
         consumer="adepthood",
     )
     last = _audit(vault)[-1]
     assert last["tool"] == TOOL_NAME
     assert last["consumer"] == "adepthood"
+    assert last["args_summary"]["tier"] == "personal"
+    assert last["created_tier"] == "personal"
+    assert last["affected_fragment_ids"] == [result["fragment_id"]]
+
+
+def test_refused_intimate_attempt_is_audited_with_tier(tmp_path: Path) -> None:
+    """A refused INTIMATE attempt is audited (with its tier) so it is investigable."""
+    vault = _vault(tmp_path)
+    journal_ingest_tool(
+        vault_path=vault,
+        content="tender",
+        external_id="adep-008",
+        timestamp=_TS,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="adepthood",
+    )
+    last = _audit(vault)[-1]
+    assert last["tool"] == TOOL_NAME
+    assert last["args_summary"]["tier"] == "intimate"  # the attempted tier is recorded

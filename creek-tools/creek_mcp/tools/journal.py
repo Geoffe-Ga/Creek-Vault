@@ -43,6 +43,9 @@ _SOURCE_TYPE = "markdown"
 # makes the markdown ingestor classify them as SourcePlatform.JOURNAL; the
 # ``adepthood`` segment identifies the source in each fragment's origin_key.
 _JOURNAL_INBOX = Path("00-Creek-Meta/adepthood/journal")
+# Where JOURNAL-platform fragments are routed by the writer — recorded as the
+# audit ``created_path`` (mirrors ingest_tool's dir-level created_path).
+_FRAGMENT_ROUTING_DIR = Path("01-Fragments/Journal")
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -118,13 +121,10 @@ def journal_ingest_tool(
         on success (``action`` ∈ ``created``/``updated``/``unchanged``), or a
         structured refusal.
     """
-    MCPAuditLog(vault_path).append(
-        tool=TOOL_NAME,
-        args={"external_id": external_id[:64], "has_timestamp": timestamp is not None},
-        tier_ceiling=privacy_tier_ceiling,
-        consumer=consumer,
-    )
-
+    # Malformed calls (blank content/id, unknown tier) refuse without an audit
+    # entry, mirroring save_tool/ingest_tool — there is no meaningful tier to
+    # record yet. The tier-ceiling refusal and success DO audit (below), since
+    # the audit trail is how a privacy-tier violation would be investigated.
     if not content.strip() or not external_id.strip():
         return refusal_response(
             tool=TOOL_NAME,
@@ -139,7 +139,15 @@ def journal_ingest_tool(
             ceiling=privacy_tier_ceiling,
             reason=f"unknown tier {tier!r}",
         )
+
+    audit_args = {"external_id": external_id[:64], "tier": tier}
     if not write_tier_allowed(entry_tier, privacy_tier_ceiling):
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args=audit_args,
+            tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
@@ -166,12 +174,22 @@ def journal_ingest_tool(
             reason=f"ingest failed: {result.errors[0]}",
         )
 
+    fragment_id = _resolve_fragment_id(vault_path, staged)
+    MCPAuditLog(vault_path).append(
+        tool=TOOL_NAME,
+        args=audit_args,
+        tier_ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+        created_path=str(_FRAGMENT_ROUTING_DIR),
+        created_tier=entry_tier.value,
+        affected_fragment_ids=[fragment_id] if fragment_id else [],
+    )
     return {
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": privacy_tier_ceiling.value,
         "external_id": external_id,
-        "fragment_id": _resolve_fragment_id(vault_path, staged),
+        "fragment_id": fragment_id,
         "action": _action_of(result),
         "tier": entry_tier.value,
     }
