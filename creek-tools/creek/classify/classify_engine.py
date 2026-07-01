@@ -28,7 +28,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
@@ -77,7 +80,7 @@ _PROCESSING_LOG_SUBDIR = ("00-Creek-Meta", "Processing-Log")
 """Per-vault subdirectory carrying the LLM progress + trace logs."""
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from creek.config import ClassificationConfig, CreekConfig, LLMConfig
 
@@ -308,19 +311,7 @@ def run_classify(
     # #647). Resolving here also fails the run loudly (IntimateRoutingError) when
     # classification is cloud and no local default exists to route Intimate to.
     tier_classifiers = build_tier_classifiers(config) if method == LLM_METHOD else None
-    if tier_classifiers is not None:
-        for classifier in tier_classifiers.distinct():
-            if not classifier.available:
-                # Refuse to iterate when a provider is unreachable so the vault
-                # is never stamped with ``classification_method: llm`` for
-                # fragments the LLM never actually saw. The orchestrator already
-                # logged the provider-specific reason (missing API key, missing
-                # consent env var, Ollama down) as a WARNING; we capture it here
-                # so the remediation hint is not buried in stderr.
-                raise LLMProviderUnavailableError(
-                    provider=classifier.config.provider,
-                    detail=_describe_llm_unavailability(classifier.config.provider),
-                )
+    _assert_classifiers_available(tier_classifiers)
     counts = _RunCounts()
     progress_path: Path | None = None
     trace_log_path: Path | None = None
@@ -342,20 +333,33 @@ def run_classify(
         VaultWriter(vault_path=vault_path) if reatomize_enabled else None
     )
 
-    for md_file in sorted(fragments_root.rglob("*.md")):
-        _process_file(
-            md_file=md_file,
-            method=method,
-            force=force,
-            rules=rules,
-            audience=audience,
-            tier_classifiers=tier_classifiers,
-            classification_config=config.classification,
-            counts=counts,
-            progress_path=progress_path,
-            trace_log_path=trace_log_path,
-            vault_writer=vault_writer,
-        )
+    files = sorted(fragments_root.rglob("*.md"))
+    process_one = partial(
+        _process_file,
+        method=method,
+        force=force,
+        rules=rules,
+        audience=audience,
+        tier_classifiers=tier_classifiers,
+        classification_config=config.classification,
+        counts=counts,
+        progress_path=progress_path,
+        trace_log_path=trace_log_path,
+        vault_writer=vault_writer,
+        lock=threading.Lock(),
+    )
+
+    # Concurrency (#764): the per-fragment LLM call is network-bound, so running
+    # files through a thread pool sized by the classification stage's
+    # ``max_concurrent`` lets the calls overlap — previously this loop was serial
+    # and the knob had no effect. Re-atomization keeps a single shared writer, and
+    # the rules path is local CPU with no I/O to overlap, so both stay serial.
+    workers = (
+        config.llm.for_stage("classification").max_concurrent
+        if method == LLM_METHOD and vault_writer is None
+        else 1
+    )
+    _dispatch_files(files, process_one, workers=workers)
 
     return ClassifySummary(
         total=counts.total,
@@ -402,9 +406,60 @@ def _record_if_preserved(
     return False
 
 
-def _process_file(
+def _assert_classifiers_available(tier_classifiers: TierClassifiers | None) -> None:
+    """Raise if any per-tier classifier's provider is unreachable (#666).
+
+    Refuses to iterate when a provider is unreachable so the vault is never
+    stamped with ``classification_method: llm`` for fragments the LLM never saw.
+    The orchestrator already logged the provider-specific reason (missing key,
+    missing consent, Ollama down) as a WARNING; this surfaces the remediation
+    hint instead of burying it in stderr.
+
+    Args:
+        tier_classifiers: The per-tier classifier set, or ``None`` for rules.
+
+    Raises:
+        LLMProviderUnavailableError: When a configured provider is unavailable.
+    """
+    if tier_classifiers is None:
+        return
+    for classifier in tier_classifiers.distinct():
+        if not classifier.available:
+            raise LLMProviderUnavailableError(
+                provider=classifier.config.provider,
+                detail=_describe_llm_unavailability(classifier.config.provider),
+            )
+
+
+def _dispatch_files(
+    files: list[Path],
+    process_one: Callable[[Path], None],
     *,
+    workers: int,
+) -> None:
+    """Run *process_one* over *files* — concurrently when ``workers > 1`` (#764).
+
+    A thread pool sized by *workers* lets the network-bound per-fragment LLM
+    calls overlap; ``workers == 1`` preserves the original strictly-serial loop.
+    The map is drained so every file completes (and any error surfaces) before
+    returning.
+
+    Args:
+        files: Fragment files to process, in order.
+        process_one: Callback classifying and writing one file.
+        workers: Thread-pool width (1 = serial).
+    """
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(process_one, files))
+    else:
+        for md_file in files:
+            process_one(md_file)
+
+
+def _process_file(
     md_file: Path,
+    *,
     method: str,
     force: bool,
     rules: RuleClassifier,
@@ -415,6 +470,7 @@ def _process_file(
     progress_path: Path | None,
     trace_log_path: Path | None,
     vault_writer: VaultWriter | None,
+    lock: threading.Lock,
 ) -> None:
     """Classify a single fragment file and update ``counts`` in place.
 
@@ -445,31 +501,45 @@ def _process_file(
         vault_writer: Shared :class:`VaultWriter` for persisting
             FEAT-023 children. ``None`` when re-atomization is not
             enabled for this run.
+        lock: Guards the shared-state sections (``counts`` mutation, the
+            progress/trace-log appends, and the re-atomization writer) so this
+            function is safe to run on many worker threads at once. The
+            expensive, network-bound classify call runs *outside* the lock so
+            calls from different threads overlap — the fix for #764. An
+            uncontended lock is passed on the serial path.
     """
-    record = _load_classifiable_fragment(
-        md_file=md_file,
-        counts=counts,
-    )
-    if record is None:
-        return
-    fragment, body, raw = record
+    with lock:
+        record = _load_classifiable_fragment(
+            md_file=md_file,
+            counts=counts,
+        )
+        if record is None:
+            return
+        fragment, body, raw = record
 
-    # Per-tier routing (#666): pick the classifier for this fragment's privacy
-    # tier. ``tier_of`` fails closed to INTIMATE for an unrecognised tier, so an
-    # unknown fragment is classified locally rather than risking cloud egress.
-    llm = (
-        tier_classifiers.for_tier(tier_of(fragment))
-        if tier_classifiers is not None
-        else None
-    )
+        # Per-tier routing (#666): pick the classifier for this fragment's
+        # privacy tier. ``tier_of`` fails closed to INTIMATE for an unrecognised
+        # tier, so an unknown fragment is classified locally rather than risking
+        # cloud egress.
+        llm = (
+            tier_classifiers.for_tier(tier_of(fragment))
+            if tier_classifiers is not None
+            else None
+        )
 
-    # Skip fragments whose previous run already settled the classification.
-    # Tracked on distinct counters so the CLI summary can label "manual
-    # preserved" and "previously LLM-classified preserved" honestly
-    # (issue #321).
-    if not force and _record_if_preserved(raw, counts):
-        return
+        # Skip fragments whose previous run already settled the classification.
+        # Tracked on distinct counters so the CLI summary can label "manual
+        # preserved" and "previously LLM-classified preserved" honestly
+        # (issue #321).
+        if not force and _record_if_preserved(raw, counts):
+            return
 
+    # The provider call is the expensive, network-bound step (#764). It runs
+    # WITHOUT the lock so calls from different worker threads overlap — that is
+    # what makes ``max_concurrent`` effective. The classifiers are pre-warmed
+    # (their availability was checked before the loop) and read-only during the
+    # run, and each fragment is an independent input, so concurrent calls are
+    # safe.
     new_fragment, was_skipped, reasoning = _classify_one(
         fragment=fragment,
         body=body,
@@ -485,39 +555,42 @@ def _process_file(
     # so it runs on both the rules and LLM paths and stays idempotent.
     new_fragment = audience.classify_and_enforce(new_fragment, body)
 
-    # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
-    # True we run the orchestrator on the root fragment and persist any
-    # newly-derived child fragments. The root's frontmatter still flows
-    # through the existing write path below so the per-run provenance
-    # stamps (method, classified_at, reasoning) stay consistent with the
-    # non-reatomize code path.
-    if vault_writer is not None and not was_skipped:
-        _maybe_reatomize_and_persist(
-            root_fragment=new_fragment,
-            body=body,
-            rules=rules,
-            llm=llm,
-            classification_config=classification_config,
-            vault_writer=vault_writer,
-            counts=counts,
-        )
+    with lock:
+        # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
+        # True we run the orchestrator on the root fragment and persist any
+        # newly-derived child fragments. The root's frontmatter still flows
+        # through the existing write path below so the per-run provenance
+        # stamps (method, classified_at, reasoning) stay consistent with the
+        # non-reatomize code path. (Re-atomization runs serially — see
+        # run_classify — so the shared VaultWriter is never touched concurrently.)
+        if vault_writer is not None and not was_skipped:
+            _maybe_reatomize_and_persist(
+                root_fragment=new_fragment,
+                body=body,
+                rules=rules,
+                llm=llm,
+                classification_config=classification_config,
+                vault_writer=vault_writer,
+                counts=counts,
+            )
 
-    _finalise_fragment_write(
-        md_file=md_file,
-        new_fragment=new_fragment,
-        body=body,
-        raw=raw,
-        reasoning=reasoning,
-        method=method,
-        # The fragment's tier picked the classifier (#666); record its provider
-        # so a later quality-aware run can rank local-LLM vs cloud-LLM. Only an
-        # actual ``llm`` write keeps it (the writer clears it otherwise).
-        provider=llm.config.provider if llm is not None else None,
-        was_skipped=was_skipped,
-        counts=counts,
-        progress_path=progress_path,
-        trace_log_path=trace_log_path,
-    )
+        _finalise_fragment_write(
+            md_file=md_file,
+            new_fragment=new_fragment,
+            body=body,
+            raw=raw,
+            reasoning=reasoning,
+            method=method,
+            # The fragment's tier picked the classifier (#666); record its
+            # provider so a later quality-aware run can rank local-LLM vs
+            # cloud-LLM. Only an actual ``llm`` write keeps it (the writer
+            # clears it otherwise).
+            provider=llm.config.provider if llm is not None else None,
+            was_skipped=was_skipped,
+            counts=counts,
+            progress_path=progress_path,
+            trace_log_path=trace_log_path,
+        )
 
 
 def _load_classifiable_fragment(
