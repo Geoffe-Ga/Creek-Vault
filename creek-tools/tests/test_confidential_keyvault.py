@@ -117,6 +117,26 @@ def test_empty_passphrase_is_rejected() -> None:
         create_key_vault("")
 
 
+def test_short_passphrase_is_rejected_below_the_floor() -> None:
+    """A passphrase under the strength floor is refused with a non-leaking error."""
+    weak = "short11char"  # 11 chars — below the 12-char floor; a test literal
+    assert len(weak) < 12
+    with pytest.raises(ValueError, match="at least 12 characters") as excinfo:
+        create_key_vault(weak)
+    # The error states the requirement only — never the supplied passphrase.
+    assert weak not in str(excinfo.value)
+
+
+def test_at_floor_passphrase_is_accepted_and_unlocks_both_paths() -> None:
+    """A passphrase exactly at the floor is accepted; both unwrap paths still work."""
+    at_floor = "twelvechars!"  # exactly 12 chars — a test literal, not a secret
+    assert len(at_floor) == 12
+    setup = create_key_vault(at_floor)
+    vmk = unlock_with_passphrase(setup.vault, at_floor)
+    # The recovery-key path is unaffected by the passphrase floor.
+    assert unlock_with_recovery(setup.vault, setup.recovery_key) == vmk
+
+
 def test_each_setup_is_unique() -> None:
     """Two setups yield distinct VMKs, salts, and recovery keys (fresh randomness)."""
     a = create_key_vault(_PASSPHRASE)

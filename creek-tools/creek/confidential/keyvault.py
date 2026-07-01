@@ -50,6 +50,14 @@ _NONCE_BYTES: Final[int] = 12
 _RECOVERY_BYTES: Final[int] = 32
 """Recovery-key entropy — 256 bits of ``os.urandom``."""
 
+_MIN_PASSPHRASE_LENGTH: Final[int] = 12
+"""Minimum passphrase length accepted at setup (#770).
+
+A length floor is the cheap, dependency-free strength guard: it refuses the
+weakest passphrases without pulling in an offline strength estimator. Argon2id
+memory-hardness (below) remains the primary defence against cracking a passphrase
+that clears the floor."""
+
 # Argon2id cost parameters. Comfortably above the OWASP minimum (memory 19 MiB,
 # t=2, p=1); memory-hardness is the primary defence against offline passphrase
 # cracking. Persisted per-vault so a future increase does not lock out old vaults.
@@ -231,17 +239,19 @@ def create_key_vault(passphrase: str) -> SetupResult:
     returns; only the ciphertext-only :class:`KeyVault` should be persisted.
 
     Args:
-        passphrase: The user's passphrase. Must be non-empty.
+        passphrase: The user's passphrase. Must be at least
+            :data:`_MIN_PASSPHRASE_LENGTH` characters (this also rejects empty).
 
     Returns:
         A :class:`SetupResult` carrying the vault to persist and the recovery key
         to surface to the user exactly once.
 
     Raises:
-        ValueError: If *passphrase* is empty.
+        ValueError: If *passphrase* is shorter than the strength floor. The
+            message states only the required length, never the supplied value.
     """
-    if not passphrase:
-        msg = "passphrase must not be empty"
+    if len(passphrase) < _MIN_PASSPHRASE_LENGTH:
+        msg = f"passphrase must be at least {_MIN_PASSPHRASE_LENGTH} characters"
         raise ValueError(msg)
 
     vmk = os.urandom(_VMK_BYTES)
