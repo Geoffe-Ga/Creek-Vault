@@ -18,11 +18,18 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config
-from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.remote_auth import (
+    CONSUMER_TOKENS_ENV,
+    ConsumerTokenVerifier,
+    load_consumer_tokens,
+    remote_auth_settings,
+)
+from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools import (
     author_tool,
     classify_tool,
@@ -50,12 +57,76 @@ from creek_mcp.tools import (
 from creek_mcp.tools.draft import draft_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
+
+    from mcp.server.auth.provider import AccessToken, TokenVerifier
+    from mcp.types import ContentBlock
 
     from creek.models import PrivacyTier
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
 
 SERVER_NAME = "creek-tools-mcp"
+
+# Tier ceilings a REMOTE (network-authed) consumer may request. INTIMATE and ALL
+# are excluded so intimate content can never be reached over the network — the
+# load-bearing boundary of #759. Local (stdio) callers are unaffected.
+_REMOTE_ADMITTED_CEILINGS: frozenset[TierCeiling] = frozenset(
+    {TierCeiling.OPEN, TierCeiling.PERSONAL}
+)
+
+
+def _current_access_token() -> AccessToken | None:
+    """Return the current request's authenticated token, or ``None`` for stdio.
+
+    A thin, monkeypatchable wrapper over the SDK's request-scoped
+    ``get_access_token`` — non-``None`` exactly when the call arrived over the
+    authenticated network transport.
+    """
+    return get_access_token()
+
+
+def _effective_consumer(default: str) -> str:
+    """Return the per-call consumer: the authed remote ``client_id``, else *default*.
+
+    So a network call is audited under the consumer its bearer token identifies,
+    while a local stdio call keeps the process-global ``CREEK_MCP_CONSUMER``.
+    """
+    token = _current_access_token()
+    return token.client_id if token is not None else default
+
+
+class _BoundedFastMCP(FastMCP):
+    """``FastMCP`` that enforces the remote tier-ceiling cap at the one call chokepoint.
+
+    Every tool call flows through :meth:`call_tool`. When the call is remote (an
+    authenticated network request — ``_current_access_token()`` is set), a
+    requested ceiling above the remote cap (i.e. ``INTIMATE`` or ``ALL``, or any
+    unrecognised value) is refused **before dispatch**, so intimate content is
+    never even read for a remote caller. Local stdio calls (no token) pass
+    through unchanged — the default per-tool ``OPEN`` ceiling still applies.
+    """
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        """Refuse over-ceiling remote calls, else dispatch normally."""
+        if _current_access_token() is not None:
+            raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
+            try:
+                requested = TierCeiling(raw)
+            except ValueError:
+                requested = None
+            if requested not in _REMOTE_ADMITTED_CEILINGS:
+                return refusal_response(
+                    tool=name,
+                    ceiling=TierCeiling.OPEN,
+                    reason=(
+                        "remote consumers may not request a ceiling above "
+                        f"'{TierCeiling.PERSONAL.value}'; intimate content is not "
+                        "reachable over the network"
+                    ),
+                )
+        return await super().call_tool(name, arguments)
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:
@@ -138,6 +209,7 @@ def build_server(
     draft_llm_factory: Callable[[], Callable[[str], str]] | None = None,
     compile_llm_factory: Callable[[], Callable[[str], str]] | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
+    token_verifier: TokenVerifier | None = None,
 ) -> FastMCP:
     """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
@@ -154,8 +226,19 @@ def build_server(
         reflect_llm_factory: Optional thunk returning the tier-keyed LLM
             factory for ``creek.reflect``. Invoked lazily per call so only
             ``creek.reflect`` needs an LLM provider.
+        token_verifier: When set, the server serves the network transport
+            authenticated — every request must present a bearer token the
+            verifier accepts (no anonymous access), and remote calls are
+            capped below INTIMATE. ``None`` (the default) is the local stdio
+            server, unauthenticated as before.
     """
-    server: FastMCP = FastMCP(SERVER_NAME)
+    server: FastMCP = (
+        _BoundedFastMCP(
+            SERVER_NAME, token_verifier=token_verifier, auth=remote_auth_settings()
+        )
+        if token_verifier is not None
+        else _BoundedFastMCP(SERVER_NAME)
+    )
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
     factory = draft_llm_factory or _build_draft_llm
@@ -173,7 +256,7 @@ def build_server(
             capabilities=sorted(tool.name for tool in tools),
             server_name=SERVER_NAME,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.reflect")
@@ -190,7 +273,7 @@ def build_server(
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.wheel")
@@ -201,7 +284,7 @@ def build_server(
         return wheel_tool(
             vault_path=vault,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.journal")
@@ -220,7 +303,7 @@ def build_server(
             timestamp=timestamp,
             tier=tier,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.state.read")
@@ -231,7 +314,7 @@ def build_server(
         return state_read_tool(
             vault_path=vault,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.state.render")
@@ -242,7 +325,7 @@ def build_server(
         return state_render_tool(
             vault_path=vault,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.lint")
@@ -257,7 +340,7 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             checks=checks,
             since=since,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.mine")
@@ -272,7 +355,7 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             limit=limit,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.draft")
@@ -288,7 +371,7 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.author")
@@ -307,7 +390,7 @@ def build_server(
             max_rounds=max_rounds,
             dry_run=dry_run,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.save")
@@ -336,7 +419,7 @@ def build_server(
             saved_by=saved_by,
             full_body=full_body,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.ingest")
@@ -351,7 +434,7 @@ def build_server(
             source_type=source_type,
             input_path=input_path,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.redact.scan")
@@ -364,7 +447,7 @@ def build_server(
             vault_path=vault,
             input_path=input_path,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.classify")
@@ -379,7 +462,7 @@ def build_server(
             method=method,
             force=force,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.link")
@@ -394,7 +477,7 @@ def build_server(
             method=method,
             rebuild=rebuild,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.report")
@@ -407,7 +490,7 @@ def build_server(
             vault_path=vault,
             report_type=report_type,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.skills.refresh")
@@ -418,7 +501,7 @@ def build_server(
         return skills_refresh_tool(
             vault_path=vault,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.compile")
@@ -438,7 +521,7 @@ def build_server(
             target_title=target_title,
             llm_factory=compile_factory,
             privacy_tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.purge.fragment")
@@ -453,7 +536,7 @@ def build_server(
             fragment_id=fragment_id,
             auth_token=auth_token,
             dry_run=dry_run,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.purge.source")
@@ -468,7 +551,7 @@ def build_server(
             source_type=source_type,
             auth_token=auth_token,
             dry_run=dry_run,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.purge.classifications")
@@ -481,7 +564,7 @@ def build_server(
             vault_path=vault,
             auth_token=auth_token,
             dry_run=dry_run,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.purge.daterange")
@@ -498,7 +581,7 @@ def build_server(
             end=end,
             auth_token=auth_token,
             dry_run=dry_run,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     @server.tool(name="creek.purge.vault")
@@ -513,7 +596,7 @@ def build_server(
             confirm_vault_path=confirm_vault_path,
             auth_token=auth_token,
             dry_run=dry_run,
-            consumer=consumer,
+            consumer=_effective_consumer(consumer),
         )
 
     return server
@@ -547,11 +630,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "tool handler picks it up regardless of cwd."
         ),
     )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "network"),
+        default="stdio",
+        help=(
+            "stdio (default) for local consumers, or network (authenticated "
+            "streamable-http) for a remote consumer. Network mode requires "
+            f"{CONSUMER_TOKENS_ENV} (no anonymous access) and caps remote "
+            "consumers below INTIMATE."
+        ),
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Network transport bind host."
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000, help="Network transport bind port."
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run the MCP server over stdio (entry point for ``creek-tools-mcp``).
+    """Run the MCP server over stdio (local) or the authenticated network transport.
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -565,7 +665,22 @@ def main(argv: list[str] | None = None) -> None:
         if not args.config.exists():
             parser.error(f"--config: file not found: {args.config}")
         os.environ[CONFIG_PATH_ENV_VAR] = str(args.config.resolve())
-    build_server().run(transport="stdio")
+
+    if args.transport == "network":
+        tokens = load_consumer_tokens()
+        if not tokens:
+            # No anonymous access: refuse to expose the vault without per-consumer
+            # tokens, rather than serving unauthenticated.
+            parser.error(
+                f"network transport requires {CONSUMER_TOKENS_ENV} "
+                "(consumer=token pairs); refusing to serve without authentication"
+            )
+        server = build_server(token_verifier=ConsumerTokenVerifier(tokens))
+        server.settings.host = args.host
+        server.settings.port = args.port
+        server.run(transport="streamable-http")
+    else:
+        build_server().run(transport="stdio")
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via the entry point
