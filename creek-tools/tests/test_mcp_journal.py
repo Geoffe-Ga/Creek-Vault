@@ -76,14 +76,18 @@ def test_entry_becomes_a_journal_fragment(tmp_path: Path) -> None:
 def test_resending_the_same_entry_is_idempotent(tmp_path: Path) -> None:
     """Same external id + same content → one fragment, same id, no duplicate."""
     vault = _vault(tmp_path)
-    args = {
-        "content": "A steady entry.",
-        "external_id": "adep-002",
-        "timestamp": _TS,
-        "privacy_tier_ceiling": TierCeiling.PERSONAL,
-    }
-    first = journal_ingest_tool(vault_path=vault, **args)  # type: ignore[arg-type]
-    second = journal_ingest_tool(vault_path=vault, **args)  # type: ignore[arg-type]
+
+    def _send() -> dict[str, object]:
+        return journal_ingest_tool(
+            vault_path=vault,
+            content="A steady entry.",
+            external_id="adep-002",
+            timestamp=_TS,
+            privacy_tier_ceiling=TierCeiling.PERSONAL,
+        )
+
+    first = _send()
+    second = _send()
     assert len(_fragments(vault)) == 1  # no duplicate
     assert second["fragment_id"] == first["fragment_id"]
     assert second["action"] == "unchanged"
