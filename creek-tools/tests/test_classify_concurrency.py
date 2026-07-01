@@ -22,9 +22,15 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import creek.classify.classify_engine as engine
 from creek.classify.classify_engine import run_classify
 from creek.classify.llm import LLMClassificationResult
-from creek.config import CreekConfig, LLMConfig, LLMRoutingConfig
+from creek.config import (
+    ClassificationConfig,
+    CreekConfig,
+    LLMConfig,
+    LLMRoutingConfig,
+)
 from creek.models import Fragment, FragmentSource, PrivacyTier, SourcePlatform
 from tests.helpers import write_fragment_file
 
@@ -103,13 +109,14 @@ def _fake_llm(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _config(max_concurrent: int) -> CreekConfig:
+def _config(max_concurrent: int, *, reatomize: bool = False) -> CreekConfig:
     """A config whose classification stage carries *max_concurrent*."""
     return CreekConfig(
         llm=LLMRoutingConfig(
             default=LLMConfig(**_LOCAL),
             classification=LLMConfig(**_CLOUD, max_concurrent=max_concurrent),
-        )
+        ),
+        classification=ClassificationConfig(reatomize=reatomize),
     )
 
 
@@ -156,6 +163,27 @@ def test_max_concurrent_one_is_serial(tmp_path: Path) -> None:
     )
 
     assert _ProbingClassifier.probe.max_active == 1  # never more than one in flight
+    assert summary.classified == 3
+
+
+def test_reatomize_forces_serial_even_with_high_max_concurrent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-atomization keeps the loop serial (shared VaultWriter) despite mc>1."""
+    # Stub the re-atomization tail so only the pool-width invariant is exercised.
+    monkeypatch.setattr(engine, "_maybe_reatomize_and_persist", lambda **_: None)
+    vault = tmp_path / "vault"
+    _write_fragments(vault, 3)
+    _ProbingClassifier.probe = _Probe()  # sleep probe
+
+    summary = run_classify(
+        vault_path=vault,
+        config=_config(4, reatomize=True),
+        method="llm",
+        force=True,
+    )
+
+    assert _ProbingClassifier.probe.max_active == 1  # serialized by the writer guard
     assert summary.classified == 3
 
 

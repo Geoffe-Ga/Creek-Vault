@@ -111,6 +111,15 @@ class LLMClassifier:
     def _provider(self) -> LLMProvider:
         """Lazily build and cache the configured provider.
 
+        Thread-safety: this is an unlocked check-then-set on
+        ``self._provider_instance`` (and ``.available`` memoises similarly), so a
+        classifier **must be pre-warmed serially before any concurrent use** —
+        call :attr:`available` (or ``_provider()``) once on the main thread
+        first. The concurrent classify path (#764) relies on
+        ``_assert_classifiers_available`` doing exactly that before spinning up
+        worker threads; a future concurrent caller that skips that pre-warm would
+        reintroduce a double-build data race here.
+
         Returns:
             The cached :class:`LLMProvider` instance.
 
