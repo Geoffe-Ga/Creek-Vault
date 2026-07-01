@@ -95,6 +95,23 @@ def _resolve_configured_model(configured: str | None, default: str) -> str:
     return model or default
 
 
+def _effective_key_env(config: LLMConfig, default: str) -> str:
+    """Return the env var name holding this stage's API key (BYOK-aware).
+
+    The BYOK override (``config.api_key_env``) when set, else the provider's
+    *default* env var. Returns a variable **name**, never a key value — the key
+    itself always stays in the environment.
+
+    Args:
+        config: The stage's LLM configuration.
+        default: The provider's default key env var (e.g. ``ANTHROPIC_API_KEY``).
+
+    Returns:
+        The environment-variable name to read the API key from.
+    """
+    return config.api_key_env or default
+
+
 _HTTP_TOO_MANY_REQUESTS: int = 429
 """The HTTP status code for a rate-limited request."""
 
@@ -303,29 +320,31 @@ class AnthropicProvider:
             raise RuntimeError(unmet)
         self._client: anthropic.Anthropic | None = None
 
-    @classmethod
-    def _missing_prerequisite(cls) -> str | None:
+    def _missing_prerequisite(self) -> str | None:
         """Return why the Anthropic prerequisites are unmet, or ``None``.
 
         The API key and the explicit cloud-egress consent are both read from
         the environment at call time, so the check reflects the *current* env
-        rather than the env at construction. The consent half delegates to the
-        provider-neutral :mod:`creek.classify.llm.consent` gate (#606), which
-        accepts ``CREEK_CLOUD_CONSENT`` or the legacy ``CREEK_ANTHROPIC_CONSENT``.
-        :meth:`__init__` raises the returned message; :attr:`available` reports
-        whether it is ``None``.
+        rather than the env at construction. The key is read from the BYOK
+        override env var (``config.api_key_env``) when set, else the default
+        ``ANTHROPIC_API_KEY`` — either way from the environment only. The consent
+        half delegates to the provider-neutral :mod:`creek.classify.llm.consent`
+        gate (#606), which accepts ``CREEK_CLOUD_CONSENT`` or the legacy
+        ``CREEK_ANTHROPIC_CONSENT``. :meth:`__init__` raises the returned message;
+        :attr:`available` reports whether it is ``None``.
 
         Returns:
             A human-readable explanation when the key is missing or consent is
             not affirmative; ``None`` when both prerequisites are satisfied.
         """
-        if not os.environ.get(cls.API_KEY_ENV, "").strip():
+        key_env = _effective_key_env(self.config, self.API_KEY_ENV)
+        if not os.environ.get(key_env, "").strip():
             return (
-                f"{cls.API_KEY_ENV} environment variable is not set; "
+                f"{key_env} environment variable is not set; "
                 "required for the Anthropic provider."
             )
         if not has_cloud_consent():
-            return consent_error_message(cls.PROVIDER_NAME)
+            return consent_error_message(self.PROVIDER_NAME)
         return None
 
     @property
@@ -357,13 +376,25 @@ class AnthropicProvider:
     def client(self) -> anthropic.Anthropic:
         """The lazily-initialised Anthropic SDK client.
 
+        With a BYOK override (``config.api_key_env``), the user's key is read
+        from that env var and passed explicitly; otherwise the SDK reads
+        ``ANTHROPIC_API_KEY`` itself (behaviour unchanged). The key is only ever
+        held in memory by the SDK — never logged or persisted.
+
         Returns:
             An ``anthropic.Anthropic`` client instance.
         """
         if self._client is None:
             import anthropic
 
-            self._client = anthropic.Anthropic()
+            if self.config.api_key_env:
+                self._client = anthropic.Anthropic(
+                    api_key=os.environ[
+                        _effective_key_env(self.config, self.API_KEY_ENV)
+                    ]
+                )
+            else:
+                self._client = anthropic.Anthropic()
         return self._client
 
     def call(self, prompt: str) -> str:
@@ -1092,25 +1123,26 @@ class OpenAIProvider:
             raise RuntimeError(unmet)
         self._client: openai.OpenAI | None = None
 
-    @classmethod
-    def _missing_prerequisite(cls) -> str | None:
+    def _missing_prerequisite(self) -> str | None:
         """Return why the OpenAI prerequisites are unmet, or ``None``.
 
-        The key and the shared cloud-egress consent are read from the
-        environment at call time; :meth:`__init__` raises the returned message
-        and :attr:`available` reports whether it is ``None``.
+        The key (from the BYOK override env var ``config.api_key_env`` when set,
+        else the default ``OPENAI_API_KEY``) and the shared cloud-egress consent
+        are read from the environment at call time; :meth:`__init__` raises the
+        returned message and :attr:`available` reports whether it is ``None``.
 
         Returns:
             A human-readable explanation when the key is missing or consent is
             not affirmative; ``None`` when both prerequisites are satisfied.
         """
-        if not os.environ.get(cls.API_KEY_ENV, "").strip():
+        key_env = _effective_key_env(self.config, self.API_KEY_ENV)
+        if not os.environ.get(key_env, "").strip():
             return (
-                f"{cls.API_KEY_ENV} environment variable is not set; "
+                f"{key_env} environment variable is not set; "
                 "required for the OpenAI provider."
             )
         if not has_cloud_consent():
-            return consent_error_message(cls.PROVIDER_NAME)
+            return consent_error_message(self.PROVIDER_NAME)
         return None
 
     @property
@@ -1138,8 +1170,11 @@ class OpenAIProvider:
     def client(self) -> openai.OpenAI:
         """The lazily-initialised OpenAI SDK client.
 
-        The SDK reads ``OPENAI_API_KEY`` itself; ``config.api_base`` (when set)
-        is forwarded as ``base_url`` for an OpenAI-compatible gateway.
+        Without a BYOK override the SDK reads ``OPENAI_API_KEY`` itself; with one
+        (``config.api_key_env``) the user's key is read from that env var and
+        passed explicitly. ``config.api_base`` (when set) is forwarded as
+        ``base_url`` for an OpenAI-compatible gateway. The key is only held in
+        memory by the SDK — never logged or persisted.
 
         Returns:
             An ``openai.OpenAI`` client instance.
@@ -1147,8 +1182,18 @@ class OpenAIProvider:
         if self._client is None:
             import openai
 
-            if self.config.api_base:
-                self._client = openai.OpenAI(base_url=self.config.api_base)
+            base_url = self.config.api_base
+            byok_key = (
+                os.environ[_effective_key_env(self.config, self.API_KEY_ENV)]
+                if self.config.api_key_env
+                else None
+            )
+            if base_url is not None and byok_key is not None:
+                self._client = openai.OpenAI(base_url=base_url, api_key=byok_key)
+            elif base_url is not None:
+                self._client = openai.OpenAI(base_url=base_url)
+            elif byok_key is not None:
+                self._client = openai.OpenAI(api_key=byok_key)
             else:
                 self._client = openai.OpenAI()
         return self._client
@@ -1342,23 +1387,30 @@ class GeminiProvider:
             raise RuntimeError(unmet)
         self._client: genai.Client | None = None
 
-    @classmethod
-    def _missing_prerequisite(cls) -> str | None:
+    def _missing_prerequisite(self) -> str | None:
         """Return why the Gemini prerequisites are unmet, or ``None``.
 
-        Requires one of :attr:`API_KEY_ENVS` plus the shared cloud consent;
-        both are read from the environment at call time so :attr:`available`
-        reflects the live env.
+        Requires a key plus the shared cloud consent, both read from the
+        environment at call time so :attr:`available` reflects the live env. With
+        a BYOK override (``config.api_key_env``) the key must be in that single
+        var; otherwise one of :attr:`API_KEY_ENVS` must be set (behaviour
+        unchanged).
 
         Returns:
             A human-readable explanation when no key is present or consent is
             not affirmative; ``None`` when both prerequisites are satisfied.
         """
-        if not any(os.environ.get(var, "").strip() for var in cls.API_KEY_ENVS):
-            joined = " or ".join(cls.API_KEY_ENVS)
+        if self.config.api_key_env:
+            if not os.environ.get(self.config.api_key_env, "").strip():
+                return (
+                    f"{self.config.api_key_env} environment variable is not set; "
+                    "required for the Gemini provider."
+                )
+        elif not any(os.environ.get(var, "").strip() for var in self.API_KEY_ENVS):
+            joined = " or ".join(self.API_KEY_ENVS)
             return f"Neither {joined} is set; one is required for the Gemini provider."
         if not has_cloud_consent():
-            return consent_error_message(cls.PROVIDER_NAME)
+            return consent_error_message(self.PROVIDER_NAME)
         return None
 
     @property
@@ -1386,7 +1438,10 @@ class GeminiProvider:
     def client(self) -> genai.Client:
         """The lazily-initialised ``google-genai`` client.
 
-        The SDK reads ``GOOGLE_API_KEY`` / ``GEMINI_API_KEY`` itself.
+        Without a BYOK override the SDK reads ``GOOGLE_API_KEY`` /
+        ``GEMINI_API_KEY`` itself; with one (``config.api_key_env``) the user's
+        key is read from that env var and passed explicitly. The key is only held
+        in memory by the SDK — never logged or persisted.
 
         Returns:
             A ``google.genai.Client`` instance.
@@ -1394,7 +1449,10 @@ class GeminiProvider:
         if self._client is None:
             from google import genai
 
-            self._client = genai.Client()
+            if self.config.api_key_env:
+                self._client = genai.Client(api_key=os.environ[self.config.api_key_env])
+            else:
+                self._client = genai.Client()
         return self._client
 
     def complete(

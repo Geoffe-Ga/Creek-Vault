@@ -117,6 +117,19 @@ class LLMConfig(BaseModel):
     OpenAI-compatible gateway). ``None`` lets the SDK use its default endpoint
     or its own ``*_BASE_URL`` environment variable. Never holds a secret."""
 
+    api_key_env: str | None = None
+    """BYOK: name of the environment variable holding this stage's API key.
+
+    "Bring your own key" — point the ``generation`` (or any) stage at a
+    **user-supplied** provider key held in a named environment variable (e.g.
+    ``CREEK_BYOK_ANTHROPIC_KEY``) instead of the operator's default
+    (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` / ``GOOGLE_API_KEY``). This holds
+    a **variable name, never a key value**, so the key stays in the environment
+    only — never persisted in config or logged. ``None`` uses the provider's
+    default env var (behaviour unchanged). Does not relax the ``ModelRouter``
+    INTIMATE chokepoint: BYOK only affects OPEN/PERSONAL cloud stages; INTIMATE
+    is still redirected to a local/enclave provider before any key is read."""
+
     enclave_url: str | None = None
     """Base URL of the attested GPU-CC enclave endpoint (provider ``enclave``).
 
