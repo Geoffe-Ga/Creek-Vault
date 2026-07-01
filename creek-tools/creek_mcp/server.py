@@ -29,6 +29,7 @@ from creek_mcp.tools import (
     compile_tool,
     handshake_tool,
     ingest_tool,
+    journal_ingest_tool,
     link_tool,
     lint_tool,
     mine_tool,
@@ -199,6 +200,25 @@ def build_server(
         """Return a per-frequency balance read of the corpus for the Map."""
         return wheel_tool(
             vault_path=vault,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+
+    @server.tool(name="creek.journal")
+    def _journal(
+        content: str,
+        external_id: str,
+        timestamp: str | None = None,
+        tier: str = "open",
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Ingest one Adepthood journal entry as a vault fragment (idempotent)."""
+        return journal_ingest_tool(
+            vault_path=vault,
+            content=content,
+            external_id=external_id,
+            timestamp=timestamp,
+            tier=tier,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )

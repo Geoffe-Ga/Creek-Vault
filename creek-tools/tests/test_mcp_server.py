@@ -20,6 +20,7 @@ EXPECTED_TOOLS = {
     "creek.handshake",
     "creek.reflect",
     "creek.wheel",
+    "creek.journal",
     "creek.state.read",
     "creek.state.render",
     "creek.lint",
@@ -160,6 +161,34 @@ def test_call_tool_reflect_escalates_on_acute_distress(vault: Path) -> None:
     structured = _structured(result)
     assert structured["status"] == "escalate"
     assert structured["care_signal"]["kind"] == "acute_distress"  # type: ignore[index]
+
+
+def test_call_tool_journal_ingests_entry_idempotently(vault: Path) -> None:
+    """End-to-end: ``creek.journal`` ingests an entry as a fragment, idempotently.
+
+    Re-sending the same external id through the registered tool yields the same
+    fragment id and no duplicate — proving the ledger-backed path is wired.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    payload = {
+        "content": "A registered journal entry.",
+        "external_id": "adep-srv-1",
+        "timestamp": "2026-06-20T10:00:00+00:00",
+        "privacy_tier_ceiling": "personal",
+    }
+    first = _structured(
+        asyncio.run(server.call_tool("creek.journal", payload)),
+    )
+    second = _structured(
+        asyncio.run(server.call_tool("creek.journal", payload)),
+    )
+    assert first["status"] == "ok"
+    assert first["tool"] == "creek.journal"
+    assert second["fragment_id"] == first["fragment_id"]
+    assert len(sorted((vault / "01-Fragments").rglob("*.md"))) == 1
 
 
 def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None:
