@@ -111,6 +111,42 @@ def test_tampered_ciphertext_fails_closed() -> None:
         unlock_with_passphrase(tampered, _PASSPHRASE)
 
 
+def _vault_dict_with_kdf(**overrides: int) -> dict[str, object]:
+    """A freshly-created vault's dict with KDF parameters overridden (untrusted)."""
+    data = json.loads(json.dumps(create_key_vault(_PASSPHRASE).vault.to_dict()))
+    data["kdf"].update(overrides)
+    return data
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("memory_kib", 8 * 1024 * 1024),  # 8 GiB — would OOM Argon2 on unlock
+        ("memory_kib", 0),  # degenerate
+        ("time_cost", 10_000),  # would hang the derivation
+        ("time_cost", 0),
+        ("lanes", 0),
+        ("lanes", 1_000_000),
+    ],
+)
+def test_from_dict_rejects_out_of_range_kdf_params(field: str, value: int) -> None:
+    """A tampered/corrupt vault with an out-of-range KDF param fails closed.
+
+    The bound is enforced in ``from_dict`` *before* any Argon2id derivation, so
+    an absurd ``memory_kib`` never gets allocated — no OOM, just a ``ValueError``.
+    """
+    with pytest.raises(ValueError, match=field):
+        KeyVault.from_dict(_vault_dict_with_kdf(**{field: value}))
+
+
+def test_from_dict_accepts_in_bounds_params_and_unlocks() -> None:
+    """An in-bounds vault still round-trips through ``from_dict`` and unlocks."""
+    setup = create_key_vault(_PASSPHRASE)
+    reloaded = KeyVault.from_dict(json.loads(json.dumps(setup.vault.to_dict())))
+    vmk = unlock_with_passphrase(reloaded, _PASSPHRASE)
+    assert unlock_with_recovery(reloaded, setup.recovery_key) == vmk
+
+
 def test_empty_passphrase_is_rejected() -> None:
     """An empty passphrase is refused before any key material is generated."""
     with pytest.raises(ValueError, match="passphrase"):

@@ -65,6 +65,19 @@ _ARGON2_TIME_COST: Final[int] = 3
 _ARGON2_LANES: Final[int] = 4
 _ARGON2_MEMORY_KIB: Final[int] = 64 * 1024  # 64 MiB
 
+# Accepted bounds for KDF parameters read from an UNTRUSTED on-disk vault (#771).
+# The upper bounds cap resource use so a tampered/corrupt artifact can't OOM or
+# hang the Argon2id derivation on unlock; the lower bounds reject degenerate
+# (zero / near-zero) values. Validated at load time (`from_dict`), before any
+# derivation, so an absurd ``memory_kib`` is never actually allocated. Our own
+# vaults (t=3, p=4, 64 MiB) sit comfortably inside these.
+_MIN_TIME_COST: Final[int] = 1
+_MAX_TIME_COST: Final[int] = 20
+_MIN_LANES: Final[int] = 1
+_MAX_LANES: Final[int] = 16
+_MIN_MEMORY_KIB: Final[int] = 8 * 1024  # 8 MiB
+_MAX_MEMORY_KIB: Final[int] = 1024 * 1024  # 1 GiB
+
 # AEAD associated-data domain separators — bind each wrapped copy to its purpose
 # so a ciphertext can never be swapped between the two unwrap paths.
 _AAD_PASSPHRASE: Final[bytes] = b"creek.confidential.vmk.passphrase.v1"
@@ -110,6 +123,23 @@ class _Wrapped:
         )
 
 
+def _check_kdf_bound(name: str, value: int, low: int, high: int) -> None:
+    """Reject a KDF parameter outside ``[low, high]`` — fail closed (#771).
+
+    Args:
+        name: Parameter name, echoed in the error (non-sensitive).
+        value: The value read from the untrusted vault.
+        low: Inclusive lower bound.
+        high: Inclusive upper bound.
+
+    Raises:
+        ValueError: When *value* is out of range.
+    """
+    if not low <= value <= high:
+        msg = f"{name} out of accepted range [{low}, {high}]"
+        raise ValueError(msg)
+
+
 @dataclass(frozen=True)
 class KeyVault:
     """The persisted, **ciphertext-only** key vault (no plaintext key material).
@@ -148,14 +178,30 @@ class KeyVault:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> KeyVault:
-        """Rebuild a :class:`KeyVault` from its persisted form."""
+        """Rebuild a :class:`KeyVault` from its (untrusted) persisted form.
+
+        The KDF parameters come from the on-disk artifact, which may be corrupt
+        or tampered, so they are bounds-checked **here** — before any Argon2id
+        derivation — so an absurd ``memory_kib`` can never OOM/hang the unlock
+        and a degenerate value can never weaken the derivation (#771). Out-of-
+        range parameters fail closed with a :class:`ValueError`.
+
+        Raises:
+            ValueError: If any KDF parameter is outside its accepted range.
+        """
         kdf = data["kdf"]
+        time_cost = int(kdf["time_cost"])
+        lanes = int(kdf["lanes"])
+        memory_kib = int(kdf["memory_kib"])
+        _check_kdf_bound("time_cost", time_cost, _MIN_TIME_COST, _MAX_TIME_COST)
+        _check_kdf_bound("lanes", lanes, _MIN_LANES, _MAX_LANES)
+        _check_kdf_bound("memory_kib", memory_kib, _MIN_MEMORY_KIB, _MAX_MEMORY_KIB)
         return cls(
             version=int(data["version"]),
             salt=bytes.fromhex(kdf["salt"]),
-            time_cost=int(kdf["time_cost"]),
-            lanes=int(kdf["lanes"]),
-            memory_kib=int(kdf["memory_kib"]),
+            time_cost=time_cost,
+            lanes=lanes,
+            memory_kib=memory_kib,
             passphrase_wrapped=_Wrapped.from_dict(data["passphrase_wrapped"]),
             recovery_wrapped=_Wrapped.from_dict(data["recovery_wrapped"]),
         )
