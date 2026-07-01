@@ -66,7 +66,7 @@ real desk. Only the `research` medium is wired — any other `medium` returns
 | `creek.report`          | `report_type` (`tags`\|`voice`)                             | Renders a vault-state report — any ceiling permitted.             |
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars already excluded.      |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Idempotent per FEAT-003; no-op re-runs do not log a duplicate.    |
-| `creek.journal`         | `content`, `title?`                                         | Stages an Adepthood entry then ledger-ingests it (#754); the entry's tier is honored — a ceiling that would not admit it is refused. |
+| `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. |
 
 ### Purge tools (FEAT-012, elevated authorization required)
 
