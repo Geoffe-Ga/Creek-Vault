@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from mcp.server.fastmcp import FastMCP
+
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Iterator[Path]:
@@ -286,7 +288,7 @@ def test_streamable_http_rejects_unauthenticated_request(vault: Path) -> None:
 _WIRE_TOKEN = "over-the-wire-consumer-secret"  # fake test literal, not a real key
 
 
-def _network_server(vault: Path, token: str) -> object:
+def _network_server(vault: Path, token: str) -> FastMCP:
     """Build a network server; disable DNS-rebinding host-check for the in-test host.
 
     The host validation is a separate concern from the auth path under test here,
@@ -373,8 +375,8 @@ def _wire_call(
 def test_authenticated_tools_call_dispatches_over_the_wire(vault: Path) -> None:
     """A valid bearer + open ceiling dispatches a real tools/call through middleware."""
     server = _network_server(vault, _WIRE_TOKEN)
-    path = server.settings.streamable_http_path  # type: ignore[attr-defined]
-    with TestClient(server.streamable_http_app()) as client:  # type: ignore[attr-defined]
+    path = server.settings.streamable_http_path
+    with TestClient(server.streamable_http_app()) as client:
         headers = _open_authenticated_session(client, path, _WIRE_TOKEN)
         structured = _wire_call(client, path, headers, "open")
     assert structured["tool"] == "creek.wheel"  # dispatched, not refused
@@ -389,8 +391,8 @@ def test_remote_intimate_is_refused_over_the_wire(vault: Path) -> None:
     the over-ceiling request end-to-end, exactly as it would in production.
     """
     server = _network_server(vault, _WIRE_TOKEN)
-    path = server.settings.streamable_http_path  # type: ignore[attr-defined]
-    with TestClient(server.streamable_http_app()) as client:  # type: ignore[attr-defined]
+    path = server.settings.streamable_http_path
+    with TestClient(server.streamable_http_app()) as client:
         headers = _open_authenticated_session(client, path, _WIRE_TOKEN)
         structured = _wire_call(client, path, headers, "intimate")
     assert structured["status"] == "refused"
