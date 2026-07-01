@@ -66,6 +66,7 @@ real desk. Only the `research` medium is wired — any other `medium` returns
 | `creek.report`          | `report_type` (`tags`\|`voice`)                             | Renders a vault-state report — any ceiling permitted.             |
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars already excluded.      |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Idempotent per FEAT-003; no-op re-runs do not log a duplicate.    |
+| `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. |
 
 ### Purge tools (FEAT-012, elevated authorization required)
 
@@ -201,19 +202,42 @@ Adepthood backend, the server also serves an **authenticated
 streamable-http** transport:
 
 ```bash
-export CREEK_MCP_CONSUMER_TOKENS="adepthood=<opaque-token>;other=<token>"
+# Generate each consumer token as high-entropy hex, once, per consumer:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+export CREEK_MCP_CONSUMER_TOKENS="adepthood=<secrets.token_hex(32)>;other=<token>"
 creek-tools-mcp --transport network --host 127.0.0.1 --port 8000
 ```
+
+> **⚠️ TLS is required in production — the server does not terminate it.**
+> `--transport network` speaks plain HTTP. Binding beyond loopback (e.g.
+> `--host 0.0.0.0`) **without TLS sends the bearer token in cleartext on every
+> request**, which defeats the constant-time comparison and no-anonymous-access
+> guarantees below. A bare `--host 0.0.0.0 --port 8000` is **not safe to expose
+> directly.** Production deployments MUST sit behind a **TLS-terminating reverse
+> proxy** (or use mTLS); keep the server itself bound to `127.0.0.1` and let the
+> proxy handle TLS and forward to it. The reverse proxy is also the right place
+> for rate-limiting and IP allowlisting.
 
 - **No anonymous access.** Network mode refuses to start unless
   `CREEK_MCP_CONSUMER_TOKENS` is set. It holds `consumer=token` pairs,
   `;`-separated; tokens live in the **environment only** (never in code or
-  config), mirroring the `CREEK_MCP_ELEVATED_TOKEN` precedent.
+  config), mirroring the `CREEK_MCP_ELEVATED_TOKEN` precedent. Generate each
+  token as high-entropy hex — `secrets.token_hex(32)` — so a token is never
+  guessable; the constant-time comparison only matters against a strong secret.
 - **Per-consumer identity.** Each request must present its bearer token
   (`Authorization: Bearer <token>`). The token maps to a consumer name that
   is stamped on every audit-log entry — so remote calls are attributable the
   same way `CREEK_MCP_CONSUMER` attributes stdio calls. A missing or unknown
   token is rejected `401` before any tool runs; comparison is constant-time.
+- **A consumer token grants remote _write_ access, by design.** A valid
+  `CREEK_MCP_CONSUMER_TOKENS` entry can reach every non-purge tool at or below
+  the `personal` ceiling — including the **write** tools (`creek.journal`,
+  `creek.ingest`, `creek.classify`, `creek.link`, `creek.report`,
+  `creek.compile`, `creek.save`, `creek.skills.refresh`), not just reads. This
+  is intentional (Adepthood writes journal entries remotely), so treat each
+  token as a write-capable credential — a meaningfully larger attack surface
+  than "remote read-only." Purge tools stay gated separately by
+  `CREEK_MCP_ELEVATED_TOKEN` (a per-consumer bearer alone cannot purge).
 - **INTIMATE is never reachable remotely.** The boundary caps a remote
   caller at `personal`: a request for a `privacy_tier_ceiling` above it
   (`intimate` / `all`, or any unrecognised value) is **refused before
