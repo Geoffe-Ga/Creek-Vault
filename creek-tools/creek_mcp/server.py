@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
+from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools import (
@@ -186,6 +187,7 @@ def build_server(
             llm_factory=reflect_factory(),
             content=content,
             entry_ref=entry_ref,
+            care_guard=acute_distress_guard,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=consumer,
         )

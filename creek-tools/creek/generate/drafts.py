@@ -35,6 +35,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.care.guardrail import CARE_POLICY
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
@@ -1126,7 +1127,7 @@ class DraftGenerator:
         before the ``## Ask`` block so the LLM sees the recombination
         instruction as the last thing before its task.
         """
-        parts: list[str] = []
+        parts: list[str] = [CARE_POLICY]
         if self.voice_core:
             parts.append(f"## Voice core\n{self.voice_core.strip()}")
         if self.style_preamble:
@@ -2036,7 +2037,7 @@ class DraftGenerator:
         heading and body so the section appears in the draft even when
         the vault has nothing to retrieve.
         """
-        parts: list[str] = []
+        parts: list[str] = [CARE_POLICY]
         if self.voice_core:
             parts.append(f"## Voice core\n{self.voice_core.strip()}")
         if self.style_preamble:

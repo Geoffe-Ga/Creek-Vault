@@ -25,6 +25,7 @@ from creek.author.skills import (
     find_voice_core,
     read_skill,
 )
+from creek.care.guardrail import CARE_POLICY
 from creek.generate.ontology_glossary import GLOSS_STEER
 
 if TYPE_CHECKING:
@@ -155,7 +156,9 @@ def _split_voice_prompt(
         (``""`` when the vault carries none); ``dynamic`` is the evidence block
         followed by the ask block.
     """
-    static = "\n\n".join(part for part in _skill_sections(vault, evidence) if part)
+    static = "\n\n".join(
+        [CARE_POLICY, *(part for part in _skill_sections(vault, evidence) if part)]
+    )
     dynamic = "\n\n".join(
         part
         for part in (_evidence_section(evidence), _ask_section(query, medium, contract))

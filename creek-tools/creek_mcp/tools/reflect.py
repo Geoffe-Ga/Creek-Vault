@@ -28,8 +28,10 @@ Three guarantees this module enforces:
   not are dropped — the client re-anchors verbatim quotes to character offsets
   itself, so a hallucinated span must never reach it.
 - **Care boundary (#753).** A ``care_guard`` seam is injected; when it flags the
-  entry, the tool escalates and never calls the model. The real guard lands in
-  #753; until then the seam is unset (no gating) but wired.
+  entry, the tool escalates (returning the structured ``CARE_SIGNAL`` pointing to
+  human support) and never calls the model. The production guard is
+  :func:`creek.care.guardrail.acute_distress_guard`, threaded in by
+  ``build_server``; the seam stays injectable so tests can substitute their own.
 
 The LLM and retrieval are injected so the tool is unit-testable with no live
 calls; ``build_server`` supplies the production factory + retrieval.
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
+from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
@@ -198,7 +201,9 @@ def _build_prompt(entry: str, grounding: list[str]) -> str:
         "Every quote MUST be copied verbatim from the ENTRY."
     )
     return (
-        "You are the writer's own Higher Self leaving warm, second-person margin "
+        CARE_POLICY
+        + "\n\n"
+        + "You are the writer's own Higher Self leaving warm, second-person margin "
         "notes on their journal entry. Mirror their wisdom back; never advise from "
         "above, never diagnose, never console with platitudes. Ground every note in "
         "their own words and the source fragments below.\n\n"
@@ -309,6 +314,7 @@ def reflect_tool(
                 "tool": TOOL_NAME,
                 "tier_ceiling": privacy_tier_ceiling.value,
                 "reason": care_reason,
+                "care_signal": CARE_SIGNAL,
             }
 
     tier = _routing_tier(privacy_tier_ceiling, entry_tier)
