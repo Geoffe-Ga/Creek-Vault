@@ -6,6 +6,7 @@ from creek_mcp.tools.compile import compile_tool
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.handshake import handshake_tool
 from creek_mcp.tools.ingest import ingest_tool
+from creek_mcp.tools.journal import journal_ingest_tool
 from creek_mcp.tools.link import link_tool
 from creek_mcp.tools.lint import lint_tool
 from creek_mcp.tools.mine import mine_tool
@@ -32,6 +33,7 @@ __all__ = [
     "draft_tool",
     "handshake_tool",
     "ingest_tool",
+    "journal_ingest_tool",
     "link_tool",
     "lint_tool",
     "mine_tool",
