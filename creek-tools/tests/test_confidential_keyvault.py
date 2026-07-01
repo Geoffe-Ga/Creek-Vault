@@ -140,6 +140,8 @@ def test_persisted_file_is_ciphertext_only_and_owner_readable(tmp_path: Path) ->
     assert _PASSPHRASE not in text
     assert setup.recovery_key.replace("-", "") not in text
     assert stat.S_IMODE(path.stat().st_mode) == 0o600  # owner-only
+    # Atomic write leaves no temp artifact behind in the directory.
+    assert [p.name for p in tmp_path.iterdir()] == [path.name]
     # Loading the persisted vault still unlocks by both paths.
     reloaded = load_key_vault(path)
     assert unlock_with_passphrase(reloaded, _PASSPHRASE) == vmk

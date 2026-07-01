@@ -31,17 +31,16 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tempfile
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from pathlib import Path
+from typing import Any, Final
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 _VMK_BYTES: Final[int] = 32
 """Volume master key size — a 256-bit AES key."""
@@ -290,16 +289,30 @@ def unlock_with_recovery(vault: KeyVault, recovery_key: str) -> bytes:
 
 
 def save_key_vault(vault: KeyVault, path: Path) -> None:
-    """Persist the ciphertext-only vault to *path* with owner-only permissions.
+    """Persist the ciphertext-only vault to *path* atomically, owner-only.
 
-    The artifact is safe to store (ciphertext + public parameters only), but it
-    is written ``0600`` as defence in depth so the wrapped copies and salt are
-    not world-readable. The recovery key is NOT part of the vault and is never
-    written here.
+    Written to a temp file in the same directory (created ``0600`` from the
+    start — never widen-then-narrow), fsync'd, then ``os.replace``-d into place.
+    This matters more than usual here: the artifact is the *only* copy, and the
+    "no reset" threat model means a torn write (crash / disk-full / power loss)
+    would turn a recoverable state into accidental permanent lockout with no user
+    error. The recovery key is NOT part of the vault and is never written here.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(vault.to_dict(), indent=2), encoding="utf-8")
-    path.chmod(0o600)
+    data = json.dumps(vault.to_dict(), indent=2).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:  # mkstemp already created it 0600
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def load_key_vault(path: Path) -> KeyVault:
