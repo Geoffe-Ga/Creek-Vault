@@ -22,6 +22,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from creek.classify.llm.providers import (
     AnthropicProvider,
@@ -143,6 +144,17 @@ def test_openai_byok_reads_key_and_composes_with_api_base(
     }
 
 
+def test_openai_byok_without_api_base_passes_only_the_key(
+    _clean_keys: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common BYOK case (no gateway override) passes just the user's key."""
+    monkeypatch.setenv(_BYOK_OPENAI, "sk-openai-user")  # fake test literal
+    provider = OpenAIProvider(LLMConfig(provider="openai", api_key_env=_BYOK_OPENAI))
+    with patch("openai.OpenAI", return_value=MagicMock()) as ctor:
+        _ = provider.client
+    assert ctor.call_args.kwargs == {"api_key": "sk-openai-user"}
+
+
 def test_openai_without_byok_is_behaviour_unchanged(
     _clean_keys: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -204,3 +216,48 @@ def test_byok_does_not_bypass_intimate_chokepoint() -> None:
     assert open_cfg.api_key_env == _BYOK_ANTHROPIC
     # ...but INTIMATE is still redirected to the local default — BYOK or not.
     assert router.resolve("generation", PrivacyTier.INTIMATE).provider == "ollama"
+
+
+def test_byok_through_writing_desk_role() -> None:
+    """BYOK also flows through a ``writing_desk`` role via ``resolve_role``."""
+    router = ModelRouter(
+        LLMRoutingConfig.model_validate(
+            {
+                "default": {"provider": "ollama"},
+                "writing_desk": {
+                    "voice_drafter": {
+                        "provider": "anthropic",
+                        "api_key_env": _BYOK_ANTHROPIC,
+                    }
+                },
+            }
+        )
+    )
+    # Non-intimate keeps the role's BYOK cloud config...
+    role_cfg = router.resolve_role("voice_drafter")
+    assert role_cfg.provider == "anthropic"
+    assert role_cfg.api_key_env == _BYOK_ANTHROPIC
+    # ...INTIMATE is still redirected to the local default.
+    assert (
+        router.resolve_role("voice_drafter", PrivacyTier.INTIMATE).provider == "ollama"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# A pasted key value is rejected fail-fast (api_key_env holds a NAME)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "sk-ant-api03-notarealkey",
+        "sk-openai-notarealkey",
+        "AIzaSyNotARealGeminiKey",
+        "has spaces not a name",
+    ],
+)
+def test_api_key_env_rejects_a_pasted_key_value(pasted: str) -> None:
+    """A value that looks like a key (not a var name) fails at config-load."""
+    with pytest.raises(ValidationError, match="environment variable NAME"):
+        LLMConfig(provider="anthropic", api_key_env=pasted)

@@ -112,6 +112,29 @@ def _effective_key_env(config: LLMConfig, default: str) -> str:
     return config.api_key_env or default
 
 
+def _read_key_env(env_var: str) -> str:
+    """Read an API key from *env_var*, raising ``RuntimeError`` if unset.
+
+    Used at lazy client-build time so a var that was present at construction but
+    cleared before first use fails with the module's normal ``RuntimeError``
+    rather than a raw ``KeyError``. The key value is never logged.
+
+    Args:
+        env_var: The environment variable name holding the key.
+
+    Returns:
+        The API key value.
+
+    Raises:
+        RuntimeError: When *env_var* is unset or blank.
+    """
+    key = os.environ.get(env_var, "").strip()
+    if not key:
+        msg = f"{env_var} environment variable is not set"
+        raise RuntimeError(msg)
+    return key
+
+
 _HTTP_TOO_MANY_REQUESTS: int = 429
 """The HTTP status code for a rate-limited request."""
 
@@ -389,9 +412,9 @@ class AnthropicProvider:
 
             if self.config.api_key_env:
                 self._client = anthropic.Anthropic(
-                    api_key=os.environ[
+                    api_key=_read_key_env(
                         _effective_key_env(self.config, self.API_KEY_ENV)
-                    ]
+                    )
                 )
             else:
                 self._client = anthropic.Anthropic()
@@ -1184,7 +1207,7 @@ class OpenAIProvider:
 
             base_url = self.config.api_base
             byok_key = (
-                os.environ[_effective_key_env(self.config, self.API_KEY_ENV)]
+                _read_key_env(_effective_key_env(self.config, self.API_KEY_ENV))
                 if self.config.api_key_env
                 else None
             )
@@ -1450,7 +1473,9 @@ class GeminiProvider:
             from google import genai
 
             if self.config.api_key_env:
-                self._client = genai.Client(api_key=os.environ[self.config.api_key_env])
+                self._client = genai.Client(
+                    api_key=_read_key_env(self.config.api_key_env)
+                )
             else:
                 self._client = genai.Client()
         return self._client

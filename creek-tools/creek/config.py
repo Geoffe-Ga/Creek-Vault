@@ -11,6 +11,7 @@ file — they must come from environment variables.
 
 import logging
 import os
+import re
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -203,6 +204,40 @@ class LLMConfig(BaseModel):
             msg = f"unknown LLM provider {value!r}; expected one of: {joined}"
             raise ValueError(msg)
         return value
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _api_key_env_is_a_name(cls, value: str | None) -> str | None:
+        """Reject an ``api_key_env`` that looks like a pasted key, not a var name.
+
+        The field's whole safety property is "holds a variable name, never a
+        secret." An accidentally-pasted key would be serialized into
+        ``creek_config.yaml`` and echoed into "not set" error messages, so it is
+        rejected fail-fast at config-load: the value must be a valid environment
+        variable identifier and must not begin with a known provider-key prefix.
+
+        Args:
+            value: The configured ``api_key_env`` (``None`` when unset).
+
+        Returns:
+            The trimmed variable name, or ``None`` when unset/blank.
+
+        Raises:
+            ValueError: When the value is not a plausible env var name.
+        """
+        if value is None:
+            return None
+        name = value.strip()
+        if not name:
+            return None
+        looks_like_key = name.startswith(("sk-", "sk_", "AIza", "AKIA"))
+        if looks_like_key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            msg = (
+                "api_key_env must be an environment variable NAME "
+                "(e.g. CREEK_BYOK_ANTHROPIC_KEY), not an API key value"
+            )
+            raise ValueError(msg)
+        return name
 
 
 _LLM_SCALAR_STAGES = ("default", "classification", "generation", "frontend")
