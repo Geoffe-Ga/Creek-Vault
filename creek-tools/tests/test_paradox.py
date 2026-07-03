@@ -565,3 +565,114 @@ class TestCrossLevelFilter:
         detector = ParadoxDetector()
         assert detector.detect_paradoxes([a, b]) == []
         assert len(detector.detect_paradoxes([a, b], cross_level=True)) == 1
+
+
+# ---- #790: bounded candidate generation equivalence + scale ----
+
+
+def _paradox_key(paradox: Paradox) -> tuple[tuple[str, ...], str]:
+    """Order-stable identity: (fragment ids, contradiction type)."""
+    return (tuple(paradox.fragment_ids), paradox.contradiction_type)
+
+
+def _all_rules_corpus() -> tuple[list[Fragment], dict[str, list[float]]]:
+    """Fragments + embeddings that trigger each of the four rules exactly once."""
+    fragments = [
+        make_fragment("rising", fid="f0", phase=Phase.RISING),
+        make_fragment("diminishing", fid="f1", phase=Phase.DIMINISHING),
+        make_fragment("musing", fid="f2", confidence=Confidence.MUSING, threads=["T"]),
+        make_fragment(
+            "settled",
+            fid="f3",
+            confidence=Confidence.SETTLED,
+            threads=["T"],
+        ),
+        make_fragment(
+            "medicine",
+            fid="f4",
+            primary=Frequency.F2,
+            dosage=Dosage.MEDICINE,
+        ),
+        make_fragment("toxic", fid="f5", primary=Frequency.F2, dosage=Dosage.TOXIC),
+        make_fragment("But actually I flipped", fid="f6", threads=["K"]),
+        make_fragment("partner", fid="f7", threads=["K"]),
+        make_fragment("filler one", fid="f8"),
+        make_fragment("filler two", fid="f9"),
+    ]
+    # f0/f1 share an embedding (high similarity); everyone else is orthogonal.
+    seeds = {"f0": 0, "f1": 0}
+    embeddings = {
+        f.id: unit_embedding(seeds.get(f.id, idx + 3), dims=32)
+        for idx, f in enumerate(fragments)
+    }
+    return fragments, embeddings
+
+
+class TestBoundedCandidateEquivalence:
+    """The bounded path must reproduce the exhaustive all-pairs scan exactly."""
+
+    def test_matches_exhaustive_across_all_rules(self) -> None:
+        """Bounded detection equals the exhaustive reference (all four rules)."""
+        fragments, embeddings = _all_rules_corpus()
+        detector = ParadoxDetector()
+        bounded = detector.detect_paradoxes(fragments, embeddings=embeddings)
+        # Issue #790: the private exhaustive scan is the equivalence oracle.
+        exhaustive = detector._detect_exhaustive(
+            fragments,
+            embeddings,
+            cross_level=False,
+        )
+        assert [_paradox_key(p) for p in bounded] == [
+            _paradox_key(p) for p in exhaustive
+        ]
+        assert {p.contradiction_type for p in bounded} == {
+            "phase",
+            "confidence",
+            "dosage",
+            "keyword",
+        }
+
+    def test_matches_exhaustive_without_embeddings(self) -> None:
+        """With no embeddings, thread/frequency rules still match identically."""
+        fragments, _ = _all_rules_corpus()
+        detector = ParadoxDetector()
+        bounded = detector.detect_paradoxes(fragments)
+        # Issue #790: the private exhaustive scan is the equivalence oracle.
+        exhaustive = detector._detect_exhaustive(
+            fragments,
+            {},
+            cross_level=False,
+        )
+        assert [_paradox_key(p) for p in bounded] == [
+            _paradox_key(p) for p in exhaustive
+        ]
+
+    def test_non_positive_threshold_uses_exhaustive_fallback(self) -> None:
+        """A threshold of 0 makes every pair high-similarity via the fallback."""
+        fragments, embeddings = _all_rules_corpus()
+        default = ParadoxDetector().detect_paradoxes(fragments, embeddings=embeddings)
+        degenerate = ParadoxDetector(similarity_threshold=0.0).detect_paradoxes(
+            fragments,
+            embeddings=embeddings,
+        )
+        # The keyword fragment now pairs with every high-similarity partner, so
+        # the degenerate scan finds strictly more paradoxes than the default.
+        assert len(degenerate) > len(default)
+
+    def test_scales_to_thousands(self) -> None:
+        """Detection completes on ~2000 fragments (the O(N²) scan could not)."""
+        fragments = [
+            make_fragment(
+                f"frag {i}",
+                fid=f"s{i}",
+                primary=Frequency.F2 if i % 500 == 0 else Frequency.UNCLASSIFIED,
+                dosage=Dosage.MEDICINE if i % 1000 == 0 else Dosage.UNCLASSIFIED,
+                threads=[f"t{i // 3}"],
+            )
+            for i in range(2000)
+        ]
+        embeddings = {
+            f.id: unit_embedding(i % 40, dims=64) for i, f in enumerate(fragments)
+        }
+        result = ParadoxDetector().detect_paradoxes(fragments, embeddings=embeddings)
+        assert isinstance(result, list)
