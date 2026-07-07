@@ -83,15 +83,16 @@ number. A clean scan reports zero created and that is a success.
 
 ## Examples
 
-### Example 1 — Perf scan finds an N+1
-Title: `[scan:perf] N+1 query loading marginalia in entries.list_for_user`
-Labels: `P2,scan:perf,agent-ready`. Body cites the SQLAlchemy echo log,
-`file:line` at the scanned SHA, and a `selectinload` before/after sketch.
+### Example 1 — Perf scan finds an unbatched embedding call
+Title: `[scan:perf] Unbatched generate_embedding() call in fragment loop`
+Labels: `P2,scan:perf,agent-ready`. Body cites the per-fragment loop,
+`file:line` at the scanned SHA, and a `generate_embedding` →
+`generate_embeddings` batch before/after sketch.
 
 ### Example 2 — Dedupe hit
-`[scan:dead-code] unused export parseAmount in lib/billing.ts` is already
-open as #412 → add a comment: "Still present at `<SHA>`; vulture confidence
-100%." No new issue is created.
+`[scan:dead-code] unused helper _legacy_link_summary in creek_mcp/tools/link.py`
+is already open as #412 → add a comment: "Still present at `<SHA>`; vulture
+confidence 100%." No new issue is created.
 
 ## Troubleshooting
 
