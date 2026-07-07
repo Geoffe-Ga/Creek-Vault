@@ -41,7 +41,7 @@ jobs:
           fetch-depth: 50
 
       - name: Run backlog grooming
-        uses: anthropics/claude-code-action@521136812280ae7ef256e06045655b9da02793f0  # v1.0.158
+        uses: anthropics/claude-code-action@6c0083bb7289c31716797a039b6367b3079cc46e  # v1.0.162
         env:
           GH_TOKEN: ${{ github.token }}
         with:
