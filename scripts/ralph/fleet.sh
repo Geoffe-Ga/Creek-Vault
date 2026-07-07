@@ -10,6 +10,8 @@
 # inspect, sync, and tear down those worktrees — never more than
 # `max_workers` (default 4) at a time.
 #
+# Design & concurrency model: scripts/ralph/FLEET.md
+#
 # Design contract ("optimistic parallelism, pessimistic merge"):
 #   * Parallel work is a speculation that the chosen issues are independent.
 #   * Correctness is guaranteed at MERGE time, not pick time: the orchestrator
@@ -50,9 +52,12 @@ readonly DEFAULT_MAX_WORKERS=4
 readonly WORKTREE_ROOT=".ralph/worktrees"
 readonly STATE_FILE="scripts/ralph/state.json"
 
+# Print an actionable error and exit. Callers pass the message as ONE arg and an
+# optional exit code as the second ($2) — so the code never leaks into the
+# message. Defaults to exit 1 for the common single-arg callers.
 die() {
-  echo "fleet: $*" >&2
-  exit 1
+  echo "fleet: $1" >&2
+  exit "${2:-1}"
 }
 
 # Resolve the repository root so the script works from any worktree/subdir.
@@ -162,20 +167,53 @@ cmd_path() {
   fi
 }
 
+# Acquire the assign critical-section lock via an atomic `mkdir` (no flock, so
+# macOS/bash-3.2-safe), bounded by FLEET_LOCK_TIMEOUT seconds (default 10). On
+# success installs an EXIT trap that releases the lock on EVERY later exit path —
+# the success return, a cap-refused `die`, or a fetch/worktree failure — because
+# die() calls `exit`, which fires an EXIT (not RETURN) trap. On timeout it dies
+# non-zero with an actionable stale-lock hint (a held lock is never removed here;
+# only its owner or the operator clears it).
+acquire_assign_lock() {
+  local lock="$1" timeout="${FLEET_LOCK_TIMEOUT:-10}" waited=0
+  [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=10
+  while true; do
+    if mkdir "$lock" 2>/dev/null; then
+      trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+      return 0
+    fi
+    ((waited >= timeout)) && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  die "assign: could not acquire lock (stale $lock?); remove it if no assign is running" 1
+}
+
 cmd_assign() {
-  local issue="$1" slug="${2:-}" root dir branch base
+  local issue="$1" slug="${2:-}" root dir branch base lock
   [[ -n "$issue" ]] || die "assign: usage: assign <issue> <slug>"
   [[ "$issue" =~ ^[0-9]+$ ]] || die "assign: issue must be numeric, got '$issue'"
   root="$(repo_root)"
   dir="$(issue_dir "$issue")"
 
-  # Re-entrant: an existing worktree for this issue is simply reused.
+  # Re-entrant: an existing worktree for this issue is simply reused. Checked
+  # BEFORE locking so re-entry never contends on the lock.
   if [[ -d "$dir" ]]; then
     printf '%s\n' "$dir"
     return 0
   fi
 
-  # Enforce the cap only when creating a *new* worktree.
+  # Serialize the whole check-then-create below: without a lock two concurrent
+  # assigns could both pass the cap check and both add a worktree, overflowing
+  # max_workers (TOCTOU). Ensure the worktree root exists first so the lock has a
+  # home even on a cold fleet.
+  mkdir -p "$root/$WORKTREE_ROOT"
+  lock="$root/$WORKTREE_ROOT/.assign.lock"
+  acquire_assign_lock "$lock"
+
+  # Enforce the cap only when creating a *new* worktree — INSIDE the lock so the
+  # count-then-create is atomic. A refused assign calls die → exit, and the EXIT
+  # trap installed above still releases the lock.
   if [[ "$(cmd_free)" -le 0 ]]; then
     die "assign: fleet is full ($(count_active)/$(max_workers) workers active)"
   fi
@@ -185,7 +223,6 @@ cmd_assign() {
   base="origin/main"
 
   git -C "$root" fetch --quiet origin main || die "assign: could not fetch origin/main"
-  mkdir -p "$root/$WORKTREE_ROOT"
 
   if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
     # Branch already exists (prior tick) — attach a worktree to it.
@@ -193,6 +230,11 @@ cmd_assign() {
   else
     git -C "$root" worktree add "$dir" -b "$branch" "$base" >&2
   fi
+
+  # Success: release the lock now and clear the trap so a later exit does not try
+  # to rmdir an already-gone (or a newly re-acquired) lock.
+  rmdir "$lock" 2>/dev/null || true
+  trap - EXIT
   printf '%s\n' "$dir"
 }
 
@@ -266,7 +308,7 @@ cmd_reconcile() {
 }
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 

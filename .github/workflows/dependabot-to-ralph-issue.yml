@@ -65,7 +65,7 @@ jobs:
 
       - name: Bridge Dependabot PRs into Ralph issues
         env:
-          # Prefer a real PAT (same convention as claude-code-review.yml and
+          # Prefer a real PAT (same convention as code-review.yml and
           # deslop.yml) so the issue/PR edits are authored by an account
           # the mobile webhook recognizes; fall back to the run's GITHUB_TOKEN.
           GH_TOKEN: ${{ secrets.GEOFFE_GA_PAT || secrets.GITHUB_TOKEN }}
