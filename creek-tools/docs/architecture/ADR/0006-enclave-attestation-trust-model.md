@@ -74,6 +74,17 @@ cloud-provider rule).
   compromised or mis-provisioned root key would undermine the gate. Extending to
   full vendor-chain verification is deliberate future work (a follow-up issue),
   and the boundary is documented so the guarantee is not overstated.
+- **Attestation fetch validates TLS against the `certifi` CA bundle, not a
+  pinned CA and not the OS trust store.** The client opens `httpx.Client` with
+  no `verify=` override, so `httpx` builds its default SSL context from the
+  `certifi` bundle shipped with the Python environment (`certifi` is a
+  transitive dependency via `httpx`; nothing in `providers.py` or `pyproject.toml`
+  sets a truststore, `SSL_CERT_FILE`, or `REQUESTS_CA_BUNDLE`). A self-signed
+  certificate on an internal-only enclave endpoint is therefore rejected (fails
+  closed, which is safe) rather than silently accepted. To trust an internal CA,
+  an operator can add it to the `certifi` bundle, point `SSL_CERT_FILE` (or
+  `SSL_CERT_DIR`) at a custom bundle — `httpx` honours both when `trust_env` is
+  left at its default `True` — or pass an explicit `verify=`/`ssl.SSLContext`.
 - Per-call attestation adds one round-trip of latency before each completion
   (accepted: the enclave path is for high-value voice generation, not bulk
   classification).
