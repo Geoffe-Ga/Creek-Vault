@@ -163,8 +163,12 @@ class LLMConfig(BaseModel):
     batch_size: int = 50
     """Number of items to process per LLM batch call."""
 
-    max_concurrent: int = 5
-    """Maximum number of concurrent LLM requests."""
+    max_concurrent: int = Field(default=5, ge=1)
+    """Maximum number of concurrent LLM requests.
+
+    Must be at least 1: a value below 1 would build a ``BoundedSemaphore(0)``
+    in the per-provider classify pool (PR #799) and hang forever on the first
+    ``acquire()``, so the misconfig fails fast at load time instead."""
 
     unclassified_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     """Per-dimension confidence floor below which Mode / Orientation /

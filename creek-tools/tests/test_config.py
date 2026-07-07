@@ -56,6 +56,25 @@ class TestLLMConfig:
         assert cfg.model == "claude-3"
         assert cfg.batch_size == 100
 
+    def test_max_concurrent_rejects_zero(self) -> None:
+        """Zero concurrent requests would issue no LLM calls at all."""
+        with pytest.raises(
+            ValueError, match=r"max_concurrent[\s\S]*greater than or equal to 1"
+        ):
+            LLMConfig(max_concurrent=0)
+
+    def test_max_concurrent_rejects_negative(self) -> None:
+        """A negative concurrency limit is nonsensical, not just unhelpful."""
+        with pytest.raises(
+            ValueError, match=r"max_concurrent[\s\S]*greater than or equal to 1"
+        ):
+            LLMConfig(max_concurrent=-3)
+
+    def test_max_concurrent_allows_one(self) -> None:
+        """1 is the inclusive lower bound — serial LLM operation is legal."""
+        cfg = LLMConfig(max_concurrent=1)
+        assert cfg.max_concurrent == 1
+
 
 class TestEmbeddingsConfig:
     """Tests for EmbeddingsConfig model."""
