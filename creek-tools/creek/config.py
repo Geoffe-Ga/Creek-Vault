@@ -100,7 +100,8 @@ class LLMConfig(BaseModel):
     """LLM provider configuration."""
 
     provider: str = "ollama"
-    """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, or ``gemini``."""
+    """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, ``gemini``,
+    or ``enclave`` (attested GPU-CC)."""
 
     model: str | None = None
     """Model identifier recognised by the chosen provider.

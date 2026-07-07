@@ -74,6 +74,13 @@ cloud-provider rule).
   compromised or mis-provisioned root key would undermine the gate. Extending to
   full vendor-chain verification is deliberate future work (a follow-up issue),
   and the boundary is documented so the guarantee is not overstated.
+- **Attestation fetch uses the system TLS trust store, not a pinned CA.** The
+  client opens `httpx.Client` with no `verify=` override, so it trusts
+  whatever CAs the host OS trusts. A self-signed certificate on an
+  internal-only enclave endpoint is therefore rejected (fails closed, which is
+  safe) rather than silently accepted; operators running such an endpoint must
+  provision a CA-issued certificate or install their internal CA into the
+  system trust store.
 - Per-call attestation adds one round-trip of latency before each completion
   (accepted: the enclave path is for high-value voice generation, not bulk
   classification).
