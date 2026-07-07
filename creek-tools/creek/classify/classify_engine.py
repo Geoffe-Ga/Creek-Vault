@@ -30,6 +30,7 @@ import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
@@ -333,6 +334,20 @@ def run_classify(
         VaultWriter(vault_path=vault_path) if reatomize_enabled else None
     )
 
+    # Concurrency (#764/#783): the per-fragment LLM call is network-bound, so
+    # running files through a thread pool lets the calls overlap — previously
+    # this loop was serial and ``max_concurrent`` had no effect. Each distinct
+    # provider gets its OWN bounded semaphore sized by its own stage's
+    # ``max_concurrent``: INTIMATE fragments route to a local provider (#666),
+    # which must not inherit the cloud stage's width (#783). The outer pool is
+    # sized as the SUM of the distinct providers' widths so both tiers can
+    # saturate their own cap at the same time without oversubscribing either.
+    # Re-atomization shares one writer, so it stays serial (workers forced to 1);
+    # the rules path builds no throttle and also stays serial.
+    throttle, workers = _build_classify_throttle(tier_classifiers)
+    if vault_writer is not None:
+        workers = 1
+
     files = sorted(fragments_root.rglob("*.md"))
     process_one = partial(
         _process_file,
@@ -346,18 +361,8 @@ def run_classify(
         progress_path=progress_path,
         trace_log_path=trace_log_path,
         vault_writer=vault_writer,
+        throttle=throttle,
         lock=threading.Lock(),
-    )
-
-    # Concurrency (#764): the per-fragment LLM call is network-bound, so running
-    # files through a thread pool sized by the classification stage's
-    # ``max_concurrent`` lets the calls overlap — previously this loop was serial
-    # and the knob had no effect. Re-atomization keeps a single shared writer, and
-    # the rules path is local CPU with no I/O to overlap, so both stay serial.
-    workers = (
-        config.llm.for_stage("classification").max_concurrent
-        if method == LLM_METHOD and vault_writer is None
-        else 1
     )
     _dispatch_files(files, process_one, workers=workers)
 
@@ -372,6 +377,70 @@ def run_classify(
         # underlying list and reach into completed-run state.
         errors=tuple(counts.errors),
     )
+
+
+def _build_classify_throttle(
+    tier_classifiers: TierClassifiers | None,
+) -> tuple[dict[int, threading.BoundedSemaphore], int]:
+    """Size the classify pool and build per-provider concurrency permits (#783).
+
+    Each distinct classifier (non-Intimate vs the local Intimate route, #666)
+    gets its own :class:`threading.BoundedSemaphore` sized by that classifier's
+    ``max_concurrent``, keyed by ``id(classifier)`` so a fragment's resolved
+    classifier maps to its own permit. The pool width is the **sum** of the
+    distinct widths, so both tiers can run at their own cap simultaneously
+    without either oversubscribing its provider. When ``distinct()`` returns a
+    single classifier — the shared-instance / single-provider case — this
+    collapses to exactly the pre-#783 single-stage width (no regression).
+
+    Args:
+        tier_classifiers: The per-tier classifier set, or ``None`` for the
+            rules path (which runs serially with no provider to throttle).
+
+    Returns:
+        ``(throttle, workers)``: the ``id(classifier) -> semaphore`` map and the
+        summed pool width. ``({}, 1)`` for the rules path.
+    """
+    if tier_classifiers is None:
+        return {}, 1
+    throttle: dict[int, threading.BoundedSemaphore] = {}
+    workers = 0
+    for classifier in tier_classifiers.distinct():
+        max_concurrent = classifier.config.max_concurrent
+        throttle[id(classifier)] = threading.BoundedSemaphore(max_concurrent)
+        workers += max_concurrent
+    return throttle, workers
+
+
+@contextmanager
+def _classify_permit(
+    throttle: dict[int, threading.BoundedSemaphore],
+    llm: LLMClassifier | None,
+) -> Iterator[None]:
+    """Hold the resolved classifier's concurrency permit for the classify call.
+
+    Wraps only the leaf ``_classify_one`` call (#783): the permit is acquired
+    OUTSIDE the shared ``lock`` — exactly where the expensive provider call
+    already runs unlocked (#764) — and released on the way out, including on
+    exception. When there is no matching semaphore (the rules path, where
+    ``llm`` is ``None``, or a provider with no registered permit) this yields
+    without throttling.
+
+    Args:
+        throttle: The ``id(classifier) -> semaphore`` map from
+            :func:`_build_classify_throttle`.
+        llm: The classifier resolved for this fragment's tier, or ``None`` on
+            the rules path.
+
+    Yields:
+        ``None`` while the permit (if any) is held.
+    """
+    semaphore = throttle.get(id(llm)) if llm is not None else None
+    if semaphore is None:
+        yield
+        return
+    with semaphore:
+        yield
 
 
 def _record_if_preserved(
@@ -470,6 +539,7 @@ def _process_file(
     progress_path: Path | None,
     trace_log_path: Path | None,
     vault_writer: VaultWriter | None,
+    throttle: dict[int, threading.BoundedSemaphore],
     lock: threading.Lock,
 ) -> None:
     """Classify a single fragment file and update ``counts`` in place.
@@ -501,12 +571,19 @@ def _process_file(
         vault_writer: Shared :class:`VaultWriter` for persisting
             FEAT-023 children. ``None`` when re-atomization is not
             enabled for this run.
+        throttle: Per-provider concurrency permits keyed by
+            ``id(classifier)`` (#783). The classifier resolved for this
+            fragment's tier acquires its own bounded semaphore around the
+            classify call, so a mixed-tier vault never applies the cloud
+            stage's width to the local Intimate provider. Empty on the rules
+            path (no provider to throttle).
         lock: Guards the shared-state sections (``counts`` mutation, the
             progress/trace-log appends, and the re-atomization writer) so this
             function is safe to run on many worker threads at once. The
-            expensive, network-bound classify call runs *outside* the lock so
-            calls from different threads overlap — the fix for #764. An
-            uncontended lock is passed on the serial path.
+            expensive, network-bound classify call runs *outside* the lock — and
+            under the resolved provider's permit — so calls from different
+            threads overlap up to each provider's own cap (the fix for
+            #764/#783). An uncontended lock is passed on the serial path.
     """
     with lock:
         record = _load_classifiable_fragment(
@@ -536,19 +613,23 @@ def _process_file(
 
     # The provider call is the expensive, network-bound step (#764). It runs
     # WITHOUT the lock so calls from different worker threads overlap — that is
-    # what makes ``max_concurrent`` effective. The classifiers are pre-warmed
-    # (their availability was checked before the loop) and read-only during the
-    # run, and each fragment is an independent input, so concurrent calls are
-    # safe.
-    new_fragment, was_skipped, reasoning = _classify_one(
-        fragment=fragment,
-        body=body,
-        method=method,
-        rules=rules,
-        llm=llm,
-        confidence_threshold=classification_config.confidence_threshold,
-        weighted_classification=classification_config.weighted_classification,
-    )
+    # what makes ``max_concurrent`` effective — but UNDER the resolved provider's
+    # own bounded semaphore (#783), so the local Intimate provider is capped by
+    # its own width, not the cloud stage's. The permit wraps only this leaf call
+    # (never the locked write block below) and is released even on error. The
+    # classifiers are pre-warmed (their availability was checked before the loop)
+    # and read-only during the run, and each fragment is an independent input, so
+    # concurrent calls are safe.
+    with _classify_permit(throttle, llm):
+        new_fragment, was_skipped, reasoning = _classify_one(
+            fragment=fragment,
+            body=body,
+            method=method,
+            rules=rules,
+            llm=llm,
+            confidence_threshold=classification_config.confidence_threshold,
+            weighted_classification=classification_config.weighted_classification,
+        )
 
     # Stamp the #634 audience axis on every (re)classified fragment. It is a
     # deterministic heuristic independent of the frequency/phase method above,
