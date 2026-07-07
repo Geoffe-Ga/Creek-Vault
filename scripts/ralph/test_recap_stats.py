@@ -54,6 +54,34 @@ def test_normalize_verdict_defaults_to_comments() -> None:
     assert rs.normalize_verdict("Some notes.\nVerdict: COMMENTS") == rs.COMMENTS
 
 
+def test_normalize_verdict_ignores_mid_line_prose_mention() -> None:
+    # Issue #803: a bare substring match on "VERDICT" false-positives on prose
+    # that merely mentions the word without a genuine Verdict line (as in PR
+    # #802's self-skip warning comment). No verdict line -> None.
+    body = (
+        "Heads up: the loop will self-skip so no verdict will be posted for "
+        "this PR by the author."
+    )
+    assert rs.normalize_verdict(body) is None
+
+
+def test_normalize_verdict_detects_markdown_heading_prefix() -> None:
+    assert rs.normalize_verdict("## Verdict: LGTM") == rs.LGTM
+
+
+def test_normalize_verdict_detects_bold_prefix() -> None:
+    assert rs.normalize_verdict("**Verdict:** COMMENTS") == rs.COMMENTS
+
+
+def test_normalize_verdict_legacy_header_with_token_on_next_line() -> None:
+    assert rs.normalize_verdict("## Verdict\n✅ LGTM") == rs.LGTM
+
+
+def test_normalize_verdict_last_verdict_line_wins() -> None:
+    body = "Verdict: CHANGES_REQUESTED\n\nAfter another pass:\n## Verdict: LGTM"
+    assert rs.normalize_verdict(body) == rs.LGTM
+
+
 # ---------- iterations_before_lgtm ----------
 
 

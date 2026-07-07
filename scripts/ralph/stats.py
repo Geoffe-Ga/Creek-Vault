@@ -16,6 +16,7 @@ merge history into the numbers a human wants to see in a recap.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from collections import Counter
 
 # A Claude reviewer verdict, normalized. The reviewer posts a comment ending in
@@ -23,6 +24,15 @@ from collections import Counter
 LGTM = "LGTM"
 CHANGES_REQUESTED = "CHANGES_REQUESTED"
 COMMENTS = "COMMENTS"
+
+# Anchors a genuine verdict LINE (heading- and bold-prefix tolerant) so a stray
+# mention of "verdict" in prose does not false-positive. Mirrors pr-ready.sh's
+# VERDICT_RE (its line 64) and must be kept in sync with it; single backslashes
+# here because — unlike pr-ready.sh — this pattern is not spliced into a jq
+# string literal.
+_VERDICT_LINE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]", re.IGNORECASE | re.MULTILINE
+)
 
 ISO_NO_TZ = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -39,18 +49,21 @@ def parse_iso(timestamp: str) -> dt.datetime:
 def normalize_verdict(raw: str) -> str | None:
     """Collapse a Claude review comment body to a single verdict token.
 
-    Returns None when the body carries no recognizable verdict line, so callers
-    can ignore non-review comments. The check mirrors the grep ladder in
-    `iteration-trigger.yml`: CHANGES_REQUESTED wins over a bare LGTM mention so
-    a comment that says "this is not yet LGTM, changes requested" is counted as
-    a change request.
+    Returns None when the body carries no genuine verdict LINE, so callers can
+    ignore non-review comments (a stray "verdict" mentioned mid-prose does not
+    count). Line-anchoring mirrors pr-ready.sh's VERDICT_RE. When several verdict
+    lines exist (the reviewer re-verdicted after another pass), the LAST one
+    wins: we scan from its start to end-of-body and apply the precedence
+    CHANGES_REQUESTED beats a bare LGTM mention, so "this is not yet LGTM,
+    changes requested" is counted as a change request.
     """
-    upper = raw.upper()
-    if "VERDICT" not in upper:
+    matches = list(_VERDICT_LINE_RE.finditer(raw))
+    if not matches:
         return None
-    if "CHANGES_REQUESTED" in upper or "CHANGES REQUESTED" in upper:
+    region = raw[matches[-1].start() :].upper()
+    if "CHANGES_REQUESTED" in region or "CHANGES REQUESTED" in region:
         return CHANGES_REQUESTED
-    if "LGTM" in upper:
+    if "LGTM" in region:
         return LGTM
     return COMMENTS
 
