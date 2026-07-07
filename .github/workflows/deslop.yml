@@ -1,0 +1,230 @@
+name: De-Slop
+
+# Runs the `de-slopify` skill as a MATRIX of targeted, per-product-area scans:
+# evidence-based code-quality audits that file corroborated findings as
+# Ralph-ready GitHub issues (and decomposed epics for large work). Jobs NEVER
+# write to the repo — the GITHUB_TOKEN is `contents: read` / `issues: write`,
+# so the only durable output is new issues. False positives are the enemy: the
+# skill files nothing it cannot corroborate with two independent signals, and a
+# clean run (zero issues) is a valid, expected outcome.
+#
+# The area registry is `.github/deslop-areas.json` — the single source of
+# truth. To add a scan, add an entry there (id, stack, paths, charter); the
+# matrix, the `area` dispatch input, and the Ralph tick gate all pick it up
+# with no workflow edits.
+#
+# Triggers:
+#   - schedule: every Monday 08:00 UTC — ALL areas (the weekly floor; every
+#     scan runs at least this often).
+#   - workflow_dispatch: all areas by default, or a single area via the
+#     `area` input. The local Ralph loop dispatches this workflow every
+#     `deslop_interval` (30) completed merges — see the de-slop gate in
+#     `.claude/commands/ralph-tick.md`.
+#
+# Required configuration:
+#   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
+
+on:
+  schedule:
+    # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      area:
+        description: "Area id from .github/deslop-areas.json (e.g. 'creek-pipeline', 'creek-mcp', 'crawdad-bot'). Blank or 'all' = every area."
+        required: false
+        default: "all"
+
+# Avoid overlapping audit waves (matrix jobs within one run still parallelize).
+concurrency:
+  group: deslop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  # OIDC token for the claude action's auth exchange (mirrors claude.yml).
+  id-token: write
+
+jobs:
+  plan:
+    name: Resolve target areas
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.areas.outputs.matrix }}
+    steps:
+      - name: Checkout repository (registry only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Select areas from the registry
+        id: areas
+        env:
+          AREA: ${{ github.event.inputs.area || 'all' }}
+        run: |
+          set -euo pipefail
+          MATRIX=$(jq -c --arg area "$AREA" '
+            if $area == "" or $area == "all" then .
+            else map(select(.id == $area))
+            end' .github/deslop-areas.json)
+          if [ "$(jq 'length' <<<"$MATRIX")" -eq 0 ]; then
+            echo "::error::No area matches '$AREA' in .github/deslop-areas.json"
+            exit 1
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Scanning areas: $(jq -r 'map(.id) | join(", ")' <<<"$MATRIX")"
+
+  deslop:
+    name: "Scan ${{ matrix.area.id }}"
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Bound simultaneous Claude runs (cost + issue-dedup races).
+      max-parallel: 4
+      matrix:
+        area: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout repository (full history for churn analysis)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # Full history so git-churn / hotspot detection has signal.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install creek-tools toolbox (read-only analyzers)
+        # Every area in this monorepo is Python (creek pipeline, creek_mcp,
+        # crawdad) — one toolbox serves them all. Install the fully-pinned
+        # uv.lock straight into the runner Python (mirrors the canonical uv
+        # install in ci.yml) so the evidence collector's read-only analyzers
+        # (ruff, mypy, radon, xenon, bandit[toml], vulture, interrogate,
+        # pip-audit, detect-secrets) resolve exactly as they do in CI.
+        working-directory: creek-tools
+        run: |
+          python -m pip install 'uv==0.11.16'
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o /tmp/uv-locked-deps.txt
+          uv pip install --system -r /tmp/uv-locked-deps.txt
+          uv pip install --system --no-deps -e .
+
+      - name: Run targeted de-slopify scan
+        uses: anthropics/claude-code-action@6c0083bb7289c31716797a039b6367b3079cc46e  # v1.0.162
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Surface the agent's transcript in the run log so the audit is
+          # auditable: you can verify the skill was invoked and the whole
+          # taxonomy traversed. Safe on a private repo with read-only contents.
+          show_full_output: true
+
+          # The skill files issues via gh; expose the analyzers it relies on.
+          # Security boundary is the job's GITHUB_TOKEN (contents: read /
+          # issues: write) — Claude cannot push code, only open issues.
+          #
+          # --model opus: this is a judgment-heavy audit (architecture,
+          #   duplication, AI-slop, verbosity) — Sonnet, the action default,
+          #   ran the first audit too leniently. Opus does the deep reading.
+          # --max-turns 100: one product area, read exhaustively. (The old
+          #   whole-repo audit needed 240; a targeted scope does not.)
+          claude_args: >-
+            --allowed-tools "Bash,Read,Grep,Glob,Write,Skill,Task"
+            --model opus
+            --max-turns 100
+
+          prompt: |
+            Run a TARGETED de-slop scan of ONE product area of this repository
+            using the `de-slopify` skill in its targeted-scan mode. Invoke the
+            skill and follow its instructions exactly, with the scope below as
+            the coverage set.
+
+            Area: "${{ matrix.area.id }}"
+            Charter: ${{ matrix.area.charter }}
+            Scope paths (the coverage set):
+            ${{ join(matrix.area.paths, ' | ') }}
+
+            The scope includes the TESTS that cover these paths
+            (creek-tools/tests for the creek-tools areas; crawdad/tests for
+            the crawdad bot) — weak and coverage-theater tests are in scope
+            for the taxonomy's testing family.
+
+            Linters are TABLE STAKES, not the audit. This repo already passes
+            ruff, mypy (strict), radon, xenon, bandit, and interrogate in
+            pre-commit and CI on every commit, so anything those tools gate is
+            ALREADY enforced and CANNOT be a finding — do not report complexity
+            grades, lint rules, or type errors as slop. Your value is the slop
+            those tools are blind to: dead/stubbed/orphaned code, duplication, bad
+            architecture and layering violations, lying feature flags, needless
+            verbosity, comment slop, AI-generated tells, and weak/coverage-
+            theater tests. Finding those requires READING THE CODE, not parsing
+            tool JSON. The evidence bundle is a starting map, not the territory.
+
+            Mandatory reading pass — EXHAUSTIVE over the ENTIRE SCOPE, EVERY
+            RUN. After collecting evidence, fan out with the Task tool and spawn
+            a reader subagent per module within the scope. Each reader
+            READS the source against the full 13-family taxonomy in
+            references/slop-taxonomy.md and reports corroborated candidates.
+
+            This is a whole-SCOPE audit on EVERY run, not a delta scan. A clean
+            linter bundle and an unchanged file are NOT reasons to skip reading
+            any file in scope. "Delta-focused", "since the last run", and
+            "building on last week's baseline" scoping are FORBIDDEN — slop in
+            older, stable code must be read too. Churn / size lists decide only
+            the ORDER files are read, NEVER which files are skipped.
+
+            Corroboration may read OUTSIDE the scope (e.g. proving scoped code
+            is duplicated elsewhere, or that a layering violation crosses the
+            boundary), but FILE only findings anchored inside the scope —
+            out-of-scope slop belongs to that area's own scan; skip it
+            silently.
+
+            Coverage ledger: maintain a ledger that lists, per file/module in
+            the scope, that it was READ this run (and which families it was
+            checked against). A "0 findings" verdict is only valid when the
+            ledger covers the ENTIRE scope this run.
+
+            Hard requirements (the skill enforces these — do not deviate):
+            - Corroborate every finding with TWO independent signals before
+              filing. For any correctness/bug claim, write and run a reproducing
+              test first; if it does not reproduce, DROP the finding.
+            - Discard everything in the skill's NOT-slop guard list (generated
+              code, migrations, lockfiles, justified suppressions, framework
+              boilerplate, test fixtures, deliberate conventions).
+            - Dedup against existing open and recently-closed issues before
+              filing anything (`gh issue list`, `gh search issues`). Other area
+              scans may be running CONCURRENTLY — re-run the dedup search
+              immediately before each `gh issue create`.
+            - File standalone findings as Ralph-ready issues (Template A) and
+              large coordinated work as an `epic`-labeled umbrella with
+              decomposed sub-issues (Template B); use the `triage-and-plan`
+              skill when an epic needs more than ~3 sub-issues.
+            - Orphaned/dead code that is complete AND has explicit intent
+              evidence may warrant WIRING IN (with an e2e test) instead of
+              deletion; classify each Family-3 finding's remediation
+              direction (delete / wire-in (+ e2e) / decision-needed) per
+              Template A, preferring decision-needed over silently deleting
+              finished work.
+            - Create any missing labels first. Write issue bodies to files and
+              file with `gh issue create --body-file`.
+            - A run that files NOTHING because the code is clean is a SUCCESS.
+              Do not invent work to look productive.
+
+            End by writing a concise run summary to the GitHub Actions job
+            summary — append it to the file at $GITHUB_STEP_SUMMARY (e.g.
+            `cat >> "$GITHUB_STEP_SUMMARY"`) — containing: the area id, counts
+            by severity, issues/epics filed (with numbers), findings dropped
+            and why, findings deduped, AND a coverage ledger that proves
+            WHOLE-SCOPE coverage two ways: (a) one row per taxonomy family (all
+            13) with the verdict (clean / candidates / filed), and (b) every
+            file/module in the scope marked READ this run — none may be marked
+            "unchanged → not read". The ledger is how we verify the whole
+            taxonomy AND the whole scope were actually traversed rather than
+            assumed clean. A clean scan writes "entire area read this run;
+            clean against the taxonomy" to the job summary and files NO issue.
+            Targeted scans NEVER open a `report` issue — the job summary is the
+            durable record, linked to the workflow run; the findings themselves
+            are the only issues filed.

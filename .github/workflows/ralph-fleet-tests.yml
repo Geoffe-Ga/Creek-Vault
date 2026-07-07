@@ -1,0 +1,37 @@
+name: Ralph Fleet Tests
+
+# Shell-test suite for the Ralph fleet mechanics under scripts/ralph/ (fleet.sh,
+# pick-next.sh, pr-ready.sh). These scripts live outside tests/, so the main
+# `pytest`-based CI job doesn't cover them — this workflow keeps the parallel
+# worktree fleet, the picker's parallel-awareness, and the PR-readiness
+# classifier honest. (The Discord recap's pure stats math is a separate
+# concern, tested at scripts/ralph/test_recap_stats.py and covered by
+# .github/workflows/ralph-recap-tests.yml.)
+
+on:
+  push:
+    paths:
+      - "scripts/ralph/**"
+      - ".github/workflows/ralph-fleet-tests.yml"
+  pull_request:
+    paths:
+      - "scripts/ralph/**"
+      - ".github/workflows/ralph-fleet-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-tests:
+    name: Fleet + picker + pr-ready shell tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Run fleet + picker + pr-ready shell tests
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+          bash scripts/ralph/test_fleet.sh
+          bash scripts/ralph/test_pick_next.sh
+          bash scripts/ralph/test_pr_ready.sh

@@ -5,8 +5,10 @@ distilled answer to the question *"what does sloppy, amateurish, AI-generated,
 or otherwise low-quality code actually look like?"* — organized so a reviewer
 (human or agent) can systematically hunt for each species.
 
-It synthesizes several established sources and adapts them to Adepthood's
-FastAPI + React Native stack:
+It synthesizes several established sources and adapts them to this all-Python
+monorepo: the creek pipeline (`creek-tools/creek`), the MCP server
+(`creek-tools/creek_mcp`), and the crawdad Discord bot (`crawdad/crawdad`) —
+there is no frontend:
 
 - **Fowler & Beck**, *Refactoring* (2nd ed., 2018) — the canonical 22 smells,
   grouped into Bloaters, OO-Abusers, Change-Preventers, Dispensables, Couplers.
@@ -46,7 +48,7 @@ they cause incidents, not just friction.
 | **Incorrect null/undefined handling** | `if (x)` truthiness bugs (`0`, `""`, `false`), `Optional` deref without guard | type-narrowing analysis + test. |
 | **SQL/ORM N+1 or missing filter** | query in a loop; `.all()` then filter in Python; missing tenant/user filter | log query count; the missing-filter case is also a security bug. |
 | **Wrong comparison** | `==` on objects/NaN, `is` on small ints/strings by luck, `assert` for control flow | confirm semantics differ from intent. |
-| **Silent type coercion** | implicit `str`↔`int`, JS `==`, truthy coercion | eslint `eqeqeq`; confirm a coercion path. |
+| **Silent type coercion** | implicit `str`↔`int`, truthy coercion across boundaries | reading + mypy; confirm a coercion path. |
 
 ---
 
@@ -80,14 +82,16 @@ they cause incidents, not just friction.
 
 ---
 
-## Family 3 — Dispensables (code that should not exist)
+## Family 3 — Dispensables (code with no justified presence as written)
 
 This family is the heart of "de-slopping." It is where dead, stubbed, orphaned,
-and duplicated code lives.
+and duplicated code lives. Not everything here is destined for deletion — some
+orphaned code is finished work merely awaiting the connection it was written
+for; see the remediation note below the table.
 
 | Smell | The tell | Corroboration hint |
 |-------|----------|--------------------|
-| **Dead code** | unreachable branches, unused functions/classes/vars, unused imports | **vulture** (Python) / **eslint+ts** (frontend) **and** a grep proving zero references (incl. dynamic/string refs, routers, DI). |
+| **Dead code** | unreachable branches, unused functions/classes/vars, unused imports | **vulture** **and** a grep proving zero references (incl. dynamic/string refs, CLI commands, MCP tools, Discord handlers). |
 | **Commented-out code** | blocks of `# old impl ...` / `// ...` left in | grep; trivially real — delete, git remembers. |
 | **Stubbed / hollow implementation** | `raise NotImplementedError`, `pass`, `return None  # TODO`, `return []` placeholder, `throw new Error('not implemented')`, a function whose body is a single `...` | grep + confirm it's referenced as if real (a stub nobody calls is dead code; a stub callers depend on is a **lie** — higher severity). |
 | **Fake/aspirational feature flag** | a flag/docstring/comment claiming a guarantee the code doesn't deliver (e.g. "encrypted at rest" with plaintext writes) | trace the claim to the implementation; confirm the gap. This is the `audit-destub` pattern — see that epic. |
@@ -99,6 +103,22 @@ and duplicated code lives.
 | **Dead config / deps** | declared dependencies never imported; env vars never read; settings never used | grep usage of each; confirm zero references. |
 | **Redundant test** | tests asserting framework behavior, tautologies, `assert True`, snapshot-only with no logic | confirm it would survive a logic mutation (see mutation-testing). |
 
+**Remediation direction (delete vs. wire-in + e2e).** The default for
+Dead/Orphaned/Stubbed findings is still **delete** (git remembers) unless
+**both** hold: (a) **intent evidence** — a docstring/flag promise, a roadmap/
+epic/`NORTH-STAR.md` reference, or an adjacent call site that clearly meant to
+use it; and (b) **completeness evidence** — the orphaned code is a finished,
+coherent, house-pattern-consistent implementation, not a husk. Both present ⇒
+recommend **wire-in + an e2e test** that exercises the newly connected path
+(through the real entry point: the `creek` CLI command via Typer's
+`CliRunner`, the MCP tool surface, or the crawdad Discord handler). Intent
+without completeness is not this case — that is the
+existing **Fake/aspirational feature flag** row above, the `audit-destub`
+"make it real" pattern. Ambiguous ⇒ file as **decision-needed** rather than
+silently deleting finished work. Neither signal ⇒ delete. The detector only
+**files** the issue either way — it never wires anything in and never deletes
+anything itself.
+
 ---
 
 ## Family 4 — Change-Preventers (code that makes change expensive)
@@ -108,7 +128,7 @@ and duplicated code lives.
 | **Divergent Change** | one module changed for many unrelated reasons | git churn + confirm distinct change-reasons in history. |
 | **Shotgun Surgery** | one logical change forces edits in many files | trace a representative change; confirm scatter. |
 | **Parallel inheritance hierarchies** | adding a subclass here forces one there | confirm the lock-step. |
-| **Implicit cross-layer coupling** | frontend type silently depends on backend shape with no shared contract | confirm a schema mismatch is possible. |
+| **Implicit cross-layer coupling** | a consumer silently depends on another package's payload shape with no shared contract (e.g. crawdad hand-parsing creek vault files) | confirm a schema mismatch is possible. |
 
 ---
 
@@ -118,7 +138,7 @@ and duplicated code lives.
 |-------|----------|--------------------|
 | **Circular dependency** | module A imports B imports A | import-graph cycle detection; trivially real once found. |
 | **Layering violation** | router does DB access directly; domain imports web framework; model imports a router | confirm the dependency crosses a layer the wrong way. |
-| **Business logic in the wrong tier** | validation/energy/streak math inside a route handler or a React component | confirm it belongs in `domain/`. |
+| **Business logic in the wrong tier** | validation/classification/linking math inside a CLI command, MCP handler, or Discord listener | confirm it belongs in the owning pipeline package. |
 | **Leaky abstraction** | callers must know internal details to use a thing safely | confirm the contract is insufficient. |
 | **Global mutable singleton** | module-level caches/state mutated across requests | confirm request-to-request bleed. |
 | **Missing seam / untestable design** | logic that can't be tested without network/clock/db because it hard-codes them | confirm no injection point exists. |
@@ -162,11 +182,11 @@ and duplicated code lives.
 
 | Smell | The tell | Corroboration hint |
 |-------|----------|--------------------|
-| **Escape hatches** | `# type: ignore`, `// @ts-ignore`, `// eslint-disable`, `# noqa`, `cast(Any, ...)` without justification | grep; confirm no linked issue justifies it (CLAUDE.md bans unjustified ones). |
-| **`Any` / `unknown` creep** | `Any` params/returns, `as any`, untyped dicts crossing boundaries | mypy/tsc; confirm a real type is knowable. |
-| **Loose assertions** | `as Foo` casts that bypass checks, non-null `!` operator overuse | confirm the cast can be wrong at runtime. |
-| **Frontend/backend shape drift** | TS type and Pydantic schema for the same payload disagree | diff the two; confirm a field/optionality mismatch. |
-| **Missing annotations** | public functions without signatures (where strict mode allows) | mypy/tsc strict gaps. |
+| **Escape hatches** | `# type: ignore`, `# noqa`, `cast(Any, ...)` without justification | grep; confirm no linked issue justifies it (CLAUDE.md bans unjustified ones). |
+| **`Any` creep** | `Any` params/returns, untyped dicts crossing boundaries | mypy; confirm a real type is knowable. |
+| **Loose assertions** | `cast()` calls that bypass checks, `# type: ignore` sprinkled to silence rather than fix | confirm the cast can be wrong at runtime. |
+| **Cross-boundary shape drift** | two models/dict contracts for the same payload disagree (e.g. a creek_mcp tool schema vs the pipeline's Pydantic model) | diff the two; confirm a field/optionality mismatch. |
+| **Missing annotations** | public functions without signatures (where strict mode allows) | mypy strict gaps. |
 
 ---
 
@@ -190,12 +210,12 @@ and duplicated code lives.
 | Smell | The tell | Corroboration hint |
 |-------|----------|--------------------|
 | **Hardcoded secret/credential** | API keys, tokens, passwords in source | detect-secrets / gitleaks; confirm it's a live secret shape. |
-| **Injection vector** | string-built SQL, `eval`, `exec`, shell with user input, `dangerouslySetInnerHTML` | bandit / eslint; confirm user input reaches the sink. |
+| **Injection vector** | string-built SQL, `eval`, `exec`, shell with user input | bandit; confirm user input reaches the sink. |
 | **Missing authz check** | endpoint mutates another user's data without ownership check | trace the handler; confirm no guard. |
 | **Permissive CORS / wildcard** | `allow_origins=["*"]` with credentials | confirm config. |
 | **Weak crypto / homemade auth** | md5/sha1 for passwords, custom token signing | confirm the primitive. |
 | **Sensitive data in logs** | logging tokens, PII, journal contents | grep log calls near sensitive fields. |
-| **Vulnerable dependency** | pinned dep with a known CVE | pip-audit / npm audit (defer fix to `cve-remediation`). |
+| **Vulnerable dependency** | pinned dep with a known CVE | pip-audit (defer fix to `cve-remediation`). |
 
 ---
 
@@ -203,7 +223,7 @@ and duplicated code lives.
 
 | Smell | The tell | Corroboration hint |
 |-------|----------|--------------------|
-| **Unused dependency** | declared in requirements/package.json, never imported | grep imports; confirm zero use. |
+| **Unused dependency** | declared in `pyproject.toml`, never imported | grep imports; confirm zero use. |
 | **Phantom dependency** | imported but not declared | confirm import without a manifest entry. |
 | **Duplicate / conflicting config** | two tools configured for the same job, contradicting | confirm overlap. |
 | **Magic numbers / strings** | unexplained literals (`* 86400`, `0.7`, status codes) | confirm a named constant adds meaning. |
@@ -221,7 +241,7 @@ studies of LLM-generated code.)
 | Smell | The tell | Corroboration hint |
 |-------|----------|--------------------|
 | **Confident wrongness** | plausible code that compiles and reads well but is subtly incorrect | only filed with a reproducing test — never on vibes. |
-| **Hallucinated API / import** | calls to functions/params/endpoints that don't exist | tsc/mypy/import error; trivially real if it doesn't resolve. |
+| **Hallucinated API / import** | calls to functions/params/endpoints that don't exist | mypy/import error; trivially real if it doesn't resolve. |
 | **Reinvented existing helper** | a fresh utility duplicating one already in the repo | grep for the existing helper; confirm overlap. |
 | **Ceremonial scaffolding** | elaborate structure (interfaces, abstract bases) around trivial logic | confirm the ceremony exceeds the need. |
 | **Explanatory-comment spam** | every line narrated; docstrings restating types | comment density metric. |
@@ -240,7 +260,7 @@ how aggressively Ralph should pick it up.
 | Severity | Definition | Examples |
 |----------|------------|----------|
 | **Critical** | Causes data loss, security breach, or user-facing breakage now | live secret, missing authz, injection, swallowed error on a write path, a stub callers depend on |
-| **High** | Latent correctness bug, architectural debt that compounds, lying feature flag | off-by-one behind a flag, N+1 on a hot path, circular dep, frontend/backend shape drift |
+| **High** | Latent correctness bug, architectural debt that compounds, lying feature flag | off-by-one behind a flag, N+1 on a hot path, circular dep, cross-boundary shape drift |
 | **Medium** | Maintainability tax, real dead/duplicated code, weak tests | god function, duplicated block, coverage theater, dead module |
 | **Low** | Readability, naming, comment slop, cosmetic verbosity | ceremonial comments, meaningless names, redundant conditionals |
 
@@ -254,14 +274,14 @@ twenty. Don't death-by-a-thousand-issues the backlog.
 The detector must *not* file these. Treating them as findings is itself slop.
 
 - **Intentional, documented simplicity** — a small function is not a "lazy class."
-- **Justified suppressions** — a `# type: ignore[...]` or `// eslint-disable`
+- **Justified suppressions** — a `# type: ignore[...]` or `# noqa`
   with a linked issue and a real reason is allowed by CLAUDE.md. Leave it.
 - **Test fixtures and factories** — duplication and "magic" values in tests are
   often deliberate and readable.
-- **Generated code / vendored files / migrations** — Alembic migrations,
-  `package-lock.json`, build output. Out of scope.
-- **Framework-required boilerplate** — Pydantic models, SQLModel tables, React
-  Navigation config have irreducible shape.
+- **Generated code / vendored files / migrations** — migrations, lockfiles
+  (`uv.lock`), build output. Out of scope.
+- **Framework-required boilerplate** — Pydantic models, Typer command
+  signatures, discord.py listeners have irreducible shape.
 - **Domain constants that are self-explanatory** — `status_code=404`, `HTTP_200`.
 - **Style the repo has deliberately chosen** — match CLAUDE.md/AGENTS.md, not a
   generic ideal.

@@ -1,0 +1,32 @@
+name: "Scan: TODO/FIXME harvest"
+
+# Thin wrapper over the reusable _claude-scan.yml core. Converts inline
+# TODO/FIXME/HACK/XXX markers into tracked, agent-ready GitHub issues.
+#
+# This is the tracer scan of the autonomous maintenance pipeline — the first
+# thread wired end-to-end. Clone this file for each additional scan, changing
+# only `name`, the cron, `scan_name`, `max_issues`, and `priority`.
+#
+# `workflow_dispatch` is REQUIRED on every scan wrapper: it is the hook the
+# queue-depth hopper uses to refill the Ralph backlog off-schedule.
+
+on:
+  schedule:
+    # Weekly Friday 08:00 UTC, per the task table. (cron is UTC.)
+    - cron: "0 8 * * 5"
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: "Hard cap on issues created this run."
+        required: false
+        default: "5"
+
+jobs:
+  run:
+    uses: ./.github/workflows/_claude-scan.yml
+    with:
+      scan_name: todo
+      max_issues: ${{ fromJSON(github.event.inputs.max_issues || '5') }}
+      priority: P3
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
