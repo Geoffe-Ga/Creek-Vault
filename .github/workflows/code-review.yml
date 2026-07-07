@@ -118,9 +118,43 @@ jobs:
             # claude-code-action self-skips (anti-tamper) on any PR that edits this
             # workflow file, so there is no review to post — that is expected and
             # must not fail the check (the workflow change is reviewed manually).
-            if gh pr diff "$PR_NUMBER" -R "$REPO" --name-only \
-                 | grep -qx '.github/workflows/code-review.yml'; then
+            # Assign first, then grep a herestring: a `gh … | grep -q` PIPELINE
+            # trips pipefail (grep -q exits on first match, gh dies with SIGPIPE
+            # 141, and the pipeline reports non-zero on a MATCH). If gh itself
+            # fails, set -e fails the step loudly — never a silent green.
+            changed_files=$(gh pr diff "$PR_NUMBER" -R "$REPO" --name-only)
+            if grep -qxF '.github/workflows/code-review.yml' <<<"$changed_files"; then
+              # This is the workflow-edited self-skip path: the required check must
+              # stay green (exit 0) so branch protection does not dead-lock, but a
+              # missing review must be LOUD — not a silent no-op. Post an explicit
+              # PR comment (in addition to the ::warning::) so it shows in the PR
+              # timeline. The body is a fully STATIC string (no interpolation of any
+              # PR-controlled data → no injection surface) and deliberately carries
+              # NO "## Verdict:"/"**Verdict:**" line, so the merge-critical
+              # line-anchored verdict parsers (iteration-trigger.yml, pr-ready.sh)
+              # never mistake it for a real verdict. (The word "verdict" appears
+              # mid-line only; a bare-substring analytics parser could still count
+              # it — harmless recap noise, never a gate.)
               echo "::warning::This PR edits the review workflow, so the action self-skips — no automated verdict; review manually."
+              # Idempotency: on `synchronize` this step re-runs per push, so dedup on
+              # the stable HTML marker. jq does the containment test in one command
+              # substitution (no `grep -q` pipeline → no SIGPIPE). Matching purely on
+              # the marker (not the comment author) is the robust dedup choice; even
+              # if someone pre-posts the marker to suppress the warning it is
+              # harmless — there is still no verdict comment, so the PR stays
+              # awaiting-review.
+              marker_count=$(gh pr view "$PR_NUMBER" -R "$REPO" --json comments \
+                --jq '[.comments[].body | select(. != null and contains("<!-- review-self-skip -->"))] | length')
+              if [ "$marker_count" -eq 0 ]; then
+                # Build the body from static literals via printf so the marker sits
+                # on its own top line with no leading indentation (avoids markdown
+                # treating an indented second line as a code block). No PR-controlled
+                # data is interpolated, so there is no injection surface.
+                self_skip_body=$(printf '%s\n%s\n' \
+                  '<!-- review-self-skip -->' \
+                  '⚠️ This PR edits the review workflow — no automated verdict; manual review required.')
+                gh pr comment "$PR_NUMBER" -R "$REPO" --body "$self_skip_body"
+              fi
               exit 0
             fi
             echo "::error::Claude review produced no structured output — failing so it is re-run, never a silent no-review."
