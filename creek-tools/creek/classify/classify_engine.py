@@ -393,6 +393,13 @@ def _build_classify_throttle(
     single classifier — the shared-instance / single-provider case — this
     collapses to exactly the pre-#783 single-stage width (no regression).
 
+    Note that the pool width sums **all** distinct classifiers' ``max_concurrent``
+    up front, even when a run contains fragments for only one tier (e.g. an
+    all-OPEN vault with a configured-but-unused local Intimate route still gets
+    ``cloud_width + local_width`` threads). Those extra threads sit idle rather
+    than oversubscribe any provider — harmless, but worth knowing if the
+    thread count ever surprises someone profiling (#799).
+
     Args:
         tier_classifiers: The per-tier classifier set, or ``None`` for the
             rules path (which runs serially with no provider to throttle).
