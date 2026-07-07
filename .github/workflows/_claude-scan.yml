@@ -1,0 +1,144 @@
+name: Claude Scan (reusable)
+
+# Reusable core for the autonomous maintenance pipeline. Each maintenance
+# scan (todo, deps, security, perf, …) is a ~20-line thin wrapper that calls
+# this workflow with a `scan_name`, a `priority`, and a `max_issues` cap. The
+# scan reads `prompts/scans/<scan_name>.md`, runs its read-only analysis, and
+# uses the `scan-issue-writer` skill to file deduplicated, 6-component,
+# agent-ready GitHub issues for the Ralph loop to consume.
+#
+# This mirrors the de-slop workflow's plumbing (auth, runner, permissions)
+# deliberately — see `.github/workflows/deslop.yml`. Scans NEVER push code:
+# the GITHUB_TOKEN is `contents: read` / `issues: write`, so the only durable
+# output is new issues. Code changes remain the Ralph loop's job.
+#
+# Required configuration:
+#   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
+
+on:
+  workflow_call:
+    inputs:
+      scan_name:
+        description: "Scan id — must match prompts/scans/<scan_name>.md (e.g. 'todo', 'perf')."
+        required: true
+        type: string
+      max_issues:
+        description: "Hard cap on issues created this run. The hopper controls volume."
+        required: false
+        type: number
+        default: 5
+      priority:
+        description: "Priority label applied to filed issues: P0 | P1 | P2 | P3."
+        required: true
+        type: string
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  # OIDC token for the claude action's auth exchange (mirrors claude.yml / deslop.yml).
+  id-token: write
+
+# One scan at a time per scan type: never kill a run mid-issue-creation, and
+# never let a scheduled run race a hopper-dispatched run of the same scan.
+concurrency:
+  group: claude-scan-${{ inputs.scan_name }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: "Scan ${{ inputs.scan_name }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository (recent history for churn/bug analysis)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 50
+
+      - name: Validate scan_name and locate its definition
+        env:
+          SCAN_NAME: ${{ inputs.scan_name }}
+        run: |
+          set -euo pipefail
+          # Charset guard: scan_name is interpolated into a file path and the
+          # Claude prompt. GitHub Actions inputs have no `pattern:` field, so we
+          # fail fast here instead. Blocks path-traversal / injection from any
+          # future wrapper that wires scan_name to a workflow_dispatch input.
+          if ! printf '%s' "$SCAN_NAME" | grep -qE '^[a-z][a-z0-9-]+$'; then
+            echo "::error::Invalid scan_name '$SCAN_NAME' — must match ^[a-z][a-z0-9-]+$"
+            exit 1
+          fi
+          if [ ! -f "prompts/scans/$SCAN_NAME.md" ]; then
+            echo "::error::No scan definition at prompts/scans/$SCAN_NAME.md"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install analyzer toolbox (read-only analyzers)
+        # Mirrors ci.yml's locked-uv flow: install the fully-pinned uv.lock
+        # straight into the runner's Python so every analyzer (radon, xenon,
+        # vulture, pip-audit, bandit, interrogate, mypy, ruff, …) resolves
+        # exactly as CI does. `uv export --locked` fails if uv.lock drifted.
+        working-directory: creek-tools
+        run: |
+          python -m pip install 'uv==0.11.16'
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o /tmp/locked-requirements.txt
+          uv pip install --system -r /tmp/locked-requirements.txt
+          uv pip install --system --no-deps -e .
+          # mutmut is not a repo dependency (mutation scan only) — install it
+          # ad hoc. A failure here must not sink a scan that does not use it,
+          # but it must be VISIBLE, not silent, so a scan that expected the
+          # tool and found it missing reports "tooling broken" (skill
+          # Troubleshooting) rather than a false "clean" result.
+          uv pip install --system mutmut || true
+          for tool in pip-audit vulture mutmut; do
+            uv pip show --system "$tool" >/dev/null 2>&1 \
+              || echo "::warning::optional analyzer '$tool' is not installed; scans that rely on it should fail loudly, not report clean"
+          done
+
+      - name: Run Claude scan
+        uses: anthropics/claude-code-action@521136812280ae7ef256e06045655b9da02793f0  # v1.0.158
+        env:
+          # The scan-issue-writer skill files issues via gh; the action injects
+          # GITHUB_TOKEN, but gh reads GH_TOKEN — bind it to the job token whose
+          # scope is contents:read / issues:write.
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Surface the transcript in the run log so the scan is auditable: you
+          # can verify the skill was invoked and the cap respected. Safe on a
+          # private repo with read-only contents.
+          show_full_output: true
+
+          # --model opus: issue authoring is judgment-heavy (severity ranking,
+          #   dedupe decisions, 6-component prose). The action default (Sonnet)
+          #   files vaguer issues.
+          # --max-turns 40: one scan, bounded analysis + a capped set of creates.
+          claude_args: >-
+            --allowed-tools "Bash,Read,Grep,Glob,Write,Skill,Task"
+            --model opus
+            --max-turns 40
+
+          prompt: |
+            Use the `scan-issue-writer` skill and follow its instructions exactly.
+
+            Scan type: ${{ inputs.scan_name }}
+            Scan definition file: prompts/scans/${{ inputs.scan_name }}.md
+            Max issues to create this run: ${{ inputs.max_issues }}
+            Priority label for filed issues: ${{ inputs.priority }}
+
+            Read the scan definition first. Run its read-only analysis, rank and
+            cap the findings, dedupe against open issues before every create,
+            and file each surviving finding as a fully-populated 6-component
+            issue. A clean scan that files ZERO issues is a valid success — do
+            not invent work. End with the run summary the skill specifies,
+            appended to $GITHUB_STEP_SUMMARY.

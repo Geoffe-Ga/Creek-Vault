@@ -1,0 +1,32 @@
+name: "Labels: bootstrap pipeline labels"
+
+# One-shot (manually dispatched) bootstrap that creates/updates the labels the
+# autonomous maintenance pipeline relies on: the P0–P3 priority tiers consumed
+# by scripts/ralph/pick-next.sh, the agent-ready gate, and the scan:<name>
+# provenance labels. Runs scripts/setup-scan-labels.sh, which is idempotent
+# (`gh label create --force`), so re-dispatching is safe drift correction.
+#
+# Run this once after merge (Actions → this workflow → Run workflow) before the
+# first scan files issues. Scans also create missing labels on demand, but this
+# makes the full set exist up front so pick-next.sh tiering is correct from run
+# one.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Create/update pipeline labels
+        run: bash scripts/setup-scan-labels.sh

@@ -1,0 +1,67 @@
+name: "Scan: Backlog grooming"
+
+# The backlog-grooming pass of the autonomous maintenance pipeline. Unlike the
+# producer scans (which route through _claude-scan.yml + scan-issue-writer),
+# groom is a CONSUMER: it closes resolved/stale scan issues, dedupes, and
+# promotes complete needs-triage issues to agent-ready via the backlog-grooming
+# skill. It therefore has its own thin workflow rather than the producer core,
+# but mirrors the same plumbing (auth, SHA-pinned actions, permissions).
+#
+# Runs daily at 04:00 UTC — BEFORE the day's producer scans (05:00+), so the
+# queue is deduped and trued-up against HEAD before new findings land.
+#
+# Required configuration:
+#   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"        # daily 04:00 UTC, before producer scans
+  workflow_dispatch:
+
+# issues: write covers close / comment / edit. No contents write: groom never
+# touches code, only the issue tracker.
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+concurrency:
+  group: claude-scan-groom
+  cancel-in-progress: false
+
+jobs:
+  groom:
+    name: Groom the Ralph backlog
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository (recent history to verify resolved findings)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 50
+
+      - name: Run backlog grooming
+        uses: anthropics/claude-code-action@521136812280ae7ef256e06045655b9da02793f0  # v1.0.158
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
+          # Bash carries gh issue close/comment/edit; issues:write is the scope.
+          claude_args: >-
+            --allowed-tools "Bash,Read,Grep,Glob,Skill,Task"
+            --model opus
+            --max-turns 40
+          prompt: |
+            Use the `backlog-grooming` skill and follow its instructions exactly.
+
+            Scan definition file: prompts/scans/groom.md
+
+            Reconcile the open issue backlog against current HEAD: close issues
+            resolved by merged PRs, close scan issues whose finding no longer
+            reproduces at HEAD, collapse duplicates (keep the oldest), and
+            promote fully-specified needs-triage scan issues to agent-ready.
+            Re-verify against HEAD before every close, and be conservative —
+            comment for confirmation rather than closing when "resolved/stale"
+            is uncertain. End with the run summary groom.md specifies, appended
+            to $GITHUB_STEP_SUMMARY.

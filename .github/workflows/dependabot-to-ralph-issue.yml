@@ -1,0 +1,249 @@
+name: Dependabot → Ralph Issue Bridge
+
+# Bridges Dependabot's PR-only model into Ralph's issue-first loop. Dependabot
+# produces PRs with no GitHub issue and no `Closes #N` line, so they are
+# invisible to `scripts/ralph/pick-next.sh` and rot. This workflow, for each
+# open Dependabot PR, (a) files a Ralph-qualified `dependencies` issue and
+# (b) appends `Closes #<issue>` to the Dependabot PR body — turning the
+# Dependabot PR into Ralph's in-flight PR (Mode B), so Ralph adopts it through
+# its existing path with no duplicate PR. See issue tracker for full design.
+#
+# Two triggers, one idempotent reconciler:
+#   - pull_request_target (dependabot-only): real-time, links a PR as it opens.
+#   - workflow_dispatch + schedule: backfill / safety net; clears the existing
+#     backlog and re-links any PR whose body Dependabot later overwrites.
+#
+# SECURITY — pull_request_target runs with the base-repo token (it has
+# issues:write / pull-requests:write, which a dependabot-triggered
+# `pull_request` run does not). To stay safe we NEVER check out the PR head and
+# NEVER inline untrusted `${{ }}` event fields in a `run:` block — the PR title
+# is passed via an env var so a crafted branch/title cannot inject shell.
+
+on:
+  # Real-time: a Dependabot PR opens or reopens. pull_request_target so the run
+  # has the base-repo token (issues:write / pull-requests:write). Gated to
+  # Dependabot only below.
+  pull_request_target:
+    types: [opened, reopened]
+  # Backfill + safety net: clears the existing Dependabot backlog on first
+  # dispatch and re-links any PR whose body was overwritten. Scheduled a few
+  # hours after Dependabot's weekly Monday window so freshly-opened PRs exist.
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+
+# Limit the token to exactly what the bridge needs: file issues, edit PR
+# bodies, read repo metadata. No contents:write — we never push code.
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+# Serialize runs so the event-driven and scheduled paths can never race and
+# double-file for the same PR.
+concurrency:
+  group: dependabot-to-ralph-issue
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    name: File Ralph issues for Dependabot PRs and link them
+    runs-on: ubuntu-latest
+    # On pull_request_target, only act for Dependabot's own PRs. The scheduled
+    # and manual triggers have no actor PR context, so let them through.
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.actor == 'dependabot[bot]'
+    steps:
+      - name: Check out repo metadata only (no PR head)
+        # We never check out or build the PR head — only the base repo, for
+        # nothing more than a clean workspace. The bridge reads PR data via the
+        # gh API, not the checkout.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Bridge Dependabot PRs into Ralph issues
+        env:
+          # Prefer a real PAT (same convention as claude-code-review.yml and
+          # deslop.yml) so the issue/PR edits are authored by an account
+          # the mobile webhook recognizes; fall back to the run's GITHUB_TOKEN.
+          GH_TOKEN: ${{ secrets.GEOFFE_GA_PAT || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          # Event-driven PR metadata, read ONLY from the trusted event payload.
+          # The title is passed as an env var (never inlined into a run: block)
+          # to foreclose script injection from a crafted branch/PR title.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Marker linking an issue back to its Dependabot PR. Hidden HTML
+          # comment in the issue body; the dedup check greps for it so re-runs
+          # never double-file.
+          marker_for() { printf '<!-- dependabot-pr:%s -->' "$1"; }
+
+          # True if a PR body already links an issue via Closes/Fixes/Resolves.
+          body_links_issue() {
+            printf '%s' "$1" | grep -qiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+'
+          }
+
+          # True if an open `dependencies` issue already carries this PR's
+          # marker. Idempotency keystone: a second run finds the marker and
+          # files nothing.
+          issue_exists_for_pr() {
+            local pr="$1" marker
+            marker="$(marker_for "$pr")"
+            gh issue list --repo "$REPO" --label dependencies --state open \
+              --limit 200 --json number,body \
+              --jq '.[].body' 2>/dev/null | grep -qF "$marker"
+          }
+
+          # The working contract, stated verbatim, with a `{PR}` placeholder.
+          # Kept on one source line so it stays indented inside the YAML block
+          # scalar (a heredoc at column 1 would terminate the scalar).
+          # shellcheck disable=SC2016  # single-quoted on purpose: the literal
+          # backticks/`{PR}` placeholder must NOT be shell-expanded.
+          contract='Adopt Dependabot PR #{PR} (its branch is already linked via `Closes`). Rebase on `main`, run `cd creek-tools && ./scripts/check-all.sh`. **Upgrade fully — if the new major requires code changes, make them** (TDD the adaptation per `stay-green`; no pins-back, no `# type: ignore`, no weakening a gate). Push fixes **to the Dependabot branch**, drive CI + the Claude review to green, squash-merge. Merging closes this issue.'
+
+          # File a Ralph-ready `dependencies` issue for one PR and append
+          # `Closes #<issue>` to that PR's body. No-op if already linked.
+          bridge_pr() {
+            local pr="$1" title="$2" pr_body issue_body issue_num marker
+            marker="$(marker_for "$pr")"
+
+            pr_body="$(gh pr view "$pr" --repo "$REPO" --json body --jq .body)"
+
+            # Skip PRs that already link an issue (Dependabot rarely does, but
+            # a prior bridge run may have).
+            if body_links_issue "$pr_body"; then
+              echo "PR #$pr already links an issue — skipping."
+              return 0
+            fi
+
+            # Dedup against an existing open issue carrying this PR's marker.
+            if issue_exists_for_pr "$pr"; then
+              echo "Issue already exists for PR #$pr (marker present) — skipping."
+              return 0
+            fi
+
+            # Build the Ralph-ready issue body: hidden marker, the verbatim
+            # contract (with {PR} substituted), and a link to the Dependabot PR.
+            local contract_body="${contract//\{PR\}/$pr}"
+            issue_body="$(printf '%s\n\n%s\n\nDependabot PR: #%s\n' \
+              "$marker" "$contract_body" "$pr")"
+
+            # Title mirrors the Dependabot PR so the dep/from/to is legible.
+            # Labels: `dependencies` only — none of pick-next.sh's exclude set,
+            # so the picker treats it as a normal candidate.
+            issue_num="$(gh issue create --repo "$REPO" \
+              --title "chore(deps): adopt Dependabot PR #$pr — $title" \
+              --label dependencies \
+              --body "$issue_body" \
+              | grep -oE '[0-9]+$')"
+
+            echo "Filed issue #$issue_num for PR #$pr."
+
+            # Append `Closes #<issue>` so the Dependabot PR becomes Ralph's
+            # in-flight PR and auto-closes the issue on merge into main. Do this
+            # BEFORE the label check below so that a persistent permission gap
+            # surfaces the error once instead of minting a fresh orphaned issue
+            # on every trigger: once the PR body links the issue,
+            # `body_links_issue` (which reads the PR body, not the label)
+            # short-circuits all subsequent runs.
+            gh pr edit "$pr" --repo "$REPO" \
+              --body "$(printf '%s\n\nCloses #%s' "$pr_body" "$issue_num")"
+
+            echo "Linked PR #$pr → issue #$issue_num via Closes."
+
+            # The REST create endpoint silently drops labels when the token
+            # lacks push/triage access — which would break the marker dedup
+            # above (it filters on the `dependencies` label). Re-apply the
+            # label with a dedicated call (that endpoint errors instead of
+            # dropping) and verify it stuck, so a permission gap fails loudly
+            # rather than leaving an unlabeled, picker-invisible issue.
+            # Swallow this call's own error: the read-back verification below is
+            # the authoritative diagnosis, so a failure here would be redundant.
+            gh issue edit "$issue_num" --repo "$REPO" \
+              --add-label dependencies || true
+
+            # Verify the label stuck. Capture the read call's own success
+            # separately from the label match so the two failure modes keep
+            # distinct diagnoses: a failed read is a transient API flake, while
+            # a successful read that omits the label is a real permission gap.
+            # A re-run cannot re-reach this check (the PR body now links the
+            # issue, so `body_links_issue` short-circuits), so both branches
+            # point to the same one-time manual fix: add the label by hand.
+            local labels label_error=""
+            if ! labels="$(gh issue view "$issue_num" --repo "$REPO" \
+              --json labels --jq '.labels[].name')"; then
+              label_error="Could not verify the label on issue #$issue_num (transient GitHub API error); the re-apply may have succeeded — if the issue is missing the label, add it once: gh issue edit $issue_num --add-label dependencies"
+            elif ! printf '%s\n' "$labels" | grep -qx dependencies; then
+              label_error="The 'dependencies' label is absent on issue #$issue_num after re-apply (the token likely lacks Issues/triage permission); add it once by hand: gh issue edit $issue_num --add-label dependencies"
+            fi
+
+            # Failure handling differs by path. The single-PR event path fails
+            # loud and immediate (exit 1). The reconciler processes a whole
+            # batch, so one PR's label-verify failure must NOT skip every later
+            # PR: record the diagnosis and let the caller continue, then fail
+            # the run once at the end. The issue is filed and its PR is already
+            # linked, so `body_links_issue` short-circuits any re-run — no
+            # duplicate is ever minted while the label is added by hand.
+            if [ -n "$label_error" ]; then
+              if [ "$EVENT_NAME" = "pull_request_target" ]; then
+                echo "::error::$label_error" >&2
+                exit 1
+              fi
+              reconcile_failures+=("$label_error")
+              echo "Label-verify failed for issue #$issue_num — recorded; continuing the batch." >&2
+            fi
+          }
+
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            # Real-time path: bridge just this one PR. Title comes from the env
+            # var, never inlined into the command.
+            echo "Event-driven: bridging Dependabot PR #$PR_NUMBER."
+            bridge_pr "$PR_NUMBER" "$PR_TITLE"
+            exit 0
+          fi
+
+          # Reconciler path (schedule / manual): bridge every open Dependabot
+          # PR that is not yet linked. Idempotent — a re-run files/edits nothing.
+          echo "Reconciler: scanning open Dependabot PRs."
+          prs="$(gh pr list --repo "$REPO" --state open --author 'app/dependabot' \
+            --limit 200 --json number,title,body,headRefName)"
+
+          count="$(printf '%s' "$prs" | jq 'length')"
+          echo "Found $count open Dependabot PR(s)."
+
+          # Collects label-verify diagnoses across the batch so one PR's
+          # failure never skips the rest; the run fails once at the end if any
+          # were recorded.
+          reconcile_failures=()
+
+          # Iterate without piping into a subshell so set -e propagates.
+          for i in $(seq 0 $((count - 1))); do
+            num="$(printf '%s' "$prs" | jq -r ".[$i].number")"
+            ttl="$(printf '%s' "$prs" | jq -r ".[$i].title")"
+            body="$(printf '%s' "$prs" | jq -r ".[$i].body")"
+            if body_links_issue "$body"; then
+              echo "PR #$num already links an issue — skipping."
+              continue
+            fi
+            bridge_pr "$num" "$ttl"
+          done
+
+          # Surface every deferred label-verify failure at once and fail the
+          # run, so the batch completes but a permission gap or persistent API
+          # flake is never silently swallowed. Each issue is filed and its PR
+          # linked, so the only manual step is adding the missing label(s).
+          if [ "${#reconcile_failures[@]}" -gt 0 ]; then
+            echo "::error::${#reconcile_failures[@]} bridged PR(s) could not have their 'dependencies' label verified; add the label(s) by hand (details below)." >&2
+            for failure in "${reconcile_failures[@]}"; do
+              echo "::error::$failure" >&2
+            done
+            exit 1
+          fi
+
+          echo "Reconciler complete."
