@@ -67,7 +67,7 @@ jobs:
           fi
 
           # Find the latest Claude review comment via the deterministic
-          # "## Verdict: <verdict>" line that claude-code-review.yml appends.
+          # "## Verdict: <verdict>" line that code-review.yml appends.
           CLAUDE=$(jq -c '[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last // empty' comments.json)
           if [ -z "$CLAUDE" ]; then
             echo "No Claude review yet - skipping"

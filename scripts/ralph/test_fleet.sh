@@ -139,6 +139,47 @@ chmod +x "$BIN/gh"
 check "reconcile released only the merged worker" "1" "$(run count)"
 check "the open worker survived reconcile"        "105" "$(run active)"
 
+# --- die() honors an explicit exit code (rc==2) -----------------------------
+# cmd_reconcile's very first statement is `command -v gh || die "..." 2` — run
+# it with gh absent from PATH so the die call fires deterministically. Invoke
+# the running bash by absolute path ($BASH) so the interpreter is still findable
+# even though PATH is emptied (the /usr/bin/env shebang would otherwise need bash
+# on PATH); `command -v gh` is a builtin, so it works under the empty PATH.
+EMPTYBIN="$WORK/emptybin"; mkdir -p "$EMPTYBIN"
+rc=0
+(cd "$REPO" && PATH="$EMPTYBIN" "$BASH" "$FLEET" reconcile) >/dev/null 2>&1 || rc=$?
+check "die honors explicit exit code (reconcile w/o gh => 2)" "2" "$rc"
+
+# --- die() still defaults to exit 1 when no code is given --------------------
+rc=0
+run definitely-not-a-command >/dev/null 2>&1 || rc=$?
+check "die defaults to exit 1" "1" "$rc"
+
+# --- die() message excludes the exit-code arg ---------------------------------
+err="$( (cd "$REPO" && PATH="$EMPTYBIN" "$BASH" "$FLEET" reconcile) 2>&1 1>/dev/null || true )"
+check "die message excludes the exit-code arg" "fleet: reconcile: gh CLI required" "$err"
+
+# --- lock hygiene for cmd_assign ---------------------------------------------
+LOCKDIR="$REPO/.ralph/worktrees/.assign.lock"
+
+# (a) a successful assign leaves no lock dir behind.
+run assign 201 'lock cleanup' >/dev/null 2>&1
+[[ -d "$LOCKDIR" ]] && bad "assign left lock dir behind" || ok "assign releases lock on success"
+
+# (b) a refused assign (fleet full) also releases the lock (trap fires on die).
+printf '{"max_workers": 4, "parallel_enabled": false}\n' > "$REPO/scripts/ralph/state.json"
+run assign 203 'refused, lock must release' >/dev/null 2>&1 || true
+[[ -d "$LOCKDIR" ]] && bad "refused assign left lock dir behind" \
+  || ok "refused assign releases lock (trap fired on die)"
+printf '{"max_workers": 4, "parallel_enabled": true}\n' > "$REPO/scripts/ralph/state.json"
+
+# (c) a pre-existing stale lock makes assign fail fast, not hang or bypass it.
+mkdir -p "$LOCKDIR"
+rc=0
+(cd "$REPO" && FLEET_LOCK_TIMEOUT=1 "$FLEET" assign 202 'blocked by stale lock') >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] && ok "stale lock makes assign fail fast" || bad "stale lock did not block assign"
+rmdir "$LOCKDIR" 2>/dev/null || true
+
 # --- summary ----------------------------------------------------------------
 echo
 echo "fleet tests: $PASS passed, $FAIL failed"

@@ -152,6 +152,14 @@ set_labels 10 "epic-foo"   # active issue shares epic-foo with candidate 11
 worktree 10
 check "same-epic candidate skipped, cross-epic picked" "12" "$(run_pick)"
 
+# 6b) Same-epic guard must be case-insensitive: "Epic-Foo" and "epic-foo" are
+#     the same epic and must still conflict.
+new_scenario epic_guard_mixed_case
+candidate 11 "Epic-Foo"; candidate 12 "epic-bar"
+set_labels 10 "epic-foo"   # active issue's epic label differs only in case from candidate 11
+worktree 10
+check "same-epic guard is case-insensitive (mixed-case skipped, cross-epic picked)" "12" "$(run_pick)"
+
 # 7) `parallelizable` overrides the same-epic guard.
 new_scenario epic_override
 candidate 11 "epic-foo,parallelizable"

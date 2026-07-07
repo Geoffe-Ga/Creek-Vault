@@ -186,9 +186,11 @@ has_label() {
   return 1
 }
 
-# Epic-prefixed labels of an issue (labels beginning with "epic").
+# Epic-prefixed labels of an issue (labels beginning with "epic"). Lowercased
+# BEFORE `sort -u` so the same-epic guard's `comm -12` intersection is
+# case-insensitive (e.g. "Epic-Foo" matches "epic-foo") and collates correctly.
 epic_labels() {
-  printf '%s\n' "${1//,/$'\n'}" | grep -iE '^epic' | sort -u || true
+  printf '%s\n' "${1//,/$'\n'}" | grep -iE '^epic' | tr '[:upper:]' '[:lower:]' | sort -u || true
 }
 
 # Does the candidate (labels CSV) conflict with any active issue?
