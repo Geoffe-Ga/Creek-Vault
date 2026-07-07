@@ -119,7 +119,7 @@ jobs:
             # workflow file, so there is no review to post — that is expected and
             # must not fail the check (the workflow change is reviewed manually).
             if gh pr diff "$PR_NUMBER" -R "$REPO" --name-only \
-                 | grep -qx '.github/workflows/claude-code-review.yml'; then
+                 | grep -qx '.github/workflows/code-review.yml'; then
               echo "::warning::This PR edits the review workflow, so the action self-skips — no automated verdict; review manually."
               exit 0
             fi
