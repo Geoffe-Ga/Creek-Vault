@@ -27,7 +27,12 @@ BIN="$WORK/bin"
 mkdir -p "$BIN"
 
 # Arg-aware fake gh. Behaviour is driven by env vars the test sets per case:
-#   CHECKS_EC     — exit code `gh pr checks` should return (0 green / 8 pending / other failed)
+#   CHECKS_EC        — exit code `gh pr checks` should return (0 green / 8 pending / other failed)
+#   CHECKS_NO_CHECKS — when "1", `gh pr checks` fails with the exact stderr gh
+#                      emits when NO check runs are registered yet on the
+#                      branch ("no checks reported on the '<branch>' branch"),
+#                      exit 1. This must classify as `pending`, not `ci-failed`
+#                      — CI just hasn't started, not failed.
 #   MERGE_STATE   — mergeStateStatus (CLEAN / BEHIND / ...)
 #   HEAD_DATE     — RFC3339 committedDate of the PR HEAD commit
 #   VERDICT       — the "<createdAt>|<isLGTM>" scalar the verdict jq resolves to
@@ -41,7 +46,12 @@ cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
-  *"pr checks"*)            exit "${CHECKS_EC:-0}" ;;
+  *"pr checks"*)
+    if [[ "${CHECKS_NO_CHECKS:-0}" == "1" ]]; then
+      echo "no checks reported on the 'feature-x' branch" >&2
+      exit 1
+    fi
+    exit "${CHECKS_EC:-0}" ;;
   *"--json mergeStateStatus"*) printf '%s|%s\n' "${MERGE_STATE:-CLEAN}" "${HEAD_DATE:-}" ;;
   *"--json comments"*)
     if [[ -n "${COMMENTS_JSON:-}" ]]; then
@@ -70,6 +80,10 @@ check "missing PR number exits 2" "2" "$rc"
 # --- pending: gh pr checks exit 8 is NEVER ready (the core bug) -------------
 check "exit 8 → pending" "pending" \
   "$(CHECKS_EC=8 run 100)"
+
+# --- pending: no checks registered yet (exit 1 + the gh "no checks reported"
+# stderr signature) is CI-hasn't-started, not CI-failed ----------------------
+check "exit 1 + 'no checks reported' stderr → pending" "pending" "$(CHECKS_NO_CHECKS=1 run 100)"
 
 # --- CI failure surfaced: non-0/non-8 exit → ci-failed ---------------------
 check "exit 1 → ci-failed" "ci-failed" \

@@ -7,7 +7,7 @@
 #
 #   ready            LGTM (fresh) + CI green + up-to-date with main  → merge now
 #   behind           LGTM (fresh) + CI green but mergeStateStatus BEHIND → sync first
-#   pending          CI still running → wait for a later wake
+#   pending          CI still running (or no checks registered yet) → wait for a later wake
 #   ci-failed        CI has a failing/errored check → Step 2 (ci-debugging)
 #   awaiting-review  no fresh LGTM verdict (missing, stale, or non-LGTM) → wait / Step 2
 #
@@ -16,7 +16,9 @@
 # grep never matched and a still-running CI was read as settled — a false READY
 # that could merge a PR with pending/failing checks. CI state here is keyed off
 # the `gh pr checks` EXIT CODE, which is authoritative: 0 = all passed, 8 = some
-# pending, anything else = failure. No text parsing of the checks table at all.
+# pending, anything else = failure. No text parsing of the checks table at all —
+# with one deliberate exception: a stderr *signature* match (not table parsing)
+# for gh's no-checks-yet exit-1 case, which is reclassified from failure to pending.
 #
 # Stale-verdict guard: a review verdict only counts when it was posted AFTER the
 # PR's HEAD commit. An LGTM from before the latest push is stale (it reviewed
@@ -28,6 +30,13 @@ set -euo pipefail
 # `gh pr checks` exit code that means "checks still pending" (gh's documented
 # contract: 0 = pass, 8 = pending, other = failure).
 readonly CHECKS_PENDING_EC=8
+
+# gh also exits 1 (a "failure") with this case-insensitive stderr substring when a
+# PR has no check runs registered yet: `no checks reported on the '<branch>' branch`.
+# That is a not-yet-started PR, not a failed one, so it must classify as `pending`.
+# We never pass `--required`, so gh's `--required` variant ("no required checks
+# reported...", which this substring would NOT match) never arises here.
+readonly NO_CHECKS_SIG='no checks reported'
 
 die() { echo "pr-ready: $1" >&2; exit 2; }
 
@@ -61,11 +70,21 @@ gh_args=("$pr" ${repo_args[@]+"${repo_args[@]}"})
 
 # --- CI state from the exit code, not the text table -----------------------
 ci_ec=0
-gh pr checks "${gh_args[@]}" >/dev/null 2>&1 || ci_ec=$?
+# `2>&1 >/dev/null`: route stderr into the capture, then drop stdout — so ci_err
+# holds gh's stderr (e.g. the no-checks-yet message) while the checks table is
+# discarded. The `|| ci_ec=$?` guard absorbs gh's non-zero exit under `set -e`.
+ci_err="$(gh pr checks "${gh_args[@]}" 2>&1 >/dev/null)" || ci_ec=$?
 if [[ "$ci_ec" -eq "$CHECKS_PENDING_EC" ]]; then
   echo "pending"; exit 0
 elif [[ "$ci_ec" -ne 0 ]]; then
-  echo "ci-failed"; exit 0
+  # No check runs registered yet (gh exits non-zero with a "no checks
+  # reported" stderr) is a not-yet-started PR, not a failure → pending.
+  if printf '%s' "$ci_err" | grep -qi "$NO_CHECKS_SIG"; then
+    echo "pending"
+  else
+    echo "ci-failed"
+  fi
+  exit 0
 fi
 
 # --- CI is green: check mergeability + a FRESH LGTM verdict -----------------
