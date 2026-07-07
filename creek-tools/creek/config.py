@@ -160,8 +160,12 @@ class LLMConfig(BaseModel):
     secret; ``None`` means no trust anchor is configured and the provider fails
     closed. See ADR-0006."""
 
-    batch_size: int = 50
-    """Number of items to process per LLM batch call."""
+    batch_size: int = Field(default=50, ge=1)
+    """Number of items to process per LLM batch call.
+
+    Must be at least 1: a value below 1 would feed ``encode(batch_size=0)`` in
+    the embeddings pass (``creek/link/embeddings.py``) and process nothing, so
+    the misconfig fails fast at load time instead of silently doing no work."""
 
     max_concurrent: int = Field(default=5, ge=1)
     """Maximum number of concurrent LLM requests.
