@@ -19,6 +19,13 @@ on:
 
 jobs:
   run:
+    # A reusable workflow may not request more GITHUB_TOKEN scopes than its
+    # caller grants; the repo default is read-only, so grant the core's needs
+    # here (contents: read / issues: write / id-token: write) explicitly.
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
     uses: ./.github/workflows/_claude-scan.yml
     with:
       scan_name: deps
