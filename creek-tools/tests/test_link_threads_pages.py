@@ -136,6 +136,13 @@ def test_fragment_thread_links_target_written_pages(tmp_path: Path) -> None:
     page_titles = {
         str(frontmatter.load(p).metadata.get("title", "")) for p in _thread_pages(vault)
     }
+    # Every page also aliases its bare title, so a fragment's ``[[<title>]]``
+    # link resolves to the ``{date}-<title>.md`` filename in stock Obsidian.
+    page_aliases: set[str] = set()
+    for page in _thread_pages(vault):
+        page_aliases.update(
+            str(a) for a in frontmatter.load(page).metadata.get("aliases", [])
+        )
 
     linked_titles: set[str] = set()
     for frag_file in (vault / "01-Fragments").rglob("*.md"):
@@ -146,6 +153,9 @@ def test_fragment_thread_links_target_written_pages(tmp_path: Path) -> None:
     assert linked_titles, "expected fragments to carry threads: wiki-links"
     assert linked_titles <= page_titles, (
         f"thread links {linked_titles - page_titles} have no page with that title"
+    )
+    assert linked_titles <= page_aliases, (
+        f"thread links {linked_titles - page_aliases} do not resolve to a page alias"
     )
 
 

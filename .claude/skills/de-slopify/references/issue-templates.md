@@ -37,12 +37,13 @@ Create any that don't exist (`gh label create <name> --color <hex> --description
 
 | Label | Meaning | Color |
 |-------|---------|-------|
-| `de-slop` | Filed by the weekly de-slopify detector | `#5319e7` |
+| `de-slop` | Filed by the de-slopify detector | `#5319e7` |
 | `epic` | Umbrella issue; Ralph skips, works sub-issues | `#3e4b9e` |
 | `priority-critical` / `priority-high` / `priority-medium` / `priority-low` | Severity from the rubric | red→grey |
-| `backend` / `frontend` / `full-stack` | Scope | tool-matched |
+| `creek-pipeline` / `creek-mcp` / `crawdad-bot` | Scope (matches `.github/deslop-areas.json` area ids) | tool-matched |
 | `bug` | Family 0 / 12 correctness finding (has a reproducing test) | `#d73a4a` |
 | `dead-code` | Family 3 dispensable | `#cfd3d7` |
+| `wire-in` | Family 3 finding whose remedy is connect-it + e2e test (not delete) | `#0052cc` |
 | `refactor` | Bloaters / couplers / verbosity | `#fbca04` |
 | `tech-debt` | Architecture / change-preventers | `#e99695` |
 | `security` | Family 10 (work itself defers to the `security` skill) | `#b60205` |
@@ -50,27 +51,33 @@ Create any that don't exist (`gh label create <name> --color <hex> --description
 | `blocked` / `needs-spec` | Not ready for autonomous pickup | `#000000` |
 
 Keep labels minimal per issue: one severity + one scope + one category + `de-slop`.
+`wire-in` is **not** in `pick-next.sh`'s exclude list, so Ralph still picks
+these issues up like any other standalone finding.
 
 ---
 
 ## Template A — Standalone finding (single, atomic, Ralph-ready)
 
 Mirror the established `prompts/github-issues/*.md` shape so it's actionable
-without a single clarifying question. Title is imperative and specific.
+without a single clarifying question. Title is imperative and specific. For a
+wire-in finding, title it as a connect-it task, e.g. "Wire in orphaned
+`export_data()` from the creek CLI and cover it with an e2e test" — not as a
+removal.
 
 ```markdown
-# <imperative title> (e.g. "Remove dead `legacy_streak()` and its orphaned test")
+# <imperative title> (e.g. "Remove dead `legacy_resonance()` and its orphaned test")
 
 **Labels:** `de-slop`, `<scope>`, `<category>`, `priority-<level>`
-**Detected by:** weekly de-slopify run <YYYY-MM-DD>
+**Detected by:** de-slopify scan (<area id or "full audit">) <YYYY-MM-DD>
 **Severity:** <Critical|High|Medium|Low>
+**Remediation:** <delete | wire-in (+ e2e test) | decision-needed>
 
 ## Problem
 <2-3 sentences. What's wrong, where. Cite file:line. State the taxonomy family.>
 **Current state:** <concrete observation>
 
 ## Evidence (corroboration)
-- Signal 1: <reproducing artifact — test output / tsc error / query count / tool JSON>
+- Signal 1: <reproducing artifact — test output / mypy error / query count / tool JSON>
 - Signal 2: <independent signal — grep result / second tool / reading>
 <Paste the minimal proof. This is what makes the finding trustworthy.>
 
@@ -92,6 +99,9 @@ without a single clarifying question. Title is imperative and specific.
 | `path/to/file.py` | Modify / Delete / Create |
 ```
 
+For a wire-in issue, the Files table's Action column is Create/Modify — the
+wired call site plus the new e2e test file — not Delete.
+
 **Rule:** a standalone issue should be ~50–300 net LoC and touch ≤ ~5 files. If
 it's bigger, it's an epic.
 
@@ -100,15 +110,15 @@ it's bigger, it's an epic.
 ## Template B — Epic (umbrella for coordinated, multi-issue work)
 
 Use when a corroborated problem needs more than one PR's worth of change
-(e.g. "decompose the 600-line `HabitsScreen`", "unify three divergent error
-contracts", "destub the aspirational encryption feature"). Mirrors the existing
-`prompts/github-issues/phase-*-epic.md` and `audit-destub` shape.
+(e.g. "decompose the 600-line crawdad `router.py`", "unify three divergent
+error contracts", "destub the aspirational encryption feature"). Mirrors the
+existing `prompts/github-issues/phase-*-epic.md` and `audit-destub` shape.
 
 ```markdown
-# <Epic title> (e.g. "De-Slop: Decompose the HabitsScreen god-component")
+# <Epic title> (e.g. "De-Slop: Decompose the crawdad router god-module")
 
 **Labels:** `de-slop`, `epic`, `<scope>`, `priority-<level>`
-**Detected by:** weekly de-slopify run <YYYY-MM-DD>
+**Detected by:** de-slopify scan (<area id or "full audit">) <YYYY-MM-DD>
 
 ## Why this is an epic
 <The corroborated problem and why it can't be one atomic PR. Cite evidence.>
@@ -158,19 +168,19 @@ cat > "$BODY" <<'EOF'
 ...
 EOF
 gh issue create \
-  --title "Remove dead legacy_streak() and its orphaned test" \
-  --label de-slop --label backend --label dead-code --label priority-medium \
+  --title "Remove dead legacy_resonance() and its orphaned test" \
+  --label de-slop --label creek-pipeline --label dead-code --label priority-medium \
   --body-file "$BODY"
 
 # Epic (capture its number to link sub-issues)
-EPIC_URL=$(gh issue create --title "De-Slop: Decompose HabitsScreen" \
-  --label de-slop --label epic --label frontend --label priority-high \
+EPIC_URL=$(gh issue create --title "De-Slop: Decompose the crawdad router god-module" \
+  --label de-slop --label epic --label crawdad-bot --label priority-high \
   --body-file "$SCRATCH/deslop-epic.md")
 EPIC_NUM="${EPIC_URL##*/}"
 
 # Sub-issue referencing the epic
-gh issue create --title "Extract useHabits hook from HabitsScreen" \
-  --label de-slop --label frontend --label refactor --label priority-high \
+gh issue create --title "Extract message parsing from crawdad router.py" \
+  --label de-slop --label crawdad-bot --label refactor --label priority-high \
   --body-file "$SCRATCH/deslop-sub-1.md"   # body contains "Refs #$EPIC_NUM"
 ```
 

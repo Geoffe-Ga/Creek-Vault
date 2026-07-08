@@ -1323,6 +1323,64 @@ def test_report_paradox_writes_notes(tmp_path: Path) -> None:
     assert sorted((vault / "10-Liminal" / "Paradoxes").glob("*.md"))
 
 
+def test_report_synchronicity_writes_notes(tmp_path: Path) -> None:
+    """`report --type synchronicity` writes notes + reports success (#711, #726).
+
+    Mirrors the paradox success-path test: a cross-source, >30-day pair with an
+    identical crafted embedding cache (cosine 1.0 > the 0.9 threshold) yields one
+    synchronicity note and the bold-green success message.
+    """
+    from datetime import UTC, datetime
+
+    from creek.config import EmbeddingsConfig
+    from creek.link.embeddings import (
+        CachedEmbedding,
+        EmbeddingLinker,
+        embeddings_cache_path,
+    )
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+    from tests.helpers import write_fragment_file
+
+    vault = _report_vault(tmp_path)
+    pairs = (
+        ("frag-synx-cli-aa", SourcePlatform.DISCORD, datetime(2025, 1, 5, tzinfo=UTC)),
+        ("frag-synx-cli-bb", SourcePlatform.JOURNAL, datetime(2025, 4, 20, tzinfo=UTC)),
+    )
+    for fid, platform, created in pairs:
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="the river remembers every stone it has touched",
+                source=FragmentSource(platform=platform),
+                created=created,
+                authored_at=created,  # the gap filter reads effective_authored_at
+            ),
+            body="a near-identical meaning arriving from a different source",
+        )
+    # Identical vectors → cosine 1.0 > the 0.9 synchronicity threshold.
+    config = EmbeddingsConfig()
+    now = datetime.now(tz=UTC)
+    entries = {
+        fid: CachedEmbedding(
+            fragment_id=fid,
+            content_hash="h",
+            model_name=config.model,
+            vector=[1.0, 0.0, 0.0, 0.0],
+            computed_at=now,
+        )
+        for fid, _platform, _created in pairs
+    }
+    EmbeddingLinker(config).save_cache(entries, embeddings_cache_path(vault))
+
+    result = runner.invoke(
+        app, ["report", "--type", "synchronicity", "--vault", str(vault)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "synchronicity notes generated" in result.output.lower()  # success branch
+    assert sorted((vault / "10-Liminal" / "Synchronicities").glob("*.md"))
+
+
 def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     """``report --type decisions`` with no signalling fragments is friendly (#581).
 

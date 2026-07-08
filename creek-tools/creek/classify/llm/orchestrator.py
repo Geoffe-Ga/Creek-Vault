@@ -55,10 +55,16 @@ class LLMClassificationResult:
             pre-FEAT-017 response shape) or the call short-circuited.
             Truncation / tier-routing is the engine's responsibility,
             not this dataclass's — the raw trace lives here.
+        succeeded: ``True`` when the LLM actually classified the
+            fragment; ``False`` when the call short-circuited (provider
+            unavailable or all retries exhausted) and ``fragment`` is the
+            input returned unchanged. Lets the engine avoid stamping
+            ``classification_method: llm`` on a failed call (#744).
     """
 
     fragment: Fragment
     reasoning: str
+    succeeded: bool = True
 
 
 class LLMClassifier:
@@ -104,6 +110,15 @@ class LLMClassifier:
 
     def _provider(self) -> LLMProvider:
         """Lazily build and cache the configured provider.
+
+        Thread-safety: this is an unlocked check-then-set on
+        ``self._provider_instance`` (and ``.available`` memoises similarly), so a
+        classifier **must be pre-warmed serially before any concurrent use** —
+        call :attr:`available` (or ``_provider()``) once on the main thread
+        first. The concurrent classify path (#764) relies on
+        ``_assert_classifiers_available`` doing exactly that before spinning up
+        worker threads; a future concurrent caller that skips that pre-warm would
+        reintroduce a double-build data race here.
 
         Returns:
             The cached :class:`LLMProvider` instance.
@@ -321,7 +336,9 @@ class LLMClassifier:
                 "LLM provider unavailable — returning fragment '%s' unchanged",
                 fragment.title,
             )
-            return LLMClassificationResult(fragment=fragment, reasoning="")
+            return LLMClassificationResult(
+                fragment=fragment, reasoning="", succeeded=False
+            )
 
         prompt = self._build_prompt(fragment, content)
 
@@ -371,7 +388,7 @@ class LLMClassifier:
             self.MAX_RETRIES,
             fragment.title,
         )
-        return LLMClassificationResult(fragment=fragment, reasoning="")
+        return LLMClassificationResult(fragment=fragment, reasoning="", succeeded=False)
 
     def _retry_delay_for(self, exc: Exception) -> float:
         """Resolve the backoff before the next retry attempt.

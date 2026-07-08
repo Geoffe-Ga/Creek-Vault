@@ -32,12 +32,10 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from collections import Counter
 from typing import TYPE_CHECKING
 
-from tqdm import tqdm
-
+from creek.link.neighbours import cosine_neighbours
 from creek.models import Eddy
 from creek.time import effective_authored_at, effective_authored_date
 
@@ -435,7 +433,11 @@ class EddyDetector:
         """Run DBSCAN over the provided fragment IDs.
 
         Uses cosine distance against :attr:`embeddings` with parameters
-        :attr:`eps` and :attr:`min_samples`.
+        :attr:`eps` and :attr:`min_samples`. Neighbour discovery is
+        vectorised via :func:`creek.link.neighbours.cosine_neighbours`
+        (issue #790): a fragment's neighbours are those with cosine
+        similarity ``>= 1 - eps``, computed in memory-bounded blocks
+        rather than an O(N²) pure-Python loop, yielding identical clusters.
 
         Args:
             ids: Fragment IDs to cluster (all must have embeddings).
@@ -446,16 +448,12 @@ class EddyDetector:
         """
         n = len(ids)
         labels = [_UNVISITED] * n
-        # OPS-004: neighbour-cache build is O(N²); progress bar in TTYs.
-        neighbour_cache = [
-            self._neighbours(ids, i)
-            for i in tqdm(
-                range(n),
-                desc="Eddy neighbours",
-                unit="frag",
-                disable=not sys.stderr.isatty(),
-            )
-        ]
+        # Vectorised neighbour discovery (issue #790): a fragment's neighbours
+        # are those with cosine similarity >= 1 - eps (i.e. cosine distance
+        # <= eps), computed in memory-bounded blocks rather than an O(N²)
+        # pure-Python loop. Clusters are identical to the exhaustive path.
+        vectors = [self.embeddings[fid] for fid in ids]
+        neighbour_cache = cosine_neighbours(vectors, 1.0 - self.eps)
         cluster_id = 0
         for i in range(n):
             if labels[i] != _UNVISITED:
@@ -466,26 +464,6 @@ class EddyDetector:
             self._expand_cluster(labels, neighbour_cache, i, cluster_id)
             cluster_id += 1
         return self._group_clusters(labels, ids)
-
-    def _neighbours(self, ids: list[str], index: int) -> list[int]:
-        """Return indices of fragments within :attr:`eps` of ``ids[index]``.
-
-        Args:
-            ids: Ordered list of fragment IDs.
-            index: Position in *ids* whose neighbourhood is needed.
-
-        Returns:
-            Indices ``j != index`` where the cosine distance between
-            ``ids[index]`` and ``ids[j]`` is at most :attr:`eps`.
-        """
-        anchor = self.embeddings[ids[index]]
-        result: list[int] = []
-        for j, other_id in enumerate(ids):
-            if j == index:
-                continue
-            if _cosine_distance(anchor, self.embeddings[other_id]) <= self.eps:
-                result.append(j)
-        return result
 
     def _expand_cluster(
         self,

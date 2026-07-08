@@ -54,6 +54,34 @@ def test_normalize_verdict_defaults_to_comments() -> None:
     assert rs.normalize_verdict("Some notes.\nVerdict: COMMENTS") == rs.COMMENTS
 
 
+def test_normalize_verdict_ignores_mid_line_prose_mention() -> None:
+    # Issue #803: a bare substring match on "VERDICT" false-positives on prose
+    # that merely mentions the word without a genuine Verdict line (as in PR
+    # #802's self-skip warning comment). No verdict line -> None.
+    body = (
+        "Heads up: the loop will self-skip so no verdict will be posted for "
+        "this PR by the author."
+    )
+    assert rs.normalize_verdict(body) is None
+
+
+def test_normalize_verdict_detects_markdown_heading_prefix() -> None:
+    assert rs.normalize_verdict("## Verdict: LGTM") == rs.LGTM
+
+
+def test_normalize_verdict_detects_bold_prefix() -> None:
+    assert rs.normalize_verdict("**Verdict:** COMMENTS") == rs.COMMENTS
+
+
+def test_normalize_verdict_legacy_header_with_token_on_next_line() -> None:
+    assert rs.normalize_verdict("## Verdict\n✅ LGTM") == rs.LGTM
+
+
+def test_normalize_verdict_last_verdict_line_wins() -> None:
+    body = "Verdict: CHANGES_REQUESTED\n\nAfter another pass:\n## Verdict: LGTM"
+    assert rs.normalize_verdict(body) == rs.LGTM
+
+
 # ---------- iterations_before_lgtm ----------
 
 
@@ -75,7 +103,12 @@ def test_iterations_before_lgtm_none_when_never_lgtm() -> None:
 
 def test_merge_rate_empty() -> None:
     rate = rs.merge_rate([], now=_at(27))
-    assert rate == {"last_24h": 0.0, "per_hour": 0.0, "last_7_days": 0.0, "per_day": 0.0}
+    assert rate == {
+        "last_24h": 0.0,
+        "per_hour": 0.0,
+        "last_7_days": 0.0,
+        "per_day": 0.0,
+    }
 
 
 def test_merge_rate_last_24h_per_hour() -> None:
@@ -116,12 +149,18 @@ def test_time_to_merge_stats() -> None:
 
 def test_merge_intervals_hours_returns_consecutive_gaps() -> None:
     # 09:00, 12:00, 15:00 -> two 3-hour gaps.
-    assert rs.merge_intervals_hours([_at(27, 9), _at(27, 12), _at(27, 15)]) == [3.0, 3.0]
+    assert rs.merge_intervals_hours([_at(27, 9), _at(27, 12), _at(27, 15)]) == [
+        3.0,
+        3.0,
+    ]
 
 
 def test_merge_intervals_hours_sorts_before_diffing() -> None:
     # Newest-first input (as the recap holds it) still yields positive gaps.
-    assert rs.merge_intervals_hours([_at(27, 15), _at(27, 9), _at(27, 12)]) == [3.0, 3.0]
+    assert rs.merge_intervals_hours([_at(27, 15), _at(27, 9), _at(27, 12)]) == [
+        3.0,
+        3.0,
+    ]
 
 
 def test_merge_intervals_hours_empty_below_two_merges() -> None:
@@ -207,17 +246,24 @@ def test_busiest_day_none_when_empty() -> None:
 
 
 def _issue(number: int, *, labels: list[str], is_pr: bool = False) -> dict[str, Any]:
-    issue: dict[str, Any] = {"number": number, "labels": [{"name": name} for name in labels]}
+    issue: dict[str, Any] = {
+        "number": number,
+        "labels": [{"name": name} for name in labels],
+    }
     if is_pr:
         issue["pull_request"] = {"url": f"https://example/{number}"}
     return issue
 
 
-def _patch_issues(monkeypatch: pytest.MonkeyPatch, issues: list[dict[str, Any]]) -> None:
+def _patch_issues(
+    monkeypatch: pytest.MonkeyPatch, issues: list[dict[str, Any]]
+) -> None:
     monkeypatch.setattr(recap, "_gh_get_paged", lambda *a, **k: issues)
 
 
-def test_count_open_backlog_excludes_prs_and_labelled_issues(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_count_open_backlog_excludes_prs_and_labelled_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("RALPH_EXCLUDE_LABELS", raising=False)
     issues = [
         _issue(1, labels=[]),  # counted
@@ -230,7 +276,9 @@ def test_count_open_backlog_excludes_prs_and_labelled_issues(monkeypatch: pytest
     assert recap.count_open_backlog("owner/repo", token="t") == 2
 
 
-def test_count_open_backlog_respects_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_count_open_backlog_respects_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("RALPH_EXCLUDE_LABELS", "deferred")
     issues = [
         _issue(1, labels=["epic"]),  # no longer excluded (override drops "epic")
@@ -244,8 +292,12 @@ def test_count_open_backlog_respects_env_override(monkeypatch: pytest.MonkeyPatc
 # ---------- count_merged_total ----------
 
 
-def test_count_merged_total_reads_search_total_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(recap, "_request_json", lambda *a, **k: {"total_count": 723, "items": []})
+def test_count_merged_total_reads_search_total_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recap, "_request_json", lambda *a, **k: {"total_count": 723, "items": []}
+    )
     assert recap.count_merged_total("owner/repo", token="t") == 723
 
 
@@ -253,17 +305,25 @@ def test_count_merged_total_reads_search_total_count(monkeypatch: pytest.MonkeyP
 
 
 def _hit(number: int, *, merged: str, created: str) -> dict[str, Any]:
-    return {"number": number, "created_at": created, "pull_request": {"merged_at": merged}}
+    return {
+        "number": number,
+        "created_at": created,
+        "pull_request": {"merged_at": merged},
+    }
 
 
-def test_fetch_recent_merged_prs_sorts_newest_merge_first(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_recent_merged_prs_sorts_newest_merge_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hits = [
         _hit(1, merged="2026-06-25T00:00:00Z", created="2026-06-24T00:00:00Z"),
         _hit(2, merged="2026-06-27T00:00:00Z", created="2026-06-26T00:00:00Z"),
         _hit(3, merged="2026-06-26T00:00:00Z", created="2026-06-25T00:00:00Z"),
     ]
     monkeypatch.setattr(recap, "_gh_search_issues", lambda *a, **k: hits)
-    out = recap.fetch_recent_merged_prs("owner/repo", token="t", since=_at(20).date(), max_prs=200)
+    out = recap.fetch_recent_merged_prs(
+        "owner/repo", token="t", since=_at(20).date(), max_prs=200
+    )
     assert [pr["number"] for pr in out] == [2, 3, 1]
 
 
@@ -285,11 +345,17 @@ def test_open_to_merge_hours_clamps_negative_to_zero() -> None:
 
 
 def test_pr_churn_reads_detail_fields(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(recap, "fetch_pr_detail", lambda *a, **k: {"additions": 12, "deletions": 4, "changed_files": 3})
+    monkeypatch.setattr(
+        recap,
+        "fetch_pr_detail",
+        lambda *a, **k: {"additions": 12, "deletions": 4, "changed_files": 3},
+    )
     assert recap._pr_churn("owner/repo", 1, token="t") == (12, 4, 3)
 
 
-def test_pr_churn_degrades_to_zero_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pr_churn_degrades_to_zero_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import urllib.error
 
     def _boom(*_a: Any, **_k: Any) -> dict[str, Any]:
@@ -302,18 +368,64 @@ def test_pr_churn_degrades_to_zero_on_http_error(monkeypatch: pytest.MonkeyPatch
 # ---------- fetch_repo_net_lines ----------
 
 
-def test_fetch_repo_net_lines_sums_code_frequency(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(recap, "_request_json", lambda *a, **k: [[1, 100, -40], [2, 20, -5]])
+def test_fetch_repo_net_lines_sums_code_frequency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recap, "_request_json", lambda *a, **k: [[1, 100, -40], [2, 20, -5]]
+    )
     assert recap.fetch_repo_net_lines("owner/repo", token="t") == 75
 
 
-def test_fetch_repo_net_lines_none_when_stats_still_warming(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_repo_net_lines_none_when_stats_still_warming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # A 202 from GitHub yields an empty body (None); retries exhaust to None.
     monkeypatch.setattr(recap, "_request_json", lambda *a, **k: None)
-    assert recap.fetch_repo_net_lines("owner/repo", token="t", attempts=2) is None
+    assert (
+        recap.fetch_repo_net_lines(
+            "owner/repo", token="t", attempts=2, sleep=lambda _d: None
+        )
+        is None
+    )
 
 
-def test_fetch_repo_net_lines_none_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_repo_net_lines_retries_warming_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GitHub answers 202/empty (None) on a cold cache, then real rows once warm.
+    # The fix waits with backoff between attempts instead of firing instantly.
+    calls = {"n": 0}
+    rows = [[1, 100, -40], [2, 20, -5]]  # net 75
+
+    def _resp(*_a: Any, **_k: Any) -> object:
+        calls["n"] += 1
+        return None if calls["n"] < 3 else rows
+
+    monkeypatch.setattr(recap, "_request_json", _resp)
+    slept: list[float] = []
+    result = recap.fetch_repo_net_lines(
+        "owner/repo", token="t", attempts=4, sleep=slept.append
+    )
+    assert result == 75  # the retry now succeeds once the cache warms
+    assert calls["n"] == 3  # two warming 202s, then the real rows
+    assert slept == [2.0, 4.0]  # exponential backoff between the failed attempts
+
+
+def test_fetch_repo_net_lines_empty_history_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A genuinely empty history (HTTP 200 with []) is final (net 0), NOT a
+    # warming 202 to retry — distinguishable from the empty-body None case.
+    monkeypatch.setattr(recap, "_request_json", lambda *a, **k: [])
+    slept: list[float] = []
+    assert recap.fetch_repo_net_lines("owner/repo", token="t", sleep=slept.append) == 0
+    assert slept == []  # returned immediately; no retry/backoff
+
+
+def test_fetch_repo_net_lines_none_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import urllib.error
 
     def _boom(*_a: Any, **_k: Any) -> object:
@@ -346,7 +458,9 @@ def test_loc_line_renders_three_windows() -> None:
     loc_24h = {"additions": 1200, "deletions": 300, "net": 900, "files": 5}
     loc_7d = {"additions": 8400, "deletions": 1600, "net": 6800, "files": 40}
     line = recap._loc_line(loc_24h, loc_7d, 124_500)
-    assert line == "+1,200 / -300 (24h) · +8,400 / -1,600 (7d) · 124,500 net (full repo)"
+    assert (
+        line == "+1,200 / -300 (24h) · +8,400 / -1,600 (7d) · 124,500 net (full repo)"
+    )
 
 
 def test_loc_line_placeholder_when_repo_net_unavailable() -> None:
@@ -359,11 +473,16 @@ def test_loc_line_placeholder_when_repo_net_unavailable() -> None:
 
 
 def test_heuristic_headline_strips_conventional_prefix() -> None:
-    assert recap._heuristic_headline("feat(backend): add the energy ledger") == "add the energy ledger"
+    assert (
+        recap._heuristic_headline("feat(backend): add the energy ledger")
+        == "add the energy ledger"
+    )
 
 
 def test_heuristic_headline_clips_to_ten_words() -> None:
-    headline = recap._heuristic_headline("one two three four five six seven eight nine ten eleven")
+    headline = recap._heuristic_headline(
+        "one two three four five six seven eight nine ten eleven"
+    )
     assert headline == "one two three four five six seven eight nine ten"
 
 
@@ -403,7 +522,9 @@ class _FakeAnthropic:
         return _FakeAnthropic._Client()
 
 
-def test_generate_headline_uses_sdk_and_passes_low_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_headline_uses_sdk_and_passes_low_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake = _FakeAnthropic()
     _FakeAnthropic.last_kwargs = {}
     monkeypatch.setattr(recap, "_anthropic_mod", fake)
@@ -416,21 +537,33 @@ def test_generate_headline_uses_sdk_and_passes_low_effort(monkeypatch: pytest.Mo
     assert _FakeAnthropic.last_kwargs["output_config"] == {"effort": "low"}
 
 
-def test_generate_headline_falls_back_when_no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_headline_falls_back_when_no_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(recap, "_anthropic_mod", _FakeAnthropic())
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    assert recap.generate_headline("feat: add energy ledger", "Body") == "add energy ledger"
+    assert (
+        recap.generate_headline("feat: add energy ledger", "Body")
+        == "add energy ledger"
+    )
 
 
-def test_generate_headline_falls_back_when_sdk_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_headline_falls_back_when_sdk_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(recap, "_anthropic_mod", None)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # pragma: allowlist secret
 
-    assert recap.generate_headline("feat: add energy ledger", "Body") == "add energy ledger"
+    assert (
+        recap.generate_headline("feat: add energy ledger", "Body")
+        == "add energy ledger"
+    )
 
 
-def test_generate_headline_falls_back_on_sdk_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_headline_falls_back_on_sdk_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _Boom:
         def Anthropic(self) -> object:  # noqa: N802 - mirrors the SDK's class name
             raise RuntimeError("api down")
@@ -438,4 +571,7 @@ def test_generate_headline_falls_back_on_sdk_error(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(recap, "_anthropic_mod", _Boom())
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # pragma: allowlist secret
 
-    assert recap.generate_headline("feat: add energy ledger", "Body") == "add energy ledger"
+    assert (
+        recap.generate_headline("feat: add energy ledger", "Body")
+        == "add energy ledger"
+    )

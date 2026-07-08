@@ -1,0 +1,26 @@
+[
+  {
+    "id": "creek-pipeline",
+    "stack": "backend",
+    "paths": [
+      "creek-tools/creek"
+    ],
+    "charter": "The Creek processing pipeline and Typer CLI (ingest → classify → link → index → draft) over an Obsidian vault. Prime sites for copy-paste stage variants, per-stage vault re-reads, O(n²) linking hotspots, dead pipeline branches, and inconsistent error handling."
+  },
+  {
+    "id": "creek-mcp",
+    "stack": "backend",
+    "paths": [
+      "creek-tools/creek_mcp"
+    ],
+    "charter": "The MCP server surface exposing vault operations to agent clients over authenticated transport. Prime sites for tool-registration drift, duplicated request validation, bearer-token/auth edge cases, and error responses that leak internals."
+  },
+  {
+    "id": "crawdad-bot",
+    "stack": "backend",
+    "paths": [
+      "crawdad/crawdad"
+    ],
+    "charter": "The CrawDad Discord bot that fronts a Creek vault in chat. Prime sites for command-handler duplication, swallowed Discord API errors, config/allowlist drift, and stubbed or orphaned conversation flows."
+  }
+]

@@ -1,0 +1,73 @@
+name: "Hopper: queue-depth refill"
+
+# The never-runs-out guarantee for the Ralph loop. Fixed scan crons are a floor,
+# not a guarantee — repo entropy is bursty. This hourly guard measures the
+# agent-ready queue depth and, when runway drops below MIN_QUEUE, dispatches the
+# most-stale eligible producer scan off-schedule (with a raised max_issues cap).
+# When the queue is healthy it stands down; when it is bloated it also stands
+# down, letting the backlog drain rather than piling on more.
+#
+# No Claude token needed — pure gh + jq queue arithmetic.
+
+on:
+  schedule:
+    - cron: "23 * * * *"        # hourly, off the :00 mark to spread API load
+  workflow_dispatch:
+
+permissions:
+  issues: read
+  actions: write               # needed to dispatch scan workflows
+
+concurrency:
+  group: hopper
+  cancel-in-progress: false
+
+jobs:
+  check-and-refill:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MIN_QUEUE: "12"           # ~6 hrs of runway at ~2 issues/hr
+      MAX_QUEUE: "80"           # above this, let the backlog drain
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Measure runway and refill if starving
+        run: |
+          set -euo pipefail
+          COUNT=$(gh issue list --label agent-ready --state open \
+                    --limit 300 --json number --jq 'length')
+          echo "Agent-ready queue depth: $COUNT" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COUNT" -ge "$MAX_QUEUE" ]; then
+            echo "Queue bloated (>= $MAX_QUEUE) — standing down so it drains." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$COUNT" -ge "$MIN_QUEUE" ]; then
+            echo "Queue healthy (>= $MIN_QUEUE) — standing down." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Starving. Rotate through refill candidates, cheapest/highest-value
+          # first. Skips mutation (too expensive — schedule-only) and
+          # security/deps/bugs (already daily; not appropriate to spam here).
+          for WF in scan-complexity.yml scan-dead-code.yml scan-coverage.yml \
+                    scan-perf.yml scan-todo.yml scan-types.yml \
+                    scan-docs.yml; do
+            LAST=$(gh run list --workflow "$WF" --limit 1 \
+                     --json createdAt --jq '.[0].createdAt // "1970-01-01T00:00:00Z"')
+            AGE=$(( $(date +%s) - $(date -d "$LAST" +%s) ))
+            if [ "$AGE" -gt 21600 ]; then   # don't re-dispatch within 6 hrs
+              echo "Runway low ($COUNT < $MIN_QUEUE); dispatching $WF (max_issues=8)." \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              gh workflow run "$WF" -f max_issues=8
+              exit 0
+            fi
+          done
+          echo "All refill candidates ran within 6 hrs; queue recovers on schedule." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

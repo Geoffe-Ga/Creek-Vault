@@ -51,7 +51,7 @@ PY_REQS="creek-tools/requirements.txt"
 
 log() { echo ">>> $*" >&2; }
 
-# Activate the project venv if present (so backend tools resolve).
+# Activate the project venv if present (so the Python tools resolve).
 if [[ -f .venv/bin/activate ]]; then
   # shellcheck disable=SC1091
   source .venv/bin/activate
@@ -109,15 +109,20 @@ greps() {
     || echo "(no matches)" >"$OUT/$out"
 }
 
-greps grep-stubs.txt        'NotImplementedError|not implemented|throw new Error\(.?not implemented|return None\s*#\s*TODO|\bpass\s*#\s*(stub|placeholder)'
+greps grep-stubs.txt        'NotImplementedError|not implemented|return None\s*#\s*TODO|\bpass\s*#\s*(stub|placeholder)'
 greps grep-ai-tells.txt     'In a real implementation|real implementation|placeholder|for now|as an AI|should probably'
 greps grep-debt.txt         'TODO|FIXME|HACK|XXX'
-greps grep-escape-hatch.txt 'type: ?ignore|@ts-ignore|@ts-nocheck|eslint-disable|# ?noqa|cast\(Any'
-greps grep-swallow.txt      'except (Exception|BaseException)?\s*:|catch\s*\([^)]*\)\s*\{\s*\}|\.catch\(\(\)\s*=>\s*\{?\s*\}?\)'
+greps grep-escape-hatch.txt 'type: ?ignore|# ?noqa|cast\(Any'
+greps grep-swallow.txt      'except (Exception|BaseException)?\s*:'
 greps grep-commented.txt    '^\s*#\s*(def |class |return |if |for |while |import |from )'
-greps grep-any.txt          ':\s*any\b|<any>|as any'
+greps grep-any.txt          ':\s*Any\b|->\s*Any\b|dict\[str,\s*Any\]'
 
 # Git churn / hotspots (top 30 most-changed files in the last 90 days).
+# PRIORITIZATION SIGNAL ONLY — churn (and reading-targets below) decide which
+# area the reading pass starts with; they NEVER decide which areas are skipped.
+# Files untouched in 90 days never appear here, so a run anchored to this list
+# would never read stable code. Coverage is governed by area-inventory.txt
+# (every area must be read each run); this is just the order to read it in.
 if command -v git >/dev/null 2>&1; then
   git log --since="90 days ago" --format= --name-only 2>/dev/null \
     | grep -E '^(creek-tools|crawdad)/' \
@@ -125,18 +130,55 @@ if command -v git >/dev/null 2>&1; then
     || echo "(churn unavailable)" >"$OUT/churn.txt"
 fi
 
-# Reading targets: the largest source files by line count. These — together
-# with churn.txt — are where the reading pass should start, because size and
-# change-frequency are where bloaters, duplication, and god-objects accumulate.
+# Reading targets: the largest source files by line count. PRIORITIZATION ONLY
+# (same caveat as churn.txt) — together with churn they say where to START
+# reading, because size and change-frequency are where bloaters, duplication,
+# and god-objects accumulate. They are NOT the coverage set.
 {
-  echo "# Largest source files (LoC) — prime reading-pass targets"
+  echo "# Largest source files (LoC) — prime reading-pass START targets."
+  echo "# Prioritization order only; NOT a coverage filter (see area-inventory.txt)."
   if [[ ${#SEARCH_PATHS[@]} -gt 0 ]]; then
     find "${SEARCH_PATHS[@]}" -type f \
       -name '*.py' \
-      -not -path '*/node_modules/*' -print0 2>/dev/null \
+      -not -path '*/__pycache__/*' -print0 2>/dev/null \
       | xargs -0 wc -l 2>/dev/null | sort -rn | sed '/ total$/d' | head -30
   fi
 } >"$OUT/reading-targets.txt"
+
+# ----------------------------------------------------------------------------
+# Area inventory — the AUTHORITATIVE coverage set for the reading pass.
+# EVERY area listed here MUST be read every run (whole-codebase audit). Churn /
+# reading-targets decide the ORDER only. The coverage ledger must enumerate
+# every area below and mark it read this run; a "0 findings" verdict is only
+# defensible when the ledger covers this entire inventory — never "delta since
+# last run". Best-effort + never-fail: missing dirs are simply skipped.
+# ----------------------------------------------------------------------------
+{
+  echo "# Area inventory — the coverage set the reading pass MUST cover in full."
+  echo "# Every area must be read each run; churn/reading-targets are order only."
+  echo
+  echo "## creek pipeline stages (creek-tools/creek/*)"
+  [[ -d creek-tools/creek ]] \
+    && find creek-tools/creek -mindepth 1 -maxdepth 1 -type d ! -name '__pycache__' 2>/dev/null | sort
+  echo
+  echo "## creek top-level modules"
+  [[ -d creek-tools/creek ]] \
+    && find creek-tools/creek -maxdepth 1 -name '*.py' ! -name '__init__.py' 2>/dev/null | sort
+  echo
+  echo "## MCP server surface"
+  [[ -d creek-tools/creek_mcp ]] && echo "creek-tools/creek_mcp"
+  echo
+  echo "## crawdad Discord bot (incl. llm/ and builtin_workflows/)"
+  [[ -d crawdad/crawdad ]] \
+    && find crawdad/crawdad -mindepth 1 -maxdepth 1 \
+         \( -type d ! -name '__pycache__' -o -name '*.py' ! -name '__init__.py' \) \
+         2>/dev/null | sort
+  echo
+  echo "## shell tooling"
+  for d in creek-tools/scripts crawdad/scripts scripts; do
+    [[ -d "$d" ]] && echo "$d"
+  done
+} >"$OUT/area-inventory.txt"
 
 # ----------------------------------------------------------------------------
 # Manifest
@@ -147,20 +189,32 @@ fi
   echo "Out:     $OUT"
   echo
   echo "## Files"
-  ls -1 "$OUT" | sed 's/^/  - /'
+  for f in "$OUT"/*; do
+    [[ -e "$f" ]] && echo "  - $(basename "$f")"
+  done
   echo
   echo "Each *.json / *.txt holds raw tool or grep output. Every entry is a"
   echo "CANDIDATE only — apply the Two-Signal Rule from detection-playbook.md"
   echo "before filing anything. Tool exit codes are appended as [exit N]."
   echo
   echo "## IMPORTANT — this bundle is a MAP, not the findings"
-  echo "The linter outputs (ruff/mypy/radon/bandit/eslint/tsc) are TABLE STAKES:"
+  echo "The linter outputs (ruff/mypy/radon/bandit/interrogate) are TABLE STAKES:"
   echo "the repo already passes them in pre-commit and CI, so they cannot be"
   echo "findings. Do NOT file complexity grades, lint rules, or type errors."
-  echo "Use churn.txt + reading-targets.txt to drive a Task fan-out that READS"
-  echo "the source for what linters cannot see (dead/stubbed/orphaned code,"
-  echo "duplication, architecture, lying flags, verbosity, comment slop, AI"
-  echo "tells, weak tests). That reading pass is the actual audit."
+  echo "Drive a Task fan-out that READS the source for what linters cannot see"
+  echo "(dead/stubbed/orphaned code, duplication, architecture, lying flags,"
+  echo "verbosity, comment slop, AI tells, weak tests). That reading pass is the"
+  echo "actual audit."
+  echo
+  echo "## COVERAGE IS MANDATORY AND WHOLE-CODEBASE"
+  echo "area-inventory.txt is the AUTHORITATIVE coverage set: the reading pass"
+  echo "MUST cover EVERY area in it EVERY run. churn.txt + reading-targets.txt"
+  echo "are PRIORITIZATION ORDER ONLY — they say where to start, never which"
+  echo "areas to skip. A clean linter bundle or an unchanged file is NOT a reason"
+  echo "to skip reading an area. 'Delta-focused' / 'since last run' / 'building on"
+  echo "last week's baseline' scoping is FORBIDDEN. A '0 findings' verdict is only"
+  echo "valid when the coverage ledger enumerates this entire inventory as read"
+  echo "this run."
 } >"$OUT/README.txt"
 
 log "evidence collected in $OUT"

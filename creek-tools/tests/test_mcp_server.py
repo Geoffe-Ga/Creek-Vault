@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.server import SERVER_NAME, build_server
 
 if TYPE_CHECKING:
@@ -16,6 +17,10 @@ if TYPE_CHECKING:
 
 
 EXPECTED_TOOLS = {
+    "creek.handshake",
+    "creek.reflect",
+    "creek.wheel",
+    "creek.journal",
     "creek.state.read",
     "creek.state.render",
     "creek.lint",
@@ -77,6 +82,133 @@ def test_build_server_registers_all_tools(vault: Path) -> None:
     tools = asyncio.run(server.list_tools())
     names = {tool.name for tool in tools}
     assert names == EXPECTED_TOOLS
+
+
+def test_call_tool_handshake_reflects_registered_tools(vault: Path) -> None:
+    """End-to-end: ``creek.handshake`` negotiates versions + the live tool list.
+
+    Its ``capabilities`` must equal the names of the tools actually registered
+    (not a hardcoded list), proving the #750 acceptance criterion through the
+    registered async handler rather than only the unit-level helper.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    registered = {tool.name for tool in asyncio.run(server.list_tools())}
+    result = asyncio.run(
+        server.call_tool("creek.handshake", {"privacy_tier_ceiling": "open"}),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["available"] is True
+    assert structured["contract_version"] == CONTRACT_VERSION
+    assert structured["ontology_version"] == ONTOLOGY_VERSION
+    assert structured["tiers"] == ["open", "personal", "intimate"]
+    assert set(structured["capabilities"]) == registered  # type: ignore[arg-type]
+    for expected in ("creek.handshake", "creek.ingest", "creek.classify"):
+        assert expected in structured["capabilities"]  # type: ignore[operator]
+
+
+def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
+    """End-to-end: ``creek.reflect`` returns verbatim-quoted notes (injected factory).
+
+    The tier-keyed LLM factory is injected (no live provider); the registered
+    tool wires it through ``reflect_tool``, whose verbatim-quote guard keeps only
+    spans copied from the entry.
+    """
+    entry = "I rest sometimes and the work survives."
+    note = '{"quote": "I rest sometimes", "kind": "reframe", "note": "Yours."}'
+    payload = '{"notes": [' + note + "]}"
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+        reflect_llm_factory=lambda: lambda tier: lambda prompt: payload,
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.reflect",
+            {"content": entry, "privacy_tier_ceiling": "open"},
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["tool"] == "creek.reflect"
+    assert structured["notes"][0]["quote"] == "I rest sometimes"  # type: ignore[index]
+
+
+def test_call_tool_reflect_escalates_on_acute_distress(vault: Path) -> None:
+    """The registered ``creek.reflect`` wires the real care guard (#753).
+
+    Acute-distress content must escalate with the structured care signal and
+    never reach the (injected) LLM — proving ``server.py`` threads
+    ``acute_distress_guard`` into ``reflect_tool``.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+        reflect_llm_factory=lambda: lambda tier: lambda prompt: '{"notes": []}',
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.reflect",
+            {
+                "content": "I am going to kill myself tonight.",
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "escalate"
+    assert structured["care_signal"]["kind"] == "acute_distress"  # type: ignore[index]
+
+
+def test_call_tool_journal_ingests_entry_idempotently(vault: Path) -> None:
+    """End-to-end: ``creek.journal`` ingests an entry as a fragment, idempotently.
+
+    Re-sending the same external id through the registered tool yields the same
+    fragment id and no duplicate — proving the ledger-backed path is wired.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    payload = {
+        "content": "A registered journal entry.",
+        "external_id": "adep-srv-1",
+        "timestamp": "2026-06-20T10:00:00+00:00",
+        "privacy_tier_ceiling": "personal",
+    }
+    first = _structured(
+        asyncio.run(server.call_tool("creek.journal", payload)),
+    )
+    second = _structured(
+        asyncio.run(server.call_tool("creek.journal", payload)),
+    )
+    assert first["status"] == "ok"
+    assert first["tool"] == "creek.journal"
+    assert second["fragment_id"] == first["fragment_id"]
+    assert len(sorted((vault / "01-Fragments").rglob("*.md"))) == 1
+
+
+def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None:
+    """End-to-end: ``creek.wheel`` returns a complete F1-F10 balance map.
+
+    Even with an empty corpus the wheel is present and all-zero (the new-user
+    case), proving the read-only aggregation is reachable through the registry.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["tool"] == "creek.wheel"
+    assert list(structured["wheel"].keys()) == [f"F{n}" for n in range(1, 11)]  # type: ignore[union-attr]
+    assert structured["total_classified"] == 0
 
 
 def test_call_tool_save_through_mcp(vault: Path) -> None:
@@ -372,3 +504,56 @@ def test_main_without_config_flag_leaves_env_var_untouched(
     server_module.main([])
 
     assert CONFIG_PATH_ENV_VAR not in os.environ
+
+
+def test_build_reflect_llm_factory_routes_then_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reflect factory returns a working callable, and raises when no provider.
+
+    Exercises the production INTIMATE-routing seam without a live model: the
+    router + provider are stubbed so both the available path (a usable callable)
+    and the unavailable path (a clean ``RuntimeError`` the tool turns into a
+    refusal) are covered.
+    """
+    from creek.models import PrivacyTier
+    from creek_mcp import server as server_mod
+
+    class _Cfg:
+        provider = "ollama"
+        model = "m"
+
+    class _Router:
+        def resolve(self, stage: str, tier: object) -> _Cfg:
+            return _Cfg()
+
+    class _Config:
+        model_router = _Router()
+
+    monkeypatch.setattr(server_mod, "load_config", lambda: _Config())
+
+    class _Completion:
+        text = "reflected"
+
+    class _Provider:
+        available = True
+
+        def complete(self, prompt: str) -> _Completion:
+            return _Completion()
+
+    monkeypatch.setattr(
+        "creek.classify.llm.providers.build_provider",
+        lambda cfg: _Provider(),
+    )
+    factory = server_mod._build_reflect_llm_factory()
+    assert factory(PrivacyTier.OPEN)("p") == "reflected"
+
+    class _Unavailable:
+        available = False
+
+    monkeypatch.setattr(
+        "creek.classify.llm.providers.build_provider",
+        lambda cfg: _Unavailable(),
+    )
+    with pytest.raises(RuntimeError):
+        server_mod._build_reflect_llm_factory()(PrivacyTier.OPEN)

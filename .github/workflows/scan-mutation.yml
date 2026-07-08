@@ -1,0 +1,28 @@
+name: "Scan: Mutation survivors"
+
+# Thin wrapper over the reusable _claude-scan.yml core. mutmut/Stryker survivors on the hottest modules, each with the killing assertion.
+#
+# Clone of scan-todo.yml; see it and _claude-scan.yml for the full rationale
+# (auth, permissions, SHA-pinned actions, the scan-issue-writer contract).
+# workflow_dispatch is REQUIRED on every scan wrapper — it is the hook the
+# queue-depth hopper uses to refill the Ralph backlog off-schedule.
+
+on:
+  schedule:
+    - cron: "0 8 8,22 * *"       # biweekly (8th & 22nd) 08:00 UTC — expensive, schedule-only (never hopper)
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: "Hard cap on issues created this run."
+        required: false
+        default: "8"
+
+jobs:
+  run:
+    uses: ./.github/workflows/_claude-scan.yml
+    with:
+      scan_name: mutation
+      max_issues: ${{ fromJSON(github.event.inputs.max_issues || '8') }}
+      priority: P3
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

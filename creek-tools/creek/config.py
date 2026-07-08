@@ -11,6 +11,7 @@ file — they must come from environment variables.
 
 import logging
 import os
+import re
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -99,7 +100,8 @@ class LLMConfig(BaseModel):
     """LLM provider configuration."""
 
     provider: str = "ollama"
-    """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, or ``gemini``."""
+    """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, ``gemini``,
+    or ``enclave`` (attested GPU-CC)."""
 
     model: str | None = None
     """Model identifier recognised by the chosen provider.
@@ -117,11 +119,60 @@ class LLMConfig(BaseModel):
     OpenAI-compatible gateway). ``None`` lets the SDK use its default endpoint
     or its own ``*_BASE_URL`` environment variable. Never holds a secret."""
 
-    batch_size: int = 50
-    """Number of items to process per LLM batch call."""
+    api_key_env: str | None = None
+    """BYOK: name of the environment variable holding this stage's API key.
 
-    max_concurrent: int = 5
-    """Maximum number of concurrent LLM requests."""
+    "Bring your own key" — point the ``generation`` (or any) stage at a
+    **user-supplied** provider key held in a named environment variable (e.g.
+    ``CREEK_BYOK_ANTHROPIC_KEY``) instead of the operator's default
+    (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` / ``GOOGLE_API_KEY``). This holds
+    a **variable name, never a key value**, so the key stays in the environment
+    only — never persisted in config or logged. ``None`` uses the provider's
+    default env var (behaviour unchanged). Does not relax the ``ModelRouter``
+    INTIMATE chokepoint: BYOK only affects OPEN/PERSONAL cloud stages; INTIMATE
+    is still redirected to a local/enclave provider before any key is read."""
+
+    enclave_url: str | None = None
+    """Base URL of the attested GPU-CC enclave endpoint (provider ``enclave``).
+
+    The enclave provider verifies remote attestation at ``{enclave_url}/attestation``
+    before sending any prompt to ``{enclave_url}/generate``. ``None`` means the
+    enclave is unconfigured and the provider refuses to run. Never holds a secret."""
+
+    enclave_expected_measurement: str | None = None
+    """The attestation measurement the enclave must present before any egress.
+
+    This is the "attest, then mount" policy: the ``enclave`` provider refuses to
+    send a prompt unless the enclave's attested measurement equals this value, so
+    ``is_cloud=False`` is defended in code — a mis-set flag cannot leak intimate
+    content because the measurement gate stands in front of every call. ``None``
+    means no attestation policy is configured, and the provider fails closed."""
+
+    enclave_attestation_pubkey: str | None = None
+    """Hex-encoded Ed25519 **public** key that anchors the enclave attestation.
+
+    The root of trust: the enclave signs each attestation quote (its measurement
+    bound to a fresh, caller-supplied nonce) with the matching private key, and
+    the provider verifies that signature against this public key before any prompt
+    egresses. This is what makes the attestation *cryptographic* rather than a
+    bare string match — an impersonator without the private key cannot forge a
+    quote, and the nonce defeats replay. It is a **public** key, so it is not a
+    secret; ``None`` means no trust anchor is configured and the provider fails
+    closed. See ADR-0006."""
+
+    batch_size: int = Field(default=50, ge=1)
+    """Number of items to process per LLM batch call.
+
+    Must be at least 1: a value below 1 would feed ``encode(batch_size=0)`` in
+    the embeddings pass (``creek/link/embeddings.py``) and process nothing, so
+    the misconfig fails fast at load time instead of silently doing no work."""
+
+    max_concurrent: int = Field(default=5, ge=1)
+    """Maximum number of concurrent LLM requests.
+
+    Must be at least 1: a value below 1 would build a ``BoundedSemaphore(0)``
+    in the per-provider classify pool (PR #799) and hang forever on the first
+    ``acquire()``, so the misconfig fails fast at load time instead."""
 
     unclassified_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     """Per-dimension confidence floor below which Mode / Orientation /
@@ -162,6 +213,40 @@ class LLMConfig(BaseModel):
             msg = f"unknown LLM provider {value!r}; expected one of: {joined}"
             raise ValueError(msg)
         return value
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _api_key_env_is_a_name(cls, value: str | None) -> str | None:
+        """Reject an ``api_key_env`` that looks like a pasted key, not a var name.
+
+        The field's whole safety property is "holds a variable name, never a
+        secret." An accidentally-pasted key would be serialized into
+        ``creek_config.yaml`` and echoed into "not set" error messages, so it is
+        rejected fail-fast at config-load: the value must be a valid environment
+        variable identifier and must not begin with a known provider-key prefix.
+
+        Args:
+            value: The configured ``api_key_env`` (``None`` when unset).
+
+        Returns:
+            The trimmed variable name, or ``None`` when unset/blank.
+
+        Raises:
+            ValueError: When the value is not a plausible env var name.
+        """
+        if value is None:
+            return None
+        name = value.strip()
+        if not name:
+            return None
+        looks_like_key = name.startswith(("sk-", "sk_", "AIza", "AKIA"))
+        if looks_like_key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            msg = (
+                "api_key_env must be an environment variable NAME "
+                "(e.g. CREEK_BYOK_ANTHROPIC_KEY), not an API key value"
+            )
+            raise ValueError(msg)
+        return name
 
 
 _LLM_SCALAR_STAGES = ("default", "classification", "generation", "frontend")
