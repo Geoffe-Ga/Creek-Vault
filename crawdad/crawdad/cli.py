@@ -14,18 +14,18 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import anthropic
-
 from crawdad.bot import CrawDadClient
+from crawdad.capture import MessageCapture
 from crawdad.composer import SonnetComposer
 from crawdad.config import (
-    DEFAULT_COMPOSER_MODEL,
-    DEFAULT_ROUTER_MODEL,
+    composer_model_for,
     load_config,
+    router_model_for,
 )
 from crawdad.consent import PendingBatchStore
 from crawdad.history import ConversationHistory
 from crawdad.intents import ToolInfo
+from crawdad.llm import build_async_provider
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPClient, MCPUnavailableError
 from crawdad.router import IntentRouter
@@ -139,8 +139,20 @@ def run_bot(config: CrawDadConfig) -> None:
         pending_batches=pending_batches,
         workflow_lister=_build_workflow_lister(workflow_registry),
         workflow_runner=workflow_runner,
+        message_capture=_build_message_capture(config),
     )
     client.run(config.discord_bot_token)
+
+
+def _build_message_capture(config: CrawDadConfig) -> MessageCapture | None:
+    """Build the bot-capture writer when enabled, else ``None`` (#687).
+
+    The capture dir is the vault-relative ``capture_subpath`` joined onto the
+    vault root, mirroring where creek's Tier-A ingest reads.
+    """
+    if not config.capture_enabled:
+        return None
+    return MessageCapture(capture_dir=config.vault_path / config.capture_subpath)
 
 
 def _build_workflow_lister(
@@ -326,7 +338,7 @@ def _build_agent_components(
             known_tools=known_tools,
             history=history,
         )
-    anthropic_client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
+    provider = build_async_provider(config)
     router_tools = [
         ToolInfo(
             name=tool.name,
@@ -336,13 +348,13 @@ def _build_agent_components(
         for tool in tool_details
     ]
     router = IntentRouter(
-        anthropic_client=anthropic_client,
-        model=DEFAULT_ROUTER_MODEL,
+        provider=provider,
+        model=router_model_for(config.llm_provider),
         tools=router_tools,
     )
     composer = SonnetComposer(
-        anthropic_client=anthropic_client,
-        model=DEFAULT_COMPOSER_MODEL,
+        provider=provider,
+        model=composer_model_for(config.llm_provider),
     )
     return _AgentComponents(
         router=router,

@@ -20,6 +20,7 @@ from creek.config import (
     HygieneConfig,
     LinkingConfig,
     LLMConfig,
+    LLMRoutingConfig,
     MarkdownCleaningConfig,
     OCRConfig,
     QualityConfig,
@@ -43,7 +44,7 @@ class TestLLMConfig:
         """LLMConfig should have sensible defaults."""
         cfg = LLMConfig()
         assert cfg.provider == "ollama"
-        assert cfg.model == "mistral"
+        assert cfg.model is None
         assert cfg.ollama_url == "http://localhost:11434"
         assert cfg.batch_size == 50
         assert cfg.max_concurrent == 5
@@ -54,6 +55,44 @@ class TestLLMConfig:
         assert cfg.provider == "anthropic"
         assert cfg.model == "claude-3"
         assert cfg.batch_size == 100
+
+    def test_max_concurrent_rejects_zero(self) -> None:
+        """Zero concurrent requests would issue no LLM calls at all."""
+        with pytest.raises(
+            ValueError, match=r"max_concurrent[\s\S]*greater than or equal to 1"
+        ):
+            LLMConfig(max_concurrent=0)
+
+    def test_max_concurrent_rejects_negative(self) -> None:
+        """A negative concurrency limit is nonsensical, not just unhelpful."""
+        with pytest.raises(
+            ValueError, match=r"max_concurrent[\s\S]*greater than or equal to 1"
+        ):
+            LLMConfig(max_concurrent=-3)
+
+    def test_max_concurrent_allows_one(self) -> None:
+        """1 is the inclusive lower bound — serial LLM operation is legal."""
+        cfg = LLMConfig(max_concurrent=1)
+        assert cfg.max_concurrent == 1
+
+    def test_batch_size_rejects_zero(self) -> None:
+        """A zero batch would feed ``encode(batch_size=0)`` and process nothing."""
+        with pytest.raises(
+            ValueError, match=r"batch_size[\s\S]*greater than or equal to 1"
+        ):
+            LLMConfig(batch_size=0)
+
+    def test_batch_size_rejects_negative(self) -> None:
+        """A negative batch size is nonsensical, not just unhelpful."""
+        with pytest.raises(
+            ValueError, match=r"batch_size[\s\S]*greater than or equal to 1"
+        ):
+            LLMConfig(batch_size=-10)
+
+    def test_batch_size_allows_one(self) -> None:
+        """1 is the inclusive lower bound — one item per batch is legal."""
+        cfg = LLMConfig(batch_size=1)
+        assert cfg.batch_size == 1
 
 
 class TestEmbeddingsConfig:
@@ -470,8 +509,10 @@ class TestCreekConfig:
         assert cfg.vault_path == Path(".")
         assert cfg.source_drive == Path(".")
         assert cfg.timezone == "America/Los_Angeles"
-        # Nested models should exist with their own defaults
-        assert isinstance(cfg.llm, LLMConfig)
+        # Nested models should exist with their own defaults. ``llm`` is now a
+        # per-stage LLMRoutingConfig (#646) whose ``default`` is an LLMConfig.
+        assert isinstance(cfg.llm, LLMRoutingConfig)
+        assert isinstance(cfg.llm.default, LLMConfig)
         assert isinstance(cfg.embeddings, EmbeddingsConfig)
         assert isinstance(cfg.ocr, OCRConfig)
         assert isinstance(cfg.linking, LinkingConfig)
@@ -540,11 +581,11 @@ class TestLoadConfig:
         cfg = load_config(config_file)
         assert cfg.vault_path == Path("/home/user/vault")
         assert cfg.timezone == "America/New_York"
-        assert cfg.llm.provider == "anthropic"
-        assert cfg.llm.model == "claude-3"
+        assert cfg.llm.default.provider == "anthropic"
+        assert cfg.llm.default.model == "claude-3"
         assert cfg.embeddings.similarity_threshold == 0.85
         # Unspecified fields keep defaults
-        assert cfg.llm.batch_size == 50
+        assert cfg.llm.default.batch_size == 50
 
     def test_loads_empty_yaml(self, tmp_path: Path) -> None:
         """load_config() should handle an empty YAML file gracefully."""
@@ -700,7 +741,7 @@ class TestGenerateDefaultConfig:
         cfg = load_config(output)
         assert cfg.vault_path == Path(".")
         assert cfg.timezone == "America/Los_Angeles"
-        assert cfg.llm.provider == "ollama"
+        assert cfg.llm.default.provider == "ollama"
         assert cfg.embeddings.model == "all-MiniLM-L6-v2"
         assert cfg.google_drive.scopes == [
             "https://www.googleapis.com/auth/drive.readonly"
@@ -757,7 +798,7 @@ class TestGenerateDefaultConfig:
 
         cfg = load_config(output)
         # The comment is informational — provider default still ollama.
-        assert cfg.llm.provider == "ollama"
+        assert cfg.llm.default.provider == "ollama"
 
 
 class TestVoiceConfigRoundtrip:

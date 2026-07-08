@@ -1,11 +1,14 @@
 """Creek Writing Desk — multi-agent authoring package (FEAT-041).
 
-This package wires the author desk end-to-end with typed stubs (#455): a
-:class:`~creek.author.conductor.Conductor` drives stub specialist agents, a
-stub voice agent, and a stub reflection node to return a shaped
-:class:`~creek.author.models.AuthoredDraft`. Later FEAT-041 issues replace the
-stub bodies with real retrieval, synthesis, voicing, and judging behind the
-same seams.
+A :class:`~creek.author.conductor.Conductor` drives the desk end-to-end and
+returns a shaped :class:`~creek.author.models.AuthoredDraft`. The specialist
+agents (graph, retrieval, ontology) and the reflection node do **real,
+deterministic** work — link-graph walks, embedding retrieval, rule-based
+ontology grounding, and quality-gate judging (no LLM). The voice node renders
+**live** through the router-resolved ``generation`` provider when one is
+available (tier-routed so Intimate content stays local, #658/#661), falling back
+to a deterministic rendering otherwise. The original #455 scaffold's stubs have
+since been replaced behind the same seams.
 """
 
 from __future__ import annotations

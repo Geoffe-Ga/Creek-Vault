@@ -11,13 +11,20 @@ file — they must come from environment variables.
 
 import logging
 import os
+import re
+from functools import cached_property
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from creek.classify.llm.router import ModelRouter
 
 logger = logging.getLogger(__name__)
 
@@ -93,19 +100,79 @@ class LLMConfig(BaseModel):
     """LLM provider configuration."""
 
     provider: str = "ollama"
-    """LLM backend — ``ollama``, ``anthropic``, or ``openai``."""
+    """LLM backend — ``ollama`` (local), ``anthropic``, ``openai``, ``gemini``,
+    or ``enclave`` (attested GPU-CC)."""
 
-    model: str = "mistral"
-    """Model identifier recognised by the chosen provider."""
+    model: str | None = None
+    """Model identifier recognised by the chosen provider.
+
+    ``None`` (the default) means "use the provider's own default model" —
+    each provider resolves it locally (e.g. ``mistral`` for Ollama). An
+    explicit value is always honored verbatim, whatever the provider.
+    """
 
     ollama_url: str = "http://localhost:11434"
     """Base URL for the Ollama API server."""
 
-    batch_size: int = 50
-    """Number of items to process per LLM batch call."""
+    api_base: str | None = None
+    """Optional base-URL override for a cloud provider's SDK (e.g. an
+    OpenAI-compatible gateway). ``None`` lets the SDK use its default endpoint
+    or its own ``*_BASE_URL`` environment variable. Never holds a secret."""
 
-    max_concurrent: int = 5
-    """Maximum number of concurrent LLM requests."""
+    api_key_env: str | None = None
+    """BYOK: name of the environment variable holding this stage's API key.
+
+    "Bring your own key" — point the ``generation`` (or any) stage at a
+    **user-supplied** provider key held in a named environment variable (e.g.
+    ``CREEK_BYOK_ANTHROPIC_KEY``) instead of the operator's default
+    (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` / ``GOOGLE_API_KEY``). This holds
+    a **variable name, never a key value**, so the key stays in the environment
+    only — never persisted in config or logged. ``None`` uses the provider's
+    default env var (behaviour unchanged). Does not relax the ``ModelRouter``
+    INTIMATE chokepoint: BYOK only affects OPEN/PERSONAL cloud stages; INTIMATE
+    is still redirected to a local/enclave provider before any key is read."""
+
+    enclave_url: str | None = None
+    """Base URL of the attested GPU-CC enclave endpoint (provider ``enclave``).
+
+    The enclave provider verifies remote attestation at ``{enclave_url}/attestation``
+    before sending any prompt to ``{enclave_url}/generate``. ``None`` means the
+    enclave is unconfigured and the provider refuses to run. Never holds a secret."""
+
+    enclave_expected_measurement: str | None = None
+    """The attestation measurement the enclave must present before any egress.
+
+    This is the "attest, then mount" policy: the ``enclave`` provider refuses to
+    send a prompt unless the enclave's attested measurement equals this value, so
+    ``is_cloud=False`` is defended in code — a mis-set flag cannot leak intimate
+    content because the measurement gate stands in front of every call. ``None``
+    means no attestation policy is configured, and the provider fails closed."""
+
+    enclave_attestation_pubkey: str | None = None
+    """Hex-encoded Ed25519 **public** key that anchors the enclave attestation.
+
+    The root of trust: the enclave signs each attestation quote (its measurement
+    bound to a fresh, caller-supplied nonce) with the matching private key, and
+    the provider verifies that signature against this public key before any prompt
+    egresses. This is what makes the attestation *cryptographic* rather than a
+    bare string match — an impersonator without the private key cannot forge a
+    quote, and the nonce defeats replay. It is a **public** key, so it is not a
+    secret; ``None`` means no trust anchor is configured and the provider fails
+    closed. See ADR-0006."""
+
+    batch_size: int = Field(default=50, ge=1)
+    """Number of items to process per LLM batch call.
+
+    Must be at least 1: a value below 1 would feed ``encode(batch_size=0)`` in
+    the embeddings pass (``creek/link/embeddings.py``) and process nothing, so
+    the misconfig fails fast at load time instead of silently doing no work."""
+
+    max_concurrent: int = Field(default=5, ge=1)
+    """Maximum number of concurrent LLM requests.
+
+    Must be at least 1: a value below 1 would build a ``BoundedSemaphore(0)``
+    in the per-provider classify pool (PR #799) and hang forever on the first
+    ``acquire()``, so the misconfig fails fast at load time instead."""
 
     unclassified_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     """Per-dimension confidence floor below which Mode / Orientation /
@@ -118,15 +185,212 @@ class LLMConfig(BaseModel):
     the per-dimension agreement rate on your corpus is known.
     """
 
+    @field_validator("provider")
+    @classmethod
+    def _known_provider(cls, value: str) -> str:
+        """Fail fast at config-load on an unregistered provider.
+
+        Validates against the live provider registry so a typo like
+        ``provider: anthropics`` raises here — at parse time — instead of
+        surfacing as a ``ValueError`` from ``build_provider`` mid-run. The
+        valid set is read from the registry, never re-listed, so it cannot
+        drift.
+
+        Args:
+            value: The configured provider string.
+
+        Returns:
+            *value* unchanged when it names a registered provider.
+
+        Raises:
+            ValueError: When *value* names no registered provider.
+        """
+        from creek.classify.llm.providers import known_providers
+
+        known = known_providers()
+        if value not in known:
+            joined = ", ".join(known)
+            msg = f"unknown LLM provider {value!r}; expected one of: {joined}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _api_key_env_is_a_name(cls, value: str | None) -> str | None:
+        """Reject an ``api_key_env`` that looks like a pasted key, not a var name.
+
+        The field's whole safety property is "holds a variable name, never a
+        secret." An accidentally-pasted key would be serialized into
+        ``creek_config.yaml`` and echoed into "not set" error messages, so it is
+        rejected fail-fast at config-load: the value must be a valid environment
+        variable identifier and must not begin with a known provider-key prefix.
+
+        Args:
+            value: The configured ``api_key_env`` (``None`` when unset).
+
+        Returns:
+            The trimmed variable name, or ``None`` when unset/blank.
+
+        Raises:
+            ValueError: When the value is not a plausible env var name.
+        """
+        if value is None:
+            return None
+        name = value.strip()
+        if not name:
+            return None
+        looks_like_key = name.startswith(("sk-", "sk_", "AIza", "AKIA"))
+        if looks_like_key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            msg = (
+                "api_key_env must be an environment variable NAME "
+                "(e.g. CREEK_BYOK_ANTHROPIC_KEY), not an API key value"
+            )
+            raise ValueError(msg)
+        return name
+
+
+_LLM_SCALAR_STAGES = ("default", "classification", "generation", "frontend")
+"""Stages that resolve to a single :class:`LLMConfig` (``writing_desk`` is a
+role *map*, handled separately by the router in #648)."""
+
+
+class LLMRoutingConfig(BaseModel):
+    """Per-stage LLM routing (#642), backward-compatible with a flat block.
+
+    A vault's ``llm:`` block is accepted in two shapes:
+
+    * **legacy flat** — ``{provider, model, …}`` (an :class:`LLMConfig`) is
+      promoted to ``default`` so every stage resolves to it (pre-#642
+      behaviour, and the shape an env override ``CREEK_LLM='{"provider":…}'``
+      produces);
+    * **per-stage map** — ``{default, classification, generation, frontend,
+      writing_desk}``.
+
+    Unset scalar stages fall back to :attr:`default`; :attr:`default` itself
+    falls back to a plain :class:`LLMConfig` (local Ollama). The per-stage
+    *resolution* and the ``Intimate``-never-cloud rule live in
+    :class:`~creek.classify.llm.router.ModelRouter`, not here — this model only
+    holds and normalises the config.
+    """
+
+    default: LLMConfig = Field(default_factory=LLMConfig)
+    """The fallback config for any stage without its own entry."""
+
+    classification: LLMConfig | None = None
+    """Override for the classification stage; ``None`` falls back to default."""
+
+    generation: LLMConfig | None = None
+    """Override for the generation stage; ``None`` falls back to default."""
+
+    frontend: LLMConfig | None = None
+    """Reserved for the OpenClaw frontend (schema-only until it lands, #642)."""
+
+    writing_desk: dict[str, LLMConfig] = Field(default_factory=dict)
+    """Writing Desk role -> model map (resolved by the router in #648)."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_flat(cls, data: object) -> object:
+        """Promote a legacy flat ``LLMConfig`` (or its mapping) to ``default``.
+
+        A bare :class:`LLMConfig` instance — e.g.
+        ``CreekConfig(llm=LLMConfig(...))`` — or a flat mapping carrying any
+        :class:`LLMConfig` field with no per-stage key is the old single-block
+        shape; wrap it as ``{"default": <it>}`` so it keeps working unchanged.
+
+        Args:
+            data: The raw input to validation (mapping, ``LLMConfig``, or other).
+
+        Returns:
+            ``data`` unchanged, or ``{"default": data}`` when it is a legacy
+            flat block.
+        """
+        if isinstance(data, LLMConfig):
+            return {"default": data}
+        if not isinstance(data, dict):
+            return data
+        stage_keys = {*_LLM_SCALAR_STAGES, "writing_desk"}
+        legacy_keys = set(LLMConfig.model_fields)
+        keys = set(data)
+        if keys & legacy_keys and not (keys & stage_keys):
+            return {"default": data}
+        return data
+
+    def for_stage(self, stage: str) -> LLMConfig:
+        """Return the :class:`LLMConfig` for *stage*, falling back to default.
+
+        Args:
+            stage: A scalar stage name (``default`` / ``classification`` /
+                ``generation`` / ``frontend``). Any other value (including a
+                role name or a typo) safely resolves to :attr:`default`.
+
+        Returns:
+            The stage's configured :class:`LLMConfig`, or :attr:`default`.
+        """
+        if stage in _LLM_SCALAR_STAGES:
+            return getattr(self, stage) or self.default
+        return self.default
+
+    def iter_stage_configs(self) -> "Iterator[tuple[str, LLMConfig]]":
+        """Yield ``(stage_label, LLMConfig)`` for every configured stage.
+
+        ``default`` first, then each set scalar-stage override, then every
+        ``writing_desk`` role (labelled ``writing_desk.<role>``). The label lets
+        callers name the offending stage in messages.
+
+        Yields:
+            ``(label, config)`` pairs across all configured stages.
+        """
+        yield "default", self.default
+        for stage in _LLM_SCALAR_STAGES:
+            if stage != "default" and (cfg := getattr(self, stage)) is not None:
+                yield stage, cfg
+        for role, cfg in self.writing_desk.items():
+            yield f"writing_desk.{role}", cfg
+
+    def all_configs(self) -> list[LLMConfig]:
+        """Return every distinct :class:`LLMConfig` this routing can resolve.
+
+        Used by the cloud-consent preflight so a cloud provider configured for
+        *any* stage (not just ``default``) is caught before the run starts.
+
+        Returns:
+            ``default`` plus each set scalar-stage override and every
+            ``writing_desk`` role config.
+        """
+        return [cfg for _, cfg in self.iter_stage_configs()]
+
 
 class EmbeddingsConfig(BaseModel):
-    """Embedding model configuration."""
+    """Embedding model configuration.
+
+    Embeddings are local-only by design — unlike ``llm.provider``, there is no
+    cloud backend selection here, so vault text never leaves the device for
+    linking (see ``docs/architecture/ADR/0004-embeddings-stay-local.md``).
+    """
 
     model: str = "all-MiniLM-L6-v2"
-    """Sentence-transformer model used to generate embeddings."""
+    """Sentence-transformer model used to generate embeddings (always local).
+
+    Changing it invalidates the on-disk vector cache: every fragment must be
+    re-embedded and ``similarity_threshold`` re-calibrated for the new model.
+    """
 
     similarity_threshold: float = 0.75
     """Minimum cosine similarity for linking fragments."""
+
+    resonance_method: Literal["exact", "topk"] = "exact"
+    """Resonance-discovery strategy.
+
+    ``exact`` (default) emits every above-``similarity_threshold`` pair — the
+    validated, exhaustive path. ``topk`` keeps only each fragment's
+    ``resonance_top_k`` most-similar above-threshold neighbours, bounding the
+    edge set to O(n·k) for large vaults; its output is always a subset of the
+    exact path's edges.
+    """
+
+    resonance_top_k: int = Field(default=10, ge=1)
+    """Per-fragment neighbour cap when ``resonance_method = "topk"``."""
 
     cache_dir: str | None = None
     """Local directory for caching downloaded models."""
@@ -215,6 +479,18 @@ class ClassificationConfig(BaseModel):
 
     confidence_threshold: float = 0.7
     """Minimum confidence score for automatic classification."""
+
+    reclassify_on_edit_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    """Body-similarity floor below which an edited mutable source unit is
+    flagged for re-classification (#675 / SPEC R1).
+
+    When a journal/markdown fragment is updated in place, its body is compared
+    to the prior version (``difflib`` ratio in ``[0, 1]``). At/above this
+    threshold the edit is *trivial* (typo, whitespace) and classifications are
+    preserved; below it the change is *material* and the fragment's
+    ``classification_method`` is cleared so the next classify pass re-does only
+    that fragment (cooperating with OPS-001, no global ``--force``). ``0.0``
+    disables flagging (always preserve)."""
 
     auto_classify_sources: list[str] = Field(
         default_factory=lambda: ["claude", "chatgpt", "discord"],
@@ -927,6 +1203,16 @@ class AIStyleConfig(BaseModel):
     Rates are per-1000-words, so ``0.5`` means "half an occurrence per
     thousand words above the user's own rate"."""
 
+    signature_polarity_threshold: float = Field(default=3.0, ge=0.0)
+    """Per-1000-words rate at or above which a feature is treated as one of
+    *this user's* signatures, deriving its polarity per-user (#635): the
+    concern flips from over-use (``avoid``) to under-use (``signature``), so a
+    draft that strips a feature the user characteristically employs raises
+    voice distance instead of lowering it. Below this rate the feature keeps
+    its declared (avoid) polarity. Never-legitimate artifacts (tells with
+    ``margin == 0.0``: placeholder dates, fabricated citations) are exempt and
+    stay ``avoid`` regardless of the user's measured rate."""
+
     min_fingerprint_fragments: int = Field(default=5, ge=1)
     """Below this many user-authored fragments the fingerprint is treated
     as thin: divergence contributions are softened toward the generic
@@ -1114,6 +1400,38 @@ def _default_representativeness_authority() -> dict[str, float]:
     return {"self": 1.0, "endorsed": 0.9, "aspirational": 0.6, "reference": 0.3}
 
 
+def _default_platform_authority() -> dict[str, float]:
+    """Default per-``source.platform`` voice-authority multipliers (#633).
+
+    Audience-facing platforms (essays, Substack posts) outrank private ones
+    (journals, DMs, chats) so the voice fingerprint is built primarily from how
+    the user writes *for an audience* rather than their texting average. Missing
+    platforms fall back to ``1.0`` so a new platform never silently zeroes out.
+    """
+    return {
+        "essay": 2.0,
+        "substack": 2.0,
+        "journal": 0.1,
+        "messages": 0.4,
+        "discord": 0.4,
+        "chatgpt": 0.3,
+        "claude": 0.3,
+    }
+
+
+def _default_audience_authority() -> dict[str, float]:
+    """Default per-``audience``-axis voice-authority multipliers (#634).
+
+    The primary audience signal once the FEAT/#634 audience classifier has
+    run: a fragment explicitly classified ``audience-facing`` dominates the
+    voice fingerprint, ``private`` material is strongly down-weighted, and
+    ``mixed`` (the unclassified default and the ambiguous verdict) is neutral
+    at ``1.0`` so legacy vaults keep relying on the platform heuristic until
+    they are re-classified. Missing values fall back to ``1.0``.
+    """
+    return {"audience-facing": 2.0, "private": 0.1, "mixed": 1.0}
+
+
 class VoiceAudienceWeightingConfig(BaseModel):
     """Graduated audience-authority weighting for the voice proxy.
 
@@ -1137,6 +1455,142 @@ class VoiceAudienceWeightingConfig(BaseModel):
     )
     """Multiplier per ``representativeness`` value (missing default to 1.0)."""
 
+    platform_authority: dict[str, float] = Field(
+        default_factory=_default_platform_authority,
+    )
+    """Multiplier per ``source.platform`` (missing platforms default to 1.0).
+
+    The reliable audience signal: audience-facing platforms (essay, substack)
+    outweigh private ones (journal, DMs, chat). Used to scope the voice
+    fingerprint to audience-facing documents (#633) on top of the
+    privacy/representativeness factors."""
+
+    audience_authority: dict[str, float] = Field(
+        default_factory=_default_audience_authority,
+    )
+    """Multiplier per persisted ``audience`` axis (missing default to 1.0).
+
+    The primary audience signal once the #634 classifier has tagged fragments:
+    ``audience-facing`` content dominates the fingerprint, ``private`` is
+    down-weighted, ``mixed`` stays neutral. Layered on top of the #633
+    platform/privacy/representativeness factors so an unclassified vault
+    (every fragment ``mixed`` → 1.0) still falls back to the platform
+    heuristic, while a classified vault is scoped by the real axis."""
+
+
+def _default_sync_sources() -> dict[str, bool]:
+    """Default per-source enable toggles for ``creek sync`` (#676).
+
+    The journal and Google Drive are the regularly-updated sources enabled
+    by default; the rest are present-but-off so an operator opts in per source.
+    """
+    return {
+        "journal": True,
+        "gdrive": True,
+        "discord": False,
+        "chatgpt": False,
+        "claude": False,
+        "essays": False,
+    }
+
+
+class SyncConfig(BaseModel):
+    """Scheduling configuration for ``creek sync`` (#676 / SPEC R3).
+
+    Holds the per-source enable toggles and the two-tier cadence. The cadence
+    values are config-tunable (decision #5) even though the skeleton command
+    does not schedule anything yet — a later issue emits the launchd/systemd
+    units that read them.
+    """
+
+    tier_a_interval_minutes: int = Field(default=30, ge=1)
+    """How often the cheap Tier-A pass (pull → incremental ingest → rules
+    classify) should run, in minutes (default 30)."""
+
+    tier_b_hour: int = Field(default=3, ge=0, le=23)
+    """Local hour (0-23) for the nightly Tier-B pass (LLM classify -> link ->
+    index); default 3 (~03:00)."""
+
+    sources: dict[str, bool] = Field(default_factory=_default_sync_sources)
+    """Per-source enable toggles; only enabled sources are pulled in Tier A."""
+
+    def enabled_sources(self) -> list[str]:
+        """Return the enabled source names in stable (sorted) order."""
+        return sorted(name for name, on in self.sources.items() if on)
+
+
+class DiscordModeToggle(BaseModel):
+    """On/off toggle for one Discord ingest mode (#685)."""
+
+    enabled: bool = False
+    """Whether this mode is enabled. Opt-in per mode."""
+
+
+class DiscordSourceConfig(BaseModel):
+    """How Discord content reaches the vault — three explicit modes (#685).
+
+    A bot **cannot** read DMs (Discord API limit), so the modes differ by
+    coverage and compliance (SPEC R5, decision #3):
+
+    * ``data_package`` — ingest a manually-downloaded Data Package. The clean,
+      ToS-compliant fallback; on by default.
+    * ``exporter`` — a user-token exporter (DMs + servers). **Off by default**;
+      enabling it is a ToS-caveated, opt-in choice.
+    * ``bot_capture`` — a bot logging the servers/channels it is in. Clean, but
+      cannot see DMs. Off by default.
+
+    Config holds only the mode toggles — the Discord token lives in the
+    environment, never here.
+    """
+
+    data_package: DiscordModeToggle = Field(
+        default_factory=lambda: DiscordModeToggle(enabled=True),
+    )
+    """The clean Data Package fallback — enabled by default."""
+
+    exporter: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
+    """User-token exporter — OFF by default (decision #3); ToS-caveated."""
+
+    exporter_binary: str | None = None
+    """Absolute path to the operator-provided user-token exporter binary (#686).
+
+    Non-secret. The exporter is invoked read-only with the Discord token passed
+    via the environment only, never on the command line or in this config."""
+
+    exporter_timeout_seconds: int = Field(default=600, ge=1)
+    """Hard timeout for the exporter subprocess so a hung binary cannot block
+    the run indefinitely (#686)."""
+
+    bot_capture: DiscordModeToggle = Field(default_factory=DiscordModeToggle)
+    """Bot message capture for servers/channels — off by default."""
+
+    capture_subpath: str = "discord-capture"
+    """Vault-relative dir the bot-capture path writes and Tier-A ingest reads (#687).
+
+    The bot appends ``<capture_subpath>/<channel>/<date>.jsonl`` (relative to the
+    vault root) in the lowercase Discord message schema the ``DiscordIngestor``
+    already reads; ``creek sync`` reshapes it into the Data-Package layout. Must
+    be vault-relative — never absolute, never parent-traversing."""
+
+    @field_validator("exporter_binary")
+    @classmethod
+    def _validate_exporter_binary(cls, value: str | None) -> str | None:
+        """Require an absolute path so the binary resolves predictably (#686)."""
+        if value is not None and not Path(value).is_absolute():
+            msg = f"exporter_binary must be an absolute path, got {value!r}."
+            raise ValueError(msg)
+        return value
+
+    @field_validator("capture_subpath")
+    @classmethod
+    def _validate_capture_subpath(cls, value: str) -> str:
+        """Refuse absolute or parent-traversing capture paths — stay in vault (#687)."""
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            msg = f"capture_subpath must be vault-relative, got {value!r}."
+            raise ValueError(msg)
+        return value
+
 
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
@@ -1159,8 +1613,10 @@ class CreekConfig(BaseSettings):
     timezone: str = "America/Los_Angeles"
     """IANA timezone for timestamp normalisation."""
 
-    llm: LLMConfig = Field(default_factory=LLMConfig)
-    """LLM provider settings."""
+    llm: LLMRoutingConfig = Field(default_factory=LLMRoutingConfig)
+    """Per-stage LLM routing (#642). A legacy flat ``llm`` block is promoted to
+    ``default`` by :class:`LLMRoutingConfig`, so existing configs keep working;
+    resolve a stage's provider+model via :attr:`model_router`."""
 
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     """Embedding model settings."""
@@ -1216,6 +1672,12 @@ class CreekConfig(BaseSettings):
     sources: SourcePaths = Field(default_factory=SourcePaths)
     """Source data path mappings."""
 
+    sync: SyncConfig = Field(default_factory=SyncConfig)
+    """Scheduling config for ``creek sync`` — per-source toggles + cadence."""
+
+    discord: DiscordSourceConfig = Field(default_factory=DiscordSourceConfig)
+    """Discord ingest mode toggles (data_package | exporter | bot_capture)."""
+
     @field_validator("timezone")
     @classmethod
     def validate_timezone(cls, v: str) -> str:
@@ -1236,6 +1698,19 @@ class CreekConfig(BaseSettings):
             msg = f"Invalid timezone: {v}"
             raise ValueError(msg) from exc
         return v
+
+    @cached_property
+    def model_router(self) -> "ModelRouter":
+        """Return a :class:`~creek.classify.llm.router.ModelRouter` for this run.
+
+        The single resolver every LLM call site uses to map a pipeline stage
+        (and, from #647, a fragment tier) to a provider+model. Imported lazily
+        to avoid a config<->router import cycle, and cached so the several call
+        sites in one command share one router instance.
+        """
+        from creek.classify.llm.router import ModelRouter
+
+        return ModelRouter(self.llm)
 
 
 def load_config(

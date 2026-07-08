@@ -28,6 +28,11 @@ RULES_METHOD: Final[str] = "rules"
 LLM_METHOD: Final[str] = "llm"
 """``classification_method`` value emitted by the LLM classifier."""
 
+CLASSIFICATION_PROVIDER_KEY: Final[str] = "classification_provider"
+"""Frontmatter key naming the LLM provider behind an ``llm`` classification
+(e.g. ``anthropic`` / ``ollama``). Lets a quality-aware re-run tell a local-LLM
+classification apart from a cloud-LLM one; absent for ``rules`` / ``manual``."""
+
 CLASSIFICATION_REASONING_KEY: Final[str] = "classification_reasoning"
 """Frontmatter key carrying the truncated LLM reasoning trace (FEAT-017).
 

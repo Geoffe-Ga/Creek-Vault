@@ -1,0 +1,28 @@
+name: "Scan: Dependencies"
+
+# Thin wrapper over the reusable _claude-scan.yml core. Groups compatible minor/patch Dependabot bumps into batch issues and writes a migration-plan issue per major bump.
+#
+# Clone of scan-todo.yml; see it and _claude-scan.yml for the full rationale
+# (auth, permissions, SHA-pinned actions, the scan-issue-writer contract).
+# workflow_dispatch is REQUIRED on every scan wrapper — it is the hook the
+# queue-depth hopper uses to refill the Ralph backlog off-schedule.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"       # daily 06:00 UTC (Dependabot runs daily)
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: "Hard cap on issues created this run."
+        required: false
+        default: "5"
+
+jobs:
+  run:
+    uses: ./.github/workflows/_claude-scan.yml
+    with:
+      scan_name: deps
+      max_issues: ${{ fromJSON(github.event.inputs.max_issues || '5') }}
+      priority: P2
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

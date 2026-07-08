@@ -25,6 +25,7 @@ from creek.author.models import (
     OntologyParadox,
     WalkStats,
 )
+from creek.classify.privacy_filter import PrivacyTierOverride, tier_within_override
 from creek.classify.rules import RuleClassifier
 from creek.classify.weighted import WeightedDimension
 from creek.generate.paradox import OPPOSITE_CONFIDENCE_PAIRS, OPPOSITE_PHASE_PAIRS
@@ -35,7 +36,15 @@ from creek.link.embeddings import (
     embeddings_cache_path,
     fragment_embedding_text,
 )
-from creek.models import Confidence, Dosage, Frequency, Mode, Phase, VoiceRegister
+from creek.models import (
+    Confidence,
+    Dosage,
+    Frequency,
+    Mode,
+    Phase,
+    PrivacyTier,
+    VoiceRegister,
+)
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
@@ -68,8 +77,18 @@ class Specialist(Protocol):
 
     name: str
 
-    def gather(self, query: str, vault: Path) -> EvidenceBundle:
-        """Return structured evidence for *query* drawn from *vault*."""
+    def gather(
+        self,
+        query: str,
+        vault: Path,
+        *,
+        override: PrivacyTierOverride | None = None,
+    ) -> EvidenceBundle:
+        """Return structured evidence for *query* drawn from *vault*.
+
+        *override* is the privacy admission ceiling (#660): fragments above it
+        are excluded from the evidence. ``None`` defaults to ``OPEN``.
+        """
         ...
 
 
@@ -80,13 +99,45 @@ def _load_config(vault: Path) -> CreekConfig:
     return load_config(resolve_config_path(vault, None), warn_on_missing=False)
 
 
-def _load_corpus(vault: Path) -> list[tuple[Fragment, str]]:
-    """Return ``(fragment, body)`` records across the corpus subtrees."""
+def _load_corpus(
+    vault: Path,
+    override: PrivacyTierOverride | None = None,
+) -> list[tuple[Fragment, str]]:
+    """Return ``(fragment, body)`` records across the corpus subtrees.
+
+    Fragments whose ``privacy_tier`` exceeds *override* are excluded (#660), so
+    above-ceiling content never enters ranking, the link graph, or the evidence.
+    ``override`` of ``None`` defaults to ``OPEN`` (the most restrictive).
+    """
     records: list[tuple[Fragment, str]] = []
     for sub in _CORPUS_SUBDIRS:
         for _path, fragment, body, _meta in iter_vault_fragments(vault / sub):
-            records.append((fragment, body))
+            if tier_within_override(fragment.privacy_tier, override):
+                records.append((fragment, body))
     return records
+
+
+def fragment_tier_map(
+    vault: Path,
+    override: PrivacyTierOverride | None = None,
+) -> dict[str, PrivacyTier]:
+    """Return a ``{fragment_id: privacy_tier}`` map for the admitted corpus (#661).
+
+    Built from the same override-filtered corpus the specialists gather from, so
+    the desk can derive a run's *content tier* (the most-sensitive tier actually
+    in the evidence) and route the voice call accordingly.
+
+    Args:
+        vault: Vault root.
+        override: The privacy admission ceiling (matches the gather override).
+
+    Returns:
+        A mapping of admitted fragment id to its :class:`PrivacyTier`.
+    """
+    return {
+        fragment.id: fragment.privacy_tier
+        for fragment, _ in _load_corpus(vault, override)
+    }
 
 
 def _fragment_claim(fragment: Fragment) -> EvidenceClaim:
@@ -232,16 +283,23 @@ class RetrievalSpecialist:
             self._cache_vault = vault
         return self._cache
 
-    def gather(self, query: str, vault: Path) -> EvidenceBundle:
+    def gather(
+        self,
+        query: str,
+        vault: Path,
+        *,
+        override: PrivacyTierOverride | None = None,
+    ) -> EvidenceBundle:
         """Return the top-``retrieval_top_k`` fragments most relevant to *query*.
 
         Degrades to an empty bundle when the corpus is empty or the embedding
         model is unavailable, so the desk never crashes on a thin/offline vault.
         The persisted embeddings cache is loaded once and used to skip
-        re-embedding fragments whose text is unchanged.
+        re-embedding fragments whose text is unchanged. Fragments above
+        *override* are excluded from the corpus (#660).
         """
         config = _load_config(vault)
-        corpus = _load_corpus(vault)
+        corpus = _load_corpus(vault, override)
         if not corpus:
             return EvidenceBundle()
         linker = self._get_linker(config)
@@ -357,14 +415,22 @@ class GraphSpecialist:
 
     name = "graph"
 
-    def gather(self, query: str, vault: Path) -> EvidenceBundle:
+    def gather(
+        self,
+        query: str,
+        vault: Path,
+        *,
+        override: PrivacyTierOverride | None = None,
+    ) -> EvidenceBundle:
         """Walk the link graph from a query-matched seed within the config bounds.
 
         The walk respects ``author.graph_breadth_bound`` / ``graph_depth_bound``
-        and reports its reach in ``walk_stats``.
+        and reports its reach in ``walk_stats``. Fragments above *override* are
+        excluded from the corpus before the graph is built (#660), so the walk
+        never traverses or surfaces above-ceiling content.
         """
         config = _load_config(vault)
-        corpus = _load_corpus(vault)
+        corpus = _load_corpus(vault, override)
         by_id = {fragment.id: fragment for fragment, _ in corpus}
         if not by_id:
             return EvidenceBundle(walk_stats=WalkStats())
@@ -738,22 +804,30 @@ class OntologySpecialist:
 
     name = "ontology"
 
-    def gather(self, query: str, vault: Path) -> EvidenceBundle:
+    def gather(
+        self,
+        query: str,
+        vault: Path,
+        *,
+        override: PrivacyTierOverride | None = None,
+    ) -> EvidenceBundle:
         """Return canonical ontological analysis grounded in corpus fragments.
 
         Degrades to an empty bundle when the corpus is empty so the desk never
         crashes on a thin vault. When the corpus is non-empty it always emits
-        at least one claim, traced to the scanned fragments.
+        at least one claim, traced to the scanned fragments. Fragments above
+        *override* are excluded from the corpus (#660).
 
         Args:
             query: The user query (unused — analysis is corpus-wide).
             vault: The vault to scan.
+            override: The privacy admission ceiling; ``None`` defaults to OPEN.
 
         Returns:
             An :class:`EvidenceBundle` carrying the analysis and a grounded
             summary claim, or an empty bundle for an empty corpus.
         """
-        corpus = _load_corpus(vault)
+        corpus = _load_corpus(vault, override)
         if not corpus:
             return EvidenceBundle()
         signals = [

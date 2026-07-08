@@ -27,6 +27,7 @@ The pipeline runs in three named passes (FEAT-005):
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -36,7 +37,8 @@ from creek.audit.yield_summary import (
     format_yield_line,
     write_yield_summary,
 )
-from creek.classify.llm import LLMClassifier
+from creek.classify.classify_engine import build_tier_classifiers
+from creek.classify.privacy_filter import tier_of
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
@@ -44,12 +46,94 @@ from creek.consent import ConsentManager
 from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.base import IngestedFragment, assemble_ingested_fragment
+from creek.ingest.ledger import LedgerRecord
 from creek.link.linker import LinkingPipeline
 from creek.models import Fragment, Frequency
 from creek.redact.scanner import RedactionScanner
 from creek.vault.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
+
+
+# Map a ``creek sync`` source name -> the ingestor type it routes to.
+_SYNC_INGEST_TYPE: dict[str, str] = {
+    "journal": "markdown",
+    "gdrive": "gdrive",
+    "discord": "discord",
+    "chatgpt": "chatgpt",
+    "claude": "claude",
+    "essays": "substack",
+}
+
+
+def sync_ingest_type(source: str) -> str:
+    """Return the ingestor type a ``creek sync`` source routes to (#676)."""
+    return _SYNC_INGEST_TYPE.get(source, source)
+
+
+def resolve_tier_a_plan(source: str) -> list[str]:
+    """Return the ordered Tier-A subcommand plan for *source* (#676).
+
+    Tier A is the cheap, per-source pass: pull the source, incrementally
+    ingest it, then run the offline rules classifier. This is a *plan* (an
+    ordered list of human-readable step strings) — the skeleton command echoes
+    it; real execution lands in a later issue.
+    """
+    ingest_type = sync_ingest_type(source)
+    return [
+        "pull",
+        f"ingest --type {ingest_type} --since <ledger>",
+        "classify --method rules",
+    ]
+
+
+def resolve_tier_b_plan() -> list[str]:
+    """Return the ordered Tier-B subcommand plan (#676).
+
+    Tier B is the nightly, global pass: LLM classification then the expensive
+    link + index rebuilds. Returned as an ordered list of step strings.
+    """
+    return ["classify --method llm", "link", "index"]
+
+
+def _as_aware(value: datetime) -> datetime:
+    """Return *value* as an aware datetime, assuming UTC when naive."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def unit_is_changed(
+    timestamp: datetime,
+    content_hash: str,
+    record: LedgerRecord | None,
+    since: datetime | None,
+) -> bool:
+    """Return whether a source unit should be (re)processed by incremental ingest.
+
+    Two cursors, used by the two incremental modes (#677):
+
+    * ``since`` given (``creek ingest --since``): a unit is changed when its
+      timestamp is strictly newer than the cutoff (mtime-style, generalising
+      the Drive mtime-skip to every file source). Naive timestamps are treated
+      as UTC.
+    * ``since`` is ``None`` (``--incremental``, ledger-driven): a unit is
+      changed when the ledger has no record for it, or its recorded
+      ``content_hash`` differs from *content_hash* — so a touch-without-edit
+      (same hash) is still skipped.
+
+    Args:
+        timestamp: The source unit's timestamp (fragment mtime/authored time).
+        content_hash: SHA-256 of the unit's current content.
+        record: The prior ledger record for this unit, or ``None``.
+        since: Explicit cutoff datetime, or ``None`` for ledger-driven mode.
+
+    Returns:
+        ``True`` when the unit should be processed; ``False`` to skip it.
+    """
+    if since is not None:
+        return _as_aware(timestamp) > _as_aware(since)
+    if record is not None:
+        return record.content_hash != content_hash
+    return True
 
 
 class RedactionRequiredError(RuntimeError):
@@ -134,7 +218,8 @@ class Pipeline:
         config: The Creek configuration governing all subsystems.
         scanner: The redaction scanner for PII detection.
         rule_classifier: Keyword-based classifier.
-        llm_classifier: LLM-based classifier stub.
+        tier_classifiers: Per-tier LLM classifiers (#666/#706) — the fragment's
+            privacy tier selects the provider so Intimate stays local.
         review_generator: Review queue generator for uncertain fragments.
         linking_pipeline: Orchestrator for all four linking stages.
         consent_manager: Optional consent manager for gating processing.
@@ -156,7 +241,7 @@ class Pipeline:
             no_llm: When ``True``, skip Pass 3 (LLM classification)
                 entirely. The deterministic and local-model passes still
                 run; the run summary records ``no_llm: true`` and the
-                pipeline never invokes ``llm_classifier.classify`` —
+                pipeline never invokes the LLM classifier —
                 guaranteeing zero network egress along the LLM path.
                 The flag wins over ``LLMConfig.provider`` so passing
                 ``no_llm=True`` with ``provider: anthropic`` is safe.
@@ -166,7 +251,12 @@ class Pipeline:
         self.no_llm = no_llm
         self.scanner = RedactionScanner(config=config.redaction)
         self.rule_classifier = RuleClassifier()
-        self.llm_classifier = LLMClassifier(config=config.llm)
+        # Per-tier routing (#666/#706): each fragment is classified by the
+        # provider its privacy tier resolves to — Intimate stays local even when
+        # ``classification`` is cloud. Building here is safe with any config:
+        # build_tier_classifiers defers IntimateRoutingError (it never raises at
+        # construction), so a rules-only or all-cloud ``process`` run is fine.
+        self.tier_classifiers = build_tier_classifiers(config)
         self.review_generator = ReviewQueueGenerator(config=config.classification)
         self.linking_pipeline = LinkingPipeline(
             config=config.embeddings,
@@ -443,7 +533,8 @@ class Pipeline:
             if self._needs_llm(frag, item.body):
                 result.residue += 1
                 if not self.no_llm:
-                    frag = self.llm_classifier.classify(frag, content=item.body)
+                    classifier = self.tier_classifiers.for_tier(tier_of(frag))
+                    frag = classifier.classify(frag, content=item.body)
             else:
                 result.deterministic_classified += 1
             classified.append(IngestedFragment(fragment=frag, body=item.body))

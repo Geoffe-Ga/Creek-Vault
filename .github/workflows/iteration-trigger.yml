@@ -1,19 +1,24 @@
 name: Iteration Trigger
 
-# Posts a brief executive summary on a PR (commenting as Geoffe-Ga via PAT)
+# Posts a brief executive summary on a PR (commenting as the repo owner via PAT)
 # whenever CI completes fully green AND a Claude review has been posted.
 # The comment is intended to fire a webhook that wakes the Claude Code mobile
 # app via MCP so it can continue iterating on feedback. Capped at 10 self-posts
 # per PR to avoid runaway loops.
 #
 # Required secrets:
-#   GEOFFE_GA_PAT  - personal access token for Geoffe-Ga with `pull-requests: write`.
+#   GEOFFE_GA_PAT  - personal access token for the repo owner with `pull-requests: write`.
 #                    Without this the comment would post as github-actions[bot]
 #                    and the mobile webhook would not recognize the author.
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    # Must match the upstream workflows' ``name:`` exactly — this repo's CI
+    # workflow is named "CI/CD Pipeline" (.github/workflows/ci.yml). "Claude
+    # Code Review" is included so the trigger re-fires when the verdict comment
+    # lands AFTER CI has already completed — otherwise the merge clearance
+    # would never be evaluated for that ordering.
+    workflows: ["CI/CD Pipeline", "Claude Code Review"]
     types: [completed]
 
 permissions:
@@ -61,8 +66,9 @@ jobs:
             exit 0
           fi
 
-          # Find latest Claude review comment (its body contains 'Verdict').
-          CLAUDE=$(jq -c '[.[] | select(.body | test("Verdict"))] | last // empty' comments.json)
+          # Find the latest Claude review comment via the deterministic
+          # "## Verdict: <verdict>" line that code-review.yml appends.
+          CLAUDE=$(jq -c '[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last // empty' comments.json)
           if [ -z "$CLAUDE" ]; then
             echo "No Claude review yet - skipping"
             exit 0
@@ -70,16 +76,24 @@ jobs:
           ID=$(jq -r '.id'   <<<"$CLAUDE")
           BODY=$(jq -r '.body' <<<"$CLAUDE")
 
-          # Summarize verdict via grep on the Claude comment body.
-          if   grep -qE 'CHANGES[_ ]REQUESTED' <<<"$BODY"; then VERDICT='CHANGES REQUESTED'
-          elif grep -q   'LGTM'                <<<"$BODY"; then VERDICT='LGTM'
-          else                                                  VERDICT='COMMENTS'
-          fi
+          # Parse the verdict from that line only — grepping the whole body is
+          # unsafe (a COMMENTS rationale may itself mention "LGTM").
+          VLINE=$(grep -m1 -E '^## Verdict:' <<<"$BODY" || true)
+          case "$VLINE" in
+            *CHANGES_REQUESTED*) VERDICT='CHANGES REQUESTED' ;;
+            *LGTM*)              VERDICT='LGTM' ;;
+            *)                   VERDICT='COMMENTS' ;;
+          esac
 
-          # CI status from check-runs on the head SHA.
+          # CI status from check-runs on the head SHA. Skipped/neutral runs are
+          # non-blocking (e.g. a job that's conditionally skipped on this PR)
+          # and would otherwise keep GREEN < TOTAL forever, so the merge
+          # clearance below could never fire. In-progress runs (conclusion
+          # null) still count in TOTAL, so nothing is cleared while a check
+          # is running.
           gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" > runs.json
-          TOTAL=$(jq '.check_runs | length'                                       runs.json)
-          GREEN=$(jq '[.check_runs[] | select(.conclusion=="success")] | length' runs.json)
+          TOTAL=$(jq '[.check_runs[] | select(.conclusion != "skipped" and .conclusion != "neutral")] | length' runs.json)
+          GREEN=$(jq '[.check_runs[] | select(.conclusion == "success")] | length'                             runs.json)
 
           if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
             ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."

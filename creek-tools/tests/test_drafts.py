@@ -10,6 +10,7 @@ import frontmatter
 import pytest
 import yaml
 
+from creek.care.guardrail import CARE_POLICY
 from creek.config import AIStyleConfig
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 from creek.generate.drafts import (
@@ -470,7 +471,24 @@ class TestGenerateDraft:
         assert "frequencies/F1.SKILL.md" in draft.skill_stack
         assert "Core voice." in captured["prompt"]
         assert "A line." in captured["prompt"]
+        assert CARE_POLICY in captured["prompt"]  # #753: care policy woven in
         assert seed.title in captured["prompt"]
+
+    def test_bare_section_prompt_weaves_care_policy(
+        self,
+        skills_root: Path,
+    ) -> None:
+        """The source-less section path also carries the care policy (#753)."""
+        captured: dict[str, str] = {}
+
+        def llm(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "Section body."
+
+        gen = DraftGenerator(llm=llm, skills_root=skills_root, voice_core="Core voice.")
+        section = OutlineSection(heading="A heading", level=2, body="some body")
+        gen._compose_bare_section(section, None)
+        assert CARE_POLICY in captured["prompt"]
 
     def test_raises_when_llm_returns_empty(
         self,

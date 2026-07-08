@@ -37,8 +37,24 @@ import time as time
 # call time, so the patches reach the inner code paths.
 import httpx as httpx
 
+from creek.classify.llm.base import LLMProvider
 from creek.classify.llm.batch import BatchStats
 from creek.classify.llm.calibration import _BIASED_DIMENSIONS as _BIASED_DIMENSIONS
+from creek.classify.llm.completion import (
+    AnthropicCompletion as AnthropicCompletion,
+)
+from creek.classify.llm.completion import (
+    Completion as Completion,
+)
+from creek.classify.llm.consent import (
+    cloud_warning as cloud_warning,
+)
+from creek.classify.llm.consent import (
+    has_cloud_consent as has_cloud_consent,
+)
+from creek.classify.llm.consent import (
+    require_cloud_consent as require_cloud_consent,
+)
 from creek.classify.llm.orchestrator import (
     LLMClassificationResult,
     LLMClassifier,
@@ -57,13 +73,32 @@ from creek.classify.llm.prompts import (
 )
 from creek.classify.llm.prompts import CLASSIFICATION_PROMPT
 from creek.classify.llm.prompts import _sanitise_for_prompt as _sanitise_for_prompt
-from creek.classify.llm.providers import ANTHROPIC_CLOUD_WARNING, AnthropicProvider
+from creek.classify.llm.providers import (
+    ANTHROPIC_CLOUD_WARNING,
+    AnthropicProvider,
+    GeminiProvider,
+    OllamaProvider,
+    OpenAIProvider,
+    build_provider,
+    provider_is_cloud,
+)
 
 __all__ = [
     "ANTHROPIC_CLOUD_WARNING",
     "CLASSIFICATION_PROMPT",
+    "AnthropicCompletion",
     "AnthropicProvider",
     "BatchStats",
+    "Completion",
+    "GeminiProvider",
     "LLMClassificationResult",
     "LLMClassifier",
+    "LLMProvider",
+    "OllamaProvider",
+    "OpenAIProvider",
+    "build_provider",
+    "cloud_warning",
+    "has_cloud_consent",
+    "provider_is_cloud",
+    "require_cloud_consent",
 ]

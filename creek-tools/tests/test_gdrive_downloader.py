@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from creek.config import GoogleDriveConfig
+from creek.ingest.connectors import RemoteSourceConnector
 from creek.ingest.gdrive import (
     GOOGLE_DOCS_MIME,
     GOOGLE_SHEETS_MIME,
@@ -17,6 +18,7 @@ from creek.ingest.gdrive import (
     GoogleApiDriveClient,
     GoogleApiUnavailableError,
     GoogleDriveDownloader,
+    build_drive_connector,
     route_to_ingestor,
 )
 
@@ -1267,6 +1269,79 @@ class TestAstReadOnlyAudit:
         )
         with pytest.raises(AssertionError, match="delete"):
             _audit_no_write_calls(sample)
+
+
+class TestRemoteSourceConnector:
+    """Drive conforms to RemoteSourceConnector, behaviour-preservingly (#683)."""
+
+    def test_drive_satisfies_protocol(self, tmp_path: Path) -> None:
+        """The built Drive connector is a RemoteSourceConnector."""
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"hi"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path
+        )
+        assert isinstance(connector, RemoteSourceConnector)
+
+    def test_is_available_reflects_client(self, tmp_path: Path) -> None:
+        """is_available delegates to the underlying client."""
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=StubDriveClient(files=[]), staging=tmp_path
+        )
+        assert connector.is_available() is True
+
+    def test_list_changed_since_advances_with_cursor(self, tmp_path: Path) -> None:
+        """cursor=None lists all; after save_cursor the reloaded cursor yields none."""
+        files = [
+            _file(fid="a", name="a.md", mime="text/markdown"),
+            _file(fid="b", name="b.md", mime="text/markdown"),
+        ]
+        stub = StubDriveClient(files=files, media={"a": b"A", "b": b"B"})
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path
+        )
+
+        changed = connector.list_changed_since(cursor=connector.load_cursor())
+        assert [f.id for f in changed] == ["a", "b"]
+
+        connector.fetch_to(tmp_path)
+        connector.save_cursor(changed)
+        assert connector.list_changed_since(cursor=connector.load_cursor()) == []
+
+    def test_fetch_to_stages_and_returns_result(self, tmp_path: Path) -> None:
+        """fetch_to downloads the file and returns the DownloadResult."""
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"hello"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path
+        )
+        result = connector.fetch_to(tmp_path)
+        assert len(result.downloaded) == 1
+        assert (tmp_path / "a.md").read_bytes() == b"hello"
+
+    def test_corrupt_cursor_falls_back_to_full_scan(self, tmp_path: Path) -> None:
+        """A non-JSON or non-ISO cursor file degrades to a full scan, not a crash."""
+        cursor_path = tmp_path / "c.json"
+        stub = StubDriveClient(
+            files=[_file(fid="a", name="a.md", mime="text/markdown")],
+            media={"a": b"A"},
+        )
+        connector = build_drive_connector(
+            GoogleDriveConfig(), client=stub, staging=tmp_path, cursor_path=cursor_path
+        )
+
+        cursor_path.write_text("not json at all", encoding="utf-8")
+        assert connector.load_cursor() is None
+
+        cursor_path.write_text('{"cursor": "not-a-date"}', encoding="utf-8")
+        assert connector.load_cursor() is None  # valid JSON, invalid ISO
+        # list_changed_since(None) is a full scan — no ValueError.
+        changed = connector.list_changed_since(cursor=connector.load_cursor())
+        assert [f.id for f in changed] == ["a"]
 
 
 if __name__ == "__main__":

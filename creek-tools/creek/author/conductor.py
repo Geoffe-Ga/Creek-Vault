@@ -5,9 +5,11 @@ evidence, the bundles are synthesized, the voice agent renders a draft, and the
 reflection node judges it — looping on ``REVISE`` up to ``max_rounds``. A draft
 still in ``REVISE`` once the round budget is exhausted is escalated to a human
 (``ESCALATE``) rather than shipped (#473), then returned as a shaped
-:class:`~creek.author.models.AuthoredDraft`. The reflection node is a real
-deterministic judge; the remaining collaborators are typed stubs that later
-issues swap behind these same seams.
+:class:`~creek.author.models.AuthoredDraft`. The specialists (graph, retrieval,
+ontology) and the reflection node do real, deterministic work; the voice agent
+renders live through the router-resolved provider when one is available
+(tier-routed so Intimate content stays local, #658/#661), falling back to a
+deterministic rendering otherwise.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
-from creek.author.agents import Specialist, default_specialists
+from creek.author.agents import Specialist, default_specialists, fragment_tier_map
 from creek.author.contracts import CHAT_MAX_CHARS, load_medium_contract
 from creek.author.models import (
     AuthoredDraft,
@@ -30,17 +32,52 @@ from creek.author.models import (
 from creek.author.reflection import ReflectionNode
 from creek.author.voice import VoiceAgent
 from creek.compile.provenance import ProvenanceEntry
+from creek.models import PrivacyTier
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from creek.author.client import AuthorLLMClient
+    from creek.classify.privacy_filter import PrivacyTierOverride
     from creek.config import AIStyleConfig
     from creek.generate.ai_style.model import VoiceFingerprint
     from creek.models import MediumContract
 
+    #: A callable that builds the voice client for a run's content tier (#661).
+    VoiceClientFactory = Callable[[PrivacyTier | None], "AuthorLLMClient | None"]
+
 logger = logging.getLogger(__name__)
+
+
+def _content_tier(
+    evidence: EvidenceBundle,
+    vault: Path,
+    override: PrivacyTierOverride | None,
+) -> PrivacyTier | None:
+    """Return the most-sensitive tier among the evidence's fragments (#661).
+
+    The voice call sends the evidence to the LLM, so its routing tier is the
+    highest ``privacy_tier`` actually cited. ``INTIMATE`` outranks ``PERSONAL``
+    outranks ``OPEN``; ``None`` when the evidence cites no known fragment.
+
+    Args:
+        evidence: The gathered evidence.
+        vault: Vault root (to look up fragment tiers).
+        override: The admission ceiling used when gathering (same corpus view).
+
+    Returns:
+        The content tier, or ``None`` for empty/untraceable evidence.
+    """
+    tier_map = fragment_tier_map(vault, override)
+    tiers = {
+        tier_map[fid] for fid in evidence.all_source_fragments() if fid in tier_map
+    }
+    for tier in (PrivacyTier.INTIMATE, PrivacyTier.PERSONAL, PrivacyTier.OPEN):
+        if tier in tiers:
+            return tier
+    return None
+
 
 #: Mediums the conductor will run. ``research``/``chat``/``essay``/
 #: ``research-piece``/``book-report``/``how-to`` are all wired — ``how-to``
@@ -72,8 +109,13 @@ class VoiceRenderer(Protocol):
         *,
         medium: Medium | None = None,
         contract: MediumContract | None = None,
+        client: AuthorLLMClient | None = None,
     ) -> str:
-        """Return draft prose for *query* from *evidence* (in the owner's voice)."""
+        """Return draft prose for *query* from *evidence* (in the owner's voice).
+
+        *client* (#661) overrides the agent's own client for this render — the
+        conductor passes the tier-routed voice client; ``None`` falls back.
+        """
         ...
 
 
@@ -105,7 +147,7 @@ def require_supported_medium(medium: str) -> Medium:
         The validated medium literal.
 
     Raises:
-        ValueError: When *medium* is not wired in the skeleton.
+        ValueError: When *medium* is not wired in the Writing Desk.
     """
     if medium not in SUPPORTED_MEDIUMS:
         wired = ", ".join(repr(m) for m in sorted(SUPPORTED_MEDIUMS))
@@ -120,7 +162,7 @@ def require_supported_medium(medium: str) -> Medium:
 
 
 def _claims_to_provenance(claims: Sequence[EvidenceClaim]) -> list[ProvenanceEntry]:
-    """Render evidence *claims* into mock provenance entries.
+    """Render evidence *claims* into provenance entries.
 
     Args:
         claims: The claims to trace.
@@ -149,8 +191,11 @@ class Conductor:
         voice: The agent that renders evidence into a draft.
         reflection: The node that judges each drafted body.
         max_rounds: Upper bound on voice/reflect rounds.
-        llm_client: Optional network seam; unused by the stub collaborators
-            but injected here so issue #460 can wire real LLM calls.
+        llm_client: Optional voice client; when set,
+            :func:`build_default_conductor` threads it into the voice agent so
+            the desk renders live voicing (#658). ``None`` keeps the
+            deterministic rendering. The specialists and reflection node are
+            deterministic and do not use it.
         contract: The medium contract driving this run; its reflection rubric
             is exposed to the reflection node (FEAT-041 #459).
     """
@@ -163,9 +208,16 @@ class Conductor:
         *,
         max_rounds: int,
         llm_client: AuthorLLMClient | None = None,
+        voice_client_factory: VoiceClientFactory | None = None,
         contract: MediumContract | None = None,
     ) -> None:
         """Store collaborators, the round bound, and the medium contract.
+
+        Args:
+            voice_client_factory: When set (#661), the conductor builds the
+                voice client *after* gathering evidence, passing the run's
+                content tier so the ``Intimate``-never-cloud chokepoint fires on
+                the actual content. Takes precedence over a static *llm_client*.
 
         Raises:
             ValueError: When *max_rounds* is below 1 — the voice/reflect loop
@@ -181,23 +233,36 @@ class Conductor:
         self.reflection = reflection
         self.max_rounds = max_rounds
         self.llm_client = llm_client
+        self.voice_client_factory = voice_client_factory
         self.contract = contract
 
     def plan(self) -> list[str]:
         """Return the ordered pipeline step names for display/dry-run."""
         return [s.name for s in self.specialists] + list(_DOWNSTREAM_STEPS)
 
-    def gather_evidence(self, query: str, vault: Path) -> EvidenceBundle:
+    def gather_evidence(
+        self,
+        query: str,
+        vault: Path,
+        *,
+        override: PrivacyTierOverride | None = None,
+    ) -> EvidenceBundle:
         """Run the specialist roster then the synthesize step.
 
         Args:
             query: The user query.
             vault: The vault the specialists read from.
+            override: The privacy admission ceiling (#660) threaded to every
+                specialist so above-ceiling fragments never enter the evidence.
+                ``None`` defaults to ``OPEN``.
 
         Returns:
             The synthesized :class:`EvidenceBundle`.
         """
-        bundles = [specialist.gather(query, vault) for specialist in self.specialists]
+        bundles = [
+            specialist.gather(query, vault, override=override)
+            for specialist in self.specialists
+        ]
         return self.synthesize(bundles)
 
     def synthesize(self, bundles: Sequence[EvidenceBundle]) -> EvidenceBundle:
@@ -288,13 +353,22 @@ class Conductor:
             return (ai_style, None)
         return (ai_style, fingerprint)
 
-    def run(self, *, medium: str, query: str, vault: Path) -> AuthoredDraft:
+    def run(
+        self,
+        *,
+        medium: str,
+        query: str,
+        vault: Path,
+        override: PrivacyTierOverride | None = None,
+    ) -> AuthoredDraft:
         """Run the full author pipeline and return a shaped draft.
 
         Args:
             medium: The requested medium (only ``research`` is wired).
             query: The user query.
             vault: The vault to author from.
+            override: The privacy admission ceiling (#660); above-ceiling
+                fragments are excluded from the evidence. ``None`` => ``OPEN``.
 
         Returns:
             The :class:`AuthoredDraft` with mock provenance and a verdict. A
@@ -305,7 +379,16 @@ class Conductor:
             ValueError: When *medium* is unsupported.
         """
         validated = require_supported_medium(medium)
-        evidence = self.gather_evidence(query, vault)
+        evidence = self.gather_evidence(query, vault, override=override)
+        # #661: route the voice call by the evidence's content tier so Intimate
+        # content is redirected to a local provider by the chokepoint. The
+        # factory (built per content tier) takes precedence over a static client.
+        if self.voice_client_factory is not None:
+            voice_client = self.voice_client_factory(
+                _content_tier(evidence, vault, override),
+            )
+        else:
+            voice_client = self.llm_client
         rubric = self.contract.reflection_rubric if self.contract else None
         # Voice-fidelity is wired from the owner's persisted fingerprint (#506):
         # loaded once before the loop. When no fingerprint has been built the
@@ -320,7 +403,12 @@ class Conductor:
         for attempt in range(1, self.max_rounds + 1):
             rounds = attempt
             body = self.voice.render(
-                query, evidence, vault, medium=validated, contract=self.contract
+                query,
+                evidence,
+                vault,
+                medium=validated,
+                contract=self.contract,
+                client=voice_client,
             )
             result = self.reflection.review(
                 body,
@@ -363,24 +451,31 @@ def build_default_conductor(
     *,
     max_rounds: int,
     llm_client: AuthorLLMClient | None = None,
+    voice_client_factory: VoiceClientFactory | None = None,
     contract: MediumContract | None = None,
 ) -> Conductor:
-    """Build a conductor wired with the default stub collaborators.
+    """Build a conductor wired with the default desk collaborators.
 
     Args:
         max_rounds: Upper bound on voice/reflect rounds.
         llm_client: Optional network seam passed through to the conductor.
+        voice_client_factory: Optional tier-aware voice-client factory (#661);
+            takes precedence over a static *llm_client*.
         contract: Optional medium contract passed through to the conductor.
 
     Returns:
         A ready-to-run :class:`Conductor`.
     """
     return Conductor(
+        # #658: thread the client into the voice agent — the only collaborator
+        # that calls the LLM — so an injected client produces live voicing
+        # instead of the deterministic rendering. ``None`` keeps it.
         specialists=default_specialists(),
-        voice=VoiceAgent(),
+        voice=VoiceAgent(llm_client=llm_client),
         reflection=ReflectionNode(),
         max_rounds=max_rounds,
         llm_client=llm_client,
+        voice_client_factory=voice_client_factory,
         contract=contract,
     )
 
@@ -391,6 +486,9 @@ def run_author(
     query: str,
     vault: Path,
     max_rounds: int | None = None,
+    llm_client: AuthorLLMClient | None = None,
+    voice_client_factory: VoiceClientFactory | None = None,
+    override: PrivacyTierOverride | None = None,
 ) -> AuthoredDraft:
     """Author *query* for *medium* against *vault* with the default desk.
 
@@ -400,6 +498,11 @@ def run_author(
         vault: The vault to author from.
         max_rounds: Optional override for the round bound; defaults to the
             ``author.max_author_rounds`` config default.
+        llm_client: Optional voice client (#658). When supplied, the desk
+            renders live voicing; ``None`` keeps the deterministic rendering.
+        override: The privacy admission ceiling (#660) threaded to the
+            specialists; above-ceiling fragments are excluded. ``None`` =>
+            ``OPEN``.
 
     Returns:
         The shaped :class:`AuthoredDraft`.
@@ -409,9 +512,12 @@ def run_author(
     require_supported_medium(medium)
     contract = load_medium_contract(medium, vault)
     rounds = max_rounds if max_rounds is not None else AuthorConfig().max_author_rounds
-    draft = build_default_conductor(max_rounds=rounds, contract=contract).run(
-        medium=medium, query=query, vault=vault
-    )
+    draft = build_default_conductor(
+        max_rounds=rounds,
+        llm_client=llm_client,
+        voice_client_factory=voice_client_factory,
+        contract=contract,
+    ).run(medium=medium, query=query, vault=vault, override=override)
     return _enforce_chat_ceiling(draft)
 
 
@@ -427,7 +533,13 @@ class AuthorPlan(TypedDict):
     evidence: dict[str, int]
 
 
-def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
+def plan_author(
+    *,
+    medium: str,
+    query: str,
+    vault: Path,
+    override: PrivacyTierOverride | None = None,
+) -> AuthorPlan:
     """Return the pipeline plan + evidence summary without authoring (dry run).
 
     A lightweight preview for ``creek author --dry-run`` and the MCP verb's
@@ -438,6 +550,8 @@ def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
         medium: The requested medium.
         query: The user query.
         vault: The vault to gather evidence from.
+        override: The privacy admission ceiling (#660); above-ceiling fragments
+            are excluded from the previewed evidence. ``None`` => ``OPEN``.
 
     Returns:
         An :class:`AuthorPlan` with the step plan and evidence counts.
@@ -448,7 +562,7 @@ def plan_author(*, medium: str, query: str, vault: Path) -> AuthorPlan:
     require_supported_medium(medium)
     contract = load_medium_contract(medium, vault)
     conductor = build_default_conductor(max_rounds=1, contract=contract)
-    evidence = conductor.gather_evidence(query, vault)
+    evidence = conductor.gather_evidence(query, vault, override=override)
     return {
         "plan": conductor.plan(),
         "evidence": {

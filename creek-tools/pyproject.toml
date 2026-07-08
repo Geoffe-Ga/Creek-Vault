@@ -21,6 +21,10 @@ dependencies = [
     "httpx>=0.27.0",
     "tqdm>=4.66.0",
     "mcp>=1.0.0,<2.0.0",
+    # At-rest volume key (creek.confidential): Argon2id / AES-GCM / HKDF are
+    # imported unconditionally, so cryptography is a direct base dependency —
+    # not left to transitive resolution via mcp -> pyjwt[crypto] (#758).
+    "cryptography>=48.0.0",
     # Security: pin urllib3 above CVE-2026-44431 / CVE-2026-44432
     # (transitive via requests/conan). Both are fixed in 2.7.0.
     "urllib3>=2.7.0",
@@ -44,6 +48,8 @@ creek-tools-mcp = "creek_mcp.server:main"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
+openai = ["openai>=1.0"]
+gemini = ["google-genai>=1.0"]
 embeddings = [
     "sentence-transformers>=2.2.0",
     "numpy>=2.4.4",
@@ -68,7 +74,7 @@ gdrive = [
 all = [
     # Self-referential extras (pip >= 21.2). Adding a new sub-extra
     # automatically flows into [all] without manual duplication.
-    "creek-tools[anthropic,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
+    "creek-tools[anthropic,openai,gemini,embeddings,ocr,documents,spreadsheets,presentations,gdrive]",
 ]
 dev = [
     # `tests/conftest.py` imports numpy, `tests/test_classify.py` mocks

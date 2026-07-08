@@ -910,27 +910,31 @@ def test_str_list_drops_non_list_inputs_from_llm() -> None:
 
 
 def test_default_llm_returns_callable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The CLI entry point's LLM factory wraps the Anthropic provider."""
+    """The CLI entry point's LLM factory routes through ``build_provider`` (#646).
+
+    No longer hard-wired to Anthropic: ``default_llm`` builds the configured
+    provider via the factory and drives it through the provider-neutral
+    ``complete`` method.
+    """
     from creek.compile import engine as engine_module
+    from creek.config import LLMConfig
 
     captured: dict[str, object] = {}
 
     class _StubProvider:
-        def __init__(self, config: object) -> None:
-            captured["config"] = config
+        def complete(self, prompt: str, **_kw: object) -> object:
+            return type("C", (), {"text": f"echo:{prompt}"})()
 
-        def call(self, prompt: str) -> str:
-            return f"echo:{prompt}"
+    def _fake_build(config: object) -> _StubProvider:
+        captured["config"] = config
+        return _StubProvider()
 
-    monkeypatch.setattr(
-        "creek.classify.llm.AnthropicProvider",
-        _StubProvider,
-    )
-    sentinel = object()
-    llm = engine_module.default_llm(sentinel)
+    monkeypatch.setattr("creek.classify.llm.build_provider", _fake_build)
+    config = LLMConfig(provider="ollama")
+    llm = engine_module.default_llm(config)
     assert callable(llm)
     assert llm("hi") == "echo:hi"
-    assert captured["config"] is sentinel
+    assert captured["config"] is config
 
 
 def test_cli_compile_unknown_target_kind_exits_2(vault: Path) -> None:

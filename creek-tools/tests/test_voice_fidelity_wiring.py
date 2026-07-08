@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
     import pytest
 
+    from creek.author.client import AuthorLLMClient
     from creek.author.models import EvidenceBundle, Medium
     from creek.models import MediumContract
 
@@ -88,9 +89,10 @@ class _FixedVoice:
         *,
         medium: Medium | None = None,
         contract: MediumContract | None = None,
+        client: AuthorLLMClient | None = None,
     ) -> str:
         """Return the fixed body, ignoring the query and evidence."""
-        del query, evidence, vault, medium, contract
+        del query, evidence, vault, medium, contract, client
         return self._body
 
 

@@ -31,13 +31,12 @@ documented soft reply rather than crashing ``on_message``.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
-
-import anthropic
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from crawdad.dispatcher import ToolResult
     from crawdad.history import ConversationHistory
+    from crawdad.llm.base import AsyncLLMProvider
     from crawdad.skill_loader import VoiceSkillStack
     from crawdad.state import SessionState
 
@@ -164,21 +163,21 @@ class SonnetComposer:
     def __init__(
         self,
         *,
-        anthropic_client: Any,
+        provider: AsyncLLMProvider,
         model: str,
         max_tokens: int = 1024,
     ) -> None:
-        """Store the injected client and model identifier.
+        """Store the injected provider and model identifier.
 
         Args:
-            anthropic_client: An :class:`anthropic.AsyncAnthropic`
-                instance (or a test double with the same shape).
+            provider: An :class:`~crawdad.llm.base.AsyncLLMProvider`
+                instance (or a test double with the same ``complete`` shape).
             model: The Sonnet model identifier — resolved from
                 :data:`crawdad.config.DEFAULT_COMPOSER_MODEL` by the
                 caller, NEVER a literal in this module.
             max_tokens: Hard cap on the composer's reply length.
         """
-        self._client = anthropic_client
+        self._provider = provider
         self._model = model
         self._max_tokens = max_tokens
 
@@ -205,29 +204,17 @@ class SonnetComposer:
             skills=skills,
         )
         try:
-            response = await self._client.messages.create(
+            completion = await self._provider.complete(
+                [{"role": "user", "content": prompt}],
                 model=self._model,
                 max_tokens=self._max_tokens,
-                messages=[{"role": "user", "content": prompt}],
             )
-        except anthropic.AnthropicError as exc:
-            _LOGGER.warning(
-                "Sonnet composer call failed: %s: %r", type(exc).__name__, exc
-            )
-            msg = f"Sonnet composer call failed: {type(exc).__name__}"
+        except RuntimeError as exc:
+            _LOGGER.warning("Sonnet composer call failed: %s", exc)
+            msg = f"Sonnet composer call failed: {exc}"
             raise ComposerFailureError(msg) from exc
-        reply = _extract_text(response)
+        reply = completion.text
         if not reply.strip():
             msg = "Sonnet composer returned an empty body"
             raise ComposerFailureError(msg)
         return reply
-
-
-def _extract_text(response: Any) -> str:
-    """Pull the concatenated text from a (possibly multi-block) reply."""
-    parts: list[str] = []
-    for block in getattr(response, "content", []) or []:
-        text = getattr(block, "text", None)
-        if text is not None:
-            parts.append(str(text))
-    return "\n".join(parts)

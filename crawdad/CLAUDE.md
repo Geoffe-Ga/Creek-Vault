@@ -87,7 +87,16 @@ Four gates, each must pass before the next:
 
 ## 5. Configuration
 
-- Secrets ONLY via env: `DISCORD_BOT_TOKEN`, `ANTHROPIC_API_KEY`.
+- Secrets ONLY via env: `DISCORD_BOT_TOKEN` plus the selected provider's API
+  key. The backend is chosen by `CRAWDAD_PROVIDER` (default `anthropic`;
+  also `openai`, `gemini` — #610); the matching key
+  (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY`) must be set and
+  is validated at load time but **never stored** on `CrawDadConfig` — each SDK
+  reads it from env. A missing provider key fails fast naming the variable.
+  Per-provider router/composer model tiers live in `config.py`, overridable via
+  `CRAWDAD_ROUTER_MODEL` / `CRAWDAD_COMPOSER_MODEL`. See the
+  [README provider-selection table](README.md#llm-provider-selection) and
+  [ADR-0003](../creek-tools/docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
 - Everything else in `crawdad.yaml`:
   - `vault_path` — Obsidian vault root.
   - `mcp_server_command` — argv for the MCP subprocess (default

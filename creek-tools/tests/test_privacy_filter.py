@@ -20,6 +20,7 @@ from creek.classify.privacy_filter import (
     override_elevates,
     parse_include_tier,
     record_privacy_override,
+    tier_within_override,
 )
 from creek.models import (
     Authorship,
@@ -134,14 +135,14 @@ def test_tier_of_unknown_string_fails_closed_to_intimate(
     """Fragments carrying an unrecognised tier string fail closed.
 
     Regression for PR #193 review (comment 4367360694 LOW): the prior
-    ``_tier_of`` did ``PrivacyTier(fragment.privacy_tier)`` with no
+    ``tier_of`` did ``PrivacyTier(fragment.privacy_tier)`` with no
     safety net, so a hand-edited or schema-migrated vault with an
     unknown tier string would crash generation flows. The new helper
     catches the :class:`ValueError`, logs a warning that names the
     fragment ID, and returns :data:`PrivacyTier.INTIMATE` so the
     fragment is excluded from the default-policy output.
     """
-    from creek.classify.privacy_filter import _tier_of
+    from creek.classify.privacy_filter import tier_of
 
     # ``model_construct`` skips Pydantic validation, allowing us to
     # plant a bogus tier value the same way a hand-edited markdown file
@@ -160,7 +161,7 @@ def test_tier_of_unknown_string_fails_closed_to_intimate(
     )
 
     with caplog.at_level("WARNING", logger="creek.classify.privacy_filter"):
-        tier = _tier_of(bogus)
+        tier = tier_of(bogus)
 
     assert tier is PrivacyTier.INTIMATE
     assert any(
@@ -230,3 +231,26 @@ def test_parse_include_tier_handles_known_and_unknown() -> None:
     assert parse_include_tier("ALL") is PrivacyTierOverride.ALL
     with pytest.raises(ValueError, match="--include-tier"):
         parse_include_tier("nope")
+
+
+@pytest.mark.parametrize(
+    ("tier", "override", "expected"),
+    [
+        (PrivacyTier.OPEN, PrivacyTierOverride.OPEN, True),
+        (PrivacyTier.UNCLASSIFIED, PrivacyTierOverride.OPEN, True),
+        (PrivacyTier.PERSONAL, PrivacyTierOverride.OPEN, False),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.OPEN, False),
+        (PrivacyTier.PERSONAL, PrivacyTierOverride.PERSONAL, True),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.PERSONAL, False),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.INTIMATE, True),
+        (PrivacyTier.INTIMATE, PrivacyTierOverride.ALL, True),
+        (PrivacyTier.INTIMATE, None, False),  # None defaults to OPEN
+    ],
+)
+def test_tier_within_override(
+    tier: PrivacyTier,
+    override: PrivacyTierOverride | None,
+    expected: bool,
+) -> None:
+    """The hard rank cutoff admits a tier iff it is at/below the override (#660)."""
+    assert tier_within_override(tier, override) is expected

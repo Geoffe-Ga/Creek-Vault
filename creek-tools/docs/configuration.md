@@ -43,7 +43,7 @@ timezone: America/Los_Angeles
 ```yaml
 llm:
   provider: ollama
-  model: mistral
+  model: mistral          # optional; omit to use the provider's own default
   ollama_url: http://localhost:11434
   batch_size: 50
   max_concurrent: 5
@@ -52,12 +52,14 @@ llm:
 | Field            | Default   | Notes |
 |------------------|-----------|-------|
 | `provider`       | `ollama`  | `ollama` or `anthropic`. |
-| `model`          | `mistral` | Model id understood by the provider. |
+| `model`          | *(unset)* | Model id understood by the provider; when omitted each provider uses its own default (`mistral` for Ollama). An explicit value is always sent verbatim. |
 | `ollama_url`     | `http://localhost:11434` | Base URL when `provider: ollama`. |
 | `batch_size`     | `50`      | Items per batch call. |
 | `max_concurrent` | `5`       | Concurrent requests in flight. |
 
 When `provider: anthropic`, set `ANTHROPIC_API_KEY` in the environment. Local Ollama models require nothing in the environment beyond the server being running.
+
+The flat block above is the `default` stage. The `llm` block also accepts **per-stage routing** — a `default` plus optional `classification` / `generation` / `frontend` overrides and a `writing_desk` role map — so classification can run locally while generation uses a cloud model, with `Intimate`-tier fragments guaranteed never to reach a cloud provider. The flat block keeps working unchanged. See [Per-stage model routing](../README.md#per-stage-model-routing) for the full shape, the privacy guarantee, and migration notes.
 
 ## `embeddings` — semantic similarity
 

@@ -1,9 +1,9 @@
-"""Static check: no Claude model-ID literals live outside ``config.py``.
+"""Static check: no LLM model-ID literals live outside ``config.py``.
 
 FEAT-014 §pre-decided choices §27 mandates this: model IDs move, so the
-constant ``DEFAULT_ROUTER_MODEL`` in ``config.py`` is the contract.
-Other modules must read it (or accept a model argument resolved from
-it), never reference the literal string.
+per-provider model defaults in ``config.py`` are the contract. Other modules
+must read the resolved value (or accept a model argument), never reference the
+literal string — for Claude, OpenAI ``gpt-*``, or Gemini ``gemini-*`` (#610).
 
 The check is a simple grep so it remains fast and trivially debuggable
 when it fires.
@@ -16,7 +16,9 @@ from pathlib import Path
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "crawdad"
 _ALLOWED_FILE = "config.py"
-_MODEL_PATTERN = re.compile(r"claude-(haiku|sonnet|opus)-\d", re.IGNORECASE)
+_MODEL_PATTERN = re.compile(
+    r"claude-(?:haiku|sonnet|opus)-\d|gpt-\d|gemini-\d", re.IGNORECASE
+)
 
 
 def test_no_model_id_literals_outside_config() -> None:

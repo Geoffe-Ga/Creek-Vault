@@ -94,7 +94,9 @@ class TestNoLLMFlagSkipsLLMClassifier:
                 "classify",
                 side_effect=lambda f, content="": f,
             ),
-            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+            patch.object(
+                pipeline.tier_classifiers.non_intimate, "classify"
+            ) as mock_llm,
         ):
             pipeline._run_classification([item], vault_path, PipelineResult())
 
@@ -116,7 +118,7 @@ class TestNoLLMFlagSkipsLLMClassifier:
                 side_effect=lambda f, content="": f,
             ),
             patch.object(
-                pipeline.llm_classifier,
+                pipeline.tier_classifiers.non_intimate,
                 "classify",
                 side_effect=lambda f, content="": f,
             ) as mock_llm,
@@ -132,7 +134,7 @@ class TestNoLLMOverridesAnthropicProvider:
     def test_no_llm_wins_over_anthropic_provider(self, vault_path: Path) -> None:
         """An Anthropic-configured pipeline still skips Pass 3 with no_llm."""
         config = CreekConfig()
-        config.llm.provider = "anthropic"
+        config.llm.default.provider = "anthropic"
         pipeline = Pipeline(config=config, no_llm=True)
         item = _make_ingested()
 
@@ -142,7 +144,9 @@ class TestNoLLMOverridesAnthropicProvider:
                 "classify",
                 side_effect=lambda f, content="": f,
             ),
-            patch.object(pipeline.llm_classifier, "classify") as mock_llm,
+            patch.object(
+                pipeline.tier_classifiers.non_intimate, "classify"
+            ) as mock_llm,
         ):
             pipeline._run_classification([item], vault_path, PipelineResult())
 
@@ -368,7 +372,7 @@ class TestNoLLMNoNetworkEgress:
         # set the provider so a regression that ignores the flag would
         # surface as a NetworkBlockedError on first availability check.
         config = CreekConfig()
-        config.llm.provider = "anthropic"
+        config.llm.default.provider = "anthropic"
         pipeline = Pipeline(config=config, no_llm=True)
         result = pipeline.run(source_path=source_path, vault_path=vault_path)
 

@@ -1,16 +1,18 @@
 """CrawDad configuration model (FEAT-013 §Pre-decided choices).
 
-Secrets — the Discord bot token and the Anthropic API key — come from
-environment variables (``DISCORD_BOT_TOKEN``, ``ANTHROPIC_API_KEY``).
-Everything else (vault path, MCP server command, allowlists) comes from
-``crawdad.yaml``. The two sources are merged in :func:`load_config`.
+Secrets come from environment variables: the Discord bot token
+(``DISCORD_BOT_TOKEN``) and the selected provider's API key. The backend is
+chosen by ``CRAWDAD_PROVIDER`` (``anthropic`` default / ``openai`` / ``gemini``,
+#610); the matching key (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` /
+``GOOGLE_API_KEY``) is validated at load but **never stored** on the config —
+each SDK reads it from env. Everything else (vault path, MCP server command,
+allowlists) comes from ``crawdad.yaml``. The sources are merged in
+:func:`load_config`.
 
-FEAT-014 adds the agent-loop knobs. The Haiku router model identifier
-lives here so no other module under ``crawdad/crawdad/`` references a
-model ID literal — model IDs move (today: ``claude-haiku-4-5-20251001``;
-the constant is the contract, not the literal). The
-``CRAWDAD_ROUTER_MODEL`` env var overrides the fallback for
-local-only experiments.
+Per-provider router/composer model tiers live here so no other module under
+``crawdad/crawdad/`` references a model-ID literal — model IDs move; the
+defaults are the contract, not the literal. ``CRAWDAD_ROUTER_MODEL`` /
+``CRAWDAD_COMPOSER_MODEL`` override the per-provider fallback.
 """
 
 from __future__ import annotations
@@ -80,27 +82,98 @@ _DEFAULT_DENIED_EXTENSIONS: tuple[str, ...] = (
 _DEFAULT_STAGING_SUBPATH = Path("00-Creek-Meta") / "Inbound"
 
 _ENV_DISCORD_TOKEN = "DISCORD_BOT_TOKEN"
-_ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
+_ENV_PROVIDER = "CRAWDAD_PROVIDER"
 _ENV_ROUTER_MODEL = "CRAWDAD_ROUTER_MODEL"
 _ENV_COMPOSER_MODEL = "CRAWDAD_COMPOSER_MODEL"
 _DEFAULT_MCP_COMMAND: tuple[str, ...] = ("creek-tools-mcp",)
 
-# The single place a Haiku model literal lives in this package. Other
-# modules must read ``DEFAULT_ROUTER_MODEL`` (or accept a model argument
-# resolved from it) — see the regression test that enforces this.
-_DEFAULT_ROUTER_MODEL_FALLBACK = "claude-haiku-4-5-20251001"
-DEFAULT_ROUTER_MODEL: str = os.environ.get(
-    _ENV_ROUTER_MODEL, _DEFAULT_ROUTER_MODEL_FALLBACK
-)
+DEFAULT_PROVIDER: str = "anthropic"
+"""The backend used when ``CRAWDAD_PROVIDER`` is unset."""
 
-# Same indirection for the FEAT-015 Sonnet composer. The literal Sonnet
-# model ID lives ONLY here; the regression test in
-# ``test_no_model_literals.py`` enforces that no other module references
-# any ``claude-sonnet-*`` string.
-_DEFAULT_COMPOSER_MODEL_FALLBACK = "claude-sonnet-4-6"
-DEFAULT_COMPOSER_MODEL: str = os.environ.get(
-    _ENV_COMPOSER_MODEL, _DEFAULT_COMPOSER_MODEL_FALLBACK
-)
+# Provider → the environment variable its SDK reads the API key from. The key
+# is validated at load time and read by the SDK from env — never stored on
+# :class:`CrawDadConfig`, logged, or written to YAML.
+_PROVIDER_KEY_ENV: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+}
+
+# Per-provider model tiers. These are the ONLY model literals in the package —
+# router/composer modules read the resolved values, never a literal (enforced
+# by ``test_no_model_literals.py``). ``CRAWDAD_ROUTER_MODEL`` /
+# ``CRAWDAD_COMPOSER_MODEL`` override regardless of provider, as before.
+_ROUTER_MODEL_DEFAULTS: dict[str, str] = {
+    "anthropic": "claude-haiku-4-5-20251001",
+    "openai": "gpt-4o-mini",
+    "gemini": "gemini-2.5-flash",
+}
+_COMPOSER_MODEL_DEFAULTS: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-4o",
+    "gemini": "gemini-2.5-pro",
+}
+
+
+def _resolve_model(provider: str, override_env: str, defaults: dict[str, str]) -> str:
+    """Resolve a model tier for *provider*, honoring an env override.
+
+    Raises on an unknown provider rather than silently falling back to the
+    Anthropic default — the load-time validator catches operator typos, so an
+    unknown value here is a programmer error, not something to paper over.
+
+    Args:
+        provider: The selected backend.
+        override_env: The env var that overrides the default tier when set.
+        defaults: The per-provider default model map.
+
+    Returns:
+        The override when set, else the provider's default tier.
+
+    Raises:
+        ValueError: When *provider* names no known backend.
+    """
+    override = os.environ.get(override_env)
+    if override:
+        return override
+    try:
+        return defaults[provider]
+    except KeyError:
+        known = ", ".join(sorted(defaults))
+        msg = f"unknown provider {provider!r}; expected one of: {known}"
+        # The KeyError adds no caller-useful context; suppress its chain.
+        raise ValueError(msg) from None
+
+
+def router_model_for(provider: str) -> str:
+    """Resolve the router (intent-extraction) model for *provider*.
+
+    Args:
+        provider: The selected backend (``anthropic`` / ``openai`` / ``gemini``).
+
+    Returns:
+        ``CRAWDAD_ROUTER_MODEL`` when set, else the provider's default tier.
+
+    Raises:
+        ValueError: When *provider* names no known backend.
+    """
+    return _resolve_model(provider, _ENV_ROUTER_MODEL, _ROUTER_MODEL_DEFAULTS)
+
+
+def composer_model_for(provider: str) -> str:
+    """Resolve the composer (prose) model for *provider*.
+
+    Args:
+        provider: The selected backend (``anthropic`` / ``openai`` / ``gemini``).
+
+    Returns:
+        ``CRAWDAD_COMPOSER_MODEL`` when set, else the provider's default tier.
+
+    Raises:
+        ValueError: When *provider* names no known backend.
+    """
+    return _resolve_model(provider, _ENV_COMPOSER_MODEL, _COMPOSER_MODEL_DEFAULTS)
+
 
 # History truncation knobs (ADOPT-008 hard cliff; FEAT-016 may refine).
 HISTORY_MAX_ENTRIES: int = 20
@@ -321,7 +394,8 @@ class CrawDadConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     discord_bot_token: str = Field(min_length=1)
-    anthropic_api_key: str = Field(min_length=1)
+    llm_provider: str = Field(default=DEFAULT_PROVIDER, min_length=1)
+    """The selected LLM backend; the SDK reads its key from env, never here."""
     vault_path: Path
     mcp_server_command: tuple[str, ...] = _DEFAULT_MCP_COMMAND
     allowed_user_ids: tuple[int, ...]
@@ -330,6 +404,39 @@ class CrawDadConfig(BaseModel):
     consent: ConsentConfig = Field(default_factory=ConsentConfig)
     max_loop_rounds: int = Field(default=MAX_LOOP_ROUNDS, ge=1, le=50)
     """Operator override for the FEAT-015 agent-loop round cap."""
+
+    capture_enabled: bool = Field(default=False)
+    """Bot-capture toggle (#687) — OFF by default; opt-in per deployment.
+
+    When ``True`` the bot logs each message in the servers/channels it is in to
+    ``<vault>/<capture_subpath>/<channel>/<date>.jsonl`` for Tier-A ingest. The
+    bot cannot read DMs (a hard Discord API limit), so this covers channels only.
+    """
+
+    capture_subpath: Path = Field(default=Path("discord-capture"))
+    """Vault-relative dir the bot-capture writer appends to (#687).
+
+    Mirrors the creek-side ``DiscordSourceConfig.capture_subpath`` default so the
+    bot writes exactly where Tier-A ingest reads. Must stay inside the vault.
+    """
+
+    @field_validator("capture_subpath")
+    @classmethod
+    def _refuse_absolute_capture_subpath(cls, value: Path) -> Path:
+        """Refuse absolute / ``..`` capture paths — must stay in the vault (#687)."""
+        if value.is_absolute():
+            msg = (
+                f"capture_subpath {value!r} must be vault-relative; "
+                "absolute paths could escape the vault root."
+            )
+            raise ValueError(msg)
+        if ".." in value.parts:
+            msg = (
+                f"capture_subpath {value!r} must not contain '..'; "
+                "parent-directory segments could escape the vault root."
+            )
+            raise ValueError(msg)
+        return value
 
     @field_validator("allowed_user_ids", "allowed_channel_ids")
     @classmethod
@@ -350,25 +457,37 @@ class CrawDadConfig(BaseModel):
 def load_config(yaml_path: Path | None = None) -> CrawDadConfig:
     """Merge ``crawdad.yaml`` with env secrets into a :class:`CrawDadConfig`.
 
+    The backend is selected by ``CRAWDAD_PROVIDER`` (default ``anthropic``); the
+    matching provider key (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` /
+    ``GOOGLE_API_KEY``) must be present in the environment but is **never**
+    stored on the config — the SDK reads it from env at call time.
+
     Args:
         yaml_path: Path to the YAML config. Defaults to ``./crawdad.yaml``.
 
     Raises:
-        RuntimeError: when ``DISCORD_BOT_TOKEN`` or ``ANTHROPIC_API_KEY``
-            is missing — secrets must never come from the YAML.
+        RuntimeError: when ``DISCORD_BOT_TOKEN`` is missing, ``CRAWDAD_PROVIDER``
+            names an unknown backend, or the selected provider's key env var is
+            unset — secrets must never come from the YAML.
         FileNotFoundError: when the YAML config is missing.
     """
     discord_token = os.environ.get(_ENV_DISCORD_TOKEN)
-    anthropic_key = os.environ.get(_ENV_ANTHROPIC_KEY)
     if not discord_token:
         msg = f"missing required env var {_ENV_DISCORD_TOKEN}"
         raise RuntimeError(msg)
-    if not anthropic_key:
-        msg = f"missing required env var {_ENV_ANTHROPIC_KEY}"
+
+    provider = os.environ.get(_ENV_PROVIDER, DEFAULT_PROVIDER).strip().lower()
+    key_env = _PROVIDER_KEY_ENV.get(provider)
+    if key_env is None:
+        known = ", ".join(sorted(_PROVIDER_KEY_ENV))
+        msg = f"unknown {_ENV_PROVIDER} {provider!r}; expected one of: {known}"
+        raise RuntimeError(msg)
+    if not os.environ.get(key_env, "").strip():
+        msg = f"missing required env var {key_env} for {_ENV_PROVIDER}={provider}"
         raise RuntimeError(msg)
 
     path = yaml_path or Path("crawdad.yaml")
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     raw["discord_bot_token"] = discord_token
-    raw["anthropic_api_key"] = anthropic_key
+    raw["llm_provider"] = provider
     return CrawDadConfig.model_validate(raw)

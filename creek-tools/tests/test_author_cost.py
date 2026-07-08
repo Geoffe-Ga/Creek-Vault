@@ -122,7 +122,7 @@ def test_complete_uses_default_unbounded_max_tokens() -> None:
     ceiling; this pins that the default forwards ``max_tokens=None``.
     """
     provider = MagicMock()
-    provider.call_with_metadata.return_value = AnthropicCompletion(
+    provider.complete.return_value = AnthropicCompletion(
         text="completion", usage={"input_tokens": 1}
     )
 
@@ -130,13 +130,13 @@ def test_complete_uses_default_unbounded_max_tokens() -> None:
     text = client.complete("ask")
 
     assert text == "completion"
-    provider.call_with_metadata.assert_called_once_with("ask", max_tokens=None)
+    provider.complete.assert_called_once_with("ask", max_tokens=None)
 
 
 def test_complete_with_usage_returns_text_and_usage() -> None:
     """``complete_with_usage`` returns the full completion; ``complete`` stays str."""
     provider = MagicMock()
-    provider.call_with_metadata.return_value = AnthropicCompletion(
+    provider.complete.return_value = AnthropicCompletion(
         text="hi", usage={"input_tokens": 3, "cache_read_input_tokens": 2}
     )
 
@@ -146,7 +146,7 @@ def test_complete_with_usage_returns_text_and_usage() -> None:
     assert isinstance(completion, AnthropicCompletion)
     assert completion.text == "hi"
     assert completion.usage == {"input_tokens": 3, "cache_read_input_tokens": 2}
-    provider.call_with_metadata.assert_called_once_with(
+    provider.complete.assert_called_once_with(
         "ask",
         system="static",
         max_tokens=None,
@@ -265,14 +265,23 @@ def test_resolve_voice_model_prefers_override() -> None:
     assert resolve_voice_model(AuthorConfig(), llm) == "base-model"
 
 
+def test_resolve_voice_model_unset_means_provider_default() -> None:
+    """With neither tier set, resolution yields ``None`` = provider default (#621).
+
+    ``None`` flows into :meth:`AuthorLLMClient.from_config`, which leaves
+    ``config.model`` untouched so the provider applies its own default.
+    """
+    assert resolve_voice_model(AuthorConfig(), LLMConfig()) is None
+
+
 def test_author_client_from_config_threads_model_override() -> None:
     """``from_config(model=...)`` overrides the model id without hard-coding one."""
     from unittest.mock import patch
 
-    with patch("creek.author.client.AnthropicProvider") as mock_provider_cls:
+    with patch("creek.author.client.build_provider") as mock_build:
         AuthorLLMClient.from_config(
             LLMConfig(provider="anthropic", model="base"), model="tier-x"
         )
 
-    passed_config = mock_provider_cls.call_args.args[0]
+    passed_config = mock_build.call_args.args[0]
     assert passed_config.model == "tier-x"

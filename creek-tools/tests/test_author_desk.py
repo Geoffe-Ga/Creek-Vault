@@ -221,19 +221,19 @@ def test_author_llm_client_delegates_to_provider() -> None:
     provider = MagicMock()
     completion = MagicMock()
     completion.text = "hello"
-    provider.call_with_metadata.return_value = completion
+    provider.complete.return_value = completion
 
     client = AuthorLLMClient(provider)
     result = client.complete("prompt", max_tokens=10)
 
     assert result == "hello"
-    provider.call_with_metadata.assert_called_once_with("prompt", max_tokens=10)
+    provider.complete.assert_called_once_with("prompt", max_tokens=10)
 
 
 def test_author_llm_client_from_config_builds_provider() -> None:
     """``from_config`` constructs a provider from config (model id from config)."""
-    with patch("creek.author.client.AnthropicProvider") as mock_provider_cls:
+    with patch("creek.author.client.build_provider") as mock_build:
         client = AuthorLLMClient.from_config(LLMConfig(provider="anthropic"))
 
     assert isinstance(client, AuthorLLMClient)
-    mock_provider_cls.assert_called_once()
+    mock_build.assert_called_once()

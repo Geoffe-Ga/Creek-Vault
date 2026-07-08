@@ -17,6 +17,7 @@ Obsidian-compatible markdown files with YAML frontmatter. It handles:
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
 import logging
 import os
@@ -77,6 +78,9 @@ _PLATFORM_SUBFOLDER: dict[str, str] = {
     SourcePlatform.IMAGE_OCR: "Images",
     SourcePlatform.OTHER: "Unsorted",
 }
+
+# Destination for soft-tombed fragments whose source unit has vanished (#674).
+_ORPHANED_RELPARTS: tuple[str, ...] = ("10-Liminal", "Orphaned")
 
 # Map an AuthorManifest.author_kind -> the fragment's Authorship axis (#470).
 # Any unrecognised kind (the manifest already fails closed to ``human_source``)
@@ -387,6 +391,40 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 tmp_path.unlink()
 
 
+def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
+    """Return ``True`` when an edit changed the body materially (#675).
+
+    A positive *threshold* compares old vs new body with ``difflib``; a
+    similarity ratio below the threshold is a material change. A non-positive
+    threshold never flags (every edit is treated as trivial).
+    """
+    if threshold <= 0.0:
+        return False
+    ratio = difflib.SequenceMatcher(None, old_body, new_body).ratio()
+    return ratio < threshold
+
+
+def _clear_classification(post: frontmatter.Post) -> None:
+    """Drop classification frontmatter so OPS-001 re-classifies on next pass."""
+    # Deferred import: `creek.classify.classify_engine` imports `VaultWriter`
+    # from this module, so a module-level import of `creek.classify.constants`
+    # here would close a load-time cycle. The constants are pure `Final[str]`;
+    # extracting them to a dependency-free module would let this move to the top
+    # (tracked as a follow-up).
+    from creek.classify.constants import (
+        CLASSIFICATION_METHOD_KEY,
+        CLASSIFICATION_REASONING_KEY,
+        CLASSIFIED_AT_KEY,
+    )
+
+    for key in (
+        CLASSIFICATION_METHOD_KEY,
+        CLASSIFIED_AT_KEY,
+        CLASSIFICATION_REASONING_KEY,
+    ):
+        post.metadata.pop(key, None)
+
+
 def _apply_other_author_attribution(
     fragment: Fragment,
     manifest: AuthorManifest,
@@ -540,6 +578,7 @@ class VaultWriter:
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
+        target_dir = self._fragment_target_dir(fragment)
         slug = fragment.source.author_slug
         if slug:
             # The helper returns a stamped copy, so the caller's Fragment is
@@ -547,12 +586,162 @@ class VaultWriter:
             # attribution (#470).
             manifest = load_author_manifest_or_default(self.vault_path, slug)
             stamped = _apply_other_author_attribution(fragment, manifest)
-            target_dir = self.vault_path / OTHER_AUTHORS_DIR / slug
             return self._write_model(stamped, target_dir, body=body)
-        platform = fragment.source.platform
-        subfolder = _PLATFORM_SUBFOLDER[str(platform)]
-        target_dir = self.vault_path / "01-Fragments" / subfolder
         return self._write_model(fragment, target_dir, body=body)
+
+    def _fragment_target_dir(self, fragment: Fragment) -> Path:
+        """Return the vault directory a fragment routes to (#673).
+
+        The single source of truth for fragment routing, used by both
+        :meth:`write_fragment` and :meth:`update_fragment`: a borrowed
+        fragment (``source.author_slug`` set) lives under
+        ``11-Other-Authors/<slug>/``; a native fragment routes by source
+        platform into ``01-Fragments/<subfolder>/``.
+        """
+        slug = fragment.source.author_slug
+        if slug:
+            return self.vault_path / OTHER_AUTHORS_DIR / slug
+        subfolder = _PLATFORM_SUBFOLDER[str(fragment.source.platform)]
+        return self.vault_path / "01-Fragments" / subfolder
+
+    def update_fragment(
+        self,
+        fragment: Fragment,
+        body: str,
+        *,
+        reclassify_threshold: float = 0.0,
+    ) -> Path | None:
+        """Rewrite an existing fragment's body in place, or return ``None``.
+
+        Locates the file already mapped to ``fragment.id`` (via the per-dir
+        id index) and rewrites **only its body**, preserving the on-disk
+        frontmatter — id, classifications (OPS-001), resonance links, and
+        ``source.origin_key``. This is the changed-branch of idempotent
+        mutable-source ingest (#673): an edited journal entry updates the same
+        fragment instead of minting a new id and orphaning the old one.
+
+        When *reclassify_threshold* is positive (#675) the new body is compared
+        to the prior one; a **material** change (``difflib`` ratio below the
+        threshold) clears the fragment's ``classification_method`` /
+        ``classified_at`` / ``classification_reasoning`` so the next classify
+        pass re-does only this fragment (OPS-001, no global ``--force``). A
+        trivial edit (ratio at/above the threshold) preserves classifications.
+        The default ``0.0`` never flags — every edit preserves.
+
+        Returns ``None`` when no file is mapped to ``fragment.id`` (e.g. the
+        file was removed out of band), so the caller can fall back to a fresh
+        :meth:`write_fragment`.
+
+        Args:
+            fragment: The fragment whose id locates the existing file and
+                whose platform/slug routes the lookup directory.
+            body: The new markdown body to write below the preserved
+                frontmatter.
+            reclassify_threshold: Body-similarity floor below which the edit is
+                material and classifications are cleared for re-classification.
+
+        Returns:
+            Path to the rewritten file, or ``None`` when no existing file
+            maps to the id.
+        """
+        target_dir = self._fragment_target_dir(fragment)
+        with self._lock:
+            existing = self._find_existing_locked(fragment.id, target_dir)
+            if existing is None:
+                return None
+            post = frontmatter.load(str(existing))
+            if _is_material_change(post.content, body, reclassify_threshold):
+                _clear_classification(post)
+            post.content = body
+            _atomic_write_text(existing, frontmatter.dumps(post))
+            # Record the in-place edit in the provenance log too, so the audit
+            # trail captures subsequent rewrites — not just the original write.
+            self._log_provenance_locked(fragment.id, fragment.type, existing)
+        return existing
+
+    def _find_in_fragments_locked(self, fragment_id: str) -> Path | None:
+        """Return the live fragment file for *fragment_id* under 01-Fragments.
+
+        Caller must hold ``self._lock``. Scans each platform subfolder's id
+        index so a tomb does not need to know which subfolder a fragment
+        landed in.
+        """
+        fragments_root = self.vault_path / "01-Fragments"
+        if not fragments_root.is_dir():
+            return None
+        for subdir in sorted(p for p in fragments_root.iterdir() if p.is_dir()):
+            found = self._find_existing_locked(fragment_id, subdir)
+            if found is not None:
+                return found
+        return None
+
+    def tomb_fragment(self, fragment_id: str) -> Path | None:
+        """Soft-tomb a fragment: move it to ``10-Liminal/Orphaned/`` (#674).
+
+        Relocates the live fragment file for *fragment_id* into the orphaned
+        directory and stamps ``lifecycle: orphaned`` + ``orphaned_at`` into its
+        frontmatter, so a deleted source unit is reflected without hard-deleting
+        the fragment. Returns the tombed path, or ``None`` when no live fragment
+        maps to the id (already moved/removed).
+
+        Args:
+            fragment_id: Id of the fragment to soft-tomb.
+
+        Returns:
+            Path to the tombed file, or ``None`` if no live fragment was found.
+        """
+        orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
+        with self._lock:
+            existing = self._find_in_fragments_locked(fragment_id)
+            if existing is None:
+                return None
+            post = frontmatter.load(str(existing))
+            post["lifecycle"] = "orphaned"
+            post["orphaned_at"] = datetime.now(UTC).isoformat()
+            orphan_dir.mkdir(parents=True, exist_ok=True)
+            dest = orphan_dir / existing.name
+            _atomic_write_text(dest, frontmatter.dumps(post))
+            existing.unlink()
+            index = self._load_index_locked(orphan_dir)
+            index[fragment_id] = dest.name
+            self._append_index_entry(orphan_dir, fragment_id, dest.name)
+            self._log_provenance_locked(fragment_id, "fragment", dest)
+        return dest
+
+    def restore_fragment(self, fragment: Fragment) -> Path | None:
+        """Un-tomb a fragment: move it back from ``10-Liminal/Orphaned/`` (#674).
+
+        Relocates the tombed file for ``fragment.id`` back to its routing
+        directory and clears the ``lifecycle``/``orphaned_at`` marker, so a
+        re-appeared source unit becomes a live fragment again under its
+        preserved id. Returns the restored path, or ``None`` when no tombed
+        file maps to the id.
+
+        Args:
+            fragment: The fragment whose id locates the tombed file and whose
+                platform/slug routes the restore destination.
+
+        Returns:
+            Path to the restored file, or ``None`` if no tombed file was found.
+        """
+        orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
+        target_dir = self._fragment_target_dir(fragment)
+        with self._lock:
+            existing = self._find_existing_locked(fragment.id, orphan_dir)
+            if existing is None:
+                return None
+            post = frontmatter.load(str(existing))
+            post.metadata.pop("lifecycle", None)
+            post.metadata.pop("orphaned_at", None)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dest = target_dir / existing.name
+            _atomic_write_text(dest, frontmatter.dumps(post))
+            existing.unlink()
+            index = self._load_index_locked(target_dir)
+            index[fragment.id] = dest.name
+            self._append_index_entry(target_dir, fragment.id, dest.name)
+            self._log_provenance_locked(fragment.id, fragment.type, dest)
+        return dest
 
     def write_thread(self, thread: Thread) -> Path:
         """Write a Thread to 02-Threads/{status}/.
@@ -569,7 +758,14 @@ class VaultWriter:
         """
         status_folder = str(thread.status).capitalize()
         target_dir = self.vault_path / "02-Threads" / status_folder
-        return self._write_model(thread, target_dir, body=_render_thread_body(thread))
+        return self._write_model(
+            thread,
+            target_dir,
+            body=_render_thread_body(thread),
+            # Alias the bare title so fragments' ``[[<title>]]`` thread links
+            # resolve to the date-prefixed page filename in stock Obsidian.
+            extra_frontmatter={"aliases": [thread.title]},
+        )
 
     def write_eddy(self, eddy: Eddy) -> Path:
         """Write an Eddy to 03-Eddies/.
@@ -584,7 +780,14 @@ class VaultWriter:
             Path to the written (or existing duplicate) markdown file.
         """
         target_dir = self.vault_path / "03-Eddies"
-        return self._write_model(eddy, target_dir, body=_render_eddy_body(eddy))
+        return self._write_model(
+            eddy,
+            target_dir,
+            body=_render_eddy_body(eddy),
+            # Alias the bare title so fragments' ``[[<title>]]`` eddy links
+            # resolve to the date-prefixed page filename in stock Obsidian.
+            extra_frontmatter={"aliases": [eddy.title]},
+        )
 
     def write_praxis(self, praxis: Praxis) -> Path:
         """Write a Praxis to 04-Praxis/{type}/.
@@ -672,6 +875,7 @@ class VaultWriter:
         target_dir: Path,
         *,
         body: str = "",
+        extra_frontmatter: dict[str, object] | None = None,
     ) -> Path:
         """Serialise a model to markdown with YAML frontmatter and write to disk.
 
@@ -684,6 +888,10 @@ class VaultWriter:
             model: The Pydantic model to serialise.
             target_dir: The vault directory to write the file to.
             body: Markdown body to render below the frontmatter block.
+            extra_frontmatter: Optional non-model keys merged into the YAML
+                frontmatter (e.g. ``aliases`` so an Obsidian ``[[Title]]`` link
+                resolves to a ``{date}-{title}`` filename). Keys here override
+                model-dumped keys of the same name.
 
         Returns:
             Path to the written (or existing duplicate) file.
@@ -707,6 +915,10 @@ class VaultWriter:
             base_name = self._compute_base_name(model)
 
             data = model.model_dump(mode="json")
+            if extra_frontmatter:
+                # Non-model frontmatter (e.g. ``aliases`` so an Obsidian
+                # ``[[Title]]`` link resolves to a ``{date}-{title}`` filename).
+                data.update(extra_frontmatter)
             post = frontmatter.Post(content=body, **data)
             content = frontmatter.dumps(post)
 

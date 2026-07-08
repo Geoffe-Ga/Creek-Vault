@@ -29,9 +29,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import anthropic
 from pydantic import ValidationError
 
 from crawdad.intents import (
@@ -44,6 +43,7 @@ from crawdad.intents import (
 
 if TYPE_CHECKING:
     from crawdad.history import ConversationHistory
+    from crawdad.llm.base import AsyncLLMProvider
     from crawdad.state import SessionState
 
 _LOGGER = logging.getLogger("crawdad.router")
@@ -165,16 +165,16 @@ class IntentRouter:
     def __init__(
         self,
         *,
-        anthropic_client: Any,
+        provider: AsyncLLMProvider,
         model: str,
         tools: list[ToolInfo],
         max_tokens: int = 1024,
     ) -> None:
-        """Store the injected client and the cached tools schema.
+        """Store the injected provider and the cached tools schema.
 
         Args:
-            anthropic_client: An :class:`anthropic.AsyncAnthropic`
-                instance (or a test double with the same shape).
+            provider: An :class:`~crawdad.llm.base.AsyncLLMProvider`
+                instance (or a test double with the same ``complete`` shape).
             model: The Haiku model identifier — resolved from
                 :data:`crawdad.config.DEFAULT_ROUTER_MODEL` by the
                 caller, NEVER a literal in this module.
@@ -182,7 +182,7 @@ class IntentRouter:
                 session start by :meth:`MCPSession.list_tool_details`.
             max_tokens: Hard cap on the router's reply length.
         """
-        self._client = anthropic_client
+        self._provider = provider
         self._model = model
         self._tools = tools
         self._max_tokens = max_tokens
@@ -210,27 +210,16 @@ class IntentRouter:
             tools=self._tools,
         )
         try:
-            response = await self._client.messages.create(
+            completion = await self._provider.complete(
+                [{"role": "user", "content": prompt}],
                 model=self._model,
                 max_tokens=self._max_tokens,
-                messages=[{"role": "user", "content": prompt}],
             )
-        except anthropic.AnthropicError as exc:
-            _LOGGER.warning("Haiku API call failed: %s: %r", type(exc).__name__, exc)
-            msg = f"Haiku API call failed: {type(exc).__name__}"
+        except RuntimeError as exc:
+            _LOGGER.warning("Haiku API call failed: %s", exc)
+            msg = f"Haiku API call failed: {exc}"
             raise RouterParseError(msg) from exc
-        raw_text = _extract_text(response)
-        return _parse_router_payload(raw_text)
-
-
-def _extract_text(response: Any) -> str:
-    """Pull the concatenated text from a (possibly multi-block) reply."""
-    parts: list[str] = []
-    for block in getattr(response, "content", []) or []:
-        text = getattr(block, "text", None)
-        if text is not None:
-            parts.append(str(text))
-    return "\n".join(parts)
+        return _parse_router_payload(completion.text)
 
 
 def _parse_router_payload(raw: str) -> RouterResponse:

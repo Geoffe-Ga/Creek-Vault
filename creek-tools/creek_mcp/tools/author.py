@@ -13,13 +13,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from creek.author import plan_author, require_supported_medium, run_author
+from creek.author.client import AuthorLLMClient
+from creek.config import load_config
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author import AuthoredDraft
+    from creek.models import PrivacyTier
 
 TOOL_NAME = "creek.author"
 
@@ -51,9 +54,9 @@ def _draft_response(
         "status": "ok",
         "tool": TOOL_NAME,
         "tier_ceiling": tier_ceiling.value,
-        # Explicit so callers never mistake the echo for enforcement; flips to
-        # True when tier-filtered retrieval lands with the real specialists (#463).
-        "tier_ceiling_enforced": False,
+        # #660: the specialists tier-filter retrieval against the ceiling, so
+        # the echo now reflects real enforcement.
+        "tier_ceiling_enforced": True,
         "dry_run": False,
         "medium": draft.medium,
         "query": draft.query,
@@ -82,8 +85,10 @@ def author_tool(
 
     Mirrors the ``creek author`` CLI args. Delegates to ``run_author`` (or
     ``plan_author`` when ``dry_run`` is set); the verb adds no desk logic. The
-    caller's privacy ceiling is recorded and echoed across the boundary (real
-    tier-filtered retrieval arrives with the real specialists, #463).
+    caller's privacy ceiling is recorded **and enforced** (#660): it is
+    converted to a :class:`~creek.classify.privacy_filter.PrivacyTierOverride`
+    and threaded to the specialists, which exclude above-ceiling fragments from
+    the evidence.
 
     Args:
         vault_path: The vault to author from.
@@ -99,9 +104,9 @@ def author_tool(
         ``claims``) or — for ``dry_run`` — the plan + evidence summary. An
         unsupported medium yields ``status: error`` with a ``reason``.
     """
-    # Privacy gap (#463): the ceiling is recorded and echoed across the
-    # boundary, but the current stub specialists do not yet tier-filter
-    # retrieval. Real enforcement lands with the real Graph/Retrieval agents.
+    # #660: the ceiling is enforced — converted to a PrivacyTierOverride below
+    # and threaded into the specialists, which exclude above-ceiling fragments
+    # from the retrieved evidence.
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={
@@ -124,22 +129,51 @@ def author_tool(
     # downstream validation error, ...) must surface as a structured envelope,
     # never an unhandled exception across the MCP boundary. This mirrors the
     # broad boundary catch the other MCP write tools use (e.g. purge).
+    # #660: enforce the ceiling by converting it to the core privacy override
+    # threaded into the specialists.
+    override = to_privacy_override(privacy_tier_ceiling)
     try:
         if dry_run:
-            plan = plan_author(medium=medium, query=query, vault=vault_path)
+            plan = plan_author(
+                medium=medium,
+                query=query,
+                vault=vault_path,
+                override=override,
+            )
             return {
                 "status": "ok",
                 "tool": TOOL_NAME,
                 "tier_ceiling": privacy_tier_ceiling.value,
-                "tier_ceiling_enforced": False,
+                "tier_ceiling_enforced": True,
                 "dry_run": True,
                 "medium": medium,
                 "query": query,
                 "plan": plan["plan"],
                 "evidence": plan["evidence"],
             }
+        # #658/#661: build the router-resolved voice client per the run's content
+        # tier so live voicing of Intimate content is redirected to a local
+        # provider by the chokepoint. ``for_voice_or_none`` returns ``None``
+        # (deterministic stub) when the provider is unavailable, so the tool
+        # never hard-fails on a missing/unconsented backend.
+        config = load_config()
+        router = config.model_router
+        author_config = config.author
+
+        def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+            return AuthorLLMClient.for_voice_or_none(
+                router,
+                author=author_config,
+                tier=tier,
+            )
+
         draft = run_author(
-            medium=medium, query=query, vault=vault_path, max_rounds=max_rounds
+            medium=medium,
+            query=query,
+            vault=vault_path,
+            max_rounds=max_rounds,
+            voice_client_factory=_voice_client,
+            override=override,
         )
     except Exception as exc:
         return _error_response(

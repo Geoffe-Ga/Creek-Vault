@@ -14,6 +14,7 @@ from crawdad.intents import (
     PrivacyTierCeiling,
     ToolInfo,
 )
+from crawdad.llm.base import Completion
 from crawdad.router import (
     IntentRouter,
     RouterParseError,
@@ -52,28 +53,42 @@ def session_state() -> SessionState:
     )
 
 
-class _FakeAnthropic:
-    """Minimal stand-in for ``anthropic.AsyncAnthropic`` used in tests."""
+class _FakeProvider:
+    """Minimal ``AsyncLLMProvider`` double recording ``complete`` calls."""
 
     def __init__(self, response_text: str) -> None:
         self._response_text = response_text
         self.calls: list[dict[str, Any]] = []
-        self.messages = self  # so router can call client.messages.create
 
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        return _FakeResponse(self._response_text)
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> Completion:
+        """Record the call and return a canned completion."""
+        self.calls.append(
+            {"messages": messages, "model": model, "max_tokens": max_tokens}
+        )
+        return Completion(text=self._response_text)
 
 
-class _FakeResponse:
-    def __init__(self, text: str) -> None:
-        self.content = [_FakeBlock(text)]
+class _RaisingProvider:
+    """``complete`` raises an injected exception, modeling a redacted SDK error."""
 
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
 
-class _FakeBlock:
-    def __init__(self, text: str) -> None:
-        self.type = "text"
-        self.text = text
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> Completion:
+        """Raise the injected exception."""
+        raise self._exc
 
 
 def test_build_router_prompt_includes_wavelength_and_history(
@@ -138,7 +153,7 @@ async def test_router_extract_intents_parses_valid_json(
     tools: list[ToolInfo], session_state: SessionState
 ) -> None:
     """A well-formed Haiku reply lands on a :class:`RouterResponse`."""
-    fake_haiku = _FakeAnthropic(
+    fake_haiku = _FakeProvider(
         json.dumps(
             {
                 "intents": [
@@ -151,7 +166,7 @@ async def test_router_extract_intents_parses_valid_json(
         )
     )
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )
@@ -171,9 +186,9 @@ async def test_router_uses_configured_model(
     tools: list[ToolInfo], session_state: SessionState
 ) -> None:
     """The injected model name is the one passed to the Anthropic SDK."""
-    fake_haiku = _FakeAnthropic(json.dumps({"intents": []}))
+    fake_haiku = _FakeProvider(json.dumps({"intents": []}))
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="custom-haiku-id",
         tools=tools,
     )
@@ -191,9 +206,9 @@ async def test_router_rejects_non_json_response(
     tools: list[ToolInfo], session_state: SessionState
 ) -> None:
     """A non-JSON Haiku reply raises ``RouterParseError``."""
-    fake_haiku = _FakeAnthropic("here is some prose, not JSON")
+    fake_haiku = _FakeProvider("here is some prose, not JSON")
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )
@@ -210,9 +225,9 @@ async def test_router_rejects_missing_intents_key(
     tools: list[ToolInfo], session_state: SessionState
 ) -> None:
     """JSON without the ``intents`` array is malformed router output."""
-    fake_haiku = _FakeAnthropic(json.dumps({"reply": "hi"}))
+    fake_haiku = _FakeProvider(json.dumps({"reply": "hi"}))
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )
@@ -225,37 +240,20 @@ async def test_router_rejects_missing_intents_key(
         )
 
 
-class _RaisingAnthropic:
-    """``messages.create`` raises an injected exception, modeling SDK errors."""
-
-    def __init__(self, exc: Exception) -> None:
-        self._exc = exc
-        self.messages = self
-
-    async def create(self, **_kwargs: Any) -> Any:
-        raise self._exc
-
-
-async def test_router_translates_anthropic_api_error_to_parse_error(
+async def test_router_translates_provider_error_to_parse_error(
     tools: list[ToolInfo], session_state: SessionState
 ) -> None:
-    """Rate-limit / connection / auth errors surface as ``RouterParseError``.
+    """A redacted provider ``RuntimeError`` surfaces as ``RouterParseError``.
 
     The bot maps ``RouterParseError`` to a user-visible reply; without
     this translation the SDK error would propagate through
     ``handle_message`` into discord.py and the user would receive no
-    reply at all.
+    reply at all. The provider has already redacted the SDK error to a
+    ``RuntimeError`` carrying only the exception type name.
     """
-    import anthropic
-
-    # ``APIError`` requires a request kwarg in modern SDK versions; we
-    # construct a minimal subclass exception that still belongs to the
-    # base ``AnthropicError`` hierarchy.
-    fake_haiku = _RaisingAnthropic(
-        anthropic.AnthropicError("simulated rate-limit / API failure")
-    )
+    fake_haiku = _RaisingProvider(RuntimeError("AnthropicError"))
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )
@@ -320,7 +318,7 @@ async def test_router_emits_run_workflow_for_natural_language_phrase(
     requested workflow name + inputs. We stub the model so the test
     pins the parsing path, not the model's behavior.
     """
-    fake_haiku = _FakeAnthropic(
+    fake_haiku = _FakeProvider(
         json.dumps(
             {
                 "intents": [
@@ -337,7 +335,7 @@ async def test_router_emits_run_workflow_for_natural_language_phrase(
         )
     )
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )
@@ -367,7 +365,7 @@ async def test_router_emits_activate_register_for_natural_language_phrase(
     the requested register name. We stub the model so the test pins
     the parsing path, not the model's behavior.
     """
-    fake_haiku = _FakeAnthropic(
+    fake_haiku = _FakeProvider(
         json.dumps(
             {
                 "intents": [
@@ -381,7 +379,7 @@ async def test_router_emits_activate_register_for_natural_language_phrase(
         )
     )
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )
@@ -403,11 +401,11 @@ async def test_router_extracts_fenced_json_blocks(
 ) -> None:
     """Markdown fences around the JSON are tolerated."""
     payload = json.dumps({"intents": [{"type": "creek.state.read"}]})
-    fake_haiku = _FakeAnthropic(
+    fake_haiku = _FakeProvider(
         f"Sure, here is the result:\n\n```json\n{payload}\n```\n"
     )
     router = IntentRouter(
-        anthropic_client=fake_haiku,  # type: ignore[arg-type]
+        provider=fake_haiku,
         model="claude-haiku-test",
         tools=tools,
     )

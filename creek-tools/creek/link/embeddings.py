@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from pathlib import Path
 
+    import numpy as np
+    from numpy.typing import NDArray
     from sentence_transformers import SentenceTransformer as SentenceTransformerType
 
     from creek.config import EmbeddingsConfig
@@ -351,6 +353,49 @@ def _level_for(fid: str, fragments: Mapping[str, Fragment]) -> FragmentLevel:
     if frag is None:
         return _DEFAULT_LEVEL
     return frag.level
+
+
+def _top_k_neighbours(
+    row: NDArray[np.float32],
+    i: int,
+    threshold: float,
+    top_k: int,
+) -> list[int]:
+    """Return the indices of fragment *i*'s top-*top_k* above-*threshold* neighbours.
+
+    Excludes ``i`` itself (cosine self-similarity is 1.0). Uses
+    :func:`numpy.argpartition` to select the *top_k* largest among the
+    above-threshold candidates in O(c) rather than fully sorting the row, where
+    *c* is the candidate count. The returned indices are unordered — the caller
+    re-sorts the final edge list into the canonical ``(i, j)`` order.
+
+    Tie-breaking is implementation-defined: ``argpartition`` is not stable, so
+    when more than *top_k* candidates share the same similarity, which of the
+    tied neighbours fall inside the cap is unspecified (and may differ across
+    numpy versions). Edges above the cut are always exact and above threshold.
+
+    Args:
+        row: Cosine similarities of fragment *i* against every fragment.
+        i: The query fragment's index (excluded from its own neighbours).
+        threshold: Minimum similarity for a neighbour to qualify.
+        top_k: Maximum neighbours to keep.
+
+    Returns:
+        Up to *top_k* neighbour indices, each with ``row[idx] >= threshold``.
+    """
+    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
+    candidates = np.nonzero(row >= threshold)[0]
+    candidates = candidates[candidates != i]
+    if candidates.size == 0:
+        return []
+    if candidates.size > top_k:
+        candidate_sims = row[candidates]
+        keep = np.argpartition(candidate_sims, candidates.size - top_k)[
+            candidates.size - top_k :
+        ]
+        candidates = candidates[keep]
+    return [int(idx) for idx in candidates]
 
 
 def _is_hierarchy_suppressed(
@@ -710,15 +755,63 @@ class EmbeddingLinker:
         levels = _level_lookup(ids, fragments)
         threshold = self.config.similarity_threshold
 
+        # ``exact`` (default) emits every above-threshold pair; ``topk`` keeps
+        # only each fragment's k best neighbours. Both compute similarities one
+        # row-block at a time via vectorized matmul (never the full NxN matrix)
+        # and emit pairs in ascending ``(i, j)`` index order.
+        if self.config.resonance_method == "topk":
+            resonances, suppressed = self._resonances_topk(
+                ids=ids,
+                normalized=normalized,
+                threshold=threshold,
+                top_k=self.config.resonance_top_k,
+                ancestors=ancestors,
+                sibling_positions=sibling_positions,
+                levels=levels,
+                sibling_skip_window=sibling_skip_window,
+            )
+        else:
+            resonances, suppressed = self._resonances_exact(
+                ids=ids,
+                normalized=normalized,
+                threshold=threshold,
+                ancestors=ancestors,
+                sibling_positions=sibling_positions,
+                levels=levels,
+                sibling_skip_window=sibling_skip_window,
+            )
+
+        if suppressed:
+            logger.info(
+                "Suppressed %d hierarchy-trivial resonance(s) "
+                "(ancestor/descendant or adjacent siblings within %d)",
+                suppressed,
+                sibling_skip_window,
+            )
+        logger.info("Found %d resonance(s)", len(resonances))
+        return resonances
+
+    def _resonances_exact(
+        self,
+        *,
+        ids: list[str],
+        normalized: NDArray[np.float32],
+        threshold: float,
+        ancestors: dict[str, frozenset[str]],
+        sibling_positions: dict[str, tuple[str, int]],
+        levels: dict[str, FragmentLevel],
+        sibling_skip_window: int,
+    ) -> tuple[list[Resonance], int]:
+        """Exact all-pairs path: emit every above-*threshold* pair (i < j).
+
+        Computes the upper triangle one row-block at a time so peak memory is
+        ``block_rows x N`` rather than the full matrix. Returns the resonances
+        and the count suppressed by hierarchy rules.
+        """
+        import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
         resonances: list[Resonance] = []
         suppressed = 0
-        # Resonance discovery compares every pair, but similarities are computed
-        # one block of rows at a time via vectorized matmul (never materializing
-        # the full NxN matrix) and thresholded with numpy, so only
-        # above-threshold pairs reach Python. Peak memory is block_rows x N,
-        # which scales to ≥50k fragments — unlike the old full-matrix +
-        # itertools.combinations loop (OPS-004 / #596). Pairs are still emitted
-        # in ascending ``(i, j)`` index order.
         n = len(ids)
         for start in range(0, n, _RESONANCE_BLOCK_ROWS):
             stop = min(start + _RESONANCE_BLOCK_ROWS, n)
@@ -748,13 +841,64 @@ class EmbeddingLinker:
                         ),
                     )
             del block_sims
+        return resonances, suppressed
 
-        if suppressed:
-            logger.info(
-                "Suppressed %d hierarchy-trivial resonance(s) "
-                "(ancestor/descendant or adjacent siblings within %d)",
-                suppressed,
-                sibling_skip_window,
+    def _resonances_topk(
+        self,
+        *,
+        ids: list[str],
+        normalized: NDArray[np.float32],
+        threshold: float,
+        top_k: int,
+        ancestors: dict[str, frozenset[str]],
+        sibling_positions: dict[str, tuple[str, int]],
+        levels: dict[str, FragmentLevel],
+        sibling_skip_window: int,
+    ) -> tuple[list[Resonance], int]:
+        """Top-k path: keep each fragment's *top_k* best above-*threshold* neighbours.
+
+        Bounds the edge set to O(n·k). Each directed (i -> neighbour) pick is
+        folded to its undirected ``(i < j)`` form and de-duplicated, so the
+        output is always a subset of the exact path's edges; the final list is
+        sorted into the same ascending ``(i, j)`` order the exact path emits.
+        Returns the resonances and the hierarchy-suppressed count.
+        """
+        n = len(ids)
+        seen: set[tuple[int, int]] = set()
+        picked: list[tuple[int, int, float]] = []
+        suppressed = 0
+        for start in range(0, n, _RESONANCE_BLOCK_ROWS):
+            stop = min(start + _RESONANCE_BLOCK_ROWS, n)
+            block_sims = normalized[start:stop] @ normalized.T
+            for local_index, i in enumerate(range(start, stop)):
+                row = block_sims[local_index]
+                for j in _top_k_neighbours(row, i, threshold, top_k):
+                    lo, hi = (i, j) if i < j else (j, i)
+                    if (lo, hi) in seen:
+                        continue
+                    seen.add((lo, hi))
+                    if _is_hierarchy_suppressed(
+                        ids[lo],
+                        ids[hi],
+                        ancestors=ancestors,
+                        sibling_positions=sibling_positions,
+                        sibling_skip_window=sibling_skip_window,
+                    ):
+                        suppressed += 1
+                        continue
+                    picked.append((lo, hi, float(row[j])))
+            del block_sims
+        # Tuples sort lexicographically; (lo, hi) keys are unique (deduped via
+        # ``seen``), so this yields ascending (i, j) order without a key.
+        picked.sort()
+        resonances = [
+            Resonance(
+                fragment_a_id=ids[lo],
+                fragment_b_id=ids[hi],
+                similarity=sim,
+                from_level=levels[ids[lo]],
+                to_level=levels[ids[hi]],
             )
-        logger.info("Found %d resonance(s)", len(resonances))
-        return resonances
+            for lo, hi, sim in picked
+        ]
+        return resonances, suppressed

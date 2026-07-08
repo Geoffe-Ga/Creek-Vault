@@ -1233,6 +1233,154 @@ def test_report_unnamed_command(tmp_path: Path) -> None:
     assert (vault / "10-Liminal" / "Unnamed" / "Digests").is_dir()
 
 
+def _report_vault(tmp_path: Path) -> Path:
+    """Minimal vault for a report-command invocation."""
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "00-Creek-Meta/Processing-Log", "01-Fragments"):
+        (vault / d).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+def test_report_unknown_type_errors(tmp_path: Path) -> None:
+    """`report --type <unknown>` errors with the valid list, not a no-op (#716)."""
+    vault = _report_vault(tmp_path)
+    result = runner.invoke(app, ["report", "--type", "paradoxx", "--vault", str(vault)])
+    assert result.exit_code == 2, result.output  # Unix invalid-argument convention
+    assert "paradoxx" in result.output  # names the bad type
+    assert "decisions" in result.output  # lists real valid types
+    assert "unnamed" in result.output
+    assert "Would report" not in result.output  # the silent no-op is gone
+
+
+def test_report_missing_type_errors(tmp_path: Path) -> None:
+    """`report` with no --type errors with a human-readable message (#716)."""
+    vault = _report_vault(tmp_path)
+    result = runner.invoke(app, ["report", "--vault", str(vault)])
+    assert result.exit_code == 2, result.output
+    assert "--type is required" in result.output  # not a leaked Python "None"
+    assert "None" not in result.output
+    assert "Would report" not in result.output
+
+
+def test_report_known_type_still_dispatches(tmp_path: Path) -> None:
+    """A valid --type still runs its handler (no regression) (#716)."""
+    vault = _report_vault(tmp_path)
+    (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
+    result = runner.invoke(app, ["report", "--type", "unnamed", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+
+
+def test_report_paradox_is_wired(tmp_path: Path) -> None:
+    """`report --type paradox` runs the generator, not the unknown-type error (#711)."""
+    vault = _report_vault(tmp_path)  # note-writer mkdirs its own folder
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "Unknown report type" not in result.output  # now a real handler
+    assert "no paradox notes generated" in result.output.lower()  # empty vault path
+
+
+def test_report_synchronicity_is_wired(tmp_path: Path) -> None:
+    """`report --type synchronicity` runs the generator, not the error (#711)."""
+    vault = _report_vault(tmp_path)
+    result = runner.invoke(
+        app, ["report", "--type", "synchronicity", "--vault", str(vault)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "Unknown report type" not in result.output
+    assert "no synchronicity notes generated" in result.output.lower()
+
+
+def test_report_paradox_writes_notes(tmp_path: Path) -> None:
+    """`report --type paradox` writes notes + reports success when found (#711)."""
+    from creek.models import (
+        Confidence,
+        Fragment,
+        FragmentSource,
+        SourcePlatform,
+        VoiceClassification,
+    )
+    from tests.helpers import write_fragment_file
+
+    vault = _report_vault(tmp_path)
+    for fid, conf in (
+        ("frag-cli-parax-aa", Confidence.MUSING),
+        ("frag-cli-parax-bb", Confidence.SETTLED),
+    ):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="career ambitions",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                voice=VoiceClassification(confidence=conf),
+                threads=["thread-career"],
+            ),
+            body="a contradiction worth holding",
+        )
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+    assert result.exit_code == 0, result.output
+    assert "paradox notes generated" in result.output.lower()  # success branch
+    assert sorted((vault / "10-Liminal" / "Paradoxes").glob("*.md"))
+
+
+def test_report_synchronicity_writes_notes(tmp_path: Path) -> None:
+    """`report --type synchronicity` writes notes + reports success (#711, #726).
+
+    Mirrors the paradox success-path test: a cross-source, >30-day pair with an
+    identical crafted embedding cache (cosine 1.0 > the 0.9 threshold) yields one
+    synchronicity note and the bold-green success message.
+    """
+    from datetime import UTC, datetime
+
+    from creek.config import EmbeddingsConfig
+    from creek.link.embeddings import (
+        CachedEmbedding,
+        EmbeddingLinker,
+        embeddings_cache_path,
+    )
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+    from tests.helpers import write_fragment_file
+
+    vault = _report_vault(tmp_path)
+    pairs = (
+        ("frag-synx-cli-aa", SourcePlatform.DISCORD, datetime(2025, 1, 5, tzinfo=UTC)),
+        ("frag-synx-cli-bb", SourcePlatform.JOURNAL, datetime(2025, 4, 20, tzinfo=UTC)),
+    )
+    for fid, platform, created in pairs:
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="the river remembers every stone it has touched",
+                source=FragmentSource(platform=platform),
+                created=created,
+                authored_at=created,  # the gap filter reads effective_authored_at
+            ),
+            body="a near-identical meaning arriving from a different source",
+        )
+    # Identical vectors → cosine 1.0 > the 0.9 synchronicity threshold.
+    config = EmbeddingsConfig()
+    now = datetime.now(tz=UTC)
+    entries = {
+        fid: CachedEmbedding(
+            fragment_id=fid,
+            content_hash="h",
+            model_name=config.model,
+            vector=[1.0, 0.0, 0.0, 0.0],
+            computed_at=now,
+        )
+        for fid, _platform, _created in pairs
+    }
+    EmbeddingLinker(config).save_cache(entries, embeddings_cache_path(vault))
+
+    result = runner.invoke(
+        app, ["report", "--type", "synchronicity", "--vault", str(vault)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "synchronicity notes generated" in result.output.lower()  # success branch
+    assert sorted((vault / "10-Liminal" / "Synchronicities").glob("*.md"))
+
+
 def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     """``report --type decisions`` with no signalling fragments is friendly (#581).
 
@@ -1434,10 +1582,35 @@ def test_report_voice_command(tmp_path: Path) -> None:
     assert (vault / "07-Voice" / "confessional-profile.md").is_file()
 
 
+def _write_wavelength_fragment(vault: Path, frag_id: str) -> None:
+    """Write one fragment carrying a classified wavelength phase (#719)."""
+    from creek.models import (
+        Fragment,
+        FragmentSource,
+        Phase,
+        SourcePlatform,
+        WavelengthClassification,
+    )
+    from creek.time import now_la
+    from tests.helpers import write_fragment_file
+
+    write_fragment_file(
+        vault=vault,
+        fragment=Fragment(
+            id=frag_id,
+            title="Wavelength note",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            authored_at=now_la(),
+            wavelength=WavelengthClassification(phase=Phase.RISING),
+        ),
+        body="A reflective entry.",
+    )
+
+
 def test_report_wavelength_weekly_command(tmp_path: Path) -> None:
-    """Test that report --type wavelength --period weekly produces a file."""
+    """report --type wavelength --period weekly writes a descriptive phase-map."""
     vault = tmp_path / "vault"
-    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    _write_wavelength_fragment(vault, "frag-wavecli00001")
     result = runner.invoke(
         app,
         [
@@ -1451,14 +1624,14 @@ def test_report_wavelength_weekly_command(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Wavelength weekly report generated" in result.output
+    assert "non-prescriptive" in result.output.lower()
     assert list((vault / "05-Wavelength" / "Phase-Maps").glob("*.md"))
 
 
 def test_report_wavelength_monthly_command(tmp_path: Path) -> None:
-    """Test that report --type wavelength --period monthly produces a file."""
+    """report --type wavelength --period monthly writes a descriptive phase-map."""
     vault = tmp_path / "vault"
-    (vault / "01-Fragments").mkdir(parents=True, exist_ok=True)
+    _write_wavelength_fragment(vault, "frag-wavecli00002")
     result = runner.invoke(
         app,
         [
@@ -1472,7 +1645,8 @@ def test_report_wavelength_monthly_command(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "Wavelength monthly report generated" in result.output
+    assert "non-prescriptive" in result.output.lower()
+    assert list((vault / "05-Wavelength" / "Phase-Maps").glob("*.md"))
 
 
 def test_report_wavelength_unknown_period_errors(tmp_path: Path) -> None:
@@ -1496,7 +1670,7 @@ def test_report_wavelength_unknown_period_errors(tmp_path: Path) -> None:
 
 
 def test_report_command() -> None:
-    """Test that report command runs with required args."""
+    """An unrecognised report type (`summary`) errors with the valid list (#716)."""
     result = runner.invoke(
         app,
         [
@@ -1509,7 +1683,9 @@ def test_report_command() -> None:
             "/fake/vault",
         ],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 2
+    assert "summary" in result.output
+    assert "Would report" not in result.output
 
 
 def test_review_help() -> None:

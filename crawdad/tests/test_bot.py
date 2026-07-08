@@ -43,7 +43,6 @@ class _FakeMessage:
 def config(tmp_path: Path) -> CrawDadConfig:
     return CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],
@@ -645,7 +644,6 @@ async def test_handle_message_respects_configured_max_loop_rounds(
 
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],
@@ -1154,7 +1152,6 @@ async def test_attachment_path_oversized_file_is_rejected_in_reply(
 
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],
@@ -1190,7 +1187,6 @@ async def test_attachment_path_uses_channel_tier_override_when_configured(
 
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],
@@ -1714,7 +1710,6 @@ async def test_consent_type_disambiguation_question_then_ingest(
     # — the default allow list rejects unknown extensions at the boundary.
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],
@@ -2194,7 +2189,6 @@ async def test_consent_forwards_channel_tier_override(
 
     config = CrawDadConfig(
         discord_bot_token="t",
-        anthropic_api_key="k",
         vault_path=tmp_path,
         allowed_user_ids=[111],
         allowed_channel_ids=[999],

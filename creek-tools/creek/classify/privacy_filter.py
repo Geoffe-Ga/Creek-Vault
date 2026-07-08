@@ -6,6 +6,11 @@ contribute summaries (not full bodies). This module owns the *one*
 implementation of that promise so ``mine``, ``draft``, ``report``, and
 ``skills`` cannot drift out of agreement with each other.
 
+:func:`tier_of` is the shared, fail-closed tier-extraction primitive (it maps an
+unrecognised ``privacy_tier`` to ``INTIMATE``). It is also used outside
+generation — per-tier classification routing (#666) calls it to decide whether a
+fragment must be classified locally — so keep it public and behaviour-stable.
+
 The filter accepts an optional :class:`PrivacyTierOverride` representing
 the operator-supplied ``--include-tier`` flag. When the override raises
 the included tier above the default, the caller is responsible for
@@ -96,6 +101,46 @@ def _allows_full_personal_body(override: PrivacyTierOverride | None) -> bool:
     )
 
 
+_TIER_RANK: dict[PrivacyTier, int] = {
+    PrivacyTier.OPEN: 0,
+    PrivacyTier.UNCLASSIFIED: 0,
+    PrivacyTier.PERSONAL: 1,
+    PrivacyTier.INTIMATE: 2,
+}
+
+_OVERRIDE_RANK: dict[PrivacyTierOverride, int] = {
+    PrivacyTierOverride.OPEN: 0,
+    PrivacyTierOverride.PERSONAL: 1,
+    PrivacyTierOverride.INTIMATE: 2,
+    PrivacyTierOverride.ALL: 3,
+}
+
+
+def tier_within_override(
+    tier: PrivacyTier,
+    override: PrivacyTierOverride | None,
+) -> bool:
+    """Return whether a *tier* fragment is admitted under *override* (hard cutoff).
+
+    Unlike :func:`filter_fragments` — which *summarises* ``PERSONAL`` bodies and
+    only drops ``INTIMATE`` — this is a strict rank cutoff that **excludes**
+    anything above the override entirely. The Writing Desk needs its evidence to
+    omit above-ceiling fragments outright (#660), not carry summaries. ``None``
+    defaults to ``OPEN`` (the most restrictive); ``ALL`` admits every tier.
+
+    Args:
+        tier: The fragment's privacy tier.
+        override: The admission ceiling, or ``None`` for ``OPEN``.
+
+    Returns:
+        ``True`` when the fragment may enter the evidence.
+    """
+    effective = override or PrivacyTierOverride.OPEN
+    if effective is PrivacyTierOverride.ALL:
+        return True
+    return _TIER_RANK[tier] <= _OVERRIDE_RANK[effective]
+
+
 def filter_fragments_by_tier(
     fragments: Iterable[tuple[Fragment, str]],
     *,
@@ -130,7 +175,7 @@ def filter_fragments_by_tier(
             ``--include-tier``.
     """
     for fragment, body in fragments:
-        tier = _tier_of(fragment)
+        tier = tier_of(fragment)
         if tier == PrivacyTier.INTIMATE and not _allows_intimate(override):
             continue
         if tier == PrivacyTier.PERSONAL and not _allows_full_personal_body(override):
@@ -139,7 +184,7 @@ def filter_fragments_by_tier(
         yield fragment, body
 
 
-def _tier_of(fragment: Fragment) -> PrivacyTier:
+def tier_of(fragment: Fragment) -> PrivacyTier:
     """Return the fragment's privacy tier as a :class:`PrivacyTier`.
 
     Pydantic's :class:`~creek.models.Fragment` validator constrains

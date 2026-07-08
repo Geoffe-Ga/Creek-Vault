@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
 from creek.ingest.base import (
     Ingestor,
+    IngestResult,
     ParsedFragment,
     RawDocument,
     normalize_timestamp,
@@ -734,3 +736,163 @@ class DiscordIngestor(Ingestor):
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()
         return frontmatter_dict
+
+
+# ---- Bot-capture consumption (#687) ----
+#
+# The CrawDad bot-capture path logs each message to
+# ``<capture_dir>/<channel>/<date>.jsonl`` — one JSON object per line in the
+# lowercase message schema this ingestor already reads (``id`` / ``timestamp`` /
+# ``content`` / ``author`` / optional ``reference``). To consume it without a
+# parser rewrite, the helpers below reshape the capture dir into the
+# Data-Package layout (``messages/<channel>/messages.json`` + ``channel.json``)
+# that :meth:`DiscordIngestor.discover` expects.
+
+
+def _capture_sort_key(message: dict[str, Any]) -> str:
+    """Chronological sort key — the ISO-8601 ``timestamp`` (UTC, so lexical)."""
+    return str(message.get("timestamp", ""))
+
+
+def _read_capture_messages(channel_dir: Path) -> list[dict[str, Any]]:
+    """Read every JSONL line under one capture channel dir, deduped and sorted.
+
+    Discord message ids are stable, so a line repeated across the live stream
+    and a backfill collapses to one message (keyed by id). Returns the messages
+    sorted chronologically by ``timestamp`` so reply/time grouping stays correct.
+
+    Args:
+        channel_dir: A ``<capture_dir>/<channel>/`` directory of ``*.jsonl``.
+
+    Returns:
+        The deduped, chronologically sorted message dicts.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for jsonl in sorted(channel_dir.glob("*.jsonl")):
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed capture line in %s", jsonl)
+                continue
+            if isinstance(obj, dict) and obj.get("id"):
+                by_id[str(obj["id"])] = obj
+    return sorted(by_id.values(), key=_capture_sort_key)
+
+
+def stage_capture_as_data_package(capture_dir: Path, staging_dir: Path) -> None:
+    """Reshape a ``discord-capture/`` dir into the Data-Package layout (#687).
+
+    Writes ``staging_dir/messages/<channel>/messages.json`` (deduped by stable
+    message id, chronologically sorted) plus a ``channel.json`` so the existing
+    :class:`DiscordIngestor` reads the captured messages with no parser rewrite.
+
+    Args:
+        capture_dir: The ``<vault>/discord-capture`` root the bot appends to.
+        staging_dir: A scratch dir to materialise the Data-Package layout into.
+    """
+    if not capture_dir.is_dir():
+        return
+    for channel_dir in sorted(capture_dir.iterdir()):
+        if not channel_dir.is_dir():
+            continue
+        messages = _read_capture_messages(channel_dir)
+        if not messages:
+            continue
+        channel = channel_dir.name
+        out_dir = staging_dir / "messages" / channel
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "messages.json").write_text(json.dumps(messages), encoding="utf-8")
+        (out_dir / "channel.json").write_text(
+            json.dumps({"id": channel, "name": channel}), encoding="utf-8"
+        )
+
+
+def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
+    """Assemble + write every parsed fragment; return the written vault paths.
+
+    The shared writer for all three Discord ingest paths — bot-capture
+    (:func:`ingest_capture_dir`), Data Package (:func:`run_discord_data_package`),
+    and the user-token exporter (:meth:`ExporterConnector._ingest`). This
+    **always** writes each fragment — it does not skip existing files — but the
+    path is deterministic (``frag-<sha>``), so re-writing an already-present
+    fragment overwrites the same file in place. Callers that need a "new only"
+    count diff the returned paths against a pre-run snapshot (see
+    :func:`run_discord_data_package`).
+
+    Args:
+        result: The ingestor's result carrying the parsed fragments.
+        vault: The Creek vault to write into.
+
+    Returns:
+        The vault path written for each fragment, in order.
+    """
+    from creek.ingest.base import assemble_ingested_fragment
+    from creek.vault.writer import VaultWriter
+
+    writer = VaultWriter(vault_path=vault)
+    paths: list[Path] = []
+    for parsed in result.fragments:
+        assembled = assemble_ingested_fragment(parsed)
+        paths.append(writer.write_fragment(assembled.fragment, body=assembled.body))
+    return paths
+
+
+def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
+    """Stage + ingest a bot-capture dir into *vault*; return fragments written.
+
+    Idempotent: the messages stage into a **stable** vault-relative path, so the
+    ``frag-<sha>`` id (which hashes the staged source path) is identical across
+    runs. Combined with stable Discord message ids, re-running over an
+    overlapping capture writes no duplicate fragments.
+
+    Args:
+        capture_dir: The ``<vault>/discord-capture`` root the bot appends to.
+        vault: The Creek vault to write fragments into.
+
+    Returns:
+        The number of fragments written this run.
+    """
+    # Stable, deterministic staging path (not a random tempdir) so the
+    # source-path-derived fragment id stays constant across runs. A kill between
+    # the rmtree and ingest leaves an empty/partial staging dir and writes zero
+    # fragments — self-healing: the next run re-stages from the intact capture
+    # dir, so a one-off "0 fragments" in the logs is not data loss.
+    staging = vault / "00-Creek-Meta" / "State" / "discord" / "capture-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    stage_capture_as_data_package(capture_dir, staging)
+    return len(write_fragments(DiscordIngestor().ingest(staging), vault))
+
+
+def run_discord_data_package(vault: Path, package: Path) -> int:
+    """Ingest a downloaded Discord Data Package into *vault*; return new count (#688).
+
+    The clean, always-available compliant path. The existing
+    :class:`DiscordIngestor` reads the package in place (``messages/<channel>/``)
+    with no reshape and no parser rewrite. Stable Discord message ids make a
+    re-pointed or overlapping package a clean **no-op**: only fragments whose
+    vault file did not already exist are counted as ingested, so there is no
+    LLM/link re-spend on already-seen messages. The token-bearing modes
+    (exporter/bot-capture) are unaffected — this path carries no secret.
+
+    Args:
+        vault: The Creek vault to write fragments into.
+        package: Path to the downloaded Discord Data Package root (the dir
+            containing ``messages/``).
+
+    Returns:
+        The number of **newly created** fragments this run (overwrites of
+        already-present fragments are not counted).
+    """
+    fragments_root = vault / "01-Fragments"
+    before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()
+    written = write_fragments(DiscordIngestor().ingest(package), vault)
+    # New = distinct written paths that did not pre-exist. `set(written)` also
+    # collapses any duplicate path emitted within a single run, so a fragment is
+    # counted at most once.
+    return len(set(written) - before)

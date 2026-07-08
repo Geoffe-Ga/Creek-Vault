@@ -436,10 +436,23 @@ their own interests, or a co-author."""
 Representativeness = Literal["self", "endorsed", "aspirational", "reference"]
 """How closely an author's material stands for the vault owner's own views."""
 
+Audience = Literal["audience-facing", "private", "mixed"]
+"""Attribution axis (#634): was this fragment written *for an audience*?
+
+``audience-facing`` — essays, Substack posts, published long-form: the
+register the voice proxy should imitate. ``private`` — journals, DMs,
+casual chat: real but not the public voice. ``mixed`` — the safe default
+before classification and the verdict when signals are ambiguous. This axis
+is orthogonal to :data:`Representativeness` (who the words belong to) and to
+:class:`PrivacyTier` (who may see them); it scopes VOICE only and never
+gates the knowledge/retrieval corpus.
+"""
+
 # Derive the allowed-value sets from the Literal types so they can never drift
 # out of sync when a new kind/representativeness is added.
 _AUTHOR_KINDS: frozenset[str] = frozenset(get_args(AuthorKind))
 _REPRESENTATIVENESS: frozenset[str] = frozenset(get_args(Representativeness))
+_AUDIENCES: frozenset[str] = frozenset(get_args(Audience))
 
 
 def _warn_fail_closed(
@@ -623,6 +636,12 @@ class FragmentSource(BaseModel):
     kind: SourceKind = SourceKind.UNCLASSIFIED
     original_file: str | None = None
     original_encoding: str | None = None
+    # Issue #672 / SPEC R1: stable vault-relative identity of a *mutable*
+    # source unit (e.g. a journal ``.md``), keyed by the SourceLedger so a
+    # re-ingested edit can update the same fragment in place rather than mint
+    # a new id. ``None`` for sources that don't set it — append-only event
+    # sources keep their content-hashed ids.
+    origin_key: str | None = None
     conversation_id: str | None = None
     channel: str | None = None
     interlocutor: str | None = None
@@ -727,6 +746,11 @@ class Fragment(BaseModel):
     # never crashes a vault scan (matching :class:`AuthorManifest`).
     voice_weight: float = 1.0
     representativeness: Representativeness = "self"
+    # Attribution axis (#634): whether the fragment was written for an
+    # audience. Defaults to ``mixed`` so every pre-#634 fragment is neutral
+    # until the audience classifier runs — additive and backward-compatible,
+    # and fails closed to ``mixed`` so a corrupt value never crashes a scan.
+    audience: Audience = "mixed"
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
     # Timestamp the source itself records (a Substack post's publish
@@ -783,6 +807,15 @@ class Fragment(BaseModel):
             return value
         _warn_fail_closed("Fragment representativeness", value, "self")
         return "self"
+
+    @field_validator("audience", mode="before")
+    @classmethod
+    def _coerce_audience(cls, value: object) -> str:
+        """Fail closed to ``mixed`` for an unrecognised ``audience`` value."""
+        if isinstance(value, str) and value in _AUDIENCES:
+            return value
+        _warn_fail_closed("Fragment audience", value, "mixed")
+        return "mixed"
 
     # BUG-009: the ``[prop-decorator]`` suppression below is a known
     # mypy / Pydantic-v2 limitation when stacking ``@computed_field``

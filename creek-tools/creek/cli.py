@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from creek.classify.privacy_filter import (
@@ -23,7 +27,12 @@ from creek.classify.privacy_filter import (
 from creek.config import AIStyleConfig, load_config, resolve_config_path
 from creek.consent import ConsentManager
 from creek.models import PrivacyTier
-from creek.pipeline import Pipeline, RedactionRequiredError
+from creek.pipeline import (
+    Pipeline,
+    RedactionRequiredError,
+    resolve_tier_a_plan,
+    resolve_tier_b_plan,
+)
 from creek.save import SaveTarget
 
 logger = logging.getLogger(__name__)
@@ -45,8 +54,9 @@ if TYPE_CHECKING:
     )
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
+    from creek.ingest.discord_dispatch import DiscordMode
     from creek.link.link_engine import LinkSummary
-    from creek.models import CompileTargetKind, Frequency, Mode, Phase
+    from creek.models import CompileTargetKind, Fragment, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 
@@ -303,12 +313,40 @@ def _resolve_ingestor(type_name: str) -> type[Ingestor]:
     return cls
 
 
+def _parse_since_arg(text: str) -> datetime:
+    """Parse a ``--since`` argument as an ISO timestamp or a duration (#677).
+
+    Accepts an ISO-8601 timestamp (e.g. ``2026-06-25T00:00:00``, as the ledger
+    records ``last_seen``) or a ``creek lint``-style duration (``7d``, ``1w``,
+    ``1mo``). Naive ISO timestamps are treated as UTC. Exits with code 2 on an
+    unparseable value.
+    """
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        from creek.lint import parse_since  # public re-export of runner.parse_since
+
+        try:
+            return parse_since(text)
+        except ValueError as exc:
+            console.print(
+                f"[red]Invalid --since {text!r}: expected an ISO timestamp "
+                "(2026-06-25T00:00:00) or a duration (7d, 1w, 1mo).[/red]",
+            )
+            raise typer.Exit(code=2) from exc
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
     source_type: str,
     input_path: Path,
     vault_path: Path,
+    reclassify_threshold: float = 0.0,
+    print_summary: bool = False,
+    since: datetime | None = None,
+    incremental: bool = False,
 ) -> tuple[int, list[str], int]:
     """Run a single ingestor and persist its output to the vault.
 
@@ -317,6 +355,16 @@ def _run_ingest(
         source_type: Registry key, used to prefix error messages.
         input_path: Source directory or file to ingest.
         vault_path: Vault root for :class:`VaultWriter`.
+        reclassify_threshold: Body-similarity floor below which a materially
+            edited mutable unit is flagged for re-classification (#675). ``0.0``
+            (the default, used by tests/internal callers) always preserves.
+        print_summary: When ``True``, print a created/updated/tombed summary
+            line (the ``creek ingest`` surface; #675).
+        since: Incremental cutoff (#677). When set, only units newer than this
+            timestamp are processed; older units are skipped.
+        incremental: Ledger-driven incremental mode (#677). When ``True`` and
+            *since* is ``None``, units whose ledger content-hash is unchanged
+            are skipped. Ignored for sources without a ledger.
 
     Returns:
         Tuple of ``(written_count, errors, discovered)`` where ``errors`` is a
@@ -326,38 +374,29 @@ def _run_ingest(
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
     """
-    from creek.ingest.base import assemble_ingested_fragment
-    from creek.vault.writer import VaultWriter
+    from creek.ingest.pipeline import run_ingest
 
     try:
-        writer = VaultWriter(vault_path=vault_path)
+        result = run_ingest(
+            ingestor_cls=ingestor_cls,
+            source_type=source_type,
+            input_path=input_path,
+            vault_path=vault_path,
+            reclassify_threshold=reclassify_threshold,
+            since=since,
+            incremental=incremental,
+        )
     except FileNotFoundError as exc:
         console.print(f"[red]Vault unavailable: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    ingest_result = ingestor_cls().ingest(input_path)
-
-    errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
-    written = 0
-    for parsed in ingest_result.fragments:
-        try:
-            assembled = assemble_ingested_fragment(parsed)
-        except (KeyError, ValueError) as exc:
-            errors.append(
-                f"[{source_type}] failed to assemble fragment from "
-                f"{parsed.source_path}: {exc}",
-            )
-            continue
-        try:
-            writer.write_fragment(assembled.fragment, body=assembled.body)
-        except (OSError, KeyError) as exc:
-            errors.append(
-                f"[{source_type}] failed to write {assembled.fragment.id}: {exc}",
-            )
-            continue
-        written += 1
-
-    return written, errors, ingest_result.discovered
+    if print_summary:
+        console.print(
+            f"[dim]Ingest summary: {result.created} created, "
+            f"{result.updated} updated, {result.tombed} tombed, "
+            f"{result.skipped} skipped[/dim]",
+        )
+    return result.written, result.errors, result.discovered
 
 
 def _warn_if_discovered_but_empty(
@@ -487,6 +526,577 @@ def init(
         )
 
 
+def _sync_state_path(vault_path: Path) -> Path:
+    """Return the sync last-run state file path."""
+    return vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
+
+
+def _write_sync_state(
+    vault_path: Path,
+    tier: str,
+    *,
+    dry_run: bool,
+    source_counts: dict[str, int] | None = None,
+) -> dict[str, object] | None:
+    """Write the sync last-run state, returning the prior state if any (#676).
+
+    Keeps the #676 top-level keys (``tier``/``at``/``dry_run``) and adds a
+    backward-compatible per-source ``sources`` block (#680): each enabled source
+    records its last ``{tier, at, ingested}``. Sources untouched by this run
+    keep their prior entry, so ``--status`` always reflects the latest run of
+    each source.
+    """
+    state_path = _sync_state_path(vault_path)
+    prior: dict[str, object] | None = None
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            prior = loaded if isinstance(loaded, dict) else None
+        except (OSError, json.JSONDecodeError):
+            prior = None
+    now = datetime.now(UTC).isoformat()
+    prior_sources = prior.get("sources", {}) if isinstance(prior, dict) else {}
+    # Guard against a corrupted file where "sources" is not a dict.
+    sources = dict(prior_sources) if isinstance(prior_sources, dict) else {}
+    for name, ingested in (source_counts or {}).items():
+        sources[name] = {"tier": tier, "at": now, "ingested": ingested}
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {"tier": tier, "at": now, "dry_run": dry_run, "sources": sources}
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return prior
+
+
+def _sync_status(vault_path: Path) -> None:
+    """Print the per-source last-run + counts from last-run.json (#680)."""
+    state_path = _sync_state_path(vault_path)
+    if not state_path.exists():
+        console.print("[yellow]No sync has run yet (no last-run.json).[/yellow]")
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        console.print("[red]last-run.json is unreadable.[/red]")
+        return
+    dry = " (dry-run)" if state.get("dry_run") else ""
+    console.print(
+        f"[bold]Last sync:[/bold] tier={state.get('tier')}{dry} at {state.get('at')}",
+    )
+    sources = state.get("sources", {})
+    if not isinstance(sources, dict) or not sources:
+        console.print("[dim](no per-source runs recorded yet)[/dim]")
+        return
+    table = Table("source", "last tier", "last run", "ingested")
+    for name, entry in sorted(sources.items()):
+        cells = entry if isinstance(entry, dict) else {}
+        table.add_row(
+            name,
+            str(cells.get("tier", "")),
+            str(cells.get("at", "")),
+            str(cells.get("ingested", "")),
+        )
+    console.print(table)
+
+
+def _sync_tier_a(
+    enabled_sources: list[str],
+    source: str | None,
+) -> None:
+    """Echo the Tier-A per-source plan (dry-run skeleton)."""
+    sources = [source] if source is not None else enabled_sources
+    console.print(
+        f"[sync] tier=A (dry-run) enabled sources: "
+        f"{', '.join(sources) if sources else '(none)'}",
+    )
+    for name in sources:
+        plan = " -> ".join(resolve_tier_a_plan(name))
+        console.print(f"[sync] plan ({name}): {plan}")
+
+
+def _sync_tier_b() -> None:
+    """Echo the Tier-B global plan (dry-run skeleton)."""
+    console.print("[sync] tier=B (dry-run) global passes")
+    console.print(f"[sync] plan: {' -> '.join(resolve_tier_b_plan())}")
+
+
+# ---- creek sync: real tier execution (#678) ----------------------------
+
+
+def _sync_source_input(source: str, config: CreekConfig) -> Path | None:
+    """Resolve the local input path for a Tier-A source, or ``None`` (#678)."""
+    rel = getattr(config.sources, source, None)
+    if not isinstance(rel, str):
+        return None
+    return config.source_drive / rel
+
+
+def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
+    """Pull a remote source into staging (Tier A, #678).
+
+    Only Google Drive has a pull step today (it mirrors files into a local
+    staging directory via the existing read-only downloader); local sources
+    such as the journal are already on disk and no-op here. Connector
+    generalisation is a later epic. (``_vault_path`` is unused but kept so all
+    step helpers share a uniform ``(source, config, vault_path)`` shape.)
+    """
+    if source != "gdrive":
+        return
+    from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
+
+    client = GoogleApiDriveClient(config.google_drive)
+    if not client.is_available():
+        console.print(
+            "[yellow][sync] Google Drive libraries unavailable; skipping pull."
+            "[/yellow]",
+        )
+        return
+    staging = config.source_drive / config.google_drive.staging_dir
+    GoogleDriveDownloader(client=client, config=config.google_drive).download_all(
+        staging,
+    )
+
+
+def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> int:
+    """Incrementally ingest one Tier-A source; return the units processed (#678).
+
+    Returns ``0`` when the source has no ingestor (e.g. gdrive) or its path is
+    missing — both are logged so a scheduled run's no-ops are diagnosable.
+    """
+    from creek.ingest import INGESTOR_REGISTRY
+    from creek.pipeline import sync_ingest_type
+
+    ingest_type = sync_ingest_type(source)
+    ingestor_cls = INGESTOR_REGISTRY.get(ingest_type)
+    if ingestor_cls is None:
+        return 0  # e.g. gdrive is a downloader, not an ingestor
+    input_path = _sync_source_input(source, config)
+    if input_path is None or not input_path.exists():
+        console.print(
+            f"[yellow][sync] skipping {source}: source path not found "
+            f"({input_path}).[/yellow]",
+        )
+        logger.info("sync.tier_a.skip source=%s reason=path-missing", source)
+        return 0
+    written, _errors, _discovered = _run_ingest(
+        ingestor_cls=ingestor_cls,
+        source_type=ingest_type,
+        input_path=input_path,
+        vault_path=vault_path,
+        reclassify_threshold=config.classification.reclassify_on_edit_threshold,
+        incremental=True,
+    )
+    logger.info("sync.tier_a.ingest source=%s ingested=%d", source, written)
+    return written
+
+
+def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> None:
+    """Run a classify pass for a sync tier (#678)."""
+    from creek.classify.classify_engine import run_classify
+
+    run_classify(vault_path=vault_path, config=config, method=method, force=False)
+
+
+def _sync_link(vault_path: Path, config: CreekConfig) -> None:
+    """Run the embeddings linker — Tier B only (R6, #678)."""
+    from creek.link.link_engine import run_link
+
+    run_link(vault_path=vault_path, config=config, method="embeddings", rebuild=False)
+
+
+def _sync_index(vault_path: Path) -> None:
+    """Regenerate index notes — Tier B only (R6, #678)."""
+    from creek.generate.indexes import IndexGenerator
+
+    IndexGenerator(vault_path=vault_path).generate_all()
+
+
+def _sync_run_tier_a(
+    config: CreekConfig,
+    vault_path: Path,
+    sources: list[str],
+) -> dict[str, int]:
+    """Execute Tier A; return per-source ingested counts (#678/#680).
+
+    Per source: pull + incremental ingest, then one rules-classify pass.
+    Linking and indexing are **never** invoked here (R6: they are O(n²)/global
+    and belong to Tier B).
+    """
+    counts: dict[str, int] = {}
+    for source in sources:
+        _sync_pull(source, config, vault_path)
+        counts[source] = _sync_ingest_source(source, config, vault_path)
+    _sync_classify(vault_path, config, "rules")
+    logger.info("sync.tier_a.done count=%d", len(sources))
+    return counts
+
+
+def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
+    """Execute Tier B globally: llm classify -> link -> index (#678)."""
+    _sync_classify(vault_path, config, "llm")
+    _sync_link(vault_path, config)
+    _sync_index(vault_path)
+    logger.info("sync.tier_b.done")
+
+
+def _sync_dispatch(
+    tier_norm: str,
+    *,
+    dry_run: bool,
+    config: CreekConfig,
+    vault_path: Path,
+    source: str | None,
+) -> dict[str, int] | None:
+    """Echo (dry-run) or execute the chosen sync tier; return Tier-A counts.
+
+    Returns the per-source ingested counts for a real Tier-A run (for the
+    status file), or ``None`` for dry-run / Tier-B runs.
+    """
+    if tier_norm == "A":
+        if dry_run:
+            _sync_tier_a(config.sync.enabled_sources(), source)
+            return None
+        # An explicit --source overrides the enable toggle (the operator
+        # asked for it by name); otherwise run the enabled set.
+        sources = [source] if source is not None else config.sync.enabled_sources()
+        return _sync_run_tier_a(config, vault_path, sources)
+    if dry_run:
+        _sync_tier_b()
+    else:
+        _sync_run_tier_b(config, vault_path)
+    return None
+
+
+def _install_launchd(
+    vault_path: Path,
+    minutes: int,
+    hour: int,
+    out_dir: Path | None,
+) -> None:
+    """Write both launchd plists and print activation instructions."""
+    from creek.sync import render_launchd_plists
+
+    plists = render_launchd_plists(
+        vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour
+    )
+    base = out_dir or (Path.home() / "Library" / "LaunchAgents")
+    base.mkdir(parents=True, exist_ok=True)
+    tier_a = base / plists.tier_a_filename
+    tier_b = base / plists.tier_b_filename
+    tier_a.write_text(plists.tier_a, encoding="utf-8")
+    tier_b.write_text(plists.tier_b, encoding="utf-8")
+    console.print(f"# wrote {tier_a}")
+    console.print(f"# wrote {tier_b}")
+    console.print(f"# To activate: launchctl load {tier_a} && launchctl load {tier_b}")
+
+
+def _install_systemd(
+    vault_path: Path,
+    minutes: int,
+    hour: int,
+    out_dir: Path | None,
+) -> None:
+    """Write systemd service+timer units (and print the cron alternative)."""
+    from creek.sync import render_crontab, render_systemd_units
+
+    units = render_systemd_units(
+        vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour
+    )
+    base = out_dir or (Path.home() / ".config" / "systemd" / "user")
+    base.mkdir(parents=True, exist_ok=True)
+    for fname, content in (
+        (units.tier_a_service_filename, units.tier_a_service),
+        (units.tier_a_timer_filename, units.tier_a_timer),
+        (units.tier_b_service_filename, units.tier_b_service),
+        (units.tier_b_timer_filename, units.tier_b_timer),
+    ):
+        (base / fname).write_text(content, encoding="utf-8")
+        console.print(f"# wrote {base / fname}")
+    console.print(
+        "# To activate: systemctl --user enable --now "
+        "creek-sync-tier-a.timer creek-sync-tier-b.timer",
+    )
+    console.print("# Or as cron (crontab -e):")
+    cron = render_crontab(vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour)
+    for line in cron.splitlines():
+        console.print(f"#   {line}")
+
+
+def _install_schedule(host: str, vault: Path | None, out_dir: Path | None) -> None:
+    """Emit schedule units for *host* (launchd|systemd), parametrised by config."""
+    if host not in {"launchd", "systemd"}:
+        console.print("[red]--install-schedule must be launchd or systemd[/red]")
+        raise typer.Exit(code=2)
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    minutes = config.sync.tier_a_interval_minutes
+    hour = config.sync.tier_b_hour
+    if host == "launchd":
+        _install_launchd(vault_path, minutes, hour, out_dir)
+    else:
+        _install_systemd(vault_path, minutes, hour, out_dir)
+    console.print(
+        "# Tokens (OAuth) read from this host's keychain/env; "
+        "see docs/sync-scheduling.md",
+    )
+
+
+def _sync_validate_source(
+    tier_norm: str,
+    source: str | None,
+    config: CreekConfig,
+) -> None:
+    """Reject a Tier-B ``--source`` or an unknown source name (exits 2)."""
+    if source is None:
+        return
+    if tier_norm == "B":
+        # --source is a Tier-A concept; Tier B always runs the global passes.
+        console.print("[red]--source is not supported with --tier B.[/red]")
+        raise typer.Exit(code=2)
+    if source not in config.sync.sources:
+        known = ", ".join(sorted(config.sync.sources))
+        console.print(
+            f"[red]Unknown --source '{source}'. Known sources: {known}.[/red]",
+        )
+        raise typer.Exit(code=2)
+
+
+@app.command()
+def sync(
+    tier: str = typer.Option(
+        "A", "--tier", help="A (cheap, per-source) or B (nightly)"
+    ),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Limit a Tier-A run to one source (explicitly overrides its toggle)",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Echo the plan without executing (current default)"
+    ),
+    install_schedule: str | None = typer.Option(
+        None,
+        "--install-schedule",
+        help="Emit schedule units for a host (launchd|systemd) and exit",
+    ),
+    schedule_out_dir: Path | None = typer.Option(
+        None,
+        "--schedule-out-dir",
+        help="Directory to write emitted schedule units (default: host standard)",
+    ),
+    status: bool = typer.Option(
+        False,
+        "--status",
+        help="Show the per-source last run + counts from last-run.json and exit",
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Run a scheduled sync pass, emit schedule units, or show status.
+
+    ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
+    rules classify) for each enabled source; ``--tier B`` is the nightly global
+    pass (LLM classify -> link -> index). Linking and indexing run only in Tier
+    B (R6). ``--dry-run`` echoes the ordered plan without executing. Every run
+    records ``00-Creek-Meta/State/sync/last-run.json``; because every step is
+    idempotent, a missed tick self-heals on the next run (no catch-up queue).
+
+    ``--install-schedule launchd|systemd`` emits the host's schedule units and
+    exits; ``--status`` prints the per-source last-run table and exits.
+    """
+    if status:
+        # Status only needs the vault path; avoid loading (and possibly failing
+        # on) the config when --vault is explicitly given.
+        _sync_status(vault or _load_config_for_vault(None).vault_path)
+        return
+
+    if install_schedule is not None:
+        _install_schedule(install_schedule, vault, schedule_out_dir)
+        return
+
+    tier_norm = tier.upper()
+    if tier_norm not in {"A", "B"}:
+        console.print("[red]--tier must be A or B[/red]")
+        raise typer.Exit(code=2)
+
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    _sync_validate_source(tier_norm, source, config)
+
+    source_counts = _sync_dispatch(
+        tier_norm,
+        dry_run=dry_run,
+        config=config,
+        vault_path=vault_path,
+        source=source,
+    )
+
+    prior = _write_sync_state(
+        vault_path, tier_norm, dry_run=dry_run, source_counts=source_counts
+    )
+    if prior is not None:
+        console.print(
+            f"[sync] (previous run: tier={prior.get('tier')} at {prior.get('at')})",
+        )
+    mode = "planned" if dry_run else "ran"
+    console.print(f"[sync] {mode} tier={tier_norm}; wrote last-run.json")
+
+
+def _parse_discord_mode(mode: str) -> DiscordMode:
+    """Parse a ``--mode`` string into a :class:`DiscordMode`, or exit 2 (#685)."""
+    from creek.ingest.discord_dispatch import DiscordMode
+
+    try:
+        return DiscordMode(mode)
+    except ValueError:
+        valid = ", ".join(m.value for m in DiscordMode)
+        console.print(f"[red]Unknown --mode '{mode}'. Valid: {valid}.[/red]")
+        raise typer.Exit(code=2) from None
+
+
+def _run_discord_exporter(
+    config: CreekConfig,
+    vault_path: Path,
+    binary: str,
+) -> None:
+    """Run the real opt-in DM exporter connector (#686)."""
+    import subprocess
+
+    from creek.ingest.discord_dispatch import (
+        ExporterConnector,
+        SubprocessExporterRunner,
+        TokenMissingError,
+    )
+
+    runner = SubprocessExporterRunner(
+        binary, timeout_seconds=config.discord.exporter_timeout_seconds
+    )
+    try:
+        ExporterConnector(config.discord, runner, vault_path).run()
+    except TokenMissingError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]Discord exporter failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print("[green][discord] exporter run complete; staged + ingested.[/green]")
+
+
+def _run_discord_data_package(vault_path: Path, package: Path) -> None:
+    """Ingest a downloaded Discord Data Package incrementally (#688).
+
+    The clean, always-available compliant path — no token, no ToS concern. Stable
+    Discord ids make a re-pointed package a clean no-op (only new messages cost).
+    """
+    from creek.ingest.discord import run_discord_data_package
+
+    if not package.exists():
+        console.print(f"[red]Data Package path does not exist: {package}[/red]")
+        raise typer.Exit(code=1)
+    if not package.is_dir():
+        console.print(
+            f"[red]Data Package must be the unzipped export directory, "
+            f"not a file: {package}[/red]"
+        )
+        raise typer.Exit(code=1)
+    new_count = run_discord_data_package(vault_path, package)
+    console.print(
+        f"[green][discord] data_package ingested {new_count} new fragment(s).[/green]"
+    )
+
+
+def _run_real_discord_mode(
+    selected: DiscordMode,
+    config: CreekConfig,
+    vault_path: Path,
+    *,
+    dry_run: bool,
+    package: Path | None,
+) -> bool:
+    """Run the exporter / Data Package helper if its gate is met (#686/#688).
+
+    Returns ``True`` when a real ingest ran (the caller should stop), ``False``
+    when no real path applies and the caller should fall back to the echo plan.
+    """
+    from creek.ingest.discord_dispatch import DiscordMode
+
+    if dry_run:
+        return False
+    discord = config.discord
+    binary = discord.exporter_binary
+    if selected is DiscordMode.EXPORTER and discord.exporter.enabled and binary:
+        _run_discord_exporter(config, vault_path, binary)
+        return True
+    if (
+        selected is DiscordMode.DATA_PACKAGE
+        and discord.data_package.enabled
+        and package is not None
+    ):
+        _run_discord_data_package(vault_path, package)
+        return True
+    return False
+
+
+def _dispatch_discord(
+    selected: DiscordMode,
+    config: CreekConfig,
+    vault_path: Path,
+    *,
+    dry_run: bool,
+    package: Path | None = None,
+) -> None:
+    """Run the exporter / Data Package helper, else echo the mode plan (#686/#688)."""
+    from creek.ingest.discord_dispatch import ModeDisabledError, resolve_discord_handler
+
+    if _run_real_discord_mode(
+        selected, config, vault_path, dry_run=dry_run, package=package
+    ):
+        return
+
+    try:
+        handler = resolve_discord_handler(selected, config.discord)
+    except ModeDisabledError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    handler.announce()
+    for line in handler.plan():
+        console.print(line)
+    if not dry_run:
+        console.print(
+            "[dim][discord] echo only — pass --package <path> for data_package, "
+            "set discord.exporter_binary for the exporter, or run the bot for "
+            "bot_capture.[/dim]",
+        )
+
+
+@app.command()
+def discord(
+    mode: str = typer.Option(
+        ..., "--mode", help="data_package | exporter | bot_capture"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Echo the plan without running"
+    ),
+    package: Path | None = typer.Option(
+        None, "--package", help="Path to a downloaded Discord Data Package to ingest"
+    ),
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Dispatch a Discord ingest mode (#685/#686/#688).
+
+    Resolves ``--mode`` against the configured Discord toggles. When
+    ``exporter`` is enabled and ``discord.exporter_binary`` is set (and not
+    ``--dry-run``), runs the real opt-in user-token DM exporter. When
+    ``data_package`` is selected with ``--package <path>`` (and not
+    ``--dry-run``), incrementally ingests the downloaded Data Package. Otherwise
+    echoes the mode's plan. The ``exporter`` mode is opt-in (off by default) and
+    prints a Terms-of-Service caveat. The Discord token lives in the
+    environment, never in config; the Data Package path carries no token.
+    """
+    selected = _parse_discord_mode(mode)
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    _dispatch_discord(selected, config, vault_path, dry_run=dry_run, package=package)
+
+
 @app.command()
 def process(
     source: Path | None = typer.Option(None, help="Source directory to process"),
@@ -605,6 +1215,22 @@ def ingest(
             "fragments (likely an unrecognized export format)."
         ),
     ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help=(
+            "Incremental: only process units newer than this ISO timestamp "
+            "(e.g. 2026-06-25T00:00:00) or duration (e.g. 7d, 1w)."
+        ),
+    ),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        help=(
+            "Incremental: skip units whose content is unchanged vs the ledger "
+            "(ledger-driven; overridden by --since)."
+        ),
+    ),
 ) -> None:
     """Ingest a specific source type into the vault.
 
@@ -648,11 +1274,17 @@ def ingest(
         assume_yes=yes,
     )
 
+    since_dt = _parse_since_arg(since) if since is not None else None
+
     written, errors, discovered = _run_ingest(
         ingestor_cls=ingestor_cls,
         source_type=type,
         input_path=input,
         vault_path=vault_path,
+        reclassify_threshold=config.classification.reclassify_on_edit_threshold,
+        print_summary=True,
+        since=since_dt,
+        incremental=incremental,
     )
 
     console.print(f"[bold green]Ingested {written} fragment(s).[/bold green]")
@@ -839,7 +1471,7 @@ def redact(
 
 
 _CLASSIFY_METHODS = ("rules", "llm")
-_LINK_METHODS = ("embeddings", "temporal", "eddies")
+_LINK_METHODS = ("embeddings", "temporal", "eddies", "threads")
 _REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
 
 
@@ -847,50 +1479,73 @@ _CLASSIFY_METHOD_HELP: str = (
     "Classification method (rules|llm). "
     "'rules' is local and offline. 'llm' calls the provider configured "
     "under llm: in creek_config.yaml; the default 'ollama' provider is "
-    "local, while 'anthropic' requires both ANTHROPIC_API_KEY and "
-    "CREEK_ANTHROPIC_CONSENT=1 to be set in the environment before the "
-    "run (data-egress acknowledgement; see issue #320)."
+    "local, while any cloud provider (e.g. 'anthropic') requires its API "
+    "key plus CREEK_CLOUD_CONSENT=1 (the legacy CREEK_ANTHROPIC_CONSENT is "
+    "still honored) to be set in the environment before the run "
+    "(data-egress acknowledgement; see issue #320)."
 )
 
 
-def _preflight_anthropic_consent(config: CreekConfig) -> None:
-    """Abort early when ``--method llm`` will hit the Anthropic consent gate.
+def _preflight_cloud_consent(config: CreekConfig) -> None:
+    """Abort early when ``--method llm`` will hit a cloud-consent gate.
 
-    Issue #320: previously the consent requirement only surfaced once
-    :class:`creek.classify.llm.providers.AnthropicProvider` was
-    instantiated mid-classify run, after vault load and first-fragment
-    iteration. This pre-flight inspects the resolved config plus the
-    live process environment and surfaces the exact remediation BEFORE
-    any fragment work begins.
+    Issue #320: previously the consent requirement only surfaced once the
+    cloud provider was instantiated mid-classify run, after vault load and
+    first-fragment iteration. This pre-flight inspects the resolved config
+    plus the live process environment and surfaces the exact remediation
+    BEFORE any fragment work begins.
 
-    No-ops for any non-anthropic provider, and silent when consent is
-    already on file (the run continues normally).
+    Provider-neutral (#606): it fires for *any* cloud provider via
+    :func:`~creek.classify.llm.providers.provider_is_cloud` and accepts the
+    neutral ``CREEK_CLOUD_CONSENT`` or the legacy ``CREEK_ANTHROPIC_CONSENT``.
+    No-ops for local providers (Ollama), and silent when consent is already on
+    file (the run continues normally).
 
     Args:
         config: Loaded :class:`CreekConfig` for the current invocation.
 
     Raises:
-        typer.Exit: With code ``1`` when the Anthropic provider is
-            selected but ``CREEK_ANTHROPIC_CONSENT`` is missing or not
-            set to a truthy value.
+        typer.Exit: With code ``1`` when a cloud provider is selected but
+            cloud-egress consent is missing.
     """
-    from creek.classify.llm.providers import AnthropicProvider
+    from creek.classify.llm.consent import (
+        CLOUD_CONSENT_ENV,
+        LEGACY_CONSENT_ENV,
+        has_cloud_consent,
+    )
+    from creek.classify.llm.providers import (
+        provider_display_name,
+        provider_is_cloud,
+    )
 
-    if config.llm.provider.strip().lower() != "anthropic":
+    # Per-stage routing (#646): a cloud provider configured for ANY stage
+    # (not just the global default) requires consent — check them all, and name
+    # the offending stage so the operator looks at the right config key.
+    cloud_stage = next(
+        (
+            (label, cfg.provider.strip().lower())
+            for label, cfg in config.llm.iter_stage_configs()
+            if provider_is_cloud(cfg.provider.strip().lower())
+        ),
+        None,
+    )
+    if cloud_stage is None:
         return
-    consent = os.environ.get(AnthropicProvider.CONSENT_ENV, "").strip().lower()
-    if consent in AnthropicProvider.CONSENT_TRUTHY:
+    if has_cloud_consent():
         return
+    stage_label, provider = cloud_stage
+    name = provider_display_name(provider)
     console.print(
-        "[red]Anthropic provider selected in creek_config.yaml "
-        "(llm.provider: anthropic), but cloud classification requires "
-        "explicit consent.[/red]",
+        f"[red]{name} provider configured for the '{stage_label}' LLM stage "
+        f"in creek_config.yaml (llm.{stage_label}.provider: {provider}), but "
+        "cloud processing requires explicit consent.[/red]",
     )
     console.print(
-        f"[yellow]Set [bold]{AnthropicProvider.CONSENT_ENV}=1[/bold] "
-        "(also accepts 'true' or 'yes') to confirm that fragment "
-        "content may be sent to Anthropic's servers, then re-run "
-        "[bold]creek classify --method llm[/bold].[/yellow]",
+        f"[yellow]Set [bold]{CLOUD_CONSENT_ENV}=1[/bold] "
+        "(also accepts 'true' or 'yes'; the legacy "
+        f"[bold]{LEGACY_CONSENT_ENV}[/bold] is still honored) to confirm "
+        f"that fragment content may be sent to {name}'s servers, then "
+        "re-run [bold]creek classify --method llm[/bold].[/yellow]",
     )
     console.print(
         "[dim]To keep classification fully local instead, set "
@@ -996,11 +1651,11 @@ def classify(
 
     config = _load_config_for_vault(vault)
     if method == "llm":
-        # Issue #320: surface the Anthropic consent-env-var gate before
+        # Issue #320 / #606: surface the cloud-egress consent gate before
         # any vault iteration. The provider's own __init__ also raises,
         # but only after the engine has already started — by then the
         # operator has waited through vault load and per-fragment setup.
-        _preflight_anthropic_consent(config)
+        _preflight_cloud_consent(config)
     if reatomize:
         # Late-bind the FEAT-023 CLI overrides into the loaded config so
         # downstream call-sites only ever look at the config object, not
@@ -1130,7 +1785,7 @@ def _run_calibration_cli(
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
-    classifier = LLMClassifier(config=config.llm)
+    classifier = LLMClassifier(config=config.model_router.resolve("classification"))
     report = run_calibration(classifier, load_fixture(resolved))
     console.print(report.render())
 
@@ -1147,7 +1802,7 @@ def link(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     method: str = typer.Option(
         "embeddings",
-        help="Linking method (embeddings|temporal|eddies)",
+        help="Linking method (embeddings|temporal|eddies|threads)",
     ),
     rebuild: bool = typer.Option(
         False,
@@ -1231,10 +1886,330 @@ def _format_link_summary(summary: LinkSummary) -> str:
         body = (
             f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
         )
+    elif summary.method == "threads":
+        body = (
+            f"Threads linker: {fragments} fragment(s) scanned, "
+            f"{summary.threads_detected} thread(s) detected, "
+            f"{summary.threads_written} page(s) written to "
+            "02-Threads/{Active,Dormant,Resolved}/, "
+            f"{summary.member_fragments_updated} fragment(s) updated with "
+            "`threads:` wiki-links."
+        )
     else:
         msg = f"Unknown link method: {summary.method!r}"
         raise ValueError(msg)
     return f"[bold green]{body}[/bold green]"
+
+
+@app.command()
+def index(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+) -> None:
+    """Regenerate the Dataview index notes without running the full pipeline.
+
+    Runs only the index stage: rebuilds the per-frequency indexes under
+    ``06-Frequencies/``, the master thread index, the eddy map, and the temporal
+    and source indexes from whatever fragments and threads already live in the
+    vault. Deterministic and local — no ingest, redact, classify, link, or LLM —
+    so operators who added fragments or re-linked can refresh the indexes in
+    place instead of re-running all of ``process``. Re-running overwrites each
+    note with identical content (idempotent).
+    """
+    from creek.generate.indexes import IndexGenerator
+
+    vault_path = _resolve_vault(vault)
+    generated = IndexGenerator(vault_path=vault_path).generate_all()
+    rel = ", ".join(str(path.relative_to(vault_path)) for path in generated)
+    console.print(
+        f"[bold green]Wrote {len(generated)} index note(s): {rel}[/bold green]",
+    )
+
+
+_FILL_SUMMARY_FOLDERS: tuple[str, ...] = (
+    "02-Threads",
+    "03-Eddies",
+    "04-Praxis",
+    "05-Wavelength",
+    "06-Frequencies",
+    "08-Decisions",
+    "09-Reference",
+    "10-Liminal",
+)
+"""Vault folders whose markdown population ``creek fill`` reports in its summary."""
+
+
+def _build_fill_steps(
+    vault_path: Path,
+    config: CreekConfig,
+    *,
+    with_compost: bool,
+) -> list[tuple[str, Callable[[], object]]]:
+    """Build the ordered ``(label, action)`` plan for ``creek fill``.
+
+    Pure orchestration: each action calls an existing step command/function in
+    dependency order — embeddings/temporal/eddies/thread-page links first (links
+    must precede the thread and eddy pages), then the deterministic reports, then
+    the index regeneration. ``--with-compost`` appends the deterministic compost
+    overview report. No generator logic lives here.
+
+    Args:
+        vault_path: Vault root.
+        config: Loaded Creek configuration (threaded into the link steps).
+        with_compost: When ``True`` append the compost overview report step.
+
+    Returns:
+        The ordered list of ``(label, zero-arg callable)`` steps.
+    """
+    from creek.generate.indexes import IndexGenerator
+    from creek.link.link_engine import run_link
+
+    def _link(method: str) -> Callable[[], object]:
+        return lambda: run_link(
+            vault_path=vault_path, config=config, method=method, rebuild=False
+        )
+
+    steps: list[tuple[str, Callable[[], object]]] = [
+        ("link/embeddings", _link("embeddings")),
+        ("link/temporal", _link("temporal")),
+        ("link/eddies", _link("eddies")),
+        ("link/threads", _link("threads")),
+        ("report/decisions", lambda: _report_decisions(vault_path)),
+        ("report/unnamed", lambda: _report_unnamed(vault_path)),
+        ("report/paradox", lambda: _report_paradox(vault_path)),
+        ("report/synchronicity", lambda: _report_synchronicity(vault_path)),
+        ("report/mode-profiles", lambda: _report_mode_profiles(vault_path)),
+        ("report/wavelength", lambda: _report_wavelength(vault_path, "weekly")),
+        ("index", lambda: IndexGenerator(vault_path=vault_path).generate_all()),
+    ]
+    if with_compost:
+        steps.append(("compost/report", lambda: _fill_compost_report(vault_path)))
+    return steps
+
+
+def _fill_compost_report(vault_path: Path) -> object:
+    """Run the deterministic compost overview report (the opt-in fill step)."""
+    from creek.generate.compost import CompostTracker
+
+    return CompostTracker().generate_compost_report(vault_path)
+
+
+def _count_markdown(folder: Path) -> int:
+    """Count non-hidden markdown files under *folder* (0 when it is absent)."""
+    if not folder.exists():
+        return 0
+    return sum(1 for p in folder.rglob("*.md") if not p.name.startswith("."))
+
+
+def _format_fill_summary(vault_path: Path) -> str:
+    """Render the per-folder population summary line for ``creek fill``."""
+    parts = [
+        f"{name} {_count_markdown(vault_path / name)}" for name in _FILL_SUMMARY_FOLDERS
+    ]
+    return "[bold green][fill] done. " + " | ".join(parts) + "[/bold green]"
+
+
+@dataclass(frozen=True)
+class _ClassifyUpgradeOffer:
+    """A quality-aware classification upgrade ``creek fill`` can offer (#736).
+
+    Attributes:
+        count: Number of ``rules``-classified fragments that a now-available
+            higher-fidelity method would improve.
+        non_intimate_label: ``provider/model`` the non-Intimate route would use.
+        intimate_label: ``provider/model`` the Intimate route would use (always
+            local — Intimate is never proposed a cloud upgrade).
+    """
+
+    count: int
+    non_intimate_label: str
+    intimate_label: str
+
+    def context(self) -> str:
+        """The bold context line printed before the prompt."""
+        return (
+            f"[yellow][fill] {self.count} fragment(s) were classified by `rules`; "
+            "a higher-fidelity method is now available "
+            f"({self.non_intimate_label} for non-Intimate; "
+            f"{self.intimate_label} for Intimate, kept local).[/yellow]"
+        )
+
+    def hint(self) -> str:
+        """The non-interactive hint (printed when no upgrade is performed)."""
+        return (
+            f"[dim][fill] {self.count} `rules`-classified fragment(s) could be "
+            f"upgraded ({self.non_intimate_label} / {self.intimate_label}); "
+            "re-run with --upgrade to apply (Intimate stays local).[/dim]"
+        )
+
+
+def _classification_route_label(config: CreekConfig, *, intimate: bool) -> str:
+    """Return a ``provider/model`` label for the classification route."""
+    from creek.classify.llm.router import IntimateRoutingError
+    from creek.models import PrivacyTier
+
+    router = config.model_router
+    try:
+        cfg = router.resolve(
+            "classification", PrivacyTier.INTIMATE if intimate else None
+        )
+    except IntimateRoutingError:
+        return "rules (no local backend)"
+    return f"{cfg.provider}/{cfg.model}" if cfg.model else cfg.provider
+
+
+def _detect_classify_upgrade(
+    vault_path: Path, config: CreekConfig
+) -> _ClassifyUpgradeOffer | None:
+    """Return an upgrade offer when ``rules`` artifacts could now do better.
+
+    A fragment is upgradeable when it was classified by ``rules`` and its tier's
+    best-available method (per the fidelity ladder) outranks ``rules`` — i.e. an
+    LLM is now reachable. Returns ``None`` when no LLM is available or no
+    ``rules`` fragment would benefit (so the offer never appears spuriously).
+    """
+    from creek.classify.constants import (
+        CLASSIFICATION_METHOD_KEY,
+        RULES_METHOD,
+    )
+    from creek.classify.fidelity import RANK_RULES, best_available
+    from creek.classify.privacy_filter import tier_of
+    from creek.vault.reader import iter_vault_fragments
+
+    best = best_available(config)
+    if not best.any_llm_available():
+        return None
+    upgradeable = 0
+    for _path, fragment, _body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments"
+    ):
+        if raw.get(CLASSIFICATION_METHOD_KEY) != RULES_METHOD:
+            continue
+        if best.for_tier(tier_of(fragment)) > RANK_RULES:
+            upgradeable += 1
+    if upgradeable == 0:
+        return None
+    return _ClassifyUpgradeOffer(
+        count=upgradeable,
+        non_intimate_label=_classification_route_label(config, intimate=False),
+        intimate_label=_classification_route_label(config, intimate=True),
+    )
+
+
+def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
+    """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
+
+    Runs ``classify --method llm`` WITHOUT ``--force``: the resume-skip leaves
+    ``llm``/``manual`` fragments untouched, so only the ``rules`` ones are
+    upgraded, and the per-tier ModelRouter keeps Intimate content local.
+    """
+    from creek.classify.classify_engine import run_classify
+
+    console.print(
+        "[bold green][fill] upgrading classify: rules → LLM "
+        "(non-Intimate per config; Intimate kept local) …[/bold green]"
+    )
+    run_classify(vault_path=vault_path, config=config, method="llm", force=False)
+
+
+def _maybe_upgrade_classification(
+    vault_path: Path, config: CreekConfig, *, upgrade: bool
+) -> None:
+    """Surface / apply a quality-aware classification upgrade before filling.
+
+    Non-interactive default is a safe no-op (never silently overwrites, never
+    silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
+    without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
+    """
+    try:
+        offer = _detect_classify_upgrade(vault_path, config)
+    except Exception as exc:
+        # The upgrade check is best-effort: a provider/config hiccup (an
+        # unexpected build_provider error, a malformed routing block) must not
+        # crash fill before any step runs. Skip the offer and carry on.
+        logger.warning("fill: skipping classify-upgrade check: %s", exc)
+        return
+    if offer is None:
+        return
+    if upgrade:
+        _run_classify_upgrade(vault_path, config)
+        return
+    if not sys.stdin.isatty():
+        console.print(offer.hint())
+        return
+    console.print(offer.context())
+    if typer.confirm("Re-run classification to upgrade?", default=False):
+        _run_classify_upgrade(vault_path, config)
+    else:
+        console.print(
+            "[dim][fill] declined — existing classifications kept "
+            "(second run is a clean no-op).[/dim]"
+        )
+
+
+@app.command()
+def fill(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the plan without running any step."
+    ),
+    with_compost: bool = typer.Option(
+        False,
+        "--with-compost",
+        help="Also run the compost overview report (off by default).",
+    ),
+    upgrade: bool = typer.Option(
+        False,
+        "--upgrade",
+        help=(
+            "Re-classify `rules`-stamped fragments with the best LLM now "
+            "available before filling (Intimate stays local). Non-interactive "
+            "opt-in; without it a TTY is prompted and other runs are a no-op."
+        ),
+    ),
+) -> None:
+    """Run the deterministic vault-population sequence in dependency order.
+
+    An umbrella over the existing per-generator steps: it runs the link stages
+    (embeddings, temporal, eddies, thread-pages), the deterministic reports
+    (decisions, unnamed, paradox, synchronicity, mode-profiles, wavelength), and
+    the index regeneration — so an already-classified, already-embedded vault
+    becomes prod-ready from one command. Classification and embedding are
+    preconditions, not run here.
+
+    Each step is non-fatal: a failure is logged and the sequence continues, so
+    one bad step cannot abort the rest. ``--dry-run`` prints the plan and runs
+    nothing. ``--with-compost`` appends the deterministic compost overview
+    report (the only compost vault-write currently wired). Every underlying step
+    is idempotent, so a second ``creek fill`` is a clean no-op.
+    """
+    config = _load_config_for_vault(vault)
+    vault_path = _resolve_vault(vault)
+    steps = _build_fill_steps(vault_path, config, with_compost=with_compost)
+
+    if dry_run:
+        console.print("[bold]creek fill plan (dry-run, nothing run):[/bold]")
+        for index_, (label, _action) in enumerate(steps, start=1):
+            console.print(f"  {index_:>2}. {label}")
+        return
+
+    # Quality-aware upgrade (#736): offer/apply re-classification of `rules`
+    # fragments before the steps consume them. Safe no-op unless --upgrade or an
+    # interactive yes; the ModelRouter keeps Intimate content local.
+    _maybe_upgrade_classification(vault_path, config, upgrade=upgrade)
+
+    for label, action in steps:
+        console.print(f"[dim][fill] {label} …[/dim]")
+        try:
+            action()
+        except Exception as exc:
+            # Orchestrator contract: a single failing step (missing embedding
+            # model, empty dimension, I/O error) must not abort the remaining
+            # steps. Catch broadly, log, and carry on; the final summary shows
+            # what actually populated.
+            logger.warning("fill step %s failed: %s", label, exc)
+            console.print(f"[yellow][fill] {label} failed: {exc}[/yellow]")
+
+    console.print(_format_fill_summary(vault_path))
 
 
 @app.command(name="compile")
@@ -1284,7 +2259,7 @@ def compile_(
         target_kind=kind,
         target_id=target_id,
         target_title=target_title,
-        llm=default_llm(config.llm),
+        llm=default_llm(config.model_router.resolve("generation")),
     )
     console.print(
         f"[bold green]Compiled {fragment_id} -> {written}[/bold green]",
@@ -1430,26 +2405,99 @@ def _report_mode_profiles(vault_path: Path) -> None:
     )
 
 
+_WAVELENGTH_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+_WAVELENGTH_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
+def _resolve_wavelength_period(period: str | None) -> tuple[str, date] | None:
+    """Resolve a ``--period`` string to a ``(mode, anchor-date)`` pair.
+
+    Accepts the relative keywords ``weekly`` / ``monthly`` (anchored on today)
+    and explicit ``YYYY-Www`` (ISO week) / ``YYYY-MM`` (calendar month) periods,
+    so an operator can regenerate a historical phase-map deterministically.
+
+    Args:
+        period: The raw ``--period`` value.
+
+    Returns:
+        ``("weekly", anchor)`` or ``("monthly", anchor)`` where *anchor* is any
+        date inside the target window, or ``None`` when *period* is missing or
+        unparseable (the caller surfaces the error).
+    """
+    if period is None:
+        return None
+    if period in {"weekly", "monthly"}:
+        return (period, date.today())
+    week_match = _WAVELENGTH_ISO_WEEK_RE.match(period)
+    if week_match:
+        year, week = int(week_match.group(1)), int(week_match.group(2))
+        try:
+            return ("weekly", date.fromisocalendar(year, week, 1))
+        except ValueError:
+            return None
+    month_match = _WAVELENGTH_MONTH_RE.match(period)
+    if month_match:
+        year, month = int(month_match.group(1)), int(month_match.group(2))
+        try:
+            return ("monthly", date(year, month, 1))
+        except ValueError:
+            return None
+    return None
+
+
+def _wavelength_dimension_populated(fragments: list[Fragment]) -> bool:
+    """Return whether any *fragments* carry a classified wavelength phase."""
+    # Local import: cli.py defers model imports to keep CLI startup fast.
+    from creek.models import Phase
+
+    return any(f.wavelength.phase != Phase.UNCLASSIFIED for f in fragments)
+
+
 def _report_wavelength(vault_path: Path, period: str | None) -> None:
-    """Generate weekly or monthly wavelength reports."""
-    from datetime import date as _date
+    """Generate a descriptive wavelength phase-map to ``05-Wavelength/Phase-Maps/``.
 
-    from creek.generate.wavelength import WavelengthTracker
+    Wires the deterministic :class:`WavelengthTracker` weekly/monthly generators
+    to the report surface. Supports ``--period weekly|monthly`` (today) and
+    explicit ``YYYY-Www`` / ``YYYY-MM`` periods. When no fragment carries a
+    classified wavelength phase the dimension is unpopulated, so it prints an
+    informative message instead of writing a silent empty file. Wavelength
+    output is descriptive only — it never prescribes action.
+    """
+    from creek.generate.wavelength import (
+        WavelengthTracker,
+        load_fragments_from_vault,
+    )
 
-    if period not in {"weekly", "monthly"}:
+    resolved = _resolve_wavelength_period(period)
+    if resolved is None:
         console.print(
-            "[red]--period must be 'weekly' or 'monthly' for wavelength reports.[/red]",
+            "[red]--period must be 'weekly', 'monthly', an ISO week "
+            "(YYYY-Www), or a month (YYYY-MM) for wavelength reports.[/red]",
         )
         raise typer.Exit(code=2)
+    mode, anchor = resolved
+
+    fragments = load_fragments_from_vault(vault_path)
+    if not _wavelength_dimension_populated(fragments):
+        console.print(
+            "[yellow]No wavelength phase-map written: no fragment carries a "
+            "classified wavelength phase. Classify the wavelength dimension "
+            "first (see #319).[/yellow]",
+        )
+        return
+
     tracker = WavelengthTracker()
-    today = _date.today()
-    if period == "weekly":
-        wavelength_path = tracker.generate_weekly_report(vault_path, week_of=today)
+    if mode == "weekly":
+        wavelength_path = tracker.generate_weekly_report(
+            vault_path, week_of=anchor, fragments=fragments
+        )
     else:
-        wavelength_path = tracker.generate_monthly_report(vault_path, month=today)
+        wavelength_path = tracker.generate_monthly_report(
+            vault_path, month=anchor, fragments=fragments
+        )
     console.print(
-        f"[bold green]Wavelength {period} report generated: "
-        f"{wavelength_path}[/bold green]",
+        f"[bold green]Wrote {wavelength_path.relative_to(vault_path)} "
+        "(descriptive; non-prescriptive)[/bold green]",
     )
 
 
@@ -1461,8 +2509,13 @@ def _report_fingerprint(vault_path: Path) -> None:
         save_fingerprint,
     )
 
-    config = load_config().ai_style
-    fingerprint = build_fingerprint(vault_path, config)
+    full_config = load_config()
+    config = full_config.ai_style
+    fingerprint = build_fingerprint(
+        vault_path,
+        config,
+        audience_weighting=full_config.voice_audience_weighting,
+    )
     if fingerprint.fragment_count == 0:
         console.print(
             "[yellow]No voice fingerprint built: no self-authored "
@@ -1721,6 +2774,53 @@ def voice_authenticity(
         console.print(report.summary_line(), markup=False)
 
 
+def _report_paradox(vault_path: Path) -> None:
+    """Write Paradox notes for contradictory fragment pairs (#711).
+
+    Wires the implemented ``ParadoxDetector`` to a runnable command: scans the
+    vault for contradictory pairs and writes one neutral note per paradox into
+    ``10-Liminal/Paradoxes/``. Idempotent; deterministic (no LLM).
+    """
+    from creek.generate.paradox import generate_paradoxes
+
+    config = _load_config_for_vault(vault_path)
+    written = generate_paradoxes(vault_path, config.embeddings)
+    if not written:
+        console.print(
+            "[yellow]No paradox notes generated: "
+            "no contradictory fragment pairs found.[/yellow]",
+        )
+        return
+    console.print(
+        f"[bold green]Paradox notes generated ({len(written)}) "
+        f"in 10-Liminal/Paradoxes/[/bold green]",
+    )
+
+
+def _report_synchronicity(vault_path: Path) -> None:
+    """Write Synchronicity notes for surprising cross-source resonances (#711).
+
+    Wires the implemented ``SynchronicityDetector`` to a runnable command: loads
+    embeddings, computes resonances, filters for cross-source >0.9-similarity
+    >30-day pairs, and writes one note per pair into
+    ``10-Liminal/Synchronicities/``. Idempotent; deterministic (no LLM).
+    """
+    from creek.generate.synchronicity import generate_synchronicities
+
+    config = _load_config_for_vault(vault_path)
+    written = generate_synchronicities(vault_path, config.embeddings)
+    if not written:
+        console.print(
+            "[yellow]No synchronicity notes generated: "
+            "no qualifying cross-source resonances found.[/yellow]",
+        )
+        return
+    console.print(
+        f"[bold green]Synchronicity notes generated ({len(written)}) "
+        f"in 10-Liminal/Synchronicities/[/bold green]",
+    )
+
+
 _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "tags": _report_tags,
     "unnamed": _report_unnamed,
@@ -1730,6 +2830,8 @@ _REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
     "lexicon": _report_lexicon,
     "rhetorical-patterns": _report_rhetorical_patterns,
     "mode-profiles": _report_mode_profiles,
+    "paradox": _report_paradox,
+    "synchronicity": _report_synchronicity,
 }
 
 
@@ -1773,10 +2875,17 @@ def report(
     if type == "wavelength":
         _report_wavelength(vault_path, period)
         return
-    console.print(
-        f"[bold green]Would report: type={type}, "
-        f"period={period}, vault={vault_path}[/bold green]",
-    )
+    # Unknown/missing type: fail loudly with the valid list, not a no-op (#716).
+    valid = ", ".join([*_REPORT_DISPATCH, "wavelength"])
+    if type is None:
+        console.print(f"[red]--type is required. Valid types: {valid}.[/red]")
+    else:
+        # escape the operator-supplied value so it can't inject Rich markup.
+        console.print(
+            f"[red]Unknown report type '{escape(str(type))}'. "
+            f"Valid types: {valid}.[/red]",
+        )
+    raise typer.Exit(code=2)
 
 
 @app.command()
@@ -1967,6 +3076,33 @@ def _gdrive_revoke() -> None:
         )
 
 
+def _gdrive_check() -> None:
+    """Run the read-only Drive doctor and print a secret-free report.
+
+    Reports credentials/token presence, local token validity, optional-
+    library availability, and a dry-run reachability listing. Downloads
+    nothing and triggers no OAuth browser flow; when no locally-valid
+    token is present the live probe is skipped so nothing egresses
+    (issue #681). The report surfaces only paths and derived status —
+    never a token, refresh token, or client secret.
+    """
+    from creek.ingest.gdrive import GoogleApiDriveClient, check_drive
+
+    config = load_config()
+    client = GoogleApiDriveClient(config.google_drive)
+    report = check_drive(config.google_drive, client=client)
+    for line in report.notes:
+        console.print(line)
+    if report.drive_reachable is None:
+        console.print(
+            "\n[dim]No network calls were made. Nothing was downloaded.[/dim]",
+        )
+    else:
+        console.print(
+            "\n[dim]Read-only listing only. Nothing was downloaded.[/dim]",
+        )
+
+
 @app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
@@ -1975,31 +3111,43 @@ def gdrive(
         "--revoke",
         help="Revoke the cached OAuth token and delete the local token file",
     ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Read-only doctor: report auth/token/reachability, download nothing",
+    ),
     staging: Path | None = typer.Option(None, help="Staging directory"),
 ) -> None:
-    """Download files from Google Drive or revoke the cached OAuth token.
+    """Download from Google Drive, revoke the token, or run the doctor.
 
     ``--download`` mirrors files into a local staging directory
     (read-only; subsequent runs are incremental). ``--revoke`` runs the
     SEC-008 hygiene path: it best-effort calls Google's revocation
     endpoint, then erases the local token file with a zero-byte pass
-    before unlinking. The two flags are mutually exclusive.
+    before unlinking. ``--check`` is a read-only doctor (issue #681): it
+    reports credentials/token presence, local token validity, library
+    availability, and a dry-run reachability listing — downloading
+    nothing and triggering no OAuth flow. The three flags are mutually
+    exclusive.
 
     First ``--download`` run opens a browser for OAuth authorisation;
     the refresh token is cached at ``GoogleDriveConfig.token_file``
     (mode ``0o600``) so subsequent runs are non-interactive.
     """
-    if download and revoke:
+    if sum([download, revoke, check]) > 1:
         console.print(
-            "[red]Specify exactly one of --download or --revoke.[/red]",
+            "[red]Specify exactly one of --download, --revoke, or --check.[/red]",
         )
         raise typer.Exit(code=2)
+    if check:
+        _gdrive_check()
+        return
     if revoke:
         _gdrive_revoke()
         return
     if not download:
         console.print(
-            "[yellow]Nothing to do. Pass --download or --revoke.[/yellow]",
+            "[yellow]Nothing to do. Pass --download, --revoke, or --check.[/yellow]",
         )
         return
 
@@ -2008,7 +3156,7 @@ def gdrive(
         staging if staging is not None else Path(config.google_drive.staging_dir)
     )
 
-    from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
+    from creek.ingest.gdrive import GoogleApiDriveClient, build_drive_connector
 
     client = GoogleApiDriveClient(config.google_drive)
     if not client.is_available():
@@ -2019,9 +3167,13 @@ def gdrive(
         )
         raise typer.Exit(code=1)
 
-    downloader = GoogleDriveDownloader(client=client, config=config.google_drive)
+    # Route the download through the source-agnostic connector (#683); fetch_to
+    # delegates to download_all, so observable behaviour is unchanged.
+    connector = build_drive_connector(
+        config.google_drive, client=client, staging=staging_dir
+    )
     try:
-        result = downloader.download_all(staging_dir)
+        result = connector.fetch_to(staging_dir)
     except Exception as exc:
         # Drive surface includes GoogleApiUnavailableError (missing
         # optional deps), HttpError (quota / rate limit / revoked
@@ -2481,7 +3633,7 @@ def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
     effective_max_tokens = (
         max_tokens if max_tokens is not None else config.draft.max_tokens
     )
-    classifier = LLMClassifier(config.llm)
+    classifier = LLMClassifier(config.model_router.resolve("classification"))
     if not classifier.available:
         console.print(
             "[red]LLM provider unavailable; cannot generate draft. "
@@ -2580,7 +3732,7 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
     config = _load_config_for_vault(vault)
 
     def _detect(prompt: str) -> PromptOntology:
-        return detect_ontology(prompt, config.llm)
+        return detect_ontology(prompt, config.model_router.resolve("classification"))
 
     return _detect
 
@@ -3185,17 +4337,32 @@ def author(
             "the vault's author.max_author_rounds config (3)."
         ),
     ),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=(
+            "Privacy ceiling for retrieved evidence: open (default) / personal "
+            "/ intimate / all. Fragments above the ceiling are excluded from "
+            "the desk's evidence (#660)."
+        ),
+    ),
 ) -> None:
-    """Author a piece with the Creek Writing Desk (stub skeleton).
+    """Author a piece with the Creek Writing Desk.
 
-    Drives an end-to-end author desk — stub Graph/Retrieval/Ontology
-    specialists, a stub Voice agent, and a stub Reflection node — and prints a
-    shaped :class:`~creek.author.models.AuthoredDraft`. ``--dry-run`` prints the
-    plan and a stub evidence summary instead. ``book-report`` takes ``--work``
-    (the 11-Other-Authors path) instead of ``--query``; every other medium
-    requires ``--query``.
+    Drives an end-to-end author desk. The Graph, Retrieval, and Ontology
+    specialists and the Reflection node do **real, deterministic** work — a
+    link-graph walk, embedding-based retrieval, rule-based ontology grounding,
+    and quality-gate judging. The Voice node renders **live via the configured
+    ``generation`` provider** when one is available (routed by content tier so
+    Intimate stays local, #661), and falls back to a deterministic rendering when
+    no provider is configured/available. Returns a shaped
+    :class:`~creek.author.models.AuthoredDraft`. ``--dry-run`` plans and gathers
+    real evidence only (no voicing or reflection). ``book-report`` takes
+    ``--work`` (the 11-Other-Authors path) instead of ``--query``; every other
+    medium requires ``--query``.
     """
     from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
+    from creek.author.client import AuthorLLMClient
 
     _validate_author_inputs(medium, query, work, SUPPORTED_MEDIUMS)
     effective_query = _compose_author_query(query, work)
@@ -3203,18 +4370,69 @@ def author(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault if vault is not None else config.vault_path)
     rounds = max_rounds if max_rounds is not None else config.author.max_author_rounds
-    conductor = build_default_conductor(max_rounds=rounds)
+    # #660: the privacy ceiling for retrieved evidence (default OPEN).
+    override = _parse_include_tier(include_tier)
 
     if dry_run:
-        evidence = conductor.gather_evidence(effective_query, vault_path)
+        # The dry run only plans + gathers evidence; no voicing, so no client.
+        conductor = build_default_conductor(max_rounds=rounds)
+        evidence = conductor.gather_evidence(
+            effective_query,
+            vault_path,
+            override=override,
+        )
+        # #660: an elevated --include-tier admits above-OPEN fragments into the
+        # evidence; record that operator decision in the privacy audit (no-op
+        # for None/OPEN). Mirrors the other --include-tier callers.
+        _audit_privacy_override_if_needed(
+            vault_path=vault_path,
+            command="author",
+            override=override,
+            fragment_ids=evidence.all_source_fragments(),
+        )
         console.print(f"PLAN: {' → '.join(conductor.plan())}")
         console.print(
-            f"EVIDENCE (stub): {len(evidence.claims)} claims, "
+            f"EVIDENCE: {len(evidence.claims)} claims, "
             f"{len(evidence.all_source_fragments())} source_fragments",
         )
         return
 
-    draft_result = conductor.run(medium=medium, query=effective_query, vault=vault_path)
+    # #658/#661: build the router-resolved voice client *per the run's content
+    # tier* so live voicing of Intimate content is redirected to a local
+    # provider by the chokepoint. The factory falls back to ``None``
+    # (deterministic stub) when the provider is unavailable.
+    def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+        return AuthorLLMClient.for_voice_or_none(
+            config.model_router,
+            author=config.author,
+            tier=tier,
+        )
+
+    if _voice_client(None) is None:
+        console.print(
+            "[dim]No LLM provider available — rendering the deterministic "
+            "stub. Configure llm.generation (and consent for a cloud provider) "
+            "for live voicing.[/dim]",
+        )
+    draft_result = build_default_conductor(
+        max_rounds=rounds,
+        voice_client_factory=_voice_client,
+    ).run(
+        medium=medium,
+        query=effective_query,
+        vault=vault_path,
+        override=override,
+    )
+    # #660: audit the elevated access using the fragments actually cited in the
+    # draft's provenance (no-op for None/OPEN).
+    _audit_privacy_override_if_needed(
+        vault_path=vault_path,
+        command="author",
+        override=override,
+        fragment_ids=[
+            fid for entry in draft_result.provenance for fid in entry.fragment_ids
+        ],
+    )
     console.print(
         f"medium={draft_result.medium} verdict={draft_result.verdict} "
         f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",
@@ -4066,20 +5284,32 @@ def _run_compost_calibration(
 def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None:
     """Construct the production LLM verifier, or ``None`` if it can't be built.
 
-    ``creek compost calibrate`` runs in environments where the
-    Anthropic credentials may or may not be present; rather than fail
-    loud, fall back to embedding-only scoring with a console note so
-    the operator can re-run with the verifier once credentials are in
-    place.
+    ``creek compost calibrate`` runs in environments where the configured
+    ``generation`` provider's credentials (or local host) may or may not be
+    present; rather than fail loud, fall back to embedding-only scoring with a
+    console note so the operator can re-run with the verifier once the provider
+    is ready.
     """
-    from creek.classify.llm import AnthropicProvider
+    from creek.classify.llm import build_provider
     from creek.generate.compost_verifier import LLMCompostVerifier
 
+    # Provider-neutral (#667): build the configured ``generation`` provider
+    # (#646) and gate on availability so any backend (Ollama / OpenAI / Gemini /
+    # Anthropic) degrades the same way. A cloud provider validates its env in the
+    # constructor and may raise (build_provider contract); a local provider
+    # constructs but reports ``available is False`` when its host is down — both
+    # fall back to embedding-only scoring.
     try:
-        provider = AnthropicProvider(config=config.llm)
+        provider = build_provider(config.model_router.resolve("generation"))
     except RuntimeError as exc:
         console.print(
             f"[yellow]Skipping LLM verifier — provider unavailable: {exc}[/yellow]",
+        )
+        return None
+    if not provider.available:
+        console.print(
+            "[yellow]Skipping LLM verifier — provider prerequisites unmet "
+            "(missing key/consent, or local host unreachable).[/yellow]",
         )
         return None
     return LLMCompostVerifier(provider=provider)

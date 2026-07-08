@@ -27,7 +27,12 @@ Optional dependencies are imported lazily, so you only need to install the ones 
 | Image OCR              | `pytesseract`, `pdf2image`, system-level `tesseract` and `poppler` |
 | Google Drive           | `google-api-python-client`, `google-auth-oauthlib` |
 | Embeddings             | `sentence-transformers`      |
-| LLM classification     | Ollama running locally, or `ANTHROPIC_API_KEY` for the cloud path |
+| LLM classification — Anthropic | `anthropic` (the `[anthropic]` extra) |
+| LLM classification — OpenAI    | `openai` (the `[openai]` extra) |
+| LLM classification — Gemini    | `google-genai` (the `[gemini]` extra) |
+| LLM classification — local     | Ollama running locally — no extra, no key |
+
+The cloud LLM backend is selectable — see [LLM providers](#llm-providers) below. `[all]` (and therefore `[dev]`) pulls in every cloud extra so the test suite can mock each SDK.
 
 To install everything required for development plus the full quality toolchain:
 
@@ -153,7 +158,7 @@ read the threat model below before doing anything else.
 
 | Section | Class | What it controls |
 |---------|-------|------------------|
-| `llm`            | `LLMConfig`            | Provider (`ollama` or `anthropic`), model name, batch size, retries. |
+| `llm`            | `LLMRoutingConfig`     | Per-stage provider+model routing (`default` / `classification` / `generation` / `frontend` + a `writing_desk` role map), or a legacy flat `LLMConfig` block. See [LLM providers](#llm-providers). |
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
 | `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
@@ -164,6 +169,70 @@ read the threat model below before doing anything else.
 | `cleaning`       | `CleaningConfig`       | Per-source filters (Discord, ChatGPT, Drive, Markdown) plus `validation`, `quality`, `deduplication`, `hygiene` sub-sections. |
 
 See [`docs/configuration.md`](docs/configuration.md) for the full schema with examples.
+
+### LLM providers
+
+The cloud LLM backend is selectable via `llm.provider` in `creek_config.yaml`. The default `ollama` runs fully locally and needs no key or consent. Each cloud provider's **API key is read from the environment by its SDK** — it must **never** be written into `creek_config.yaml`, committed to the repo, or logged. Cloud egress additionally requires explicit consent (Ollama is exempt).
+
+| Provider | `llm.provider` | Env key | Cloud-egress consent |
+|---|---|---|---|
+| Ollama (local) | `ollama` | — | not required |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `CREEK_CLOUD_CONSENT=1` |
+| OpenAI | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`, or `llm.api_base`) | `CREEK_CLOUD_CONSENT=1` |
+| Gemini | `gemini` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `CREEK_CLOUD_CONSENT=1` |
+| GPU-CC enclave | `enclave` | — (attestation config, not a key) | not required (attested) |
+
+`CREEK_CLOUD_CONSENT=1` (also accepts `true` / `yes`) acknowledges that fragment content leaves the device; the legacy `CREEK_ANTHROPIC_CONSENT` is still honored as an alias. `llm.api_base` is OpenAI-specific (an OpenAI-compatible gateway); other providers ignore it. Install the matching optional extra (`[openai]` / `[gemini]`) for the cloud SDKs — see [Install](#install).
+
+**BYOK (bring your own key).** Any stage can point at a **user-supplied** provider key with `llm.<stage>.api_key_env` — the **name** of an environment variable holding the key (e.g. `CREEK_BYOK_ANTHROPIC_KEY`), never the key value. This lets a user run the `generation` stage on their own Anthropic/OpenAI/Gemini subscription instead of an operator key; the key stays in the environment and is passed straight to the SDK (never persisted in config or logged). Cloud-consent still applies, and BYOK does **not** relax the tier gate — INTIMATE fragments are still redirected to a local/enclave provider by the `ModelRouter` chokepoint before any key is read. Omit `api_key_env` to use the provider's default env var (unchanged).
+
+**Attested GPU-CC enclave (`enclave`).** An operator-run confidential-compute endpoint that gets GPU-quality output for the most private tier. It is classified `is_cloud=False` — and so is INTIMATE-eligible — because it **cryptographically verifies remote attestation before every completion**, and fails closed otherwise. Configure it (none of these is a secret — the pubkey is a *public* key) with `llm.enclave_url` (must be `https://`), `llm.enclave_expected_measurement` (the expected enclave image), and `llm.enclave_attestation_pubkey` (the hex Ed25519 **public** trust-root key). Each call challenges the enclave with a fresh nonce and requires an Ed25519 signature over `measurement || nonce` that validates under the configured public key — an impersonator without the private key, a replayed quote, a non-TLS URL, or a measurement mismatch all refuse and send nothing. The trust model and its boundaries (operator-provisioned root key, not yet a full vendor certificate chain) are recorded in [ADR-0006](docs/architecture/ADR/0006-enclave-attestation-trust-model.md).
+
+The architectural decision to keep creek-tools' and CrawDad's provider abstractions decoupled is recorded in [ADR-0003](docs/architecture/ADR/0003-decoupled-provider-abstractions.md).
+
+#### Per-stage model routing
+
+The `llm` block routes **different pipeline stages to different backends in one run**. It accepts two shapes:
+
+- **Legacy flat block** — `{ provider, model, … }` — still valid; it is promoted to the `default` stage, so every stage uses it (pre-routing behaviour, unchanged).
+- **Per-stage map** — a `default` plus optional `classification` / `generation` / `frontend` overrides and a `writing_desk` role map. Unset stages fall back to `default`.
+
+```yaml
+llm:
+  default:        { provider: ollama,    model: qwen3:8b }       # fallback for any unset stage
+  classification: { provider: ollama,    model: qwen3:8b }       # local, Intimate-safe
+  generation:     { provider: anthropic, model: claude-sonnet-4-6 }
+  frontend:       { provider: ollama,    model: qwen3:14b }      # reserved (OpenClaw); no consumer yet
+  writing_desk:                                                  # FEAT-041 subagent roles
+    outliner:          { provider: ollama,    model: qwen3:8b }
+    voice_drafter:     { provider: anthropic, model: claude-sonnet-4-6 }
+    voice_line_editor: { provider: anthropic, model: claude-sonnet-4-6 }  # the 2nd voice role
+```
+
+Stage and role routing is centralised in `ModelRouter` (`creek/classify/llm/router.py`): a stage resolves to its own config or the `default`; a Writing Desk role resolves role → `generation` → `default`. The voice-role `voice_model` model-id override (below) is applied separately by `AuthorLLMClient.for_role()` (`creek/author/client.py`). Keys remain environment-only — never put an API key in any stage.
+
+**Intimate-tier fragments never reach a cloud provider.** This is enforced at the single `ModelRouter` chokepoint: when an `Intimate` fragment would route to a cloud provider, it is **redirected to the local `default`** (with a `WARNING` for the audit trail); if even `default` is a cloud provider, the run **fails loudly** with `IntimateRoutingError` rather than egressing intimate content. The cloud-consent preflight likewise checks **every** stage, so a cloud provider configured for any stage requires `CREEK_CLOUD_CONSENT=1`.
+
+For the Writing Desk voice roles (`voice_drafter` / `voice_line_editor`), an explicit `writing_desk` entry wins; otherwise the legacy `author.voice_model` fills the model id; otherwise the `generation` model stands.
+
+**Migration.** No action is required — a flat `llm: { provider, model }` block keeps working as the `default`. To route per-stage, replace it with the map above. Environment override uses the JSON-string form (e.g. `CREEK_LLM='{"generation":{"provider":"anthropic"}}'`); the dotted `CREEK_LLM__PROVIDER` form is not wired (no `env_nested_delimiter`), so a flat `CREEK_LLM='{"provider":"anthropic"}'` is the supported flat override and is promoted to `default`.
+
+**Embeddings are deliberately not provider-swappable.** `llm.provider` selects the *completion* backend only; the resonance/linking path always embeds locally via sentence-transformers (`embeddings.model`), so vault text never leaves the device for linking and the vector index stays stable. The decision and its reopening criteria are recorded in [ADR-0004](docs/architecture/ADR/0004-embeddings-stay-local.md).
+
+**Provider capability notes.** The abstraction normalizes text, stop reason, and usage — three behaviors intentionally remain per-provider:
+
+- **Rate limits**: a vendor 429 surfaces with the server's `Retry-After` hint preserved (never request state), and the classifier's retry loop honors it instead of retrying on the fixed delay.
+- **Prompt caching** (cost asymmetry): Anthropic gets an explicit ephemeral `cache_control` block on the static system prefix; OpenAI relies on its vendor-side automatic prompt caching; Gemini sends the prefix plain (no explicit caching wired). Repeated static prefixes therefore bill differently per provider.
+- **Streaming**: the abstraction is non-streaming by design — fine for batch classification and current consumers; a token-streaming UX would need a protocol extension.
+
+**Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model id is only proven by a real call. With the provider's key (and consent) in the env, one command makes a single tiny live request and asserts the normalized round-trip:
+
+```bash
+./scripts/test.sh --integration -k openai                                  # smoke the provider's default model
+CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --integration -k gemini # smoke a candidate model id
+```
+
+Each smoke skips cleanly when its key is absent, and the `integration` marker keeps them out of the default test selection and CI entirely.
 
 ---
 

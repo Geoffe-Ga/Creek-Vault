@@ -40,7 +40,7 @@ A minimal starter `creek_config.yaml` (already written by `creek init`):
 ```yaml
 llm:
   provider: ollama
-  model: mistral
+  model: mistral                # optional; omit to use the provider's default
 embeddings:
   model: all-MiniLM-L6-v2
   similarity_threshold: 0.78    # cosine cutoff for a resonance edge

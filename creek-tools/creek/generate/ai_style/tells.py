@@ -90,7 +90,17 @@ class Tell:
         margin: Optional per-tell divergence margin overriding the config
             default. ``0.0`` means "any divergence in the bad direction
             fires" (use for features that are never legitimate, like
-            placeholder text).
+            placeholder text). A ``0.0`` margin also locks the tell's
+            polarity (it can never become a per-user signature).
+        lock_polarity: When ``True``, the tell keeps its declared
+            :attr:`polarity` regardless of the user's measured rate — the
+            per-user signature derivation (#635) is skipped. Defaults to
+            ``False``; a ``margin`` of ``0.0`` locks polarity implicitly too,
+            so never-legitimate artifacts need not set this.
+        signature_threshold: Optional per-tell override for the rate at or
+            above which the user is deemed to *characteristically* use this
+            feature (so under-use becomes the concern). ``None`` falls back to
+            ``AIStyleConfig.signature_polarity_threshold``.
         measure: ``measure(text) -> float`` returning the draft's rate.
         locate: ``locate(text) -> list[Span]`` returning occurrence spans
             for findings. Empty list yields a single doc-level finding.
@@ -110,7 +120,23 @@ class Tell:
     locate: Callable[[str], list[Span]]
     generic_prior: float = 0.0
     margin: float | None = None
+    lock_polarity: bool = False
+    signature_threshold: float | None = None
     contexts: frozenset[str] | None = None
+
+    def polarity_is_locked(self) -> bool:
+        """Return whether this tell's polarity is exempt from #635 derivation.
+
+        Never-legitimate artifacts are intrinsic ``avoid`` tells: a fabricated
+        DOI or a placeholder date can never be one of the user's signatures, so
+        they are exempt from per-user polarity derivation. These are exactly
+        the tells pinned with a ``0.0`` margin (any over-use fires), plus any
+        tell that opts out explicitly via :attr:`lock_polarity`.
+
+        Returns:
+            ``True`` when the declared :attr:`polarity` must be used as-is.
+        """
+        return self.lock_polarity or self.margin == 0.0
 
     def applies_in(self, context: str) -> bool:
         """Return whether this tell runs in the given scan *context*.
@@ -122,6 +148,51 @@ class Tell:
             ``True`` when the tell is context-agnostic or lists *context*.
         """
         return self.contexts is None or context in self.contexts
+
+
+def effective_polarity(
+    tell: Tell,
+    user_rate: float,
+    *,
+    signature_threshold: float,
+) -> Polarity | None:
+    """Return *tell*'s polarity for this user, derived from their rate (#635).
+
+    Polarity is derived per-user rather than fixed at registration, but with
+    discernment — the declared :attr:`Tell.polarity` gates *which* derivation
+    applies, so the AI-tell catalog is never wholesale-reinforced (a
+    triad-loving writer should not have triad padding *reinforced*, only
+    tolerated):
+
+    * **avoid** tells (the AI-tell catalog) always stay ``avoid``. Over-use is
+      the only concern; the existing vault-relative suppression (a draft below
+      the user's rate scores ``0``) is unchanged.
+    * **signature** tells (genuine authentic-voice features, e.g. the one-line
+      rhythm) derive per-user: at or above ``signature_threshold`` the user
+      characteristically employs it → ``signature`` (under-use raises voice
+      distance, reinforcing the voice); below the threshold the tell is
+      **inert** (``None``) — the user does not use it, so neither over- nor
+      under-use is *their* concern, and it never fires spuriously on a draft
+      that happens to use the feature.
+
+    Never-legitimate artifacts (:meth:`Tell.polarity_is_locked`) are exempt and
+    always return their declared polarity.
+
+    Args:
+        tell: The tell whose effective polarity is wanted.
+        user_rate: The user's measured rate for the feature (or generic prior).
+        signature_threshold: The rate at or above which the feature counts as a
+            user signature (a per-tell override or the config default).
+
+    Returns:
+        ``"avoid"`` / ``"signature"`` to score with that polarity, or ``None``
+        when the tell is inert for this user (no contribution, no finding).
+    """
+    if tell.polarity_is_locked():
+        return tell.polarity
+    if tell.polarity == "signature":
+        return "signature" if user_rate >= signature_threshold else None
+    return "avoid"
 
 
 TELL_REGISTRY: dict[str, Tell] = {}

@@ -33,11 +33,14 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
-from creek.models import Confidence, Dosage, Phase
+from creek.link.neighbours import cosine_neighbours
+from creek.models import Confidence, Dosage, Frequency, Phase
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
+    from creek.config import EmbeddingsConfig
     from creek.models import Fragment
 
 
@@ -61,6 +64,17 @@ Invites integration by sitting with the tension rather than resolving it.
 
 _DEFAULT_SIMILARITY_THRESHOLD: float = 0.7
 """Minimum cosine similarity for two fragments to count as the same topic."""
+
+
+_SIMILARITY_CANDIDATE_MARGIN: float = 1e-4
+"""Slack subtracted from the threshold when gating similarity candidates (#790).
+
+The bounded candidate pass uses vectorised float32 similarities only to *select*
+which pairs to evaluate; the actual rule decision still runs the unchanged
+:meth:`ParadoxDetector._pair_similarity` check. Widening the candidate gate by
+this margin guarantees no genuinely-matching pair is dropped due to float32
+rounding, so the bounded output is identical to the exhaustive scan.
+"""
 
 
 _EXCERPT_MAX_CHARS: int = 280
@@ -192,6 +206,36 @@ def _has_contradiction_keyword(fragment: Fragment) -> bool:
     return any(kw in lowered for kw in CONTRADICTION_KEYWORDS)
 
 
+def _ordered(a: int, b: int) -> tuple[int, int]:
+    """Return the pair ``(a, b)`` as a sorted ``(low, high)`` tuple.
+
+    Args:
+        a: First index.
+        b: Second index.
+
+    Returns:
+        ``(a, b)`` if ``a < b`` else ``(b, a)``.
+    """
+    return (a, b) if a < b else (b, a)
+
+
+def _within_group_pairs(groups: Iterable[list[int]]) -> set[tuple[int, int]]:
+    """Return every ascending index pair drawn from within each group.
+
+    Args:
+        groups: Iterable of index lists; each list's members are paired
+            with one another (across groups they are not).
+
+    Returns:
+        The set of ``(low, high)`` index pairs co-occurring in some group.
+    """
+    pairs: set[tuple[int, int]] = set()
+    for members in groups:
+        for source, other in itertools.combinations(sorted(members), 2):
+            pairs.add((source, other))
+    return pairs
+
+
 @dataclass
 class Paradox:
     """A detected contradiction linking two (or more) fragments.
@@ -278,15 +322,243 @@ class ParadoxDetector:
             return []
 
         embeddings = embeddings or {}
+        if self.similarity_threshold <= 0.0:
+            # Degenerate config: every pair is "high similarity", so no
+            # similarity bound applies — fall back to the exhaustive scan.
+            return self._detect_exhaustive(
+                fragments,
+                embeddings,
+                cross_level=cross_level,
+            )
         paradoxes: list[Paradox] = []
-        for a, b in itertools.combinations(fragments, 2):
-            if not cross_level and str(a.level) != str(b.level):
-                continue
-            similarity = self._pair_similarity(a, b, embeddings)
-            paradox = self._detect_pair(a, b, similarity)
+        for i, j in sorted(self._candidate_pairs(fragments, embeddings)):
+            paradox = self._paradox_for_indices(
+                fragments,
+                i,
+                j,
+                embeddings,
+                cross_level=cross_level,
+            )
             if paradox is not None:
                 paradoxes.append(paradox)
         return paradoxes
+
+    def _detect_exhaustive(
+        self,
+        fragments: list[Fragment],
+        embeddings: dict[str, list[float]],
+        *,
+        cross_level: bool,
+    ) -> list[Paradox]:
+        """All-pairs scan — the reference path, used when threshold ``<= 0``.
+
+        Retained for the degenerate ``similarity_threshold <= 0`` config, where
+        every pair counts as high-similarity so no similarity bound applies.
+        O(N²); never taken on a large vault at the default threshold. The bounded
+        :meth:`_candidate_pairs` path is validated to reproduce its output.
+
+        Args:
+            fragments: Fragments to scan.
+            embeddings: Fragment-ID to embedding-vector mapping.
+            cross_level: Whether to emit cross-structural-level pairs.
+
+        Returns:
+            One :class:`Paradox` per contradictory pair, in ascending index
+            order.
+        """
+        paradoxes: list[Paradox] = []
+        for i, j in itertools.combinations(range(len(fragments)), 2):
+            paradox = self._paradox_for_indices(
+                fragments,
+                i,
+                j,
+                embeddings,
+                cross_level=cross_level,
+            )
+            if paradox is not None:
+                paradoxes.append(paradox)
+        return paradoxes
+
+    def _paradox_for_indices(
+        self,
+        fragments: list[Fragment],
+        i: int,
+        j: int,
+        embeddings: dict[str, list[float]],
+        *,
+        cross_level: bool,
+    ) -> Paradox | None:
+        """Evaluate the fragment pair ``(i, j)`` under the four detection rules.
+
+        Args:
+            fragments: The fragment list.
+            i: Index of the first fragment.
+            j: Index of the second fragment.
+            embeddings: Fragment-ID to embedding-vector mapping.
+            cross_level: When ``False``, pairs at differing structural levels
+                are skipped (FEAT-025).
+
+        Returns:
+            A :class:`Paradox` for the first matching rule, or ``None``.
+        """
+        a, b = fragments[i], fragments[j]
+        if not cross_level and str(a.level) != str(b.level):
+            return None
+        similarity = self._pair_similarity(a, b, embeddings)
+        return self._detect_pair(a, b, similarity)
+
+    # ---- Bounded candidate generation (issue #790) ----
+
+    def _candidate_pairs(
+        self,
+        fragments: list[Fragment],
+        embeddings: dict[str, list[float]],
+    ) -> set[tuple[int, int]]:
+        """Return every index pair ``(i < j)`` that could match a rule.
+
+        The union of four bounded families — one per rule — so it is a superset
+        of the matching pairs while avoiding the O(N²) all-pairs enumeration.
+        Each family is bounded: similarity by the k neighbours above threshold,
+        thread/dosage/keyword by their (small) grouping cardinalities.
+
+        Args:
+            fragments: The fragment list.
+            embeddings: Fragment-ID to embedding-vector mapping.
+
+        Returns:
+            The set of candidate ``(low, high)`` index pairs.
+        """
+        pairs = self._similarity_candidates(fragments, embeddings)
+        pairs |= self._thread_candidates(fragments)
+        pairs |= self._dosage_candidates(fragments)
+        pairs |= self._keyword_frequency_candidates(fragments)
+        return pairs
+
+    def _similarity_candidates(
+        self,
+        fragments: list[Fragment],
+        embeddings: dict[str, list[float]],
+    ) -> set[tuple[int, int]]:
+        """Pairs whose cosine similarity clears the threshold (phase/keyword rules).
+
+        Only embedded fragments participate — a missing embedding scores ``0.0``
+        similarity and so can never be "high similarity". The gate uses a small
+        negative margin (:data:`_SIMILARITY_CANDIDATE_MARGIN`) so float32
+        rounding never drops a pair the exact per-pair check would keep.
+
+        Args:
+            fragments: The fragment list.
+            embeddings: Fragment-ID to embedding-vector mapping.
+
+        Returns:
+            The set of high-similarity ``(low, high)`` index pairs.
+        """
+        indexed = [
+            (idx, embeddings[frag.id])
+            for idx, frag in enumerate(fragments)
+            if frag.id in embeddings
+        ]
+        if not indexed:
+            return set()
+        global_indices = [idx for idx, _ in indexed]
+        neighbours = cosine_neighbours(
+            [vec for _, vec in indexed],
+            self.similarity_threshold - _SIMILARITY_CANDIDATE_MARGIN,
+        )
+        pairs: set[tuple[int, int]] = set()
+        for local_index, local_neighbours in enumerate(neighbours):
+            source = global_indices[local_index]
+            pairs.update(
+                _ordered(source, global_indices[local_other])
+                for local_other in local_neighbours
+            )
+        return pairs
+
+    @staticmethod
+    def _thread_candidates(fragments: list[Fragment]) -> set[tuple[int, int]]:
+        """Pairs sharing at least one thread (confidence and keyword rules).
+
+        Args:
+            fragments: The fragment list.
+
+        Returns:
+            The set of shared-thread ``(low, high)`` index pairs.
+        """
+        by_thread: dict[str, list[int]] = {}
+        for idx, frag in enumerate(fragments):
+            for thread in set(frag.threads):
+                by_thread.setdefault(thread, []).append(idx)
+        return _within_group_pairs(by_thread.values())
+
+    @staticmethod
+    def _dosage_candidates(fragments: list[Fragment]) -> set[tuple[int, int]]:
+        """Same-primary-frequency medicine/toxic pairs (dosage rule).
+
+        Only the cross product of the (typically small) medicine and toxic sets
+        within each primary frequency is emitted — never the whole frequency
+        group, which can hold thousands of fragments.
+
+        Args:
+            fragments: The fragment list.
+
+        Returns:
+            The set of medicine/toxic ``(low, high)`` index pairs.
+        """
+        medicine: dict[str, list[int]] = {}
+        toxic: dict[str, list[int]] = {}
+        for idx, frag in enumerate(fragments):
+            primary = str(frag.frequency.primary)
+            if primary == Frequency.UNCLASSIFIED.value:
+                continue
+            dosage = str(frag.wavelength.dosage)
+            if dosage == Dosage.MEDICINE.value:
+                medicine.setdefault(primary, []).append(idx)
+            elif dosage == Dosage.TOXIC.value:
+                toxic.setdefault(primary, []).append(idx)
+        pairs: set[tuple[int, int]] = set()
+        for primary, med_indices in medicine.items():
+            for source in med_indices:
+                pairs.update(
+                    _ordered(source, other) for other in toxic.get(primary, [])
+                )
+        return pairs
+
+    @staticmethod
+    def _keyword_frequency_candidates(
+        fragments: list[Fragment],
+    ) -> set[tuple[int, int]]:
+        """Keyword-bearing fragment x same-primary-frequency fragment (keyword rule).
+
+        The keyword rule also fires via high similarity or a shared thread, but
+        those pairs are already covered by the similarity and thread families —
+        so only the shared-primary-frequency arm is added here. Bounded by the
+        (rare) count of keyword-bearing fragments.
+
+        Args:
+            fragments: The fragment list.
+
+        Returns:
+            The set of keyword x same-frequency ``(low, high)`` index pairs.
+        """
+        keyword_indices = [
+            idx
+            for idx, frag in enumerate(fragments)
+            if _has_contradiction_keyword(frag)
+        ]
+        if not keyword_indices:
+            return set()
+        by_primary: dict[str, list[int]] = {}
+        for idx, frag in enumerate(fragments):
+            primary = str(frag.frequency.primary)
+            if primary != Frequency.UNCLASSIFIED.value:
+                by_primary.setdefault(primary, []).append(idx)
+        pairs: set[tuple[int, int]] = set()
+        for source in keyword_indices:
+            primary = str(fragments[source].frequency.primary)
+            for other in by_primary.get(primary, []):
+                if other != source:
+                    pairs.add(_ordered(source, other))
+        return pairs
 
     def create_paradox_note(self, paradox: Paradox, vault_path: Path) -> Path:
         """Write a paradox to ``<vault>/10-Liminal/Paradoxes/`` as Markdown.
@@ -530,3 +802,44 @@ class ParadoxDetector:
         stem = "-".join(paradox.fragment_ids[:2]) or "paradox"
         sanitized = _FILENAME_SANITIZER.sub("-", stem).strip("-")
         return f"{iso}-{sanitized}.md"
+
+
+def generate_paradoxes(
+    vault_path: Path,
+    embeddings_config: EmbeddingsConfig,
+) -> list[Path]:
+    """Detect contradictory fragment pairs and write paradox notes (#711).
+
+    The runnable wiring for ``creek report --type paradox``: loads the vault's
+    fragments and their cached embeddings, runs :class:`ParadoxDetector`, and
+    writes one note per paradox into ``10-Liminal/Paradoxes/``. Idempotent — each
+    note's path is stable per paradox, so re-running overwrites in place rather
+    than duplicating. Embeddings sharpen the topic-sharing rules; when the cache
+    is empty only the thread/frequency rules can match (still useful, no crash).
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        embeddings_config: Embeddings config (model + cache) used to load the
+            per-vault vector cache for the topic-similarity rules.
+
+    Returns:
+        Paths of the paradox notes written this run (empty when none are found).
+    """
+    from creek.link.embeddings import EmbeddingLinker, embeddings_cache_path
+    from creek.vault.reader import iter_vault_fragments
+
+    fragments = [
+        fragment
+        for _path, fragment, _body, _raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+    ]
+    cache = EmbeddingLinker(embeddings_config).load_cache(
+        embeddings_cache_path(vault_path),
+    )
+    embeddings = {fid: cached.vector for fid, cached in cache.items()}
+    detector = ParadoxDetector()
+    return [
+        detector.create_paradox_note(paradox, vault_path)
+        for paradox in detector.detect_paradoxes(fragments, embeddings=embeddings)
+    ]

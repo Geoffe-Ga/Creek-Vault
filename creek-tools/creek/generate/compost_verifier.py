@@ -24,7 +24,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from creek.classify.llm import AnthropicProvider
+    from creek.classify.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +61,8 @@ class SupportsVerifyCompost(Protocol):
     """Subset of verifier surface the compost tracker needs.
 
     Any object exposing :meth:`verify` with this signature is accepted
-    by :class:`creek.generate.compost.CompostTracker`. Real verifier
-    wraps :class:`creek.classify.llm.AnthropicProvider`; tests pass a
+    by :class:`creek.generate.compost.CompostTracker`. The real verifier
+    wraps any :class:`creek.classify.llm.base.LLMProvider`; tests pass a
     deterministic stub.
     """
 
@@ -125,21 +125,24 @@ def _parse_verifier_response(text: str) -> CompostVerifierResult:
 
 
 class LLMCompostVerifier:
-    """Default :class:`SupportsVerifyCompost` impl backed by Anthropic.
+    """Default :class:`SupportsVerifyCompost` impl, provider-neutral (#667).
 
-    Wraps an :class:`creek.classify.llm.AnthropicProvider` and parses
-    the three-line response format defined by ``_PROMPT_TEMPLATE``.
-    Reuses the existing classify infrastructure rather than building
-    a parallel transport layer.
+    Wraps any :class:`creek.classify.llm.base.LLMProvider` (Ollama / OpenAI /
+    Gemini / Anthropic) and parses the three-line response format defined by
+    ``_PROMPT_TEMPLATE``. Reuses the existing classify provider abstraction
+    rather than building a parallel transport layer.
     """
 
-    def __init__(self, provider: AnthropicProvider) -> None:
+    def __init__(self, provider: LLMProvider) -> None:
         """Initialise the verifier.
 
         Args:
-            provider: A constructed :class:`AnthropicProvider`. Caller
-                is responsible for handling the ``ANTHROPIC_API_KEY``
-                and ``CREEK_ANTHROPIC_CONSENT`` env-var preconditions.
+            provider: A constructed :class:`LLMProvider`. The caller builds it
+                via the model router's ``generation`` stage and is responsible
+                for the provider's env-var preconditions (the
+                :func:`creek.cli._build_compost_verifier` builder gates on
+                ``provider.available`` so an unready provider degrades to
+                embedding-only scoring).
         """
         self._provider = provider
 
@@ -158,5 +161,5 @@ class LLMCompostVerifier:
             routes to review rather than being dropped.
         """
         prompt = _PROMPT_TEMPLATE.format(title=title.strip() or "(untitled)", body=body)
-        response = self._provider.call(prompt)
+        response = self._provider.complete(prompt).text
         return _parse_verifier_response(response)
