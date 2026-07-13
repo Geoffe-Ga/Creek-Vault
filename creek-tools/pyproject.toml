@@ -102,7 +102,7 @@ dev = [
     # .pre-commit-config.yaml's mirrors-mypy rev so the three install
     # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
     # mypy version. Bumping requires updating all three together.
-    "mypy>=2.1.0,<2.2.0",
+    "mypy>=2.1.0,<2.3.0",
     "pylint>=3.0.0",
     # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
     # PyCQA/bandit rev so the three install paths run the same bandit
