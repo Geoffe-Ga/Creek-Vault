@@ -77,8 +77,7 @@
 # Claude Code local worktrees
 .claude/worktrees/
 
-# graphify knowledge graph — machine-local artifacts only
-# (graph.json, GRAPH_REPORT.md, manifest.json and cache/ast are committed;
-#  stat-index.json embeds absolute paths and is rebuilt per machine)
-graphify-out/cache/stat-index.json
-graphify-out/graph.html
+# graphify knowledge graph — never committed in this repo (~30 MB, weekly
+# regenerated). Published as a rolling GitHub Release ("knowledge-graph")
+# by .github/workflows/graph-update.yml; the adepthood hub fetches it there.
+graphify-out/
