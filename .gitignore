@@ -76,3 +76,9 @@
 
 # Claude Code local worktrees
 .claude/worktrees/
+
+# graphify knowledge graph — machine-local artifacts only
+# (graph.json, GRAPH_REPORT.md, manifest.json and cache/ast are committed;
+#  stat-index.json embeds absolute paths and is rebuilt per machine)
+graphify-out/cache/stat-index.json
+graphify-out/graph.html

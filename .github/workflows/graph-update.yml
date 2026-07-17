@@ -1,0 +1,115 @@
+# Knowledge graph freshness for the adepthood federation.
+#
+# This repo commits its graphify knowledge graph (graphify-out/) so the
+# adepthood hub can fetch it and merge it into the ecosystem pan-graph
+# (see Geoffe-Ga/adepthood — "Graphify" epic).
+#
+# Unlike the smaller satellites, Creek-Vault's graph is ~30 MB
+# (23k nodes across 500 Python files), so the refresh runs on a WEEKLY
+# cron + manual dispatch rather than on every push — bounding repo-size
+# churn to ~52 graph versions/year. The adepthood hub's nightly
+# federation merge always picks up whatever is committed here.
+#
+# Jobs:
+#   update   — weekly/manual: incremental AST re-extraction.
+#              Deterministic, local, keyless, $0.
+#   semantic — weekly/manual: LLM extraction of docs/Ontology/** and
+#              docs/decisions/** (the federation-keystone ontology spec
+#              and the Adepthood↔Creek MCP contract) plus community
+#              naming. Runs ONLY if the ANTHROPIC_API_KEY secret is
+#              configured; otherwise it logs and exits green.
+#
+# Optional hub push-trigger: add an ADEPTHOOD_DISPATCH_TOKEN secret
+# (fine-grained PAT able to send repository_dispatch to
+# Geoffe-Ga/adepthood). Without it, the hub's nightly cron picks up the
+# committed graph within 24h — that fallback is fine.
+
+name: Knowledge graph
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: knowledge-graph
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: AST update (keyless)
+    runs-on: ubuntu-latest
+    env:
+      DISPATCH_TOKEN: ${{ secrets.ADEPTHOOD_DISPATCH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned graphify
+        run: pip install graphifyy==0.9.17
+      - name: Incremental AST re-extraction
+        run: graphify update .
+      - name: Commit refreshed graph
+        run: |
+          git add graphify-out
+          if git diff --cached --quiet; then
+            echo "Graph unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(graph): refresh knowledge graph [skip ci]"
+          git push
+      - name: Notify adepthood hub (optional)
+        if: env.DISPATCH_TOKEN != ''
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Geoffe-Ga/adepthood/dispatches \
+            -d '{"event_type":"graph-updated","client_payload":{"repo":"creek-vault"}}'
+
+  semantic:
+    name: Semantic refresh (weekly, key-guarded)
+    needs: update
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - name: Skip without API key
+        if: env.HAS_KEY != 'true'
+        run: echo "ANTHROPIC_API_KEY secret not set — graph stays code-only. Add the secret to enable the semantic layer."
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        if: env.HAS_KEY == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install pinned graphify
+        if: env.HAS_KEY == 'true'
+        run: pip install graphifyy==0.9.17
+      - name: Semantic extraction (SHA-cached, incremental)
+        if: env.HAS_KEY == 'true'
+        run: graphify extract . --backend claude --max-concurrency 2
+      - name: Name communities
+        if: env.HAS_KEY == 'true'
+        run: graphify label . --missing-only --backend claude
+      - name: Commit refreshed graph
+        if: env.HAS_KEY == 'true'
+        run: |
+          git add graphify-out
+          if git diff --cached --quiet; then
+            echo "No semantic changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(graph): weekly semantic refresh [skip ci]"
+          git push

@@ -93,3 +93,19 @@ Phase-3 of the implementation plan is complete: eleven registered ingestors plus
 ## License
 
 MIT.
+
+## Knowledge graph
+
+This repo maintains a [graphify](https://github.com/Graphify-Labs/graphify)
+knowledge graph in `graphify-out/` (committed, ~30 MB) so the
+[adepthood](https://github.com/Geoffe-Ga/adepthood) hub can merge it into the
+ecosystem pan-graph. A weekly workflow keeps it fresh (AST-only, free) and
+refreshes the semantic layer over `docs/Ontology/**` and `docs/decisions/**`
+when an `ANTHROPIC_API_KEY` secret is configured — see
+`.github/workflows/graph-update.yml`.
+
+```bash
+pip install graphifyy==0.9.17
+graphify query "how does the link engine detect eddies"
+graphify update .   # after code changes; no API key needed
+```
