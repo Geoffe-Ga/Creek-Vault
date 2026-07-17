@@ -1,0 +1,13 @@
+# Paths excluded from graphify knowledge-graph extraction.
+# Skill/agent scaffolding is process noise, not domain knowledge.
+# docs/ (Ontology, decisions) stays IN — it is the federation keystone.
+.claude/
+.github/
+node_modules/
+dist/
+build/
+htmlcov/
+.venv/
+venv/
+graphify-out/
+*.log

@@ -1,0 +1,157 @@
+# Knowledge graph freshness for the adepthood federation.
+#
+# This repo publishes its graphify knowledge graph as assets on a rolling
+# GitHub Release tagged `knowledge-graph` (never committed to git — the
+# ~30 MB, weekly-regenerated graph.json would bloat history and produce
+# undiffable commits, and this repo's policy forbids direct pushes to
+# main). The adepthood hub fetches the release asset and merges it into
+# the ecosystem pan-graph (see Geoffe-Ga/adepthood — "Graphify" epic).
+#
+# Jobs:
+#   build    — weekly/manual: full code-only tree-sitter extraction.
+#              Deterministic, local, keyless, $0. Publishes graph.json,
+#              GRAPH_REPORT.md, graph-meta.json to the rolling release.
+#   semantic — weekly/manual: LLM extraction of docs/Ontology/** and
+#              docs/decisions/** (the federation-keystone ontology spec
+#              and the Adepthood↔Creek MCP contract) plus community
+#              naming, cache-amortized via a semantic-cache.tar.gz
+#              release asset. Runs ONLY if the ANTHROPIC_API_KEY secret
+#              is configured; otherwise it logs and exits green.
+#
+# No job pushes to any branch. The only write surface is release assets.
+#
+# Optional hub push-trigger: add an ADEPTHOOD_DISPATCH_TOKEN secret
+# (fine-grained PAT able to send repository_dispatch to
+# Geoffe-Ga/adepthood). Without it, the hub's nightly cron picks up the
+# published release within 24h — that fallback is fine.
+
+name: Knowledge graph
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: knowledge-graph
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + publish (keyless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DISPATCH_TOKEN: ${{ secrets.ADEPTHOOD_DISPATCH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned graphify
+        run: pip install graphifyy==0.9.17
+      - name: Full code-only extraction
+        run: |
+          GRAPHIFY_FORCE=1 graphify extract . --code-only
+          graphify cluster-only . --no-viz --no-label
+      - name: Write graph-meta.json
+        run: |
+          python - << 'PY'
+          import datetime
+          import json
+          import subprocess
+
+          g = json.load(open("graphify-out/graph.json"))
+          meta = {
+              "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "sha": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip(),
+              "nodes": len(g.get("nodes", [])),
+              "edges": len(g.get("links", g.get("edges", []))),
+              "graphifyy": "0.9.17",
+              "kind": "code-only",
+          }
+          json.dump(meta, open("graphify-out/graph-meta.json", "w"), indent=2)
+          print(meta)
+          PY
+      - name: Publish rolling release
+        run: |
+          gh release view knowledge-graph --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create knowledge-graph --repo "$GITHUB_REPOSITORY" \
+              --title "Knowledge graph (rolling)" --latest=false \
+              --notes "Rolling release. Assets are overwritten by the Knowledge graph workflow; do not attach anything else here."
+          gh release upload knowledge-graph --repo "$GITHUB_REPOSITORY" --clobber \
+            graphify-out/graph.json graphify-out/GRAPH_REPORT.md graphify-out/graph-meta.json
+      - name: Notify adepthood hub (optional)
+        if: env.DISPATCH_TOKEN != ''
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Geoffe-Ga/adepthood/dispatches \
+            -d '{"event_type":"graph-updated","client_payload":{"repo":"creek-vault"}}'
+
+  semantic:
+    name: Semantic refresh (weekly, key-guarded)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Skip without API key
+        if: env.HAS_KEY != 'true'
+        run: echo "ANTHROPIC_API_KEY secret not set — graph stays code-only. Add the secret to enable the semantic layer."
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+      - uses: actions/setup-python@v5
+        if: env.HAS_KEY == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install pinned graphify
+        if: env.HAS_KEY == 'true'
+        run: pip install graphifyy==0.9.17
+      - name: Restore semantic cache from release
+        if: env.HAS_KEY == 'true'
+        run: |
+          if gh release download knowledge-graph --repo "$GITHUB_REPOSITORY" \
+               -p semantic-cache.tar.gz -O semantic-cache.tar.gz 2>/dev/null; then
+            tar xzf semantic-cache.tar.gz
+            echo "Semantic cache restored."
+          else
+            echo "No semantic cache yet — first run pays the full corpus."
+          fi
+      - name: Semantic extraction (SHA-cached, incremental)
+        if: env.HAS_KEY == 'true'
+        run: graphify extract . --backend claude --max-concurrency 2
+      - name: Name communities
+        if: env.HAS_KEY == 'true'
+        run: graphify label . --missing-only --backend claude
+      - name: Publish refreshed assets
+        if: env.HAS_KEY == 'true'
+        run: |
+          python - << 'PY'
+          import datetime
+          import json
+          import subprocess
+
+          g = json.load(open("graphify-out/graph.json"))
+          meta = {
+              "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "sha": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip(),
+              "nodes": len(g.get("nodes", [])),
+              "edges": len(g.get("links", g.get("edges", []))),
+              "graphifyy": "0.9.17",
+              "kind": "code+semantic",
+          }
+          json.dump(meta, open("graphify-out/graph-meta.json", "w"), indent=2)
+          PY
+          tar czf semantic-cache.tar.gz graphify-out/cache
+          gh release upload knowledge-graph --repo "$GITHUB_REPOSITORY" --clobber \
+            graphify-out/graph.json graphify-out/GRAPH_REPORT.md \
+            graphify-out/graph-meta.json semantic-cache.tar.gz

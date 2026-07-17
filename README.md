@@ -93,3 +93,22 @@ Phase-3 of the implementation plan is complete: eleven registered ingestors plus
 ## License
 
 MIT.
+
+## Knowledge graph
+
+This repo publishes a [graphify](https://github.com/Graphify-Labs/graphify)
+knowledge graph as assets on the rolling
+[`knowledge-graph` release](https://github.com/Geoffe-Ga/Creek-Vault/releases/tag/knowledge-graph)
+(never committed — the ~30 MB weekly-regenerated artifact would bloat git
+history) so the [adepthood](https://github.com/Geoffe-Ga/adepthood) hub can
+merge it into the ecosystem pan-graph. A weekly workflow rebuilds it
+(AST-only, free) and refreshes the semantic layer over `docs/Ontology/**` and
+`docs/decisions/**` when an `ANTHROPIC_API_KEY` secret is configured — see
+`.github/workflows/graph-update.yml`. To query locally, build with
+`graphify extract . --code-only` or download the release's `graph.json`.
+
+```bash
+pip install graphifyy==0.9.17
+graphify query "how does the link engine detect eddies"
+graphify update .   # after code changes; no API key needed
+```

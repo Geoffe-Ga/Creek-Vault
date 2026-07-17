@@ -76,3 +76,8 @@
 
 # Claude Code local worktrees
 .claude/worktrees/
+
+# graphify knowledge graph — never committed in this repo (~30 MB, weekly
+# regenerated). Published as a rolling GitHub Release ("knowledge-graph")
+# by .github/workflows/graph-update.yml; the adepthood hub fetches it there.
+graphify-out/
