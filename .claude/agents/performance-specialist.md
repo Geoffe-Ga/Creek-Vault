@@ -4,7 +4,7 @@ description: "Profiles and optimizes performance-sensitive code — O(n²) pairw
 level: 2
 phase: Implementation,Cleanup
 tools: Read,Write,Edit,Grep,Glob
-model: sonnet
+model: fable
 delegates_to: []
 receives_from: [chief-architect, code-review-orchestrator]
 ---

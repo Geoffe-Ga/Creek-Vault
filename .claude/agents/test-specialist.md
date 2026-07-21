@@ -4,7 +4,7 @@ description: "Gate 1 RED — writes the failing tests that specify a behavior be
 level: 2
 phase: Test
 tools: Read,Write,Edit,Grep,Glob
-model: sonnet
+model: fable
 delegates_to: []
 receives_from: [chief-architect, code-review-orchestrator]
 ---
