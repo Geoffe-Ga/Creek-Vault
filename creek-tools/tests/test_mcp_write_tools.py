@@ -9,6 +9,7 @@ tier-ceiling enforcement helper, and the audit-log write-side fields
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -348,6 +349,165 @@ def test_ingest_writes_fragments_and_audit(
     assert last["affected_fragment_ids"] == ["frag-stub-1"]
     # Ensure the unused IngestedFragment alias does not cause import warnings.
     assert stub_fragment is not None
+
+
+# ---------------------------------------------------------------------------
+# ingest — vault path confinement (issue #819)
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_refuses_absolute_path_outside_vault(vault: Path) -> None:
+    """An absolute ``input_path`` resolving outside the vault root is refused."""
+    outside = vault.parent / "outside.md"
+    outside.write_text("# outside\n", encoding="utf-8")
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path=str(outside),
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused"
+    assert "outside the vault root" in result["reason"]
+    assert not any((vault / "01-Fragments").rglob("*.md"))
+
+
+def test_ingest_refuses_dot_dot_traversal_outside_vault(vault: Path) -> None:
+    """A ``..``-relative ``input_path`` that escapes the vault is refused.
+
+    Proves the confinement check resolves the path (collapsing ``..``)
+    before comparing it against the vault root.
+    """
+    outside = vault.parent / "escape.md"
+    outside.write_text("# escape\n", encoding="utf-8")
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path=str(vault / ".." / "escape.md"),
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused"
+    assert "outside the vault root" in result["reason"]
+    assert not any((vault / "01-Fragments").rglob("*.md"))
+
+
+def test_ingest_refuses_symlink_escaping_vault(vault: Path) -> None:
+    """A symlink inside the vault pointing outside it is refused.
+
+    Proves the confinement check follows symlinks (via ``resolve()``)
+    rather than trusting the in-vault-looking literal path.
+    """
+    outside = vault.parent / "secret.md"
+    outside.write_text("# secret\n", encoding="utf-8")
+    link = vault / "link-to-secret.md"
+    os.symlink(outside, link)
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path=str(link),
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused"
+    assert "outside the vault root" in result["reason"]
+    assert not any((vault / "01-Fragments").rglob("*.md"))
+
+
+def test_ingest_confinement_refusal_skips_ingestor_invocation(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confinement is checked before any ingestor touches the source file."""
+
+    class _RaisingIngestor:
+        def ingest(self, _input: object) -> object:
+            raise AssertionError("should not be reached")
+
+    monkeypatch.setattr(
+        "creek_mcp.tools.ingest.INGESTOR_REGISTRY",
+        {"markdown": _RaisingIngestor},
+    )
+    outside = vault.parent / "untouched.md"
+    outside.write_text("# untouched\n", encoding="utf-8")
+
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path=str(outside),
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused"
+    assert "outside the vault root" in result["reason"]
+
+
+def test_ingest_relative_input_path_resolves_against_vault(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative ``input_path`` is resolved against the vault root, not cwd."""
+
+    class _StubResult:
+        def __init__(self) -> None:
+            self.fragments: list[object] = ["stub-parsed"]
+            self.errors: list[str] = []
+
+    class _StubIngestor:
+        def ingest(self, _input: object) -> object:
+            return _StubResult()
+
+    def _stub_assemble(_parsed: object) -> object:
+        return type(
+            "_A",
+            (),
+            {
+                "fragment": type("_F", (), {"id": "frag-stub-rel"})(),
+                "body": "stub body",
+            },
+        )()
+
+    class _StubWriter:
+        def __init__(self, *, vault_path: object) -> None:
+            self.vault_path = vault_path
+
+        def write_fragment(self, fragment: object, *, body: str) -> None:
+            del fragment, body
+
+    monkeypatch.setattr(
+        "creek_mcp.tools.ingest.INGESTOR_REGISTRY",
+        {"markdown": _StubIngestor},
+    )
+    monkeypatch.setattr(
+        "creek_mcp.tools.ingest.assemble_ingested_fragment",
+        _stub_assemble,
+    )
+    monkeypatch.setattr("creek_mcp.tools.ingest.VaultWriter", _StubWriter)
+
+    (vault / "input.md").write_text("# stub\n", encoding="utf-8")
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path="input.md",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "ok"
+    assert result["written"] == 1
+
+
+def test_ingest_tier_ceiling_checked_before_confinement(vault: Path) -> None:
+    """The tier-ceiling gate refuses before the confinement check runs.
+
+    ``ceiling=open`` against the personal-tier default must fail on
+    ``"exceeds ceiling"`` even for an outside-the-vault path, proving
+    the ceiling gate still fires first.
+    """
+    outside = vault.parent / "outside-ceiling.md"
+    outside.write_text("# outside\n", encoding="utf-8")
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path=str(outside),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert "exceeds ceiling" in result["reason"]
 
 
 # ---------------------------------------------------------------------------
