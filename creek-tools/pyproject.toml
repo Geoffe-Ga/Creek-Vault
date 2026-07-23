@@ -24,6 +24,10 @@ dependencies = [
     # injection on Streamable HTTP bearer transport — reachable via
     # creek_mcp), CVE-2026-52870, CVE-2026-59950. All fixed in 1.28.1.
     "mcp>=1.28.1,<2.0.0",
+    # creek_mcp.server._serve_network drives uvicorn directly for the TLS
+    # network transport (#837), so uvicorn is a direct dependency rather than
+    # a transitive one via mcp. Floor matches the uv.lock resolution.
+    "uvicorn>=0.47.0",
     # At-rest volume key (creek.confidential): Argon2id / AES-GCM / HKDF are
     # imported unconditionally, so cryptography is a direct base dependency —
     # not left to transitive resolution via mcp -> pyjwt[crypto] (#758).

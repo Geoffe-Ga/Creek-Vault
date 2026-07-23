@@ -194,7 +194,7 @@ CrawDad (FEAT-013+) treats this server's tool registry as its
 stdio child process. Set `CREEK_MCP_CONSUMER=crawdad` in the bot's
 environment so the audit trail distinguishes Discord-driven calls.
 
-## Network transport (authenticated, epic #757 / #759)
+## Network transport (authenticated, epic #757 / #759 / #837)
 
 Local consumers (Claude Code, CrawDad) speak JSON-RPC over **stdio** — the
 default, unchanged. To reach a user's per-user-VM vault from a remote
@@ -208,15 +208,28 @@ export CREEK_MCP_CONSUMER_TOKENS="adepthood=<secrets.token_hex(32)>;other=<token
 creek-tools-mcp --transport network --host 127.0.0.1 --port 8000
 ```
 
-> **⚠️ TLS is required in production — the server does not terminate it.**
-> `--transport network` speaks plain HTTP. Binding beyond loopback (e.g.
-> `--host 0.0.0.0`) **without TLS sends the bearer token in cleartext on every
-> request**, which defeats the constant-time comparison and no-anonymous-access
-> guarantees below. A bare `--host 0.0.0.0 --port 8000` is **not safe to expose
-> directly.** Production deployments MUST sit behind a **TLS-terminating reverse
-> proxy** (or use mTLS); keep the server itself bound to `127.0.0.1` and let the
-> proxy handle TLS and forward to it. The reverse proxy is also the right place
-> for rate-limiting and IP allowlisting.
+### TLS is enforced for non-loopback binds (#837)
+
+`--host` defaults to `127.0.0.1`. A **loopback** bind — `127.0.0.0/8`,
+`::1`, or the literal hostname `localhost` (case-insensitive) — may still
+serve plain HTTP, for local dev; anything else is refused unless
+`--tls-cert`/`--tls-key` are both supplied and point at existing files:
+
+```bash
+creek-tools-mcp --transport network --host 0.0.0.0 --port 8443 \
+  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+```
+
+With both flags set, the server serves the Starlette app directly under
+`uvicorn` with `ssl_certfile`/`ssl_keyfile` — no reverse proxy is required.
+Alternatively, keep the server bound to `127.0.0.1` (or `localhost`) and
+terminate TLS in a reverse proxy in front of it; either path keeps bearer
+tokens off the wire in cleartext. A non-loopback bind without TLS exits
+immediately with a nonzero status and an error on stderr, before any socket
+opens — no partial startup. Note that only an IP literal or the exact
+hostname `localhost` is recognised as loopback; any other hostname (even one
+that happens to resolve to `127.0.0.1`, e.g. via `/etc/hosts`) is treated as
+routable by design and requires TLS.
 
 - **No anonymous access.** Network mode refuses to start unless
   `CREEK_MCP_CONSUMER_TOKENS` is set. It holds `consumer=token` pairs,
@@ -229,6 +242,18 @@ creek-tools-mcp --transport network --host 127.0.0.1 --port 8000
   is stamped on every audit-log entry — so remote calls are attributable the
   same way `CREEK_MCP_CONSUMER` attributes stdio calls. A missing or unknown
   token is rejected `401` before any tool runs; comparison is constant-time.
+- **Bearer tokens carry a finite lifetime (#837).** Each verified bearer is
+  issued an `AccessToken` that expires `CREEK_MCP_TOKEN_TTL_SECONDS` after
+  the moment it was verified (default `3600`, i.e. one hour); an unset,
+  non-integer, or non-positive TTL value falls back to the default rather
+  than issuing a non-expiring token. In practice the SDK's bearer middleware
+  re-verifies the `Authorization` header on every request rather than
+  caching a session-scoped token, so a consumer that keeps presenting the
+  same configured `CREEK_MCP_CONSUMER_TOKENS` secret is re-verified and
+  granted a fresh `AccessToken`/`expires_at` on each call; the TTL bounds how
+  long any *individually captured* `AccessToken` (e.g. one logged or cached
+  outside the server) would remain valid, not how often the underlying
+  shared secret must be rotated.
 - **A consumer token grants remote _write_ access, by design.** A valid
   `CREEK_MCP_CONSUMER_TOKENS` entry can reach every non-purge tool at or below
   the `personal` ceiling — including the **write** tools (`creek.journal`,
@@ -340,6 +365,10 @@ an identical target page.
 - **`creek.draft` returns "LLM provider unavailable":** the server
   loads the LLM lazily so only `draft` requires it. Configure
   `ANTHROPIC_API_KEY` or a running Ollama instance.
+- **`--transport network` exits with "refusing to serve on non-loopback
+  host ... without TLS":** bind `127.0.0.1`/`localhost` for local dev, or
+  pass `--tls-cert`/`--tls-key` (both, pointing at existing files) for a
+  routable bind.
 - **Fewer mine seeds than expected:** the ceiling is filtering intimate
   fragments by design. Raise the ceiling to `intimate` or `all` only
   when the caller is authorised.
