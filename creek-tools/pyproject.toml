@@ -154,6 +154,11 @@ constraint-dependencies = [
     "pip>=26.1.2",
     "setuptools>=78.1.1",
     "wheel>=0.47.0",
+    # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
+    # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
+    # transitive-only via the gdrive extra → google-auth →
+    # pyasn1-modules. Both fixed in 0.6.4 (#867).
+    "pyasn1>=0.6.4",
 ]
 
 [tool.setuptools.packages.find]
