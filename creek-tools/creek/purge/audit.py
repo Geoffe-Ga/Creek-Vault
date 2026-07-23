@@ -89,6 +89,12 @@ class PurgeAuditEntry(BaseModel):
             ``saved_from.intimate_body_pointer`` (GAP-012). Zero for
             notes that carry no pointer, dry-runs count what *would* be
             removed, and an already-missing stub does not increment it.
+        journal_staged_removed: Number of staged journal source files
+            deleted under ``00-Creek-Meta/adepthood/journal/`` because
+            the fragment they produced was purged, or because a
+            whole-vault purge swept the staging dir (issue #845). Zero
+            for fragments with no ``source.origin_key``; dry-runs count
+            what *would* be removed.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before
@@ -119,6 +125,7 @@ class PurgeAuditEntry(BaseModel):
     embeddings_removed: int = 0
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
+    journal_staged_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
@@ -152,6 +159,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("embeddings_removed", 0)
     upgraded.setdefault("provenance_scrubbed", 0)
     upgraded.setdefault("intimate_stubs_removed", 0)
+    upgraded.setdefault("journal_staged_removed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
     # absent, so we leave them out here rather than fabricating a
     # phase / operation_id that doesn't correspond to anything on disk.
@@ -320,6 +328,7 @@ class PurgeAuditLog:
             "embeddings_removed": 0,
             "provenance_scrubbed": 0,
             "intimate_stubs_removed": 0,
+            "journal_staged_removed": 0,
             "operator": "system",
             "dry_run": False,
             "migrated_entries": migrated_count,

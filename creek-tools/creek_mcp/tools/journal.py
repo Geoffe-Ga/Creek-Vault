@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import frontmatter
 
+from creek.ingest.journal_staging import JOURNAL_STAGING_RELDIR
 from creek.ingest.markdown import MarkdownIngestor
 from creek.ingest.pipeline import derive_source_key, ledger_for_source, run_ingest
 from creek.models import PrivacyTier
@@ -46,10 +47,10 @@ if TYPE_CHECKING:
 
 TOOL_NAME = "creek.journal"
 _SOURCE_TYPE = "markdown"
-# A stable per-vault home for staged Adepthood entries. The ``journal`` segment
-# makes the markdown ingestor classify them as SourcePlatform.JOURNAL; the
-# ``adepthood`` segment identifies the source in each fragment's origin_key.
-_JOURNAL_INBOX = Path("00-Creek-Meta/adepthood/journal")
+# A stable per-vault home for staged Adepthood entries — the shared constant
+# keeps this tool and the purge engine's RTBF staged-entry sweep pointed at
+# the same directory (#845). Aliased so the rest of the module reads unchanged.
+_JOURNAL_INBOX = JOURNAL_STAGING_RELDIR
 # Where JOURNAL-platform fragments are routed by the writer — recorded as the
 # audit ``created_path`` (mirrors ingest_tool's dir-level created_path).
 _FRAGMENT_ROUTING_DIR = Path("01-Fragments/Journal")

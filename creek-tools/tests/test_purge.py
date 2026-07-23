@@ -582,6 +582,244 @@ def test_fragment_purge_intimate_stub_outside_vault_skipped(
 
 
 # ---------------------------------------------------------------------------
+# Engine tests — journal staged-entry sweep (#845)
+# ---------------------------------------------------------------------------
+
+_JOURNAL_STAGING_DIR = "00-Creek-Meta/adepthood/journal"
+"""Where ``journal_ingest_tool`` stages full entry bodies (the ledger key root)."""
+
+_JOURNAL_SECRET = "synthetic-intimate-secret-845"
+"""Synthetic marker standing in for intimate body content — never real data."""
+
+
+def _write_journal_fragment_with_staged(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    origin_key: str | None = None,
+    write_staged: bool = True,
+) -> tuple[Path, Path]:
+    """Write a journal fragment plus the staged plaintext entry it points at.
+
+    Mirrors what ``journal_ingest_tool`` leaves on disk (#845): the
+    fragment lands under ``01-Fragments/Journal/`` with frontmatter
+    ``source.origin_key`` naming the staged full-body markdown file
+    under ``00-Creek-Meta/adepthood/journal/``. The staged body carries
+    :data:`_JOURNAL_SECRET` so tests can assert the plaintext is really
+    gone from the vault after a purge.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID for the fragment's frontmatter.
+        title: Fragment title (also the staged file's stem by default).
+        origin_key: Vault-relative pointer recorded in the fragment's
+            ``source.origin_key``. Defaults to the canonical staging
+            path for *title*.
+        write_staged: When ``False``, record the pointer but do not
+            create the staged file on disk.
+
+    Returns:
+        Tuple of ``(fragment_path, staged_path)``.
+    """
+    key = origin_key or f"{_JOURNAL_STAGING_DIR}/{title}.md"
+    staged_path = vault / key
+    if write_staged:
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_post = frontmatter.Post(
+            content=f"The full journal body. {_JOURNAL_SECRET}\n",
+            privacy_tier="intimate",
+            source_id=title,
+        )
+        staged_path.write_text(frontmatter.dumps(staged_post), encoding="utf-8")
+
+    frag_path = vault / "01-Fragments" / "Journal" / f"{title}.md"
+    frag_post = frontmatter.Post(
+        content="A journal fragment summary.\n",
+        id=frag_id,
+        title=title,
+        type="fragment",
+        source={
+            "platform": "journal",
+            "origin_key": key,
+            "original_file": str(staged_path),
+        },
+        threads=[],
+        eddies=[],
+        privacy_tier="intimate",
+    )
+    frag_path.parent.mkdir(parents=True, exist_ok=True)
+    frag_path.write_text(frontmatter.dumps(frag_post), encoding="utf-8")
+    return frag_path, staged_path
+
+
+def _vault_files_containing_secret(vault: Path) -> list[Path]:
+    """Return every vault markdown file whose text still carries the secret.
+
+    Walks the whole vault (not just ``01-Fragments``) because the RTBF
+    contract is vault-wide: after a purge, :data:`_JOURNAL_SECRET` must
+    appear in **no** file anywhere under the vault root.
+
+    Args:
+        vault: Vault root to walk.
+
+    Returns:
+        Offending paths — empty when the purge honored the RTBF request.
+    """
+    return [
+        md_file
+        for md_file in sorted(vault.rglob("*.md"))
+        if _JOURNAL_SECRET in md_file.read_text(encoding="utf-8")
+    ]
+
+
+def test_fragment_purge_removes_journal_staged_entry(tmp_path: Path) -> None:
+    """Purging a journal fragment deletes its staged plaintext body (#845)."""
+    vault = _make_vault(tmp_path)
+    frag, staged = _write_journal_fragment_with_staged(vault, "frag-J", "entry-one")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-J")
+
+    assert result.journal_staged_removed == 1
+    assert not frag.exists()
+    assert not staged.exists()
+    # The RTBF core: the intimate body survives NOWHERE under the vault.
+    assert _vault_files_containing_secret(vault) == []
+
+
+def test_source_purge_removes_journal_staged_entry(tmp_path: Path) -> None:
+    """``purge_source("journal")`` sweeps the staged entry too (#845).
+
+    Pins the ``_purge_single`` path — source-scoped purges must follow
+    ``source.origin_key`` exactly like the single-fragment path does.
+    """
+    vault = _make_vault(tmp_path)
+    _frag, staged = _write_journal_fragment_with_staged(vault, "frag-J", "entry-one")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("journal")
+
+    assert result.fragments_affected == 1
+    assert result.journal_staged_removed == 1
+    assert not staged.exists()
+    assert _vault_files_containing_secret(vault) == []
+
+
+def test_vault_purge_removes_journal_staged_entries(tmp_path: Path) -> None:
+    """``purge_vault`` wipes the staging dir; counters stay honest (#845).
+
+    Both staged bodies must be gone and counted on
+    ``journal_staged_removed`` — but staged files are *not* fragments,
+    so ``fragments_affected`` must match a twin vault that never had
+    them.
+    """
+    vault = _make_vault(tmp_path)
+    _frag_a, staged_a = _write_journal_fragment_with_staged(
+        vault,
+        "frag-J1",
+        "entry-one",
+    )
+    _frag_b, staged_b = _write_journal_fragment_with_staged(
+        vault,
+        "frag-J2",
+        "entry-two",
+    )
+    twin = _make_vault(tmp_path / "twin")
+    for twin_id, twin_title in [("frag-J1", "entry-one"), ("frag-J2", "entry-two")]:
+        _write_journal_fragment_with_staged(
+            twin,
+            twin_id,
+            twin_title,
+            write_staged=False,
+        )
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+    twin_result = PurgeEngine(twin).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.journal_staged_removed == 2
+    assert not staged_a.exists()
+    assert not staged_b.exists()
+    assert _vault_files_containing_secret(vault) == []
+    # Staged files never inflate the fragment count.
+    assert result.fragments_affected == twin_result.fragments_affected
+
+
+def test_journal_staged_dry_run_preserves(tmp_path: Path) -> None:
+    """Dry-run counts the staged entry it would delete but leaves it on disk."""
+    vault = _make_vault(tmp_path)
+    frag, staged = _write_journal_fragment_with_staged(vault, "frag-J", "entry-one")
+
+    frag_result = PurgeEngine(vault, dry_run=True).purge_fragment("frag-J")
+
+    assert frag_result.journal_staged_removed == 1
+    assert frag.exists()
+    assert staged.exists()
+
+    vault_result = PurgeEngine(vault, dry_run=True).purge_vault(
+        VAULT_PURGE_CONFIRMATION,
+    )
+
+    assert vault_result.journal_staged_removed == 1
+    assert staged.exists()
+
+
+def test_journal_staged_pointer_outside_vault_skipped(tmp_path: Path) -> None:
+    """Escaping or out-of-scope ``origin_key`` pointers are never followed.
+
+    Containment is two guards (#845): the pointer must resolve inside
+    the vault root AND inside ``00-Creek-Meta/adepthood/journal/``. A
+    pointer escaping the vault and a pointer at a vault file outside
+    the staging dir must both survive, each with a zero counter.
+    """
+    vault = _make_vault(tmp_path)
+    # Variant 1: the pointer escapes the vault root entirely.
+    frag_out, outside = _write_journal_fragment_with_staged(
+        vault,
+        "frag-out",
+        "escapee",
+        origin_key="../outside-secret.md",
+    )
+
+    result_out = PurgeEngine(vault).purge_fragment("frag-out")
+
+    assert result_out.journal_staged_removed == 0
+    assert not frag_out.exists()
+    assert outside.exists()
+    assert _JOURNAL_SECRET in outside.read_text(encoding="utf-8")
+
+    # Variant 2: the pointer stays inside the vault but outside the
+    # staging dir (staging-dir scope guard).
+    frag_in, decoy = _write_journal_fragment_with_staged(
+        vault,
+        "frag-in",
+        "decoyed",
+        origin_key="01-Fragments/other.md",
+    )
+
+    result_in = PurgeEngine(vault).purge_fragment("frag-in")
+
+    assert result_in.journal_staged_removed == 0
+    assert not frag_in.exists()
+    assert decoy.exists()
+    assert _JOURNAL_SECRET in decoy.read_text(encoding="utf-8")
+
+
+def test_journal_purge_audit_records_count(tmp_path: Path) -> None:
+    """The outcome audit entry reports ``journal_staged_removed`` (#845)."""
+    vault = _make_vault(tmp_path)
+    _write_journal_fragment_with_staged(vault, "frag-J", "entry-one")
+    engine = PurgeEngine(vault)
+
+    engine.purge_fragment("frag-J")
+
+    entries = PurgeAuditLog(vault).read()
+    intent, outcome = entries
+    assert intent.journal_staged_removed == 0
+    assert outcome.journal_staged_removed == 1
+
+
+# ---------------------------------------------------------------------------
 # Engine tests — purge_source
 # ---------------------------------------------------------------------------
 

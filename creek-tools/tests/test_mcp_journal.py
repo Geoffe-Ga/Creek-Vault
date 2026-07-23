@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.purge import PurgeEngine
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.journal import TOOL_NAME, journal_ingest_tool
@@ -256,3 +257,74 @@ def test_ingest_failure_is_refused_and_audited(tmp_path: Path) -> None:
     assert last["tool"] == TOOL_NAME
     assert last["args_summary"]["tier"] == "personal"
     assert last["created_tier"] == "personal"
+
+
+def test_resend_after_purge_restages_cleanly(tmp_path: Path) -> None:
+    """RTBF then re-send: purge removes the staged body; re-ingest restages (#845).
+
+    The staged plaintext under ``00-Creek-Meta/adepthood/journal/`` must
+    be gone right after the purge (the RTBF core), and re-sending the
+    SAME external id + content afterwards must land the fragment AND the
+    staged file again at their stable paths — a purge must not poison
+    the idempotency key.
+    """
+    vault = _vault(tmp_path)
+    secret = "synthetic-intimate-secret-845"
+
+    def _send() -> dict[str, object]:
+        """Ingest the same intimate entry (stable external id + content)."""
+        return journal_ingest_tool(
+            vault_path=vault,
+            content=f"a tender entry {secret}",
+            external_id="adep-845",
+            timestamp=_TS,
+            tier="intimate",
+            privacy_tier_ceiling=TierCeiling.INTIMATE,
+        )
+
+    first = _send()
+    assert first["status"] == "ok"
+    staged_dir = vault / "00-Creek-Meta" / "adepthood" / "journal"
+    staged = sorted(staged_dir.glob("*.md"))
+    assert len(staged) == 1
+    assert secret in staged[0].read_text(encoding="utf-8")
+
+    PurgeEngine(vault).purge_fragment(str(first["fragment_id"]))
+
+    # The RTBF core (#845): the staged plaintext body is gone right
+    # after the purge, before any re-send.
+    assert not staged[0].exists()
+    assert _fragments(vault) == []
+
+    resent = _send()
+    assert resent["status"] == "ok"
+    assert len(_fragments(vault)) == 1  # the fragment exists again
+    assert staged[0].exists()  # restaged at the same stable path
+
+
+def test_staging_path_unchanged(tmp_path: Path) -> None:
+    """The staging dir is pinned at ``00-Creek-Meta/adepthood/journal/`` (#845).
+
+    Regression pin: the purge engine's staging-dir containment guard
+    and the source ledger both key on this path — relocating the
+    constant without a ledger migration would orphan every existing
+    staged entry. May already pass; that is the point.
+    """
+    vault = _vault(tmp_path)
+    result = journal_ingest_tool(
+        vault_path=vault,
+        content="a steady entry",
+        external_id="adep-846",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "ok"
+    staged = sorted((vault / "00-Creek-Meta" / "adepthood" / "journal").glob("*.md"))
+    assert len(staged) == 1
+    post = _load(_fragments(vault)[0])
+    source = post.metadata["source"]
+    assert isinstance(source, dict)
+    # The ledger key recorded on the fragment names the same staging path.
+    assert str(source["origin_key"]) == (
+        f"00-Creek-Meta/adepthood/journal/{staged[0].name}"
+    )
