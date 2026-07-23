@@ -14,6 +14,7 @@ point (``main``).
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -651,16 +652,131 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--host", default="127.0.0.1", help="Network transport bind host."
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Network transport bind host. A non-loopback host requires "
+            "--tls-cert/--tls-key so bearer tokens never transit in cleartext."
+        ),
     )
     parser.add_argument(
         "--port", type=int, default=8000, help="Network transport bind port."
     )
+    parser.add_argument(
+        "--tls-cert",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the TLS certificate (PEM). Required together with "
+            "--tls-key when binding a non-loopback host."
+        ),
+    )
+    parser.add_argument(
+        "--tls-key",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the TLS private key (PEM). Required together with "
+            "--tls-cert when binding a non-loopback host."
+        ),
+    )
     return parser
+
+
+def _is_loopback(host: str) -> bool:
+    """Return whether *host* is a loopback bind (safe for plaintext transport).
+
+    Loopback traffic never leaves the machine, so serving bearer-token auth
+    without TLS is acceptable there — and only there.
+
+    Args:
+        host: The ``--host`` value: an IP literal or a hostname.
+
+    Returns:
+        ``True`` for loopback IPs (``127.0.0.0/8``, ``::1``) and the literal
+        ``"localhost"`` (case-insensitive); ``False`` for everything else,
+        including ``""``, wildcard binds, other hostnames, and strings that
+        do not parse as an IP address at all.
+    """
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not an IP literal (hostname, empty, garbage): assume routable.
+        return False
+
+
+def _require_transport_confidentiality(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Refuse network configurations that would put bearer tokens on the wire.
+
+    Enforces, in order: ``--tls-cert``/``--tls-key`` come as a pair; both
+    files exist on disk; and a non-loopback ``--host`` is only served when
+    TLS is configured. Each violation exits via :meth:`argparse.ArgumentParser.error`
+    (nonzero exit, message on stderr) *before* any socket is opened (#837).
+
+    Args:
+        parser: The CLI parser, used to report errors in argparse style.
+        args: Parsed arguments carrying ``host``, ``tls_cert``, ``tls_key``.
+    """
+    if (args.tls_cert is None) != (args.tls_key is None):
+        parser.error(
+            "--tls-cert and --tls-key are required together; supply both "
+            "(or neither, for a loopback-only bind)"
+        )
+    if args.tls_cert is not None:
+        for flag, path in (("--tls-cert", args.tls_cert), ("--tls-key", args.tls_key)):
+            if not path.exists():
+                parser.error(f"{flag}: file not found: {path}")
+        return
+    if not _is_loopback(args.host):
+        parser.error(
+            f"refusing to serve on non-loopback host {args.host!r} without TLS: "
+            "bearer tokens would transit the network in cleartext. Bind "
+            "127.0.0.1, terminate TLS in a reverse proxy, or pass "
+            "--tls-cert/--tls-key"
+        )
+
+
+def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
+    """Serve the streamable-http transport, with TLS when cert + key are given.
+
+    With ``--tls-cert``/``--tls-key`` configured, runs the server's Starlette
+    app under uvicorn with ``ssl_certfile``/``ssl_keyfile`` (mirroring the
+    SDK's own ``run_streamable_http_async`` bootstrap, plus TLS). Without
+    TLS — a loopback bind, per :func:`_require_transport_confidentiality` —
+    falls back to the SDK's plain ``run("streamable-http")``.
+
+    Args:
+        server: The built (authenticated) :class:`FastMCP` server.
+        args: Parsed arguments carrying ``host``, ``port``, ``tls_cert``,
+            ``tls_key``.
+    """
+    if args.tls_cert is not None and args.tls_key is not None:
+        # Lazy import, matching FastMCP's own transport bootstrap pattern.
+        import uvicorn
+
+        config = uvicorn.Config(
+            server.streamable_http_app(),
+            host=args.host,
+            port=args.port,
+            log_level=server.settings.log_level.lower(),
+            ssl_certfile=str(args.tls_cert),
+            ssl_keyfile=str(args.tls_key),
+        )
+        uvicorn.Server(config).run()
+    else:
+        server.run(transport="streamable-http")
 
 
 def main(argv: list[str] | None = None) -> None:
     """Run the MCP server over stdio (local) or the authenticated network transport.
+
+    The network branch is fail-closed twice over: it refuses to start without
+    per-consumer tokens (no anonymous access), and it refuses a non-loopback
+    bind unless TLS is configured (no cleartext bearer tokens, #837).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -684,10 +800,11 @@ def main(argv: list[str] | None = None) -> None:
                 f"network transport requires {CONSUMER_TOKENS_ENV} "
                 "(consumer=token pairs); refusing to serve without authentication"
             )
+        _require_transport_confidentiality(parser, args)
         server = build_server(token_verifier=ConsumerTokenVerifier(tokens))
         server.settings.host = args.host
         server.settings.port = args.port
-        server.run(transport="streamable-http")
+        _serve_network(server, args)
     else:
         build_server().run(transport="stdio")
 
