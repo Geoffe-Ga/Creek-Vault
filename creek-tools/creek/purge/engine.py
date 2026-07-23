@@ -1219,7 +1219,12 @@ def _build_source_path_matcher(
 
 
 def _build_wikilink_pattern(title: str) -> re.Pattern[str]:
-    """Build a regex matching ``[[title]]`` and ``[[title|alias]]``.
+    """Build a regex matching every wikilink form targeting ``title``.
+
+    Matches ``[[title]]`` and ``[[title|alias]]``, plus heading
+    (``[[title#Heading]]``), block-reference (``[[title#^id]]``), and
+    heading+alias (``[[title#Heading|alias]]``) variants, so a purge
+    removes all links that leak the title.
 
     Args:
         title: The target title to match exactly.
@@ -1228,7 +1233,7 @@ def _build_wikilink_pattern(title: str) -> re.Pattern[str]:
         A compiled regex pattern.
     """
     escaped = re.escape(title)
-    return re.compile(rf"\[\[{escaped}(?:\|[^\]]*)?\]\]")
+    return re.compile(rf"\[\[{escaped}(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 
 
 def _build_provenance_pattern(fragment_id: str) -> re.Pattern[str]:

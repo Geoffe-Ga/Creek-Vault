@@ -289,6 +289,73 @@ def test_fragment_purge_removes_wikilinks(tmp_path: Path) -> None:
     assert "[[Beta]]" in post.content
 
 
+@pytest.mark.parametrize(
+    "link",
+    [
+        "[[Alpha#Heading]]",
+        "[[Alpha#Heading|alias]]",
+        "[[Alpha#^blk01]]",
+        "[[Alpha#]]",
+    ],
+)
+def test_fragment_purge_removes_heading_wikilinks(tmp_path: Path, link: str) -> None:
+    """Heading/block-suffixed wiki-links to the purged title are scrubbed (#833)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    linker = _write_fragment(vault, "frag-B", "Beta", body=f"See {link} today.")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.wikilinks_removed == 1
+    post = frontmatter.load(str(linker))
+    assert link not in post.content
+    assert "Alpha" not in post.content
+
+
+def test_fragment_purge_removes_all_wikilink_variants(tmp_path: Path) -> None:
+    """A mixed body loses every Alpha link variant while [[Beta]] survives (#833)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    linker = _write_fragment(
+        vault,
+        "frag-B",
+        "Beta",
+        body=(
+            "See [[Alpha]] and [[Alpha|a]] and [[Alpha#H]] "
+            "and [[Alpha#H|a]] and [[Beta]]."
+        ),
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.wikilinks_removed == 4
+    post = frontmatter.load(str(linker))
+    assert "Alpha" not in post.content
+    assert "[[Beta]]" in post.content
+
+
+def test_fragment_purge_leaves_prefix_titled_wikilinks(tmp_path: Path) -> None:
+    """Links to a longer title sharing the purged prefix are untouched (#833)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    linker = _write_fragment(
+        vault,
+        "frag-B",
+        "Beta",
+        body="See [[AlphaBeta]] and [[AlphaBeta#H]].",
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.wikilinks_removed == 0
+    post = frontmatter.load(str(linker))
+    assert "[[AlphaBeta]]" in post.content
+    assert "[[AlphaBeta#H]]" in post.content
+
+
 def test_fragment_purge_decrements_thread_counts(tmp_path: Path) -> None:
     """Threads referenced in the fragment have fragment_count decremented."""
     vault = _make_vault(tmp_path)
