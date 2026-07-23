@@ -152,13 +152,21 @@ constraint-dependencies = [
     "cryptography>=48.0.0",
     "pyjwt>=2.13.0",
     "pip>=26.1.2",
-    "setuptools>=78.1.1",
+    # Security: pin setuptools above PYSEC-2026-3447 (CVE-2026-59890,
+    # path traversal in the PackageIndex download path) — build/dev
+    # tooling only, never a runtime import. Fixed in 83.0.0 (#861).
+    "setuptools>=83.0.0",
     "wheel>=0.47.0",
     # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
     # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
     # transitive-only via the gdrive extra → google-auth →
     # pyasn1-modules. Both fixed in 0.6.4 (#867).
     "pyasn1>=0.6.4",
+    # Security: pin torch above PYSEC-2025-194 (CVE-2025-3000) —
+    # transitive-only via the embeddings extra → sentence-transformers,
+    # so the floor lives here rather than [project].dependencies.
+    # Fixed in 2.13.0 (#861).
+    "torch>=2.13.0",
 ]
 
 [tool.setuptools.packages.find]

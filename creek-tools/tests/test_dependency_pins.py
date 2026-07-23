@@ -23,6 +23,19 @@ pyasn1-modules and is never imported directly, so its floor lives in
 the package is already in the graph without declaring a dependency we
 never import (precedent: the pyjwt>=2.13.0 constraint, DEP-003).
 
+``setuptools`` (issue #861): setuptools 81.0.0 carries PYSEC-2026-3447
+(CVE-2026-59890, GHSA-h35f-9h28-mq5c — path traversal in the
+``PackageIndex`` download path). Fixed in setuptools 83.0.0. setuptools
+is build/dev tooling — transitive, never a runtime import — so its
+floor lives in ``[tool.uv].constraint-dependencies`` rather than
+``[project].dependencies`` (DEP-003 precedent).
+
+``torch`` (issue #861): torch 2.12.1 carries PYSEC-2025-194
+(CVE-2025-3000, GHSA-rrmf-rvhw-rf47). Fixed in torch 2.13.0. torch is
+transitive-only: it enters this graph via the ``embeddings`` extra →
+sentence-transformers and is never imported as a declared dependency,
+so its floor belongs in ``[tool.uv].constraint-dependencies``.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
@@ -57,6 +70,14 @@ _PATCHED_VERSION = Version("1.28.1")
 #: First pyasn1 release containing the fixes for CVE-2026-59885 and
 #: CVE-2026-59886.
 _PYASN1_PATCHED_VERSION = Version("0.6.4")
+
+#: First setuptools release containing the fix for PYSEC-2026-3447
+#: (CVE-2026-59890 / GHSA-h35f-9h28-mq5c).
+_SETUPTOOLS_PATCHED_VERSION = Version("83.0.0")
+
+#: First torch release containing the fix for PYSEC-2025-194
+#: (CVE-2025-3000 / GHSA-rrmf-rvhw-rf47).
+_TORCH_PATCHED_VERSION = Version("2.13.0")
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -121,6 +142,88 @@ def _locked_pyasn1_version() -> Version:
         if package["name"] == "pyasn1":
             return Version(str(package["version"]))
     pytest.fail("pyasn1 has no [[package]] entry in uv.lock")
+
+
+def _setuptools_constraint_specifier() -> SpecifierSet:
+    """Return the ``setuptools`` specifier from uv constraint-dependencies.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``setuptools`` constraint
+        entry. Fails the calling test if the ``[tool.uv]`` table or the
+        ``setuptools`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "setuptools":
+            return requirement.specifier
+    pytest.fail(
+        "setuptools has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_setuptools_version() -> Version:
+    """Return the resolved ``setuptools`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``setuptools`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``setuptools`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "setuptools":
+            return Version(str(package["version"]))
+    pytest.fail("setuptools has no [[package]] entry in uv.lock")
+
+
+def _torch_constraint_specifier() -> SpecifierSet:
+    """Return the ``torch`` specifier from uv constraint-dependencies.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``torch`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``torch`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "torch":
+            return requirement.specifier
+    pytest.fail(
+        "torch has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_torch_version() -> Version:
+    """Return the resolved ``torch`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``torch`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``torch`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "torch":
+            return Version(str(package["version"]))
+    pytest.fail("torch has no [[package]] entry in uv.lock")
 
 
 def test_mcp_floor_rejects_last_vulnerable_range() -> None:
@@ -213,6 +316,99 @@ def test_locked_pyasn1_at_or_above_patched_release() -> None:
     assert locked >= _PYASN1_PATCHED_VERSION, (
         f"uv.lock pins pyasn1 {locked}, below the CVE-patched "
         f"{_PYASN1_PATCHED_VERSION} (CVE-2026-59885 / CVE-2026-59886); "
+        "pip-audit inspects the lock, so relock after adding the "
+        "constraint"
+    )
+
+
+def test_setuptools_floor_rejects_last_vulnerable_release() -> None:
+    """The constraint excludes 81.0.0, the previously-locked vulnerable release.
+
+    setuptools 81.0.0 carries PYSEC-2026-3447 (CVE-2026-59890 — path
+    traversal in the ``PackageIndex`` download path). The fix lands AT
+    83.0.0, so the probe assertion on 82.9999 pins the floor at the
+    patch itself: any weakened floor below ``>=83.0.0`` still admits
+    vulnerable releases and fails here.
+    """
+    specifier = _setuptools_constraint_specifier()
+    assert "81.0.0" not in specifier, (
+        f"setuptools constraint {specifier!r} admits 81.0.0, the release "
+        "carrying PYSEC-2026-3447 / CVE-2026-59890; the floor must be "
+        ">=83.0.0"
+    )
+    assert "82.9999" not in specifier, (
+        f"setuptools constraint {specifier!r} admits 82.9999; the fix for "
+        "PYSEC-2026-3447 / CVE-2026-59890 lands at 83.0.0, so any floor "
+        "below >=83.0.0 still admits vulnerable releases"
+    )
+
+
+def test_setuptools_floor_accepts_patched_release() -> None:
+    """The constraint accepts 83.0.0, the first CVE-patched release."""
+    specifier = _setuptools_constraint_specifier()
+    assert "83.0.0" in specifier, (
+        f"setuptools constraint {specifier!r} rejects 83.0.0; the patched "
+        "release itself must satisfy the constraint"
+    )
+
+
+def test_locked_setuptools_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves setuptools to >= 83.0.0.
+
+    The lockfile is what CI installs and what pip-audit inspects; a
+    correct constraint floor with a stale lock still ships the
+    vulnerable 81.0.0.
+    """
+    locked = _locked_setuptools_version()
+    assert locked >= _SETUPTOOLS_PATCHED_VERSION, (
+        f"uv.lock pins setuptools {locked}, below the CVE-patched "
+        f"{_SETUPTOOLS_PATCHED_VERSION} (PYSEC-2026-3447 / "
+        "CVE-2026-59890); pip-audit inspects the lock, so relock after "
+        "raising the constraint"
+    )
+
+
+def test_torch_floor_rejects_last_vulnerable_release() -> None:
+    """The constraint excludes 2.12.1, the previously-locked vulnerable release.
+
+    torch 2.12.1 carries PYSEC-2025-194 (CVE-2025-3000). The fix lands
+    AT 2.13.0, so the probe assertion on 2.12.99 pins the floor at the
+    patch itself: any weakened floor below ``>=2.13.0`` still admits
+    vulnerable releases and fails here.
+    """
+    specifier = _torch_constraint_specifier()
+    assert "2.12.1" not in specifier, (
+        f"torch constraint {specifier!r} admits 2.12.1, the release "
+        "carrying PYSEC-2025-194 / CVE-2025-3000; the floor must be "
+        ">=2.13.0"
+    )
+    assert "2.12.99" not in specifier, (
+        f"torch constraint {specifier!r} admits 2.12.99; the fix for "
+        "PYSEC-2025-194 / CVE-2025-3000 lands at 2.13.0, so any floor "
+        "below >=2.13.0 still admits vulnerable releases"
+    )
+
+
+def test_torch_floor_accepts_patched_release() -> None:
+    """The constraint accepts 2.13.0, the first CVE-patched release."""
+    specifier = _torch_constraint_specifier()
+    assert "2.13.0" in specifier, (
+        f"torch constraint {specifier!r} rejects 2.13.0; the patched "
+        "release itself must satisfy the constraint"
+    )
+
+
+def test_locked_torch_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves torch to >= 2.13.0.
+
+    The lockfile is what CI installs and what pip-audit inspects; a
+    correct constraint floor with a stale lock still ships the
+    vulnerable 2.12.1.
+    """
+    locked = _locked_torch_version()
+    assert locked >= _TORCH_PATCHED_VERSION, (
+        f"uv.lock pins torch {locked}, below the CVE-patched "
+        f"{_TORCH_PATCHED_VERSION} (PYSEC-2025-194 / CVE-2025-3000); "
         "pip-audit inspects the lock, so relock after adding the "
         "constraint"
     )
