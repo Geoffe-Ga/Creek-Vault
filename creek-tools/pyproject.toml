@@ -58,7 +58,10 @@ embeddings = [
 ocr = [
     "pytesseract>=0.3",
     "pdf2image>=1.0",
-    "pillow>=10.0",
+    # >=12.3.0: fixes 8 pip-audit advisories incl. PYSEC-2026-2253..2257,
+    # PYSEC-2026-3451..3453 (font decompression-bomb DoS, WindowsViewer
+    # shell injection) reachable via OCR/pptx/markdownify ingestion (#843).
+    "pillow>=12.3.0",
 ]
 documents = [
     "python-docx>=1.0.0",
