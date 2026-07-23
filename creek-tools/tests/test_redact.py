@@ -2186,3 +2186,127 @@ class TestHighEntropyRegexSourceOfTruth:
         from creek.redact.scanner import HIGH_ENTROPY_CANDIDATE
 
         assert HIGH_ENTROPY_CANDIDATE is PATTERN_METADATA["high_entropy_string"].pattern
+
+
+# ---------------------------------------------------------------------------
+# Sequential pattern-order redaction leaks (Issue #832)
+# ---------------------------------------------------------------------------
+
+
+class TestPatternOrderLeak:
+    """Overlapping matches must all be redacted from ORIGINAL content (Issue #832).
+
+    ``Redactor.redact_content`` applies patterns sequentially and mutates
+    the content in place, so an earlier pattern (``email``) can destroy
+    the text a later, higher-severity pattern (``email_password_combo``)
+    needs to match — leaving the password half in cleartext. These tests
+    pin the required behavior: every match found against the original
+    content must be redacted in the output, with no cleartext gaps.
+    """
+
+    def test_email_password_combo_password_not_leaked_on_apply(self) -> None:
+        """The password half of an email:password combo must never survive."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        content = "login user@example.com:hunter2secret here"
+        result = redactor.redact_content(content)
+
+        assert "hunter2secret" not in result
+        assert "user@example.com" not in result
+
+    def test_email_password_combo_uses_combo_marker(self) -> None:
+        """An email:password combo should carry the combo marker, not email's."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        content = "login user@example.com:hunter2secret here"
+        result = redactor.redact_content(content)
+
+        assert "[REDACTED:email_password_combo]" in result
+        assert "[REDACTED:email]:hunter2secret" not in result
+
+    def test_apply_removes_every_scan_finding_parity(self, tmp_path: Path) -> None:
+        """Every finding reported by a scan must be removed by an apply."""
+        content = (
+            "creds user@example.com:hunter2secret\n"
+            "contact other@example.com\n"
+            "ssn 123-45-6789\n"
+        )
+        test_file = tmp_path / "leaks.txt"
+        test_file.write_text(content)
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        matches = scanner.scan_file(test_file)
+        match_types = {match.match_type for match in matches}
+        assert "email_password_combo" in match_types
+
+        redactor = Redactor(config=config, salt=scanner.salt)
+        result = redactor.redact_content(content)
+
+        assert "hunter2secret" not in result
+        assert "user@example.com" not in result
+        assert "other@example.com" not in result
+        assert "123-45-6789" not in result
+
+    def test_standalone_email_still_marked_email(self) -> None:
+        """A bare email with no password suffix keeps the email marker."""
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        content = "contact test@example.com"
+        result = redactor.redact_content(content)
+
+        assert "test@example.com" not in result
+        assert "[REDACTED:email]" in result
+
+    def test_allowlisted_email_inside_combo_still_redacts_password(self) -> None:
+        """Allowlisting the bare email must not spare the combo's password."""
+        config = RedactionConfig(
+            false_positive_allowlist=["user@example.com"],
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        content = "user@example.com:hunter2secret"
+        result = redactor.redact_content(content)
+
+        assert "hunter2secret" not in result
+
+    def test_custom_composite_pattern_not_leaked(self) -> None:
+        """A custom composite pattern must redact despite built-in overlap."""
+        combo_re = r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}::[^\s]+"
+        config = RedactionConfig(
+            custom_patterns={"email_token_combo": combo_re},
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        content = "user@example.com::tok_supersecret99"
+        result = redactor.redact_content(content)
+
+        assert "tok_supersecret99" not in result
+
+    def test_partial_overlap_union_redacted(self) -> None:
+        """Partially overlapping matches must be redacted as one full union."""
+        config = RedactionConfig(
+            custom_patterns={"tail_secret": r"com hunter[^\s]+"},
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        # Against the ORIGINAL content, `email` matches [0:16)
+        # ("user@example.com") and `tail_secret` matches [13:30)
+        # ("com hunter2secret") — a genuine partial, non-containment
+        # overlap on "com". No fragment of either match may survive.
+        content = "user@example.com hunter2secret"
+        result = redactor.redact_content(content)
+
+        assert "user@example.com" not in result
+        assert "hunter2secret" not in result
+        assert "example" not in result
+        assert "hunter" not in result
