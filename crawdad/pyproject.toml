@@ -12,7 +12,9 @@ authors = [
 ]
 dependencies = [
     "discord.py>=2.3.0",
-    "mcp>=1.0.0,<2.0.0",
+    # Security: pin mcp above CVE-2026-52869 (cross-principal session
+    # injection on Streamable HTTP bearer transport). Fixed in 1.28.1.
+    "mcp>=1.28.1,<2.0.0",
     "anthropic>=0.40.0",
     "openai>=1.0",
     "google-genai>=1.0",
