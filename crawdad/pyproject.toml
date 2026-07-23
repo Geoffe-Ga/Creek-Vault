@@ -54,6 +54,19 @@ dev = [
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.uv]
+# constraint-dependencies floor transitive packages that pip-audit
+# flagged (DEP-003). A constraint tightens resolution *if* the package
+# is in the graph without adding it as a direct dependency, so a future
+# `uv lock` cannot silently regress onto a vulnerable version.
+constraint-dependencies = [
+    # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
+    # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
+    # transitive via google-genai → google-auth → pyasn1-modules.
+    # Both fixed in 0.6.4 (#867).
+    "pyasn1>=0.6.4",
+]
+
 [tool.setuptools.packages.find]
 include = ["crawdad", "crawdad.*"]
 
