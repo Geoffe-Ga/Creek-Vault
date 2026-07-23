@@ -19,6 +19,11 @@ never-expiring credential. ``CREEK_MCP_TOKEN_TTL_SECONDS`` overrides the TTL;
 a non-integer or non-positive value falls back to the default rather than
 failing open with ``expires_at=None``.
 
+Configured tokens must clear a **minimum-length floor** (#838): a token in
+``CREEK_MCP_CONSUMER_TOKENS`` shorter than 32 characters is refused at load
+time so a guessable secret never guards the wire. Generate compliant tokens
+with ``python -c "import secrets; print(secrets.token_urlsafe(32))"``.
+
 Stdio (local CrawDad / Claude Code) is unaffected: no verifier is wired, so
 ``get_access_token()`` is ``None`` and calls run as before.
 """
@@ -47,6 +52,9 @@ TOKEN_TTL_ENV: Final[str] = "CREEK_MCP_TOKEN_TTL_SECONDS"
 
 _REMOTE_TOKEN_TTL_SECONDS: Final[int] = 3600
 """Default lifetime of a verified bearer's ``AccessToken`` (one hour)."""
+
+_MIN_TOKEN_LEN: Final[int] = 32
+"""Minimum consumer-token length — the ``secrets.token_urlsafe(32)`` floor (#838)."""
 
 # Monkeypatchable clock alias: tests pin `_now` to a fixed instant so the
 # expires_at arithmetic is exact; production keeps wall-clock time.
@@ -79,6 +87,32 @@ def _token_ttl_seconds() -> int:
     return ttl if ttl > 0 else _REMOTE_TOKEN_TTL_SECONDS
 
 
+def _validated_token(name: str, token: str) -> str:
+    """Return *token* if it clears :data:`_MIN_TOKEN_LEN`, else raise (#838).
+
+    The error names the consumer and the observed/required lengths and gives
+    the rotation recipe — it never echoes the token value itself.
+
+    Args:
+        name: The consumer the token belongs to (already stripped).
+        token: The configured token (already stripped, non-empty).
+
+    Returns:
+        The token, unchanged, when it meets the minimum length.
+
+    Raises:
+        ValueError: If the token is shorter than :data:`_MIN_TOKEN_LEN`.
+    """
+    if len(token) < _MIN_TOKEN_LEN:
+        msg = (
+            f"consumer {name!r} token is {len(token)} chars, below the "
+            f"{_MIN_TOKEN_LEN}-char minimum; rotate it with "
+            'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        )
+        raise ValueError(msg)
+    return token
+
+
 def load_consumer_tokens(
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -87,20 +121,27 @@ def load_consumer_tokens(
     Format: ``adepthood=<token>;other=<token>``. Blank entries and entries
     without a token are skipped. Returns an empty dict when unset — the caller
     treats "no tokens configured" as "network mode not permitted" (no anonymous
-    access).
+    access). A *present* token shorter than :data:`_MIN_TOKEN_LEN` characters
+    is refused outright (#838); generate compliant tokens with
+    ``python -c "import secrets; print(secrets.token_urlsafe(32))"``.
 
     Args:
         environ: Environment mapping (defaults to :data:`os.environ`).
 
     Returns:
         A ``{consumer: token}`` mapping.
+
+    Raises:
+        ValueError: If a configured token is shorter than
+            :data:`_MIN_TOKEN_LEN` characters. The message names the consumer
+            and lengths but never the token value.
     """
     raw = (environ if environ is not None else os.environ).get(CONSUMER_TOKENS_ENV, "")
     tokens: dict[str, str] = {}
     for entry in raw.split(";"):
         name, sep, token = entry.strip().partition("=")
         if sep and name.strip() and token.strip():
-            tokens[name.strip()] = token.strip()
+            tokens[name.strip()] = _validated_token(name.strip(), token.strip())
     return tokens
 
 
