@@ -143,9 +143,14 @@ def _parse_datetime(value: object) -> datetime | None:
 
 
 _WIKILINK_PATTERN: re.Pattern[str] = re.compile(
-    r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]",
+    r"\[\[([^\]|#]+?)(?:[#|][^\]]*?)?\]\]",
 )
-"""Matches Obsidian wiki-links like ``[[Target]]`` or ``[[Target|Alias]]``."""
+"""Matches Obsidian wiki-links, capturing only the file portion of the target.
+
+Heading anchors (``[[Note#Heading]]``) and aliases (``[[Note|alias]]``) are
+excluded from the captured target, and same-file anchors (``[[#Heading]]``)
+produce no target at all — they name no file to resolve (issue #835).
+"""
 
 _RELATIVE_LINK_PATTERN: re.Pattern[str] = re.compile(
     r"\[([^\]]*)\]\((?!#)([^)]+)\)",
@@ -191,11 +196,15 @@ def _list_all_md_files(vault_path: Path) -> list[Path]:
 def _extract_wikilinks(content: str) -> list[str]:
     """Extract wiki-link targets from markdown content.
 
+    Targets are the file portions only: heading anchors and aliases are
+    stripped by the pattern, and same-file anchor links (``[[#Heading]]``)
+    yield no target (issue #835).
+
     Args:
         content: Raw markdown text.
 
     Returns:
-        List of wiki-link target strings.
+        List of wiki-link target strings (file portions only).
     """
     return _WIKILINK_PATTERN.findall(content)
 
@@ -220,21 +229,27 @@ def _extract_relative_links(content: str) -> list[str]:
     """Extract relative (local file) link targets from markdown content.
 
     The raw target captured by the pattern may carry an optional title
-    suffix (``path "title"``); only the URL portion is considered. External
-    targets (URLs with a scheme, or protocol-relative ``//host`` targets)
-    are excluded, since they are not local file references.
+    suffix (``path "title"``); only the URL portion is considered. Anchor
+    (``#section``) and query (``?raw=1``) suffixes are stripped — Obsidian
+    links like ``[text](file.md#section)`` target the file portion — and a
+    target that is empty after stripping names no file, so it is skipped
+    (issue #835). External targets (URLs with a scheme, or protocol-relative
+    ``//host`` targets) are excluded, since they are not local file
+    references.
 
     Args:
         content: Raw markdown text.
 
     Returns:
-        List of relative link target strings, with external URLs removed.
+        List of relative link target strings (file portions only), with
+        external URLs removed.
     """
     targets: list[str] = []
     for match in _RELATIVE_LINK_PATTERN.findall(content):
         # A markdown link target may be ``path "optional title"``; the URL
-        # is the first whitespace-delimited token.
+        # is the first whitespace-delimited token, cut at any anchor/query.
         target = match[1].strip().split(maxsplit=1)[0] if match[1].strip() else ""
+        target = target.partition("#")[0].partition("?")[0]
         if not target or _is_external_target(target):
             continue
         targets.append(target)
