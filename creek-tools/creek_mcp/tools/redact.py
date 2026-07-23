@@ -18,13 +18,16 @@ Discord attachments staged under ``00-Creek-Meta/Inbound/`` before any
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from creek.config import load_config
 from creek.redact.scanner import RedactionMatch, RedactionScanner, ScanSummary
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.path_confinement import resolve_within_vault
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 TOOL_NAME = "creek.redact.scan"
 
@@ -60,7 +63,7 @@ def redact_scan_tool(
         consumer=consumer,
     )
 
-    resolved = _resolve_within_vault(vault_path, input_path)
+    resolved = resolve_within_vault(vault_path, input_path)
     if resolved is None:
         return refusal_response(
             tool=TOOL_NAME,
@@ -102,27 +105,6 @@ def redact_scan_tool(
         "findings": [_finding_to_dict(m, vault_path) for m in summary.matches],
         "report_markdown": scanner.generate_markdown_summary(summary),
     }
-
-
-def _resolve_within_vault(vault_path: Path, input_path: str) -> Path | None:
-    """Return *input_path* resolved inside *vault_path*, or ``None`` if outside.
-
-    Accepts either an absolute path inside the vault or a vault-relative
-    path. Uses ``Path.resolve(strict=False)`` so non-existent staging
-    directories still validate (existence is checked separately so the
-    caller gets a clean ``input_path not found`` message instead of a
-    silent ``None`` collapse).
-    """
-    vault_resolved = vault_path.resolve()
-    candidate = Path(input_path)
-    if not candidate.is_absolute():
-        candidate = vault_resolved / candidate
-    resolved = candidate.resolve()
-    try:
-        resolved.relative_to(vault_resolved)
-    except ValueError:
-        return None
-    return resolved
 
 
 def _finding_to_dict(match: RedactionMatch, vault_path: Path) -> dict[str, Any]:
