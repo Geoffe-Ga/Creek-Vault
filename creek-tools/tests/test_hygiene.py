@@ -199,6 +199,26 @@ class TestOrphanScanner:
         result_loose = scanner_loose.scan(vault)
         assert len(result_loose.orphan_paths) == 0
 
+    def test_anchor_wikilink_counts_in_link_graph(self, tmp_path: Path) -> None:
+        """An anchor wikilink connects both endpoints in the link graph (#835).
+
+        Fragment ``a`` links to ``b`` only via ``[[b#Section]]``; the anchor
+        must not hide the connection, so ``a`` has an outgoing link and ``b``
+        has an incoming link — neither is an orphan.
+        """
+        vault = _make_vault(tmp_path)
+        old = datetime.now(tz=UTC) - timedelta(days=60)
+        _write_fragment(vault, "b", created=old)
+        _write_fragment(
+            vault,
+            "a",
+            content="See [[b#Section]] for context.",
+            created=old,
+        )
+        scanner = OrphanScanner(age_days=30)
+        result = scanner.scan(vault)
+        assert result.orphan_paths == []
+
 
 # ---------------------------------------------------------------------------
 # StaleReviewScanner tests
@@ -415,6 +435,54 @@ class TestBrokenLinkScanner:
         # Must not raise; the unresolvable target is treated as not-a-file.
         assert result.total_broken == 0
 
+    def test_heading_anchor_wikilink_not_broken(self, tmp_path: Path) -> None:
+        """A ``[[b#Section]]`` link to an existing file is not broken (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "b", content="Target with a heading.")
+        _write_fragment(vault, "a", content="See [[b#Section]] for details.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_same_file_anchor_wikilink_not_broken(self, tmp_path: Path) -> None:
+        """A same-file anchor link like ``[[#Heading]]`` is not broken (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "self-anchor", content="Jump to [[#Heading]] above.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_heading_anchor_wikilink_with_alias_not_broken(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A ``[[b#Section|display]]`` link to an existing file is not broken (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "b", content="Target with a heading.")
+        _write_fragment(vault, "a", content="See [[b#Section|display]] here.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_relative_link_with_anchor_not_broken(self, tmp_path: Path) -> None:
+        """A relative link with a heading anchor to an existing file is fine (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "b", content="Target content.")
+        _write_fragment(vault, "a", content="See [text](b.md#Section) for more.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_missing_target_with_anchor_still_broken(self, tmp_path: Path) -> None:
+        """A ``[[missing#Section]]`` link to no file reports ``[[missing]]`` (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "a", content="See [[missing#Section]] here.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 1
+        broken_targets = next(iter(result.broken_links.values()))
+        assert broken_targets == ["[[missing]]"]
+
 
 # ---------------------------------------------------------------------------
 # DuplicateScanner tests
@@ -625,3 +693,30 @@ class TestLinkExtraction:
 
         content = "[x]( https://example.com/y)"
         assert _extract_relative_links(content) == []
+
+    def test_extract_wikilinks_strips_heading_anchor(self) -> None:
+        """Heading anchors are stripped from wiki-link targets (#835).
+
+        ``[[b#Section]]`` yields ``b``, ``[[Note#H|alias]]`` yields ``Note``,
+        and a same-file anchor like ``[[#Self]]`` yields no target at all.
+        """
+        from creek.clean.hygiene import _extract_wikilinks
+
+        content = "See [[b#Section]] and [[Note#H|alias]] and [[#Self]]."
+        assert _extract_wikilinks(content) == ["b", "Note"]
+        # A '#' inside the alias (after the pipe) must not affect the target,
+        # and a nested heading path keeps only the file portion.
+        assert _extract_wikilinks("[[Target|Display#thing]]") == ["Target"]
+        assert _extract_wikilinks("[[Note#H1#H2]]") == ["Note"]
+
+    def test_extract_relative_links_strips_anchor_and_query(self) -> None:
+        """Anchor and query suffixes are stripped from relative targets (#835).
+
+        The URL token is cut at the first ``#`` or ``?``; a target that is
+        empty after stripping (query-only) is skipped entirely.
+        """
+        from creek.clean.hygiene import _extract_relative_links
+
+        content = "[x](b.md#Section) and [y](c.md?raw=1)"
+        assert _extract_relative_links(content) == ["b.md", "c.md"]
+        assert _extract_relative_links("[q](?query)") == []
