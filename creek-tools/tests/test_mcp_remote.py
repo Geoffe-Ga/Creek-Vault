@@ -19,6 +19,10 @@ Security properties under test:
 - **No plaintext on routable interfaces** (#837) — a non-loopback ``--host``
   refuses to serve unless ``--tls-cert``/``--tls-key`` are configured; loopback
   binds and stdio keep working without TLS.
+- **Weak tokens are refused at startup** (#838) — a configured consumer token
+  shorter than 32 chars fails ``load_consumer_tokens`` (and the network
+  transport, via ``parser.error``) with a rotation recipe that names the
+  consumer and lengths but never echoes the token value.
 
 No real/production token material is hardcoded — every token is a test literal.
 """
@@ -85,6 +89,11 @@ def _fake_token(consumer: str) -> AccessToken:
     )
 
 
+# 43 chars — clears the 32-char minimum (#838). Low-entropy test literal,
+# not a real credential.
+_STRONG_TOKEN = "unit-test-strong-token-" + "a" * 20
+
+
 # --------------------------------------------------------------------------- #
 # load_consumer_tokens — parsing
 # --------------------------------------------------------------------------- #
@@ -92,17 +101,51 @@ def _fake_token(consumer: str) -> AccessToken:
 
 def test_load_consumer_tokens_parses_pairs() -> None:
     """Well-formed ``consumer=token`` pairs parse into a map."""
-    env = {CONSUMER_TOKENS_ENV: "adepthood=secret123;crawdad=tok456"}
+    adepthood_token = "adepthood-strong-token-" + "a" * 20  # 43 chars, test literal
+    crawdad_token = "crawdad-strong-token-" + "b" * 20  # 41 chars, test literal
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={adepthood_token};crawdad={crawdad_token}"}
     assert load_consumer_tokens(env) == {
-        "adepthood": "secret123",
-        "crawdad": "tok456",
+        "adepthood": adepthood_token,
+        "crawdad": crawdad_token,
     }
 
 
 def test_load_consumer_tokens_skips_blank_and_tokenless_entries() -> None:
     """Blank segments and ``name=`` entries with no token are dropped."""
-    env = {CONSUMER_TOKENS_ENV: " adepthood = secret123 ; ; missing= ;=orphan"}
-    assert load_consumer_tokens(env) == {"adepthood": "secret123"}
+    env = {CONSUMER_TOKENS_ENV: f" adepthood = {_STRONG_TOKEN} ; ; missing= ;=orphan"}
+    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+
+
+def test_load_consumer_tokens_rejects_sub_minimum_token() -> None:
+    """A present token shorter than 32 chars raises, naming everything but the token."""
+    env = {CONSUMER_TOKENS_ENV: "adepthood=hunter2"}  # 7 chars, test literal
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "'adepthood'" in message  # consumer named via repr
+    assert "7" in message  # observed length of the rejected token
+    assert "32" in message  # the enforced minimum
+    assert "secrets.token_urlsafe(32)" in message  # the rotation recipe
+    assert "hunter2" not in message  # NEVER echo the token value
+
+
+def test_load_consumer_tokens_accepts_minimum_length_token() -> None:
+    """A token at or above the 32-char minimum is accepted and returned intact."""
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN}"}
+    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+
+
+def test_load_consumer_tokens_accepts_exact_boundary_token() -> None:
+    """A token of exactly 32 chars sits on the floor and is accepted."""
+    boundary_token = "a" * 32
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={boundary_token}"}
+    assert load_consumer_tokens(env) == {"adepthood": boundary_token}
+
+
+def test_load_consumer_tokens_skips_blanks_without_raising() -> None:
+    """Blank and bare ``name=`` entries stay silently skipped, not length-checked."""
+    env = {CONSUMER_TOKENS_ENV: f";;missing=;=orphan;adepthood={_STRONG_TOKEN}"}
+    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
 
 
 def test_load_consumer_tokens_empty_when_unset() -> None:
@@ -534,7 +577,7 @@ def test_network_transport_refuses_routable_host_without_tls(
     host: str,
 ) -> None:
     """A routable ``--host`` without TLS exits before serving, pointing at the fix."""
-    monkeypatch.setenv(CONSUMER_TOKENS_ENV, "adepthood=secret123")
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_TOKEN}")
     _stub_build_server(monkeypatch)
     with pytest.raises(SystemExit) as excinfo:
         main(["--transport", "network", "--host", host])
@@ -543,12 +586,29 @@ def test_network_transport_refuses_routable_host_without_tls(
     assert "--tls-cert" in err or "TLS" in err
 
 
+def test_network_transport_rejects_short_token_with_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sub-minimum token exits 2 with the rotation recipe, never the token."""
+    # 7-char test literal, well under the 32-char minimum.
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, "adepthood=hunter2")
+    _stub_build_server(monkeypatch)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--transport", "network", "--host", "127.0.0.1"])
+    assert excinfo.value.code == 2  # argparse parser.error convention
+    err = capsys.readouterr().err
+    assert "adepthood" in err  # the offending consumer is named
+    assert "secrets.token_urlsafe(32)" in err  # the rotation recipe
+    assert "hunter2" not in err  # NEVER echo the token value
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
 def test_network_transport_allows_loopback_without_tls(
     monkeypatch: pytest.MonkeyPatch, host: str
 ) -> None:
     """A loopback bind still serves plaintext — local dev is not broken by #837."""
-    monkeypatch.setenv(CONSUMER_TOKENS_ENV, "adepthood=secret123")
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_TOKEN}")
     stub = _stub_build_server(monkeypatch)
     served: list[tuple[object, argparse.Namespace]] = []
     monkeypatch.setattr(
@@ -565,7 +625,7 @@ def test_network_transport_allows_routable_host_with_tls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A routable bind with cert + key serves, and the TLS paths reach the args."""
-    monkeypatch.setenv(CONSUMER_TOKENS_ENV, "adepthood=secret123")
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_TOKEN}")
     _stub_build_server(monkeypatch)
     cert = tmp_path / "cert.pem"
     key = tmp_path / "key.pem"
@@ -601,7 +661,7 @@ def test_network_transport_rejects_tls_cert_without_key(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``--tls-cert`` without ``--tls-key`` is refused (both-or-neither)."""
-    monkeypatch.setenv(CONSUMER_TOKENS_ENV, "adepthood=secret123")
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_TOKEN}")
     _stub_build_server(monkeypatch)
     cert = tmp_path / "cert.pem"
     cert.write_text("dummy-cert")  # fixture material, not a real credential
@@ -619,7 +679,7 @@ def test_network_transport_rejects_missing_tls_cert_file(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """TLS flags pointing at nonexistent files exit with a 'file not found' error."""
-    monkeypatch.setenv(CONSUMER_TOKENS_ENV, "adepthood=secret123")
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_TOKEN}")
     _stub_build_server(monkeypatch)
     missing_cert = tmp_path / "no-cert.pem"
     missing_key = tmp_path / "no-key.pem"

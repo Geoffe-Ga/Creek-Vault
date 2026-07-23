@@ -774,9 +774,11 @@ def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     """Run the MCP server over stdio (local) or the authenticated network transport.
 
-    The network branch is fail-closed twice over: it refuses to start without
-    per-consumer tokens (no anonymous access), and it refuses a non-loopback
-    bind unless TLS is configured (no cleartext bearer tokens, #837).
+    The network branch is fail-closed three times over: it refuses to start
+    without per-consumer tokens (no anonymous access), it refuses a configured
+    token below the minimum-strength floor (#838), and it refuses a
+    non-loopback bind unless TLS is configured (no cleartext bearer
+    tokens, #837).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -792,7 +794,12 @@ def main(argv: list[str] | None = None) -> None:
         os.environ[CONFIG_PATH_ENV_VAR] = str(args.config.resolve())
 
     if args.transport == "network":
-        tokens = load_consumer_tokens()
+        try:
+            tokens = load_consumer_tokens()
+        except ValueError as exc:
+            # A configured token is below the minimum-strength floor (#838):
+            # exit with the rotation recipe rather than serve a weak secret.
+            parser.error(str(exc))
         if not tokens:
             # No anonymous access: refuse to expose the vault without per-consumer
             # tokens, rather than serving unauthenticated.
