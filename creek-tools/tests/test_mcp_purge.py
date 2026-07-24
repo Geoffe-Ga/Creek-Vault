@@ -31,7 +31,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-ELEVATED_TOKEN = "test-elevated-secret"
+# 41 chars — clears the 32-char floor (#907). Low-entropy test literal,
+# not a real credential.
+ELEVATED_TOKEN = "test-elevated-secret-" + "a" * 20
 
 
 @pytest.fixture
@@ -463,8 +465,12 @@ def test_crawdad_consumer_cannot_purge(
     elevated token. The vault must remain intact after such a call —
     this test stands in for the FEAT's "CrawDad cannot purge anything"
     fixture-vault regression.
+
+    The server-side token must clear the 32-char floor (#907): with a weak
+    secret configured the refusal would be right for the *wrong* reason
+    (weak server config, not CrawDad's missing token).
     """
-    monkeypatch.setenv("CREEK_MCP_ELEVATED_TOKEN", "kept-secret")
+    monkeypatch.setenv("CREEK_MCP_ELEVATED_TOKEN", ELEVATED_TOKEN)
     result = purge_vault_tool(
         vault_path=vault,
         confirm_vault_path=str(vault),
@@ -473,3 +479,39 @@ def test_crawdad_consumer_cannot_purge(
     )
     assert result["status"] == "refused"
     assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+def test_purge_refused_when_configured_token_is_sub_minimum(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A weak server secret disarms purge entirely, without leaking why (#907).
+
+    The caller presents the exact configured token *and* the correct
+    ``confirm_vault_path`` — the only thing wrong is that the operator's
+    secret is 31 characters. The purge must be refused, the vault left
+    intact, and the refusal audited. The caller-visible ``reason`` must
+    stay the generic elevated-authorization refusal: telling a hostile
+    caller "the server secret is 31 chars" would be a configuration
+    oracle handed out for free.
+    """
+    # 31 chars — one under the floor. Test literal, not a real credential.
+    weak_token = "weak-elevated-" + "a" * 17
+    monkeypatch.setenv("CREEK_MCP_ELEVATED_TOKEN", weak_token)
+
+    result = purge_vault_tool(
+        vault_path=vault,
+        confirm_vault_path=str(vault),
+        auth_token=weak_token,  # an exact match against the weak secret
+        consumer="claude-code",
+    )
+
+    assert result["status"] == "refused"
+    assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.vault"
+    reason = str(result["reason"])
+    assert "32" not in reason  # no config oracle: never disclose the floor
+    assert "chars" not in reason  # nor the observed length
+    assert weak_token not in reason  # nor, obviously, the token itself

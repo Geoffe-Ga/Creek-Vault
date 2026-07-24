@@ -121,14 +121,27 @@ Operational rules:
   therefore returns `status="refused"` — there is no Discord command
   surface that could accidentally destroy vault content.
 - **The developer's Claude Code can be configured with the token.**
-  Generate one with high entropy:
+  Generate one with high entropy — this is the same recipe the startup
+  check prints if the configured token is too weak:
   ```bash
-  python -c "import secrets; print(secrets.token_hex(32))"
+  python -c "import secrets; print(secrets.token_urlsafe(32))"
   ```
   Add `"CREEK_MCP_ELEVATED_TOKEN": "<generated-token>"` to the `env`
   block of `.mcp.json` (alongside `CREEK_MCP_CONSUMER`). Treat the
   token like any other vault secret — keep it out of public dotfiles
   and shared shells.
+- **The token must be at least 32 characters (#907).** A configured
+  value below the floor aborts server startup on *both* transports with
+  the rotation recipe on stderr (the token value itself is never
+  printed), and — for embedders that bypass `main` — is denied silently
+  by the gate itself. Leaving `CREEK_MCP_ELEVATED_TOKEN` unset remains
+  fully supported: that is the "purge disabled" posture, not an error.
+- **Breaking change for operators upgrading (#907).** This floor is
+  new: a server that starts fine today with a `CREEK_MCP_ELEVATED_TOKEN`
+  under 32 characters will refuse to start the next time it is launched
+  — on both transports — with no grace period, warning-only mode, or
+  opt-out. If you rely on `creek.purge.*`, rotate the token with the
+  recipe above *before* upgrading.
 - **`creek.purge.vault` requires both the token AND
   `confirm_vault_path`.** The confirmation must match the resolved
   absolute path of the target vault, mirroring the CLI's interactive
@@ -141,7 +154,7 @@ Operational rules:
 
 Example `.mcp.json` for a Claude Code instance configured for
 destructive ops (replace the token with a freshly generated one — the
-sample shown here is high-entropy hex from `secrets.token_hex(32)` and
+sample shown here is high-entropy from `secrets.token_urlsafe(32)` and
 must not be reused):
 
 ```json
@@ -151,7 +164,7 @@ must not be reused):
       "command": "creek-tools-mcp",
       "env": {
         "CREEK_MCP_CONSUMER": "claude-code",
-        "CREEK_MCP_ELEVATED_TOKEN": "REPLACE_WITH_secrets.token_hex(32)"
+        "CREEK_MCP_ELEVATED_TOKEN": "REPLACE_WITH_secrets.token_urlsafe(32)"
       }
     }
   }
@@ -237,6 +250,9 @@ routable by design and requires TLS.
   config), mirroring the `CREEK_MCP_ELEVATED_TOKEN` precedent. Generate each
   token as high-entropy hex — `secrets.token_hex(32)` — so a token is never
   guessable; the constant-time comparison only matters against a strong secret.
+  A configured token below 32 characters is refused at startup, the same
+  floor `CREEK_MCP_ELEVATED_TOKEN` now enforces (#907) — both surfaces share
+  one minimum defined once in `creek_mcp/token_policy.py`.
 - **Per-consumer identity.** Each request must present its bearer token
   (`Authorization: Bearer <token>`). The token maps to a consumer name that
   is stamped on every audit-log entry — so remote calls are attributable the
