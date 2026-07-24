@@ -40,12 +40,19 @@ Four guarantees this module enforces:
   :func:`creek.care.guardrail.acute_distress_guard`, threaded in by
   ``build_server``; the seam stays injectable so tests can substitute their own.
 
+Underneath those guarantees, every read and parse failure answers with a
+structured dict rather than raising: a malformed or unreadable file under
+``01-Fragments`` is skipped during ``entry_ref`` resolution (#847), and a
+malformed model turn degrades to no notes. No parse error crosses the MCP
+boundary.
+
 The LLM and retrieval are injected so the tool is unit-testable with no live
 calls; ``build_server`` supplies the production factory + retrieval.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Protocol
 
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
@@ -61,6 +68,8 @@ from creek_mcp.tier_ceiling import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 TOOL_NAME = "creek.reflect"
 
@@ -290,6 +299,21 @@ def _resolve_entry(
     :func:`creek.classify.privacy_filter.tier_of`, not by this fail-closed
     path. A blank result yields ``("", None)``, which the caller turns into
     a refusal.
+
+    A fragment file that cannot be parsed or even read is skipped, debug-logged,
+    and the scan continues (#847) — one hand-edited or half-written file must not
+    take down ``entry_ref`` resolution for the whole vault. The skip is
+    fail-closed: such a fragment can never be *returned* as an entry either, so
+    it is unreadable-by-anyone rather than readable-without-a-tier. Its front
+    matter never became usable metadata — the file may not even have been read —
+    so its ``privacy_tier`` is unknown and unknowable, and salvaging the id or
+    the body out of the raw text would hand an ``open``-ceiling caller content
+    nobody can vouch for — walking around the #846 gate rather than through it.
+    The skip is also deliberately indistinguishable from not-found (both land on
+    the caller's ``"entry_ref not found"`` refusal): a distinct "unreadable"
+    reason would confirm to an unadmitted caller that a fragment with that id
+    exists, a new existence oracle over the corpus in the one place where the
+    tier is unknown.
     """
     if content and content.strip():
         return content, None
@@ -297,7 +321,28 @@ def _resolve_entry(
         import frontmatter
 
         for path in (vault_path / "01-Fragments").rglob("*.md"):
-            post = frontmatter.load(path)
+            try:
+                post = frontmatter.load(path)
+            except Exception as exc:
+                # Broader than the house ``(OSError, ValueError, yaml.YAMLError)``
+                # tuple on purpose. ``frontmatter.load`` splats the parsed
+                # metadata as ``Post(content, handler, **metadata)``, so front
+                # matter with a non-string key — a bare YAML date such as
+                # ``2024-05-01: note``, a realistic hand-edited-vault case —
+                # raises ``TypeError``, which is none of those three (see
+                # ``test_nonstring_frontmatter_key_is_skipped_not_crashed``). The
+                # corpus is user-managed and arbitrarily messy, so the failure
+                # surface is open-ended *beyond* decode/IO/YAML, and per the
+                # never-raises contract none of it may cross the MCP boundary.
+                #
+                # Log the exception's *type name only* — never ``str(exc)``,
+                # ``exc_info``, or ``logger.exception``. ``yaml.MarkedYAMLError``
+                # stringifies with the offending source snippet, so the message
+                # text would write tier-unknown vault content into the log.
+                logger.debug(
+                    "Skipping unreadable fragment %s (%s)", path, type(exc).__name__
+                )
+                continue
             if str(post.metadata.get("id", "")) == entry_ref:
                 body: str = post.content
                 return body, _fragment_tier(post.metadata)
@@ -341,7 +386,9 @@ def reflect_tool(
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with ``notes`` (+ optional
         ``essay``), ``escalate`` with a ``reason``, or a structured ``refused``
         response for one of: no *entry_ref*/*content* resolves to text
-        (``"entry_ref not found"`` / ``"no entry content supplied"``); the
+        (``"entry_ref not found"`` — which also covers a fragment whose front
+        matter is unparseable or unreadable, see :func:`_resolve_entry` — or
+        ``"no entry content supplied"``); the
         *entry_ref*'s classified tier exceeds *privacy_tier_ceiling*
         (``"entry_ref tier exceeds ceiling"``, #846 — see :func:`_above_ceiling`);
         or the LLM provider is unavailable/raises (``"reflection unavailable:
@@ -396,9 +443,9 @@ def reflect_tool(
             # probe costs a vault scan — while the distinct not-found reason is
             # what makes a legitimate client's bug debuggable. If the two reasons
             # are ever unified, the scan must be equalised too: the not-found
-            # path parses every fragment file whereas this path early-returns at
-            # the match, so the timing difference would preserve the oracle as a
-            # side channel.
+            # path attempts to parse every fragment file whereas this path
+            # early-returns at the match, so the timing difference would preserve
+            # the oracle as a side channel.
             reason="entry_ref tier exceeds ceiling",
         )
 

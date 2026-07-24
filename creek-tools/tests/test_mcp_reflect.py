@@ -20,7 +20,8 @@ contract this suite pins, in order of stakes:
 3. **Quotes are verbatim** — every returned ``quote`` is a substring of the
    input; model-supplied spans that are not are dropped, never trusted.
 4. Corpus-grounded retrieval, audit logging, read-only wrt the corpus, clean
-   degradation with no provider, and the care seam (#753).
+   degradation with no provider, the care seam (#753), and tolerance of
+   malformed fragment frontmatter under ``01-Fragments`` (#847).
 
 The LLM and retrieval are injected — no live calls.
 """
@@ -30,6 +31,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+import frontmatter
 import pytest
 
 from creek.care.guardrail import CARE_SIGNAL
@@ -928,3 +930,452 @@ def test_care_guard_still_runs_for_an_admitted_entry_ref(tmp_path: Path) -> None
     assert result["status"] == "escalate"
     assert result["care_signal"] == CARE_SIGNAL
     assert guard.calls == 1
+
+
+# --- Malformed fragment frontmatter (#847) --------------------------------------------
+
+# Corrupt files written alongside a resolvable target. Three rather than one so the
+# skip has to survive *repeated* failures and still reach the far side of the walk.
+# The names carry no ordering meaning: traversal order is a filesystem detail, and
+# the guarantee is carried by :func:`_assert_sweep_reaches_every_fragment` instead.
+_CORRUPT_SIBLINGS = ("bad-one", "bad-two", "bad-three")
+_UNDECODABLE_SIBLINGS = ("undecodable-one", "undecodable-two", "undecodable-three")
+
+# A phrase that appears only inside corrupt files, so finding it in a response can
+# only mean unparseable content was salvaged instead of skipped.
+_CORRUPT_BODY = "a fragment nobody can parse"
+
+
+def _frag_path(vault: Path, name: str) -> Path:
+    """Return the ``01-Fragments/Notes`` path for *name*, creating the directory.
+
+    Every fragment in this section lands in the same directory
+    :func:`_write_fragment` uses, so it is swept by exactly the same ``rglob``
+    that resolves an ``entry_ref`` — and the sweep assertions below have to name
+    those exact paths back. Defining the location once keeps the two in step.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        name: The file stem; ``.md`` is appended.
+
+    Returns:
+        ``<vault>/01-Fragments/Notes/<name>.md``. The parent directory exists on
+        return; the entry itself is not created.
+    """
+    frag_dir = vault / "01-Fragments" / "Notes"
+    frag_dir.mkdir(parents=True, exist_ok=True)
+    return frag_dir / f"{name}.md"
+
+
+def _spy_on_frontmatter_load(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every path handed to ``frontmatter.load``, delegating to the real one.
+
+    ``_resolve_entry`` does a lazy ``import frontmatter`` inside its own body and
+    then calls ``frontmatter.load(path)``, so the attribute is looked up on the
+    module object at call time and patching it here is picked up. The real loader
+    still runs — including raising — so nothing about the behaviour under test
+    changes; this only observes. Deliberately not ``caplog``: asserting on log
+    text would couple the suite to a debug message's phrasing rather than to the
+    fact that the load was attempted.
+
+    Args:
+        monkeypatch: The builtin pytest fixture; it restores the real
+            ``frontmatter.load`` at teardown.
+
+    Returns:
+        The live record — ``str(path)`` per call, in call order. Read it after
+        the call under test.
+    """
+    real_load = frontmatter.load
+    loaded: list[str] = []
+
+    def _spy(fd: Any, *args: Any, **kwargs: Any) -> Any:
+        """Record *fd*, then delegate to (and raise exactly like) the real load."""
+        loaded.append(str(fd))
+        return real_load(fd, *args, **kwargs)
+
+    monkeypatch.setattr(frontmatter, "load", _spy)
+    return loaded
+
+
+def _assert_sweep_reaches_every_fragment(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, *names: str
+) -> None:
+    """Assert one full sweep of *vault* opens every named fragment and survives.
+
+    ORDERING HAZARD, and why this exists. ``rglob`` yields ``os.scandir`` order.
+    Nothing in ``pathlib`` sorts it and no mainstream filesystem promises
+    anything about it — it is hash-ordered on APFS and XFS, roughly insertion-
+    ordered on ext4. So in a vault that also holds a resolvable target,
+    ``_resolve_entry`` may reach the ``id`` match and return *before* it ever
+    opens a corrupt file, and a test that only checks the target's outcome then
+    passes without entering the skip path at all. That is a false green, and no
+    naming scheme fixes it — do not try to "strengthen" these tests by adding
+    more or better-sorting file names.
+
+    The guarantee is carried by an assertion instead. This probes with an
+    ``entry_ref`` that matches nothing, which cannot early-return and therefore
+    must exhaust the directory on every platform, and then asserts each named
+    file really was handed to ``frontmatter.load``. Reaching *all* of them also
+    pins ``continue`` as the skip's control flow: an implementation that
+    abandoned the walk at the first bad file would record only one.
+
+    Note:
+        The probe is a real ``reflect_tool`` call and appends its own audit
+        record, so assert audit-log counts *before* calling this.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        monkeypatch: The builtin pytest fixture, forwarded to the load spy.
+        *names: Fragment stems, as passed to the writers, that the sweep must
+            reach.
+    """
+    loaded = _spy_on_frontmatter_load(monkeypatch)
+    probe = reflect_tool(
+        vault_path=vault,
+        entry_ref="does-not-exist",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert probe["status"] == "refused"
+    assert probe["reason"] == "entry_ref not found"
+    for name in names:
+        path = str(_frag_path(vault, name))
+        assert path in loaded, f"never handed to frontmatter.load: {path}"
+
+
+def _write_malformed_fragment(vault: Path, name: str, body: str) -> None:
+    """Write a fragment whose YAML front matter cannot be parsed at all.
+
+    The front matter opens a flow sequence and never closes it, so
+    ``frontmatter.load`` fails at the *scanner* level and raises
+    ``yaml.YAMLError`` rather than returning partial metadata.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        name: The file stem, and the ``id`` the unparseable front matter
+            nominally carries — it must never become resolvable.
+        body: The text below the front matter.
+    """
+    _frag_path(vault, name).write_text(
+        f"---\nfoo: [unterminated\nid: {name}\n---\n{body}\n", encoding="utf-8"
+    )
+
+
+def _write_undecodable_fragment(vault: Path, name: str) -> None:
+    """Write a fragment file whose raw bytes are not valid UTF-8 at all.
+
+    ``frontmatter.load`` decodes the file *before* any YAML parser sees it, so
+    this one raises ``UnicodeDecodeError`` rather than ``yaml.YAMLError`` — the
+    sibling failure mode that proves the skip cannot be a narrow ``except
+    yaml.YAMLError``.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        name: The file stem. Nothing in the file is decodable, so it must never
+            become resolvable as an ``entry_ref``.
+    """
+    _frag_path(vault, name).write_bytes(b"---\n\xff\xfe: x\n---\nbody\n")
+
+
+def _write_nonstring_key_fragment(vault: Path, name: str) -> None:
+    """Write a fragment whose front matter parses but carries a non-string key.
+
+    A bare ``2024-05-01:`` line is resolved by YAML's safe loader to a
+    ``datetime.date`` key, and ``frontmatter.loads`` splats the parsed mapping as
+    ``Post(content, handler, **metadata)`` — so the load dies one layer *above*
+    YAML with a bare ``TypeError: keywords must be strings``. A ``TypeError`` is
+    not a ``yaml.YAMLError`` (the YAML parsed fine), not a ``ValueError`` and not
+    an ``OSError``, so the narrow tuple used at other call sites in this
+    codebase, ``except (OSError, ValueError, yaml.YAMLError)``, would let it
+    escape. This is the sharpest reason the skip must be ``except Exception``.
+    A date key in hand-edited front matter is an ordinary vault accident.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        name: The file stem, and the ``id`` the front matter nominally carries —
+            the load fails before that ``id`` is reachable, so it must never
+            become resolvable.
+    """
+    _frag_path(vault, name).write_text(
+        f"---\n2024-05-01: note\nid: {name}\n---\nbody\n", encoding="utf-8"
+    )
+
+
+def test_malformed_sibling_frontmatter_does_not_block_entry_ref_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One corrupt fragment must not break every other ``entry_ref`` (#847).
+
+    ``_resolve_entry`` walks ``01-Fragments`` and calls ``frontmatter.load`` on
+    every ``*.md`` it finds. A single hand-edited or half-written fragment with
+    unparseable YAML therefore takes down *all* ``entry_ref`` reflection, as an
+    unhandled ``yaml.YAMLError`` crossing the MCP boundary — not a structured
+    refusal. The unreadable files must be skipped and the walk must continue.
+
+    Traversal order decides whether the target's own resolution ever touches a
+    corrupt sibling, so that half is not what proves the skip ran; the closing
+    :func:`_assert_sweep_reaches_every_fragment` call is, on every filesystem.
+    """
+    vault = _vault(tmp_path)
+    for bad in _CORRUPT_SIBLINGS:
+        _write_malformed_fragment(vault, bad, _CORRUPT_BODY)
+    body = "the kettle boiled before I remembered why"
+    _write_fragment(vault, "frag-target", body, tier="open")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": body, "kind": "pattern", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-target",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert isinstance(result, dict)  # returns rather than raises (the #847 AC)
+    assert result["status"] == "ok"
+    assert result["notes"][0]["quote"] == body
+    # Defense in depth against a future "salvage the raw text" regression: the
+    # skipped siblings' content must stay out of the response entirely.
+    assert _CORRUPT_BODY not in json.dumps(result)
+    _assert_sweep_reaches_every_fragment(
+        vault, monkeypatch, *_CORRUPT_SIBLINGS, "frag-target"
+    )
+
+
+def test_malformed_fragment_can_never_be_resolved_as_an_entry(tmp_path: Path) -> None:
+    """An unparseable fragment is unreadable by *anyone* — the fail-closed half.
+
+    This is the security contract, and it is why the fix must be a skip rather
+    than a salvage. The file's raw bytes contain both ``id: frag-corrupt`` and
+    intimate body text, but its front matter never parsed, so its
+    ``privacy_tier`` is unknown and unknowable. A "helpful" recovery — regexing
+    the id out of the raw text, or falling back to the body with no metadata —
+    would hand an ``open``-ceiling caller content whose classification nobody
+    can vouch for: exactly the leak the #846 gate exists to prevent, reached by
+    walking around it.
+
+    So: unparseable implies unresolvable. Not routed to any model, not quoted
+    back, and indistinguishable from absent (see the test below).
+    """
+    vault = _vault(tmp_path)
+    _write_malformed_fragment(vault, "frag-corrupt", _INTIMATE_BODY)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _INTIMATE_BODY, "kind": "fear", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-corrupt",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert _INTIMATE_SPAN not in json.dumps(result), "unparseable content egressed"
+    assert result["status"] == "refused"
+    assert result["reason"] == "entry_ref not found"
+    assert factory.asked_tier is None  # the model was never reached
+
+
+def test_malformed_fragment_skip_is_indistinguishable_from_not_found(
+    tmp_path: Path,
+) -> None:
+    """Skipping a corrupt fragment must not become a new existence oracle (#847).
+
+    A caller who probes ``entry_ref`` values learns only "not found" today. If
+    the skip path grew its own reason — ``"entry_ref unreadable"``, say — that
+    refusal would confirm a fragment with that id *exists in the corpus*, to a
+    caller who is not admitted to any of its content and cannot even be told its
+    tier. That is a strictly new read oracle over the corpus, in the one place
+    where the tier is unknown so nothing can be reasoned about it.
+
+    The two responses must therefore be *identical*, not merely similarly
+    refused: ``refusal_response`` builds a fixed four-key dict with nothing
+    nondeterministic in it, so whole-dict equality is the honest assertion and it
+    also catches a distinguishing field added anywhere else in the payload. This
+    test exists so that a future, well-meaning "more debuggable" distinct reason
+    fails the suite rather than shipping.
+    """
+    vault = _vault(tmp_path)
+    _write_malformed_fragment(vault, "frag-corrupt", _INTIMATE_BODY)
+    corrupt = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-corrupt",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    missing = reflect_tool(
+        vault_path=vault,
+        entry_ref="does-not-exist",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert corrupt == missing
+    # Kept explicit so a failure names the contracted reason, not just a diff.
+    assert corrupt["reason"] == "entry_ref not found"
+
+
+def test_malformed_sibling_does_not_weaken_the_ceiling_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The corrupt-file skip must not reorder or bypass the #846 read gate.
+
+    The skip lands inside ``_resolve_entry``, directly upstream of the read-side
+    ceiling gate. An implementation that swallowed the parse error by, say,
+    returning early with a default tier, or by continuing past the ``id`` match
+    with partially-populated metadata, would resolve an INTIMATE fragment as
+    something the gate admits. The gate must still fire with the tier-neutral
+    reason, nothing of the body may appear, the model must be untouched, and the
+    single audit append above the gate must stay exactly one record.
+
+    The audit assertion is made *before* the closing sweep, which is itself a
+    ``reflect_tool`` call and appends a record of its own; see
+    :func:`_assert_sweep_reaches_every_fragment` for why the sweep — rather than
+    this call's own traversal order — is what proves the skip path ran.
+    """
+    vault = _vault(tmp_path)
+    for bad in _CORRUPT_SIBLINGS:
+        _write_malformed_fragment(vault, bad, _CORRUPT_BODY)
+    _write_fragment(vault, "frag-intimate", _INTIMATE_BODY, tier="intimate")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _INTIMATE_BODY, "kind": "fear", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-intimate",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert _INTIMATE_SPAN not in json.dumps(result), "intimate content egressed"
+    assert _CORRUPT_BODY not in json.dumps(result), "unparseable content egressed"
+    assert result["reason"] == _REFUSAL_REASON
+    assert factory.asked_tier is None
+    assert len(_audit(vault)) == 1
+    _assert_sweep_reaches_every_fragment(
+        vault, monkeypatch, *_CORRUPT_SIBLINGS, "frag-intimate"
+    )
+
+
+def test_unreadable_fragment_file_is_skipped_not_crashed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fragment that is not even valid UTF-8 is skipped, not fatal (#847).
+
+    This is the evidence that the fix cannot be a narrow ``except
+    yaml.YAMLError``. ``frontmatter.load`` decodes the file before any YAML
+    parser sees it, so a byte sequence that is not valid UTF-8 raises
+    ``UnicodeDecodeError``, which is not a ``YAMLError`` and is just as fatal to
+    every other ``entry_ref`` in the vault. The skip must be broad enough to
+    cover "this file could not be opened and understood", whatever the reason,
+    because the corpus is user-managed and arbitrarily messy. The ``OSError`` and
+    ``TypeError`` arms of that breadth get their own tests below.
+
+    As with the malformed siblings above, the closing sweep — not this call's
+    traversal order — is what guarantees the undecodable files were opened.
+    """
+    vault = _vault(tmp_path)
+    for bad in _UNDECODABLE_SIBLINGS:
+        _write_undecodable_fragment(vault, bad)
+    body = "the kettle boiled before I remembered why"
+    _write_fragment(vault, "frag-target", body, tier="open")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": body, "kind": "pattern", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-target",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+    assert result["notes"][0]["quote"] == body
+    _assert_sweep_reaches_every_fragment(
+        vault, monkeypatch, *_UNDECODABLE_SIBLINGS, "frag-target"
+    )
+
+
+def test_undecodable_fragment_never_crashes_a_full_scan(tmp_path: Path) -> None:
+    """``UnicodeDecodeError`` is survived by construction, not by luck (#847).
+
+    The sibling test above needs a spy to guarantee the undecodable file is ever
+    reached; this one gets the guarantee from the vault's shape. The corrupt file
+    is the *only* fragment and the ``entry_ref`` matches nothing, so
+    ``_resolve_entry`` cannot early-return: it has to open the file, fail to
+    decode it, skip it, and run off the end into the ``"entry_ref not found"``
+    refusal. Every traversal order produces exactly that.
+
+    Without this, a regression narrowing the catch to ``except (yaml.YAMLError,
+    OSError)`` could survive the entire suite on a lucky directory ordering.
+    """
+    vault = _vault(tmp_path)
+    _write_undecodable_fragment(vault, "undecodable")
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="does-not-exist",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == "entry_ref not found"
+
+
+def test_unopenable_fragment_path_is_skipped_not_crashed(tmp_path: Path) -> None:
+    """The I/O arm: an ``OSError`` out of ``frontmatter.load`` is skipped (#847).
+
+    ``rglob("*.md")`` matches by name, so a *directory* called ``not-a-file.md``
+    is swept exactly like a file. ``frontmatter.load`` hands it to ``open()``,
+    which raises ``IsADirectoryError`` — an ``OSError``, not a ``YAMLError`` and
+    not a ``UnicodeDecodeError``. The same arm covers a file that vanished
+    mid-walk or that the process cannot read; a directory is the portable way to
+    provoke it, since ``chmod`` is a no-op for root and CI containers run as
+    root.
+
+    Order-independent by construction: it is the only entry under
+    ``01-Fragments`` and the ``entry_ref`` matches nothing, so the walk must
+    exhaust it. Without this, a mutant narrowing the catch to ``except
+    (yaml.YAMLError, UnicodeDecodeError)`` survives deterministically forever.
+    """
+    vault = _vault(tmp_path)
+    _frag_path(vault, "not-a-file").mkdir()
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="does-not-exist",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == "entry_ref not found"
+
+
+def test_nonstring_frontmatter_key_is_skipped_not_crashed(tmp_path: Path) -> None:
+    """The ``TypeError`` arm — why the catch cannot be the narrow tuple (#847).
+
+    This is the case that decides the *shape* of the catch. The YAML here parses
+    cleanly; the failure is one layer above it, in ``frontmatter.loads``, which
+    does ``Post(content, handler, **metadata)``. A bare ``2024-05-01:`` line
+    loads as a ``datetime.date`` key, so that splat raises ``TypeError: keywords
+    must be strings``. A ``TypeError`` is not a ``yaml.YAMLError``, not a
+    ``ValueError`` and not an ``OSError``, so this codebase's usual narrow tuple
+    ``except (OSError, ValueError, yaml.YAMLError)`` would let it cross the MCP
+    boundary and take down every ``entry_ref`` in the vault. ``except Exception``
+    is load-bearing, and this test is what stops a future "tightening" of it.
+
+    Order-independent by construction, as above: sole fragment, unmatchable ref.
+    """
+    vault = _vault(tmp_path)
+    _write_nonstring_key_fragment(vault, "date-keyed")
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="does-not-exist",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == "entry_ref not found"
