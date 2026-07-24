@@ -7,8 +7,14 @@ grounded in retrieval over their corpus. Distinct from the essay-shaped
 ``draft``/``author``/``mine`` surface; this is the reflection surface Adepthood's
 journal needs.
 
-Three guarantees this module enforces:
+Four guarantees this module enforces:
 
+- **The ceiling is enforced on read (#846).** An ``entry_ref`` resolves a vault
+  fragment the caller did not supply, so its classified tier is checked against
+  the caller's ``privacy_tier_ceiling`` before anything is done with its text: an
+  above-ceiling fragment is refused outright rather than reflected. Raw inline
+  ``content`` is the caller's own text and carries no classification, so it is
+  never gated here.
 - **INTIMATE never egresses.** The LLM callable is obtained from a *tier-keyed
   factory* (``llm_factory(tier)``). The production factory resolves through
   :class:`creek.classify.llm.router.ModelRouter`, whose
@@ -18,11 +24,12 @@ Three guarantees this module enforces:
   only derives the routing tier and hands it over. The routing tier is the
   **more sensitive** of the entry's own classified ``privacy_tier`` (when it came
   from a vault fragment via ``entry_ref``) and the ceiling-derived tier — so an
-  INTIMATE fragment routes local even under a low ceiling. Raw inline ``content``
-  carries no classification, so there the guarantee is bounded by the caller's
-  declared ceiling (a caller cannot mark intimate content ``open`` and also have
-  it treated as intimate without classifying it first). Both fail closed to
-  INTIMATE on anything unrecognised.
+  admitted INTIMATE fragment still routes local under a broader ceiling, which is
+  defense in depth behind the read-side gate above. Raw inline ``content`` carries
+  no classification, so there the guarantee is bounded by the caller's declared
+  ceiling (a caller cannot mark intimate content ``open`` and also have it treated
+  as intimate without classifying it first). Both fail closed to INTIMATE on
+  anything unrecognised.
 - **Quotes are verbatim.** Every returned ``quote`` is validated to be a
   substring of the entry (whitespace-normalised). Model-supplied spans that are
   not are dropped — the client re-anchors verbatim quotes to character offsets
@@ -44,7 +51,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
+from creek_mcp.tier_ceiling import (
+    TierCeiling,
+    refusal_response,
+    tier_allowed,
+    to_privacy_override,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -110,11 +122,37 @@ def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> Priva
 
     Failing closed: an unrecognised ceiling, or an *entry_tier* outside the known
     ranks, routes as INTIMATE (local-only).
+
+    An above-ceiling *entry_tier* is now refused upstream by
+    :func:`_above_ceiling` before this function ever runs (#846), so in practice
+    this only reconciles an *admitted* ``entry_ref`` (or raw ``content``, which
+    has no *entry_tier*) against the ceiling. It stays in place as defense in
+    depth — the load-bearing INTIMATE-never-egresses guarantee — and must not be
+    removed.
     """
     ceiling_tier = _CEILING_ROUTING_TIER.get(ceiling, PrivacyTier.INTIMATE)
     if entry_tier is None:
         return ceiling_tier
     return max(ceiling_tier, entry_tier, key=_sensitivity)
+
+
+def _above_ceiling(entry_tier: PrivacyTier | None, ceiling: TierCeiling) -> bool:
+    """Return whether a resolved entry's classified tier exceeds *ceiling*.
+
+    Delegates the rank comparison to :func:`creek_mcp.tier_ceiling.tier_allowed`,
+    the canonical read-side admission predicate, so this tool cannot drift from
+    the rest of the MCP surface.
+
+    Args:
+        entry_tier: The entry's classified ``privacy_tier``, or ``None`` for raw
+            inline ``content`` — which carries no classification and is the
+            caller's own text, so it is never above the ceiling.
+        ceiling: The caller's declared ceiling.
+
+    Returns:
+        ``True`` when the entry must be refused rather than reflected.
+    """
+    return entry_tier is not None and not tier_allowed(entry_tier, ceiling)
 
 
 def _normalise(text: str) -> str:
@@ -237,9 +275,21 @@ def _resolve_entry(
     Raw *content* carries no classification, so its tier is ``None`` and the
     caller falls back to the ceiling. An *entry_ref* is resolved to a fragment
     markdown file under ``01-Fragments``; its body becomes the entry **and its
-    persisted ``privacy_tier`` becomes the routing tier** — this is what stops an
-    INTIMATE fragment being reflected through a cloud model under a low ceiling.
-    A blank result yields ``("", None)``, which the caller turns into a refusal.
+    persisted ``privacy_tier`` becomes both the admission tier and the routing
+    tier** — the caller checks the admission tier against the ceiling via
+    :func:`_above_ceiling` (#846) before doing anything else with the text, and
+    separately folds it into :func:`_routing_tier` so an admitted INTIMATE
+    fragment still routes local. A fragment with the ``privacy_tier`` key
+    missing entirely fails closed to INTIMATE (:func:`_fragment_tier`) — but
+    that only fires for hand-edited or legacy files. A normally
+    pipeline-written, not-yet-classified fragment carries an *explicit*
+    ``privacy_tier: unclassified`` (the ``Fragment`` model default,
+    serialised by every write), which ranks as open and is admitted at any
+    ceiling; that is a separate, deliberate policy owned by
+    ``creek_mcp.tier_ceiling._TIER_RANK`` and
+    :func:`creek.classify.privacy_filter.tier_of`, not by this fail-closed
+    path. A blank result yields ``("", None)``, which the caller turns into
+    a refusal.
     """
     if content and content.strip():
         return content, None
@@ -280,18 +330,34 @@ def reflect_tool(
             defaults to the corpus retrieval specialist.
         care_guard: ``(entry) -> reason | None``; a non-``None`` reason escalates
             to a human and skips the model entirely (#753 seam).
-        privacy_tier_ceiling: The ceiling; gates corpus admission and, via
-            :func:`_routing_tier`, the local-vs-cloud routing tier.
+        privacy_tier_ceiling: The ceiling; gates admission of the *entry itself*
+            when it came from an ``entry_ref`` (see :func:`_above_ceiling`),
+            corpus admission for grounding retrieval, and — via
+            :func:`_routing_tier` — the local-vs-cloud routing tier.
         consumer: Free-form consumer id for the audit log.
         max_notes: Cap on returned notes.
 
     Returns:
         ``{status, tool, tier_ceiling, ...}`` — ``ok`` with ``notes`` (+ optional
-        ``essay``), ``escalate`` with a ``reason``, or a structured refusal. Each
-        ``notes[].quote`` is a verified verbatim span of the entry; the optional
-        ``essay`` is free model prose and is **not** grounding-checked, flagged by
-        ``essay_grounded: False`` so a client never treats it as grounded.
+        ``essay``), ``escalate`` with a ``reason``, or a structured ``refused``
+        response for one of: no *entry_ref*/*content* resolves to text
+        (``"entry_ref not found"`` / ``"no entry content supplied"``); the
+        *entry_ref*'s classified tier exceeds *privacy_tier_ceiling*
+        (``"entry_ref tier exceeds ceiling"``, #846 — see :func:`_above_ceiling`);
+        or the LLM provider is unavailable/raises (``"reflection unavailable:
+        ..."``). Each ``notes[].quote`` is a verified verbatim span of the entry;
+        the optional ``essay`` is free model prose and is **not**
+        grounding-checked, flagged by ``essay_grounded: False`` so a client never
+        treats it as grounded.
     """
+    # Logged unconditionally, above the ceiling gate below, so a refused
+    # above-ceiling attempt is still recorded (tool, ceiling, consumer,
+    # has_entry_ref, timestamp) — this is the only append for this call; no
+    # second append happens on refusal. The probed entry_ref itself and the
+    # call's outcome are deliberately NOT logged, so this record cannot
+    # answer "did consumer X read fragment F?" in either direction: a
+    # probing consumer shows up as an elevated rate of has_entry_ref calls,
+    # never as a named target.
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={"has_entry_ref": entry_ref is not None},
@@ -304,6 +370,36 @@ def reflect_tool(
         reason = "entry_ref not found" if entry_ref else "no entry content supplied"
         return refusal_response(
             tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=reason
+        )
+
+    # The read-side ceiling gate (#846). It sits *above* the care seam on
+    # purpose: an ``escalate`` response is a one-bit oracle telling a caller who
+    # is not admitted to this fragment that it carries acute-distress markers.
+    # Care still runs for every raw-``content`` call and every within-ceiling
+    # ``entry_ref`` — only unadmitted reads skip it, and they skip the model too.
+    if _above_ceiling(entry_tier, privacy_tier_ceiling):
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            # Unlike ``save``'s refusal, this reason does NOT echo the offending
+            # tier. There the tier came from the caller's own input, so echoing
+            # it tells them nothing new; here it is derived from content the
+            # caller is not admitted to, so echoing it would turn the refusal
+            # into a tier-classification oracle over the corpus.
+            #
+            # ACCEPTED RESIDUAL RISK: keeping this reason distinct from
+            # "entry_ref not found" is itself a coarse existence-and-rank oracle
+            # across repeated probes (refused at ``open`` implies tier >=
+            # personal; refused at ``personal`` implies intimate). Accepted
+            # because fragment ids are unguessable (``frag-`` + 12 hex), are only
+            # learnable from content already admitted to the caller, and each
+            # probe costs a vault scan — while the distinct not-found reason is
+            # what makes a legitimate client's bug debuggable. If the two reasons
+            # are ever unified, the scan must be equalised too: the not-found
+            # path parses every fragment file whereas this path early-returns at
+            # the match, so the timing difference would preserve the oracle as a
+            # side channel.
+            reason="entry_ref tier exceeds ceiling",
         )
 
     if care_guard is not None:
