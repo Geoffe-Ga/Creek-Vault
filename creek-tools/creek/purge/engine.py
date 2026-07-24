@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
+from creek.ingest.journal_staging import JOURNAL_STAGING_RELDIR
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
@@ -168,6 +169,12 @@ class PurgeResult(BaseModel):
             deleted under ``10-Liminal/Compost/intimate-stubs/`` because
             a purged note carried a ``saved_from.intimate_body_pointer``
             at them (GAP-012). Counted-only in a dry run.
+        journal_staged_removed: Number of staged journal source files
+            deleted under ``00-Creek-Meta/adepthood/journal/`` because
+            the fragment they produced was purged (issue #845). The
+            staged file holds the entry's full plaintext body, so
+            leaving it behind would defeat the RTBF request.
+            Counted-only in a dry run.
     """
 
     operation: str
@@ -184,6 +191,7 @@ class PurgeResult(BaseModel):
     embeddings_removed: int = 0
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
+    journal_staged_removed: int = 0
 
 
 class PurgeEngine:
@@ -262,6 +270,7 @@ class PurgeEngine:
                 eddy_ids,
             )
             self._purge_intimate_stub(post, result)
+            self._purge_journal_staged_entry(post, result)
             if not self.dry_run:
                 frag_file.unlink()
             result.embeddings_removed = self._purge_cache_for(
@@ -502,6 +511,7 @@ class PurgeEngine:
                     continue
                 self._wipe_folder_contents(folder_path, result)
             result.fragments_affected = len(result.deleted_files)
+            self._wipe_journal_staging(result)
             result.embeddings_removed = self._delete_cache_file()
 
         return self._run_audited(result, body)
@@ -619,6 +629,7 @@ class PurgeEngine:
             eddy_ids,
         )
         self._purge_intimate_stub(post, result)
+        self._purge_journal_staged_entry(post, result)
         if not self.dry_run:
             frag_file.unlink()
 
@@ -686,6 +697,88 @@ class PurgeEngine:
         if isinstance(pointer, str) and pointer.strip():
             return pointer
         return None
+
+    def _purge_journal_staged_entry(
+        self,
+        post: frontmatter.Post,
+        result: PurgeResult,
+    ) -> None:
+        """Sweep the staged journal body a purged fragment points at (#845).
+
+        ``creek.journal`` (the MCP tool) stages each Adepthood entry's
+        full body as a markdown file under
+        ``00-Creek-Meta/adepthood/journal/`` and records that
+        vault-relative path in the fragment's ``source.origin_key``. A
+        scoped purge that deletes the fragment must follow that key and
+        delete the staged file too, or the full — often intimate —
+        entry body survives the right-to-be-forgotten request.
+
+        The method is defensive, mirroring :meth:`_purge_intimate_stub`:
+        a missing or empty key, an already-deleted staged file, and a
+        key that resolves outside the vault root are all no-ops rather
+        than errors. A second containment guard additionally scopes
+        deletion to the staging directory itself, so a hand-edited or
+        malicious ``origin_key`` (``../x``, ``01-Fragments/other.md``)
+        can never steer a delete at an arbitrary vault file.
+
+        Args:
+            post: Frontmatter of the fragment being purged.
+            result: Result accumulator; ``journal_staged_removed`` is
+                incremented for each staged file actually removed (or
+                that would be removed in a dry run).
+        """
+        origin_key = _extract_source_origin_key(post)
+        if not origin_key:
+            return
+        staged_path = (self.vault_path / origin_key).resolve()
+        vault_root = self.vault_path.resolve()
+        if not staged_path.is_relative_to(vault_root):
+            logger.warning(
+                "Ignoring source.origin_key %r that resolves outside the vault root %s",
+                origin_key,
+                vault_root,
+            )
+            return
+        staging_root = (self.vault_path / JOURNAL_STAGING_RELDIR).resolve()
+        if not staged_path.is_relative_to(staging_root):
+            logger.warning(
+                "Ignoring source.origin_key %r that resolves outside "
+                "the journal staging dir %s",
+                origin_key,
+                staging_root,
+            )
+            return
+        if not staged_path.is_file():
+            return
+        result.journal_staged_removed += 1
+        if not self.dry_run:
+            staged_path.unlink(missing_ok=True)
+
+    def _wipe_journal_staging(self, result: PurgeResult) -> None:
+        """Wipe every staged journal entry body during a vault purge (#845).
+
+        ``purge_vault`` deliberately preserves ``00-Creek-Meta/``
+        (config marker, audit log), so the content-folder wipe never
+        reaches the staged journal bodies under
+        ``00-Creek-Meta/adepthood/journal/`` — they must be swept
+        explicitly or full entry plaintext survives a whole-vault RTBF
+        request. Staged files are source material, not fragments, so
+        they are counted on ``journal_staged_removed`` only — never
+        appended to ``deleted_files`` and never inflating
+        ``fragments_affected``.
+
+        Args:
+            result: Result accumulator; ``journal_staged_removed`` is
+                incremented per staged file removed (or counted-only in
+                a dry run).
+        """
+        staging_dir = self.vault_path / JOURNAL_STAGING_RELDIR
+        if not staging_dir.is_dir():
+            return
+        for staged_file in sorted(staging_dir.iterdir()):
+            result.journal_staged_removed += 1
+            if not self.dry_run:
+                staged_file.unlink()
 
     def _find_fragment_by_id(
         self,
@@ -1071,6 +1164,7 @@ class PurgeEngine:
             embeddings_removed=result.embeddings_removed,
             provenance_scrubbed=result.provenance_scrubbed,
             intimate_stubs_removed=result.intimate_stubs_removed,
+            journal_staged_removed=result.journal_staged_removed,
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,
@@ -1165,6 +1259,26 @@ def _extract_source_original_file(post: frontmatter.Post) -> str | None:
     if isinstance(source, dict):
         original = source.get("original_file")
         return str(original) if original is not None else None
+    return None
+
+
+def _extract_source_origin_key(post: frontmatter.Post) -> str | None:
+    """Extract the ``source.origin_key`` string from frontmatter (#845).
+
+    ``origin_key`` is the vault-relative source-ledger key the ingest
+    pipeline records on each fragment; for journal fragments it names
+    the staged full-body file under ``00-Creek-Meta/adepthood/journal/``.
+
+    Args:
+        post: Parsed frontmatter post.
+
+    Returns:
+        The origin key, or ``None`` when missing.
+    """
+    source = post.get("source")
+    if isinstance(source, dict):
+        origin_key = source.get("origin_key")
+        return str(origin_key) if origin_key is not None else None
     return None
 
 
