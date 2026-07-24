@@ -62,8 +62,13 @@ specialists are leaf workers that do their own work and do not sub-delegate.
 
 ## Model tiers (strategic mix)
 
-The tiering rule is **Fable for planning, Opus 5 for implementation, Sonnet for
-review, Haiku for quick checks.**
+The tiering rule is **Fable 5 for planning, Opus 5 for implementation, Sonnet 5
+for review, Haiku 4.5 for quick checks.**
+
+> Prose names the model *family generation*; the `model:` frontmatter takes the
+> unversioned **alias** (`fable`/`opus`/`sonnet`/`haiku`), which always resolves
+> to the current model in that family. Keep the aliases in frontmatter — pinning
+> a dated ID there would rot.
 
 **Fable 5** for the one role where a better plan changes everything downstream:
 `chief-architect` (the once-per-issue design pass). Fable is ~2× Opus-tier cost
@@ -74,7 +79,7 @@ step-by-step scaffolding), which suits a planning brief.
 
 **Fable is credit-metered and can run out.** The architect role therefore
 carries an explicit **graceful fallback: on a Fable-unavailable spawn failure,
-the conductor immediately re-spawns `chief-architect` with an
+the conductor immediately re-spawns `chief-architect` with a
 `model: opus` override and continues the tick.** A tick never blocks, and never
 skips the planning pass, because Fable credits are exhausted. See
 [`chief-architect.md`](chief-architect.md) and `scripts/ralph/PROMPT.md` step 5.
