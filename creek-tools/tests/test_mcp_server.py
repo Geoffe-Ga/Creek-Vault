@@ -8,12 +8,20 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
+from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
 from creek_mcp.server import SERVER_NAME, build_server
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
+
+
+# Low-entropy test literals, not real credentials.
+_WEAK_ELEVATED_TOKEN = "weak-" + "a" * 6  # 11 chars, under the 32-char floor
+_BOUNDARY_ELEVATED_TOKEN = "a" * 32  # exactly on the floor
+_STRONG_CONSUMER_TOKEN = "server-test-consumer-" + "b" * 22  # 43 chars
 
 
 EXPECTED_TOOLS = {
@@ -557,3 +565,149 @@ def test_build_reflect_llm_factory_routes_then_degrades(
     )
     with pytest.raises(RuntimeError):
         server_mod._build_reflect_llm_factory()(PrivacyTier.OPEN)
+
+
+# --------------------------------------------------------------------------- #
+# Elevated-token minimum-length floor at startup (#907)
+# --------------------------------------------------------------------------- #
+
+
+def test_main_rejects_short_elevated_token_on_stdio(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sub-minimum elevated token aborts stdio startup before any tool exists.
+
+    ``CREEK_MCP_ELEVATED_TOKEN`` guards irreversible ``creek.purge.*``
+    calls, so a guessable value must be a loud startup failure — not a
+    quietly weak gate. Stubbing ``build_server`` with an exploding
+    callable proves the refusal happens *before* the purge tools are
+    ever registered or reachable.
+    """
+    from creek_mcp import server as server_module
+
+    monkeypatch.setenv(ELEVATED_TOKEN_ENV, _WEAK_ELEVATED_TOKEN)
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+
+    def _explode() -> object:  # pragma: no cover - asserts non-invocation
+        msg = "build_server must not run with a weak elevated token"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(server_module, "build_server", _explode)
+
+    with pytest.raises(SystemExit) as excinfo:
+        server_module.main([])
+
+    assert excinfo.value.code == 2  # argparse parser.error convention
+    err = capsys.readouterr().err
+    assert ELEVATED_TOKEN_ENV in err  # the offending setting is named
+    assert "11" in err  # the observed length
+    assert "32" in err  # the enforced minimum
+    assert "secrets.token_urlsafe(32)" in err  # the rotation recipe
+    assert _WEAK_ELEVATED_TOKEN not in err  # NEVER echo the token value
+
+
+def test_main_rejects_short_elevated_token_on_network_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The elevated-token check runs before the transport branch, so network too.
+
+    Consumer tokens are valid here; only the elevated token is weak. The
+    *elevated* message must be what surfaces, proving the check precedes
+    the network branch rather than riding along inside it.
+    """
+    from creek_mcp import server as server_module
+
+    monkeypatch.setenv(ELEVATED_TOKEN_ENV, _WEAK_ELEVATED_TOKEN)
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_CONSUMER_TOKEN}")
+
+    def _explode(**_kwargs: object) -> object:  # pragma: no cover - non-invocation
+        msg = "build_server must not run with a weak elevated token"
+        raise AssertionError(msg)
+
+    def _no_serve(server: object, args: object) -> None:  # pragma: no cover
+        msg = "_serve_network must not run with a weak elevated token"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(server_module, "build_server", _explode)
+    monkeypatch.setattr(server_module, "_serve_network", _no_serve)
+
+    with pytest.raises(SystemExit) as excinfo:
+        server_module.main(["--transport", "network", "--host", "127.0.0.1"])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert ELEVATED_TOKEN_ENV in err  # the elevated complaint, not the consumer one
+    assert "adepthood" not in err  # the consumer token is fine; not the subject
+    assert "32" in err  # the enforced minimum
+    assert "secrets.token_urlsafe(32)" in err  # the rotation recipe
+    assert _WEAK_ELEVATED_TOKEN not in err  # NEVER echo the token value
+
+
+def test_main_starts_with_compliant_elevated_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token of exactly 32 chars sits on the floor and startup proceeds."""
+    from creek_mcp import server as server_module
+
+    monkeypatch.setenv(ELEVATED_TOKEN_ENV, _BOUNDARY_ELEVATED_TOKEN)
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+
+    runs: list[str] = []
+
+    class _StubServer:
+        def run(self, transport: str) -> None:
+            runs.append(transport)
+
+    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    server_module.main([])
+
+    assert runs == ["stdio"]
+
+
+def test_main_starts_when_elevated_token_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent elevated token is the supported 'purge disabled' posture.
+
+    No token configured means every ``creek.purge.*`` call already fails
+    closed in :func:`creek_mcp.auth.is_elevated`; refusing to boot would
+    break every operator who never wanted purge enabled.
+    """
+    from creek_mcp import server as server_module
+
+    monkeypatch.delenv(ELEVATED_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+
+    runs: list[str] = []
+
+    class _StubServer:
+        def run(self, transport: str) -> None:
+            runs.append(transport)
+
+    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    server_module.main([])
+
+    assert runs == ["stdio"]
+
+
+def test_main_treats_empty_elevated_token_as_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty elevated token is 'unset', not 'zero chars, too short'."""
+    from creek_mcp import server as server_module
+
+    monkeypatch.setenv(ELEVATED_TOKEN_ENV, "")
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+
+    runs: list[str] = []
+
+    class _StubServer:
+        def run(self, transport: str) -> None:
+            runs.append(transport)
+
+    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    server_module.main([])
+
+    assert runs == ["stdio"]

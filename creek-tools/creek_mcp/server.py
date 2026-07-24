@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config
+from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
@@ -31,6 +32,7 @@ from creek_mcp.remote_auth import (
     remote_auth_settings,
 )
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
+from creek_mcp.token_policy import require_min_length
 from creek_mcp.tools import (
     author_tool,
     classify_tool,
@@ -771,14 +773,43 @@ def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
         server.run(transport="streamable-http")
 
 
+def _require_strong_elevated_token(parser: argparse.ArgumentParser) -> None:
+    """Refuse to start when the elevated token is configured but too weak (#907).
+
+    ``CREEK_MCP_ELEVATED_TOKEN`` gates irreversible ``creek.purge.*``
+    calls, so a guessable value is a startup failure rather than a quietly
+    weak gate. An *absent or empty* value is not an error: that is the
+    supported "purge disabled" posture, under which
+    :func:`creek_mcp.auth.is_elevated` already denies every call.
+
+    Applies to both transports — the token is read from the environment
+    at call time, not from the wire — so it is checked before the
+    transport branch and before any server is built.
+
+    Args:
+        parser: The CLI parser, used to report errors in argparse style
+            (usage on stderr, exit code 2).
+    """
+    configured = os.environ.get(ELEVATED_TOKEN_ENV, "")
+    if not configured:
+        return
+    try:
+        require_min_length(ELEVATED_TOKEN_ENV, configured)
+    except ValueError as exc:
+        # Mirrors the #838 consumer-token treatment: exit with the rotation
+        # recipe (never the token value) rather than serve a weak gate.
+        parser.error(str(exc))
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the MCP server over stdio (local) or the authenticated network transport.
 
-    The network branch is fail-closed three times over: it refuses to start
-    without per-consumer tokens (no anonymous access), it refuses a configured
-    token below the minimum-strength floor (#838), and it refuses a
-    non-loopback bind unless TLS is configured (no cleartext bearer
-    tokens, #837).
+    Startup is fail-closed four times over. On *every* transport it refuses
+    an elevated token below the minimum-strength floor (#907). The network
+    branch additionally refuses to start without per-consumer tokens (no
+    anonymous access), refuses a configured consumer token below the same
+    floor (#838), and refuses a non-loopback bind unless TLS is configured
+    (no cleartext bearer tokens, #837).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -792,6 +823,8 @@ def main(argv: list[str] | None = None) -> None:
         if not args.config.exists():
             parser.error(f"--config: file not found: {args.config}")
         os.environ[CONFIG_PATH_ENV_VAR] = str(args.config.resolve())
+
+    _require_strong_elevated_token(parser)
 
     if args.transport == "network":
         try:
