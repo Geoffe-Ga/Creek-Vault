@@ -57,6 +57,11 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
    design approach, touch-list, TDD test strategy, an **ordered dispatch list**,
    and **risk flags** (security / performance / deps / docs). You execute that
    list — you do not improvise the design.
+   **Fable fallback:** the architect runs on Fable 5, which is credit-metered.
+   If the spawn fails because Fable is unavailable or out of credits, do **not**
+   skip the planning pass and do **not** improvise the design — immediately
+   re-spawn the same `chief-architect` with an explicit `model: opus` override
+   and continue. Note the downgrade in one line in the PR body's Summary.
 6. **Dispatch the build.** The test- and implementation-specialists *embody* the
    `stay-green` Red→Green→Refactor discipline and `max-quality-no-shortcuts`
    (no bypasses) — that is now the TDD path; you do not separately invoke the

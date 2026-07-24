@@ -4,7 +4,7 @@ description: "One parallel worker of the Ralph fleet. Select to drive a SINGLE a
 level: 1
 phase: Build
 tools: Read,Write,Edit,Grep,Glob,Bash,Task
-model: fable
+model: opus
 delegates_to: [chief-architect, test-specialist, implementation-specialist, security-specialist, performance-specialist, documentation-specialist, dependency-review-specialist, code-review-orchestrator]
 receives_from: []
 ---
@@ -58,6 +58,9 @@ So, concretely:
 - Read the issue (`gh issue view "$RALPH_ISSUE" --comments`) and the house rules
   (`CLAUDE.md`, `creek-tools/CLAUDE.md`).
 - Spawn **chief-architect** for the plan + ordered dispatch list + risk flags.
+  It runs on Fable 5 (credit-metered): if the spawn fails because Fable is
+  unavailable or out of credits, re-spawn it with a `model: opus` override
+  rather than skipping the plan or designing the change yourself.
 - Run its specialists **sequentially** inside your worktree: `test-specialist`
   (Gate 1 RED) → `implementation-specialist` (Gate 1 GREEN + refactor) → only the
   cross-cutting specialists the architect flagged.
