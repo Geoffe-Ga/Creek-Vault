@@ -65,7 +65,7 @@ real desk. Only the `research` medium is wired — any other `medium` returns
 | `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`), `rebuild`    | Links existing artefacts in place — any ceiling permitted.        |
 | `creek.report`          | `report_type` (`tags`\|`voice`)                             | Renders a vault-state report — any ceiling permitted.             |
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars already excluded.      |
-| `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Idempotent per FEAT-003; no-op re-runs do not log a duplicate.    |
+| `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Gates the *source* fragments' tier, not the compiled page's tier — a source above `ceiling` refuses the whole call (#848). Idempotent per FEAT-003; no-op re-runs do not log a duplicate. |
 | `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. |
 
 ### Purge tools (FEAT-012, elevated authorization required)
@@ -103,6 +103,14 @@ rather than silently downgraded — the body never lands in the vault
 and the audit entry records the refusal without the body. The same
 gate applies to `creek.ingest` because the default ingestor tier is
 `personal`.
+
+`creek.compile` (#848) gates on the opposite side: the tier that
+matters is the classified tier of the *source* fragments being rolled
+up, not the tier of the compiled page being created. If any requested
+source fragment's tier exceeds `ceiling`, the whole call is refused
+before the compile LLM is invoked or the page is written — so an
+intimate fragment can never be laundered into an open-tier compiled
+page. The refusal is audited but names no fragment ids and no tiers.
 
 ### Elevated-authorization model (FEAT-012)
 

@@ -16,12 +16,17 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.compile.engine import PARADOX_LOG_RELPATH
 from creek.models import PrivacyTier
 from creek.save import TARGET_SUBDIRS
-from creek_mcp.audit import MCP_AUDIT_RELPATH, MCPAuditLog
+from creek_mcp.audit import (
+    MCP_AUDIT_RELPATH,
+    MCPAuditLog,
+    verify_mcp_audit_chain,
+)
 from creek_mcp.tier_ceiling import TierCeiling, write_tier_allowed
 from creek_mcp.tools.classify import classify_tool
-from creek_mcp.tools.compile import compile_tool
+from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.ingest import ingest_tool
 from creek_mcp.tools.link import link_tool
 from creek_mcp.tools.report import report_tool
@@ -937,6 +942,478 @@ def test_compile_propagates_engine_errors_as_refusal(
     )
     assert result["status"] == "refused"
     assert "engine boom" in result["reason"]
+
+
+# ---------------------------------------------------------------------------
+# compile — write-side source-tier ceiling (issue #848)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLLMFactory:
+    """Compile LLM factory that records how many times it was invoked.
+
+    Issue #848's gate must refuse *before* the LLM client is built,
+    because the compile prompt is the egress surface: it carries source
+    fragment ids and titles to a possibly-cloud provider. A ``status ==
+    "refused"`` assertion alone cannot prove that. The pre-fix wrapper
+    evaluates ``llm_factory()`` as an argument *inside* the ``try``
+    around ``compile_to_vault``, so any factory that raises
+    ``ValueError``/``RuntimeError`` produces a refusal even with no gate
+    at all. Counting invocations separates "refused by the ceiling
+    gate" from "blew up on the way to the engine".
+    """
+
+    def __init__(self) -> None:
+        """Start with a zero invocation count."""
+        self.calls = 0
+
+    def __call__(self) -> object:
+        """Record one invocation and return a deterministic stub LLM."""
+        self.calls += 1
+        return lambda _prompt: "{}"
+
+
+def test_compile_refuses_intimate_source_under_open_ceiling(vault: Path) -> None:
+    """An ``intimate`` source fragment is refused at ``ceiling=open``.
+
+    Acceptance test for issue #848: the ``creek_mcp.tools.compile``
+    module docstring promises a caller cannot create a compiled page
+    whose source fragments include a tier they could not read.
+    """
+    _write_fragment(vault, frag_id="frag-sealed", privacy_tier="intimate")
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-sealed"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=_noop_llm_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+
+
+def test_compile_refusal_never_invokes_the_llm_factory(vault: Path) -> None:
+    """The above-ceiling refusal never builds the compile LLM client.
+
+    This is the load-bearing egress assertion for issue #848: source
+    fragment ids and titles reach the (possibly cloud) provider through
+    the compile prompt, so the gate is only real if the factory is
+    never called. See :class:`_RecordingLLMFactory` for why a refusal
+    status on its own would be a false green.
+    """
+    _write_fragment(vault, frag_id="frag-sealed", privacy_tier="intimate")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-sealed"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert factory.calls == 0
+
+
+def test_compile_refusal_writes_no_page_no_paradox_log_no_hash_marker(
+    vault: Path,
+) -> None:
+    """An above-ceiling refusal leaves no on-disk trace of the sources.
+
+    The stub LLM returns a payload that *would* produce both a compiled
+    page (with provenance naming the intimate fragment) and a paradox
+    log entry, so each missing artefact is evidence the engine never
+    ran rather than evidence it ran and found nothing to write.
+    """
+    frag_id = "frag-sealed"
+    _write_fragment(vault, frag_id=frag_id, privacy_tier="intimate")
+    payload = json.dumps(
+        {
+            "claims": [{"id": "c1", "text": "A claim.", "fragment_ids": [frag_id]}],
+            "paradoxes": [
+                {"description": "A tension.", "fragment_ids": [frag_id]},
+            ],
+        },
+    )
+
+    def _leaky_factory() -> object:
+        """Return a stub LLM that would emit a page body and a paradox."""
+        return lambda _prompt: payload
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=[frag_id],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=_leaky_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert not (vault / "02-Threads" / "Active" / "thread-x.md").exists()
+    assert not (vault / PARADOX_LOG_RELPATH).exists()
+    assert not (vault / "00-Creek-Meta" / "audit" / "compile-thread-x.hash").exists()
+
+
+def test_compile_refusal_is_audited_without_ids_or_tiers(vault: Path) -> None:
+    """The refusal is audited, but the audit row names no source content.
+
+    One ``creek.compile`` entry records *that* a ceiling violation was
+    attempted (operators need the signal) while the write-side fields
+    stay absent and ``fragment_ids`` collapses to the count that
+    :func:`creek_mcp.audit.summarise_args` produces for any list — so
+    the log cannot become a side channel for the ids, titles, or tier
+    of content the caller was refused.
+    """
+    frag_id = "frag-sealed"
+    _write_fragment(vault, frag_id=frag_id, privacy_tier="intimate")
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=[frag_id],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=_noop_llm_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+
+    entries = [e for e in _read_audit(vault) if e["tool"] == "creek.compile"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["args_summary"]["fragment_ids"] == {"count": 1}
+    assert "affected_fragment_ids" not in entry
+    assert "created_path" not in entry
+    assert "created_tier" not in entry
+
+    raw = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    assert frag_id not in raw
+    assert f"Title {frag_id}" not in raw
+    assert "intimate" not in raw
+
+    # The refusal append must leave the hash chain intact — a tamper-evident
+    # log that the refusal path could silently break would be worse than none.
+    verify_mcp_audit_chain(vault)
+
+
+@pytest.mark.parametrize(
+    "fragment_ids",
+    [
+        ["frag-open", "frag-sealed"],
+        ["frag-sealed", "frag-open"],
+    ],
+    ids=["above-ceiling-last", "above-ceiling-first"],
+)
+def test_compile_refuses_when_above_ceiling_source_is_not_first(
+    vault: Path,
+    fragment_ids: list[str],
+) -> None:
+    """One above-ceiling source refuses the whole call, at any position.
+
+    The gate must scan every requested fragment, not just the head of
+    the list. Both assertions are position-independent (invocation
+    count and the reason constant) so the test says nothing about
+    filesystem traversal order or fragment file naming.
+    """
+    _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
+    _write_fragment(vault, frag_id="frag-sealed", privacy_tier="intimate")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=fragment_ids,
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert factory.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("privacy_tier", "ceiling", "allowed"),
+    [
+        ("open", TierCeiling.OPEN, True),
+        ("personal", TierCeiling.OPEN, False),
+        ("personal", TierCeiling.PERSONAL, True),
+        ("intimate", TierCeiling.PERSONAL, False),
+        ("intimate", TierCeiling.INTIMATE, True),
+        ("intimate", TierCeiling.ALL, True),
+    ],
+)
+def test_compile_source_tier_ceiling_matrix(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    privacy_tier: str,
+    ceiling: TierCeiling,
+    allowed: bool,
+) -> None:
+    """Source-tier admission mirrors :func:`write_tier_allowed` exactly.
+
+    The allowed rows assert the factory *was* invoked, so a future
+    short-circuit elsewhere in the wrapper cannot masquerade as the
+    gate passing; the refused rows assert the ceiling reason and a
+    never-invoked factory.
+    """
+    _write_fragment(vault, frag_id="frag-src", privacy_tier=privacy_tier)
+    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
+
+    def _stub_compile(**_kw: object) -> object:
+        """Write a placeholder target page instead of running the engine."""
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not target_path.exists():
+            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
+        return target_path
+
+    if allowed:
+        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-src"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+
+    if allowed:
+        assert result["status"] == "ok"
+        assert factory.calls == 1
+    else:
+        assert result["status"] == "refused"
+        assert result["reason"] == _ABOVE_CEILING_REASON
+        assert factory.calls == 0
+
+
+def test_compile_admits_unclassified_source_at_open_ceiling(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``unclassified`` source is admitted at ``ceiling=open``.
+
+    This pins existing, deliberate policy rather than proposing new
+    policy: ``creek_mcp.tier_ceiling._TIER_RANK`` ranks ``unclassified``
+    alongside ``open`` (rank 0), and every ceiling comparison in the MCP
+    surface inherits that. Issue #923 owns any change to the ranking; if
+    it lands, update ``_TIER_RANK`` and this test together — do not
+    weaken the ceiling gate here.
+    """
+    _write_fragment(vault, frag_id="frag-src", privacy_tier="unclassified")
+    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
+
+    def _stub_compile(**_kw: object) -> object:
+        """Write a placeholder target page instead of running the engine."""
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not target_path.exists():
+            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
+        return target_path
+
+    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-src"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.calls == 1
+
+
+def _write_fragment_without_tier(vault: Path, *, frag_id: str) -> None:
+    """Write a fragment whose frontmatter omits ``privacy_tier`` entirely.
+
+    Distinct from ``_write_fragment(..., privacy_tier="unclassified")``:
+    that writes the key *explicitly*, which is what every
+    pipeline-written fragment carries. Omitting the key is the
+    hand-edited / legacy-vault case, where the tier is unknown rather
+    than known-to-be-unclassified.
+    """
+    metadata = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": f"Title {frag_id}",
+        "created": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "ingested": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "eddies": [],
+    }
+    target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="Body text.", **metadata)),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "allowed"),
+    [
+        (TierCeiling.OPEN, False),
+        (TierCeiling.PERSONAL, False),
+        (TierCeiling.INTIMATE, True),
+        (TierCeiling.ALL, True),
+    ],
+)
+def test_compile_fails_closed_when_privacy_tier_key_is_absent(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ceiling: TierCeiling,
+    allowed: bool,
+) -> None:
+    """A fragment with no ``privacy_tier`` key is treated as ``intimate``.
+
+    The :class:`~creek.models.Fragment` model defaults a *missing*
+    ``privacy_tier`` to ``unclassified``, which ranks 0 and would be
+    admitted at every ceiling — so reading the tier off the model alone
+    fails **open** on exactly the hand-edited or legacy file whose tier
+    nobody can vouch for.
+
+    ``creek.reflect`` already refuses that file closed to ``intimate``
+    (``creek_mcp.tools.reflect._fragment_tier``, #847), mirroring
+    :func:`creek.classify.privacy_filter.tier_of`. Compile must agree:
+    two MCP tools that disagree about the same file is the divergence
+    the shared-loader design exists to prevent. Contrast
+    :func:`test_compile_admits_unclassified_source_at_open_ceiling`,
+    where the key is present and explicitly ``unclassified``.
+    """
+    _write_fragment_without_tier(vault, frag_id="frag-legacy")
+    target_path = vault / "02-Threads" / "Active" / "thread-x.md"
+
+    def _stub_compile(**_kw: object) -> object:
+        """Write a placeholder target page instead of running the engine."""
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not target_path.exists():
+            target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
+        return target_path
+
+    if allowed:
+        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-legacy"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+
+    if allowed:
+        assert result["status"] == "ok"
+        assert factory.calls == 1
+    else:
+        assert result["status"] == "refused"
+        assert result["reason"] == _ABOVE_CEILING_REASON
+        assert factory.calls == 0
+
+
+def test_compile_missing_fragment_id_still_reports_not_found(vault: Path) -> None:
+    """A nonexistent id keeps the engine's "not found" refusal.
+
+    Runs the real engine with nothing above the ceiling in the vault:
+    the new gate must let the call through so the caller still learns
+    the id does not exist, instead of the ceiling check swallowing
+    every unresolvable id behind a generic refusal.
+    """
+    _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-open", "frag-missing"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert "not found" in result["reason"]
+    assert "frag-missing" in result["reason"]
+    assert result["reason"] != _ABOVE_CEILING_REASON
+    assert factory.calls == 1
+
+
+def test_compile_above_ceiling_wins_over_missing_id(vault: Path) -> None:
+    """A ceiling violation is reported ahead of any missing-id error.
+
+    Deliberate ordering: if the not-found error won, a caller holding
+    ``ceiling=open`` could pair one above-ceiling id with a batch of
+    guesses and read back which of the guesses exist. The ceiling
+    refusal reveals nothing about the rest of the request.
+    """
+    _write_fragment(vault, frag_id="frag-sealed", privacy_tier="intimate")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-sealed", "frag-missing"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert "not found" not in result["reason"]
+    assert factory.calls == 0
+
+
+def test_compile_reports_unknown_target_kind_even_with_above_ceiling_sources(
+    vault: Path,
+) -> None:
+    """Cheap argument validation runs before the vault-walking gate.
+
+    An unknown ``target_kind`` is rejected on its own terms even when
+    the request also names an above-ceiling fragment, so a typo never
+    costs a full fragment scan and the caller gets the actionable
+    message.
+    """
+    _write_fragment(vault, frag_id="frag-sealed", privacy_tier="intimate")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-sealed"],
+        target_kind="not-a-kind",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert "unknown target_kind" in result["reason"]
+    assert result["reason"] != _ABOVE_CEILING_REASON
+    assert factory.calls == 0
 
 
 # ---------------------------------------------------------------------------
