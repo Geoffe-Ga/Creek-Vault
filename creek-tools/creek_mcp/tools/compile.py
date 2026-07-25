@@ -1,8 +1,34 @@
 """``creek.compile`` MCP tool — roll fragments into a compiled page.
 
-Wraps :func:`creek.compile.engine.compile_to_vault` (FEAT-003). The
-write-side tier-ceiling rule applies: a caller cannot create a compiled
-page whose source fragments include a tier they could not read.
+Wraps :func:`creek.compile.engine.compile_to_vault` (FEAT-003).
+
+Four guarantees this module enforces (#848 — before that fix the first
+of them was asserted in this docstring and implemented nowhere):
+
+- **The write-side ceiling is checked against the *source* tiers, before
+  any state-affecting step.** Compile's variant of the FEAT-011 write-side
+  rule gates the classified tiers of the fragments being rolled up
+  rather than the tier of the page being created: a caller cannot
+  compile a page out of fragments they *named* and could not read.
+  (Only the named ids are checked — an admitted fragment's own
+  ``structural_path`` ancestry is not, which is a tracked follow-up.)
+  The check runs
+  ahead of any LLM client being built, any page being written, and any
+  paradox being logged — the three places the source ids would
+  otherwise escape (enumerated in :func:`compile_tool`).
+- **The refusal names nothing.** It carries the fixed
+  :data:`_ABOVE_CEILING_REASON`: no ids, no titles, no tiers, not even a
+  count of how many sources were above the ceiling.
+- **The refusal is audited, while the argument-validation refusals are
+  not.** An attempted ceiling violation is an operator-relevant signal;
+  a typo'd ``target_kind`` is not. This mirrors ``save`` / ``journal``
+  and is a deliberate departure from ``reflect``, which appends
+  unconditionally at the top of the call — :func:`compile_tool`
+  explains why compile cannot do the same.
+- **The gate and the engine share one fragment loader.** Both read the
+  vault through :func:`creek.vault.reader.iter_vault_fragments`, so the
+  two can never disagree about which files exist or which of them are
+  fragments (see :func:`_sources_above_ceiling`).
 
 **Idempotency semantics (audit-dedup only).** The wrapper fingerprints
 the target file after each compile and stamps the hash under
@@ -20,18 +46,62 @@ Engine-side LLM-call dedup is tracked separately as a follow-up.
 from __future__ import annotations
 
 import hashlib
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 from creek.compile.engine import TARGET_KINDS, compile_to_vault
+from creek.models import PrivacyTier
+from creek.vault.reader import iter_vault_fragments
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling, refusal_response
+from creek_mcp.tier_ceiling import (
+    TierCeiling,
+    refusal_response,
+    write_tier_allowed,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from creek.models import CompileTargetKind
+    from creek.models import CompileTargetKind, Fragment
 
 TOOL_NAME = "creek.compile"
+
+# The above-ceiling refusal reason is a fixed string naming no fragment id, no
+# title, no tier, and no count. Echoing the offending ids would turn a single
+# call into a bulk tier-classification oracle — submit 100 ids, learn 100 tiers
+# in one round trip. A count would be nearly as useful to an attacker: it makes
+# group testing *exact*, so a caller could binary-search a batch knowing
+# precisely how many above-ceiling ids each half holds.
+#
+# ACCEPTED RESIDUAL RISK: a bare boolean is still a group-testing oracle — a
+# caller who resubmits subsets of a batch identifies every above-ceiling id in
+# O(k log n) calls. Two things that argument must NOT lean on:
+#
+# - *Id unguessability is not a control here.* Ids are deterministic
+#   (``creek.ingest.base.generate_fragment_id`` hashes source+timestamp+content;
+#   ``generate_child_fragment_id`` hashes ``f"{parent_id}:{level}:{index}"``), so
+#   from a single admitted parent id a caller can enumerate every child id with
+#   no knowledge of the content. The id space around known content IS sweepable;
+#   only a blind sweep of the full 48-bit space is infeasible.
+# - *Probe cost does NOT leak where the offending fragment sits.* Worth stating
+#   because the symmetry is accidental and a refactor could destroy it:
+#   ``iter_vault_fragments`` materialises the whole directory into a list before
+#   returning, so the rglob + parse cost is paid in full before
+#   ``_sources_above_ceiling``'s loop begins. The early ``return True`` therefore
+#   short-circuits only in-memory iteration, not the I/O. Unlike
+#   ``reflect.py::_resolve_entry``, which walks a raw lazy ``rglob`` and returns
+#   at the match — a genuine timing channel that comment correctly records. If
+#   this gate is ever switched to a lazy loader (see the load-once follow-up),
+#   that channel appears here too and must be re-analysed.
+#
+# Accepted because the real control is the audit trail, not id entropy: every
+# True probe appends a ``creek.compile`` entry distinguishable from a success
+# (no ``created_path``, no ``affected_fragment_ids``), so a sweep is detectable
+# by rate. Noting the attacker's counter honestly — appending one known-missing
+# id makes the negative half fall through to the engine's not-found refusal,
+# which is NOT audited, so only positive probes are logged. Accepted also
+# because *some* distinguishable refusal is required for a legitimate client's
+# bug to be debuggable at all.
+_ABOVE_CEILING_REASON: Final[str] = "source fragments exceed tier ceiling"
 
 
 class CompileLLMFactory(Protocol):
@@ -50,6 +120,105 @@ def _fingerprint(path: Path) -> str | None:
     if not path.exists():
         return None
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _tier_of(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
+    """Return *fragment*'s tier, failing closed when the key is absent.
+
+    :class:`~creek.models.Fragment` defaults a *missing* ``privacy_tier``
+    to ``unclassified``, which ranks alongside ``open`` and so would be
+    admitted at every ceiling. Reading the tier off the model alone
+    would therefore fail **open** on exactly the file whose tier nobody
+    can vouch for — a hand-edited or legacy fragment. The raw
+    frontmatter is consulted because it is the only place the two cases
+    are still distinguishable once the model has applied its default.
+
+    This mirrors :func:`creek_mcp.tools.reflect._fragment_tier` (#847)
+    and :func:`creek.classify.privacy_filter.tier_of`, both of which
+    treat an absent tier as ``intimate``. Compile must agree with them:
+    two MCP tools that disagree about the same file is precisely the
+    divergence this module's shared-loader design exists to prevent.
+
+    A fragment carrying an *explicit* ``privacy_tier: unclassified`` —
+    what every pipeline-written, not-yet-classified fragment has — is
+    untouched here and stays admitted at any ceiling. That ranking is
+    deliberate policy owned by ``creek_mcp.tier_ceiling._TIER_RANK``
+    (#923), not by this fail-closed path.
+
+    Args:
+        fragment: The validated fragment as loaded by the shared reader.
+        raw: The file's raw frontmatter, before model defaults applied.
+
+    Returns:
+        ``PrivacyTier.INTIMATE`` when ``privacy_tier`` is absent from
+        *raw*, else the fragment's own classified tier.
+    """
+    if "privacy_tier" not in raw:
+        return PrivacyTier.INTIMATE
+    return fragment.privacy_tier
+
+
+def _sources_above_ceiling(
+    vault_path: Path, fragment_ids: list[str], ceiling: TierCeiling
+) -> bool:
+    """Return whether any requested source fragment's tier exceeds *ceiling*.
+
+    The vault is walked through
+    :func:`creek.vault.reader.iter_vault_fragments` — the exact function
+    :func:`creek.compile.engine._load_fragments_for_compile` calls — so the set
+    of files this gate inspects and the set the engine would compile are
+    identical *by construction*. A bespoke ``frontmatter.load`` walk would
+    diverge: :func:`creek.vault.reader.try_load_fragment` rejects files whose
+    ``type`` is not ``fragment`` and files that fail ``Fragment`` schema
+    validation, both of which a raw scan happily reads. That divergence would
+    create a class of file one side sees and the other does not — precisely the
+    bug class this gate exists to prevent. A file the shared loader skips
+    (unreadable, non-fragment, schema-invalid) is invisible to gate and engine
+    alike, and so fails closed to the engine's "not found".
+
+    That parity is by construction but not instantaneous: the gate walks the
+    vault, returns, and the engine then walks it again. A concurrent writer that
+    *raises* a fragment's tier inside that window (``creek classify``, the
+    ``creek.classify`` MCP tool, a text editor) would be compiled under the
+    pre-write tier. The window is not caller-controlled and closing it means
+    handing the loaded fragments to the engine — an engine signature change,
+    tracked as a follow-up along with eliminating the duplicated walk.
+
+    Admission is decided by :func:`creek_mcp.tier_ceiling.write_tier_allowed`
+    rather than the :func:`~creek_mcp.tier_ceiling.tier_allowed` it delegates
+    to. The two are behaviourally identical today, but this is a *write* tool
+    enforcing the FEAT-011 write-side rule, and keeping every write gate on one
+    predicate (``save.py``, ``journal.py``, here) means ``grep
+    write_tier_allowed`` enumerates them all — and any future divergence
+    between the read-side and write-side rules lands compile on the correct
+    side automatically. For the same reason there is deliberately no
+    ``ceiling is TierCeiling.ALL`` fast path: a second route to the answer
+    would silently desync if ``ALL``'s semantics ever changed.
+
+    Args:
+        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        fragment_ids: The ids the caller asked to compile. An id with no
+            matching fragment in the vault is **not** a violation — it falls
+            through to the engine's ``ValueError("Fragment(s) not found in
+            vault: ...")`` so a legitimate caller still learns the id does not
+            resolve.
+        ceiling: The caller's declared ceiling.
+
+    Returns:
+        ``True`` when at least one requested fragment is above *ceiling*.
+        Deliberately a bare bool — the offending ids never leave this function;
+        see :data:`_ABOVE_CEILING_REASON` for why.
+    """
+    requested = set(fragment_ids)
+    for _path, fragment, _body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments",
+    ):
+        if fragment.id in requested and not write_tier_allowed(
+            _tier_of(fragment, raw),
+            ceiling,
+        ):
+            return True
+    return False
 
 
 def compile_tool(
@@ -72,7 +241,25 @@ def compile_tool(
     Args:
         llm_factory: Zero-argument callable returning the compile LLM
             client. Invoked lazily so the LLM provider only matters
-            when this tool is actually called.
+            when this tool is actually called — and not at all when the
+            source-tier gate refuses.
+        privacy_tier_ceiling: The caller's ceiling. Compile's variant of
+            the FEAT-011 write-side rule gates the *source* fragments'
+            classified tiers, not the tier of the content created (which
+            is what ``save`` gates): rolling an ``intimate`` fragment
+            into a compiled page under ``ceiling=open`` is refused,
+            because the page, its provenance, and the compile prompt
+            would each carry content the caller cannot read.
+
+    Returns:
+        ``{status, tool, tier_ceiling, ...}`` — ``ok`` with the written
+        ``compiled_path``, ``noop`` when a re-run reproduced the stored
+        hash, or a structured ``refused`` response for one of: an
+        unknown *target_kind*; an empty *fragment_ids*; a source
+        fragment above *privacy_tier_ceiling*
+        (:data:`_ABOVE_CEILING_REASON`, #848 — the only refusal that is
+        audited); or an engine ``ValueError`` / ``RuntimeError``, such
+        as a fragment id that does not resolve in the vault.
     """
     if target_kind not in TARGET_KINDS:
         return refusal_response(
@@ -88,6 +275,69 @@ def compile_tool(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason="fragment_ids must be non-empty",
+        )
+
+    # The write-side source-tier gate (#848). Its position is load-bearing in
+    # both directions.
+    #
+    # It sits *below* the two argument-validation refusals above because
+    # neither ordering leaks — those checks read only caller-supplied input and
+    # touch no vault state, so they can answer nothing about the corpus. The
+    # tiebreaker is cost asymmetry: this gate is a full ``01-Fragments`` walk,
+    # so gating first would let any caller force a 35k-file parse with a
+    # syntactically invalid call.
+    #
+    # It sits *above* everything that follows, because each of those steps
+    # hands the source fragments somewhere the caller is not admitted to:
+    #
+    # - ``llm_factory()`` is evaluated as an *argument* to ``compile_to_vault``
+    #   below, and the prompt the engine builds emits ``id:`` and ``title:``
+    #   for every source unconditionally (``_fragment_excerpt_for_prompt``
+    #   redacts only the *body*) to a provider that is **not** tier-routed.
+    #   That is the primary egress breach.
+    # - ``compile_to_vault`` writes the compiled page — carrying per-claim
+    #   provenance that names the source ids — into ``02-Threads`` /
+    #   ``03-Eddies`` / ``06-Frequencies``, pages any ``open``-ceiling read
+    #   tool then serves: intimate ids laundered into open-tier artifacts.
+    # - ``_append_paradox_log`` writes LLM-authored text plus the source ids to
+    #   ``00-Creek-Meta/Processing-Log/paradoxes-during-compile.jsonl``.
+    # - the hash marker further below: a refused call must leave zero
+    #   idempotency state behind.
+    #
+    # The gate also deliberately wins over the engine's missing-id
+    # ``ValueError``. Were it the other way round, a caller could pair one
+    # above-ceiling id with a batch of guesses and read back from the
+    # "not found" list which of those guesses exist.
+    #
+    # This refusal is audited while the two argument-validation refusals above
+    # are not, mirroring ``save_tool`` / ``journal_ingest_tool``: an attempted
+    # ceiling violation is an operator-relevant signal, a malformed call is
+    # not. That is a deliberate departure from ``reflect_tool``, which appends
+    # unconditionally at the top of the function. Appending unconditionally
+    # here would append on *every* compile including no-ops, breaking
+    # ``test_compile_writes_audit_then_noop_on_re_run`` — the FEAT-011
+    # acceptance test asserting exactly one ``creek.compile`` entry across two
+    # calls. Compile's audit contract is "one entry per materially-new page",
+    # not "one entry per call".
+    #
+    # The audited args carry no source content: ``summarise_args`` collapses
+    # ``fragment_ids`` to ``{"count": N}``, and ``affected_fragment_ids`` — the
+    # one field the log persists verbatim — is omitted, as are ``created_path``
+    # and ``created_tier`` (nothing was created). ``target_title`` is omitted
+    # too: caller free text, irrelevant to a refusal.
+    if _sources_above_ceiling(vault_path, fragment_ids, privacy_tier_ceiling):
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args={
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "fragment_ids": list(fragment_ids),
+            },
+            tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+        return refusal_response(
+            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=_ABOVE_CEILING_REASON
         )
 
     kind = cast("CompileTargetKind", target_kind)
