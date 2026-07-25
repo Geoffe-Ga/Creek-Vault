@@ -24,6 +24,7 @@ from creek.classify.llm import (
     _strip_code_fences,
 )
 from creek.classify.llm import LLMClassifier as LLMClassifierDirect
+from creek.classify.llm.parsing import _apply_praxis
 from creek.classify.review import ReviewQueueGenerator as ReviewQueueGeneratorDirect
 from creek.classify.rules import (
     CONFIDENCE_SIGNALS,
@@ -45,6 +46,7 @@ from creek.models import (
     Mode,
     Orientation,
     Phase,
+    PraxisPotential,
     SourcePlatform,
     VoiceClassification,
     VoiceRegister,
@@ -70,6 +72,30 @@ def _make_fragment(
         id="frag-000000000003",
         title=title,
         source=FragmentSource(platform=platform),
+    )
+
+
+def _make_praxis_fragment(potential: PraxisPotential) -> Fragment:
+    """Create a Fragment that already carries a praxis verdict (issue #877).
+
+    :func:`_make_fragment` always yields the model default, ``none`` — the
+    *weakest* verdict on the monotone ``none < latent < explicit`` scale.
+    Any assertion built on it is therefore structurally blind to a
+    demotion, because there is no higher verdict left to lose.
+
+    ``.value`` is used because ``Fragment`` sets ``use_enum_values=True``
+    but ``model_copy`` bypasses that coercion, so passing the bare
+    StrEnum member would store something a plain-``str`` consumer (and
+    YAML's SafeDumper) does not see the same way.
+
+    Args:
+        potential: The praxis verdict already recorded on the fragment.
+
+    Returns:
+        A Fragment identical to :func:`_make_fragment`'s but at *potential*.
+    """
+    return _make_fragment().model_copy(
+        update={"praxis_potential": potential.value},
     )
 
 
@@ -2813,3 +2839,438 @@ class TestInvokePromptWithMetadata:
         completion = classifier.invoke_prompt_with_metadata("prompt", max_tokens=512)
         assert completion.text == "cut"
         assert completion.stop_reason == "max_tokens"
+
+
+# ---- Praxis potential: LLM schema + prompt (issue #877) ----
+
+
+_PRAXIS_YAML_RESPONSE: str = """\
+frequency:
+  primary: F3
+praxis:
+  potential: explicit
+"""
+"""A documented response carrying the new ``praxis`` section."""
+
+_LATENT_PRAXIS_RESPONSE: str = _VALID_YAML_RESPONSE + "praxis:\n  potential: latent\n"
+"""A full response whose praxis verdict is the *middle* one, ``latent``.
+
+Appended to :data:`_VALID_YAML_RESPONSE` so the other sections still land
+— an end-to-end praxis assertion is worthless if the call could have
+short-circuited before applying anything.
+"""
+
+_EXPLICIT_PRAXIS_RESPONSE: str = (
+    _VALID_YAML_RESPONSE + "praxis:\n  potential: explicit\n"
+)
+"""A full response whose praxis verdict is the strongest one."""
+
+
+class TestValidatePraxisSection:
+    """``praxis`` joins the documented top-level schema (issue #877)."""
+
+    def test_accepts_a_praxis_section(self) -> None:
+        """A response with ``praxis:`` validates rather than being rejected.
+
+        ``praxis`` has to join ``_ALLOWED_TOP_LEVEL_KEYS`` in lockstep with
+        the prompt: :func:`validate_response` rejects *any* undocumented
+        top-level key, so a model that obeys the new prompt would
+        otherwise have its entire response thrown away (and the fragment
+        left unclassified) on every call.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        result = classifier.validate_response(_PRAXIS_YAML_RESPONSE)
+
+        assert result["praxis"] == {"potential": "explicit"}
+
+    def test_still_rejects_privacy_tier(self) -> None:
+        """SEC-004 regression: widening the schema must not widen it to privacy.
+
+        The allow-list exists so a successful prompt injection cannot
+        smuggle in a field like ``privacy_tier`` and talk the classifier
+        into re-tiering intimate content as ``open``. Adding ``praxis``
+        is a one-key change; this pins that the *rest* of the allow-list
+        is unchanged, including on a payload that also carries the
+        newly-legal ``praxis`` section.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        bogus = "praxis:\n  potential: explicit\nprivacy_tier: open\n"
+
+        with pytest.raises(ValueError, match="top-level"):
+            classifier.validate_response(bogus)
+
+    def test_still_rejects_other_undocumented_keys(self) -> None:
+        """An unrelated smuggled key is still refused after the widening."""
+        classifier = LLMClassifier(config=LLMConfig())
+        bogus = "praxis:\n  potential: explicit\nvoice_proxy_eligible: true\n"
+
+        with pytest.raises(ValueError, match="top-level"):
+            classifier.validate_response(bogus)
+
+
+class TestApplyPraxisSection:
+    """``_apply_praxis`` translates the LLM's verdict onto the fragment."""
+
+    def test_applies_explicit(self) -> None:
+        """``praxis.potential: explicit`` lands on the fragment."""
+        from creek.models import PraxisPotential
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"praxis": {"potential": "explicit"}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+
+    def test_applies_latent(self) -> None:
+        """``latent`` is the LLM-only verdict — it must survive the parser.
+
+        The free keyword heuristic deliberately never emits ``latent``
+        ("there is a practice hiding in here that the author has not
+        named" is not something a regex can see), so this branch is the
+        *only* way a fragment can ever reach ``praxis_potential: latent``.
+        """
+        from creek.models import PraxisPotential
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"praxis": {"potential": "latent"}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert str(result.praxis_potential) == PraxisPotential.LATENT.value
+
+    def test_unknown_value_writes_nothing(self) -> None:
+        """A junk ``potential`` leaves the fragment object untouched.
+
+        Unknown values fall back to ``none``, and ``none`` writes no
+        update key at all — so a garbage response cannot demote a
+        fragment the heuristic already marked ``explicit``.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"praxis": {"potential": "somewhat-maybe"}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_explicit_none_writes_nothing(self) -> None:
+        """``praxis.potential: none`` is a no-op, not a demotion.
+
+        The LLM can only ever *raise* this axis. The engine runs the free
+        heuristic before the LLM call, so a model answering ``none`` on a
+        fragment whose body carries a task checkbox must not undo the
+        heuristic's ``explicit``.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"praxis": {"potential": "none"}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_non_dict_praxis_section_is_ignored(self) -> None:
+        """A scalar where the nested section belongs must not raise."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"praxis": "explicit"}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_absent_praxis_section_is_ignored(self) -> None:
+        """A response without ``praxis`` leaves the axis alone."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"frequency": {"primary": "F3"}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.praxis_potential == frag.praxis_potential
+
+    def test_praxis_applies_alongside_the_other_sections(self) -> None:
+        """Praxis does not displace frequency / voice in the same response."""
+        from creek.models import PraxisPotential
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {
+            "frequency": {"primary": "F3", "secondary": ["F5"]},
+            "voice": {"voice_register": "analytical", "confidence": "forming"},
+            "praxis": {"potential": "explicit"},
+        }
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.frequency.primary == Frequency.F3
+        assert result.voice.confidence == Confidence.FORMING
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+
+
+class TestApplyPraxisIsEscalateOnly:
+    """``_apply_praxis`` merges against the verdict the fragment already has.
+
+    The axis is monotone — ``none < latent < explicit``, and nothing may
+    lower it (see :mod:`creek.classify.praxis_pass`). That invariant is a
+    property of the *merge*, so the helper has to be told what the
+    fragment currently carries; refusing to write only when the parsed
+    value is ``none`` is not sufficient, because ``latent`` is also
+    weaker than ``explicit``.
+
+    Every case below drives ``_apply_praxis`` directly and asserts on the
+    ``updates`` dict rather than on a returned Fragment, because "writes
+    no key at all" is the contract: ``_apply_classification`` returns the
+    fragment untouched precisely when ``updates`` is empty, so writing
+    the merged value back unconditionally would be a behaviour change in
+    its own right.
+    """
+
+    def test_latent_never_demotes_an_explicit_fragment(self) -> None:
+        """``latent`` over a recorded ``explicit`` writes nothing.
+
+        The blocker's direct regression test. A model answering ``latent``
+        for a fragment already at ``explicit`` — from an earlier LLM run,
+        or from an operator's hand edit — is offering a *weaker* verdict.
+        The heuristic pass that runs afterwards cannot repair the damage:
+        it re-derives from the body and only ever proposes ``explicit`` or
+        ``none``, so a fragment whose ``explicit`` came from judgment
+        rather than keywords keeps the demotion all the way to disk.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "latent"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_explicit_raises_a_latent_fragment(self) -> None:
+        """``explicit`` over a recorded ``latent`` writes ``explicit``.
+
+        The escalating direction of the same merge: ``latent`` is the
+        weaker verdict, so the model's stronger answer wins.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "explicit"}},
+            updates,
+            PraxisPotential.LATENT,
+        )
+
+        assert updates == {"praxis_potential": "explicit"}
+
+    def test_latent_raises_a_none_fragment(self) -> None:
+        """``latent`` over ``none`` still writes ``latent``.
+
+        Guards the fix against over-correcting into "never write anything
+        but ``explicit``". ``latent`` is the entire reason the LLM praxis
+        section exists — the free keyword heuristic can never emit it —
+        so a merge that dropped it would silently delete the feature.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "latent"}},
+            updates,
+            PraxisPotential.NONE,
+        )
+
+        assert updates == {"praxis_potential": "latent"}
+
+    def test_an_unchanged_explicit_verdict_writes_no_key(self) -> None:
+        """Re-confirming ``explicit`` is a no-op, not a rewrite.
+
+        ``_apply_classification`` returns the input Fragment unchanged
+        only when ``updates`` is empty; writing the merged value back
+        whenever the model agrees would allocate a fresh model copy per
+        fragment and blur the "did this run change anything?" signal
+        callers read from object identity.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "explicit"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_an_unchanged_latent_verdict_writes_no_key(self) -> None:
+        """The same no-op contract holds at the middle rank."""
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "latent"}},
+            updates,
+            PraxisPotential.LATENT,
+        )
+
+        assert updates == {}
+
+    def test_none_from_the_model_never_demotes_explicit(self) -> None:
+        """``none`` over ``explicit`` writes nothing.
+
+        Pinned against a fragment that is actually at ``explicit`` — the
+        pre-existing coverage only ever started from the model default,
+        where ``none`` is a no-op for free.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "none"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_unparseable_garbage_never_demotes_explicit(self) -> None:
+        """An unrecognised value falls back to ``none`` and still writes nothing."""
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "somewhat-maybe"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_the_written_value_is_a_plain_string(self) -> None:
+        """The update carries ``.value``, not the StrEnum member itself.
+
+        ``Fragment`` sets ``use_enum_values=True``, but ``model_copy``
+        bypasses that coercion — so a bare member would reach the vault
+        writer, where YAML's SafeDumper cannot represent it. ``type(...)
+        is str`` rather than ``isinstance`` / ``==`` on purpose: a
+        ``PraxisPotential`` member passes both of those.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "explicit"}},
+            updates,
+            PraxisPotential.NONE,
+        )
+
+        assert updates["praxis_potential"] == "explicit"
+        assert type(updates["praxis_potential"]) is str
+
+    def test_apply_classification_feeds_the_fragments_own_verdict(self) -> None:
+        """The orchestrator is the call site that must supply ``current``.
+
+        ``_apply_praxis`` can only refuse a demotion if it is told what
+        the fragment already carries, and ``_apply_classification`` is its
+        only production caller. ``Fragment.model_config`` sets
+        ``use_enum_values=True``, so ``fragment.praxis_potential`` is a
+        plain ``str`` at runtime and has to be coerced back to a
+        ``PraxisPotential`` on the way in — this pins that wiring, which
+        the direct-call tests above cannot see.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_praxis_fragment(PraxisPotential.EXPLICIT)
+        data: dict[str, object] = {"praxis": {"potential": "latent"}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+        assert result is frag
+
+
+class TestClassifyPreservesAPriorPraxisVerdict:
+    """A whole ``classify`` call must never lower ``praxis_potential`` (#877).
+
+    The end-to-end counterpart to
+    :class:`TestApplyPraxisIsEscalateOnly`: prompt, stubbed provider,
+    response split, schema validation and application all run, and no
+    private helper is touched. This is the shape of test that would have
+    caught the demotion before review — the unit tests around
+    ``_apply_praxis`` all started from the model default and so had no
+    higher verdict to lose.
+    """
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_a_latent_answer_leaves_an_explicit_fragment_explicit(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The model's weaker verdict loses to the one already on record."""
+        mock_call.return_value = _LATENT_PRAXIS_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        frag = _make_praxis_fragment(PraxisPotential.EXPLICIT)
+
+        result = classifier.classify(frag)
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+        # The rest of the same response *did* land, so the assertion above
+        # cannot be passing because the call short-circuited.
+        assert result.frequency.primary == Frequency.F3
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_a_latent_answer_still_raises_a_none_fragment(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """A fragment at the default ``none`` still reaches ``latent``.
+
+        The LLM section exists to produce exactly this verdict, so the
+        escalate-only merge must not cost us the raise.
+        """
+        mock_call.return_value = _LATENT_PRAXIS_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+
+        result = classifier.classify(_make_praxis_fragment(PraxisPotential.NONE))
+
+        assert str(result.praxis_potential) == PraxisPotential.LATENT.value
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_an_explicit_answer_raises_a_latent_fragment(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The escalating direction survives the full call too."""
+        mock_call.return_value = _EXPLICIT_PRAXIS_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+
+        result = classifier.classify(_make_praxis_fragment(PraxisPotential.LATENT))
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+
+
+class TestPraxisPrompt:
+    """The prompt must ask for the axis the parser now accepts."""
+
+    def test_prompt_renders_without_a_format_error(self) -> None:
+        """``CLASSIFICATION_PROMPT`` still survives ``str.format``.
+
+        The template is consumed by ``str.format`` (prompts.py:286), so a
+        single stray literal ``{`` or ``}`` added while editing the YAML
+        schema block raises ``KeyError`` / ``IndexError`` / ``ValueError``
+        on *every* classification call. That failure is invisible in a
+        static read of the diff, so it is pinned here.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        prompt = classifier._build_prompt(_make_fragment(title="ok"), content="body")
+
+        assert "ok" in prompt
+        assert "body" in prompt
+
+    def test_prompt_names_the_praxis_dimension(self) -> None:
+        """The dimension list names praxis and its three legal values."""
+        prompt_lower = CLASSIFICATION_PROMPT.lower()
+
+        assert "praxis" in prompt_lower
+        assert "explicit" in prompt_lower
+        assert "latent" in prompt_lower
+
+    def test_prompt_yaml_example_includes_the_praxis_section(self) -> None:
+        """The YAML schema example must show the nested ``potential`` key.
+
+        Same lesson as issue #319: models follow the explicit YAML block
+        far more reliably than the prose above it. Without ``praxis:`` /
+        ``potential:`` in the example, the model never emits the section
+        and the LLM half of #877 silently regresses to never firing.
+        """
+        assert "praxis:" in CLASSIFICATION_PROMPT
+        assert "potential:" in CLASSIFICATION_PROMPT

@@ -131,6 +131,11 @@ instructional, raw, conversational
 
 9. **Confidence**: musing, exploring, forming, settled, conviction
 
+10. **Praxis Potential**: explicit, latent, none — does this fragment state an
+    actionable insight, a practice, or a decision-in-progress? Use ``explicit``
+    when the fragment names something to *do*; ``latent`` when a practice is
+    implied but never stated outright; ``none`` otherwise.
+
 A few labelled examples (do not include these in your YAML output):
 
 {examples}
@@ -139,8 +144,9 @@ Two-step protocol (FEAT-017):
 
 Step 1 — Reason briefly. Walk through which frequency this most resonates
 with and why, then which phase, then which mode, orientation, and dosage,
-which color and descriptor follow from those, and finally the voice
-register. Two to four short sentences total.
+which color and descriptor follow from those, then the voice register,
+and finally whether the fragment carries any praxis potential. Two to
+four short sentences total.
 
 Step 2 — Emit your classification as valid YAML inside a fenced
 ```yaml ... ``` block. **You MUST emit the full ``wavelength:`` block
@@ -169,6 +175,8 @@ confidence_scores:
   mode: 0.7
   orientation: 0.7
   dosage: 0.7
+praxis:
+  potential: none
 ```
 
 If a dimension is genuinely unclear, set ``unclassified`` rather than
@@ -203,6 +211,13 @@ because models follow the explicit YAML far more reliably than the
 bullet-point list above it. Drop a field from the schema and the
 classifier silently regresses to the pre-fix state where every
 fragment had ``wavelength.color: unclassified``.
+
+Issue #877: the ``praxis`` section is listed **last** in the schema, and
+:data:`creek.classify.llm.parsing._YAML_HEAD_RE` is deliberately not
+widened to recognise it — a key that can never lead a payload does not
+belong in the unfenced-payload head pattern. Every literal ``{``/``}``
+added to this template must be doubled: it is consumed by ``str.format``
+in :func:`build_classification_prompt`.
 """
 
 

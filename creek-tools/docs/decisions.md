@@ -42,6 +42,19 @@ The frontmatter follows `creek.models.Decision`: `id`, `title`, `status`, `opene
 
 A fragment matching both strategies produces a single candidate scored **0.9**.
 
+Every input to the Pattern strategy now has a producer. `confidence` and the
+frequencies come from `creek classify` (rules or LLM); `praxis_potential` was
+added a producer by issue #877 — `creek.classify.praxis_pass.detect` scores the
+body for task checkboxes, `Decision:`-style labels and first-person commitments,
+and the LLM response schema carries a `praxis:` section that can additionally
+report `latent`. Before #877 the field defaulted to `none` and nothing ever
+changed it, so this strategy could never fire and `08-Decisions/` stayed empty
+no matter what the vault contained. The pass is escalate-only, and it runs only
+on fragments a run actually (re-)classifies: a vault already stamped
+`classification_method: llm` backfills the axis under
+`creek classify --method llm --force`, and `creek fill` reports the outstanding
+count.
+
 Each candidate captures `wavelength_phase_at_detection` and the active `frequency_context` so the eventual Decision note can preserve the felt-sense of when the question first surfaced.
 
 ---

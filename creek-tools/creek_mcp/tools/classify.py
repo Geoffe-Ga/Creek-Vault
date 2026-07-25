@@ -94,5 +94,10 @@ def classify_tool(
         # tier. Surfaced separately from ``classified`` because the tier
         # pass also runs on fragments the resume short-circuit preserved.
         "privacy_tiers_assigned": summary.privacy_tiers_assigned,
+        # Issue #877: how many fragments this run raised to a stronger
+        # praxis potential. Surfaced for the same reason as the tier count
+        # — the field previously had no producer at all, and a silent
+        # producer is how that bug survived.
+        "praxis_marked": summary.praxis_marked,
         "errors": list(summary.errors),
     }

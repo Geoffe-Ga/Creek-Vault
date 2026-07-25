@@ -8,6 +8,7 @@ compost step, and the summary reports real per-folder counts.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
@@ -316,3 +317,196 @@ def test_fill_summary_reports_folder_counts(
     assert result.exit_code == 0, result.output
     assert "02-Threads 2" in result.output
     assert "08-Decisions 1" in result.output
+
+
+# ---- Issue #877: the praxis-backfill hint ---------------------------------
+#
+# The gap detector cannot be "the ``praxis_potential`` key is absent"
+# (``Fragment.model_dump`` always writes it) and cannot be "the value is
+# ``none``" (most fragments genuinely ARE none, so that nag would be
+# permanent and instantly ignored). It is the one shape that proves work is
+# outstanding: **the free keyword heuristic says ``explicit`` but the disk
+# says ``none``.** Self-limiting, costs zero tokens to compute, and goes
+# quiet the moment the operator acts on it.
+
+_PRAXIS_SIGNAL_BODY = "notes from the week ahead\n- [ ] book the boiler service"
+"""A body carrying one strong praxis marker (a task checkbox)."""
+
+_PRAXIS_QUIET_BODY = "a plain note about the walk to the shops and the weather"
+"""A body carrying no praxis marker at all."""
+
+
+def _seed_praxis_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    body: str,
+    praxis: str,
+) -> None:
+    """Write a fragment with a chosen body and ``praxis_potential`` value.
+
+    Built from a literal frontmatter template so the on-disk value is
+    exactly what the test names, independent of ``Fragment`` defaults. A
+    real ``privacy_tier`` is stamped so the sibling #876 untiered hint
+    stays silent and cannot pollute the captured output.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem).
+        body: Markdown body the praxis heuristic scores.
+        praxis: The ``praxis_potential`` value already on disk.
+    """
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "A note"\n'
+        f"source:\n  platform: markdown\n  author: self\n"
+        f"privacy_tier: open\npraxis_potential: {praxis}\n---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_count_praxis_backfillable_counts_only_provable_gaps(
+    tmp_path: Path,
+) -> None:
+    """Only "signals present but disk says none" counts as backfillable.
+
+    Four fragments spanning four distinct states so the count cannot be
+    right by accident:
+
+    * signals + ``none`` — the real gap, the only one counted;
+    * signals + ``explicit`` — already backfilled, nothing owed;
+    * signals + ``latent`` — a verdict is on record, so not a gap;
+    * no signals + ``none`` — genuinely has no praxis potential.
+
+    Counting the last two would make the hint permanent, which is the
+    failure mode this detector was designed around.
+    """
+    from creek.cli import _count_praxis_backfillable_fragments
+
+    vault = tmp_path / "vault"
+    _seed_praxis_fragment(vault, "frag-gap", body=_PRAXIS_SIGNAL_BODY, praxis="none")
+    _seed_praxis_fragment(
+        vault, "frag-done", body=_PRAXIS_SIGNAL_BODY, praxis="explicit"
+    )
+    _seed_praxis_fragment(
+        vault, "frag-latent", body=_PRAXIS_SIGNAL_BODY, praxis="latent"
+    )
+    _seed_praxis_fragment(vault, "frag-quiet", body=_PRAXIS_QUIET_BODY, praxis="none")
+
+    assert _count_praxis_backfillable_fragments(vault) == 1
+
+
+def test_count_praxis_backfillable_is_zero_without_a_fragments_dir(
+    tmp_path: Path,
+) -> None:
+    """A vault with no ``01-Fragments`` counts zero rather than exploding."""
+    from creek.cli import _count_praxis_backfillable_fragments
+
+    assert _count_praxis_backfillable_fragments(tmp_path / "empty-vault") == 0
+
+
+def test_fill_hints_when_praxis_can_be_backfilled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hint reports the count, and names the command and its cost.
+
+    Printed ahead of the ``offer is None`` early return, like the #876
+    untiered hint it sits beside, so it still fires on the vault that most
+    needs it (fully classified, no LLM upgrade to offer).
+
+    It reports a **count only**. Naming a fragment id or quoting a body
+    excerpt would turn an advisory line into an unaudited disclosure of
+    vault content through stdout, which the config-oracle rule (#846 /
+    #848) forbids — so both are asserted absent.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_praxis_fragment(vault, "frag-gap", body=_PRAXIS_SIGNAL_BODY, praxis="none")
+    _seed_praxis_fragment(vault, "frag-quiet", body=_PRAXIS_QUIET_BODY, praxis="none")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "praxis" in out.lower()
+    assert "1" in out
+    # The remedy is named, and so is its price: --force re-sends those
+    # fragments to the configured provider and bills for the tokens.
+    assert "--force" in out
+    assert "token" in out.lower()
+    # …and nothing about the fragment itself leaks.
+    assert "frag-gap" not in out
+    assert "boiler" not in out
+
+
+def test_praxis_hint_is_silent_when_every_signal_is_already_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A backfilled vault gets no hint — the nag must not be permanent.
+
+    The vault here is the steady state after one ``creek classify`` run:
+    every fragment the heuristic can prove is already ``explicit``, and
+    the rest genuinely are ``none``. Any implementation that keys off
+    "value == none" would print here forever and train the operator to
+    ignore the line.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_praxis_fragment(
+        vault, "frag-done", body=_PRAXIS_SIGNAL_BODY, praxis="explicit"
+    )
+    _seed_praxis_fragment(vault, "frag-quiet", body=_PRAXIS_QUIET_BODY, praxis="none")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    assert "praxis" not in capsys.readouterr().out.lower()
+
+
+def test_praxis_hint_failure_never_crashes_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken praxis count is swallowed by its own best-effort guard.
+
+    The hint is advisory; an unreadable fragment must not abort ``creek
+    fill`` before any step runs, exactly as the classify-upgrade probe
+    (#736) and the untiered hint (#876) already behave.
+
+    Contract note for the implementation: the hint must call the
+    module-level ``_count_praxis_backfillable_fragments`` (this test
+    patches it there) and log its own WARNING naming ``praxis``, rather
+    than sharing the untiered hint's guard — otherwise one failing scan
+    silently suppresses the other hint too.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    def _boom(*_a: object) -> int:
+        raise OSError("unreadable fragment")
+
+    monkeypatch.setattr(cli_mod, "_count_praxis_backfillable_fragments", _boom)
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+
+    with caplog.at_level(logging.WARNING):
+        # Must not raise.
+        _maybe_upgrade_classification(
+            tmp_path, cli_mod._load_config_for_vault(tmp_path), upgrade=False
+        )
+
+    assert any("praxis" in record.getMessage().lower() for record in caplog.records)

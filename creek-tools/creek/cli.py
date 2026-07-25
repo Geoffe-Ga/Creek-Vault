@@ -26,7 +26,7 @@ from creek.classify.privacy_filter import (
 )
 from creek.config import AIStyleConfig, load_config, resolve_config_path
 from creek.consent import ConsentManager
-from creek.models import PrivacyTier
+from creek.models import PraxisPotential, PrivacyTier
 from creek.pipeline import (
     Pipeline,
     RedactionRequiredError,
@@ -1710,7 +1710,10 @@ def classify(
         # Issue #876: tier assignment is orthogonal to the classification
         # method — preserved fragments get one too — so it is reported as
         # its own count rather than folded into "classified".
-        f"{summary.privacy_tiers_assigned} privacy tier(s) assigned"
+        f"{summary.privacy_tiers_assigned} privacy tier(s) assigned, "
+        # Issue #877: same reasoning for the praxis axis — it is the only
+        # visible evidence that the field has a producer at all.
+        f"{summary.praxis_marked} praxis marked"
         ").[/bold green]",
     )
     if summary.errors:
@@ -2100,7 +2103,92 @@ def _detect_classify_upgrade(
     )
 
 
-def _count_untiered_fragments(vault_path: Path) -> int:
+@dataclass(frozen=True)
+class _FillGapCounts:
+    """What one walk of the vault found for ``creek fill``'s hints.
+
+    Both gap detectors need the same expensive thing — every fragment's
+    frontmatter *and* body, parsed. Bundling their answers lets
+    :func:`_scan_fill_gaps` pay for that walk once on a 35k-fragment
+    vault instead of once per hint.
+
+    Attributes:
+        untiered: Fragments still carrying no privacy tier (#876).
+        praxis_backfillable: Fragments the free praxis heuristic can
+            prove are ``explicit`` while the disk still says ``none``
+            (#877).
+    """
+
+    untiered: int
+    praxis_backfillable: int
+
+
+def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
+    """Walk the vault once and count both classes of fill-time gap.
+
+    The praxis detector deserves a note, because the two obvious choices
+    are both wrong. It cannot be "the ``praxis_potential`` key is absent"
+    — ``Fragment.model_dump`` always writes it — and it must not be "the
+    value is ``none``", because most fragments genuinely are ``none``, so
+    that nag would be permanent and instantly ignored. The one shape that
+    *proves* work is outstanding is this: the free keyword heuristic says
+    ``explicit`` while the disk still says ``none``. That is positive
+    evidence the fragment was classified before the field had a producer,
+    it costs zero tokens to compute, and it goes quiet the moment the
+    operator acts on it.
+
+    The imports are function-local (like the rest of this module's) so a
+    bare ``creek --help`` never pays to import the classification stack.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        The :class:`_FillGapCounts` for this vault; all zeroes when there
+        is no ``01-Fragments`` directory at all.
+    """
+    from creek.classify.praxis_pass import detect
+    from creek.classify.privacy_pass import needs_tier
+    from creek.vault.reader import iter_vault_fragments
+
+    untiered = 0
+    backfillable = 0
+    for _path, fragment, body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments",
+    ):
+        if needs_tier(raw):
+            untiered += 1
+        recorded_none = str(fragment.praxis_potential) == PraxisPotential.NONE.value
+        if recorded_none and detect(fragment, body) is PraxisPotential.EXPLICIT:
+            backfillable += 1
+    return _FillGapCounts(untiered=untiered, praxis_backfillable=backfillable)
+
+
+def _scan_fill_gaps_quietly(vault_path: Path) -> _FillGapCounts | None:
+    """Run :func:`_scan_fill_gaps`, swallowing any failure.
+
+    The shared scan is an optimisation, not a step: if it fails, each
+    hint below still falls back to its own scan and reports its own
+    failure through its own guard, so one broken hint can never silence
+    the other.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        The counts, or ``None`` when the walk raised.
+    """
+    try:
+        return _scan_fill_gaps(vault_path)
+    except Exception as exc:
+        logger.warning("fill: shared fragment-gap scan failed: %s", exc)
+        return None
+
+
+def _count_untiered_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
     """Count fragments under *vault_path* that still carry no privacy tier.
 
     "Untiered" is both on-disk shapes a fragment that has never been
@@ -2112,24 +2200,46 @@ def _count_untiered_fragments(vault_path: Path) -> int:
 
     Args:
         vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
 
     Returns:
         The number of untiered fragments; ``0`` when the vault has no
         ``01-Fragments`` directory at all.
     """
-    from creek.classify.privacy_pass import needs_tier
-    from creek.vault.reader import iter_vault_fragments
-
-    return sum(
-        1
-        for _path, _fragment, _body, raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
-        )
-        if needs_tier(raw)
-    )
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.untiered
 
 
-def _hint_untiered_fragments(vault_path: Path) -> None:
+def _count_praxis_backfillable_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments whose praxis verdict a ``--force`` run would raise.
+
+    See :func:`_scan_fill_gaps` for why "the heuristic proves ``explicit``
+    but the disk says ``none``", and not "the value is ``none``", is the
+    gap worth reporting (issue #877).
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of backfillable fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.praxis_backfillable
+
+
+def _hint_untiered_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
     """Print the ``creek classify`` nudge when untiered fragments remain.
 
     Best-effort and advisory, exactly like the classify-upgrade probe it
@@ -2139,9 +2249,10 @@ def _hint_untiered_fragments(vault_path: Path) -> None:
 
     Args:
         vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
     """
     try:
-        untiered = _count_untiered_fragments(vault_path)
+        untiered = _count_untiered_fragments(vault_path, scan)
     except Exception as exc:
         logger.warning("fill: skipping untiered-fragment hint: %s", exc)
         return
@@ -2152,6 +2263,41 @@ def _hint_untiered_fragments(vault_path: Path) -> None:
         "(privacy_tier absent or `unclassified`); they are gated like "
         "`personal`, so they contribute summaries only. "
         "Run `creek classify` to assign real tiers.[/dim]",
+    )
+
+
+def _hint_praxis_backfill(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the backfill nudge when praxis verdicts are provably missing.
+
+    Own guard, own warning: sharing the untiered hint's ``try`` would let
+    one failing scan silently suppress the other hint too. Silent at
+    zero, so a vault the operator has already backfilled never nags.
+
+    Reports a **count only** — never a fragment id or a body excerpt.
+    Naming either would turn an advisory line into an unaudited
+    disclosure of vault content through stdout (the config-oracle rule,
+    #846 / #848).
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        backfillable = _count_praxis_backfillable_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping praxis-backfill hint: %s", exc)
+        return
+    if backfillable == 0:
+        return
+    console.print(
+        f"[dim][fill] {backfillable} fragment(s) show explicit praxis signals "
+        "but are recorded as `praxis_potential: none` (classified before the "
+        "field had a producer). Run `creek classify --method llm --force` to "
+        "backfill — that re-sends those fragments to the configured provider "
+        "and costs tokens.[/dim]",
     )
 
 
@@ -2180,11 +2326,15 @@ def _maybe_upgrade_classification(
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
 
-    The #876 untiered-fragment hint fires first, ahead of every early return:
-    the vault that most needs it (rules-classified, no LLM reachable, every
-    fragment untiered) is exactly the one where there is no upgrade to offer.
+    The #876 untiered-fragment hint and the #877 praxis-backfill hint fire
+    first, ahead of every early return: the vault that most needs them
+    (rules-classified, no LLM reachable, every fragment untiered) is exactly
+    the one where there is no upgrade to offer. Both read one shared vault
+    walk so ``creek fill`` parses every fragment once, not once per hint.
     """
-    _hint_untiered_fragments(vault_path)
+    gaps = _scan_fill_gaps_quietly(vault_path)
+    _hint_untiered_fragments(vault_path, gaps)
+    _hint_praxis_backfill(vault_path, gaps)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:
