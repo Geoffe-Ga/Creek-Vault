@@ -1706,7 +1706,12 @@ def classify(
         f"{summary.total} fragment(s) "
         f"({summary.preserved_manual} manual preserved, "
         f"{summary.preserved_llm} previously LLM-classified preserved, "
-        f"{summary.skipped_high_confidence} skipped).[/bold green]",
+        f"{summary.skipped_high_confidence} skipped, "
+        # Issue #876: tier assignment is orthogonal to the classification
+        # method — preserved fragments get one too — so it is reported as
+        # its own count rather than folded into "classified".
+        f"{summary.privacy_tiers_assigned} privacy tier(s) assigned"
+        ").[/bold green]",
     )
     if summary.errors:
         console.print(f"[yellow]Errors: {len(summary.errors)}[/yellow]")
@@ -2095,6 +2100,61 @@ def _detect_classify_upgrade(
     )
 
 
+def _count_untiered_fragments(vault_path: Path) -> int:
+    """Count fragments under *vault_path* that still carry no privacy tier.
+
+    "Untiered" is both on-disk shapes a fragment that has never been
+    through a privacy pass can take: the ``privacy_tier`` key is absent,
+    or it is present as ``unclassified`` (issue #876). Since #876 those
+    fragments are gated like ``personal`` by every generation flow, so a
+    vault full of them silently yields thin drafts and empty mining runs
+    — worth telling the operator about.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        The number of untiered fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    from creek.classify.privacy_pass import needs_tier
+    from creek.vault.reader import iter_vault_fragments
+
+    return sum(
+        1
+        for _path, _fragment, _body, raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+        if needs_tier(raw)
+    )
+
+
+def _hint_untiered_fragments(vault_path: Path) -> None:
+    """Print the ``creek classify`` nudge when untiered fragments remain.
+
+    Best-effort and advisory, exactly like the classify-upgrade probe it
+    sits beside (#736): an unreadable fragment must never abort ``creek
+    fill`` before a single step has run. Silent on a fully-tiered vault so
+    the nag cannot become permanent.
+
+    Args:
+        vault_path: Vault root.
+    """
+    try:
+        untiered = _count_untiered_fragments(vault_path)
+    except Exception as exc:
+        logger.warning("fill: skipping untiered-fragment hint: %s", exc)
+        return
+    if untiered == 0:
+        return
+    console.print(
+        f"[dim][fill] {untiered} fragment(s) are untiered "
+        "(privacy_tier absent or `unclassified`); they are gated like "
+        "`personal`, so they contribute summaries only. "
+        "Run `creek classify` to assign real tiers.[/dim]",
+    )
+
+
 def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
     """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
 
@@ -2119,7 +2179,12 @@ def _maybe_upgrade_classification(
     Non-interactive default is a safe no-op (never silently overwrites, never
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
+
+    The #876 untiered-fragment hint fires first, ahead of every early return:
+    the vault that most needs it (rules-classified, no LLM reachable, every
+    fragment untiered) is exactly the one where there is no upgrade to offer.
     """
+    _hint_untiered_fragments(vault_path)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:

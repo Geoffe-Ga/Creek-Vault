@@ -109,16 +109,27 @@ def test_intimate_or_all_lets_everything_through(
     assert bodies == {"frag-i": "secret", "frag-p": "personal", "frag-o": "open"}
 
 
-def test_unclassified_tier_passes_through_with_full_body() -> None:
-    """``unclassified`` is treated as ``open`` — full body, no exclusion.
+def test_unclassified_tier_is_summarised_like_personal() -> None:
+    """``unclassified`` is treated as ``personal`` — title-only by default (#876).
 
-    Documents and pins the existing fall-through behaviour. Fragments
-    that have not yet been classified are presumed non-sensitive; the
-    classifier should backfill an explicit tier before they enter
-    sensitive flows.
+    Rewritten from ``test_unclassified_tier_passes_through_with_full_body``,
+    which pinned the exact bug: an untiered fragment ranked alongside
+    ``open`` and handed its **full body** to every generation flow. Since
+    ``creek classify`` had no privacy caller at all, that meant the entire
+    private corpus was mineable, draftable and voice-proxy eligible at the
+    open tier.
+
+    New contract: an unclassified fragment is still *yielded* (so the
+    operator sees it exists) but contributes a title-only summary unless
+    the caller explicitly raises the ceiling.
     """
     inputs = [
-        _frag(id_="frag-u", tier=PrivacyTier.UNCLASSIFIED, body="raw body"),
+        _frag(
+            id_="frag-u",
+            tier=PrivacyTier.UNCLASSIFIED,
+            title="Untiered note",
+            body="raw body",
+        ),
     ]
 
     out = list(filter_fragments_by_tier(inputs))
@@ -126,7 +137,34 @@ def test_unclassified_tier_passes_through_with_full_body() -> None:
     assert len(out) == 1
     fragment, body = out[0]
     assert fragment.id == "frag-u"
-    assert body == "raw body"
+    assert "raw body" not in body
+    assert "Untiered note" in body
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        PrivacyTierOverride.PERSONAL,
+        PrivacyTierOverride.INTIMATE,
+        PrivacyTierOverride.ALL,
+    ],
+)
+def test_unclassified_full_body_only_under_raised_ceiling(
+    override: PrivacyTierOverride,
+) -> None:
+    """An unclassified body passes intact only under personal/intimate/all (#876)."""
+    inputs = [
+        _frag(
+            id_="frag-u",
+            tier=PrivacyTier.UNCLASSIFIED,
+            title="Untiered note",
+            body="raw body",
+        ),
+    ]
+
+    out = list(filter_fragments_by_tier(inputs, override=override))
+
+    assert [(f.id, b) for f, b in out] == [("frag-u", "raw body")]
 
 
 def test_tier_of_unknown_string_fails_closed_to_intimate(
@@ -174,12 +212,15 @@ def test_open_override_matches_default_behaviour() -> None:
 
     The flag value exists for symmetry with ``personal``/``intimate``/
     ``all``; users who pass it should observe identical filtering to
-    callers who pass nothing.
+    callers who pass nothing. The ``unclassified`` input is present so the
+    equivalence covers the #876 rank change too — ``open`` and the default
+    must agree about an untiered fragment as well.
     """
     inputs = [
         _frag(id_="frag-i", tier=PrivacyTier.INTIMATE, body="x"),
         _frag(id_="frag-p", tier=PrivacyTier.PERSONAL, body="full"),
         _frag(id_="frag-o", tier=PrivacyTier.OPEN, body="open"),
+        _frag(id_="frag-u", tier=PrivacyTier.UNCLASSIFIED, body="untiered"),
     ]
 
     default_out = list(filter_fragments_by_tier(inputs))
@@ -237,7 +278,6 @@ def test_parse_include_tier_handles_known_and_unknown() -> None:
     ("tier", "override", "expected"),
     [
         (PrivacyTier.OPEN, PrivacyTierOverride.OPEN, True),
-        (PrivacyTier.UNCLASSIFIED, PrivacyTierOverride.OPEN, True),
         (PrivacyTier.PERSONAL, PrivacyTierOverride.OPEN, False),
         (PrivacyTier.INTIMATE, PrivacyTierOverride.OPEN, False),
         (PrivacyTier.PERSONAL, PrivacyTierOverride.PERSONAL, True),
@@ -245,6 +285,13 @@ def test_parse_include_tier_handles_known_and_unknown() -> None:
         (PrivacyTier.INTIMATE, PrivacyTierOverride.INTIMATE, True),
         (PrivacyTier.INTIMATE, PrivacyTierOverride.ALL, True),
         (PrivacyTier.INTIMATE, None, False),  # None defaults to OPEN
+        # #876: UNCLASSIFIED ranks as PERSONAL, not OPEN. An untiered
+        # fragment is content nobody has vouched for, so the strict
+        # admission cutoff must exclude it at the default ceiling.
+        (PrivacyTier.UNCLASSIFIED, PrivacyTierOverride.OPEN, False),
+        (PrivacyTier.UNCLASSIFIED, None, False),
+        (PrivacyTier.UNCLASSIFIED, PrivacyTierOverride.PERSONAL, True),
+        (PrivacyTier.UNCLASSIFIED, PrivacyTierOverride.ALL, True),
     ],
 )
 def test_tier_within_override(

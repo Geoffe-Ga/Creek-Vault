@@ -39,6 +39,7 @@ from creek.models import (
     Orientation,
     Phase,
     PraxisPotential,
+    PrivacyTier,
     SourcePlatform,
     Synchronicity,
     Thread,
@@ -98,10 +99,18 @@ def _build_fragment(
     praxis: PraxisPotential = PraxisPotential.LATENT,
     created_day: int = 15,
 ) -> Fragment:
-    """Build a minimal :class:`Fragment` with optional links."""
+    """Build a minimal :class:`Fragment` with optional links.
+
+    ``privacy_tier`` is explicitly ``OPEN`` because these fixtures stand
+    for ordinary, already-classified corpus content. Since #876 an
+    untiered fragment ranks as PERSONAL and would have its body replaced
+    with a title-only summary by ``filter_fragments_by_tier``, which is a
+    privacy contract these mining tests are not trying to exercise.
+    """
     return Fragment(
         id=frag_id,
         title=title,
+        privacy_tier=PrivacyTier.OPEN,
         source=FragmentSource(platform=platform),
         created=datetime(2026, 1, created_day, 12, 0, 0, tzinfo=UTC),
         ingested=datetime(2026, 1, created_day, 12, 0, 0, tzinfo=UTC),

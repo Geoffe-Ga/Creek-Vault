@@ -38,7 +38,9 @@ from creek.audit.yield_summary import (
     write_yield_summary,
 )
 from creek.classify.classify_engine import build_tier_classifiers
+from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
+from creek.classify.privacy_pass import PRIVACY_TIER_KEY, apply_tier
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
@@ -218,6 +220,8 @@ class Pipeline:
         config: The Creek configuration governing all subsystems.
         scanner: The redaction scanner for PII detection.
         rule_classifier: Keyword-based classifier.
+        privacy_classifier: Assigns each fragment's privacy tier before the
+            per-tier router reads it (#876).
         tier_classifiers: Per-tier LLM classifiers (#666/#706) — the fragment's
             privacy tier selects the provider so Intimate stays local.
         review_generator: Review queue generator for uncertain fragments.
@@ -251,6 +255,10 @@ class Pipeline:
         self.no_llm = no_llm
         self.scanner = RedactionScanner(config=config.redaction)
         self.rule_classifier = RuleClassifier()
+        # Issue #876: a freshly-ingested fragment is always ``unclassified``,
+        # so without this the per-tier router below saw "not INTIMATE" for
+        # every fragment and shipped journal entries to the cloud.
+        self.privacy_classifier = PrivacyClassifier()
         # Per-tier routing (#666/#706): each fragment is classified by the
         # provider its privacy tier resolves to — Intimate stays local even when
         # ``classification`` is cloud. Building here is safe with any config:
@@ -511,6 +519,11 @@ class Pipeline:
         classifier gave it, and the residue counter still increments so
         the run summary records what *would* have been routed to Pass 3.
 
+        Every fragment is stamped with a real privacy tier between the
+        rules pass and the LLM dispatch (#876), because the per-tier
+        router reads that tier to keep Intimate content off cloud
+        providers and a freshly-ingested fragment carries none.
+
         Classification operates on the inner :class:`Fragment`; the body
         is preserved unchanged on the returned :class:`IngestedFragment`.
 
@@ -530,6 +543,18 @@ class Pipeline:
         classified: list[IngestedFragment] = []
         for item in ingested:
             frag = self.rule_classifier.classify(item.fragment, content=item.body)
+            # Issue #876: assign a real privacy tier BEFORE ``for_tier`` picks
+            # a provider, or an Intimate fragment routes to the cloud on the
+            # very run meant to classify it (Intimate-never-cloud, ADR-0003).
+            # There is no frontmatter on disk yet, so the fragment's own tier
+            # is the "raw" state a manual override would have to come through.
+            frag = apply_tier(
+                frag,
+                item.body,
+                raw={PRIVACY_TIER_KEY: frag.privacy_tier},
+                force=False,
+                classifier=self.privacy_classifier,
+            )
             if self._needs_llm(frag, item.body):
                 result.residue += 1
                 if not self.no_llm:

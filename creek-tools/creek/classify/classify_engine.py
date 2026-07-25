@@ -22,6 +22,57 @@ Resume contract (OPS-001)
    observability (newline-delimited JSON, one ``{"id": ...}`` object
    per line); this file is informational and **not** the source of
    truth — the per-fragment frontmatter is.
+
+Privacy-tier pass (issue #876)
+------------------------------
+
+Every fragment leaves this engine carrying a real
+:class:`~creek.models.PrivacyTier`. **Invariant: the classify engine
+never persists ``privacy_tier: unclassified``.** The policy lives in
+:mod:`creek.classify.privacy_pass`; the engine only decides *when* to
+call it:
+
+* **Before the router.** The tier is assigned immediately after the
+  fragment is loaded and *before*
+  :meth:`TierClassifiers.for_tier` picks a provider. That ordering is
+  the security payload: the router reads the fragment's tier to honour
+  Intimate-never-cloud (#666 / ADR-0003), so an untiered journal entry
+  used to resolve to "not INTIMATE" and get shipped to the configured
+  cloud provider on the very run meant to classify it.
+* **Above the resume short-circuit.** A fragment already stamped
+  ``classification_method: llm`` or ``manual`` still gets a tier
+  *without* ``--force``, and is persisted through
+  :func:`_write_tier_only`, which touches only ``privacy_tier`` and the
+  derived ``voice_proxy_eligible``. This is a deliberate exception to
+  the OPS-001 resume contract above: that short-circuit exists to
+  protect operator curation and paid LLM tokens, and a deterministic,
+  free, local tier assignment threatens neither. (The 35k-fragment demo
+  vault is entirely ``llm``-stamped, so gating this behind ``--force``
+  would mean re-paying for 35k cloud calls to fix a bug that needs
+  zero.)
+* **Escalate-only, never auto-downgrade.** ``--force`` may raise a tier
+  that is too light, and the post-classification reassess may raise one
+  the classifier just hardened, but neither ever lowers a tier —
+  lowering is the one direction that leaks content. An explicit
+  non-``unclassified`` tier on disk also survives any non-``--force``
+  run untouched: the operator's decision outranks the heuristic.
+
+Known residual (not fixable by ordering)
+----------------------------------------
+
+One class of fragment still reaches the cloud once before it is known to
+be intimate: a self-authored, non-journal fragment carrying no recovery
+keyword whose INTIMATE status is revealed *only* by a confessional +
+conviction voice register — because that register is produced by the
+very LLM call in question.
+:meth:`~creek.classify.privacy.PrivacyClassifier._is_high_confidence_confessional`
+needs inputs that do not exist before the call, so no single-pass
+ordering can prevent that first egress. The escalation still prevents
+every *future* egress for that fragment (re-runs, ``draft``, ``mine``,
+voice-proxy generation, the Writing Desk), which is a strict improvement
+on the prior behaviour where 100% of intimate content routed to the
+cloud, every time. Fixing the residual properly needs a local
+pre-classification pass, which is out of scope here.
 """
 
 from __future__ import annotations
@@ -53,7 +104,14 @@ from creek.classify.constants import (
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
+from creek.classify.privacy_pass import (
+    PRIVACY_TIER_KEY,
+    apply_tier,
+    needs_tier,
+    reassess,
+)
 from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
@@ -79,6 +137,14 @@ the file.
 
 _PROCESSING_LOG_SUBDIR = ("00-Creek-Meta", "Processing-Log")
 """Per-vault subdirectory carrying the LLM progress + trace logs."""
+
+_VOICE_PROXY_ELIGIBLE_KEY = "voice_proxy_eligible"
+"""Frontmatter key derived from ``privacy_tier`` (BUG-009).
+
+A :func:`~pydantic.computed_field` on :class:`~creek.models.Fragment`, so
+it is serialised to disk and would go stale if a tier-only rewrite
+(:func:`_write_tier_only`) left it behind.
+"""
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -159,6 +225,14 @@ class ClassifySummary:
             produced a high-confidence answer. The fragment is still
             stamped ``classification_method: rules`` on disk.
         errors: Human-readable error messages (one per failure).
+        privacy_tiers_assigned: Fragments whose privacy tier this run
+            owned and (re-)derived — i.e. the frontmatter carried no
+            tier (or an explicit ``unclassified``), or ``--force`` was
+            passed (issue #876). A fragment carrying a deliberate
+            operator tier that the run left alone is **not** counted.
+            This counts the decision, not the bytes: a fragment whose
+            subsequent write fails is counted here *and* reported on
+            :attr:`errors`.
     """
 
     total: int
@@ -167,6 +241,10 @@ class ClassifySummary:
     preserved_llm: int
     skipped_high_confidence: int
     errors: tuple[str, ...]
+    # Appended last, with a default, so the positional
+    # ``ClassifySummary(0, 0, 0, 0, 0, ())`` construction below still
+    # compiles unchanged.
+    privacy_tiers_assigned: int = 0
 
 
 @dataclass
@@ -182,6 +260,7 @@ class _RunCounts:
     preserved_manual: int = 0
     preserved_llm: int = 0
     skipped: int = 0
+    privacy_tiers_assigned: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -355,6 +434,9 @@ def run_classify(
         force=force,
         rules=rules,
         audience=audience,
+        # Issue #876: stateless and read-only for the duration of the
+        # run, so one instance is safe to share across worker threads.
+        privacy=PrivacyClassifier(),
         tier_classifiers=tier_classifiers,
         classification_config=config.classification,
         counts=counts,
@@ -376,6 +458,7 @@ def run_classify(
         # immutable: the caller can't accidentally append to the
         # underlying list and reach into completed-run state.
         errors=tuple(counts.errors),
+        privacy_tiers_assigned=counts.privacy_tiers_assigned,
     )
 
 
@@ -533,6 +616,115 @@ def _dispatch_files(
             process_one(md_file)
 
 
+@dataclass(frozen=True)
+class _PreparedFragment:
+    """A loaded, tiered fragment that still needs classifying (issue #876).
+
+    The return shape of :func:`_prepare_fragment` — everything the
+    classify-and-write half of :func:`_process_file` needs, so that half
+    never has to re-derive the tier decision.
+
+    Attributes:
+        fragment: The fragment as loaded, carrying a concrete privacy
+            tier.
+        body: Its markdown body.
+        raw: Its frontmatter exactly as read from disk (non-Fragment
+            keys are preserved through the rewrite).
+        llm: The classifier the fragment's tier resolved to, or ``None``
+            on the rules path.
+        owns_tier: Whether *this* run owns the fragment's tier — true
+            when the frontmatter carried none (or ``unclassified``), or
+            when ``--force`` was passed. Gates the post-classification
+            reassess so a hand-set tier is never silently escalated
+            either.
+    """
+
+    fragment: Fragment
+    body: str
+    raw: dict[str, object]
+    llm: LLMClassifier | None
+    owns_tier: bool
+
+
+def _prepare_fragment(
+    *,
+    md_file: Path,
+    force: bool,
+    privacy: PrivacyClassifier,
+    tier_classifiers: TierClassifiers | None,
+    counts: _RunCounts,
+) -> _PreparedFragment | None:
+    """Load *md_file*, tier it, and resolve its classifier — or short-circuit.
+
+    Runs under :func:`_process_file`'s lock. Ordering here is load-bearing
+    (issue #876): the privacy tier is assigned *before*
+    :meth:`TierClassifiers.for_tier` reads it, so an Intimate fragment
+    routes to the local provider on its very first classification rather
+    than after the cloud has already seen the body; and it is assigned
+    *above* the OPS-001 / issue-#321 preserved short-circuit, so the
+    ``llm``/``manual``-stamped fragments that make up a mature vault can
+    acquire a tier without ``--force`` re-paying for their classification.
+
+    Args:
+        md_file: The file to consider.
+        force: Whether to re-derive settled classifications and tiers.
+        privacy: Shared :class:`PrivacyClassifier`.
+        tier_classifiers: Per-tier :class:`LLMClassifier` set, or ``None``
+            on the rules path.
+        counts: Mutable per-run counters; mutated in place.
+
+    Returns:
+        The :class:`_PreparedFragment` to classify, or ``None`` when the
+        file is not a Creek fragment, is unreadable, or was preserved by
+        the resume short-circuit (in which case any newly-assigned tier
+        has already been persisted here).
+    """
+    record = _load_classifiable_fragment(md_file=md_file, counts=counts)
+    if record is None:
+        return None
+    fragment, body, raw = record
+
+    # #876: stamp a real tier before anything else looks at one. ``force``
+    # merges escalate-only, so an existing ``intimate`` is never lowered.
+    owns_tier = needs_tier(raw) or force
+    fragment = apply_tier(fragment, body, raw=raw, force=force, classifier=privacy)
+    if owns_tier:
+        counts.privacy_tiers_assigned += 1
+
+    # Per-tier routing (#666): pick the classifier for this fragment's
+    # privacy tier. ``tier_of`` fails closed to INTIMATE for an unrecognised
+    # tier, so an unknown fragment is classified locally rather than risking
+    # cloud egress.
+    llm = (
+        tier_classifiers.for_tier(tier_of(fragment))
+        if tier_classifiers is not None
+        else None
+    )
+
+    # Skip fragments whose previous run already settled the classification.
+    # Tracked on distinct counters so the CLI summary can label "manual
+    # preserved" and "previously LLM-classified preserved" honestly
+    # (issue #321). A tier assigned above still lands, through the narrow
+    # writer that touches nothing else.
+    if not force and _record_if_preserved(raw, counts):
+        if owns_tier:
+            _persist_tier_only(
+                md_file=md_file,
+                fragment=fragment,
+                body=body,
+                raw=raw,
+                counts=counts,
+            )
+        return None
+    return _PreparedFragment(
+        fragment=fragment,
+        body=body,
+        raw=raw,
+        llm=llm,
+        owns_tier=owns_tier,
+    )
+
+
 def _process_file(
     md_file: Path,
     *,
@@ -540,6 +732,7 @@ def _process_file(
     force: bool,
     rules: RuleClassifier,
     audience: AudienceClassifier,
+    privacy: PrivacyClassifier,
     tier_classifiers: TierClassifiers | None,
     classification_config: ClassificationConfig,
     counts: _RunCounts,
@@ -559,6 +752,9 @@ def _process_file(
         audience: Shared :class:`AudienceClassifier`; stamps the #634
             audience axis on every (re)classified fragment, deterministically,
             regardless of method.
+        privacy: Shared :class:`PrivacyClassifier`; assigns the #876
+            privacy tier before the router reads it and re-checks it once
+            classification has hardened the fragment's voice signals.
         tier_classifiers: Per-tier :class:`LLMClassifier` set (when
             ``method == "llm"``); the fragment's tier selects the provider so
             Intimate content is classified locally (#666). ``None`` for rules.
@@ -593,30 +789,16 @@ def _process_file(
             #764/#783). An uncontended lock is passed on the serial path.
     """
     with lock:
-        record = _load_classifiable_fragment(
+        prepared = _prepare_fragment(
             md_file=md_file,
+            force=force,
+            privacy=privacy,
+            tier_classifiers=tier_classifiers,
             counts=counts,
         )
-        if record is None:
-            return
-        fragment, body, raw = record
-
-        # Per-tier routing (#666): pick the classifier for this fragment's
-        # privacy tier. ``tier_of`` fails closed to INTIMATE for an unrecognised
-        # tier, so an unknown fragment is classified locally rather than risking
-        # cloud egress.
-        llm = (
-            tier_classifiers.for_tier(tier_of(fragment))
-            if tier_classifiers is not None
-            else None
-        )
-
-        # Skip fragments whose previous run already settled the classification.
-        # Tracked on distinct counters so the CLI summary can label "manual
-        # preserved" and "previously LLM-classified preserved" honestly
-        # (issue #321).
-        if not force and _record_if_preserved(raw, counts):
-            return
+    if prepared is None:
+        return
+    body, raw, llm = prepared.body, prepared.raw, prepared.llm
 
     # The provider call is the expensive, network-bound step (#764). It runs
     # WITHOUT the lock so calls from different worker threads overlap — that is
@@ -629,7 +811,7 @@ def _process_file(
     # concurrent calls are safe.
     with _classify_permit(throttle, llm):
         new_fragment, was_skipped, reasoning = _classify_one(
-            fragment=fragment,
+            fragment=prepared.fragment,
             body=body,
             method=method,
             rules=rules,
@@ -642,6 +824,14 @@ def _process_file(
     # deterministic heuristic independent of the frequency/phase method above,
     # so it runs on both the rules and LLM paths and stays idempotent.
     new_fragment = audience.classify_and_enforce(new_fragment, body)
+
+    # #876: classification may have hardened the fragment's voice signals
+    # (confessional + conviction is one of the INTIMATE triggers), which the
+    # pre-pass could not see. Take the stricter of the two verdicts —
+    # escalate-only, and only when this run owns the tier, so a deliberate
+    # operator tier is never silently raised either.
+    if prepared.owns_tier:
+        new_fragment = reassess(new_fragment, body, classifier=privacy)
 
     with lock:
         # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
@@ -693,7 +883,7 @@ def _load_classifiable_fragment(
     Creek fragment or is unreadable. Updates ``counts`` in place for
     the ``total`` and ``errors`` cases so the caller only handles the
     happy path. The OPS-001 / issue #321 "preserved" short-circuit is
-    applied by :func:`_record_if_preserved` in :func:`_process_file`
+    applied by :func:`_record_if_preserved` in :func:`_prepare_fragment`
     so the per-reason counters (``preserved_manual`` vs
     ``preserved_llm``) stay the single source of truth.
 
@@ -768,6 +958,82 @@ def _finalise_fragment_write(
         counts.skipped += 1
     elif progress_path is not None and write_method == LLM_METHOD:
         _record_llm_progress(progress_path, new_fragment.id)
+
+
+def _persist_tier_only(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+    counts: _RunCounts,
+) -> None:
+    """Write a preserved fragment's new privacy tier, recording any failure.
+
+    A single unwritable file must not abort a 35k-file run, so an
+    :class:`OSError` is appended to :attr:`_RunCounts.errors` and the
+    remaining fragments still classify normally — the same contract the
+    main write path (:func:`_finalise_fragment_write`) honours.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        fragment: The fragment carrying the freshly-assigned tier.
+        body: Markdown body to retain, byte-identical, below the
+            frontmatter.
+        raw: The frontmatter as read from disk.
+        counts: Mutable per-run counters; write failures land on
+            :attr:`_RunCounts.errors`.
+    """
+    try:
+        _write_tier_only(md_file=md_file, fragment=fragment, body=body, raw=raw)
+    except OSError as exc:
+        counts.errors.append(
+            f"failed to update privacy tier for {fragment.id} ({md_file}): {exc}",
+        )
+
+
+def _write_tier_only(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+) -> None:
+    """Rewrite *md_file* changing ONLY the privacy-tier fields (issue #876).
+
+    Used exclusively on the preserved short-circuit path, where the whole
+    point is that the run did *not* re-classify the fragment. So this
+    writer must leave ``classification_method``, ``classified_at``,
+    ``classification_provider``, ``classification_reasoning`` and the body
+    exactly as they were, and touch only:
+
+    * ``privacy_tier`` — the newly-assigned tier; and
+    * ``voice_proxy_eligible`` — a ``@computed_field`` on
+      :class:`~creek.models.Fragment` derived from the tier (BUG-009).
+      Because it *is* serialised into frontmatter, leaving it behind
+      would let a fragment freshly marked ``intimate`` keep advertising
+      itself as voice-proxy eligible.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        fragment: The fragment carrying the freshly-assigned tier.
+        body: Markdown body to retain unchanged.
+        raw: Original frontmatter; every other key is copied verbatim.
+
+    Raises:
+        OSError: When the file cannot be written. The caller
+            (:func:`_persist_tier_only`) records it and carries on.
+    """
+    new_metadata = raw.copy()
+    # ``.value`` because ``Fragment`` uses ``use_enum_values=True`` but
+    # ``model_copy`` bypasses that coercion — YAML's SafeDumper cannot
+    # represent a bare StrEnum member.
+    new_metadata[PRIVACY_TIER_KEY] = PrivacyTier(fragment.privacy_tier).value
+    new_metadata[_VOICE_PROXY_ELIGIBLE_KEY] = fragment.voice_proxy_eligible
+
+    post = frontmatter.Post(content=body)
+    post.metadata.update(new_metadata)
+    md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 
 def _classify_one(
@@ -978,6 +1244,7 @@ def _maybe_reatomize_and_persist(
     _persist_reatomized_children(
         tree=tree,
         root_id=root_fragment.id,
+        root_tier=tier_of(root_fragment),
         vault_writer=vault_writer,
         counts=counts,
     )
@@ -987,6 +1254,7 @@ def _persist_reatomized_children(
     *,
     tree: ClassificationTree,
     root_id: str,
+    root_tier: PrivacyTier,
     vault_writer: VaultWriter,
     counts: _RunCounts,
 ) -> None:
@@ -1001,20 +1269,48 @@ def _persist_reatomized_children(
     Args:
         tree: Output of :func:`classify_reatomize`.
         root_id: ID of the fragment whose file the engine already owns.
+        root_tier: The root's privacy tier, inherited fail-closed by any
+            child that arrives untiered (issue #876).
         vault_writer: Shared :class:`VaultWriter` instance.
         counts: Mutable per-run counters; write failures are recorded
             on :attr:`_RunCounts.errors`.
     """
     for node in _walk_tree(tree):
-        child_fragment = node.fragment.fragment
-        if child_fragment.id == root_id:
+        if node.fragment.fragment.id == root_id:
             continue
+        child_fragment = _child_with_concrete_tier(node.fragment.fragment, root_tier)
         try:
             vault_writer.write_fragment(child_fragment, body=node.fragment.body)
         except (OSError, KeyError) as exc:
             counts.errors.append(
                 f"failed to write reatomized child {child_fragment.id}: {exc}",
             )
+
+
+def _child_with_concrete_tier(child: Fragment, root_tier: PrivacyTier) -> Fragment:
+    """Return *child* guaranteed to carry a real tier, inheriting the root's.
+
+    The FEAT-021 splitter derives children with ``parent.model_copy``, so
+    they normally inherit the tier the engine just assigned. This guard
+    covers the paths that do not — a future operator that mints a child
+    fresh, or a :class:`~creek.models.Fragment` default that survives —
+    because these children are written through :class:`VaultWriter`, a
+    path the root never travels and where an ``unclassified`` row would
+    silently re-open the fail-open hole (issue #876) in a vault the
+    classify run had just finished cleaning.
+
+    Args:
+        child: A re-atomized descendant fragment.
+        root_tier: The already-assigned tier of the fragment it was
+            derived from.
+
+    Returns:
+        *child* unchanged when it already carries a tier, otherwise a
+        copy at *root_tier*.
+    """
+    if tier_of(child) is not PrivacyTier.UNCLASSIFIED:
+        return child
+    return child.model_copy(update={"privacy_tier": root_tier})
 
 
 def _walk_tree(
