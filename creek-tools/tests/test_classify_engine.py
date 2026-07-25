@@ -1152,3 +1152,720 @@ def test_run_classify_audience_axis_is_idempotent(tmp_path: Path) -> None:
     first = _audience_of(path)
     run_classify(vault_path=vault, config=CreekConfig(), method="rules", force=True)
     assert _audience_of(path) == first == "audience-facing"
+
+
+# ---- Issue #876: `creek classify` assigns a real privacy tier ---------------
+#
+# `PrivacyClassifier` shipped fully implemented but with zero production
+# callers, so every fragment stayed `privacy_tier: unclassified` after a
+# classify run and Intimate-never-cloud routing (#666 / ADR-0003) had nothing
+# to act on. These tests pin the wire-up: the tier is assigned BEFORE the
+# per-tier router picks a provider, it survives the preserved-method
+# short-circuit, it only ever escalates, and it is never persisted as
+# `unclassified`.
+#
+# TEST-DESIGN RULE for every vault-level test below: ``Path.rglob`` does not
+# sort — it returns ``os.scandir`` order, which is hash-ordered on APFS. So we
+# always build >= 3 fragments with DISTINCT expected tiers, read the results
+# back off disk, and assert an explicit ``{fragment_id: tier}`` mapping. Never
+# assert on "the first file" and never index into rglob output: a positional
+# assertion can false-green against the live bug (this nearly shipped in #847).
+
+_TIER_NEUTRAL_BODY = "a plain note about the walk to the shops and the weather"
+"""Body with no rule-classifier voice signal, so the tier heuristic drives.
+
+Deliberately free of confessional keywords ("confess", "shame", "bare", …)
+and conviction keywords ("absolutely", "undeniably", "truth is", …) so the
+rules pass cannot escalate a fragment to INTIMATE via the
+confessional+conviction branch and silently invalidate the expected map.
+"""
+
+
+def _tier_map(vault: Path) -> dict[str, str]:
+    """Return ``{fragment_id: privacy_tier}`` read back off disk.
+
+    Reads EVERY markdown file under ``01-Fragments`` (recursively) rather
+    than a positional slice of ``rglob`` output, so the assertion is
+    independent of filesystem iteration order.
+    """
+    out: dict[str, str] = {}
+    for path in (vault / "01-Fragments").rglob("*.md"):
+        meta = frontmatter.load(str(path)).metadata
+        if meta.get("type") != "fragment":
+            continue
+        out[str(meta["id"])] = str(meta.get("privacy_tier", "<absent>"))
+    return out
+
+
+def _seed_tier_corpus(vault: Path) -> None:
+    """Seed five fragments whose expected tiers cover the whole ladder.
+
+    One per branch of :meth:`PrivacyClassifier.classify_tier`: journal
+    self-authored, recovery keyword, Discord public channel, Discord DM,
+    and a published essay.
+    """
+    from creek.models import Authorship
+
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tier-journal",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tier-recovry",
+            title="Ninety days",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body="ninety days of sobriety today and the walk felt shorter",
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tier-general",
+            title="Build notes",
+            source=FragmentSource(
+                platform=SourcePlatform.DISCORD,
+                author=Authorship.SELF,
+                channel="#general",
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tier-dm0001",
+            title="Scheduling",
+            source=FragmentSource(
+                platform=SourcePlatform.DISCORD,
+                author=Authorship.SELF,
+                channel="dm",
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tier-essay01",
+            title="On public transit",
+            source=FragmentSource(
+                platform=SourcePlatform.ESSAY,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+
+_EXPECTED_TIER_MAP = {
+    "frag-tier-journal": "intimate",
+    "frag-tier-recovry": "intimate",
+    "frag-tier-general": "open",
+    "frag-tier-dm0001": "personal",
+    "frag-tier-essay01": "open",
+}
+"""The exact id→tier map ``_seed_tier_corpus`` must produce (AC-2)."""
+
+
+def test_run_classify_assigns_the_exact_privacy_tier_per_fragment(
+    tmp_path: Path,
+) -> None:
+    """``creek classify --method rules`` stamps the right tier on each fragment.
+
+    AC-2 for issue #876. Five fragments, five deliberate outcomes across
+    three distinct tiers, asserted as one exact ``{id: tier}`` mapping read
+    back off disk. Before the fix every value in this map was
+    ``unclassified``.
+    """
+    vault = tmp_path / "vault"
+    _seed_tier_corpus(vault)
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _tier_map(vault) == _EXPECTED_TIER_MAP
+    assert summary.privacy_tiers_assigned == 5
+
+
+def test_run_classify_never_persists_unclassified_tier(tmp_path: Path) -> None:
+    """No file under ``01-Fragments`` retains ``privacy_tier: unclassified``.
+
+    The #934 pin. ``creek_mcp.tools.compile._tier_of`` and
+    ``creek_mcp.tools.reflect._fragment_tier`` fail closed to INTIMATE only
+    when the ``privacy_tier`` key is **absent**; an *explicit*
+    ``unclassified`` is admitted at every ceiling. So a vault full of
+    explicitly-unclassified fragments is not "safely unknown" — it is the
+    whole private corpus exposed at the open tier. The engine's invariant
+    is therefore stronger than "eventually classify": it must never write
+    ``unclassified`` back to disk at all.
+
+    The corpus deliberately includes one fragment written through the raw
+    frontmatter path so its ``privacy_tier`` key is genuinely **missing**,
+    not merely defaulted — that file must come out of the run with a real
+    tier too.
+    """
+    from tests.helpers import write_raw_fragment_file
+
+    vault = tmp_path / "vault"
+    _seed_tier_corpus(vault)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments/Notes",
+        "frag-tier-nokey01",
+        "No tier key at all",
+        body=_TIER_NEUTRAL_BODY,
+        platform="journal",
+        author="self",
+        privacy_tier=None,  # the key must be genuinely ABSENT, not defaulted
+    )
+    # Precondition: the key really is absent before the run, otherwise this
+    # test would silently degrade into a duplicate of the AC-2 mapping test.
+    raw_before = frontmatter.load(
+        str(vault / "01-Fragments" / "Notes" / "frag-tier-nokey01.md"),
+    ).metadata
+    assert "privacy_tier" not in raw_before
+
+    run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    tiers = _tier_map(vault)
+    assert len(tiers) == 6
+    assert "unclassified" not in tiers.values()
+    assert "<absent>" not in tiers.values()
+    assert tiers["frag-tier-nokey01"] == "intimate"
+
+
+def test_preserved_llm_and_manual_fragments_still_get_a_tier(
+    tmp_path: Path,
+) -> None:
+    """Preserved fragments get a tier without ``--force``, and nothing else moves.
+
+    The 35k demo-vault shape: every fragment already carries
+    ``classification_method: llm`` or ``manual``, so the OPS-001 /
+    issue-#321 short-circuit skips them and — before this fix — they could
+    never acquire a tier at all. The tier pass therefore runs ABOVE that
+    short-circuit and persists through a narrow tier-only writer that
+    touches ONLY ``privacy_tier`` (and the derived
+    ``voice_proxy_eligible``): the classification provenance and the body
+    must come out byte-identical, and the preserved counters must not move.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    stamps: dict[str, object] = {
+        "classified_at": "2020-01-01T00:00:00-08:00",
+        "classification_reasoning": "a trace from the prior paid run",
+        "classification_provider": "ollama",
+    }
+    llm_path = _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-presrv-llm01",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+        method="llm",
+        extras=dict(stamps),
+    )
+    manual_path = _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-presrv-man01",
+            title="On public transit",
+            source=FragmentSource(
+                platform=SourcePlatform.ESSAY,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+        method="manual",
+        extras=dict(stamps),
+    )
+    before = {path: frontmatter.load(str(path)) for path in (llm_path, manual_path)}
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    # The tiers actually landed, distinct per fragment, read back off disk.
+    assert _tier_map(vault) == {
+        "frag-presrv-llm01": "intimate",
+        "frag-presrv-man01": "open",
+    }
+    assert summary.privacy_tiers_assigned == 2
+
+    # …and the preserved short-circuit still preserved everything else.
+    assert summary.preserved_llm == 1
+    assert summary.preserved_manual == 1
+    for path, original in before.items():
+        after = frontmatter.load(str(path))
+        assert after.content == original.content, f"body rewritten for {path.name}"
+        for key in (
+            "classification_method",
+            "classified_at",
+            "classification_reasoning",
+            "classification_provider",
+        ):
+            assert after.metadata[key] == original.metadata[key], (
+                f"{key} rewritten for {path.name}"
+            )
+
+    # ``voice_proxy_eligible`` is derived from the tier (BUG-009), so the
+    # tier-only write must carry it along or the two fall out of sync.
+    assert frontmatter.load(str(llm_path)).metadata["voice_proxy_eligible"] is False
+    assert frontmatter.load(str(manual_path)).metadata["voice_proxy_eligible"] is True
+
+
+def test_router_sees_the_real_tier_on_first_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A journal fragment routes LOCAL on its FIRST classify (#666 / ADR-0003).
+
+    The security payload of issue #876. The per-tier router reads
+    ``tier_of(fragment)`` to pick a provider; with the fragment still at
+    ``unclassified`` on disk, that resolved to "not INTIMATE" and the
+    journal entry was shipped to the configured CLOUD provider on the very
+    run that was supposed to classify it. The tier pre-pass therefore has
+    to run BEFORE ``tier_classifiers.for_tier(...)``, not after.
+
+    Asserted on the recorded ``{fragment_id: provider}`` map (the
+    ``_FakeClassifier`` / ``_CALLS`` shape from
+    ``tests/test_classify_tier_routing.py``), not on a return value — so a
+    regression that leaks Intimate content to the cloud fails here.
+    """
+    from creek.config import LLMConfig, LLMRoutingConfig
+    from creek.models import Authorship
+
+    calls: dict[str, str] = {}
+
+    class _RecordingClassifier:
+        """Records which provider was handed which fragment; never calls out."""
+
+        def __init__(self, config: LLMConfig) -> None:
+            """Capture the resolved config — its ``provider`` is the assertion."""
+            self.config = config
+
+        @property
+        def available(self) -> bool:
+            """Always reachable; the availability gate is not under test."""
+            return True
+
+        def classify_with_reasoning(
+            self,
+            fragment: Fragment,
+            content: str = "",
+        ) -> LLMClassificationResult:
+            """Record ``id -> provider`` and echo the fragment back unchanged."""
+            _ = content
+            assert fragment.id not in calls, f"classified {fragment.id} twice"
+            calls[fragment.id] = self.config.provider
+            return LLMClassificationResult(fragment=fragment, reasoning="")
+
+    monkeypatch.setattr(
+        "creek.classify.classify_engine.LLMClassifier",
+        _RecordingClassifier,
+    )
+
+    vault = tmp_path / "vault"
+    for frag_id, platform in (
+        ("frag-route-journl", SourcePlatform.JOURNAL),
+        ("frag-route-essay1", SourcePlatform.ESSAY),
+    ):
+        _write_fragment(
+            vault=vault,
+            fragment=Fragment(
+                id=frag_id,
+                title="A note",
+                source=FragmentSource(platform=platform, author=Authorship.SELF),
+            ),
+            body=_TIER_NEUTRAL_BODY,
+        )
+    # Precondition: both fragments start at ``unclassified`` on disk, so this
+    # really is the FIRST classification, not a re-run over an already-tiered
+    # vault (which would pass even with the bug present).
+    assert set(_tier_map(vault).values()) == {"unclassified"}
+
+    config = CreekConfig(
+        llm=LLMRoutingConfig(
+            default=LLMConfig(provider="ollama", model="qwen3:8b"),
+            classification=LLMConfig(provider="anthropic", model="claude-haiku-4-5"),
+        ),
+    )
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    assert calls == {
+        "frag-route-journl": "ollama",  # Intimate → redirected to local
+        "frag-route-essay1": "anthropic",  # non-Intimate → configured cloud
+    }
+
+
+def test_classification_signals_escalate_the_tier(tmp_path: Path) -> None:
+    """A confessional+conviction verdict lifts the persisted tier to intimate.
+
+    The pre-pass runs before the classifier, so it can only see the axes
+    already on the fragment. When classification then *hardens* the
+    signal — a self-authored, non-journal fragment coming back
+    ``confessional`` + ``conviction`` — the escalate-only reassess after
+    ``audience.classify_and_enforce`` has to raise ``personal`` to
+    ``intimate`` before the write, or the harder signal is thrown away.
+
+    Three fragments with three distinct expected tiers, so the assertion
+    cannot pass by accidentally escalating everything.
+    """
+    from creek.models import Authorship, Confidence, VoiceClassification, VoiceRegister
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-escal-conf01",
+            title="A hard thing",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-escal-essay1",
+            title="On public transit",
+            source=FragmentSource(
+                platform=SourcePlatform.ESSAY,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-escal-dm0001",
+            title="Scheduling",
+            source=FragmentSource(
+                platform=SourcePlatform.DISCORD,
+                author=Authorship.SELF,
+                channel="dm",
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+    confessional = VoiceClassification(
+        voice_register=VoiceRegister.CONFESSIONAL,
+        confidence=Confidence.CONVICTION,
+    )
+
+    def _harden(fragment: Fragment, content: str = "") -> LLMClassificationResult:
+        """Return the confessional+conviction verdict for the target fragment."""
+        _ = content
+        if fragment.id != "frag-escal-conf01":
+            return LLMClassificationResult(fragment=fragment, reasoning="")
+        return LLMClassificationResult(
+            fragment=fragment.model_copy(update={"voice": confessional}),
+            reasoning="",
+        )
+
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_harden,
+    ):
+        run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    assert _tier_map(vault) == {
+        "frag-escal-conf01": "intimate",  # escalated by the LLM's verdict
+        "frag-escal-essay1": "open",
+        "frag-escal-dm0001": "personal",
+    }
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_an_existing_intimate_tier_is_never_lowered(
+    tmp_path: Path,
+    force: bool,
+) -> None:
+    """An essay stamped ``intimate`` stays intimate — even under ``--force``.
+
+    The converse of the escalate test: the heuristic would call these
+    essay-platform fragments ``open``, but the tier already on disk is the
+    stricter one. Auto-lowering is the one direction that leaks content, so
+    both the pre-pass merge and the post-classification reassess must be
+    escalate-only. Three fragments with distinct expected tiers keep the
+    assertion honest.
+    """
+    from creek.models import Authorship, PrivacyTier
+
+    vault = tmp_path / "vault"
+    for frag_id, tier, platform, channel in (
+        ("frag-nolow-intim1", PrivacyTier.INTIMATE, SourcePlatform.ESSAY, None),
+        ("frag-nolow-person", PrivacyTier.PERSONAL, SourcePlatform.ESSAY, None),
+        ("frag-nolow-open01", PrivacyTier.OPEN, SourcePlatform.ESSAY, None),
+    ):
+        _write_fragment(
+            vault=vault,
+            fragment=Fragment(
+                id=frag_id,
+                title="On public transit",
+                source=FragmentSource(
+                    platform=platform,
+                    author=Authorship.SELF,
+                    channel=channel,
+                ),
+                privacy_tier=tier,
+            ),
+            body=_TIER_NEUTRAL_BODY,
+        )
+
+    run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=force,
+    )
+
+    assert _tier_map(vault) == {
+        "frag-nolow-intim1": "intimate",
+        "frag-nolow-person": "personal",
+        "frag-nolow-open01": "open",
+    }
+
+
+def test_manual_tier_override_survives_a_non_force_run(tmp_path: Path) -> None:
+    """An explicit ``privacy_tier: open`` is untouched by a non-force pass.
+
+    The operator's deliberate decision outranks the heuristic: the
+    heuristic would call this journal fragment ``intimate``. Two contrast
+    fragments (one untiered journal, one Discord DM) prove the run really
+    did do tier work — otherwise a no-op implementation would pass.
+    """
+    from creek.models import Authorship, PrivacyTier
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-manual-open1",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+            privacy_tier=PrivacyTier.OPEN,
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-manual-jrnl1",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-manual-dm001",
+            title="Scheduling",
+            source=FragmentSource(
+                platform=SourcePlatform.DISCORD,
+                author=Authorship.SELF,
+                channel="dm",
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _tier_map(vault) == {
+        "frag-manual-open1": "open",  # operator's call, kept
+        "frag-manual-jrnl1": "intimate",
+        "frag-manual-dm001": "personal",
+    }
+    assert summary.privacy_tiers_assigned == 2  # the override was NOT re-assigned
+
+
+def test_second_classify_run_assigns_no_tiers_and_changes_none(
+    tmp_path: Path,
+) -> None:
+    """The tier pass is idempotent: run two reports zero assignments.
+
+    ``classified_at`` is legitimately re-stamped on the non-preserved path,
+    so a whole-file byte comparison would be meaningless here; the durable
+    contract is that the id→tier mapping is identical and the new counter
+    reports zero work on the second pass.
+    """
+    vault = tmp_path / "vault"
+    _seed_tier_corpus(vault)
+
+    first = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+    after_first = _tier_map(vault)
+
+    second = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert first.privacy_tiers_assigned == 5
+    assert second.privacy_tiers_assigned == 0
+    assert after_first == _EXPECTED_TIER_MAP
+    assert _tier_map(vault) == _EXPECTED_TIER_MAP
+
+
+def test_reatomized_children_carry_a_concrete_tier(tmp_path: Path) -> None:
+    """FEAT-023 child fragments are persisted with a real tier, never unclassified.
+
+    Re-atomization writes brand-new files through the ``VaultWriter``, a
+    write path the root fragment never travels. If the children inherit the
+    pre-tier root (or are minted fresh), the split silently re-introduces
+    ``privacy_tier: unclassified`` rows into a vault the classify run just
+    finished cleaning — and the parent here is a journal entry, so those
+    rows would be intimate content sitting at the open tier.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    root = Fragment(
+        id="frag-reatom-root1",
+        title="Morning pages",
+        source=FragmentSource(
+            platform=SourcePlatform.JOURNAL,
+            author=Authorship.SELF,
+        ),
+    )
+    _write_fragment(vault=vault, fragment=root, body=_MULTI_PARAGRAPH_BODY)
+
+    config = CreekConfig()
+    config.classification.reatomize = True
+    config.classification.confidence_threshold = 1.0
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=lambda f, content="": LLMClassificationResult(
+            fragment=f,
+            reasoning="",
+        ),
+    ):
+        run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    # Every persisted fragment except the root came from the splitter. Keyed
+    # by id (never by rglob position) so the assertion is order-independent.
+    tiers = _tier_map(vault)
+    children = {fid: tier for fid, tier in tiers.items() if fid != root.id}
+    assert children, "FEAT-023 splitter wrote no child fragments to assert on"
+    assert "unclassified" not in children.values()
+    assert "<absent>" not in children.values()
+    assert tiers[root.id] == "intimate"
+
+
+def test_tier_only_write_failure_lands_on_errors_without_aborting(
+    tmp_path: Path,
+) -> None:
+    """An ``OSError`` from the tier-only writer is recorded, not fatal.
+
+    Contract note for the implementation: this test patches
+    ``creek.classify.classify_engine._write_tier_only`` — the narrow writer
+    that stamps ONLY ``privacy_tier`` + ``voice_proxy_eligible`` onto a
+    preserved fragment. A single unwritable file must not abort a 35k-file
+    run, so the failure is appended to ``summary.errors`` and the remaining
+    fragments still classify normally.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tierio-fail1",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+        method="llm",
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tierio-ok001",
+            title="Scheduling",
+            source=FragmentSource(
+                platform=SourcePlatform.DISCORD,
+                author=Authorship.SELF,
+                channel="dm",
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+    with patch(
+        "creek.classify.classify_engine._write_tier_only",
+        side_effect=OSError("read-only file system"),
+    ):
+        summary = run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="rules",
+            force=False,
+        )
+
+    assert len(summary.errors) == 1
+    assert "read-only file system" in summary.errors[0]
+    assert "frag-tierio-fail1" in summary.errors[0]
+    # The run continued: the other fragment still got its real tier.
+    assert _tier_map(vault)["frag-tierio-ok001"] == "personal"

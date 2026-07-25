@@ -31,11 +31,19 @@ if TYPE_CHECKING:
 
 
 def _seed_fragment(vault: Path, frag_id: str, title: str) -> None:
-    """Write a minimal owner fragment so the real specialists have a corpus."""
+    """Write a minimal owner fragment so the real specialists have a corpus.
+
+    The tier is stated explicitly because since #876 an untiered fragment
+    ranks as PERSONAL and is excluded from the Writing Desk's evidence at
+    the default OPEN ceiling — leaving the key off would silently empty
+    this corpus. These tests exercise synthesis/voice wiring, not tier
+    policy, so the corpus is ``open``.
+    """
     folder = vault / "01-Fragments" / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{frag_id}.md").write_text(
         f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"privacy_tier: open\n"
         f"source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
@@ -64,11 +72,18 @@ _ANALYTICAL_BODY = (
 
 
 def _seed_classified_fragment(vault: Path, frag_id: str, title: str, body: str) -> None:
-    """Write a fragment whose body carries dense rule-classifier signal."""
+    """Write a fragment whose body carries dense rule-classifier signal.
+
+    ``privacy_tier: open`` is explicit for the #876 reason above: the
+    register assertions read the *body*, and an untiered fragment now
+    reaches the specialists as a title-only summary, which carries none
+    of the signal keywords these tests depend on.
+    """
     folder = vault / "01-Fragments" / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{frag_id}.md").write_text(
         f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"privacy_tier: open\n"
         f"source:\n  platform: journal\n  author: self\n---\n{body}\n",
         encoding="utf-8",
     )

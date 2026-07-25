@@ -1014,7 +1014,15 @@ def _seed_rising_fixture(vault: Path) -> None:
 
 
 def _seed_bottoming_fixture(vault: Path) -> None:
-    """Populate a vault biased toward Bottoming-Out compost/synchronicity prompts."""
+    """Populate a vault biased toward Bottoming-Out compost/synchronicity prompts.
+
+    ``privacy_tier`` is explicit because ``section_suggested_questions``
+    routes through :func:`creek.generate.mining.phase_filtered_seeds`,
+    which tier-filters its corpus. Since #876 an untiered fragment ranks
+    as PERSONAL and arrives as a title-only summary, stripping the
+    ``composting``/``synchronicity`` body keywords this fixture exists to
+    surface. Tier policy is covered in the privacy-filter suite.
+    """
     base = datetime(2026, 5, 1, tzinfo=UTC)
     # Liminal "Unnamed" fragment plus matching eddy → liminal-cross-eddy seed.
     (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
@@ -1024,6 +1032,7 @@ def _seed_bottoming_fixture(vault: Path) -> None:
         "title": "Compost stirring",
         "created": base.isoformat(),
         "ingested": base.isoformat(),
+        "privacy_tier": "open",
         "source": {"platform": "journal", "author": "self"},
         "frequency": {"primary": "F4", "secondary": []},
     }

@@ -90,5 +90,9 @@ def classify_tool(
         # consumers can present the two reasons distinctly.
         "preserved_llm": summary.preserved_llm,
         "skipped_high_confidence": summary.skipped_high_confidence,
+        # Issue #876: how many fragments this run gave a real privacy
+        # tier. Surfaced separately from ``classified`` because the tier
+        # pass also runs on fragments the resume short-circuit preserved.
+        "privacy_tiers_assigned": summary.privacy_tiers_assigned,
         "errors": list(summary.errors),
     }

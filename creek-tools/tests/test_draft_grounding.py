@@ -654,6 +654,7 @@ def _build_guard_vault(tmp_path: Path, body: str) -> Path:
         Frequency,
         FrequencyClassification,
         PraxisPotential,
+        PrivacyTier,
         SourcePlatform,
         VoiceClassification,
         WavelengthClassification,
@@ -665,6 +666,10 @@ def _build_guard_vault(tmp_path: Path, body: str) -> Path:
     frag = Fragment(
         id="frag-001",
         title="Source title",
+        # Explicitly OPEN: since #876 an untiered fragment is summarised to
+        # its title by the shared privacy filter, which would empty the body
+        # these grounding tests assert against.
+        privacy_tier=PrivacyTier.OPEN,
         source=FragmentSource(
             platform=SourcePlatform.CLAUDE,
             original_file="scratch.md",

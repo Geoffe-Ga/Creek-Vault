@@ -167,11 +167,19 @@ def _write_classified(
     body: str,
     frontmatter: str = "",
 ) -> None:
-    """Write a fragment carrying optional pre-classified frontmatter blocks."""
+    """Write a fragment carrying optional pre-classified frontmatter blocks.
+
+    ``privacy_tier: open`` is explicit because since #876 an untiered
+    fragment ranks as PERSONAL and reaches the specialists as a title-only
+    summary at the default OPEN ceiling. These tests assert on signal
+    keywords in the *body*, so an implicit tier would strip exactly the
+    text under test. Tier policy itself is covered elsewhere.
+    """
     folder = vault / "01-Fragments" / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{frag_id}.md").write_text(
         f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"privacy_tier: open\n"
         f"source:\n  platform: journal\n  author: self\n{frontmatter}---\n{body}\n",
         encoding="utf-8",
     )

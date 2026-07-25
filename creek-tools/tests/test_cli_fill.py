@@ -159,6 +159,140 @@ def test_fill_with_compost_appends_compost_step(
     assert calls == [*_EXPECTED_ORDER, "compost/report"]
 
 
+# ---- Issue #876: the untiered-fragment hint -------------------------------
+
+
+def _seed_fragment(vault: Path, frag_id: str, *, tier: str | None) -> None:
+    """Write a minimal fragment file, optionally carrying a ``privacy_tier``.
+
+    Built from a literal frontmatter template (not ``Fragment.model_dump``)
+    so ``tier=None`` produces a file with the ``privacy_tier`` key genuinely
+    **absent** — the legacy/hand-edited shape, which is distinct from an
+    explicit ``privacy_tier: unclassified``.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem).
+        tier: Tier string to stamp, or ``None`` to omit the key entirely.
+    """
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    tier_line = f"privacy_tier: {tier}\n" if tier else ""
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "A note"\n'
+        f"source:\n  platform: journal\n  author: self\n{tier_line}---\nbody\n",
+        encoding="utf-8",
+    )
+
+
+def test_count_untiered_fragments_counts_absent_and_unclassified(
+    tmp_path: Path,
+) -> None:
+    """The helper counts both the absent key and an explicit ``unclassified``.
+
+    Those are the two shapes a fragment that has never been through a
+    privacy pass can take, and both are what the operator needs told
+    about. Four fragments spanning four distinct tier states so the count
+    cannot be right by accident.
+    """
+    from creek.cli import _count_untiered_fragments
+
+    vault = tmp_path / "vault"
+    _seed_fragment(vault, "frag-absent", tier=None)
+    _seed_fragment(vault, "frag-unclass", tier="unclassified")
+    _seed_fragment(vault, "frag-open", tier="open")
+    _seed_fragment(vault, "frag-intimate", tier="intimate")
+
+    assert _count_untiered_fragments(vault) == 2
+
+
+def test_count_untiered_fragments_is_zero_without_a_fragments_dir(
+    tmp_path: Path,
+) -> None:
+    """A vault with no ``01-Fragments`` counts zero rather than exploding."""
+    from creek.cli import _count_untiered_fragments
+
+    assert _count_untiered_fragments(tmp_path / "empty-vault") == 0
+
+
+def test_fill_hints_when_untiered_fragments_exist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``creek fill`` tells the operator how many fragments carry no tier.
+
+    Printed even when there is no classify-upgrade offer, so the hint has
+    to sit ahead of the ``offer is None`` early return — otherwise it never
+    fires on exactly the vault that needs it (rules-classified, no LLM
+    reachable, every fragment untiered).
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_fragment(vault, "frag-absent", tier=None)
+    _seed_fragment(vault, "frag-unclass", tier="unclassified")
+    _seed_fragment(vault, "frag-open", tier="open")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "untiered" in out
+    assert "2" in out
+
+
+def test_fill_hint_is_silent_when_every_fragment_is_tiered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fully-tiered vault gets no hint — the nag must not be permanent."""
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_fragment(vault, "frag-open", tier="open")
+    _seed_fragment(vault, "frag-personal", tier="personal")
+    _seed_fragment(vault, "frag-intimate", tier="intimate")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    assert "untiered" not in capsys.readouterr().out
+
+
+def test_untiered_hint_failure_never_crashes_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken untiered count is swallowed by the same best-effort guard.
+
+    The hint is advisory; an unreadable fragment must not abort ``creek
+    fill`` before any step runs, exactly as the classify-upgrade probe
+    already behaves (#736).
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    def _boom(*_a: object) -> int:
+        raise OSError("unreadable fragment")
+
+    monkeypatch.setattr(cli_mod, "_count_untiered_fragments", _boom)
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+
+    # Must not raise.
+    _maybe_upgrade_classification(
+        tmp_path, cli_mod._load_config_for_vault(tmp_path), upgrade=False
+    )
+
+
 def test_fill_summary_reports_folder_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

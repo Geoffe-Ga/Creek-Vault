@@ -6,8 +6,20 @@ contribute summaries (not full bodies). This module owns the *one*
 implementation of that promise so ``mine``, ``draft``, ``report``, and
 ``skills`` cannot drift out of agreement with each other.
 
+An explicit ``unclassified`` tier is treated as ``PERSONAL`` throughout
+(#876): both the summarising filter and the hard rank cutoff in
+:func:`tier_within_override` gate it like personal content. Untiered
+content is content nobody has vouched for, and it used to rank alongside
+``open`` — which, while
+:class:`~creek.classify.privacy.PrivacyClassifier` had no production
+caller and therefore *every* fragment was untiered, meant whole private
+corpora were mineable, draftable and voice-proxy eligible at the open
+tier. Run ``creek classify`` so each fragment carries a deliberate tier.
+
 :func:`tier_of` is the shared, fail-closed tier-extraction primitive (it maps an
-unrecognised ``privacy_tier`` to ``INTIMATE``). It is also used outside
+unrecognised ``privacy_tier`` to ``INTIMATE``). It reports the tier that is
+genuinely on the fragment — the ``unclassified`` → ``personal`` normalisation
+above lives in :func:`_effective_tier`, not here. It is also used outside
 generation — per-tier classification routing (#666) calls it to decide whether a
 fragment must be classified locally — so keep it public and behaviour-stable.
 
@@ -103,7 +115,15 @@ def _allows_full_personal_body(override: PrivacyTierOverride | None) -> bool:
 
 _TIER_RANK: dict[PrivacyTier, int] = {
     PrivacyTier.OPEN: 0,
-    PrivacyTier.UNCLASSIFIED: 0,
+    # #876: an untiered fragment ranks with PERSONAL, not OPEN. It is
+    # content nobody has vouched for, and before ``creek classify`` grew a
+    # privacy caller *every* fragment in a vault was untiered — so ranking
+    # it alongside ``open`` exposed the whole private corpus at the default
+    # ceiling. Note this is the *reader's* caution ordering; the
+    # escalate-only merge in :mod:`creek.classify.privacy_pass` ranks
+    # ``UNCLASSIFIED`` lowest instead, because there it means "no claim
+    # made" rather than "handle carefully".
+    PrivacyTier.UNCLASSIFIED: 1,
     PrivacyTier.PERSONAL: 1,
     PrivacyTier.INTIMATE: 2,
 }
@@ -127,6 +147,8 @@ def tier_within_override(
     anything above the override entirely. The Writing Desk needs its evidence to
     omit above-ceiling fragments outright (#660), not carry summaries. ``None``
     defaults to ``OPEN`` (the most restrictive); ``ALL`` admits every tier.
+    ``UNCLASSIFIED`` ranks with ``PERSONAL`` (#876), so an untiered fragment
+    needs an explicit ``personal`` ceiling to be admitted.
 
     Args:
         tier: The fragment's privacy tier.
@@ -141,6 +163,22 @@ def tier_within_override(
     return _TIER_RANK[tier] <= _OVERRIDE_RANK[effective]
 
 
+def _effective_tier(fragment: Fragment) -> PrivacyTier:
+    """Return the tier :func:`filter_fragments_by_tier` should enforce.
+
+    Normalises ``UNCLASSIFIED`` to ``PERSONAL`` (#876) so the body-level
+    filter agrees with the rank cutoff in :func:`tier_within_override`,
+    which reads the same equivalence out of :data:`_TIER_RANK`. Kept
+    separate from :func:`tier_of` deliberately: ``tier_of`` is the
+    router's and the fidelity ladder's input (#666) and must keep
+    reporting the tier that is genuinely on the fragment.
+    """
+    tier = tier_of(fragment)
+    if tier is PrivacyTier.UNCLASSIFIED:
+        return PrivacyTier.PERSONAL
+    return tier
+
+
 def filter_fragments_by_tier(
     fragments: Iterable[tuple[Fragment, str]],
     *,
@@ -153,12 +191,13 @@ def filter_fragments_by_tier(
     * ``intimate`` → excluded.
     * ``personal`` → included with body replaced by a title-only summary.
     * ``open`` / ``public`` → included with full body.
-    * ``unclassified`` → treated as ``open`` (pass through with full
-      body). Fragments without an explicit privacy tier are presumed
-      non-sensitive; the classifier should backfill an explicit tier
-      before they enter sensitive flows. Operators uncomfortable with
-      this default should run ``creek classify`` first so every
-      fragment carries a deliberate tier.
+    * ``unclassified`` → treated as ``personal`` (#876): still yielded,
+      so the operator sees the fragment exists, but contributing a
+      title-only summary rather than its raw body. Untiered content is
+      content nobody has vouched for; presuming it non-sensitive handed
+      every un-classified vault's private corpus to the generation flows
+      at the open tier. Run ``creek classify`` to give each fragment a
+      deliberate tier, or raise the ceiling explicitly.
 
     Override semantics:
 
@@ -175,7 +214,7 @@ def filter_fragments_by_tier(
             ``--include-tier``.
     """
     for fragment, body in fragments:
-        tier = tier_of(fragment)
+        tier = _effective_tier(fragment)
         if tier == PrivacyTier.INTIMATE and not _allows_intimate(override):
             continue
         if tier == PrivacyTier.PERSONAL and not _allows_full_personal_body(override):

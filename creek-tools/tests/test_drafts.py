@@ -35,6 +35,7 @@ from creek.models import (
     Orientation,
     Phase,
     PraxisPotential,
+    PrivacyTier,
     SourcePlatform,
     Thread,
     ThreadStatus,
@@ -67,10 +68,18 @@ def _build_fragment(
     threads: tuple[str, ...] = (),
     eddies: tuple[str, ...] = (),
 ) -> Fragment:
-    """Return a deterministic Fragment for tests."""
+    """Return a deterministic Fragment for tests.
+
+    ``privacy_tier`` is explicitly ``OPEN`` because these fixtures stand
+    for ordinary, already-classified corpus content. Since #876 an
+    untiered fragment ranks as PERSONAL and would have its body replaced
+    with a title-only summary by ``filter_fragments_by_tier``, which is a
+    privacy contract these draft tests are not trying to exercise.
+    """
     return Fragment(
         id=frag_id,
         title=title,
+        privacy_tier=PrivacyTier.OPEN,
         source=FragmentSource(
             platform=SourcePlatform.CLAUDE,
             original_file="scratch.md",

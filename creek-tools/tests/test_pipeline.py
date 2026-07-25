@@ -1103,3 +1103,86 @@ class TestPipelineTierRouting:
 
         assert seen["local"] == ["frag-intimatexx"]  # Intimate → local provider
         assert seen["cloud"] == ["frag-openxxxxxxx"]  # non-Intimate → cloud provider
+
+    @staticmethod
+    def _untiered(frag_id: str, platform: str, channel: str | None = None):
+        """An IngestedFragment carrying NO privacy tier yet (the #876 shape)."""
+        from creek.ingest.base import IngestedFragment
+        from creek.models import Authorship, Fragment, FragmentSource, SourcePlatform
+
+        fragment = Fragment(
+            id=frag_id,
+            title="A note",
+            source=FragmentSource(
+                platform=SourcePlatform(platform),
+                author=Authorship.SELF,
+                channel=channel,
+            ),
+        )
+        return IngestedFragment(
+            fragment=fragment,
+            body="a plain note about the walk to the shops and the weather",
+        )
+
+    def test_untiered_journal_fragment_routes_local_and_gets_a_tier(
+        self, vault_path, monkeypatch
+    ):
+        """``creek process`` tiers a fragment BEFORE it picks a provider (#876).
+
+        ``_run_classification`` selects the classifier with
+        ``tier_of(frag)``. Without the privacy pre-pass every freshly
+        ingested fragment is still ``unclassified`` at that moment, so a
+        journal entry resolved to "not INTIMATE" and was shipped to the
+        configured CLOUD provider on the very run meant to classify it —
+        the same Intimate-never-cloud hole this fixes in the classify
+        engine. Three fragments with three distinct expected tiers so the
+        assertion cannot pass by tiering (or routing) everything alike.
+        """
+        from creek.models import PrivacyTier
+
+        config = self._cloud_classification_local_default()
+        # ``journal`` is a human-review source by default, which would skip the
+        # LLM entirely and make the routing assertion vacuous.
+        config.classification.human_review_sources = []
+        pipeline = Pipeline(config=config)
+        assert (
+            pipeline.tier_classifiers.intimate
+            is not pipeline.tier_classifiers.non_intimate
+        )
+        # Force the LLM path: rules leave every fragment unclassified.
+        monkeypatch.setattr(
+            pipeline.rule_classifier, "classify", lambda f, content="": f
+        )
+
+        seen: dict[str, list[str]] = {"local": [], "cloud": []}
+        monkeypatch.setattr(
+            pipeline.tier_classifiers.intimate,
+            "classify",
+            lambda f, content="": (seen["local"].append(f.id), f)[1],
+        )
+        monkeypatch.setattr(
+            pipeline.tier_classifiers.non_intimate,
+            "classify",
+            lambda f, content="": (seen["cloud"].append(f.id), f)[1],
+        )
+
+        classified = pipeline._run_classification(
+            [
+                self._untiered("frag-pipejournal", "journal"),
+                self._untiered("frag-pipeessay01", "essay"),
+                self._untiered("frag-pipedmchan1", "discord", channel="dm"),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert seen["local"] == ["frag-pipejournal"]  # Intimate → local provider
+        assert seen["cloud"] == ["frag-pipeessay01", "frag-pipedmchan1"]
+        assert {
+            item.fragment.id: PrivacyTier(item.fragment.privacy_tier)
+            for item in classified
+        } == {
+            "frag-pipejournal": PrivacyTier.INTIMATE,
+            "frag-pipeessay01": PrivacyTier.OPEN,
+            "frag-pipedmchan1": PrivacyTier.PERSONAL,
+        }

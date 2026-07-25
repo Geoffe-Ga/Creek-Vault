@@ -114,6 +114,87 @@ def test_mining_load_with_intimate_override_includes_full_body(tmp_path: Path) -
     assert body == "diary body"
 
 
+def test_mining_load_summarises_unclassified_by_default(tmp_path: Path) -> None:
+    """An untiered fragment contributes a summary, not its full body (#876).
+
+    Deliberate behaviour change: ``unclassified`` used to rank alongside
+    ``open`` and hand its full body to ``creek mine``. Since ``creek
+    classify`` had no privacy caller, every fragment in a vault was
+    untiered — so the whole private corpus was mineable at the open tier.
+    Three fragments at three distinct tiers pin the whole ladder at once.
+    """
+    fragments_dir = tmp_path / "01-Fragments"
+    fragments_dir.mkdir()
+    _write_fragment(
+        fragments_dir,
+        "frag-u",
+        title="Untiered note",
+        privacy_tier="unclassified",
+        body="untiered body",
+    )
+    _write_fragment(
+        fragments_dir, "frag-o", title="Essay", privacy_tier="open", body="open body"
+    )
+    _write_fragment(
+        fragments_dir, "frag-i", title="Diary", privacy_tier="intimate", body="secret"
+    )
+
+    bodies = {f.id: body for f, body in _load_fragments(fragments_dir)}
+
+    assert set(bodies) == {"frag-u", "frag-o"}  # intimate still dropped entirely
+    assert bodies["frag-o"] == "open body"
+    assert "untiered body" not in bodies["frag-u"]
+    assert "Untiered note" in bodies["frag-u"]
+
+
+def test_mining_load_with_personal_override_returns_untiered_full_body(
+    tmp_path: Path,
+) -> None:
+    """``--include-tier personal`` lets an untiered body through intact (#876)."""
+    fragments_dir = tmp_path / "01-Fragments"
+    fragments_dir.mkdir()
+    _write_fragment(
+        fragments_dir,
+        "frag-u",
+        title="Untiered note",
+        privacy_tier="unclassified",
+        body="untiered body",
+    )
+
+    pairs = _load_fragments(
+        fragments_dir,
+        privacy_override=PrivacyTierOverride.PERSONAL,
+    )
+
+    assert [(f.id, body) for f, body in pairs] == [("frag-u", "untiered body")]
+
+
+def test_drafts_load_summarises_unclassified_by_default(tmp_path: Path) -> None:
+    """``_load_fragments_by_id`` mirrors the #876 untiered contract for drafts."""
+    fragments_dir = tmp_path / "01-Fragments"
+    fragments_dir.mkdir()
+    _write_fragment(
+        fragments_dir,
+        "frag-u",
+        title="Untiered note",
+        privacy_tier="unclassified",
+        body="untiered body",
+    )
+    _write_fragment(
+        fragments_dir, "frag-o", title="Essay", privacy_tier="open", body="open body"
+    )
+    _write_fragment(
+        fragments_dir, "frag-i", title="Diary", privacy_tier="intimate", body="secret"
+    )
+
+    loaded = _load_fragments_by_id(fragments_dir)
+
+    assert set(loaded) == {"frag-u", "frag-o"}
+    assert loaded["frag-o"][1] == "open body"
+    assert "untiered body" not in loaded["frag-u"][1]
+    assert "Untiered note" in loaded["frag-u"][1]
+
+
 def test_drafts_load_excludes_intimate_by_default(tmp_path: Path) -> None:
     """``_load_fragments_by_id`` mirrors the mining default behaviour."""
     fragments_dir = tmp_path / "01-Fragments"

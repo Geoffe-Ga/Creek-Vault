@@ -137,6 +137,41 @@ def test_unclassified_fragments_are_counted_separately(tmp_path: Path) -> None:
     assert sum(cell["count"] for cell in result["wheel"].values()) == 1
 
 
+def test_untiered_fragments_are_excluded_at_the_default_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A ``privacy_tier: unclassified`` fragment is gated like ``personal`` (#876).
+
+    Deliberate behaviour change. ``wheel.py`` admits fragments through
+    :func:`creek.classify.privacy_filter.tier_within_override`, which used
+    to rank ``unclassified`` alongside ``open`` — so an entire un-classified
+    corpus was tallied (and its shape exposed) to any MCP consumer at the
+    default OPEN ceiling. Untiered content is content nobody has vouched
+    for; it now needs an explicit ``personal`` ceiling to be counted.
+
+    Three fragments at three distinct tiers, asserted per-bucket, so the
+    test cannot pass on an aggregate coincidence.
+    """
+    _seed_dirs(tmp_path)
+    _write_fragment(tmp_path, frag_id="o", primary="F1", privacy_tier="open")
+    _write_fragment(tmp_path, frag_id="u", primary="F4", privacy_tier="unclassified")
+    _write_fragment(tmp_path, frag_id="p", primary="F6", privacy_tier="personal")
+
+    at_open = wheel_tool(vault_path=tmp_path, privacy_tier_ceiling=TierCeiling.OPEN)
+    assert at_open["wheel"]["F1"]["count"] == 1  # open still admitted
+    assert at_open["wheel"]["F4"]["count"] == 0  # unclassified excluded
+    assert at_open["wheel"]["F6"]["count"] == 0  # personal excluded
+    assert at_open["total_classified"] == 1
+
+    at_personal = wheel_tool(
+        vault_path=tmp_path, privacy_tier_ceiling=TierCeiling.PERSONAL
+    )
+    assert at_personal["wheel"]["F1"]["count"] == 1
+    assert at_personal["wheel"]["F4"]["count"] == 1  # unclassified admitted
+    assert at_personal["wheel"]["F6"]["count"] == 1
+    assert at_personal["total_classified"] == 3
+
+
 def test_wheel_is_audit_logged(tmp_path: Path) -> None:
     """The read is audit-logged with the tool name and consumer."""
     _seed_dirs(tmp_path)

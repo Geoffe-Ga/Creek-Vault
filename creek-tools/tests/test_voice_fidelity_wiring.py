@@ -36,11 +36,19 @@ if TYPE_CHECKING:
 
 
 def _seed_fragment(vault: Path, frag_id: str, title: str) -> None:
-    """Write a minimal self-authored fragment so the specialists have a corpus."""
+    """Write a minimal self-authored fragment so the specialists have a corpus.
+
+    The tier is stated explicitly because since #876 an untiered fragment
+    ranks as PERSONAL and is excluded from the Writing Desk's evidence at
+    the default OPEN ceiling — leaving the key off would silently empty
+    this corpus. This test exercises voice-fidelity wiring, not tier
+    policy, so the corpus is ``open``.
+    """
     folder = vault / "01-Fragments" / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{frag_id}.md").write_text(
         f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"privacy_tier: open\n"
         f"source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
