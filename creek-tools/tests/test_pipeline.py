@@ -1186,3 +1186,192 @@ class TestPipelineTierRouting:
             "frag-pipeessay01": PrivacyTier.OPEN,
             "frag-pipedmchan1": PrivacyTier.PERSONAL,
         }
+
+
+class TestPipelinePraxisPass:
+    """``creek process`` stamps ``praxis_potential`` too (issue #877).
+
+    ``creek classify`` is not the only way fragments enter the vault:
+    ``creek process`` ingests and classifies in one shot and never calls
+    the classify engine. Fixing only the engine would leave every
+    freshly-processed fragment at ``praxis_potential: none``, so
+    ``04-Praxis`` / ``08-Decisions`` would stay unreachable for anyone who
+    uses the one-shot command.
+    """
+
+    @staticmethod
+    def _ingested(frag_id: str, body: str):
+        """An IngestedFragment with a known id and a chosen body.
+
+        Args:
+            frag_id: Fragment id (the assertion key).
+            body: Markdown body the praxis heuristic scores.
+
+        Returns:
+            The assembled :class:`~creek.ingest.base.IngestedFragment`.
+        """
+        from creek.ingest.base import IngestedFragment
+        from creek.models import Authorship, Fragment, FragmentSource, SourcePlatform
+
+        fragment = Fragment(
+            id=frag_id,
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        )
+        return IngestedFragment(fragment=fragment, body=body)
+
+    def test_no_llm_run_stamps_praxis_on_a_signal_bearing_fragment(
+        self, vault_path: Path
+    ) -> None:
+        """A task checkbox in the body reaches ``explicit`` with zero egress.
+
+        ``no_llm=True`` guarantees Pass 3 never runs, so this asserts the
+        praxis verdict is produced by the free, local, deterministic
+        heuristic — the whole point of #877 being a keyword pass rather
+        than another LLM dimension.
+
+        Two fragments with two distinct expected outcomes so a
+        stamp-everything implementation cannot pass.
+        """
+        from creek.models import PraxisPotential
+
+        pipeline = Pipeline(config=CreekConfig(), no_llm=True)
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested(
+                    "frag-praxispipe01",
+                    "notes from the week ahead\n- [ ] book the boiler service",
+                ),
+                self._ingested(
+                    "frag-praxispipe02",
+                    "a plain note about the walk to the shops and the weather",
+                ),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert {
+            item.fragment.id: str(item.fragment.praxis_potential) for item in classified
+        } == {
+            "frag-praxispipe01": PraxisPotential.EXPLICIT.value,
+            "frag-praxispipe02": PraxisPotential.NONE.value,
+        }
+
+    def test_praxis_pass_never_demotes_an_llm_verdict(self, vault_path: Path) -> None:
+        """A fragment already ``latent`` is not reset to ``none`` by the pass.
+
+        The pipeline runs the heuristic over every fragment, including
+        re-processed ones that already carry an LLM verdict the keyword
+        table cannot reproduce. The merge is escalate-only.
+        """
+        from creek.ingest.base import IngestedFragment
+        from creek.models import (
+            Authorship,
+            Fragment,
+            FragmentSource,
+            PraxisPotential,
+            SourcePlatform,
+        )
+
+        pipeline = Pipeline(config=CreekConfig(), no_llm=True)
+        item = IngestedFragment(
+            fragment=Fragment(
+                id="frag-praxispipe03",
+                title="Week notes",
+                source=FragmentSource(
+                    platform=SourcePlatform.MARKDOWN,
+                    author=Authorship.SELF,
+                ),
+                praxis_potential=PraxisPotential.LATENT,
+            ),
+            body="a plain note about the walk to the shops and the weather",
+        )
+
+        classified = pipeline._run_classification([item], vault_path, PipelineResult())
+
+        assert str(classified[0].fragment.praxis_potential) == (
+            PraxisPotential.LATENT.value
+        )
+
+    def test_llm_answer_never_demotes_an_explicit_fragment_on_disk(
+        self, vault_path: Path
+    ) -> None:
+        """A model answering ``latent`` cannot lower a recorded ``explicit``.
+
+        The sibling test above runs with ``no_llm=True``, so it exercises
+        only :func:`creek.classify.praxis_pass.apply_praxis`'s own
+        escalate-only merge and proves nothing about the LLM path. This
+        one drives the real path: the rules leave the fragment
+        unclassified, the stubbed provider answers ``praxis.potential:
+        latent`` for a fragment already at ``explicit``, and the
+        heuristic pass that runs afterwards cannot repair the demotion —
+        the body carries no keyword signal, so ``detect`` can only
+        propose ``none``.
+
+        Asserted on what reached the vault, keyed by fragment id (never by
+        ``rglob`` order, which is unsorted), because the demotion's real
+        cost is a rewritten file.
+        """
+        import frontmatter
+
+        from creek.classify.llm import LLMClassifier
+        from creek.ingest.base import IngestedFragment
+        from creek.models import (
+            Authorship,
+            Fragment,
+            FragmentSource,
+            PraxisPotential,
+            SourcePlatform,
+        )
+
+        response = "frequency:\n  primary: F3\npraxis:\n  potential: latent\n"
+        pipeline = Pipeline(config=CreekConfig())
+        item = IngestedFragment(
+            fragment=Fragment(
+                id="frag-praxispipe04",
+                title="Week notes",
+                source=FragmentSource(
+                    platform=SourcePlatform.MARKDOWN,
+                    author=Authorship.SELF,
+                ),
+                praxis_potential=PraxisPotential.EXPLICIT,
+            ),
+            body="a plain note about the walk to the shops and the weather",
+        )
+        result = PipelineResult()
+
+        with (
+            # Rules leaving the frequency unclassified is what routes the
+            # fragment to Pass 3 at all.
+            patch.object(
+                pipeline.rule_classifier,
+                "classify",
+                side_effect=lambda f, content="": f,
+            ),
+            patch.object(LLMClassifier, "_check_availability", return_value=True),
+            patch.object(LLMClassifier, "_invoke_llm", return_value=response),
+        ):
+            classified = pipeline._run_classification([item], vault_path, result)
+
+        pipeline._write_to_vault(classified, vault_path, result)
+
+        on_disk = {
+            post["id"]: post
+            for post in (
+                frontmatter.load(str(path))
+                for path in (vault_path / "01-Fragments").rglob("*.md")
+            )
+        }
+
+        assert result.errors == []
+        assert on_disk["frag-praxispipe04"]["praxis_potential"] == (
+            PraxisPotential.EXPLICIT.value
+        )
+        # The rest of the same response *did* land, so the assertion above
+        # cannot be passing because the LLM was never consulted.
+        assert on_disk["frag-praxispipe04"]["frequency"]["primary"] == "F3"

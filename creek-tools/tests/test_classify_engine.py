@@ -1869,3 +1869,313 @@ def test_tier_only_write_failure_lands_on_errors_without_aborting(
     assert "frag-tierio-fail1" in summary.errors[0]
     # The run continued: the other fragment still got its real tier.
     assert _tier_map(vault)["frag-tierio-ok001"] == "personal"
+
+
+# ---- Praxis-potential pass (issue #877) ------------------------------------
+#
+# Same discipline as the #876 tier block above: seed fragments with known
+# ids, read the whole tree back off disk, and assert an explicit
+# ``{fragment_id: praxis_potential}`` mapping. ``rglob`` does not sort, so
+# never index into its output — a positional assertion can false-green
+# against the live bug (before #877 every fragment in the 35k-fragment demo
+# vault read ``praxis_potential: none``, so "the first file says none" was
+# trivially true for the *wrong* reason).
+
+_PRAXIS_SIGNAL_BODY = "notes from the week ahead\n- [ ] book the boiler service"
+"""A body carrying exactly one strong praxis marker (a task checkbox).
+
+Deliberately free of frequency / phase / voice keywords so the rule
+classifier's other axes cannot move and confuse the assertion, and free of
+recovery keywords so the #876 tier heuristic stays driven by the platform.
+"""
+
+
+def _praxis_map(vault: Path) -> dict[str, str]:
+    """Return ``{fragment_id: praxis_potential}`` read back off disk.
+
+    Reads EVERY markdown file under ``01-Fragments`` (recursively) and keys
+    the result by fragment id, so the assertion is independent of
+    filesystem iteration order.
+    """
+    out: dict[str, str] = {}
+    for path in (vault / "01-Fragments").rglob("*.md"):
+        meta = frontmatter.load(str(path)).metadata
+        if meta.get("type") != "fragment":
+            continue
+        out[str(meta["id"])] = str(meta.get("praxis_potential", "<absent>"))
+    return out
+
+
+def test_run_classify_rules_stamps_praxis_potential(tmp_path: Path) -> None:
+    """A ``--method rules`` run writes ``praxis_potential`` to disk (AC-1, #877).
+
+    The bug: ``Fragment.praxis_potential`` defaulted to ``none`` and *no*
+    pipeline stage ever set it, so the three consumers gated on
+    ``explicit`` (``generate/decisions.py``, ``generate/mining.py``,
+    ``generate/compost.py``) were structurally unreachable and
+    ``04-Praxis`` / ``08-Decisions`` could never be populated.
+
+    Three fragments covering three distinct outcomes — raised, left alone,
+    and already-decided — so the mapping cannot pass by stamping
+    everything alike.
+    """
+    from creek.models import Authorship, PraxisPotential
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-praxis-sig01",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_PRAXIS_SIGNAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-praxis-none1",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-praxis-keep1",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+            praxis_potential=PraxisPotential.EXPLICIT,
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    # Precondition: nothing is ``explicit`` by accident of the fixture
+    # writer, and the signal-bearing fragment really does start at ``none``.
+    assert _praxis_map(vault)["frag-praxis-sig01"] == "none"
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _praxis_map(vault) == {
+        "frag-praxis-sig01": "explicit",  # the checkbox fired
+        "frag-praxis-none1": "none",  # a plain note stays none
+        "frag-praxis-keep1": "explicit",  # never demoted by a signal-free run
+    }
+    # Only the genuine raise is counted; re-affirming an existing
+    # ``explicit`` is not work the operator needs reported.
+    assert summary.praxis_marked == 1
+
+
+def test_second_run_marks_no_praxis_and_changes_none(tmp_path: Path) -> None:
+    """The praxis pass is idempotent: run two reports zero marks.
+
+    ``classified_at`` is legitimately re-stamped on the non-preserved
+    path, so a byte comparison would be meaningless; the durable contract
+    is that the id→praxis mapping is identical and the counter reports
+    zero work the second time.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-praxis-idem1",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_PRAXIS_SIGNAL_BODY,
+    )
+
+    first = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+    after_first = _praxis_map(vault)
+
+    second = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert first.praxis_marked == 1
+    assert second.praxis_marked == 0
+    assert after_first == {"frag-praxis-idem1": "explicit"}
+    assert _praxis_map(vault) == after_first
+
+
+@pytest.mark.parametrize(
+    ("force", "expected_praxis", "expected_marked"),
+    [(False, "none", 0), (True, "explicit", 1)],
+)
+def test_preserved_fragment_gets_praxis_only_under_force(
+    tmp_path: Path,
+    force: bool,
+    expected_praxis: str,
+    expected_marked: int,
+) -> None:
+    """A preserved ``llm``-stamped fragment gains praxis only with ``--force``.
+
+    Deliberate asymmetry with the #876 tier pass. ``_write_tier_only`` is
+    the narrow writer used on the OPS-001 resume short-circuit, and it is
+    **not** widened to carry praxis: the tier exception exists because an
+    untiered fragment is a live privacy hole, whereas a missing praxis
+    verdict is a missing feature. Widening that writer would rewrite the
+    praxis axis of every already-curated fragment in a mature vault
+    without the operator asking.
+
+    The tier still lands on the same run, which is what proves the
+    short-circuit was genuinely taken rather than the fragment quietly
+    reclassified.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-praxis-prsv1",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_PRAXIS_SIGNAL_BODY,
+        method="llm",
+    )
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=force,
+    )
+
+    assert _praxis_map(vault) == {"frag-praxis-prsv1": expected_praxis}
+    assert _tier_map(vault) == {"frag-praxis-prsv1": "intimate"}
+    assert summary.praxis_marked == expected_marked
+    assert summary.preserved_llm == (0 if force else 1)
+
+
+def test_praxis_pass_runs_after_the_router_reads_the_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adding the praxis pass must not disturb the #876 tier→router ordering.
+
+    The #876 ordering is load-bearing security, not style: the per-tier
+    router calls ``tier_of(fragment)`` to honour Intimate-never-cloud
+    (#666 / ADR-0003), so the privacy tier has to be assigned in
+    ``_prepare_fragment`` — before ``TierClassifiers.for_tier`` — and
+    above the resume short-circuit. The praxis pass belongs *after* the
+    classifier returns (it reads the same body the classifier saw, and
+    must not delay the tier), so this test asserts BOTH facts on one run:
+    the recorded ``{fragment_id: provider}`` map is still correct, and the
+    praxis verdict still landed.
+
+    It exists so a future agent cannot "simplify" by hoisting the praxis
+    pass into ``_prepare_fragment`` and, in the process, sliding the
+    privacy pass below the router.
+    """
+    from creek.config import LLMConfig, LLMRoutingConfig
+    from creek.models import Authorship
+
+    calls: dict[str, str] = {}
+
+    class _RecordingClassifier:
+        """Records which provider was handed which fragment; never calls out."""
+
+        def __init__(self, config: LLMConfig) -> None:
+            """Capture the resolved config — its ``provider`` is the assertion."""
+            self.config = config
+
+        @property
+        def available(self) -> bool:
+            """Always reachable; the availability gate is not under test."""
+            return True
+
+        def classify_with_reasoning(
+            self,
+            fragment: Fragment,
+            content: str = "",
+        ) -> LLMClassificationResult:
+            """Record ``id -> provider`` and echo the fragment back unchanged."""
+            _ = content
+            assert fragment.id not in calls, f"classified {fragment.id} twice"
+            calls[fragment.id] = self.config.provider
+            return LLMClassificationResult(fragment=fragment, reasoning="")
+
+    monkeypatch.setattr(
+        "creek.classify.classify_engine.LLMClassifier",
+        _RecordingClassifier,
+    )
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-order-journl",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_PRAXIS_SIGNAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-order-essay1",
+            title="On public transit",
+            source=FragmentSource(
+                platform=SourcePlatform.ESSAY,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    # Precondition: this really is the FIRST pass over both fragments.
+    assert set(_tier_map(vault).values()) == {"unclassified"}
+    assert set(_praxis_map(vault).values()) == {"none"}
+
+    config = CreekConfig(
+        llm=LLMRoutingConfig(
+            default=LLMConfig(provider="ollama", model="qwen3:8b"),
+            classification=LLMConfig(provider="anthropic", model="claude-haiku-4-5"),
+        ),
+    )
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    assert calls == {
+        "frag-order-journl": "ollama",  # Intimate → redirected to local
+        "frag-order-essay1": "anthropic",  # non-Intimate → configured cloud
+    }
+    assert _praxis_map(vault) == {
+        "frag-order-journl": "explicit",
+        "frag-order-essay1": "none",
+    }

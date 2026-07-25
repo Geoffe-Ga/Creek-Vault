@@ -38,6 +38,7 @@ from creek.audit.yield_summary import (
     write_yield_summary,
 )
 from creek.classify.classify_engine import build_tier_classifiers
+from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
 from creek.classify.privacy_pass import PRIVACY_TIER_KEY, apply_tier
@@ -524,6 +525,14 @@ class Pipeline:
         router reads that tier to keep Intimate content off cloud
         providers and a freshly-ingested fragment carries none.
 
+        Every fragment is likewise scored for praxis potential once the
+        classifiers are done (#877). ``creek process`` never calls the
+        classify engine, so without this the one-shot command would leave
+        every fragment it ingests at ``praxis_potential: none`` and keep
+        ``04-Praxis`` / ``08-Decisions`` unreachable for anyone who uses
+        it. The pass is escalate-only, so running it after the optional
+        LLM dispatch cannot undo a ``latent`` verdict the model produced.
+
         Classification operates on the inner :class:`Fragment`; the body
         is preserved unchanged on the returned :class:`IngestedFragment`.
 
@@ -562,6 +571,9 @@ class Pipeline:
                     frag = classifier.classify(frag, content=item.body)
             else:
                 result.deterministic_classified += 1
+            # Issue #877: score the praxis axis last, so the escalate-only
+            # merge sees whatever the optional LLM dispatch above produced.
+            frag = apply_praxis(frag, item.body)
             classified.append(IngestedFragment(fragment=frag, body=item.body))
 
         self.review_generator.generate_queue(

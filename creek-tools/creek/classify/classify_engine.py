@@ -57,6 +57,42 @@ call it:
   non-``unclassified`` tier on disk also survives any non-``--force``
   run untouched: the operator's decision outranks the heuristic.
 
+Praxis pass (issue #877)
+------------------------
+
+Every fragment this run actually (re-)classifies also leaves the engine
+carrying a scored :class:`~creek.models.PraxisPotential`. Before #877 the
+field had a default and **no producer at all**, so the three consumers
+gated on ``explicit`` (:mod:`creek.generate.decisions`,
+:mod:`creek.generate.mining`, :mod:`creek.generate.compost`) were
+structurally unreachable. The policy lives in
+:mod:`creek.classify.praxis_pass`; the engine only decides *when*:
+
+* **After the classifier, before the privacy reassess.** Running after
+  :func:`_classify_one` means the escalate-only merge already sees any
+  LLM verdict, and running before :func:`~creek.classify.privacy_pass.reassess`
+  keeps the #876 privacy reassess as the last mutation before the write.
+  It must NOT be hoisted into :func:`_prepare_fragment`: that would put
+  it between the tier assignment and
+  :meth:`TierClassifiers.for_tier`, where the #876 ordering above is
+  load-bearing security.
+* **NOT on the preserved short-circuit** — a deliberate departure from
+  the tier precedent one section up. :func:`_write_tier_only` makes a
+  narrow, auditable promise ("changing ONLY the privacy-tier fields")
+  that is itself load-bearing when reviewing the #876 path, and the
+  justification for the tier exception does not transfer: an untiered
+  fragment is a live cloud-egress hole, whereas a missing praxis verdict
+  is a missing feature. So an ``llm``/``manual``-stamped vault backfills
+  this axis only under an explicit ``creek classify --method llm
+  --force``. ``creek fill`` surfaces the outstanding count and names that
+  command's token cost (:func:`creek.cli._hint_praxis_backfill`).
+* **Escalate-only.** A rules re-run can raise ``none`` to ``explicit``
+  but can never demote a verdict the LLM or the operator put on record.
+
+:attr:`ClassifySummary.praxis_marked` reports how many fragments the run
+actually raised — the observability that was missing when this field had
+an invisible (in fact absent) producer.
+
 Known residual (not fixable by ordering)
 ----------------------------------------
 
@@ -104,6 +140,7 @@ from creek.classify.constants import (
 )
 from creek.classify.llm import LLMClassifier
 from creek.classify.llm.router import IntimateRoutingError
+from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
 from creek.classify.privacy_pass import (
@@ -150,6 +187,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from creek.config import ClassificationConfig, CreekConfig, LLMConfig
+
+    # Annotation-only: the praxis verdict is compared, never constructed here.
+    from creek.models import PraxisPotential
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +273,16 @@ class ClassifySummary:
             This counts the decision, not the bytes: a fragment whose
             subsequent write fails is counted here *and* reported on
             :attr:`errors`.
+        praxis_marked: Fragments this run raised to a stronger
+            :class:`~creek.models.PraxisPotential` (issue #877) — almost
+            always ``none`` → ``explicit`` from the keyword pass. The
+            pass is escalate-only and idempotent, so a second run over an
+            unchanged vault reports ``0``. Fragments the resume
+            short-circuit preserved are **not** counted: they are not
+            given a praxis verdict at all without ``--force`` (see the
+            module docstring). Like :attr:`privacy_tiers_assigned` this
+            counts the decision, not the bytes — a fragment whose write
+            then fails is counted here *and* reported on :attr:`errors`.
     """
 
     total: int
@@ -241,10 +291,11 @@ class ClassifySummary:
     preserved_llm: int
     skipped_high_confidence: int
     errors: tuple[str, ...]
-    # Appended last, with a default, so the positional
+    # Appended last, with defaults, so the positional
     # ``ClassifySummary(0, 0, 0, 0, 0, ())`` construction below still
     # compiles unchanged.
     privacy_tiers_assigned: int = 0
+    praxis_marked: int = 0
 
 
 @dataclass
@@ -261,6 +312,7 @@ class _RunCounts:
     preserved_llm: int = 0
     skipped: int = 0
     privacy_tiers_assigned: int = 0
+    praxis_marked: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -459,6 +511,7 @@ def run_classify(
         # underlying list and reach into completed-run state.
         errors=tuple(counts.errors),
         privacy_tiers_assigned=counts.privacy_tiers_assigned,
+        praxis_marked=counts.praxis_marked,
     )
 
 
@@ -563,6 +616,29 @@ def _record_if_preserved(
         counts.preserved_llm += 1
         return True
     return False
+
+
+def _record_praxis(
+    before: PraxisPotential,
+    fragment: Fragment,
+    counts: _RunCounts,
+) -> None:
+    """Tally a fragment whose praxis verdict this run raised (issue #877).
+
+    Kept as its own function so the ``if`` lives here rather than in
+    :func:`_process_file`, whose cyclomatic complexity is already at its
+    working ceiling. Comparing before/after is safe precisely because
+    :func:`~creek.classify.praxis_pass.apply_praxis` is escalate-only:
+    the values can only ever differ upwards, so this counts real work and
+    never churn.
+
+    Args:
+        before: The verdict the fragment carried before the praxis pass.
+        fragment: The fragment after the pass.
+        counts: Mutable per-run counters; mutated in place.
+    """
+    if fragment.praxis_potential != before:
+        counts.praxis_marked += 1
 
 
 def _assert_classifiers_available(tier_classifiers: TierClassifiers | None) -> None:
@@ -825,6 +901,16 @@ def _process_file(
     # so it runs on both the rules and LLM paths and stays idempotent.
     new_fragment = audience.classify_and_enforce(new_fragment, body)
 
+    # #877: score the praxis axis from the free keyword pass. Unconditional
+    # by design — the purity of ``apply_praxis`` absorbs the decision (it
+    # returns the same object when nothing escalates), so this adds no
+    # branch to this function. It runs AFTER ``_classify_one`` so the
+    # escalate-only merge already sees any LLM verdict, and BEFORE the
+    # reassess below so the #876 privacy pass stays the last mutation
+    # before the write.
+    praxis_before = new_fragment.praxis_potential
+    new_fragment = apply_praxis(new_fragment, body)
+
     # #876: classification may have hardened the fragment's voice signals
     # (confessional + conviction is one of the INTIMATE triggers), which the
     # pre-pass could not see. Take the stricter of the two verdicts —
@@ -834,6 +920,8 @@ def _process_file(
         new_fragment = reassess(new_fragment, body, classifier=privacy)
 
     with lock:
+        _record_praxis(praxis_before, new_fragment, counts)
+
         # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
         # True we run the orchestrator on the root fragment and persist any
         # newly-derived child fragments. The root's frontmatter still flows

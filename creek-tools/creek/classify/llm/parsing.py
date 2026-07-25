@@ -18,11 +18,13 @@ from typing import TypeVar
 
 import yaml
 
+from creek.classify.praxis_pass import PRAXIS_POTENTIAL_KEY, escalate
 from creek.models import (
     Confidence,
     Dosage,
     Frequency,
     FrequencyClassification,
+    PraxisPotential,
     VoiceClassification,
     VoiceRegister,
 )
@@ -52,7 +54,7 @@ otherwise bloat fragment frontmatter on disk. See issue #319.
 
 
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {"frequency", "wavelength", "voice", "confidence_scores"},
+    {"frequency", "wavelength", "voice", "confidence_scores", "praxis"},
 )
 """Top-level keys recognised in a documented LLM classification response.
 
@@ -60,9 +62,16 @@ Mirrors the sections in
 :data:`creek.classify.llm.prompts.CLASSIFICATION_PROMPT`.
 ``confidence_scores`` was added by FEAT-017 to carry per-dimension
 self-reported confidence for the default-unclassified bias on Mode /
-Orientation / Dosage. Update both when adding a new section —
-:func:`validate_response` will otherwise reject the LLM's output as
-unexpected.
+Orientation / Dosage. ``praxis`` was added by issue #877 to carry the
+``latent`` verdict no keyword heuristic can produce. Update both when
+adding a new section — :func:`validate_response` will otherwise reject
+the LLM's output as unexpected.
+
+This allow-list is the SEC-004 injection boundary, so it is widened one
+key at a time and never to a :class:`~creek.models.Fragment` field name:
+``privacy_tier`` in particular stays rejected, or a successful prompt
+injection could talk the classifier into re-tiering intimate content as
+``open``.
 """
 
 
@@ -75,7 +84,14 @@ _YAML_FENCE_RE: re.Pattern[str] = re.compile(
 _YAML_HEAD_RE: re.Pattern[str] = re.compile(
     r"^(frequency|wavelength|voice):", re.MULTILINE
 )
-"""Match the start of an unfenced YAML payload (a documented top-level key)."""
+"""Match the start of an unfenced YAML payload (a documented top-level key).
+
+Deliberately NOT widened with ``praxis`` (issue #877): the schema lists
+``praxis`` last, so it can never be the *first* key of a payload, and
+adding an alternative here would let a stray line of reasoning prose
+beginning ``praxis:`` be mistaken for the start of the YAML — unrelated
+risk for zero benefit.
+"""
 
 
 def _split_reasoning_and_yaml(response: str) -> tuple[str, str]:
@@ -224,9 +240,10 @@ def validate_response(response_text: str) -> dict[str, object]:
     ``yaml.safe_load_all`` so a multi-document stream — a classic
     LLM-output-spoofing payload — is detected explicitly rather
     than silently swallowing the first document. Top-level keys
-    outside the documented schema (``frequency``, ``wavelength``,
-    ``voice``) are also rejected so a successful injection cannot
-    smuggle in fields like ``privacy_tier`` (see SEC-004).
+    outside the documented schema (see
+    :data:`_ALLOWED_TOP_LEVEL_KEYS`) are also rejected so a
+    successful injection cannot smuggle in fields like
+    ``privacy_tier`` (see SEC-004).
 
     Args:
         response_text: Raw YAML text from the LLM.
@@ -284,6 +301,62 @@ def _apply_frequency(
         primary=primary,
         secondary=secondary,
     )
+
+
+def _apply_praxis(
+    data: dict[str, object],
+    updates: dict[str, object],
+    current: PraxisPotential,
+) -> None:
+    """Extract the praxis-potential verdict from parsed data (issue #877).
+
+    The LLM can only ever *raise* this axis, and "raise" is measured
+    against *the verdict the fragment already carries* — not merely
+    against ``none``. The merge therefore runs through the single
+    canonical :func:`creek.classify.praxis_pass.escalate`, which takes the
+    higher of the two on ``none < latent < explicit``. Refusing to write
+    only when the parsed value is ``none`` would not be enough: ``latent``
+    is also weaker than ``explicit``, and a model answering ``latent`` for
+    a fragment already at ``explicit`` would demote it. Nothing downstream
+    can repair that — the keyword heuristic
+    (:func:`creek.classify.praxis_pass.detect`) re-derives from the body
+    and only ever proposes ``explicit`` or ``none``, so a verdict that
+    came from judgment rather than keywords keeps the demotion to disk.
+
+    The escalating direction still stands: ``latent`` over ``none`` and
+    ``explicit`` over ``latent`` are both written. ``latent`` is the
+    verdict this branch exists for — no regular expression can see "there
+    is a practice hiding in here that the author has not named".
+
+    An unchanged verdict must write **no key at all**, because
+    :meth:`~creek.classify.llm.orchestrator.LLMClassifier._apply_classification`
+    returns the input fragment itself when ``updates`` is empty. Writing
+    the merged value back whenever the model merely agrees would allocate
+    a fresh model copy per fragment and blur the "did this run change
+    anything?" signal callers read from object identity.
+
+    Args:
+        data: Parsed LLM response.
+        updates: Dict to populate with the praxis update. Left untouched
+            unless the merge raised the axis above *current*.
+        current: The verdict already recorded on the fragment. The merge
+            never returns anything weaker than this.
+    """
+    section = data.get("praxis")
+    if not isinstance(section, dict):
+        return
+    potential = _parse_enum(
+        section.get("potential"),
+        PraxisPotential,
+        PraxisPotential.NONE,
+    )
+    merged = escalate(current, potential)
+    if merged is current:
+        return
+    # ``.value`` because ``Fragment`` uses ``use_enum_values=True`` but
+    # ``model_copy`` — which consumes this dict — bypasses that coercion,
+    # and YAML's SafeDumper cannot represent a bare StrEnum member.
+    updates[PRAXIS_POTENTIAL_KEY] = merged.value
 
 
 def _apply_voice(
