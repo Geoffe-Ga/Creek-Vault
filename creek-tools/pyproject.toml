@@ -107,7 +107,7 @@ dev = [
     # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
     # ruff version. Bumping requires updating all three together
     # (issues #206, #409).
-    "ruff>=0.15.13,<0.16",
+    "ruff>=0.15.13,<0.17",
     # Pinned to the same major.minor as uv.lock and
     # .pre-commit-config.yaml's mirrors-mypy rev so the three install
     # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
