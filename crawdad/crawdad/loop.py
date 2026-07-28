@@ -10,7 +10,7 @@ Sonnet composer. The loop's contract:
        ▼  ── ROUND N ──┐
     router.extract_intents
        │
-       ├─ compose=True or intents=[] ─► composer.compose ─► reply
+       ├─ intents=[] ─► composer.compose ─► reply
        │
        └─ intents non-empty
               │
@@ -19,13 +19,23 @@ Sonnet composer. The loop's contract:
               │
               ▼
           dispatcher.dispatch(intents)  →  aggregate ToolResults
+              │                            + record the ``tool`` turn
               │
-              ▼
+              ├─ compose=True ─► composer.compose ─► reply
+              │
+              └─ compose=False ─► ROUND N+1 ──┘
        (loop until ``max_rounds`` rounds; the next attempt is refused)
+
+``compose`` is read *after* the dispatch, not before it: the router is
+prompted to emit its intents and set ``compose: true`` in the same
+response once it has everything it needs, so a bundled round must run
+the tools it asked for and then compose within that same round (#915).
+Only an *empty* intent list short-circuits straight to the composer.
 
 The cap defaults to :data:`MAX_LOOP_ROUNDS` (5) and can be raised or
 lowered per deployment via the ``max_loop_rounds`` key in
-``crawdad.yaml`` (FEAT-036, bounded ``[1, 50]``).
+``crawdad.yaml`` (FEAT-036, bounded ``[1, 50]``). The cap is reached
+only when the router keeps returning intents with ``compose=false``.
 
 Side-effects: the loop appends ``user`` and ``assistant`` turns to the
 shared :class:`ConversationHistory` (the source the next router pass
@@ -173,7 +183,8 @@ class AgentLoop:
                 _LOGGER.warning("router parse error mid-loop: %s", exc)
                 return LoopOutcome(kind="router_parse_error", reply=_ROUTER_PARSE_REPLY)
 
-            if response.compose or not response.intents:
+            # Nothing to dispatch: go straight to the composer.
+            if not response.intents:
                 break
 
             try:
@@ -186,6 +197,14 @@ class AgentLoop:
                 return LoopOutcome(kind="mcp_unavailable", reply=_MCP_UNAVAILABLE_REPLY)
             aggregated.extend(results)
             self._record_tool_round(results)
+
+            # Intents bundled with compose=true (#915): the tools above
+            # have now run, so this round composes rather than costing an
+            # extra router pass. Recording the round above keeps history
+            # identical to the two-round path — the break below guarantees
+            # no second router pass, so there is no duplicate turn.
+            if response.compose:
+                break
         else:
             # Exhausted max_rounds without the router setting compose=true.
             _LOGGER.warning(
