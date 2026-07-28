@@ -81,12 +81,37 @@ The structured queue at `<source>/.creek-redactions/queue.json` is what `--apply
 
 For every queued match:
 
-1. Replaces the match with the marker rendered from `RedactionConfig.replacement_template` (default `[REDACTED:{name}]`; `{name}` is the pattern key — e.g. `credit_card`, `ipv4`, `high_entropy_string`).
+1. Replaces the match with the marker rendered from
+   `RedactionConfig.replacement_template` (default `[REDACTED:{name}]`;
+   `{name}` is the pattern key — e.g. `credit_card`, `ipv4`,
+   `high_entropy_string`). Matches that truly overlap — including ones the
+   generic high-entropy detector finds — are unioned into a single region
+   and replaced as one, labelled with the most severe contributing
+   pattern's name; an AWS key with a high-entropy tail is removed whole as
+   `[REDACTED:api_key]` rather than leaving the tail in cleartext. Before
+   merging, any match whose start or end falls strictly inside a
+   contiguous high-entropy candidate run (base64url-ish, 20+ characters)
+   is widened out to that run's edge, so a match can never bisect one
+   token. This holds regardless of `min_confidence`: without it, a
+   low-entropy tail glued to a secret (e.g. an AWS key followed by a run
+   of the same character) would evade the entropy detector entirely and
+   leak in cleartext. Strings on `false_positive_allowlist` are exempt
+   from this widening — a regex match inside such a string still redacts
+   only its own span.
 2. Marks the queue entry as `applied: true` and stamps the timestamp.
 3. Refuses to write through symlinks (path-traversal guard): before any
    file is read or rewritten the source tree is walked and the run is
    aborted if any descendant symlink resolves outside the source root.
    The same guard is applied to `creek redact --review`.
+
+Because of that widening, `--apply` may redact slightly **more** than
+`--scan` reported — the marker can extend past the reported match to the
+end of the surrounding token. Concretely: a 20-character API key glued
+directly to a longer token is removed whole as a single
+`[REDACTED:api_key]`, not left half-redacted. This is deliberate,
+fail-closed behaviour — a missed secret is unrecoverable once written,
+whereas over-redaction is visible in the output and fixable by adding the
+token to `false_positive_allowlist`.
 
 `--dry-run` walks the queue without modifying any source file — useful for sanity-checking a big batch before committing.
 
