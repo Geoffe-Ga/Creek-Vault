@@ -242,7 +242,7 @@ The ingestion pipeline currently ships **11** registered `Ingestor`s plus a read
 
 `claude`, `chatgpt`, `discord`, `code`, `document` (.docx / .pdf), `markdown`, `spreadsheet` (.xlsx / .csv), `presentation` (.pptx), `image` (with OCR), `substack` (newsletter exports), and `generic` (fallback for unknown text).
 
-`gdrive` is a downloader, not an ingestor — it stages files locally and dispatches each one to the appropriate ingestor by extension. The `other` enum value on `SourcePlatform` is reserved for downstream consumers (e.g. fragments synthesised from praxes) and has no parser.
+`gdrive` is a downloader, not an ingestor — it stages files locally and dispatches each one to the appropriate ingestor by extension. The `other` enum value on `SourcePlatform` is what the `generic` fallback ingestor writes, and it also covers downstream consumers (e.g. fragments synthesised from praxes).
 
 Each ingestor follows the same four-stage contract — `discover` → `parse` → `convert_to_markdown` → `generate_frontmatter` — and writes one fragment per logical unit (per chat thread, per sheet, per slide deck, per file). See [`docs/ingestion.md`](docs/ingestion.md) for which is right for which export.
 

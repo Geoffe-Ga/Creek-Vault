@@ -59,6 +59,14 @@ creek ingest --type code         --input ~/projects/diary     --vault ~/Obsidian
 - The OCR backend is **injectable**: swap in a different engine by implementing `creek.ingest.images.OcrEngine` and passing it to `ImageIngestor(backend=…)`. Useful for tests and for trying alternative OCR engines.
 - Confidence below `OCRConfig.min_confidence` lands the fragment in the review queue.
 
+## Generic (`generic`)
+
+- Fallback for any file whose extension no other ingestor claims (`.txt`, `.log`, plain text, and anything not in the specialized ingestors' extension sets). Binary files (detected via a null-byte / control-character heuristic) and empty or whitespace-only files are skipped — no fragment is written.
+- Routes to `01-Fragments/Unsorted/` with `source.platform: other` (`SourcePlatform.OTHER`).
+- The fragment id is derived from the file's **mtime**, not the wall-clock time you ran `creek ingest` — re-ingesting an unchanged file reuses the same mtime and therefore the same id, so the write is a genuine no-op. (Wall clock is used only as a fallback for a pathless/synthetic document where `stat()` fails.)
+- `created` and `authored_at` in the frontmatter are both the file's mtime, kept in UTC.
+- Known limitation: this source has no ingest ledger (see [Idempotency](#idempotency)), so a bare `touch` — or any edit — bumps the mtime and mints a *new* fragment rather than updating the existing one. Tracked in [#953](https://github.com/Geoffe-Ga/Creek-Vault/issues/953).
+
 ## Google Drive
 
 `creek gdrive` is a **read-only** Drive mirror. It uses OAuth, caches the refresh token at `GoogleDriveConfig.token_file` (`0o600`), and writes nothing back to Drive.
@@ -79,7 +87,9 @@ Subsequent `--download` runs are **incremental** — unchanged files are skipped
 
 ## Idempotency
 
-Every ingestor produces deterministic fragment IDs (`SHA-256(source, timestamp, content)[:12]`), so re-running `creek ingest` against the same input only writes fragments whose content has actually changed. This is what lets `creek process` be safe to run on a cron.
+Fragment IDs are deterministic — `SHA-256(source, timestamp, content)[:12]` — so identity is stable only if `timestamp` is. Every ingestor derives `timestamp` from the source itself rather than from wall clock: the message's own epoch for conversation exports (Claude/ChatGPT/Discord), and the file's own metadata (frontmatter date, creation time, or modification time, depending on the ingestor) for file-based sources. Re-running `creek ingest` against unchanged input reuses the same ids and writes nothing new, which is what lets `creek process` be safe to run on a cron.
+
+The caveat: a source keyed on mtime treats *any* filesystem touch as a change, not just a meaningful edit — see [Generic](#generic-generic) for the concrete case. Ledger-backed sources avoid this: the markdown (journal) source tracks a stable `source_key` per file in a per-source ledger and, on a changed mtime, **updates the existing fragment in place** (preserving its id, classifications, and links) instead of minting a duplicate — see [`docs/idempotent-ingest.md`](idempotent-ingest.md). `generic` doesn't have a ledger yet, so for it, mtime-keyed identity only buys "unchanged file re-ingests as a no-op," not "edited file updates in place" ([#953](https://github.com/Geoffe-Ga/Creek-Vault/issues/953)).
 
 ## AI-chat attribution (per turn)
 

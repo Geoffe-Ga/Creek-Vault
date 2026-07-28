@@ -4,7 +4,7 @@ Handles files that are not claimed by any specialized ingestor (Markdown,
 ChatGPT, Claude, Discord).  Attempts text reading with multiple encoding
 strategies (UTF-8, UTF-16, Latin-1, chardet fallback), skips binary files,
 and routes unclassified content to ``01-Fragments/Unsorted/`` with
-``source.platform: "unknown"`` in frontmatter.
+``source.platform: "other"`` in frontmatter.
 
 Exports:
     GenericIngestor: Concrete ``Ingestor`` subclass for unclaimed files.
@@ -30,6 +30,7 @@ from creek.ingest.base import (
     file_modified_time,
     normalize_encoding,
 )
+from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ class GenericIngestor(Ingestor):
     Discovers all files whose extensions are not in ``_CLAIMED_EXTENSIONS``,
     attempts multi-encoding text decoding, skips binary files, and routes
     successfully parsed content to ``01-Fragments/Unsorted/`` with
-    ``source.platform: "unknown"``.
+    ``source.platform: "other"``.
     """
 
     def discover(self, source_path: Path) -> list[RawDocument]:
@@ -226,6 +227,30 @@ class GenericIngestor(Ingestor):
         on disk: those produce ``authored_at = None`` rather than
         raising.
 
+        Issue #911 — re-ingest identity contract. The mtime is stamped on
+        ``timestamp`` as well, because
+        :func:`creek.ingest.base.generate_fragment_id` hashes
+        ``timestamp.isoformat()``: keying it on ``datetime.now()`` made every
+        re-ingest of an *unchanged* file mint a fresh id and write a duplicate
+        fragment. Derived from the mtime, an unchanged file re-ingests to the
+        same deterministic id and the write is a no-op.
+
+        The mtime is used verbatim in UTC — never converted to
+        :data:`~creek.ingest.base.LA_TZ` — because the UTC offset string is
+        part of the hashed input. ``datetime.fromtimestamp(st_mtime, tz=UTC)``
+        is a pure function of the epoch float, so identity does not vary with
+        the host's tzdata, ``TZ`` env var, or DST state; rendering in LA would
+        bake ``-07:00``/``-08:00`` into the hash.
+
+        Known limitation: the generic source has no ingest ledger, so a bare
+        ``touch`` (or any edit) bumps the mtime and therefore mints a new
+        fragment rather than updating the existing one. Ledger-backed
+        update-in-place is tracked in issue #953.
+
+        The wall clock survives only as the fallback for the pathless /
+        synthetic case where ``stat()`` fails: there is no mtime to key on, so
+        ``timestamp`` is ``now`` and ``authored_at`` stays honestly ``None``.
+
         Args:
             raw: The raw document to parse.
 
@@ -244,8 +269,10 @@ class GenericIngestor(Ingestor):
         if not text.strip():
             return []
 
-        now = datetime.now(tz=LA_TZ)
+        # One stat, two uses: the same mtime is both the honest authored_at and
+        # the identity-bearing timestamp (issue #911). Kept in UTC verbatim.
         authored_at = _safe_file_mtime(raw.path)
+        timestamp = authored_at if authored_at is not None else datetime.now(tz=LA_TZ)
         return [
             ParsedFragment(
                 content=text,
@@ -255,7 +282,7 @@ class GenericIngestor(Ingestor):
                     "authored_at": authored_at,
                 },
                 source_path=str(raw.path),
-                timestamp=now,
+                timestamp=timestamp,
             )
         ]
 
@@ -282,11 +309,25 @@ class GenericIngestor(Ingestor):
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Generate YAML frontmatter for an unclaimed file.
 
-        Sets ``source.platform`` to ``"unknown"`` and routes to
-        ``01-Fragments/Unsorted/``. FEAT-031 (issue #335): emits
-        ``authored_at`` as an ISO string when the parse stage
-        captured the file's mtime; omits the key when the metadata
-        value is missing or ``None`` (honest absence).
+        Sets ``source.platform`` to :data:`~creek.models.SourcePlatform.OTHER`
+        (``"other"``) and routes to ``01-Fragments/Unsorted/``. Issue #911:
+        this previously emitted ``"unknown"``, which is not a
+        :class:`~creek.models.SourcePlatform` member at all, so
+        ``assemble_ingested_fragment`` raised a pydantic ``ValidationError``
+        that ``run_ingest`` swallowed into ``result.errors`` — generic
+        fragments never reached the vault. ``OTHER`` is the enum's fallback
+        member and maps to the same ``Unsorted`` subfolder, so the routing
+        target is unchanged.
+
+        FEAT-031 (issue #335): emits ``authored_at`` as an ISO string
+        when the parse stage captured the file's mtime; omits the key
+        when the metadata value is missing or ``None`` (honest absence).
+
+        ``created`` is the parse-stage ``timestamp``, i.e. the file's mtime in
+        UTC since #911. That is deliberate: :mod:`creek.time` documents that
+        ``created`` is not part of the authored-at precedence chain (all
+        time-bucketing routes through ``effective_authored_at``), and the other
+        file-based ingestors already key on mtime.
 
         Args:
             fragment: The parsed fragment.
@@ -299,7 +340,7 @@ class GenericIngestor(Ingestor):
             "type": "fragment",
             "title": title,
             "source": {
-                "platform": "unknown",
+                "platform": SourcePlatform.OTHER,
                 "original_file": fragment.source_path,
             },
             "created": fragment.timestamp.isoformat(),
