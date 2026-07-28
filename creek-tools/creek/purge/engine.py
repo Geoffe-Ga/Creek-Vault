@@ -37,6 +37,7 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 from pydantic import BaseModel, Field
 
 from creek.ingest.journal_staging import JOURNAL_STAGING_RELDIR
@@ -123,6 +124,29 @@ must tolerate nested-list entries (or skip purged drafts). The
 regression test ``test_purged_marker_reparses_as_nested_list_in_yaml``
 pins this trade-off so a future marker swap has to update the test and
 this docstring together.
+"""
+
+_FRONTMATTER_LOAD_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    TypeError,
+    ValueError,
+    yaml.YAMLError,
+)
+"""Exceptions a hand-edited or corrupt vault file raises out of ``frontmatter.load``.
+
+Widens the house ``(OSError, ValueError, yaml.YAMLError)`` tuple with
+``TypeError``, which is load-bearing here and must never be dropped:
+``frontmatter.load`` splats the parsed metadata as
+``Post(content, handler, **metadata)``, so frontmatter carrying a
+non-string key — a bare YAML date like ``2024-05-01: note``, a realistic
+hand-edited-vault case — parses to a ``datetime.date`` key and raises a
+plain ``TypeError: keywords must be strings`` that the house tuple
+misses (precedent: PR #927 / issue #847).
+
+``UnicodeDecodeError`` is a ``ValueError`` subclass and is therefore
+covered deliberately: a file whose *body* carries non-UTF-8 bytes fails
+at read time, before its (possibly byte-clean ASCII) frontmatter block
+is ever parsed.
 """
 
 
@@ -453,7 +477,7 @@ class PurgeEngine:
         def body() -> None:
             """Run the date-range destructive ops, mutating ``result``."""
             for frag_file in self._list_fragment_files():
-                post = self._load_frontmatter(frag_file)
+                post = self._load_frontmatter_for_match(frag_file)
                 if post is None:
                     continue
                 created = _coerce_date(post.get("created"))
@@ -793,7 +817,7 @@ class PurgeEngine:
             Tuple of ``(path, post)`` or ``(None, None)`` if not found.
         """
         for frag_file in self._list_fragment_files():
-            post = self._load_frontmatter(frag_file)
+            post = self._load_frontmatter_for_match(frag_file)
             if post is not None and post.get("id") == fragment_id:
                 return frag_file, post
         return None, None
@@ -812,7 +836,7 @@ class PurgeEngine:
         """
         matches: list[tuple[Path, frontmatter.Post]] = []
         for frag_file in self._list_fragment_files():
-            post = self._load_frontmatter(frag_file)
+            post = self._load_frontmatter_for_match(frag_file)
             if post is None:
                 continue
             if _extract_source_platform(post) == source_type:
@@ -841,7 +865,7 @@ class PurgeEngine:
         predicate = _build_source_path_matcher(source_path, match=match)
         matches: list[tuple[Path, frontmatter.Post]] = []
         for frag_file in self._list_fragment_files():
-            post = self._load_frontmatter(frag_file)
+            post = self._load_frontmatter_for_match(frag_file)
             if post is None:
                 continue
             original_file = _extract_source_original_file(post)
@@ -871,18 +895,114 @@ class PurgeEngine:
         return sorted(self.vault_path.rglob("*.md"))
 
     def _load_frontmatter(self, path: Path) -> frontmatter.Post | None:
-        """Read a frontmatter post from disk, tolerating bad files.
+        """Read a frontmatter post byte-faithfully, tolerating bad files.
+
+        The **write-safe** loader, for the callers that rewrite the post
+        in place (``purge_classifications`` and :meth:`_decrement_counts`
+        both do ``frontmatter.dumps`` + ``write_text``). A file this
+        cannot decode is skipped rather than salvaged, because re-encoding
+        a lossy read would overwrite the operator's original bytes during
+        a non-destructive metadata reset. Callers that only ever
+        ``unlink`` the file must use :meth:`_load_frontmatter_for_match`.
 
         Args:
             path: Path to a markdown file.
 
         Returns:
-            Parsed :class:`frontmatter.Post`, or ``None`` on failure.
+            Parsed :class:`frontmatter.Post`, or ``None`` when the file
+            cannot be read or parsed.
         """
         try:
             return frontmatter.load(str(path))
-        except Exception:
-            logger.debug("Unable to parse frontmatter in %s", path)
+        except _FRONTMATTER_LOAD_ERRORS as exc:
+            # Log the exception *type* only: yaml.MarkedYAMLError
+            # stringifies with the offending source snippet, which would
+            # copy vault content into the log.
+            logger.warning(
+                "Unable to parse frontmatter in %s (%s); leaving it untouched",
+                path,
+                type(exc).__name__,
+            )
+            return None
+
+    def _load_frontmatter_for_match(self, path: Path) -> frontmatter.Post | None:
+        """Read a post for a *delete decision only* — never write it back.
+
+        The returned :class:`frontmatter.Post` may be **lossy**: when the
+        file is not valid UTF-8, its body is re-read with
+        ``errors="replace"`` so every offending byte becomes U+FFFD.
+        Writing such a post back to disk would destroy the operator's
+        original bytes, so this loader exists solely to decide whether a
+        file matches the purge criteria before it is ``unlink``-ed. The
+        rewrite paths use :meth:`_load_frontmatter` instead.
+
+        The lossy read is safe for that one job because a purge match is
+        a function of *frontmatter metadata* only — ``id``,
+        ``source.platform``, ``source.original_file``, ``created`` — and
+        never of the body. Replacing bad body bytes therefore cannot
+        change the outcome; it can only stop a matching fragment from
+        escaping the purge with its private body intact, which is the
+        right-to-be-forgotten failure this exists to close (#910).
+
+        Args:
+            path: Path to a markdown file.
+
+        Returns:
+            Parsed :class:`frontmatter.Post` — lossy in the body when the
+            file was not valid UTF-8 — or ``None`` when the frontmatter
+            cannot be parsed at all. ``None`` means "matches nothing", so
+            an unreadable file is left on disk rather than deleted.
+        """
+        try:
+            return frontmatter.load(str(path))
+        except UnicodeDecodeError:
+            # Degrading to a lossy read on an RTBF-critical path is an
+            # operator-visible event, so name the file at WARNING.
+            logger.warning(
+                "Body of %s is not valid UTF-8; re-reading it lossily to test it "
+                "against the purge criteria (the file itself is never rewritten)",
+                path,
+            )
+            return self._load_frontmatter_lossily(path)
+        except _FRONTMATTER_LOAD_ERRORS as exc:
+            # Type name only — never str(exc); see _load_frontmatter.
+            logger.warning(
+                "Unable to parse frontmatter in %s (%s); leaving it untouched",
+                path,
+                type(exc).__name__,
+            )
+            return None
+
+    def _load_frontmatter_lossily(self, path: Path) -> frontmatter.Post | None:
+        """Re-read an undecodable file, replacing its bad bytes with U+FFFD.
+
+        The retry half of :meth:`_load_frontmatter_for_match`, and subject
+        to the same prohibition: the returned post's content is lossy and
+        must never be written back to disk.
+
+        Args:
+            path: Path to a markdown file that failed to decode as UTF-8.
+
+        Returns:
+            Parsed :class:`frontmatter.Post` with invalid bytes replaced,
+            or ``None`` when the file is *also* unparseable as
+            frontmatter and so can match no purge criteria.
+        """
+        try:
+            # Go through the file object rather than decoding bytes and
+            # calling ``frontmatter.loads``: ``frontmatter.load`` is itself
+            # ``open(...)`` + ``loads(text)``, so this keeps it the single
+            # parse entry point and preserves universal-newline handling,
+            # leaving a CRLF vault file identical on both paths.
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                return frontmatter.load(handle)
+        except _FRONTMATTER_LOAD_ERRORS as exc:
+            # Both undecodable *and* unparseable: no criteria can match.
+            logger.warning(
+                "Unable to parse frontmatter in %s (%s); leaving it untouched",
+                path,
+                type(exc).__name__,
+            )
             return None
 
     def _scrub_references(
@@ -959,11 +1079,26 @@ class PurgeEngine:
 
         Returns:
             A ``(wikilinks_removed, provenance_scrubbed)`` count pair for
-            this file. ``(0, 0)`` when the file cannot be read.
+            this file. ``(0, 0)`` when the file cannot be read or is not
+            valid UTF-8.
         """
         try:
             text = md_file.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError) as exc:
+            # Skipping is the only safe response to an undecodable file:
+            # this method writes ``text`` back, so an ``errors="replace"``
+            # read here would persist U+FFFD over the operator's bytes.
+            # A reference living inside such a file therefore survives
+            # unscrubbed: an accepted trade-off, since the alternative is
+            # corrupting the file — and far better than raising, which
+            # would abort the purge before the target is even unlinked.
+            # Type name only, never str(exc): the message can quote file
+            # content (possibly the very secret being purged).
+            logger.warning(
+                "Skipping unreadable file during reference scrub: %s (%s)",
+                md_file,
+                type(exc).__name__,
+            )
             return 0, 0
         wiki_count = prov_count = 0
         if wiki_pattern is not None:

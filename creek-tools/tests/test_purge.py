@@ -9,6 +9,7 @@ corpora per test.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -237,6 +238,99 @@ def _write_eddy(
     )
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
+
+
+# ---------------------------------------------------------------------------
+# Undecodable-body fixtures (#910)
+# ---------------------------------------------------------------------------
+
+_UNDECODABLE_BYTES = b"\xff\xfe"
+"""Raw bytes that are not valid UTF-8 anywhere in a byte stream (#910).
+
+Injected into fragment *bodies* only. A file carrying these bytes makes
+``frontmatter.load`` raise ``UnicodeDecodeError`` at read time — before
+the (perfectly well-formed, byte-clean ASCII) YAML frontmatter block is
+ever parsed.
+"""
+
+_UNDECODABLE_SECRET = "synthetic-undecodable-secret-910"
+"""Synthetic marker standing in for private body content — never real data."""
+
+
+def _write_fragment_with_undecodable_body(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    platform: str = "claude",
+    subfolder: str = "Conversations",
+    created: datetime | None = None,
+    threads: list[str] | None = None,
+    eddies: list[str] | None = None,
+    secret: str = _UNDECODABLE_SECRET,
+) -> tuple[Path, bytes]:
+    """Write a house-schema fragment whose *body* is not valid UTF-8 (#910).
+
+    Builds the fragment through :func:`_write_fragment` so the
+    frontmatter matches the house schema exactly, then re-writes the
+    file with :data:`_UNDECODABLE_BYTES` appended to the body. Because
+    the injection happens strictly after the closing ``---`` delimiter,
+    the YAML frontmatter block stays byte-clean ASCII — that is
+    precisely the class under test: well-formed metadata, undecodable
+    body.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID.
+        title: Fragment title (also the filename stem).
+        platform: Source platform recorded in ``source.platform``.
+        subfolder: Subfolder under ``01-Fragments/``.
+        created: Optional creation datetime (for date-range matching).
+        threads: Optional list of thread IDs the fragment belongs to.
+        eddies: Optional list of eddy IDs.
+        secret: Marker text embedded in the body so tests can prove the
+            private content really left the vault.
+
+    Returns:
+        Tuple of ``(path, exact_bytes_written)`` so callers can assert
+        byte-for-byte equality after a purge that must not touch it.
+    """
+    path = _write_fragment(
+        vault,
+        frag_id,
+        title,
+        platform=platform,
+        subfolder=subfolder,
+        created=created,
+        threads=threads,
+        eddies=eddies,
+        body=f"Body carrying {secret} here.",
+    )
+    raw = path.read_bytes() + _UNDECODABLE_BYTES + b"\n"
+    path.write_bytes(raw)
+    return path, raw
+
+
+def _vault_files_containing_bytes(vault: Path, needle: bytes) -> list[Path]:
+    """Return every vault markdown file whose *bytes* still carry *needle*.
+
+    The byte-level sibling of :func:`_vault_files_containing_secret`,
+    which cannot be reused here: it decodes with
+    ``read_text(encoding="utf-8")`` and would itself raise
+    ``UnicodeDecodeError`` on the very fixtures under test (#910).
+
+    Args:
+        vault: Vault root to walk.
+        needle: Byte sequence that must survive nowhere under the vault.
+
+    Returns:
+        Offending paths — empty when the purge honored the RTBF request.
+    """
+    return [
+        md_file
+        for md_file in sorted(vault.rglob("*.md"))
+        if needle in md_file.read_bytes()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3001,3 +3095,369 @@ def test_purge_single_walks_vault_once_per_fragment(
 
     # Two fragments purged → at most one walk each.
     assert calls <= 2
+
+
+# ---------------------------------------------------------------------------
+# Engine tests — fragments whose body is not valid UTF-8 (#910)
+# ---------------------------------------------------------------------------
+
+
+def test_source_purge_deletes_fragment_with_undecodable_body(
+    tmp_path: Path,
+) -> None:
+    """A matching fragment with an undecodable body is really deleted (#910).
+
+    The headline RTBF failure: ``frontmatter.load`` raises
+    ``UnicodeDecodeError`` on the body even though the frontmatter is
+    well-formed ASCII, the engine treats the unreadable load as "skip
+    this file", and the matching fragment survives with its private
+    body on disk.
+    """
+    vault = _make_vault(tmp_path)
+    frag, _raw = _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    # The RTBF core: the private body survives NOWHERE under the vault.
+    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+
+
+def test_source_purge_audit_records_the_undecodable_deletion(
+    tmp_path: Path,
+) -> None:
+    """The outcome entry counts the undecodable fragment it deleted (#910).
+
+    The "reports success" half of the bug: today the outcome line says
+    ``status="complete"`` with ``fragments_deleted=0`` and an empty
+    ``affected_fragments``, so the compliance record claims a clean
+    purge while the fragment is still on disk.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    engine.purge_source("claude")
+
+    entries = PurgeAuditLog(vault).read()
+    assert len(entries) == 2
+    intent, outcome = entries
+    assert intent.phase == "intent"
+    assert outcome.phase == "outcome"
+    assert outcome.status == "complete"
+    assert outcome.operation == "source"
+    assert outcome.criteria == {"source_type": "claude"}
+    assert outcome.affected_fragments == ["frag-A"]
+    assert outcome.fragments_deleted == 1
+
+
+def test_fragment_purge_finds_fragment_with_undecodable_body(
+    tmp_path: Path,
+) -> None:
+    """``purge_fragment`` locates a fragment whose body is undecodable (#910).
+
+    Pins ``_find_fragment_by_id``: an unreadable load there makes the
+    targeted single-fragment purge report "not found".
+    """
+    vault = _make_vault(tmp_path)
+    frag, _raw = _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+
+
+def test_source_path_purge_deletes_fragment_with_undecodable_body(
+    tmp_path: Path,
+) -> None:
+    """``purge_source_path`` deletes an undecodable-bodied match (#910).
+
+    ``_write_fragment`` records ``source.original_file`` as
+    ``"<frag_id>.json"``, so ``"frag-A.json"`` is the exact path the
+    seeded fragment carries. Pins ``_fragments_from_source_path``.
+    """
+    vault = _make_vault(tmp_path)
+    frag, _raw = _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source_path("frag-A.json", match="exact")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+
+
+def test_daterange_purge_deletes_fragment_with_undecodable_body(
+    tmp_path: Path,
+) -> None:
+    """A date-range purge deletes an in-range undecodable fragment (#910).
+
+    Pins ``purge_daterange``'s inline frontmatter load: skipping the
+    file means its ``created`` date is never even compared.
+    """
+    vault = _make_vault(tmp_path)
+    frag, _raw = _write_fragment_with_undecodable_body(
+        vault,
+        "frag-A",
+        "Alpha",
+        created=datetime(2024, 6, 1, tzinfo=UTC),
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_daterange(date(2024, 5, 1), date(2024, 12, 31))
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+
+
+def test_source_purge_leaves_undecodable_nonmatching_fragment_intact(
+    tmp_path: Path,
+) -> None:
+    """Failing closed must not over-delete a non-matching fragment (#910).
+
+    The undecodable fragment belongs to ``discord``, so a ``claude``
+    purge must leave it byte-for-byte untouched — including through the
+    vault-wide wiki-link/provenance scrub walk that visits it while
+    deleting the matching fragment.
+    """
+    vault = _make_vault(tmp_path)
+    keeper = _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    other, other_bytes = _write_fragment_with_undecodable_body(
+        vault,
+        "frag-B",
+        "Bravo",
+        platform="discord",
+        subfolder="Messages",
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.fragments_affected == 1
+    assert not keeper.exists()
+    assert other.exists()
+    assert other.read_bytes() == other_bytes
+
+
+def test_source_purge_skips_file_with_no_parseable_frontmatter(
+    tmp_path: Path,
+) -> None:
+    """Unreadable garbage under ``01-Fragments/`` is skipped, not deleted (#910).
+
+    "Fail closed" means *match* the fragments whose metadata is sound
+    even when the body is undecodable — it must never mean "delete
+    everything the parser cannot read". A delimiter-less file does not
+    raise: ``python-frontmatter`` parses it as empty metadata, so it
+    exposes none of the criteria surfaces (``source.platform`` here)
+    and matches nothing. Either way it must survive intact.
+    """
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    garbage = vault / "01-Fragments" / "Conversations" / "garbage.md"
+    garbage_bytes = b"\xff\xfe not yaml at all"
+    garbage.write_bytes(garbage_bytes)
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert garbage.exists()
+    assert garbage.read_bytes() == garbage_bytes
+
+
+def test_source_purge_skips_undecodable_file_with_malformed_yaml(
+    tmp_path: Path,
+) -> None:
+    """A file that is neither decodable nor parseable is left on disk (#910).
+
+    Pins the retry half of the frontmatter load: the invalid bytes make
+    the strict read raise ``UnicodeDecodeError``, and the unterminated
+    YAML flow sequence makes the lossy re-read raise as well, so *both*
+    arms run and the engine ends up with no metadata at all. A file the
+    engine cannot read matches no purge criteria, so it survives intact.
+
+    This is the deliberate boundary of "fail closed". Failing closed
+    resolves ambiguity *within* the criteria — that is exactly what the
+    lossy re-read buys: a fragment whose metadata is sound still gets
+    matched despite an undecodable body. It does not license deleting
+    files by absence of evidence, which on a *scoped* purge would be
+    unbounded collateral loss. The operator's total-RTBF hammer,
+    ``purge_vault``, still reaches such files, because it wipes folder
+    contents without ever parsing frontmatter.
+    """
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    unreadable = vault / "01-Fragments" / "Conversations" / "unreadable.md"
+    raw = b"---\ntitle: [unclosed \xff\xfe\n---\nsecret body\n"
+    unreadable.write_bytes(raw)
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert unreadable.exists()
+    assert unreadable.read_bytes() == raw
+
+
+def test_classifications_purge_does_not_corrupt_undecodable_fragment(
+    tmp_path: Path,
+) -> None:
+    """The classification rewrite path must never re-encode a bad file (#910).
+
+    This test is GREEN today **on purpose** — it is a regression guard,
+    not a dead test. ``purge_classifications`` rewrites fragments in
+    place via ``frontmatter.dumps`` + ``write_text``. If anyone makes
+    the frontmatter helper this path uses lossy (``errors="replace"``),
+    every undecodable byte would be silently rewritten as U+FFFD over
+    the operator's original file — data loss. The byte-equality
+    assertion fails the instant that happens.
+    """
+    vault = _make_vault(tmp_path)
+    frag, raw = _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_classifications()
+
+    assert result.classifications_reset == 0
+    assert frag.read_bytes() == raw
+
+
+def test_decrement_counts_does_not_corrupt_undecodable_thread_file(
+    tmp_path: Path,
+) -> None:
+    """A thread file with an undecodable body survives a purge intact (#910).
+
+    ``_decrement_counts`` is the second in-place rewrite path. An
+    unreadable thread file must be skipped (count not decremented)
+    rather than crashing the purge or being re-encoded lossily, while
+    the fragment itself is still deleted.
+    """
+    vault = _make_vault(tmp_path)
+    thread = _write_thread(vault, "thread-1", "Waves", fragment_count=3)
+    thread_bytes = thread.read_bytes() + _UNDECODABLE_BYTES + b"\n"
+    thread.write_bytes(thread_bytes)
+    frag = _write_fragment(vault, "frag-A", "Alpha", threads=["thread-1"])
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert result.threads_updated == 0
+    assert thread.read_bytes() == thread_bytes
+
+
+def test_source_purge_survives_two_undecodable_matching_fragments(
+    tmp_path: Path,
+) -> None:
+    """Two undecodable matches are both deleted without raising (#910).
+
+    Once matching stops skipping these files, deleting the first one
+    walks the vault to scrub references — and that walk now reaches the
+    *second* undecodable file. Pins that the scrub tolerates it instead
+    of aborting the purge half-done.
+    """
+    vault = _make_vault(tmp_path)
+    first, _first_raw = _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    second, _second_raw = _write_fragment_with_undecodable_body(
+        vault,
+        "frag-B",
+        "Bravo",
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.fragments_affected == 2
+    assert not first.exists()
+    assert not second.exists()
+    assert _vault_files_containing_bytes(vault, _UNDECODABLE_SECRET.encode()) == []
+    outcome = PurgeAuditLog(vault).read()[-1]
+    assert outcome.status == "complete"
+    assert outcome.fragments_deleted == 2
+    assert sorted(outcome.affected_fragments) == ["frag-A", "frag-B"]
+
+
+def test_purge_tolerates_bare_yaml_date_key_without_crashing(
+    tmp_path: Path,
+) -> None:
+    """A bare YAML date key raises ``TypeError``, which must stay tolerated.
+
+    ``2024-05-01: note`` parses to a ``datetime.date`` *key*, and
+    ``frontmatter`` then splats the mapping as keyword arguments —
+    ``TypeError: keywords must be strings``. GREEN today; it guards the
+    narrowing of the engine's bare ``except Exception`` so nobody drops
+    ``TypeError`` from the tolerated tuple (precedent: PR #927 /
+    issue #847). The odd file contributes zero resets while a normal
+    sibling still resets.
+    """
+    vault = _make_vault(tmp_path)
+    odd = vault / "01-Fragments" / "Conversations" / "odd.md"
+    odd_text = "---\n2024-05-01: note\n---\nbody\n"
+    odd.write_text(odd_text, encoding="utf-8")
+    _write_fragment(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_classifications()
+
+    assert result.classifications_reset == 1
+    assert result.affected_fragment_ids == ["frag-A"]
+    assert odd.read_text(encoding="utf-8") == odd_text
+
+
+def test_purge_tolerates_malformed_yaml_without_crashing(
+    tmp_path: Path,
+) -> None:
+    """Genuinely invalid YAML frontmatter is skipped, not deleted (#910).
+
+    An unterminated flow sequence raises ``yaml.YAMLError``. GREEN
+    today; it pins ``yaml.YAMLError`` into the tolerated-error tuple
+    that replaces the bare ``except Exception``, and pins that a file
+    the engine cannot classify is left alone rather than purged.
+    """
+    vault = _make_vault(tmp_path)
+    broken = vault / "01-Fragments" / "Conversations" / "broken.md"
+    broken_text = "---\ntitle: [unclosed\n---\nA body with no links.\n"
+    broken.write_text(broken_text, encoding="utf-8")
+    frag = _write_fragment(vault, "frag-A", "Alpha", platform="claude")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("claude")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert broken.exists()
+    assert broken.read_text(encoding="utf-8") == broken_text
+
+
+def test_source_purge_warns_when_fragment_body_is_undecodable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An undecodable body is a WARNING, not a debug whisper (#910).
+
+    Silently degrading to a lossy read on an RTBF-critical path is an
+    operator-visible event: the log must name the offending file so it
+    can be inspected. Asserts on level and path only — never on wording.
+    """
+    vault = _make_vault(tmp_path)
+    frag, _raw = _write_fragment_with_undecodable_body(vault, "frag-A", "Alpha")
+    engine = PurgeEngine(vault)
+
+    with caplog.at_level(logging.WARNING, logger="creek.purge.engine"):
+        engine.purge_source("claude")
+
+    naming_the_file = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and str(frag) in record.getMessage()
+    ]
+    assert len(naming_the_file) >= 1
