@@ -657,6 +657,54 @@ class PurgeEngine:
         if not self.dry_run:
             frag_file.unlink()
 
+    def _resolve_pointer_in_vault(self, pointer: str, *, field: str) -> Path | None:
+        """Resolve a frontmatter-supplied path pointer inside the vault.
+
+        Pointers such as ``saved_from.intimate_body_pointer`` and
+        ``source.origin_key`` are vault *content*: an operator (or
+        anyone who can write one note) controls their text, so they are
+        untrusted input to a destructive path. This helper turns such a
+        pointer into an absolute path only when it is safe to follow —
+        a refusal is a no-op, never an error, per the purge engine's
+        "a missing or bad pointer is skipped" contract.
+
+        A pointer is refused when it cannot be resolved at all (an
+        embedded NUL byte makes :meth:`~pathlib.Path.resolve` raise
+        ``ValueError``; a resolution loop or unreadable component
+        raises ``OSError``) or when it resolves outside the vault root.
+        Both refusals are logged at WARNING so an ignored pointer is
+        distinguishable from a sweep that never ran.
+
+        Args:
+            pointer: Vault-relative path string taken from frontmatter.
+            field: Frontmatter field name the pointer came from, used
+                verbatim in the refusal logs so operators can grep for
+                the field that carried the bad value.
+
+        Returns:
+            The resolved absolute path, or ``None`` meaning *refuse* —
+            the caller must not follow this pointer.
+        """
+        try:
+            resolved = (self.vault_path / pointer).resolve()
+        except (OSError, ValueError):
+            logger.warning(
+                "Ignoring %s %r that cannot be resolved to a path",
+                field,
+                pointer,
+            )
+            return None
+        vault_root = self.vault_path.resolve()
+        if not resolved.is_relative_to(vault_root):
+            logger.warning(
+                "Ignoring %s %r that resolves outside the vault root %s",
+                field,
+                pointer,
+                vault_root,
+            )
+            return None
+        return resolved
+
     def _purge_intimate_stub(
         self,
         post: frontmatter.Post,
@@ -673,10 +721,19 @@ class PurgeEngine:
         right-to-be-forgotten request.
 
         The method is defensive: a missing or empty pointer, an
-        already-deleted stub, and a pointer that resolves outside the
-        vault root are all treated as no-ops rather than errors. The
-        last case prevents a hand-edited or malicious pointer
-        (``../../secret``) from steering a delete outside the vault.
+        unresolvable pointer, an already-deleted stub, and a pointer
+        that resolves outside the vault root are all treated as no-ops
+        rather than errors. A second containment guard additionally
+        scopes deletion to the canonical stub directory itself, so a
+        hand-edited or malicious pointer (``../../secret``,
+        ``00-Creek-Meta/creek_config.yaml``, or a ``..`` walk back out
+        of the stub dir) can never steer a delete at an arbitrary file.
+
+        That guard is deliberately fail-closed, with one accepted side
+        effect: a hand-authored stub parked *outside* the canonical
+        directory now survives the purge. That is the safe direction —
+        the note itself is still deleted, so the RTBF request is
+        honoured, and the operator can purge the stray file explicitly.
 
         Args:
             post: Frontmatter of the note being purged.
@@ -684,17 +741,37 @@ class PurgeEngine:
                 incremented for each stub actually removed (or that
                 would be removed in a dry run).
         """
+        # Imported inside the function to keep the RTBF purge path's
+        # module-level import surface thin: at module scope this pulls
+        # ``creek/save/__init__.py`` → ``writer.py`` →
+        # ``creek.classify.privacy_filter`` → the whole
+        # ``creek.classify.llm`` provider subtree (httpx and friends).
+        # This is NOT a circular-import workaround — nothing under
+        # ``creek/save/`` imports ``creek.purge``, so please do not
+        # "fix" it by hoisting the import to module scope.
+        from creek.save._constants import INTIMATE_STUB_RELPATH
+
         pointer = self._intimate_pointer(post)
         if not pointer:
             return
-        stub_path = (self.vault_path / pointer).resolve()
-        vault_root = self.vault_path.resolve()
-        if not stub_path.is_relative_to(vault_root):
+        stub_path = self._resolve_pointer_in_vault(
+            pointer,
+            field="intimate_body_pointer",
+        )
+        if stub_path is None:
+            return
+        stub_root = (self.vault_path / INTIMATE_STUB_RELPATH).resolve()
+        # Checked before the counter so a dry run never previews a
+        # deletion the real run would refuse. The resolved victim path
+        # is deliberately left out of the message: the pointer is
+        # attacker-controlled, so echoing what it resolved to would
+        # turn the log into a filesystem oracle.
+        if not stub_path.is_relative_to(stub_root):
             logger.warning(
                 "Ignoring intimate_body_pointer %r that resolves outside "
-                "the vault root %s",
+                "the intimate stub dir %s",
                 pointer,
-                vault_root,
+                stub_root,
             )
             return
         if not stub_path.is_file():
@@ -737,13 +814,15 @@ class PurgeEngine:
         delete the staged file too, or the full — often intimate —
         entry body survives the right-to-be-forgotten request.
 
-        The method is defensive, mirroring :meth:`_purge_intimate_stub`:
-        a missing or empty key, an already-deleted staged file, and a
-        key that resolves outside the vault root are all no-ops rather
-        than errors. A second containment guard additionally scopes
-        deletion to the staging directory itself, so a hand-edited or
-        malicious ``origin_key`` (``../x``, ``01-Fragments/other.md``)
-        can never steer a delete at an arbitrary vault file.
+        The method is defensive, and now shares that defence with
+        :meth:`_purge_intimate_stub` in both directions: a missing or
+        empty key, an unresolvable key, an already-deleted staged file,
+        and a key that resolves outside the vault root are all no-ops
+        rather than errors (see :meth:`_resolve_pointer_in_vault`). A
+        second containment guard additionally scopes deletion to the
+        staging directory itself, so a hand-edited or malicious
+        ``origin_key`` (``../x``, ``01-Fragments/other.md``) can never
+        steer a delete at an arbitrary vault file.
 
         Args:
             post: Frontmatter of the fragment being purged.
@@ -754,14 +833,11 @@ class PurgeEngine:
         origin_key = _extract_source_origin_key(post)
         if not origin_key:
             return
-        staged_path = (self.vault_path / origin_key).resolve()
-        vault_root = self.vault_path.resolve()
-        if not staged_path.is_relative_to(vault_root):
-            logger.warning(
-                "Ignoring source.origin_key %r that resolves outside the vault root %s",
-                origin_key,
-                vault_root,
-            )
+        staged_path = self._resolve_pointer_in_vault(
+            origin_key,
+            field="source.origin_key",
+        )
+        if staged_path is None:
             return
         staging_root = (self.vault_path / JOURNAL_STAGING_RELDIR).resolve()
         if not staged_path.is_relative_to(staging_root):
@@ -1194,9 +1270,18 @@ class PurgeEngine:
 
         Emits an ``intent`` entry before invoking *body*, then an
         ``outcome`` entry after — ``status="complete"`` on success,
-        ``status="partial"`` (with the exception type + message in
+        ``status="partial"`` (with the exception **type name only** in
         ``failure_reason``) when *body* raises. The exception then
         propagates so callers see the failure.
+
+        The message is deliberately dropped: the audit log is preserved
+        by every purge, including ``purge_vault``, so anything written
+        there outlives the right-to-be-forgotten request that produced
+        it — and exception text routinely quotes vault-derived content
+        (a title-derived filename in an ``OSError``, a source snippet
+        in a ``yaml.MarkedYAMLError``). The type is the forensic value;
+        the message is the leak. Callers that need the detail still get
+        it from the propagating exception.
 
         The intent entry is the engine's recovery contract: even a
         SIGKILL between the intent write and the first destructive op
@@ -1219,7 +1304,7 @@ class PurgeEngine:
         try:
             body()
         except BaseException as exc:
-            failure_reason = f"{type(exc).__name__}: {exc}"
+            failure_reason = type(exc).__name__
             self._write_outcome_audit(
                 result,
                 operation_id,
@@ -1279,8 +1364,12 @@ class PurgeEngine:
             operation_id: UUID4 hex matching the paired intent entry.
             status: ``"complete"`` if the body ran to the end, or
                 ``"partial"`` if it raised.
-            failure_reason: Short ``"<ExceptionType>: <message>"`` when
-                ``status="partial"``; ``None`` otherwise.
+            failure_reason: The exception **type name only** (e.g.
+                ``"OSError"``) when ``status="partial"``; ``None``
+                otherwise. The message is omitted because the audit log
+                survives every purge, so vault-derived text quoted in an
+                exception would outlive the right-to-be-forgotten
+                request that produced it.
 
         Raises:
             ValueError: If ``result.operation`` is not a known purge

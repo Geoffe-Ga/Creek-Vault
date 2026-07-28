@@ -79,7 +79,12 @@ When you later delete an intimate note with a scoped `creek purge`
 (`fragment` / `source` / `daterange`), the purge engine follows the
 note's `saved_from.intimate_body_pointer` and deletes the stub too, so
 the full intimate body does not survive a right-to-be-forgotten request
-(GAP-012). See [Purge](cleaning-and-purge.md#purge-right-to-be-forgotten).
+(GAP-012) — but only when the pointer resolves inside
+`10-Liminal/Compost/intimate-stubs/`; a pointer aimed anywhere else is
+refused and nothing is deleted. Accepted side effect: a hand-authored
+stub parked outside that directory survives the purge and must be
+removed explicitly. See
+[Purge](cleaning-and-purge.md#purge-right-to-be-forgotten).
 
 ### Tier defaulting
 
