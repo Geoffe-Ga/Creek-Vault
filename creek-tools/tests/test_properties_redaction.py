@@ -1,9 +1,8 @@
 """Property-based tests for ``creek.redact.redactor.Redactor``.
 
-Redaction must be idempotent and additive: applying it twice yields the
-same output as once, and the redacted output never contains the
-``[REDACTED:type]`` marker shapes that the redactor would itself
-produce. Hypothesis fuzzes inputs that mix arbitrary text with
+Redaction must be idempotent: applying it twice yields the same output
+as once, so a marker the redactor emitted is never itself rewritten on a
+later pass. Hypothesis fuzzes inputs that mix arbitrary text with
 recognisable secrets to exercise these contracts on the patch logic.
 """
 
@@ -145,15 +144,19 @@ def test_digit_glued_email_is_left_intact_but_bounded_email_is_redacted() -> Non
 def test_high_entropy_email_local_part_redacted_whole_no_fragment() -> None:
     """An email with a high-entropy local part is redacted as one whole email.
 
-    The named ``email`` pass runs before the high-entropy detector, so the
+    The ``email`` match and the high-entropy candidate (the local part)
+    are both collected against the *original* content and unioned, so the
     whole address is replaced and no high-entropy fragment of it is left
-    behind — the failure mode #435's title warned about.
+    behind — the failure mode #435's title warned about. The union is
+    labelled ``email`` because both patterns are severity "medium" and
+    the tie-break picks the widest contributing span (#909).
+
+    Equality on the full string is deliberate: substring checks cannot
+    tell "redacted whole" from "redacted with a surviving remainder".
     """
     redactor = _make_redactor()
     out = redactor.redact_content("key aB3xY7zQ9mK2pL5nR8vT4wd@example.com end")
-    assert "aB3xY7zQ9mK2pL5nR8vT4wd" not in out
-    assert "@example.com" not in out
-    assert "[REDACTED:email]" in out
+    assert out == "key [REDACTED:email] end"
 
 
 @_PROFILE

@@ -2108,7 +2108,11 @@ class TestRedactorHighEntropy:
     """`Redactor.redact_content` must apply the high-entropy detector too."""
 
     def test_redactor_replaces_high_entropy_secret(self) -> None:
-        """A high-entropy hex secret must be replaced by the redactor."""
+        """A high-entropy hex secret must be replaced by the redactor.
+
+        Asserts the exact full output: a substring check would pass even
+        if part of the secret leaked alongside the marker (Issue #909).
+        """
         from creek.config import RedactionConfig as CfgCls
 
         secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
@@ -2119,11 +2123,14 @@ class TestRedactorHighEntropy:
         # Bare line — avoids env_secret picking up `token = …` first.
         out = redactor.redact_content(secret)
 
-        assert secret not in out
-        assert "[REDACTED:high_entropy_string]" in out
+        assert out == "[REDACTED:high_entropy_string]"
 
     def test_redactor_high_entropy_respects_allowlist(self) -> None:
-        """An allowlisted high-entropy substring must not be replaced."""
+        """An allowlisted high-entropy substring must not be replaced.
+
+        Asserts the exact full output, so a partial rewrite around the
+        allowlisted text cannot slip through (Issue #909).
+        """
         from creek.config import RedactionConfig as CfgCls
 
         secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
@@ -2133,11 +2140,14 @@ class TestRedactorHighEntropy:
 
         out = redactor.redact_content(secret)
 
-        assert secret in out
-        assert "REDACTED" not in out
+        assert out == secret
 
     def test_redactor_high_entropy_respects_min_confidence(self) -> None:
-        """A low-entropy string must survive even at min_confidence=0."""
+        """A low-entropy string must survive at min_confidence=1.0.
+
+        Asserts the exact full output rather than containment, so a
+        partial redaction of the run would fail (Issue #909).
+        """
         from creek.config import RedactionConfig as CfgCls
 
         # Predictable, repeating content.
@@ -2148,7 +2158,7 @@ class TestRedactorHighEntropy:
 
         out = redactor.redact_content(low_entropy)
 
-        assert low_entropy in out
+        assert out == low_entropy
 
 
 # ---------------------------------------------------------------------------
@@ -2310,3 +2320,392 @@ class TestPatternOrderLeak:
         assert "hunter2secret" not in result
         assert "example" not in result
         assert "hunter" not in result
+
+
+# ---------------------------------------------------------------------------
+# High-entropy detector overlapping a regex pattern (Issue #909)
+# ---------------------------------------------------------------------------
+
+# Synthetic secret shapes, composed from parts so the leak geometry stays
+# explicit: a documented AWS example key (covered by `api_key`, severity
+# "critical") glued to a high-entropy remainder that only the
+# `high_entropy_string` detector (severity "medium") covers.
+_AWS_EXAMPLE_KEY = "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret
+_ENTROPY_TAIL = "Zq7Wp3Rf9Tk2Ng"  # pragma: allowlist secret
+_KEY_THEN_TAIL = f"{_AWS_EXAMPLE_KEY}{_ENTROPY_TAIL}"
+_TAIL_THEN_KEY = f"{_ENTROPY_TAIL}{_AWS_EXAMPLE_KEY}"
+_HEX_SECRET = "a3f1c8b2e9d74105fb6c2e8a91d34c70"  # pragma: allowlist secret
+_REPEATING_RUN = "ababababababababababab"
+# 24 chars drawn uniformly from an 8-symbol alphabet, so the Shannon
+# entropy is exactly log2(8) = 3.0 bits/char: below the default 3.7
+# threshold (min_confidence=0.6) but above the 2.5 floor
+# (min_confidence=0.0). That window is what makes it a gating probe.
+_SUB_THRESHOLD_RUN = "abcdefghabcdefghabcdefgh"
+_ENTROPIC_EMAIL = "aB3xY7zQ9mK2pL5nR8vT4wd@example.com"  # pragma: allowlist secret
+# A deliberately *predictable* tail: 14 repeats of one character. Glued to
+# `_AWS_EXAMPLE_KEY` the combined 34-char run measures 3.1446 bits/char —
+# BELOW the default 3.7 threshold — so the entropy detector contributes no
+# span at all and only token-boundary snapping can keep the tail covered.
+_LOW_ENTROPY_TAIL = "a" * 14
+_KEY_THEN_LOW_ENTROPY_TAIL = f"{_AWS_EXAMPLE_KEY}{_LOW_ENTROPY_TAIL}"
+
+
+class TestHighEntropyOverlapLeak:
+    """Entropy hits must union with regex spans on the ORIGINAL text (#909).
+
+    Issue #832 made the *regular* patterns collect spans against the
+    untouched content, merge overlaps, and splice markers in one pass.
+    The generic high-entropy detector was left as a post-pass over the
+    ALREADY-MUTATED text, so when a regex match only partially covers a
+    high-entropy run the uncovered remainder is no longer ≥20 contiguous
+    base64url chars and silently survives in cleartext.
+
+    Concretely, ``_AWS_EXAMPLE_KEY`` glued to ``_ENTROPY_TAIL`` returns
+    the ``api_key`` marker followed by the 14-char tail in cleartext.
+    Every core assertion here compares the **complete** returned string
+    with ``==``: a ``not in`` assertion on the key alone passes while the
+    bug is live, which is exactly how this shipped.
+    """
+
+    def test_entropy_tail_after_api_key_fully_redacted(self) -> None:
+        """A trailing high-entropy remainder must not survive (RED at HEAD).
+
+        The merged span is labelled by its most severe contributor, so the
+        marker is ``api_key`` (critical), never ``high_entropy_string``
+        (medium).
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_KEY_THEN_TAIL)
+
+        assert result == "[REDACTED:api_key]"
+        assert "[REDACTED:high_entropy_string]" not in result
+
+    def test_sub_threshold_entropy_tail_after_api_key_still_redacted(self) -> None:
+        """A sub-threshold tail of the SAME token must not leak (RED at HEAD).
+
+        ``_KEY_THEN_LOW_ENTROPY_TAIL`` is one contiguous 34-char
+        ``HIGH_ENTROPY_CANDIDATE`` run whose Shannon entropy is
+        **3.145 bits/char — BELOW the default 3.7 threshold**
+        (``min_confidence=0.6``). The entropy detector therefore does not
+        fire at all, so span-unioning alone cannot cover the remainder:
+        only **token-boundary snapping** — widening the ``api_key`` match
+        outward to the enclosing run's boundaries — keeps the tail from
+        leaking.
+
+        At HEAD this returns ``[REDACTED:api_key]aaaaaaaaaaaaaa``: 14
+        characters of the very token a *critical* ``api_key`` detector
+        fired on survive in cleartext.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_KEY_THEN_LOW_ENTROPY_TAIL)
+
+        assert result == "[REDACTED:api_key]"
+
+    def test_entropy_tail_redacted_at_max_confidence(self) -> None:
+        """The fix must not be contingent on a tuning knob (RED at HEAD).
+
+        This pins **threshold-independence**. At ``min_confidence=1.0``
+        the entropy threshold is 4.5 bits/char and ``_KEY_THEN_TAIL``
+        measures 4.5725 — it clears by **0.07 bits**. That margin is
+        luck, not design: nudge the tail's alphabet, the ceiling, or the
+        confidence mapping and the union silently stops firing.
+
+        A P1 secret-leak fix must hold at *every* confidence setting, so
+        the covering mechanism has to be token-boundary snapping (a
+        structural property of the matched run) rather than an entropy
+        score that happens to land on the right side of a threshold.
+        """
+        config = RedactionConfig(min_confidence=1.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_KEY_THEN_TAIL)
+
+        assert result == "[REDACTED:api_key]"
+
+    def test_entropy_tail_redacted_with_surrounding_text(self) -> None:
+        """Surrounding plain words are preserved exactly (RED at HEAD).
+
+        Pins that the union splice is positional — it removes the whole
+        overlapping region and nothing else.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(f"prefix {_KEY_THEN_TAIL} suffix")
+
+        assert result == "prefix [REDACTED:api_key] suffix"
+
+    def test_entropy_prefix_before_api_key_fully_redacted(self) -> None:
+        """A *leading* high-entropy remainder must not survive (RED at HEAD).
+
+        The mirror image of the trailing case: at HEAD the output is
+        ``Zq7Wp3Rf9Tk2Ng[REDACTED:api_key]``. This pins that the fix is a
+        span union, not a "swallow the following characters" hack.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_TAIL_THEN_KEY)
+
+        assert result == "[REDACTED:api_key]"
+
+    def test_multiline_content_keeps_following_lines(self) -> None:
+        """The union must stop at the newline it never matched (RED at HEAD).
+
+        ``redact_content`` sees whole content while the scanner works
+        line by line; this pins that widening the merged span does not
+        swallow the line break or the inert text after it.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(f"{_KEY_THEN_TAIL}\nplain text\n")
+
+        assert result == "[REDACTED:api_key]\nplain text\n"
+
+    def test_scan_apply_parity_for_overlapping_entropy_match(
+        self, tmp_path: Path
+    ) -> None:
+        """Every scan finding must be gone after apply (RED at HEAD).
+
+        This is the Issue #832 invariant restored for the entropy
+        detector: the scan reports both ``api_key`` and
+        ``high_entropy_string``, so an apply must leave no cleartext
+        fragment of either behind.
+
+        The apply step redacts ``test_file.read_text()`` rather than the
+        in-memory constant, so the parity claim genuinely round-trips
+        through the same bytes the scanner read off disk.
+
+        Args:
+            tmp_path: pytest-provided temporary directory.
+        """
+        test_file = tmp_path / "entropy_leak.txt"
+        test_file.write_text(_KEY_THEN_TAIL)
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        matches = scanner.scan_file(test_file)
+        match_types = {match.match_type for match in matches}
+        assert {"api_key", "high_entropy_string"}.issubset(match_types)
+
+        redactor = Redactor(config=config, salt=scanner.salt)
+        result = redactor.redact_content(test_file.read_text())
+
+        assert result == "[REDACTED:api_key]"
+
+    def test_bare_high_entropy_hex_secret_redacted_whole(self) -> None:
+        """A lone high-entropy run is still redacted whole (non-regression).
+
+        Entropy ≈3.95 bits/char clears the default 3.7 threshold, and no
+        regex pattern overlaps, so the detector must fire on its own.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_HEX_SECRET)
+
+        assert result == "[REDACTED:high_entropy_string]"
+
+    def test_allowlisted_high_entropy_secret_survives_verbatim(self) -> None:
+        """The allowlist still suppresses entropy hits (non-regression).
+
+        The allowlist check must survive the move from a regex-``sub``
+        replacer to a span collector.
+        """
+        config = RedactionConfig(false_positive_allowlist=[_HEX_SECRET])
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_HEX_SECRET)
+
+        assert result == _HEX_SECRET
+
+    def test_allowlisted_run_not_snapped(self) -> None:
+        """An allowlisted run is never widened — explicit user intent wins.
+
+        This documents a deliberate carve-out in the token-boundary
+        snapping rule, with exact bytes so nobody can "tidy" it away.
+        ``_KEY_THEN_TAIL`` is the whole 34-char run *and* the allowlist
+        entry, so the entropy detector skips it and the snapping step
+        must leave its boundaries alone.
+
+        A regex match *inside* an allowlisted run still redacts its own
+        span, though: the caller allowlisted the run, not the
+        ``api_key`` hit within it. The exact expected output is therefore
+        ``"[REDACTED:api_key]Zq7Wp3Rf9Tk2Ng"`` — marker for the 20-char
+        AWS key, and the 14-char tail left verbatim by request.
+
+        The inverse failure is what this guards: a snapping rule that
+        ignored the allowlist would widen the ``api_key`` span to the
+        full run and swallow bytes the user explicitly excused.
+        """
+        config = RedactionConfig(false_positive_allowlist=[_KEY_THEN_TAIL])
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_KEY_THEN_TAIL)
+
+        assert result == f"[REDACTED:api_key]{_ENTROPY_TAIL}"
+
+    def test_repeating_run_survives_at_max_confidence(self) -> None:
+        """A predictable run is left intact at min_confidence=1.0.
+
+        Non-regression: entropy 1.0 bits/char is far below the 4.5
+        bits/char threshold that ``min_confidence=1.0`` demands.
+        """
+        config = RedactionConfig(min_confidence=1.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_REPEATING_RUN)
+
+        assert result == _REPEATING_RUN
+
+    def test_sub_threshold_run_redacted_at_min_confidence_zero(self) -> None:
+        """The threshold must still come from config (non-regression).
+
+        ``_SUB_THRESHOLD_RUN`` sits at exactly 3.0 bits/char: inert at the
+        default 3.7 threshold, flagged at the 2.5 floor that
+        ``min_confidence=0.0`` selects. If a refactor hard-coded the
+        threshold or dropped the config read, this test fails.
+        """
+        config = RedactionConfig(min_confidence=0.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_SUB_THRESHOLD_RUN)
+
+        assert result == "[REDACTED:high_entropy_string]"
+
+    def test_sub_threshold_run_inert_at_default_confidence(self) -> None:
+        """The same run is inert at the default threshold (non-regression).
+
+        Pairs with the test above to bracket the 3.0 bits/char probe from
+        both sides, so a threshold regression cannot hide behind a value
+        that happens to be flagged either way.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_SUB_THRESHOLD_RUN)
+
+        assert result == _SUB_THRESHOLD_RUN
+
+    def test_pattern_types_without_entropy_detector_leaves_tail(self) -> None:
+        """A narrowed ``pattern_types`` intentionally leaves the tail.
+
+        Non-regression, and deliberately NOT a leak: the caller excluded
+        ``high_entropy_string`` from scope, so the remainder is out of
+        scope by request. Do NOT "fix" this to ``[REDACTED:api_key]`` —
+        that would make the ``pattern_types`` filter a lie. The
+        whole-string redaction is pinned by the sibling test that passes
+        ``high_entropy_string`` explicitly.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_KEY_THEN_TAIL, pattern_types=["api_key"])
+
+        assert result == f"[REDACTED:api_key]{_ENTROPY_TAIL}"
+
+    def test_pattern_types_with_entropy_detector_redacts_whole_span(self) -> None:
+        """The detector-only name works inside ``pattern_types`` (RED at HEAD).
+
+        ``high_entropy_string`` lives in ``PATTERN_METADATA`` but is
+        excluded from ``REDACTION_PATTERNS``, so it is absent from
+        ``Redactor._patterns``; naming it must still bring the detector
+        into scope and union its span with the ``api_key`` match.
+
+        Opting the detector in explicitly did not save the tail at HEAD
+        either: the old code spliced the regex span first and only then
+        ran the entropy pass over the already-mutated text, so the
+        remainder leaked exactly as in the unfiltered case.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(
+            _KEY_THEN_TAIL,
+            pattern_types=["api_key", "high_entropy_string"],
+        )
+
+        assert result == "[REDACTED:api_key]"
+
+    def test_equal_severity_tie_break_prefers_widest_span(self) -> None:
+        """Equal-severity overlaps fall to the widest span (non-regression).
+
+        ``email`` and ``high_entropy_string`` are both "medium", and the
+        entropy candidate (the local part) is strictly narrower than the
+        email match, so the merged region must carry the ``email``
+        marker.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(f"key {_ENTROPIC_EMAIL} end")
+
+        assert result == "key [REDACTED:email] end"
+
+    def test_overlapping_redaction_is_idempotent(self) -> None:
+        """Re-redacting redacted output is a no-op (non-regression).
+
+        The marker text itself must not look like a secret to any
+        pattern, whatever the union logic produced on the first pass.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        once = redactor.redact_content(_KEY_THEN_TAIL)
+
+        assert redactor.redact_content(once) == once
+
+    def test_markers_are_inert_for_every_pattern_name(self) -> None:
+        """Every replacement marker must survive a re-redaction unchanged.
+
+        Marker inertness is not a comfortable margin — it sits on a
+        **0.016-bit cliff**. ``[REDACTED:email_password_combo]`` contains
+        the run ``email_password_combo``, which is exactly 20 characters
+        (the ``HIGH_ENTROPY_CANDIDATE`` floor) at exactly **3.6842
+        bits/char** against the default **3.7** threshold. Any change
+        that widens a span outward to a candidate run, nudges the
+        entropy threshold, renames a pattern, or adds a pattern name of
+        20+ base64url characters can tip a marker over that edge — and
+        then the marker itself is re-detected as a secret and rewritten
+        into a nested ``[REDACTED:[REDACTED:...]]``.
+
+        Asserting on the complete string for *every* name in
+        ``PATTERN_METADATA`` makes that cliff visible the moment someone
+        steps off it, rather than one release later in a corrupted
+        vault.
+
+        Deliberately **not** parametrised over ``min_confidence=0.0``:
+        that genuinely fails today (the 2.5 floor flags the 3.6842-bit
+        run) for a pre-existing reason outside the scope of #909, filed
+        as a separate follow-up.
+        """
+        from creek.redact.patterns import PATTERN_METADATA
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        for name in PATTERN_METADATA:
+            marker = f"[REDACTED:{name}]"
+            assert redactor.redact_content(marker) == marker
