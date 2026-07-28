@@ -26,6 +26,7 @@ before any ``creek.ingest`` call.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import logging
 import re
@@ -152,7 +153,9 @@ _EXTENSION_MIME_SPECS: dict[str, _ExtensionMimeSpec] = {
 # in this set are expected to be plain text, so a NUL byte or undecodable
 # bytes in the first ``_TEXT_SAMPLE_BYTES`` of the body are treated as
 # evidence that the file is actually a binary blob renamed to a text
-# extension (the polyglot case the issue calls out). The dict carries
+# extension (the polyglot case the issue calls out). One byte pattern is
+# *not* such evidence: a codepoint the sampling itself cut in half at the
+# window edge — see ``_TEXT_SAMPLE_BYTES`` and issue #916. The dict carries
 # the canonical text MIME per extension so a successful match surfaces
 # the right label (``text/markdown`` for ``.md``, ``application/json``
 # for ``.json``, etc.) instead of a generic ``text/plain`` blanket.
@@ -174,6 +177,13 @@ _TEXT_EXTENSIONS: frozenset[str] = frozenset(_TEXT_EXTENSION_TO_MIME)
 # Sample size for the text-content heuristic. One kilobyte is enough to
 # catch every common binary header (PE / ELF / OLE / PDF / ZIP) without
 # materially extending the download path's CPU cost.
+#
+# The window is a byte cut, not a character cut, so it can land in the
+# middle of a multibyte codepoint. Issue #916 pins the resulting edge
+# semantics: the sample is text iff (a) it holds no NUL byte anywhere in
+# the window, and (b) every byte decodes as UTF-8 except — when and only
+# when the body actually runs past the window — a trailing run of at most
+# three bytes forming a legal prefix of one unfinished sequence.
 _TEXT_SAMPLE_BYTES: int = 1024
 
 # Canonical MIME the text verifier uses when it has to label something
@@ -260,10 +270,24 @@ def _verify_binary_signature(suffix: str, data: bytes) -> MimeVerification:
 
 
 def _verify_text_sample(suffix: str, data: bytes) -> MimeVerification:
-    """Sample-check that *data* is plausibly UTF-8 text with no NUL bytes."""
+    """Sample-check that *data* is plausibly UTF-8 text with no NUL bytes.
+
+    The sample is a fixed-width byte window, so a multibyte codepoint can
+    straddle its edge. When — and only when — *data* actually extends past
+    the window, an unfinished-but-well-formed trailing sequence is
+    tolerated rather than read as binary (issue #916). A body that ends
+    at or before the window was never cut by us, so a dangling partial
+    there is genuine corruption and still reads as a mismatch.
+    """
     expected = _TEXT_EXTENSION_TO_MIME[suffix]
     sample = data[:_TEXT_SAMPLE_BYTES]
-    if b"\x00" in sample or not _decodes_as_utf8(sample):
+    # Strict ``>``: at exactly _TEXT_SAMPLE_BYTES the sample *is* the whole
+    # file, so nothing was cut off and no tail may be forgiven.
+    truncated = len(data) > _TEXT_SAMPLE_BYTES
+    # NUL check first, over the full raw window: NUL bytes decode as valid
+    # UTF-8, so this heuristic is independent of (and unweakened by) the
+    # truncation tolerance below.
+    if b"\x00" in sample or not _decodes_as_utf8(sample, truncated=truncated):
         return MimeVerification(
             status="mismatch",
             detected_mime=_BINARY_CANONICAL_MIME,
@@ -276,10 +300,44 @@ def _verify_text_sample(suffix: str, data: bytes) -> MimeVerification:
     )
 
 
-def _decodes_as_utf8(sample: bytes) -> bool:
-    """Return ``True`` when *sample* is fully decodable as UTF-8."""
+def _decodes_as_utf8(sample: bytes, *, truncated: bool) -> bool:
+    """Return ``True`` when *sample* decodes as UTF-8, tail cut allowance aside.
+
+    Args:
+        sample: The bytes to decode — the leading window of a larger body.
+        truncated: ``True`` when *sample* was cut out of a longer body, so
+            its final codepoint may legitimately be incomplete. ``False``
+            demands a complete decode, matching a plain
+            ``sample.decode("utf-8")``.
+
+    Returns:
+        ``True`` when every byte decodes as UTF-8, except that a
+        *truncated* sample may end in a trailing run of **at most three**
+        bytes forming a legal prefix of one unfinished sequence — issue
+        #916, where a codepoint straddling the window edge was misread as
+        a binary blob. This is a bounded allowance, not a blanket "ignore
+        the tail": the incremental decoder still raises on the first byte
+        that cannot begin or continue a valid sequence, so invalid leads,
+        bare or malformed continuations, and overlong or out-of-range
+        forms are rejected wherever the byte that disqualifies them falls
+        inside the window.
+
+        The allowance is therefore bounded by what the window can see. A
+        partial sequence whose disqualifying byte lies *past* the cut is
+        tolerated, because that byte was never inspected — a trailing
+        ``\\xed\\xa0`` passes even though it can only continue into a
+        surrogate, and a bare trailing ``\\xed`` passes too, since one
+        lead byte alone cannot yet be range-checked. The effective
+        validated prefix is
+        ``_TEXT_SAMPLE_BYTES - 3`` bytes in the worst case, which is why
+        this sits inside the false-negative surface ADR-0002 already
+        documents rather than opening a new one.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
     try:
-        sample.decode("utf-8")
+        # ``final=True`` flushes the decoder, so a dangling partial raises;
+        # ``final=False`` lets a legal unfinished tail stay buffered.
+        decoder.decode(sample, final=not truncated)
     except UnicodeDecodeError:
         return False
     return True
