@@ -106,8 +106,12 @@ class PurgeAuditEntry(BaseModel):
         status: For outcome entries only — ``"complete"`` if the body
             ran without raising, ``"partial"`` if it aborted partway.
             ``None`` for intent entries and for pre-GAP-002 outcomes.
-        failure_reason: Short string capturing the exception type and
-            message when ``status="partial"``; ``None`` otherwise.
+        failure_reason: The exception **type name only** (e.g.
+            ``"OSError"``) when ``status="partial"``; ``None``
+            otherwise. The message is deliberately excluded: this log
+            is preserved by every purge, so vault-derived text quoted
+            in an exception would outlive the right-to-be-forgotten
+            request that produced it.
         target: Legacy field preserved for backward compatibility on
             read; populated only when reading pre-Batch-C entries.
         count: Legacy fragment count preserved for backward compatibility

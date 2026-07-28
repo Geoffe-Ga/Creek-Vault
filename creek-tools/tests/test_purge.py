@@ -676,6 +676,450 @@ def test_fragment_purge_intimate_stub_outside_vault_skipped(
 
 
 # ---------------------------------------------------------------------------
+# Engine tests — intimate stub pointer containment (#950)
+# ---------------------------------------------------------------------------
+
+_INTIMATE_STUB_DIR = "10-Liminal/Compost/intimate-stubs"
+"""The only directory an ``intimate_body_pointer`` may delete from (#950)."""
+
+_VAULT_CONFIG_RELPATH = "00-Creek-Meta/creek_config.yaml"
+"""In-vault victim proving a hand-edited pointer is refused, not followed."""
+
+_PURGE_AUDIT_RELPATH = "00-Creek-Meta/audit/purge.jsonl"
+"""The audit log — a live in-vault file mid-purge, so a reachable victim."""
+
+_NUL_YAML_ESCAPE = r"\0"
+"""Two-character YAML escape that PyYAML decodes to a real NUL on load."""
+
+
+def _write_note_with_nul_stub_pointer(
+    vault: Path,
+    frag_id: str,
+    title: str,
+) -> Path:
+    """Hand-write an intimate note whose stub pointer holds a NUL byte.
+
+    ``frontmatter.dumps`` cannot be used here: PyYAML's emitter refuses
+    to serialise a control character, so a NUL put on a
+    :class:`frontmatter.Post` never survives the round-trip. The
+    markdown is therefore written by hand with the pointer as a
+    double-quoted YAML scalar carrying :data:`_NUL_YAML_ESCAPE`, which
+    PyYAML *decodes* back into a real NUL when the engine loads the
+    note.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID for the note's frontmatter.
+        title: Note title (also the note's filename stem).
+
+    Returns:
+        Path to the written note.
+    """
+    pointer = f"{_INTIMATE_STUB_DIR}/{title}{_NUL_YAML_ESCAPE}.md"
+    note_path = vault / "01-Fragments" / "Conversations" / f"{title}.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text(
+        f"""---
+id: {frag_id}
+title: {title}
+type: fragment
+privacy_tier: intimate
+saved_from:
+  source_kind: answer
+  intimate_body_pointer: "{pointer}"
+---
+(intimate body withheld)
+""",
+        encoding="utf-8",
+    )
+    return note_path
+
+
+def _write_journal_fragment_with_nul_origin_key(
+    vault: Path,
+    frag_id: str,
+    title: str,
+) -> Path:
+    """Hand-write a journal fragment whose ``origin_key`` holds a NUL byte.
+
+    The ``source.origin_key`` twin of
+    :func:`_write_note_with_nul_stub_pointer`, and hand-written for the
+    same reason — PyYAML's emitter will not round-trip a NUL, so the
+    escape has to go into the file as literal YAML text.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID for the fragment's frontmatter.
+        title: Fragment title (also the fragment's filename stem).
+
+    Returns:
+        Path to the written fragment.
+    """
+    key = f"{_JOURNAL_STAGING_DIR}/{title}{_NUL_YAML_ESCAPE}.md"
+    frag_path = vault / "01-Fragments" / "Journal" / f"{title}.md"
+    frag_path.parent.mkdir(parents=True, exist_ok=True)
+    frag_path.write_text(
+        f"""---
+id: {frag_id}
+title: {title}
+type: fragment
+privacy_tier: intimate
+source:
+  platform: journal
+  origin_key: "{key}"
+---
+A journal fragment summary.
+""",
+        encoding="utf-8",
+    )
+    return frag_path
+
+
+def test_fragment_purge_refuses_stub_pointer_at_vault_config(
+    tmp_path: Path,
+) -> None:
+    """A stub pointer aimed at the vault config never deletes it (#950).
+
+    ``intimate_body_pointer`` is vault *content*: an operator (or an
+    attacker who can write one note) can retarget it at any file. The
+    only containment today is "inside the vault root", which every
+    in-vault file trivially satisfies — so the pointer becomes an
+    arbitrary in-vault delete primitive driven by a purge. Deleting
+    ``creek_config.yaml`` also disarms the GAP-003 marker check that
+    guards ``purge vault``. The stub sweep must be scoped to
+    ``10-Liminal/Compost/intimate-stubs/`` and refuse anything else,
+    while still purging the note that carried the bad pointer.
+    """
+    vault = _make_vault(tmp_path)
+    config = vault / _VAULT_CONFIG_RELPATH
+    config_bytes_before = config.read_bytes()
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=_VAULT_CONFIG_RELPATH,
+        write_stub=False,
+    )
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert config.exists()
+    assert config.read_bytes() == config_bytes_before
+    assert result.intimate_stubs_removed == 0
+    # The refusal is scoped to the stub sweep: the note itself is still
+    # purged, so the RTBF request is honoured.
+    assert not note.exists()
+
+
+def test_fragment_purge_refuses_stub_pointer_at_sibling_fragment(
+    tmp_path: Path,
+) -> None:
+    """Purging one note must not take a sibling fragment with it (#950).
+
+    The worst form of the containment bug: purging fragment A silently
+    destroys unrelated fragment B, so a single RTBF request becomes
+    collateral data loss the operator never asked for and the audit log
+    never names (B is not in ``affected_fragments``). Bravo must survive
+    byte-identical and stay independently purgeable afterwards.
+    """
+    vault = _make_vault(tmp_path)
+    bravo = _write_fragment(vault, "frag-B", "Bravo")
+    bravo_bytes_before = bravo.read_bytes()
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath="01-Fragments/Conversations/Bravo.md",
+        write_stub=False,
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+    assert bravo.exists()
+    assert bravo.read_bytes() == bravo_bytes_before
+
+    # Bravo is untouched, not merely present: it is still a live
+    # fragment the engine can find and purge on its own terms.
+    second = PurgeEngine(vault).purge_fragment("frag-B")
+
+    assert second.fragments_affected == 1
+    assert not bravo.exists()
+
+
+def test_fragment_purge_refuses_stub_pointer_at_audit_log(
+    tmp_path: Path,
+) -> None:
+    """A stub pointer must not be able to erase the purge audit log (#950).
+
+    The GAP-002 ``intent`` line is written *before* the destructive
+    body, so ``00-Creek-Meta/audit/purge.jsonl`` is a live file by the
+    time the stub sweep runs — a pointer aimed at it unlinks the
+    forensic record of the very purge in flight, and the following
+    ``outcome`` append silently restarts the chain from genesis. The
+    surviving log must be the complete intent+outcome pair with an
+    intact hash chain.
+    """
+    vault = _make_vault(tmp_path)
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=_PURGE_AUDIT_RELPATH,
+        write_stub=False,
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+    log = PurgeAuditLog(vault)
+    entries = log.read()
+    assert [entry.phase for entry in entries] == ["intent", "outcome"]
+    assert entries[1].status == "complete"
+    log.verify()
+
+
+def test_fragment_purge_refuses_stub_pointer_escaping_stub_dir_via_relative_walk(
+    tmp_path: Path,
+) -> None:
+    """``..`` inside the stub dir cannot walk back out to a vault file (#950).
+
+    This is the test that proves the new guard is real containment
+    rather than a string-prefix check: the pointer *starts* with the
+    canonical stub directory and still lands on the vault config after
+    resolution. It also passes the existing vault-root guard untouched,
+    so only a guard applied to the **resolved** path stops it.
+    """
+    vault = _make_vault(tmp_path)
+    config = vault / _VAULT_CONFIG_RELPATH
+    config_bytes_before = config.read_bytes()
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=f"{_INTIMATE_STUB_DIR}/../../../{_VAULT_CONFIG_RELPATH}",
+        write_stub=False,
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert config.exists()
+    assert config.read_bytes() == config_bytes_before
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+
+
+def test_fragment_purge_dry_run_refuses_out_of_scope_stub_pointer(
+    tmp_path: Path,
+) -> None:
+    """A dry run must not *preview* an out-of-scope stub deletion (#950).
+
+    ``--dry-run`` is the operator's decision aid before an irreversible
+    purge. Counting a file the real run must refuse to touch both
+    overstates the blast radius and, worse, tells the operator the
+    engine considers that file in scope — so the containment guard has
+    to run before the counter, not just before the ``unlink``.
+    """
+    vault = _make_vault(tmp_path)
+    config = vault / _VAULT_CONFIG_RELPATH
+    config_bytes_before = config.read_bytes()
+    _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=_VAULT_CONFIG_RELPATH,
+        write_stub=False,
+    )
+
+    result = PurgeEngine(vault, dry_run=True).purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert config.exists()
+    assert config.read_bytes() == config_bytes_before
+
+
+def test_refused_stub_pointer_warning_does_not_echo_resolved_target(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refusing a pointer is logged, but without an existence oracle (#950).
+
+    Two properties at once. The refusal must be operator-visible at
+    WARNING — a silently ignored pointer is indistinguishable from a
+    sweep that never ran. And the message must not echo the *resolved*
+    victim path: the refusal is triggered by attacker-controlled
+    frontmatter, so echoing the absolute path it resolved to turns the
+    log into a filesystem oracle. Asserts on level and on the absence
+    of the resolved path only — never on wording.
+    """
+    vault = _make_vault(tmp_path)
+    _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=_VAULT_CONFIG_RELPATH,
+        write_stub=False,
+    )
+    resolved_victim = str((vault / _VAULT_CONFIG_RELPATH).resolve())
+    engine = PurgeEngine(vault)
+
+    with caplog.at_level(logging.WARNING, logger="creek.purge.engine"):
+        engine.purge_fragment("frag-A")
+
+    refusals = [
+        record
+        for record in caplog.records
+        if record.name == "creek.purge.engine" and record.levelno == logging.WARNING
+    ]
+    assert len(refusals) >= 1
+    echoing = [
+        record for record in caplog.records if resolved_victim in record.getMessage()
+    ]
+    assert echoing == []
+
+
+def test_fragment_purge_removes_nested_intimate_stub(tmp_path: Path) -> None:
+    """A stub nested under the stub dir is still swept (#950 no-regression).
+
+    The containment guard must be a ``is_relative_to`` containment test,
+    not an exact-parent-directory comparison: ``creek save`` is free to
+    shard stubs into subdirectories, and a guard that only accepted the
+    stub root would silently start leaking every nested intimate body
+    past an RTBF request. Green before and after the fix.
+    """
+    vault = _make_vault(tmp_path)
+    note, stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=f"{_INTIMATE_STUB_DIR}/2026/Alpha.md",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 1
+    assert not note.exists()
+    assert not stub.exists()
+
+
+def test_fragment_purge_refuses_absolute_stub_pointer(tmp_path: Path) -> None:
+    """An absolute stub pointer is refused, not followed (#950).
+
+    Pins a pathlib footgun on a deletion path: ``Path("/vault") /
+    "/etc/passwd"`` discards the left operand entirely and evaluates to
+    ``Path("/etc/passwd")``, so an absolute pointer silently escapes the
+    vault at the *join*, before any guard sees it. The vault-root
+    containment check catches it today; this test stops a future
+    refactor (e.g. swapping the join for ``os.path.join``-style
+    concatenation, or guarding the raw pointer instead of the resolved
+    path) from quietly reintroducing the escape.
+    """
+    vault = _make_vault(tmp_path)
+    outsider = tmp_path / "absolute-outsider.md"
+    outsider.write_text("not a stub\n", encoding="utf-8")
+    outsider_bytes_before = outsider.read_bytes()
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=str(outsider),
+        write_stub=False,
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert outsider.exists()
+    assert outsider.read_bytes() == outsider_bytes_before
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+
+
+def test_fragment_purge_stub_pointer_at_stub_root_itself_is_noop(
+    tmp_path: Path,
+) -> None:
+    """A pointer naming the stub *directory* deletes nothing (#950).
+
+    ``is_relative_to`` treats a path as relative to itself, so the
+    canonical stub root passes the containment guard on its own. Nothing
+    is removed only because the engine additionally requires the target
+    to be a regular file. That distinction is what stops a directory
+    pointer from ever reaching ``unlink``, so pin it explicitly rather
+    than leaving the safe outcome incidental.
+    """
+    vault = _make_vault(tmp_path)
+    stub_root = vault / _INTIMATE_STUB_DIR
+    stub_root.mkdir(parents=True, exist_ok=True)
+    bystander = stub_root / "Unrelated.md"
+    bystander.write_text("another intimate body\n", encoding="utf-8")
+    note, _stub = _write_intimate_note_with_stub(
+        vault,
+        "frag-A",
+        "Alpha",
+        stub_relpath=_INTIMATE_STUB_DIR,
+        write_stub=False,
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert stub_root.is_dir()
+    assert bystander.exists()
+    assert not note.exists()
+
+
+def test_fragment_purge_nul_byte_stub_pointer_is_noop(tmp_path: Path) -> None:
+    """A NUL byte in the stub pointer is a no-op, never an error (#950).
+
+    ``Path.resolve()`` raises :class:`ValueError` (``embedded null
+    byte``) rather than ``OSError`` for a NUL, so an unguarded resolve
+    escapes the documented "a bad pointer is a no-op" contract: the
+    exception aborts the purge body, the fragment is never unlinked,
+    and the audit closes ``status="partial"``. One byte of hostile
+    frontmatter therefore blocks the RTBF deletion it was attached to.
+    """
+    vault = _make_vault(tmp_path)
+    note = _write_note_with_nul_stub_pointer(vault, "frag-A", "Alpha")
+    loaded = frontmatter.load(str(note))
+    # Guard against a vacuous pass: the escape must really have decoded
+    # to a NUL, or this test proves nothing about NUL handling.
+    assert "\x00" in loaded["saved_from"]["intimate_body_pointer"]
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.intimate_stubs_removed == 0
+    assert not note.exists()
+    entries = PurgeAuditLog(vault).read()
+    assert [entry.phase for entry in entries] == ["intent", "outcome"]
+    assert entries[1].status == "complete"
+
+
+def test_fragment_purge_nul_byte_origin_key_is_noop(tmp_path: Path) -> None:
+    """A NUL byte in ``source.origin_key`` is a no-op, never an error (#950).
+
+    The journal-staging twin of the stub-pointer case: the same
+    unguarded ``Path.resolve()`` sits in ``_purge_journal_staged_entry``,
+    so a NUL in the origin key aborts the purge of an intimate journal
+    fragment with a bare :class:`ValueError` instead of skipping the
+    unusable key and deleting the fragment.
+    """
+    vault = _make_vault(tmp_path)
+    frag = _write_journal_fragment_with_nul_origin_key(vault, "frag-J", "entry-one")
+    loaded = frontmatter.load(str(frag))
+    assert "\x00" in loaded["source"]["origin_key"]
+
+    result = PurgeEngine(vault).purge_fragment("frag-J")
+
+    assert result.journal_staged_removed == 0
+    assert not frag.exists()
+    entries = PurgeAuditLog(vault).read()
+    assert [entry.phase for entry in entries] == ["intent", "outcome"]
+    assert entries[1].status == "complete"
+
+
+# ---------------------------------------------------------------------------
 # Engine tests — journal staged-entry sweep (#845)
 # ---------------------------------------------------------------------------
 
@@ -2578,6 +3022,13 @@ def test_purge_vault_outcome_status_partial_on_exception(
     log gets an outcome line saying what survived (intent already wrote
     what was being attempted; outcome closes the trail with the partial
     state).
+
+    ``failure_reason`` is the exception **type name only** (#950). The
+    audit log is deliberately preserved by every purge, so anything
+    written into it outlives the right-to-be-forgotten request that
+    produced it — and an exception message raised mid-wipe routinely
+    quotes vault-derived text (a path, a title, a YAML snippet). The
+    type is the whole forensic value; the message is the leak.
     """
     import shutil as shutil_mod
 
@@ -2611,7 +3062,50 @@ def test_purge_vault_outcome_status_partial_on_exception(
     assert outcome.status == "partial"
     assert intent.operation_id == outcome.operation_id
     assert outcome.failure_reason
-    assert "simulated mid-purge" in outcome.failure_reason
+    assert outcome.failure_reason == "OSError"
+    assert "simulated mid-purge" not in outcome.failure_reason
+
+
+_SYNTHETIC_EXCEPTION_MARKER = "synthetic-vault-title-950"
+"""Stands in for vault-derived text riding inside an exception message."""
+
+
+def test_partial_outcome_audit_never_writes_exception_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed purge must not copy exception text into the audit log (#950).
+
+    ``00-Creek-Meta/`` is deliberately preserved by every purge —
+    including ``purge vault`` — so the audit log is the one file a
+    right-to-be-forgotten request cannot reach. An exception raised
+    mid-wipe carries a message the vault supplied (``OSError`` on a
+    delete quotes the path; a YAML error quotes the offending source
+    line), and today that message is interpolated straight into
+    ``failure_reason``. The marker must therefore reach neither the
+    parsed entry nor the raw bytes on disk.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_thread(vault, "thread-1", "Waves")
+
+    def leaky_rmtree(*_args: object, **_kwargs: object) -> None:
+        """Abort the wipe with vault-derived text in the message."""
+        msg = _SYNTHETIC_EXCEPTION_MARKER
+        raise OSError(msg)
+
+    monkeypatch.setattr("creek.purge.engine.shutil.rmtree", leaky_rmtree)
+
+    with pytest.raises(OSError, match=_SYNTHETIC_EXCEPTION_MARKER):
+        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    entries = _entries_for_run(vault)
+    assert len(entries) == 2
+    outcome = entries[1]
+    assert outcome.status == "partial"
+    assert outcome.failure_reason == "OSError"
+    audit_text = (vault / _PURGE_AUDIT_RELPATH).read_text(encoding="utf-8")
+    assert _SYNTHETIC_EXCEPTION_MARKER not in audit_text
 
 
 def test_purge_fragment_emits_intent_then_outcome_pair(tmp_path: Path) -> None:

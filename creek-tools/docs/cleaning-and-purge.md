@@ -211,7 +211,7 @@ Every purge writes **two** JSONL lines to `<vault>/00-Creek-Meta/audit/purge.jso
 }
 ```
 
-If the process is killed *between* the two writes (SIGKILL, power loss, OOM kill), the intent line is on disk and the outcome line is not. An operator inspecting the log knows that vault `<id>` was being attempted at `<timestamp>` and can reconcile against the filesystem. If the body raises a Python exception, the engine writes an outcome line with `status="partial"` and a `failure_reason` field naming the exception type and message; the original exception then propagates.
+If the process is killed *between* the two writes (SIGKILL, power loss, OOM kill), the intent line is on disk and the outcome line is not. An operator inspecting the log knows that vault `<id>` was being attempted at `<timestamp>` and can reconcile against the filesystem. If the body raises a Python exception, the engine writes an outcome line with `status="partial"` and a `failure_reason` field naming only the exception type (e.g. `OSError`), never its message — the audit trail is not purgeable (see below), so a message quoting vault-derived content would outlive the very right-to-be-forgotten request that produced it; the original exception, with the full message, still propagates to the caller.
 
 `creek purge` is **not** transactional — there is no staging-directory rename pattern, so a crash partway through `_wipe_folder_contents` can still leave the filesystem half-deleted. The intent + outcome pair is the recovery contract: it tells you *what was attempted* and *how far it got*, but does not roll back. Pre-GAP-002 entries (no `phase` field) read back as `phase="outcome"` with `operation_id=""` and `status=null` for backward compatibility.
 
@@ -229,9 +229,13 @@ The outcome line's `embeddings_removed` is the real number of rows dropped from
 The outcome line also carries `intimate_stubs_removed` (GAP-012): the
 number of intimate-body stub files under
 `10-Liminal/Compost/intimate-stubs/` that the engine deleted because a
-purged note pointed at them via `saved_from.intimate_body_pointer`.
-Zero for notes that carry no pointer; a dry-run reports what *would* be
-removed without touching disk.
+purged note pointed at them via `saved_from.intimate_body_pointer`. The
+sweep is scoped to that directory: a pointer resolving anywhere else in
+the vault is refused and its target left untouched, so the pointer can
+never be used to steer a delete at an arbitrary vault file. Zero for
+notes that carry no pointer, and the counter is not incremented for a
+refused pointer either — in a dry run or a real one. A dry-run
+otherwise reports what *would* be removed without touching disk.
 
 `creek redact --apply` writes alongside it at `<vault>/00-Creek-Meta/audit/redact.jsonl`. Privacy-tier overrides (e.g. `creek mine --include-tier intimate`) write to `<vault>/00-Creek-Meta/audit/privacy.jsonl`. Operational provenance from ingestion stays at `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl` (separate location: not compliance-grade, allowed to be lossy).
 
