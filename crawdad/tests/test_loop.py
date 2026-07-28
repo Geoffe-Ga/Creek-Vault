@@ -675,6 +675,195 @@ async def test_loop_run_workflow_intent_invokes_workflow_runner(
     assert tool_results[0].body == "workflow phase-transitions done"
 
 
+async def test_loop_dispatches_run_workflow_bundled_with_compose(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """#915: intents bundled with ``compose=true`` must still be dispatched.
+
+    The router prompt tells Haiku to emit the intent *before* setting
+    ``compose: true``, and ``test_router.py`` pins that bundled single
+    object as the canonical well-behaved reply. The loop must therefore
+    dispatch this round's intents and *then* compose, rather than
+    breaking out before dispatch and silently dropping the work.
+    """
+    from crawdad.intents import RUN_WORKFLOW_INTENT_TYPE
+
+    runner_calls: list[tuple[str, dict[str, str]]] = []
+
+    async def _workflow_runner(name: str, inputs: dict[str, str]) -> str:
+        runner_calls.append((name, inputs))
+        return f"workflow {name} done"
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=RUN_WORKFLOW_INTENT_TYPE,
+                        args={
+                            "name": "phase-transitions",
+                            "inputs": {"topic": "spirals"},
+                        },
+                    )
+                ],
+                compose=True,
+            )
+        ]
+    )
+    composer = _ScriptedComposer("composed reply")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(_ScriptedSession()),  # type: ignore[arg-type]
+        known_tools=(),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+        workflow_runner=_workflow_runner,
+    )
+
+    outcome = await loop.run("run the phase-transitions workflow on spirals")
+
+    # The effect: the workflow actually ran with the router's arguments.
+    assert runner_calls == [("phase-transitions", {"topic": "spirals"})]
+    # Exactly one router pass — the bundled round both dispatches and
+    # composes; it does not cost an extra trip through the router.
+    assert len(router.calls) == 1
+    tool_results = composer.calls[0]["tool_results"]
+    assert len(tool_results) == 1
+    assert tool_results[0].intent_type == RUN_WORKFLOW_INTENT_TYPE
+    assert tool_results[0].body == "workflow phase-transitions done"
+    # Parity with the two-round path: the round was recorded in history.
+    composer_history = composer.calls[0]["history"].as_list()
+    assert any(
+        entry.role not in {"user", "assistant"}
+        and "workflow phase-transitions done" in entry.content
+        for entry in composer_history
+    )
+    assert outcome.kind == "composed"
+
+
+async def test_loop_activate_register_bundled_with_compose_switches_stack(
+    state: SessionState, tmp_path: Path
+) -> None:
+    """#915: a register switch bundled with ``compose=true`` still switches.
+
+    Same drop as the workflow case, but the silence is worse: the reply
+    is composed with the *old* voice stack, so the user sees an answer
+    that reads as if the register request was never made.
+    """
+    from crawdad.intents import ACTIVATE_REGISTER_INTENT_TYPE
+    from crawdad.skill_loader import (
+        SkillStackRegistry,
+        VoiceSkillStack,
+        load_skills_for_session,
+    )
+
+    skills_dir = tmp_path / "creek-skills"
+    (skills_dir / "voice-core").mkdir(parents=True)
+    (skills_dir / "voice-core" / "SKILL.md").write_text(
+        "voice core body", encoding="utf-8"
+    )
+    (skills_dir / "registers").mkdir()
+    (skills_dir / "registers" / "analytic.SKILL.md").write_text(
+        "# Analytic register\nPrecise, taxonomy-leaning.",
+        encoding="utf-8",
+    )
+
+    initial = load_skills_for_session(vault_path=tmp_path, state=None)
+    registry = SkillStackRegistry(stack=initial, vault_path=tmp_path, state=None)
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=ACTIVATE_REGISTER_INTENT_TYPE,
+                        args={"register": "analytic"},
+                    )
+                ],
+                compose=True,
+            )
+        ]
+    )
+    composer = _ScriptedComposer("switched")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(_ScriptedSession()),  # type: ignore[arg-type]
+        known_tools=(),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=VoiceSkillStack(skills=()),
+        skill_registry=registry,
+    )
+
+    outcome = await loop.run("use the analytic voice")
+
+    # The effect: the registry really swapped stacks, and the composer
+    # was handed the switched-to stack — not the pre-switch one.
+    assert registry.stack is not initial
+    assert any("Analytic" in body for body in registry.stack.bodies())
+    assert composer.calls[0]["skills"] is registry.stack
+    assert len(router.calls) == 1
+    assert outcome.kind == "composed"
+
+
+async def test_loop_bundled_compose_round_composes_at_max_rounds_one(
+    state: SessionState, skills: VoiceSkillStack
+) -> None:
+    """#915: the bundled round dispatches *and* composes within one round.
+
+    Guards against a ``continue``-shaped fix that dispatches and then
+    spins the loop for another router pass: with ``max_rounds=1`` such a
+    fix would exhaust the cap and return ``too_deep`` instead of the
+    composed reply the user asked for.
+    """
+    from crawdad.intents import RUN_WORKFLOW_INTENT_TYPE
+
+    runner_calls: list[tuple[str, dict[str, str]]] = []
+
+    async def _workflow_runner(name: str, inputs: dict[str, str]) -> str:
+        runner_calls.append((name, inputs))
+        return f"workflow {name} done"
+
+    router = _ScriptedRouter(
+        [
+            RouterResponse(
+                intents=[
+                    Intent(
+                        type=RUN_WORKFLOW_INTENT_TYPE,
+                        args={
+                            "name": "phase-transitions",
+                            "inputs": {"topic": "spirals"},
+                        },
+                    )
+                ],
+                compose=True,
+            )
+        ]
+    )
+    composer = _ScriptedComposer("composed reply")
+    loop = AgentLoop(
+        router=router,  # type: ignore[arg-type]
+        composer=composer,  # type: ignore[arg-type]
+        mcp_client=_ScriptedMCPClient(_ScriptedSession()),  # type: ignore[arg-type]
+        known_tools=(),
+        history=ConversationHistory(),
+        session_state=state,
+        skills=skills,
+        max_rounds=1,
+        workflow_runner=_workflow_runner,
+    )
+
+    outcome = await loop.run("run the phase-transitions workflow on spirals")
+
+    assert outcome.kind == "composed"
+    assert outcome.reply == "composed reply"
+    assert runner_calls == [("phase-transitions", {"topic": "spirals"})]
+    assert composer.calls
+
+
 async def test_loop_records_user_and_assistant_turns(
     state: SessionState, skills: VoiceSkillStack
 ) -> None:

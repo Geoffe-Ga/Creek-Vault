@@ -64,11 +64,16 @@ class Intent(BaseModel):
 class RouterResponse(BaseModel):
     """The exact JSON shape Haiku must emit — no prose, no extras.
 
-    FEAT-015 adds the ``compose`` flag: when ``True`` (or when
-    ``intents`` is empty) the loop terminates router iteration and
-    invokes the Sonnet composer. The pair ``{intents: [], compose:
-    true}`` is the canonical "I have enough context; compose now"
-    signal.
+    FEAT-015 adds the ``compose`` flag: it ends router iteration, so the
+    Sonnet composer produces the reply for this round. An empty
+    ``intents`` list ends iteration too. The pair ``{intents: [],
+    compose: true}`` is the canonical "I have enough context; compose
+    now" signal.
+
+    ``compose`` and ``intents`` are independent: a response may carry
+    both, and the loop then dispatches those intents *before* composing
+    rather than discarding them (#915). The router prompt invites this
+    shape by asking for the intent "BEFORE setting ``compose: true``".
     """
 
     model_config = ConfigDict(frozen=True)
