@@ -38,13 +38,45 @@ discord.py 2.7.1 declares ``aiohttp<4,>=3.7.4``, so nothing about
 discord.py changes, and the floor lives in
 ``[tool.uv].constraint-dependencies`` alongside pyasn1.
 
+``cryptography``, ``pydantic-settings``, ``python-multipart``, and
+``starlette`` (issue #979): the exported lock carried eight further
+advisories across these four transitive-only packages. cryptography
+48.0.0 carries GHSA-537c-gmf6-5ccf (fixed in 48.0.1), reached via
+google-auth and pyjwt. pydantic-settings 2.14.1 carries
+GHSA-4xgf-cpjx-pc3j (fixed in 2.14.2), reached via mcp.
+python-multipart 0.0.29 carries PYSEC-2026-3036 and PYSEC-2026-3037
+(fixed in 0.0.30) plus PYSEC-2026-3040 (fixed only in 0.0.31), so
+0.0.30 is a partial fix; reached via mcp. starlette 1.1.0 carries
+PYSEC-2026-248 (fixed in 1.3.0) plus PYSEC-2026-249 (fixed only in
+1.3.1), so 1.3.0 is a partial fix; reached via mcp and sse-starlette.
+Every upstream specifier on these four is an open floor with no
+ceiling, so all four raise cleanly with zero suppressions and their
+floors live in ``[tool.uv].constraint-dependencies`` alongside pyasn1
+and aiohttp.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
   vulnerable release so a future relock cannot resolve back down to it.
-* **locked version** — ``uv.lock`` is what CI installs and what
-  pip-audit actually inspects, so the resolved entry must already be
-  at or above the patched version.
+* **locked version** — ``uv.lock`` is the reproducibility contract
+  that ``uv sync`` users install and the second surface
+  ``scripts/security.sh`` audits via ``uv export --locked``, so the
+  resolved entry must already be at or above the patched version.
+  (crawdad's own CI provisions the *installed environment* with ``pip
+  install -e ".[dev]"``, which is audited separately by the bare
+  ``pip-audit`` run added in #979.)
+
+Three further guards cover the *wiring* of the security gate itself —
+the regression class that produced #979. A pin is only worth as much
+as the scanner that would notice its absence, and crawdad's
+``scripts/security.sh`` ran bandit alone, so eight advisories sat in
+the lock unreported while the gate stayed green. Those tests assert
+that ``security.sh`` audits both surfaces — the installed environment
+with a bare ``pip-audit``, and the exported lock via ``uv export
+--locked`` fed to ``pip-audit -r`` — and that
+``[project.optional-dependencies].dev`` actually provisions
+``pip-audit`` and ``uv``, since the crawdad CI job installs only
+``.[dev]`` before running ``check-all.sh``.
 """
 
 from __future__ import annotations
@@ -60,6 +92,7 @@ from packaging.version import Version
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _PYPROJECT = _PACKAGE_ROOT / "pyproject.toml"
 _UV_LOCK = _PACKAGE_ROOT / "uv.lock"
+_SECURITY_SCRIPT = _PACKAGE_ROOT / "scripts" / "security.sh"
 
 #: First mcp release containing the fixes for CVE-2026-52869,
 #: CVE-2026-52870, and CVE-2026-59950.
@@ -72,6 +105,28 @@ _PYASN1_PATCHED_VERSION = Version("0.6.4")
 #: First aiohttp release with all eleven advisories fixed; 3.14.0
 #: fixed only PYSEC-2026-2104, PYSEC-2026-2105, and PYSEC-2026-2106.
 _AIOHTTP_PATCHED_VERSION = Version("3.14.1")
+
+#: First cryptography release containing the fix for
+#: GHSA-537c-gmf6-5ccf.
+_CRYPTOGRAPHY_PATCHED_VERSION = Version("48.0.1")
+
+#: First pydantic-settings release containing the fix for
+#: GHSA-4xgf-cpjx-pc3j.
+_PYDANTIC_SETTINGS_PATCHED_VERSION = Version("2.14.2")
+
+#: First python-multipart release with all three advisories fixed;
+#: 0.0.30 fixed only PYSEC-2026-3036 and PYSEC-2026-3037, leaving
+#: PYSEC-2026-3040 open until 0.0.31.
+_PYTHON_MULTIPART_PATCHED_VERSION = Version("0.0.31")
+
+#: First starlette release with both advisories fixed; 1.3.0 fixed
+#: only PYSEC-2026-248, leaving PYSEC-2026-249 open until 1.3.1.
+_STARLETTE_PATCHED_VERSION = Version("1.3.1")
+
+#: Shell builtins that only *look up* a command (``command -v
+#: pip-audit``) instead of running it; a lookup must not count as an
+#: audit.
+_LOOKUP_BUILTINS = frozenset({"command", "hash", "type", "which"})
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -179,6 +234,258 @@ def _locked_aiohttp_version() -> Version:
     pytest.fail("aiohttp has no [[package]] entry in uv.lock")
 
 
+def _cryptography_constraint_specifier() -> SpecifierSet:
+    """Return the ``cryptography`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``cryptography`` constraint
+        entry. Fails the calling test if the ``[tool.uv]`` table or the
+        ``cryptography`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "cryptography":
+            return requirement.specifier
+    pytest.fail(
+        "cryptography has no entry in [tool.uv].constraint-dependencies of "
+        "pyproject.toml"
+    )
+
+
+def _locked_cryptography_version() -> Version:
+    """Return the resolved ``cryptography`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``cryptography`` version resolved in the lockfile. Fails
+        the calling test if the lock has no ``cryptography`` package
+        entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "cryptography":
+            return Version(str(package["version"]))
+    pytest.fail("cryptography has no [[package]] entry in uv.lock")
+
+
+def _pydantic_settings_constraint_specifier() -> SpecifierSet:
+    """Return the ``pydantic-settings`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``pydantic-settings``
+        constraint entry. Fails the calling test if the ``[tool.uv]``
+        table or the ``pydantic-settings`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "pydantic-settings":
+            return requirement.specifier
+    pytest.fail(
+        "pydantic-settings has no entry in [tool.uv].constraint-dependencies "
+        "of pyproject.toml"
+    )
+
+
+def _locked_pydantic_settings_version() -> Version:
+    """Return the resolved ``pydantic-settings`` version in ``uv.lock``.
+
+    Returns:
+        The ``pydantic-settings`` version resolved in the lockfile.
+        Fails the calling test if the lock has no ``pydantic-settings``
+        package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "pydantic-settings":
+            return Version(str(package["version"]))
+    pytest.fail("pydantic-settings has no [[package]] entry in uv.lock")
+
+
+def _python_multipart_constraint_specifier() -> SpecifierSet:
+    """Return the ``python-multipart`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``python-multipart``
+        constraint entry. Fails the calling test if the ``[tool.uv]``
+        table or the ``python-multipart`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "python-multipart":
+            return requirement.specifier
+    pytest.fail(
+        "python-multipart has no entry in [tool.uv].constraint-dependencies "
+        "of pyproject.toml"
+    )
+
+
+def _locked_python_multipart_version() -> Version:
+    """Return the resolved ``python-multipart`` version in ``uv.lock``.
+
+    Returns:
+        The ``python-multipart`` version resolved in the lockfile.
+        Fails the calling test if the lock has no ``python-multipart``
+        package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "python-multipart":
+            return Version(str(package["version"]))
+    pytest.fail("python-multipart has no [[package]] entry in uv.lock")
+
+
+def _starlette_constraint_specifier() -> SpecifierSet:
+    """Return the ``starlette`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``starlette`` constraint
+        entry. Fails the calling test if the ``[tool.uv]`` table or the
+        ``starlette`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "starlette":
+            return requirement.specifier
+    pytest.fail(
+        "starlette has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_starlette_version() -> Version:
+    """Return the resolved ``starlette`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``starlette`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``starlette`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "starlette":
+            return Version(str(package["version"]))
+    pytest.fail("starlette has no [[package]] entry in uv.lock")
+
+
+def _security_script_commands() -> list[str]:
+    """Return the executable commands in ``scripts/security.sh``.
+
+    Comment-only lines are dropped and backslash continuations are
+    joined, so a multi-line invocation is inspected as the single
+    command the shell actually runs.
+
+    Returns:
+        One entry per non-blank, non-comment logical line of the
+        script.
+    """
+    text = _SECURITY_SCRIPT.read_text(encoding="utf-8")
+    joined = text.replace("\\\n", " ")
+    return [
+        line.strip()
+        for line in joined.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _is_pip_audit_command(tokens: list[str]) -> bool:
+    """Return whether a tokenized command actually runs ``pip-audit``.
+
+    Args:
+        tokens: Shell tokens of a single command.
+
+    Returns:
+        ``True`` when some token is ``pip-audit`` or a path ending in
+        it, such as ``.venv/bin/pip-audit``. Existence probes such as
+        ``command -v pip-audit`` do not count as audits.
+    """
+    if any(token in _LOOKUP_BUILTINS for token in tokens):
+        return False
+    return any(token.rsplit("/", maxsplit=1)[-1] == "pip-audit" for token in tokens)
+
+
+def _pip_audit_invocations() -> list[list[str]]:
+    """Return the tokenized ``pip-audit`` commands in ``security.sh``.
+
+    Returns:
+        Each ``pip-audit`` invocation as its list of shell tokens.
+    """
+    invocations: list[list[str]] = []
+    for command in _security_script_commands():
+        tokens = command.split()
+        if _is_pip_audit_command(tokens):
+            invocations.append(tokens)
+    return invocations
+
+
+def _targets_requirements_file(tokens: list[str]) -> bool:
+    """Return whether a tokenized invocation names a requirements file.
+
+    Args:
+        tokens: Shell tokens of a single ``pip-audit`` invocation.
+
+    Returns:
+        ``True`` when the invocation carries ``-r`` / ``--requirement``
+        in any accepted spelling, meaning it audits a requirements file
+        rather than the installed environment.
+    """
+    flags = {"-r", "--requirement"}
+    prefixes = ("-r", "--requirement=")
+    return any(token in flags or token.startswith(prefixes) for token in tokens)
+
+
+def _dev_extra_requirement_names() -> set[str]:
+    """Return the names declared in ``[project.optional-dependencies].dev``.
+
+    Returns:
+        The requirement name of every entry in the ``dev`` extra. Fails
+        the calling test if the extra is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    extras = pyproject["project"].get("optional-dependencies", {})
+    if "dev" not in extras:
+        pytest.fail("pyproject.toml declares no [project.optional-dependencies].dev")
+    dev_entries: list[str] = extras["dev"]
+    return {Requirement(entry).name for entry in dev_entries}
+
+
 def test_mcp_floor_rejects_last_vulnerable_range() -> None:
     """The pyproject floor excludes 1.28.0 (and everything below it).
 
@@ -222,7 +529,10 @@ def test_mcp_floor_accepts_patched_release() -> None:
 def test_locked_mcp_at_or_above_patched_release() -> None:
     """``uv.lock`` resolves mcp to >= 1.28.1.
 
-    The lockfile is what CI installs and what pip-audit inspects; a
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``
+    (crawdad CI itself provisions the installed environment with ``pip
+    install -e ".[dev]"``, covered by the bare ``pip-audit`` run); a
     correct pyproject floor with a stale lock still ships the
     vulnerable 1.27.1.
     """
@@ -261,7 +571,10 @@ def test_pyasn1_floor_accepts_patched_release() -> None:
 def test_locked_pyasn1_at_or_above_patched_release() -> None:
     """``uv.lock`` resolves pyasn1 to >= 0.6.4.
 
-    The lockfile is what CI installs and what pip-audit inspects; a
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``
+    (crawdad CI itself provisions the installed environment with ``pip
+    install -e ".[dev]"``, covered by the bare ``pip-audit`` run); a
     correct constraint floor with a stale lock still ships the
     vulnerable 0.6.3.
     """
@@ -308,9 +621,12 @@ def test_aiohttp_floor_accepts_patched_release() -> None:
 def test_locked_aiohttp_at_or_above_patched_release() -> None:
     """``uv.lock`` resolves aiohttp to >= 3.14.1.
 
-    The lockfile is what ``uv sync`` installs and what pip-audit
-    inspects; a correct constraint floor with a stale lock still ships
-    the vulnerable 3.13.5.
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``
+    (crawdad CI itself provisions the installed environment with ``pip
+    install -e ".[dev]"``, covered by the bare ``pip-audit`` run); a
+    correct constraint floor with a stale lock still ships the
+    vulnerable 3.13.5.
     """
     locked = _locked_aiohttp_version()
     assert locked >= _AIOHTTP_PATCHED_VERSION, (
@@ -318,4 +634,251 @@ def test_locked_aiohttp_at_or_above_patched_release() -> None:
         f"{_AIOHTTP_PATCHED_VERSION} (PYSEC-2026-237 and PYSEC-2026-2104 "
         "through -2113); pip-audit inspects the lock, so relock after "
         "adding the constraint"
+    )
+
+
+def test_cryptography_floor_rejects_last_vulnerable_release() -> None:
+    """The constraint excludes 48.0.0, the last vulnerable release.
+
+    cryptography 48.0.0 carries GHSA-537c-gmf6-5ccf and reaches this
+    graph through google-auth and pyjwt. The constraint must genuinely
+    be ``>=48.0.1`` so a relock cannot resolve back onto it.
+    """
+    specifier = _cryptography_constraint_specifier()
+    assert "48.0.0" not in specifier, (
+        f"cryptography constraint {specifier!r} admits 48.0.0, the "
+        "release carrying GHSA-537c-gmf6-5ccf; the floor must be "
+        ">=48.0.1"
+    )
+
+
+def test_cryptography_floor_accepts_patched_release() -> None:
+    """The constraint accepts 48.0.1, the first patched release."""
+    specifier = _cryptography_constraint_specifier()
+    assert "48.0.1" in specifier, (
+        f"cryptography constraint {specifier!r} rejects 48.0.1; the "
+        "patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_cryptography_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves cryptography to >= 48.0.1.
+
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``;
+    a correct constraint floor with a stale lock still ships the
+    vulnerable 48.0.0.
+    """
+    locked = _locked_cryptography_version()
+    assert locked >= _CRYPTOGRAPHY_PATCHED_VERSION, (
+        f"uv.lock pins cryptography {locked}, below the patched "
+        f"{_CRYPTOGRAPHY_PATCHED_VERSION} (GHSA-537c-gmf6-5ccf); the "
+        "exported lock is audited, so relock after adding the constraint"
+    )
+
+
+def test_pydantic_settings_floor_rejects_last_vulnerable_release() -> None:
+    """The constraint excludes 2.14.1, the last vulnerable release.
+
+    pydantic-settings 2.14.1 carries GHSA-4xgf-cpjx-pc3j and reaches
+    this graph through mcp. The constraint must genuinely be
+    ``>=2.14.2`` so a relock cannot resolve back onto it.
+    """
+    specifier = _pydantic_settings_constraint_specifier()
+    assert "2.14.1" not in specifier, (
+        f"pydantic-settings constraint {specifier!r} admits 2.14.1, the "
+        "release carrying GHSA-4xgf-cpjx-pc3j; the floor must be "
+        ">=2.14.2"
+    )
+
+
+def test_pydantic_settings_floor_accepts_patched_release() -> None:
+    """The constraint accepts 2.14.2, the first patched release."""
+    specifier = _pydantic_settings_constraint_specifier()
+    assert "2.14.2" in specifier, (
+        f"pydantic-settings constraint {specifier!r} rejects 2.14.2; the "
+        "patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_pydantic_settings_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves pydantic-settings to >= 2.14.2.
+
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``;
+    a correct constraint floor with a stale lock still ships the
+    vulnerable 2.14.1.
+    """
+    locked = _locked_pydantic_settings_version()
+    assert locked >= _PYDANTIC_SETTINGS_PATCHED_VERSION, (
+        f"uv.lock pins pydantic-settings {locked}, below the patched "
+        f"{_PYDANTIC_SETTINGS_PATCHED_VERSION} (GHSA-4xgf-cpjx-pc3j); the "
+        "exported lock is audited, so relock after adding the constraint"
+    )
+
+
+def test_python_multipart_floor_rejects_vulnerable_releases() -> None:
+    """The constraint excludes 0.0.29 and the partial-fix 0.0.30.
+
+    python-multipart 0.0.29 carries PYSEC-2026-3036, PYSEC-2026-3037,
+    and PYSEC-2026-3040. 0.0.30 clears only the first two, so stopping
+    the floor at ``>=0.0.30`` would still ship a vulnerability reachable
+    through mcp; the floor has to be ``>=0.0.31``.
+    """
+    specifier = _python_multipart_constraint_specifier()
+    assert "0.0.29" not in specifier, (
+        f"python-multipart constraint {specifier!r} admits 0.0.29, the "
+        "release carrying PYSEC-2026-3036 / PYSEC-2026-3037 / "
+        "PYSEC-2026-3040; the floor must be >=0.0.31"
+    )
+    assert "0.0.30" not in specifier, (
+        f"python-multipart constraint {specifier!r} admits 0.0.30, which "
+        "still carries PYSEC-2026-3040; the floor must be >=0.0.31, not "
+        ">=0.0.30"
+    )
+
+
+def test_python_multipart_floor_accepts_patched_release() -> None:
+    """The constraint accepts 0.0.31, the first fully patched release."""
+    specifier = _python_multipart_constraint_specifier()
+    assert "0.0.31" in specifier, (
+        f"python-multipart constraint {specifier!r} rejects 0.0.31; the "
+        "patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_python_multipart_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves python-multipart to >= 0.0.31.
+
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``;
+    a correct constraint floor with a stale lock still ships the
+    vulnerable 0.0.29.
+    """
+    locked = _locked_python_multipart_version()
+    assert locked >= _PYTHON_MULTIPART_PATCHED_VERSION, (
+        f"uv.lock pins python-multipart {locked}, below the patched "
+        f"{_PYTHON_MULTIPART_PATCHED_VERSION} (PYSEC-2026-3036 / "
+        "PYSEC-2026-3037 / PYSEC-2026-3040); the exported lock is "
+        "audited, so relock after adding the constraint"
+    )
+
+
+def test_starlette_floor_rejects_vulnerable_releases() -> None:
+    """The constraint excludes 1.1.0 and the partial-fix 1.3.0.
+
+    starlette 1.1.0 carries PYSEC-2026-248 and PYSEC-2026-249. 1.3.0
+    clears only the first, so stopping the floor at ``>=1.3.0`` would
+    still ship a vulnerability reachable through mcp and sse-starlette;
+    the floor has to be ``>=1.3.1``.
+    """
+    specifier = _starlette_constraint_specifier()
+    assert "1.1.0" not in specifier, (
+        f"starlette constraint {specifier!r} admits 1.1.0, the release "
+        "carrying PYSEC-2026-248 / PYSEC-2026-249; the floor must be "
+        ">=1.3.1"
+    )
+    assert "1.3.0" not in specifier, (
+        f"starlette constraint {specifier!r} admits 1.3.0, which still "
+        "carries PYSEC-2026-249; the floor must be >=1.3.1, not >=1.3.0"
+    )
+
+
+def test_starlette_floor_accepts_patched_release() -> None:
+    """The constraint accepts 1.3.1, the first fully patched release."""
+    specifier = _starlette_constraint_specifier()
+    assert "1.3.1" in specifier, (
+        f"starlette constraint {specifier!r} rejects 1.3.1; the patched "
+        "release itself must satisfy the constraint"
+    )
+
+
+def test_locked_starlette_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves starlette to >= 1.3.1.
+
+    The lockfile is what ``uv sync`` users install and the second
+    surface ``scripts/security.sh`` audits via ``uv export --locked``;
+    a correct constraint floor with a stale lock still ships the
+    vulnerable 1.1.0.
+    """
+    locked = _locked_starlette_version()
+    assert locked >= _STARLETTE_PATCHED_VERSION, (
+        f"uv.lock pins starlette {locked}, below the patched "
+        f"{_STARLETTE_PATCHED_VERSION} (PYSEC-2026-248 / PYSEC-2026-249); "
+        "the exported lock is audited, so relock after adding the "
+        "constraint"
+    )
+
+
+def test_security_script_audits_installed_environment() -> None:
+    """``security.sh`` runs pip-audit against the live environment.
+
+    crawdad CI provisions with ``pip install -e ".[dev]"``, and pip
+    honours neither ``uv.lock`` nor ``[tool.uv].constraint-dependencies``
+    — both are invisible to it. The installed environment is therefore a
+    distinct surface that nothing else in the gate guards: a floor can be
+    correct in pyproject and the lock while CI still resolves a
+    vulnerable transitive release. Only a bare ``pip-audit`` (one with no
+    ``-r`` / ``--requirement``) inspects what is actually installed.
+    """
+    invocations = _pip_audit_invocations()
+    assert invocations, (
+        "scripts/security.sh invokes no pip-audit at all; bandit alone "
+        "left the eight advisories of #979 unreported"
+    )
+    environment_audits = [
+        tokens for tokens in invocations if not _targets_requirements_file(tokens)
+    ]
+    assert environment_audits, (
+        "every pip-audit invocation in scripts/security.sh targets a "
+        "requirements file; add a bare `pip-audit` so the environment CI "
+        f"actually installs is audited (found: {invocations!r})"
+    )
+
+
+def test_security_script_audits_exported_lock() -> None:
+    """``security.sh`` audits the lock exported by ``uv export --locked``.
+
+    ``uv.lock`` is what ``uv sync`` users install and where all eight
+    advisories in #979 lived. Auditing only the installed venv reported
+    clean while the lock stayed vulnerable, so the gate must also export
+    the lock (``--locked``, which fails rather than silently relocking)
+    and feed it to ``pip-audit -r``.
+    """
+    commands = _security_script_commands()
+    exports = [command for command in commands if "uv export" in command]
+    assert exports, (
+        "scripts/security.sh never runs `uv export`; the lockfile "
+        "surface where the #979 advisories lived would go unaudited"
+    )
+    assert any("--locked" in command for command in exports), (
+        "scripts/security.sh runs `uv export` without --locked, so a "
+        "stale lock would be silently regenerated instead of failing "
+        f"(found: {exports!r})"
+    )
+    audits = _pip_audit_invocations()
+    lock_audits = [tokens for tokens in audits if _targets_requirements_file(tokens)]
+    assert lock_audits, (
+        "scripts/security.sh exports the lock but never feeds it to "
+        "`pip-audit -r`; the export alone audits nothing"
+    )
+
+
+def test_dev_extras_provision_audit_toolchain() -> None:
+    """The ``dev`` extra installs both tools ``security.sh`` invokes.
+
+    The crawdad CI job installs ONLY ``.[dev]`` and then runs
+    ``check-all.sh``. A tool the security script invokes but the extra
+    omits fails CI outright — or, worse, is silently unavailable — so
+    this pins the provisioning contract to the script's actual needs.
+    """
+    names = _dev_extra_requirement_names()
+    assert "pip-audit" in names, (
+        "[project.optional-dependencies].dev omits pip-audit, the "
+        "scanner scripts/security.sh runs; CI installs only .[dev]"
+    )
+    assert "uv" in names, (
+        "[project.optional-dependencies].dev omits uv, which "
+        "scripts/security.sh needs for `uv export --locked`; CI installs "
+        "only .[dev]"
     )
