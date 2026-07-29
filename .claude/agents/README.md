@@ -22,7 +22,7 @@ graph under a conductor is identical:
 ```
 ralph-tick (fleet ORCHESTRATOR — worker pool: reconcile · serialized-merge · lazy-sync · refill)
   └─ ralph-worker × up to 4 . L1  opus    per-issue CONDUCTOR in an isolated worktree
-       ├─ chief-architect ..... L0  fable   plan + ordered dispatch list (no code)
+       ├─ chief-architect ..... L0  opus    plan + ordered dispatch list (no code)
        ├─ test-specialist ..... L2  opus    Gate 1 RED: failing tests          ─┐
        ├─ implementation-spec.  L2  opus    Gate 1 GREEN + Refactor             │ run per
        ├─ security-specialist . L2  opus    harden auth/input/paths/secrets     │ the
@@ -62,37 +62,39 @@ specialists are leaf workers that do their own work and do not sub-delegate.
 
 ## Model tiers (strategic mix)
 
-The tiering rule is **Fable 5 for planning, Opus 5 for implementation, Sonnet 5
-for review, Haiku 4.5 for quick checks.**
+The tiering rule is **Opus 5 for planning and implementation, Sonnet 5 for
+review, Haiku 4.5 for quick checks.**
 
 > Prose names the model *family generation*; the `model:` frontmatter takes the
 > unversioned **alias** (`fable`/`opus`/`sonnet`/`haiku`), which always resolves
 > to the current model in that family. Keep the aliases in frontmatter — pinning
 > a dated ID there would rot.
 
-**Fable 5** for the one role where a better plan changes everything downstream:
-`chief-architect` (the once-per-issue design pass). Fable is ~2× Opus-tier cost
-and can run minutes-long turns — spending it once per issue on the design, and
-not on every code-writing turn, is the cheapest place to buy quality. It also
-prefers **less-prescriptive prompts** (state the goal and constraints, not
-step-by-step scaffolding), which suits a planning brief.
+**Opus 5** for planning and every code-writing role: `chief-architect` (the
+once-per-issue design pass), `ralph-worker` (the long-horizon per-issue
+conductor), `implementation-specialist` (Gate 1 GREEN + Refactor),
+`test-specialist` (Gate 1 RED), `performance-specialist` (optimization), and
+`security-specialist`.
 
-**Fable is credit-metered and can run out.** The architect role therefore
-carries an explicit **graceful fallback: on a Fable-unavailable spawn failure,
-the conductor immediately re-spawns `chief-architect` with a
-`model: opus` override and continues the tick.** A tick never blocks, and never
-skips the planning pass, because Fable credits are exhausted. See
-[`chief-architect.md`](chief-architect.md) and `scripts/ralph/PROMPT.md` step 5.
+> **Why the architect is no longer on Fable 5.** Fable is credit-metered. Once
+> credits ran out, every tick spent a *failed* spawn before falling back to
+> Opus — pure waste, and on a long run those failed spawns count against the
+> session's subagent cap. The fallback worked exactly as designed; the problem
+> was paying for it on every tick rather than occasionally. Moving the architect
+> to Opus removes the failure path entirely.
+>
+> If Fable credits are topped up and you want the planning pass back on it, set
+> `model: fable` in [`chief-architect.md`](chief-architect.md) and restore the
+> fallback contract in `scripts/ralph/PROMPT.md` step 5. Fable is ~2× Opus-tier
+> cost and prefers **less-prescriptive prompts** (state the goal and
+> constraints, not step-by-step scaffolding), which suits a planning brief —
+> spending it once per issue on design rather than on every code-writing turn
+> is the cheapest place to buy quality.
 
-**Opus 5** for every code-writing role — implementation is where model quality
-pays off directly: `ralph-worker` (the long-horizon per-issue conductor),
-`implementation-specialist` (Gate 1 GREEN + Refactor), `test-specialist`
-(Gate 1 RED), `performance-specialist` (optimization), and
-`security-specialist`. Opus 5 is un-metered relative to Fable, so the roles that
-run many turns per tick sit here. Keeping `security-specialist` on Opus is also
-a hard requirement independent of cost: Fable's safety classifiers target
-**cyber/bio** content, and legitimate hardening work can trip a false-positive
-refusal.
+Keeping `security-specialist` on Opus is a hard requirement independent of cost:
+Fable's safety classifiers target **cyber/bio** content, and legitimate
+hardening work can trip a false-positive refusal. Do not move that role to Fable
+even if the architect goes back.
 **Sonnet** for review and other well-scoped passes over bounded input:
 `code-review-orchestrator` (Gate 2.5), `documentation-specialist`.
 **Haiku** for the purely mechanical, read-only checklist walk:
