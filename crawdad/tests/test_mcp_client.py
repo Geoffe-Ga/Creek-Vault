@@ -202,3 +202,80 @@ async def test_connect_passes_forwarded_env_to_subprocess(
         await session.list_tools()
 
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-connect-test"
+
+
+# --- Issue #918: canonical cloud consent + tri-provider keys ---
+
+
+def test_forwarded_env_vars_pin_exact_allowlist() -> None:
+    """The allowlist is exactly the five documented names, with no duplicates.
+
+    The names are spelled as literals on purpose: importing
+    ``crawdad.config._PROVIDER_KEY_ENV`` would make this assertion follow the
+    source instead of pinning it. The length check catches a derivation that
+    emits a name twice.
+    """
+    assert set(mcp_client._FORWARDED_ENV_VARS) == {
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "CREEK_CLOUD_CONSENT",
+        "CREEK_ANTHROPIC_CONSENT",
+    }
+    assert len(mcp_client._FORWARDED_ENV_VARS) == 5
+
+
+def test_subprocess_env_forwards_cloud_consent() -> None:
+    """The canonical ``CREEK_CLOUD_CONSENT`` gate reaches the subprocess."""
+    env = mcp_client._subprocess_env({"CREEK_CLOUD_CONSENT": "1"})
+
+    assert env["CREEK_CLOUD_CONSENT"] == "1"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"],
+)
+def test_subprocess_env_forwards_each_provider_key(name: str) -> None:
+    """Every provider key CrawDad supports is forwarded, not just Anthropic's."""
+    env = mcp_client._subprocess_env({name: f"key-for-{name}"})
+
+    assert env[name] == f"key-for-{name}"
+
+
+def test_subprocess_env_forwards_both_consent_vars_independently() -> None:
+    """The canonical consent name is added alongside the legacy alias.
+
+    Both must survive with their own values: adding
+    ``CREEK_CLOUD_CONSENT`` must not displace ``CREEK_ANTHROPIC_CONSENT``
+    for operators still setting the older name.
+    """
+    env = mcp_client._subprocess_env(
+        {
+            "CREEK_CLOUD_CONSENT": "cloud-yes",
+            "CREEK_ANTHROPIC_CONSENT": "anthropic-yes",
+        },
+    )
+
+    assert env["CREEK_CLOUD_CONSENT"] == "cloud-yes"
+    assert env["CREEK_ANTHROPIC_CONSENT"] == "anthropic-yes"
+
+
+def test_subprocess_env_omits_absent_new_vars() -> None:
+    """An empty source env yields no entry for any of the newly added names."""
+    env = mcp_client._subprocess_env({})
+
+    assert "CREEK_CLOUD_CONSENT" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "GOOGLE_API_KEY" not in env
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CREEK_CLOUD_CONSENT", "OPENAI_API_KEY", "GOOGLE_API_KEY"],
+)
+def test_subprocess_env_treats_blank_new_vars_as_unset(name: str) -> None:
+    """A blank value is omitted entirely rather than forwarded as an empty string."""
+    env = mcp_client._subprocess_env({name: ""})
+
+    assert name not in env
