@@ -752,3 +752,51 @@ def test_privacy_open_tier_punctuated_body_does_not_flag(tmp_path: Path) -> None
     result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
 
     assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_punctuation_led_secret_glued_at_its_word_tail_does_not_flag(
+    tmp_path: Path,
+) -> None:
+    """A punctuation-led secret glued onto a word at its tail does not flag.
+
+    Isolates the trailing boundary assertion (#939): the snippet opens on a
+    quote, so the leading assertion is dropped and cannot mask the result. Its
+    last character is a word character, so that edge must keep its assertion
+    and refuse a match that runs straight into the next word.
+    """
+    secret = '"I never told anyone what really happened'
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = 'She wrote: "I never told anyone what really happenedX'
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_punctuated_leak_finding_is_high_and_names_the_fragment(
+    tmp_path: Path,
+) -> None:
+    """The punctuation-edged leak finding keeps HIGH severity and full detail.
+
+    Pins the payload of the finding this fix restores (#939) so a downgrade of
+    the HARD privacy gate's severity, or a message that stops naming the
+    offending fragment and its tier, cannot pass silently.
+    """
+    secret = "I cheated on my partner last spring."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "Here is the leak: I cheated on my partner last spring. That is all."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    finding = next(f for f in result.findings if f.dimension == "privacy_compliance")
+    assert finding.severity == "HIGH"
+    assert "frag-a" in finding.message
+    assert "intimate" in finding.message
