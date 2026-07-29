@@ -28,6 +28,7 @@ from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 from creek.time import effective_authored_date
 
 if TYPE_CHECKING:
+    from enum import StrEnum
     from pathlib import Path
 
 
@@ -313,11 +314,30 @@ def _fragment_in_window(fragment: Fragment, start: date, end: date) -> bool:
     return start <= frag_date <= end
 
 
-def _most_common_classified(values: list[str], unclassified: str) -> str:
-    """Return the most common *values* entry, ignoring *unclassified* markers."""
+def _most_common_classified(values: list[str], unclassified: StrEnum | str) -> str:
+    """Return the most common *values* entry, ignoring *unclassified* markers.
+
+    The sentinel is normalised to a plain :class:`str` before it is
+    returned. Callers may legitimately hand over a ``StrEnum`` member
+    (``Phase.UNCLASSIFIED``) or its ``.value``: the member satisfies a
+    ``str`` annotation, compares equal to its value, and so passes mypy
+    and every comparison here unnoticed — but PyYAML has no representer
+    for the member, so returning it unchanged made the note it landed in
+    fail to serialise with ``RepresenterError`` (issue #940). Normalising
+    at the single point of return keeps that trap disarmed for every
+    caller rather than relying on each one remembering ``.value``.
+
+    Args:
+        values: Candidate markers, typically one per fragment.
+        unclassified: The marker treated as "not classified", returned
+            (as a plain ``str``) when nothing else qualifies.
+
+    Returns:
+        The most frequent classified marker, or the normalised sentinel.
+    """
     classified = [v for v in values if v and v != unclassified]
     if not classified:
-        return unclassified
+        return str(unclassified)
     counter = Counter(classified)
     return counter.most_common(1)[0][0]
 
