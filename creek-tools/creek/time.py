@@ -5,7 +5,9 @@ timestamp the pipeline produces is normalised to America/Los_Angeles.
 Bare :func:`datetime.now` calls leak the host timezone (or, worse,
 produce naive datetimes that fail to compare against tz-aware ones with
 ``TypeError``), so production code routes through :func:`now_la` /
-:func:`today_la` instead.
+:func:`today_la` instead. :func:`ensure_aware` is the repair valve for
+values that arrive from outside that discipline — persisted frontmatter,
+legacy callers — making them safe to compare without moving the clock.
 
 The constant :data:`LA_TZ` is re-exported from
 :mod:`creek.ingest.base` to preserve the historical import path while
@@ -33,6 +35,47 @@ def now_la() -> datetime:
 def today_la() -> date:
     """Return today's date as observed in America/Los_Angeles."""
     return now_la().date()
+
+
+def ensure_aware(value: datetime) -> datetime:
+    """Return *value* guaranteed comparable against other aware datetimes.
+
+    Comparing a naive datetime with a tz-aware one raises ``TypeError:
+    can't compare offset-naive and offset-aware datetimes``, which is the
+    failure mode this module exists to prevent. Callers that mix a
+    pipeline-generated clock with timestamps read back off disk route
+    through this helper first.
+
+    The contract is deliberately asymmetric:
+
+    * **Aware in, untouched out.** The instant, the ``tzinfo`` object and
+      the microseconds all survive — no normalisation to LA or UTC.
+      A fragment authored in Sydney keeps its Sydney rendering, matching
+      the promise :func:`effective_authored_at` already makes to callers
+      that display source-local time.
+    * **Naive in, LA attached — never converted.** Every wall-clock field
+      is preserved; only the missing offset is filled in. LA is the
+      right assumption because the ontology (§8.3) normalises every
+      timestamp this pipeline writes to LA, so a naive value is an LA
+      wall-clock reading that lost its offset in transit — typically
+      through YAML frontmatter serialised without one. Converting rather
+      than attaching would shift such a value by the LA offset and could
+      move it across a day boundary.
+
+    Args:
+        value: A datetime that may be naive or timezone-aware.
+
+    Returns:
+        *value* unchanged when it is already aware, otherwise the same
+        wall clock anchored to :data:`LA_TZ`.
+    """
+    # ``datetime.utcoffset()`` returns ``None`` for exactly the values
+    # CPython treats as naive when comparing: ``tzinfo is None``, plus the
+    # rarer ``tzinfo`` whose own ``utcoffset`` yields ``None``. Both need
+    # the anchor, so test the offset rather than ``tzinfo`` itself.
+    if value.utcoffset() is not None:
+        return value
+    return value.replace(tzinfo=LA_TZ)
 
 
 def effective_authored_at(fragment: Fragment) -> datetime:

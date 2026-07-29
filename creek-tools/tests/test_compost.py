@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import frontmatter
 import pytest
@@ -38,6 +39,7 @@ from creek.models import (
     ThreadStatus,
     VoiceClassification,
 )
+from creek.time import today_la
 
 
 class _StubVerifier:
@@ -936,3 +938,225 @@ class TestProjectCandidateNote:
         tracker = CompostTracker()
         # Detection on empty inputs should not error and must return empty.
         assert tracker.detect_compost_candidates([], []) == []
+
+
+# ---- Issue #938: the clock must be tz-aware -------------------------------
+#
+# ``CompostTracker.__init__`` was the only place in ``creek/`` that stripped
+# tzinfo off a datetime. Two consequences, both live crashes:
+#
+#   1. the naive clock cannot be compared against a tz-aware fragment
+#      (``TypeError: can't compare offset-naive and offset-aware datetimes``),
+#      and every fragment built from model defaults is tz-aware; and
+#   2. ``self._now.date()`` reads the *UTC* calendar, so for the seven-odd
+#      hours a day that UTC runs a day ahead of LA, compost notes and the
+#      compost report are stamped with tomorrow's date in a vault whose
+#      every other timestamp is LA-normalised.
+#
+# Normalising only the clock fixes neither the reverse pairing (aware clock,
+# naive fragment) nor the ``max()`` over a tag whose fragments mix both, so
+# the tests below pin all three call sites.
+
+_LA_ZONE = ZoneInfo("America/Los_Angeles")
+"""Explicit LA zone for these tests — never the host ``TZ``."""
+
+_TZ_PROJECT_TAG = "greenhouse"
+"""Tag the timezone tests group their fragments under."""
+
+
+def _tz_fragment(
+    *,
+    frag_id: str,
+    title: str,
+    ingested: datetime,
+    tags: list[str],
+) -> Fragment:
+    """Build a tagged fragment whose ``ingested`` value is stored verbatim.
+
+    Deliberately separate from :func:`_fragment`, which mirrors ``created``
+    into ``ingested`` precisely so the legacy tests stay on naive
+    timestamps. These tests need to choose naive *or* tz-aware per
+    fragment — including mixing both inside one tag group — so they need a
+    builder that takes ``ingested`` directly and leaves ``authored_at``
+    unset, letting ``effective_authored_at`` fall through to it.
+
+    Args:
+        frag_id: Fragment id.
+        title: Fragment title.
+        ingested: Exact value stored on ``ingested`` (and ``created``);
+            may be naive or tz-aware.
+        tags: Tags the fragment carries — project grouping keys off these.
+
+    Returns:
+        A minimal :class:`Fragment` suitable for project-silence detection.
+    """
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        created=ingested,
+        ingested=ingested,
+        frequency=FrequencyClassification(primary=Frequency.F5),
+        tags=tags,
+    )
+
+
+class TestTimezoneAwareClock:
+    """The compost clock must compare against any fragment (issue #938)."""
+
+    def _frags(self, moments: list[datetime]) -> list[Fragment]:
+        """Build one fragment per supplied ``ingested`` moment, all one tag.
+
+        Args:
+            moments: The ``ingested`` timestamps, in order.
+
+        Returns:
+            Fragments ``frag-tz-0`` … ``frag-tz-N``, all tagged
+            ``greenhouse`` so project grouping fires.
+        """
+        return [
+            _tz_fragment(
+                frag_id=f"frag-tz-{index}",
+                title=f"Greenhouse notes {index}",
+                ingested=moment,
+                tags=[_TZ_PROJECT_TAG],
+            )
+            for index, moment in enumerate(moments)
+        ]
+
+    def _assert_single_project_candidate(
+        self,
+        candidates: list[CompostCandidate],
+    ) -> None:
+        """Assert the run produced exactly the expected project candidate.
+
+        Asserting the whole candidate — not merely "no exception" — is what
+        makes these tests survive a fix that swallows the ``TypeError``
+        instead of resolving it.
+
+        Args:
+            candidates: The full result of ``detect_compost_candidates``.
+        """
+        assert [c.source_id for c in candidates] == [_TZ_PROJECT_TAG]
+        candidate = candidates[0]
+        assert candidate.source_type == "project"
+        assert candidate.title == _TZ_PROJECT_TAG
+        assert candidate.fragment_ids == ["frag-tz-0", "frag-tz-1", "frag-tz-2"]
+
+    def test_default_clock_handles_tz_aware_fragments(self) -> None:
+        """A default-clock tracker survives tz-aware fragments.
+
+        This is the crash as reported: no ``now=`` argument, fragments
+        whose ``ingested`` is tz-aware (the shape every default-constructed
+        Fragment has), and ``TypeError`` out of the ``last_seen >= cutoff``
+        comparison. The fragments sit in 2020 so the expected verdict holds
+        no matter when the suite runs.
+        """
+        aware = [
+            datetime(2020, 1, 1, 12, 0, tzinfo=_LA_ZONE) + timedelta(days=offset)
+            for offset in range(3)
+        ]
+        tracker = CompostTracker(project_gap_days=30, project_min_fragments=3)
+        candidates = tracker.detect_compost_candidates([], self._frags(aware))
+        self._assert_single_project_candidate(candidates)
+
+    def test_aware_clock_handles_naive_fragments(self) -> None:
+        """An explicitly tz-aware clock survives naive fragments.
+
+        The mirror image of the reported crash, and the reason normalising
+        the *default clock* alone is not a fix: naive ``ingested`` values
+        are a real production input (any fragment round-tripped through
+        YAML without an offset), so the comparison has to be safe from
+        whichever side the naive value arrives on.
+        """
+        naive = [
+            datetime(2020, 1, 1, 12, 0) + timedelta(days=offset) for offset in range(3)
+        ]
+        tracker = CompostTracker(
+            now=datetime(2026, 4, 1, 12, 0, tzinfo=_LA_ZONE),
+            project_gap_days=30,
+            project_min_fragments=3,
+        )
+        candidates = tracker.detect_compost_candidates([], self._frags(naive))
+        self._assert_single_project_candidate(candidates)
+
+    def test_naive_clock_handles_tz_aware_fragments(self) -> None:
+        """An explicitly *naive* ``now=`` keeps working against aware fragments.
+
+        Callers that already pass a naive reference — every legacy test in
+        this module, and any downstream script doing the same — must not be
+        broken by the fix. Their clock is interpreted as LA wall time.
+        """
+        aware = [
+            datetime(2020, 1, 1, 12, 0, tzinfo=_LA_ZONE) + timedelta(days=offset)
+            for offset in range(3)
+        ]
+        tracker = CompostTracker(
+            now=datetime(2026, 4, 1, 12, 0),
+            project_gap_days=30,
+            project_min_fragments=3,
+        )
+        candidates = tracker.detect_compost_candidates([], self._frags(aware))
+        self._assert_single_project_candidate(candidates)
+
+    def test_mixed_naive_and_aware_fragments_under_one_tag(self) -> None:
+        """One tag may carry both naive and tz-aware fragments.
+
+        This is the third crash site and the one a clock-only fix cannot
+        reach: ``max(effective_authored_at(frag) for frag in frags)`` raises
+        while ranking the group, before ``self._now`` is consulted at all.
+        The third fragment is Sydney-anchored so the group also spans two
+        real zones, not just "aware vs naive".
+        """
+        mixed = [
+            datetime(2020, 1, 1, 12, 0),
+            datetime(2020, 1, 2, 12, 0, tzinfo=_LA_ZONE),
+            datetime(2020, 1, 3, 12, 0, tzinfo=ZoneInfo("Australia/Sydney")),
+        ]
+        tracker = CompostTracker(
+            now=datetime(2026, 4, 1, 12, 0, tzinfo=_LA_ZONE),
+            project_gap_days=30,
+            project_min_fragments=3,
+        )
+        candidates = tracker.detect_compost_candidates([], self._frags(mixed))
+        self._assert_single_project_candidate(candidates)
+
+    def test_default_clock_is_tz_aware_and_la(self, vault_path: Path) -> None:
+        """The default clock stamps the LA date on a note, not the UTC one.
+
+        Asserted through the public filename rather than ``_now`` so the
+        test pins behaviour rather than internals. A UTC wall clock files
+        the note under tomorrow's date for the roughly seven hours a day
+        that UTC leads LA; ``tests/test_cli_fill.py`` carries the frozen,
+        always-deterministic version of this assertion.
+
+        The LA calendar is sampled either side of the call and the result
+        accepted against both readings, so a run that straddles LA
+        midnight cannot produce a false failure. Bracketing rather than
+        freezing keeps this test honest about the *real* default clock:
+        it would still fail against a UTC-derived one, which is off by a
+        whole day for hours at a time and so can never fall inside a
+        bracket that is at most one day wide.
+
+        Args:
+            vault_path: Vault fixture with the Compost subtree present.
+        """
+        # ``before`` is sampled ahead of construction because that is when
+        # the tracker latches its clock; ``after`` trails the write. The
+        # bracket therefore provably contains the instant the filename was
+        # derived from.
+        before = today_la()
+        tracker = CompostTracker()
+        candidate = CompostCandidate(
+            source_type="project",
+            source_id=_TZ_PROJECT_TAG,
+            title=_TZ_PROJECT_TAG,
+            reason="Project silent for 400 days",
+            fragment_ids=["frag-tz-0"],
+        )
+        path = tracker.create_compost_note(candidate, vault_path)
+        after = today_la()
+        assert path.name in {
+            f"{before.isoformat()}-{_TZ_PROJECT_TAG}.md",
+            f"{after.isoformat()}-{_TZ_PROJECT_TAG}.md",
+        }
