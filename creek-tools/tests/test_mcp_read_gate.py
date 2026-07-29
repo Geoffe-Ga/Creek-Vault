@@ -1,4 +1,4 @@
-"""Structural guardrails for the MCP read surface's tier gates (#932).
+"""Structural and behavioural guardrails for the MCP read surface's tier gates (#932).
 
 ``creek_mcp.read_gate`` is a *manifest plus two primitives*. The manifest
 (:data:`~creek_mcp.read_gate.TOOL_POSTURES`) records, for every registered MCP
@@ -10,7 +10,7 @@ primitives (:func:`~creek_mcp.read_gate.refuse_above_ceiling` and
 ways a tool may satisfy the ceiling, so gaps can be closed by adoption rather
 than by re-deriving the policy per tool.
 
-A manifest is only worth having if it cannot lie. Five layers keep it honest:
+A manifest is only worth having if it cannot lie. Six layers keep it honest:
 
 (a) **Surface completeness** — the manifest covers exactly the live tool list,
     derived from ``server.list_tools()`` rather than a second hardcoded copy,
@@ -27,6 +27,20 @@ A manifest is only worth having if it cannot lie. Five layers keep it honest:
     module learns the gap exists without consulting the manifest.
 (e) **Anti-rot** — a tool recorded as an ungated gap must not already call a
     canonical gate primitive.
+(f) **Runtime canary probe** — every ``GATED`` tool is *called for real* at
+    ``ceiling=open`` against a vault holding an ``intimate`` fragment whose
+    title, body and tags each carry a unique sentinel, and the sentinel must
+    appear nowhere in the JSON-serialised response. Driven off a manifest of
+    its own (:data:`_RUNTIME_PROBES` / :data:`_PROBE_EXEMPT`) so a newly
+    ``GATED`` tool must either grow a probe or record a justified exemption —
+    the same forcing function as layer (a), one level deeper.
+
+Layer (f) exists because layers (a)-(e) are **structural**. Between them they
+prove that a gate is declared in the manifest, exists in the named module, and
+is invoked there. None of that can prove the gate is the *only* path to the
+corpus: a second, ungated read added alongside the still-present, still-called
+gate satisfies every structural check. Only calling the tool and looking at
+what comes back can see that, which is what (f) does.
 
 Injection drill (each step is expected to turn exactly one layer red):
 
@@ -36,6 +50,22 @@ Injection drill (each step is expected to turn exactly one layer red):
    fails.
 3. Drop the ``gap_issue`` from an ``UNGATED_KNOWN_GAP`` entry → layer (d)
    fails.
+4. In ``creek_mcp/tools/wheel.py``, leave the ``to_privacy_override(...)`` gate
+   call exactly where it is and *additionally* return every raw fragment body
+   from ``wheel_tool``::
+
+       "unclassified": counts.get(Frequency.UNCLASSIFIED, 0),
+       "leak": [
+           b
+           for _p, _f, b, _m in iter_vault_fragments(vault_path / _FRAGMENTS_SUBDIR)
+       ],
+
+   → layer (f) fails, and **only** layer (f). This mutation was run against
+   the file before (f) existed: 101 passed here, 8 passed in
+   ``tests/test_mcp_wheel.py``, nothing caught it. Layers (a)-(e) stay green
+   by construction — the manifest still names ``to_privacy_override``, the
+   symbol still exists, and the AST walk still finds a call site — which is
+   precisely the blind spot (f) covers.
 
 Deliberately absent: any runtime probe asserting that a known gap *still
 leaks*. Such a test passes because the bug exists and breaks when it is fixed.
@@ -51,7 +81,7 @@ import importlib
 import inspect
 import json
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import frontmatter
 import pytest
@@ -67,8 +97,13 @@ from creek_mcp.read_gate import (
 )
 from creek_mcp.server import build_server
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
+from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
+from creek_mcp.tools.mine import mine_tool
+from creek_mcp.tools.reflect import reflect_tool
+from creek_mcp.tools.wheel import wheel_tool
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
     from types import ModuleType
 
@@ -107,6 +142,13 @@ _PINNED_GAPS = {
     "creek.state.read": 969,
     "creek.state.render": 969,
     "creek.skills.refresh": 971,
+    # Recorded as CALLER_NAMED_PATHS until the #932 Gate-2.5 review. The name
+    # was accurate — the caller does name the path — but the confinement is to
+    # the whole vault, not the FEAT-027 staging subtree, so an open-ceiling
+    # caller aimed at 01-Fragments gets back intimate fragments' filenames,
+    # which are slugified titles. Pinned so the posture cannot drift back to a
+    # reassuring label while the behaviour is unchanged.
+    "creek.redact.scan": 972,
 }
 
 _PINNED_JOURNAL_GAP_ISSUE = 970
@@ -123,6 +165,7 @@ _PINNED_AUTH_TOKEN_TOOLS = [
 # read out of their own source (layers (d) and (e)). ``GATED`` entries carry
 # their module in the manifest itself and are resolved from there.
 _TOOL_MODULES = {
+    "creek.redact.scan": "creek_mcp.tools.redact",
     "creek.report": "creek_mcp.tools.report",
     "creek.state.read": "creek_mcp.tools.state_read",
     "creek.state.render": "creek_mcp.tools.state",
@@ -195,23 +238,58 @@ def _call_name(node: ast.Call) -> str | None:
     return None
 
 
+def _discarded_calls(tree: ast.AST) -> set[int]:
+    """Return the ids of call nodes whose result is thrown away.
+
+    A bare expression statement — ``_above_ceiling(tier, ceiling)`` on a line
+    of its own — is a call whose value nothing consumes. Python allows it and
+    the AST is indistinguishable from a real gate at the ``ast.Call`` level,
+    which is how a "call-and-discard" edit can leave the declared gate present,
+    imported, and syntactically invoked while it decides nothing.
+
+    Args:
+        tree: The parsed module.
+
+    Returns:
+        ``id()`` of every :class:`ast.Call` sitting directly under an
+        :class:`ast.Expr` statement. Identity rather than equality because AST
+        nodes are unhashable and two structurally identical calls at different
+        sites are genuinely different call sites.
+    """
+    return {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+    }
+
+
 def _calls_symbol(module: ModuleType, symbol: str) -> bool:
-    """Return whether *module* contains a call to *symbol*.
+    """Return whether *module* calls *symbol* and uses the result.
 
     Deliberately looks for a *call*, not a definition or an import: a module
     can import (or even define) a gate and never invoke it, which is exactly
     the failure mode layers (c) and (e) exist to detect.
+
+    Calls whose result is discarded do not count. Requiring the value to be
+    consumed — by a condition, an assignment, a comparison, a return — is what
+    separates a gate from a gesture: replacing
+    ``if _above_ceiling(t, c): return refusal_response(...)`` with a bare
+    ``_above_ceiling(t, c)`` and falling through leaves a call site that
+    refuses nothing, and this check is the reason that edit cannot pass.
 
     Args:
         module: The imported tool module to scan.
         symbol: The callee name to look for.
 
     Returns:
-        ``True`` when at least one call site names *symbol*.
+        ``True`` when at least one *load-bearing* call site names *symbol*.
     """
     tree = ast.parse(inspect.getsource(module))
+    discarded = _discarded_calls(tree)
     return any(
-        isinstance(node, ast.Call) and _call_name(node) == symbol
+        isinstance(node, ast.Call)
+        and _call_name(node) == symbol
+        and id(node) not in discarded
         for node in ast.walk(tree)
     )
 
@@ -261,6 +339,7 @@ def _write_fragment(
     title: str,
     body: str,
     privacy_tier: str,
+    tags: list[str] | None = None,
 ) -> Path:
     """Write one classified fragment under ``01-Fragments/Notes``.
 
@@ -270,11 +349,14 @@ def _write_fragment(
         title: Fragment title — what a personal-tier summary is built from.
         body: Markdown body (a canary string in these tests).
         privacy_tier: The fragment's ``privacy_tier`` front-matter value.
+        tags: Optional Obsidian tags. ``None`` — the default — omits the key
+            entirely rather than writing an empty list, so front matter written
+            by the callers that predate layer (f) is byte-identical to before.
 
     Returns:
         The path the fragment was written to.
     """
-    metadata = {
+    metadata: dict[str, Any] = {
         "type": "fragment",
         "id": frag_id,
         "title": title,
@@ -285,6 +367,8 @@ def _write_fragment(
         "privacy_tier": privacy_tier,
         "eddies": [],
     }
+    if tags is not None:
+        metadata["tags"] = tags
     target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
@@ -979,3 +1063,414 @@ def test_iter_admitted_fragments_tolerates_a_missing_fragments_directory(
     ceiling.
     """
     assert list(iter_admitted_fragments(tmp_path, ceiling)) == []
+
+
+# ---------------------------------------------------------------------------
+# Layer (f) — runtime canary probe
+#
+# Everything above is static: it reads the manifest, the tool schemas, and the
+# tools' source. That is enough to prove a gate is declared, exists and is
+# called — and no more. A second read of the corpus, added *alongside* an
+# untouched gate call, is invisible to all of it. What follows calls each
+# GATED tool for real and looks at what comes back.
+# ---------------------------------------------------------------------------
+
+# Sentinels in the same unmistakable style as the bodies above, but distinct
+# values: these travel through four different tools, and a collision with the
+# iter_admitted_fragments canaries would make a failure ambiguous about which
+# fixture leaked.
+_RUNTIME_OPEN_CANARY = "CANARY-RUNTIME-OPEN-4e8b"
+_RUNTIME_INTIMATE_CANARY = "CANARY-RUNTIME-INTIMATE-7d21"
+
+# The ids are deliberately canary-free. ``creek.reflect`` and ``creek.compile``
+# are *given* these ids by the caller, so echoing one back is not a leak; only
+# the content behind it is. Keeping the sentinel out of the id means a probe
+# failure can only mean "the tool reached the content".
+_RUNTIME_OPEN_ID = "frag-runtime-open"
+_RUNTIME_INTIMATE_ID = "frag-runtime-intimate"
+
+# ``creek_mcp/tools/reflect.py`` inlines this string at its #846 gate rather
+# than naming a constant, so it is repeated here. Asserted (rather than a bare
+# ``status == "refused"``) because reflect has a second refusal — "entry_ref
+# not found" — and a probe that accepted either would go green if reflect
+# simply stopped resolving the fragment, which proves nothing about the gate.
+_REFLECT_ABOVE_CEILING_REASON = "entry_ref tier exceeds ceiling"
+
+_PROBE_EXEMPT: dict[str, str] = {
+    "creek.draft": (
+        "draft_tool needs a DraftGenerator driven over a deployed skills tree; "
+        "on a bare fixture it answers from generator scaffolding "
+        "(status='empty' / a RuntimeError refusal) before the response shape a "
+        "probe wants to inspect exists, so a canary-free result would be "
+        "evidence about the scaffolding, not about the ceiling. Its corpus "
+        "walk is IdeaMiner(privacy_override=to_privacy_override(ceiling)) — "
+        "byte-for-byte the walk creek.mine is probed through below — so the "
+        "read path is covered even though draft's own envelope is not."
+    ),
+    "creek.author": (
+        "author_tool calls load_config() and drives the Writing Desk, and it "
+        "wraps that whole span in `except Exception` returning status='error'. "
+        "On any unconfigured-provider or missing-contract failure it therefore "
+        "returns an envelope with no corpus content in it at all, so the "
+        "canary assertion would pass for the wrong reason — the desk never "
+        "started. A real probe needs a configured desk and belongs beside the "
+        "other author tests."
+    ),
+}
+"""``GATED`` tools that cannot be probed *here*, each with the reason why.
+
+Read these as claims, not as boilerplate: an exemption is the one way a
+``GATED`` tool escapes layer (f), so a reason that does not survive being
+checked against the tool's source is a hole in the layer.
+"""
+
+
+def _forbidden_llm_factory(tier: PrivacyTier) -> Any:
+    """Fail loudly instead of returning an LLM — the gate must never reach here.
+
+    Both probed write-side tools build their model client *below* the ceiling
+    gate, so on an above-ceiling request this factory must not be invoked at
+    all. A stub that quietly returned ``"{}"`` would let a broken gate look
+    clean: the tool would call the model, get nothing quotable back, and answer
+    with a canary-free envelope. Raising turns that same path into a failure
+    that names what happened.
+
+    Args:
+        tier: The routing tier the tool derived — reported in the message
+            because *which* tier reached the factory is the first thing a
+            reader will want.
+
+    Returns:
+        Never returns.
+
+    Raises:
+        AssertionError: Always. Neither ``reflect_tool`` (catches
+            ``RuntimeError``) nor ``compile_tool`` (catches ``ValueError`` /
+            ``RuntimeError``) swallows it, so it surfaces as a test failure
+            rather than as a structured refusal.
+    """
+    msg = (
+        "the ceiling gate let an above-ceiling read through to the model: an "
+        f"LLM client was built for tier {tier!r} on a request the tool was "
+        "supposed to refuse before reaching any provider"
+    )
+    raise AssertionError(msg)
+
+
+def _probe_wheel(vault: Path) -> dict[str, Any]:
+    """Call ``creek.wheel`` at the open ceiling over the canary vault.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return wheel_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.OPEN)
+
+
+def _probe_mine(vault: Path) -> dict[str, Any]:
+    """Call ``creek.mine`` at the open ceiling, unbounded.
+
+    ``limit=0`` returns *every* seed. A default-limited call could hide a leak
+    behind truncation — the probe would then be asserting on the first ten
+    seeds rather than on the tool's whole output.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return mine_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        limit=0,
+    )
+
+
+def _probe_reflect(vault: Path) -> dict[str, Any]:
+    """Call ``creek.reflect`` at the open ceiling on the intimate canary.
+
+    ``care_guard=None`` keeps the #753 seam out of the picture: this probe is
+    about the #846 read gate, and the gate sits above the care seam precisely
+    so an unadmitted caller cannot reach it.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return reflect_tool(
+        vault_path=vault,
+        llm_factory=_forbidden_llm_factory,
+        entry_ref=_RUNTIME_INTIMATE_ID,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        care_guard=None,
+    )
+
+
+def _probe_compile(vault: Path) -> dict[str, Any]:
+    """Call ``creek.compile`` at the open ceiling over the intimate canary.
+
+    The target metadata is deliberately sentinel-free: ``target_id`` and
+    ``target_title`` are the caller's own strings, so a response echoing them
+    would say nothing about the corpus and would only blur the assertion.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return compile_tool(
+        vault_path=vault,
+        fragment_ids=[_RUNTIME_INTIMATE_ID],
+        target_kind="thread",
+        target_id="thread-runtime-probe",
+        target_title="Runtime probe target",
+        llm_factory=_forbidden_llm_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+_RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
+    "creek.wheel": _probe_wheel,
+    "creek.mine": _probe_mine,
+    "creek.reflect": _probe_reflect,
+    "creek.compile": _probe_compile,
+}
+"""``GATED`` tool → a callable that invokes it at ``ceiling=open``.
+
+Each probe is callable with no live provider, no config file and no skills
+tree, so layer (f) stays a unit test.
+"""
+
+
+@pytest.fixture
+def canary_vault(tmp_path: Path) -> Path:
+    """Return a vault holding one ``open`` and one ``intimate`` canary fragment.
+
+    Each fragment carries its sentinel in **three** places — ``title``, body and
+    ``tags`` — so a tool that leaks only titles (an index-shaped response), only
+    tags (a tag-garden-shaped one) or only bodies is caught by the same
+    assertion. The ``open`` fragment is not decoration: it is the positive
+    control, and the per-tool tests below assert it *is* reachable, so a tool
+    that returned nothing at all could not pass layer (f) by being empty.
+    """
+    _write_fragment(
+        tmp_path,
+        frag_id=_RUNTIME_OPEN_ID,
+        title=f"Open canary {_RUNTIME_OPEN_CANARY}",
+        body=f"Open canary body {_RUNTIME_OPEN_CANARY}",
+        privacy_tier="open",
+        tags=[_RUNTIME_OPEN_CANARY],
+    )
+    _write_fragment(
+        tmp_path,
+        frag_id=_RUNTIME_INTIMATE_ID,
+        title=f"Intimate canary {_RUNTIME_INTIMATE_CANARY}",
+        body=f"Intimate canary body {_RUNTIME_INTIMATE_CANARY}",
+        privacy_tier="intimate",
+        tags=[_RUNTIME_INTIMATE_CANARY],
+    )
+    return tmp_path
+
+
+def test_every_gated_tool_is_probed_or_explicitly_exempt() -> None:
+    """Each ``GATED`` tool is either runtime-probed or exempt, never neither.
+
+    This is layer (a)'s forcing function applied one level down. Hand-listing
+    the probed tools and leaving the rest silently unprobed would let a newly
+    ``GATED`` tool inherit "structurally verified, behaviourally unchecked" —
+    which is exactly the state the wheel mutation exploited. Driving the
+    parametrisation off :data:`_RUNTIME_PROBES` while asserting its union with
+    :data:`_PROBE_EXEMPT` covers the manifest means the choice has to be made
+    out loud.
+
+    Disjointness is asserted too: a tool in both dicts would carry an
+    exemption reason nobody reads and a probe nobody knows is authoritative.
+    So is the reverse direction — an entry for a tool that is no longer
+    ``GATED`` is a claim about nothing, and it inflates the apparent depth of
+    this layer.
+    """
+    probed = set(_RUNTIME_PROBES)
+    exempt = set(_PROBE_EXEMPT)
+    gated = set(_GATED_TOOLS)
+    both = probed & exempt
+    assert not both, (
+        f"tool(s) both probed and exempt: {sorted(both)}. An exemption is a "
+        "statement that no probe is possible here; a probe refutes it."
+    )
+    unchecked = gated - probed - exempt
+    assert not unchecked, (
+        "GATED tool(s) with no runtime probe and no exemption: "
+        f"{sorted(unchecked)}. Add a probe to _RUNTIME_PROBES, or record in "
+        "_PROBE_EXEMPT the specific reason this tool cannot be called here. "
+        "Layers (a)-(e) only prove the gate is declared and invoked — they "
+        "cannot see a second, ungated read next to it."
+    )
+    stale = (probed | exempt) - gated
+    assert not stale, (
+        "_RUNTIME_PROBES/_PROBE_EXEMPT name non-GATED tool(s): "
+        f"{sorted(stale)}. Delete the entry, or restore the tool's gate."
+    )
+    assert (probed | exempt) == gated
+
+
+@pytest.mark.parametrize("tool", sorted(_PROBE_EXEMPT))
+def test_probe_exemptions_are_specific_to_their_tool(tool: str) -> None:
+    """An exemption reason names the tool it excuses and says something.
+
+    The only escape hatch out of layer (f) is a string, so the string has to
+    carry weight. Requiring it to mention the tool's own module leaf rules out
+    a reason copy-pasted from a sibling entry (the failure mode that turns two
+    exemptions into one unexamined one), and the length floor rules out
+    ``"n/a"`` and ``"TODO"``. Neither check can judge whether the reason is
+    *true* — that is a reviewer's job, and the reasons are written to be read
+    as claims about the tool's source.
+    """
+    reason = _PROBE_EXEMPT[tool]
+    module = TOOL_POSTURES[tool].gate_module
+    assert module is not None
+    leaf = module.rsplit(".", maxsplit=1)[-1]
+    assert leaf in reason, (
+        f"{tool}'s probe exemption never mentions {leaf!r}, the module it is "
+        f"excusing: {reason!r}. A reason that does not name the tool cannot "
+        "be checked against it."
+    )
+    assert len(reason) >= 60, (
+        f"{tool}'s probe exemption is too short to be a reason: {reason!r}. "
+        "State what specifically makes the tool unprobeable here."
+    )
+
+
+@pytest.mark.parametrize("tool", sorted(_RUNTIME_PROBES))
+def test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling(
+    tool: str,
+    canary_vault: Path,
+) -> None:
+    """A ``GATED`` tool called at ``ceiling=open`` never returns intimate content.
+
+    The behavioural half of the manifest, and the only layer that can see a
+    *parallel* read path. Layers (a)-(e) verify that the declared gate exists
+    and is called; a leak added next to that call — a second
+    ``iter_vault_fragments`` walk whose output is spliced into the response —
+    leaves every one of them green.
+
+    Asserted against ``json.dumps(response, default=str)`` rather than against
+    named keys: the leak is just as real one level down, in a nested
+    ``seeds[].source_fragments`` entry or a debugging key nobody reviewed, and
+    a key-by-key check would only ever cover the shape that exists today.
+    ``default=str`` keeps a ``Path`` or an enum from turning a leak into a
+    ``TypeError``.
+
+    The response is checked for a ``tool`` echo as well, so a probe that
+    silently returned ``{}`` — from an exception swallowed somewhere, or a tool
+    that stopped reading the vault entirely — cannot pass this assertion by
+    having nothing in it. The per-tool tests below carry the stronger positive
+    controls.
+    """
+    response = _RUNTIME_PROBES[tool](canary_vault)
+    assert response["tool"] == tool
+    serialised = json.dumps(response, default=str)
+    entry = TOOL_POSTURES[tool]
+    assert _RUNTIME_INTIMATE_CANARY not in serialised, (
+        f"{tool} reached content above the caller's ceiling: the intimate "
+        f"canary {_RUNTIME_INTIMATE_CANARY!r} appears in its response at "
+        f"privacy_tier_ceiling=open.\n\n{serialised}\n\n"
+        f"Note what this does NOT mean: {entry.gate_module}.{entry.gate_symbol} "
+        "is still declared in TOOL_POSTURES and still called on the request "
+        "path — layers (c) and (e) are green. The leak is a *second*, ungated "
+        f"route to the corpus inside {entry.gate_module}. Find that route and "
+        "remove it; adding another gate call leaves the first one standing."
+    )
+
+
+def test_wheel_probe_still_counts_the_fragment_it_is_admitted_to(
+    canary_vault: Path,
+) -> None:
+    """``creek.wheel``'s probe is not passing by returning an empty wheel.
+
+    The fixture holds two ``F1`` fragments, one ``open`` and one ``intimate``.
+    At ``ceiling=open`` exactly one must be tallied: ``0`` would mean the
+    corpus walk never ran (and the leak assertion above would be vacuous),
+    ``2`` would mean the intimate fragment was counted — which is itself a leak,
+    a one-bit disclosure that a fragment exists at that frequency, even though
+    no body came back with it.
+
+    Wheel returns counts and never any fragment text, so the count *is* the
+    reachability evidence for the ``open`` canary; there is no string of it in
+    the response to assert on.
+    """
+    response = _probe_wheel(canary_vault)
+    assert response["status"] == "ok"
+    assert response["total_classified"] == 1
+    assert response["wheel"]["F1"]["count"] == 1
+
+
+def test_mine_probe_still_reaches_the_admitted_corpus(canary_vault: Path) -> None:
+    """``creek.mine``'s probe is not passing by returning zero seeds.
+
+    On this minimal fixture — no threads, no eddies, no liminal folder, no
+    synchronicities, and ``phase="unclassified"`` skipping the wavelength
+    strategy — the only strategy that fires is unexplored-ontology, whose seeds
+    are coordinates in classification space and carry no fragment-derived text.
+    So mine offers no *string* positive control here; the fragment-level one
+    lives on the wheel probe above.
+
+    What it does offer is a walk-level one, and it is exact:
+    ``mine_unexplored_ontology`` runs with ``require_corpus=True`` and returns
+    ``[]`` when the ceiling-filtered snapshot holds no fragments at all. A
+    non-zero ``total`` therefore proves the corpus walk ran *and* admitted the
+    ``open`` fragment. Had the tier filter been broken in the "drop everything"
+    direction — leak-free and useless — this assertion would fail.
+    """
+    response = _probe_mine(canary_vault)
+    assert response["status"] == "ok"
+    assert response["total"] > 0
+
+
+def test_reflect_probe_refuses_rather_than_merely_staying_quiet(
+    canary_vault: Path,
+) -> None:
+    """``creek.reflect`` *refuses* the above-ceiling ``entry_ref`` (#846).
+
+    Absence of the canary is necessary but not sufficient here. Reflect could
+    resolve the intimate fragment, hand it to the model, and answer
+    ``status="ok"`` with zero verbatim-validated notes — a canary-free response
+    that has already egressed the entry. The gate's contract is a refusal, so
+    the refusal is what is asserted.
+
+    The reason is pinned too, not just the status: reflect's other refusal is
+    ``"entry_ref not found"``, and a change that stopped resolving the fragment
+    would satisfy a bare ``status == "refused"`` while telling us nothing about
+    the ceiling.
+    """
+    response = _probe_reflect(canary_vault)
+    assert response["status"] == "refused"
+    assert response["reason"] == _REFLECT_ABOVE_CEILING_REASON
+    assert response["tier_ceiling"] == TierCeiling.OPEN.value
+
+
+def test_compile_probe_refuses_rather_than_merely_staying_quiet(
+    canary_vault: Path,
+) -> None:
+    """``creek.compile`` *refuses* the above-ceiling source fragment (#848).
+
+    Same argument as reflect's probe, with a sharper edge: compile's leak is
+    not primarily its response but the page it writes. A tool that compiled the
+    intimate fragment into ``02-Threads`` and returned only a path would be
+    canary-free in the envelope and have laundered intimate content into an
+    artifact every ``open``-ceiling read tool then serves.
+
+    Pinned against the module's own ``_ABOVE_CEILING_REASON`` rather than a
+    literal, because compile's other refusals (unknown ``target_kind``, empty
+    ``fragment_ids``, the engine's not-found ``ValueError``) are also
+    ``status="refused"`` and none of them would mean the gate fired.
+    """
+    response = _probe_compile(canary_vault)
+    assert response["status"] == "refused"
+    assert response["reason"] == _ABOVE_CEILING_REASON
+    assert response["tier_ceiling"] == TierCeiling.OPEN.value

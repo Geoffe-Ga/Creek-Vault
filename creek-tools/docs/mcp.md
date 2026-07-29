@@ -128,13 +128,22 @@ Every registered tool's relationship to the caller's ceiling is now a
 machine-checked audit record: `creek_mcp/read_gate.py`'s `TOOL_POSTURES`
 names one of six postures per tool, verified against the live server
 surface and, for `GATED` entries, against a real call site in the
-named module. The sweep's key result: no unaudited tool leaks
-above-ceiling content into its MCP *response*. The remaining exposure
-is write-side — a tool **acts on** content above the caller's ceiling
-(#968, #970) rather than handing it back to the caller who asked. That
-asymmetry is also why the ceiling language elsewhere on this page reads
-entirely in read-back terms ("omitted", "returned as a title-only
-stub") — those survived the #932 audit unrevised.
+named module, and for the rest against a runtime canary probe.
+
+Most of what the sweep found is **write-side**: a tool *acts on* content
+above the caller's ceiling (#968, #970, #971) rather than handing it
+back. That is a shape the ceiling language elsewhere on this page does
+not describe — it is written entirely in read-back terms ("omitted",
+"returned as a title-only stub"), which is why those gaps survived.
+
+One read-side leak was found, and it is worth stating how: the sweep
+first concluded there were none, having probed the tools that walk the
+corpus themselves. `creek.redact.scan` was set aside as "the caller
+named the path" — true, and not sufficient. Its path confinement is to
+the whole vault rather than to the FEAT-027 staging subtree, and it
+returns matching *filenames*, which are slugified fragment titles
+(#972). A posture whose name is accurate can still license a wrong
+conclusion; that is what the machine-checked manifest is for.
 
 ### Elevated-authorization model (FEAT-012)
 

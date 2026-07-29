@@ -296,12 +296,18 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         rationale=_COUNTS_ONLY_RATIONALE,
     ),
     "creek.redact.scan": ToolPosture(
-        posture=ReadPosture.CALLER_NAMED_PATHS,
+        posture=ReadPosture.UNGATED_KNOWN_GAP,
         rationale=(
-            "The caller names the path, which resolve_within_vault confines "
-            "to the vault; findings carry counts, line numbers and salted "
-            "hashes, never the matched text."
+            "The caller names the path and resolve_within_vault confines it to "
+            "the vault, and no matched text is returned — but the confinement "
+            "is to the whole vault, not to the FEAT-027 staging subtree, and "
+            "the tier is never consulted. An open-ceiling caller pointed at "
+            "01-Fragments gets back the filenames of intimate fragments, which "
+            "are slugified titles, plus which PII types each contains. This "
+            "posture was CALLER_NAMED_PATHS until the #932 review; the name "
+            "was true and the conclusion drawn from it was not (#972)."
         ),
+        gap_issue=972,
     ),
     "creek.save": ToolPosture(
         posture=ReadPosture.NO_UNSUPPLIED_READ,

@@ -14,6 +14,20 @@ no matched text and no file body content leaves the tool.
 FEAT-027 introduces this tool so CrawDad can run the safety pass on
 Discord attachments staged under ``00-Creek-Meta/Inbound/`` before any
 ``creek.ingest`` call is dispatched.
+
+Read-side posture (#972): "no matched text leaves the tool" is true and is
+not sufficient. ``resolve_within_vault`` confines *input_path* to the whole
+vault rather than to the staging subtree above, and the tier is never
+consulted, so an ``open``-ceiling caller may aim the scan at
+``01-Fragments``. What comes back is the *filename* of every matching
+fragment — and Creek fragment filenames are slugified titles — together
+with the PII types and line numbers each contains. Reproduced: a fragment
+at ``privacy_tier: intimate`` surfaced as
+``01-Fragments/Notes/my-affair-with-dana.md`` at ``ceiling=open``.
+Separately, ``report_markdown`` is built by
+:meth:`~creek.redact.scanner.RedactionScanner.generate_markdown_summary`
+and bypasses the vault-relative rendering :func:`_finding_to_dict` applies,
+so it emits absolute filesystem paths despite that function's docstring.
 """
 
 from __future__ import annotations
