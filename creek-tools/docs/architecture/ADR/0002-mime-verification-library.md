@@ -32,10 +32,18 @@ Python, BSD-3) for magic-byte detection on binary file types.
 
 For text-extension files (`.md`, `.markdown`, `.txt`, `.html`,
 `.htm`, `.json`, `.csv` — which have no magic byte signature) the
-verifier runs a content sample instead: the first 1 KiB must decode
-as UTF-8 and contain no NUL bytes. This catches the polyglot case the
-issue calls out (executable or other binary blob renamed to a text
-extension) without false-flagging legitimate UTF-8-encoded text.
+verifier runs a content sample instead: the first 1 KiB must contain
+no NUL byte and must decode as UTF-8. This catches the polyglot case
+the issue calls out (executable or other binary blob renamed to a
+text extension) — with one carve-out for the window's own trailing
+edge: when the body actually extends past the 1 KiB cut, a trailing
+partial codepoint (at most 3 bytes, and only when it is a legal
+prefix of one unfinished sequence) is tolerated, because that cut is
+ours, not the file's. A body that ends at or before the window gets
+no such allowance; a dangling partial there is genuine corruption and
+still reads as a mismatch. (Issue #916 found the verifier without
+this carve-out misreading legitimate UTF-8 text that happened to have
+a multibyte codepoint straddle byte 1024.)
 
 The default `allowed_extensions` list shipped in `AttachmentConfig` is
 narrowed to extensions whose content type the verifier can check:
@@ -133,6 +141,12 @@ Operators who genuinely need them can re-add the extensions in
   but not zero. A future hardening could parse a JSON file end-to-end
   for `.json`, run an HTML parser tolerantly over `.html`, etc., at
   the cost of more CPU and a wider failure surface.
+- The boundary-truncation carve-out (issue #916) accepts the last
+  ≤3 bytes of the window, when the body runs past it, as an
+  unfinished-but-well-formed sequence without fully validating them.
+  Reaching those bytes requires 1021 bytes of already-valid NUL-free
+  UTF-8 ahead of them, so this sits inside the false-negative surface
+  the bullet above already describes rather than widening it.
 - `filetype` does not ship `py.typed`, so MyPy needs an
   `ignore_missing_imports` override for the one module that imports
   it. The override is documented in `crawdad/pyproject.toml` next to
