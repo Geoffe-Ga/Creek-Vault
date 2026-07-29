@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.classify.llm.router import ModelRouter
 from creek.compile.engine import PARADOX_LOG_RELPATH
+from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import PrivacyTier
 from creek.save import TARGET_SUBDIRS
 from creek_mcp.audit import (
@@ -74,12 +76,13 @@ def _write_fragment(
     frag_id: str,
     body: str = "Body text.",
     privacy_tier: str = "open",
+    title: str | None = None,
 ) -> None:
     """Write a minimal fragment under ``01-Fragments/Notes`` for compile tests."""
     metadata = {
         "type": "fragment",
         "id": frag_id,
-        "title": f"Title {frag_id}",
+        "title": title or f"Title {frag_id}",
         "created": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
         "ingested": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
         "source": {"platform": "journal", "author": "self"},
@@ -831,7 +834,7 @@ def test_skills_refresh_writes_audit_entry(vault: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _noop_llm_factory() -> object:
+def _noop_llm_factory(tier: PrivacyTier) -> object:
     """Return a deterministic stub LLM for compile-tool tests."""
     return lambda _prompt: "{}"
 
@@ -889,7 +892,7 @@ def test_compile_writes_audit_then_noop_on_re_run(
         "creek_mcp.tools.compile.compile_to_vault",
         _stub_compile,
     )
-    stub_factory = lambda: lambda _prompt: "{}"  # noqa: E731
+    stub_factory = lambda tier: lambda _prompt: "{}"  # noqa: E731
 
     first = compile_tool(
         vault_path=vault,
@@ -937,7 +940,7 @@ def test_compile_propagates_engine_errors_as_refusal(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
-        llm_factory=lambda: lambda _prompt: "{}",
+        llm_factory=lambda tier: lambda _prompt: "{}",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "refused"
@@ -967,7 +970,7 @@ class _RecordingLLMFactory:
         """Start with a zero invocation count."""
         self.calls = 0
 
-    def __call__(self) -> object:
+    def __call__(self, tier: PrivacyTier) -> object:
         """Record one invocation and return a deterministic stub LLM."""
         self.calls += 1
         return lambda _prompt: "{}"
@@ -1042,7 +1045,7 @@ def test_compile_refusal_writes_no_page_no_paradox_log_no_hash_marker(
         },
     )
 
-    def _leaky_factory() -> object:
+    def _leaky_factory(tier: PrivacyTier) -> object:
         """Return a stub LLM that would emit a page body and a paradox."""
         return lambda _prompt: payload
 
@@ -1414,6 +1417,417 @@ def test_compile_reports_unknown_target_kind_even_with_above_ceiling_sources(
     assert "unknown target_kind" in result["reason"]
     assert result["reason"] != _ABOVE_CEILING_REASON
     assert factory.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# compile — tier-routed LLM factory (issues #928 / #929)
+# ---------------------------------------------------------------------------
+
+
+class _CompletionStub:
+    """A provider completion exposing only the ``.text`` field callers read."""
+
+    def __init__(self, text: str) -> None:
+        """Store the completion *text*."""
+        self.text = text
+
+
+class _ProviderSpy:
+    """A ``build_provider`` stand-in that records configs *and* prompts.
+
+    It doubles as the provider it hands back, so one object captures both
+    halves of the egress path: *which*
+    :class:`~creek.config.LLMConfig` the router resolved (i.e. the
+    ``Intimate``-never-cloud decision) and *what text* actually reached the
+    backend. Asserting only the first would leave "the prompt is harmless
+    anyway" unproven; asserting only the second would leave the routing
+    unproven.
+    """
+
+    def __init__(self, *, available: bool = True, text: str = "{}") -> None:
+        """Start with empty recordings, the given availability and response."""
+        self.configs: list[LLMConfig] = []
+        self.prompts: list[str] = []
+        self.available = available
+        self.text = text
+
+    def build(self, config: LLMConfig) -> _ProviderSpy:
+        """Record *config* and return this spy as the constructed provider."""
+        self.configs.append(config)
+        return self
+
+    def complete(self, prompt: str) -> _CompletionStub:
+        """Record *prompt* and return the canned completion."""
+        self.prompts.append(prompt)
+        return _CompletionStub(self.text)
+
+    @property
+    def provider_names(self) -> list[str]:
+        """Return the ``provider`` of every recorded config, in call order."""
+        return [config.provider for config in self.configs]
+
+
+class _RoutingConfigStub:
+    """A minimal ``CreekConfig`` stand-in carrying a *real* routing config.
+
+    Exposes both ``llm`` (the raw :class:`~creek.config.LLMRoutingConfig`)
+    and ``model_router`` (a real
+    :class:`~creek.classify.llm.router.ModelRouter` over it), so the
+    ``Intimate``-never-cloud decision exercised by these tests is the
+    production one no matter which of the two the server's factory reads.
+    Nothing about the tier gate is stubbed.
+    """
+
+    def __init__(self, *, default: str, generation: str) -> None:
+        """Build the two-stage routing config and its router."""
+        self.llm = LLMRoutingConfig(
+            default=LLMConfig(provider=default),
+            generation=LLMConfig(provider=generation),
+        )
+        self.model_router = ModelRouter(self.llm)
+
+
+def _patch_build_provider(monkeypatch: pytest.MonkeyPatch, spy: _ProviderSpy) -> None:
+    """Route every ``build_provider`` import path through *spy*.
+
+    The provider factory is reachable under two names —
+    ``creek.classify.llm.providers.build_provider`` (what the router and
+    ``creek_mcp.server._build_reflect_llm_factory`` import) and the
+    ``creek.classify.llm`` re-export (what
+    :func:`creek.compile.engine.default_llm` imports). Both are patched so
+    the recorded config is the one the production path actually used,
+    whichever import it takes.
+    """
+    monkeypatch.setattr("creek.classify.llm.providers.build_provider", spy.build)
+    monkeypatch.setattr("creek.classify.llm.build_provider", spy.build)
+
+
+class _TierRecordingLLMFactory:
+    """Compile LLM factory recording the tier it was keyed with, per call.
+
+    Distinct from :class:`_RecordingLLMFactory`, which counts invocations to
+    prove the #848 gate refused *before* the client was built. This one pins
+    *what* the wrapper computed as the routing tier, which is the whole of
+    issue #928: a factory invoked with the wrong tier egresses exactly as
+    badly as one invoked when it should not have been.
+
+    ``tiers`` is typed to admit ``None`` so a regression that passes no tier
+    (or an explicit ``None``, which
+    :meth:`~creek.classify.llm.router.ModelRouter.resolve` treats as "no tier
+    gate") is caught by an assertion rather than silently ranking as
+    non-intimate.
+    """
+
+    def __init__(self) -> None:
+        """Start with no recorded tiers."""
+        self.tiers: list[PrivacyTier | None] = []
+
+    def __call__(self, tier: PrivacyTier) -> object:
+        """Record *tier* and return a deterministic stub LLM."""
+        self.tiers.append(tier)
+        return lambda _prompt: "{}"
+
+
+_INTIMATE_TITLE = "Sealed Confession Marker"
+_INTIMATE_BODY = "The intimate body text that must never leave this machine."
+
+
+def test_compile_routes_intimate_sources_to_the_local_provider(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed-tier compile: the real router forces the real prompt onto ollama.
+
+    The flagship regression for #928 (compile bypasses ``ModelRouter``) and
+    #929 (the production factory does not import). Nothing is stubbed at the
+    seam under test: ``creek_mcp.server._build_compile_llm`` *is* the
+    factory, a real :class:`~creek.classify.llm.router.ModelRouter` resolves
+    the ``generation`` stage, and only ``build_provider`` is replaced — by a
+    spy that records what it was handed.
+
+    The ceiling is ``intimate``, so the #848 gate *admits* the intimate
+    source: this is the live-egress case, not the refusal case.
+
+    The prompt assertion is the point. ``creek.compile.engine._build_prompt``
+    emits ``title:`` for every source unconditionally, and
+    ``_fragment_excerpt_for_prompt`` redacts only the *body* — putting the
+    title straight back into the body line as
+    ``[Intimate-tier summary: <title>]``. An intimate fragment's title is
+    therefore live egress payload. It may reach a local model; it must never
+    reach the cloud one.
+    """
+    from creek_mcp import server as server_mod
+
+    _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
+    _write_fragment(
+        vault,
+        frag_id="frag-int",
+        body=_INTIMATE_BODY,
+        privacy_tier="intimate",
+        title=_INTIMATE_TITLE,
+    )
+    spy = _ProviderSpy()
+    _patch_build_provider(monkeypatch, spy)
+    monkeypatch.setattr(
+        server_mod,
+        "load_config",
+        lambda: _RoutingConfigStub(default="ollama", generation="anthropic"),
+    )
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-open", "frag-int"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=server_mod._build_compile_llm,
+        privacy_tier_ceiling=TierCeiling.INTIMATE,
+    )
+
+    # (a) the real ``_enforce_local_for_intimate`` ran: the cloud
+    # ``generation`` config was replaced by the local ``default``.
+    assert spy.provider_names == ["ollama"]
+    # (b) the payload that would have egressed is real, not hypothetical.
+    assert len(spy.prompts) == 1
+    assert _INTIMATE_TITLE in spy.prompts[0]
+    assert _INTIMATE_BODY not in spy.prompts[0]
+    # (c) routing correctly does not break the ordinary success path.
+    assert result["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("sources", "ceiling", "expected_tier"),
+    [
+        (
+            (("frag-open", "open"),),
+            TierCeiling.OPEN,
+            PrivacyTier.OPEN,
+        ),
+        (
+            (("frag-open", "open"), ("frag-pers", "personal")),
+            TierCeiling.PERSONAL,
+            PrivacyTier.PERSONAL,
+        ),
+        (
+            (("frag-open", "open"),),
+            TierCeiling.INTIMATE,
+            PrivacyTier.INTIMATE,
+        ),
+        (
+            (("frag-open", "open"), ("frag-int", "intimate")),
+            TierCeiling.INTIMATE,
+            PrivacyTier.INTIMATE,
+        ),
+        (
+            (("frag-open", "open"),),
+            TierCeiling.ALL,
+            PrivacyTier.INTIMATE,
+        ),
+        (
+            (("frag-open", "open"), ("frag-pers", "personal")),
+            TierCeiling.ALL,
+            PrivacyTier.INTIMATE,
+        ),
+    ],
+    ids=[
+        "open-ceiling-open-source",
+        "personal-ceiling-personal-source",
+        "intimate-ceiling-open-sources-only",
+        "intimate-ceiling-intimate-source",
+        "all-ceiling-open-sources-only",
+        "all-ceiling-personal-source",
+    ],
+)
+def test_compile_keys_the_llm_factory_with_the_routing_tier(
+    vault: Path,
+    sources: tuple[tuple[str, str], ...],
+    ceiling: TierCeiling,
+    expected_tier: PrivacyTier,
+) -> None:
+    """The factory is keyed with the more sensitive of ceiling and sources.
+
+    Pins the routing table for #928. Two rows carry the defense-in-depth
+    argument that mirrors ``creek_mcp.tools.reflect._routing_tier``: an
+    ``intimate`` ceiling over nothing but ``open`` sources, and an ``all``
+    ceiling over the same, both route ``INTIMATE`` — because the ceiling the
+    caller declared is itself a statement about what the call is permitted
+    to reach, and ``all`` admits intimate content by definition.
+
+    The factory must be invoked exactly once (a second build is a second
+    provider handshake, and on a re-resolve could pick a different backend)
+    and never with ``None``, which
+    :meth:`~creek.classify.llm.router.ModelRouter.resolve` treats as "apply
+    no tier gate at all" — the precise shape of the #928 bug.
+    """
+    for frag_id, privacy_tier in sources:
+        _write_fragment(vault, frag_id=frag_id, privacy_tier=privacy_tier)
+    factory = _TierRecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=[frag_id for frag_id, _ in sources],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [expected_tier]
+    assert None not in factory.tiers
+
+
+def test_compile_routing_fails_closed_when_no_source_id_resolves(
+    vault: Path,
+) -> None:
+    """An unresolvable request routes ``INTIMATE`` and still says "not found".
+
+    Two halves, and both matter. The routing half is the only row in the
+    #928 table where the *source* term strictly dominates the ceiling term:
+    with nothing found in the vault there is no evidence about what the call
+    would carry, so the max-source tier fails closed to ``INTIMATE`` even
+    under ``ceiling=open``.
+
+    The UX half guards the fix's blast radius: routing local must not turn
+    the engine's ordinary not-found refusal into a generic one. A caller
+    with a typo'd id still learns which id does not resolve — and learns it
+    from the engine, not from the ceiling gate (hence the explicit
+    inequality against :data:`_ABOVE_CEILING_REASON`).
+    """
+    factory = _TierRecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-missing"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert factory.tiers == [PrivacyTier.INTIMATE]
+    assert result["status"] == "refused"
+    assert "not found" in result["reason"]
+    assert "frag-missing" in result["reason"]
+    assert result["reason"] != _ABOVE_CEILING_REASON
+
+
+def test_compile_routing_fails_closed_when_privacy_tier_key_is_absent(
+    vault: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key routes as ``INTIMATE``.
+
+    The routing counterpart to
+    :func:`test_compile_fails_closed_when_privacy_tier_key_is_absent`, which
+    covers the *admission* side of the same file. ``ceiling=all`` admits the
+    hand-edited / legacy fragment, so the routing tier is the only thing
+    standing between its title and a cloud provider;
+    ``creek_mcp.tools.compile._tier_of`` reports ``INTIMATE`` for it and the
+    factory must be keyed with exactly that.
+    """
+    _write_fragment_without_tier(vault, frag_id="frag-legacy")
+    factory = _TierRecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-legacy"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.INTIMATE]
+
+
+def test_compile_refuses_when_intimate_has_no_local_backend(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``IntimateRoutingError`` surfaces as a refusal, not a transport crash.
+
+    When *both* ``default`` and ``generation`` are cloud there is nowhere
+    safe to send intimate content, and the router raises rather than
+    egressing. ``IntimateRoutingError`` subclasses ``RuntimeError``, which
+    ``compile_tool`` already catches, so the caller must get the ordinary
+    structured refusal.
+
+    Everything except the routing decision is wired to *succeed* — the
+    provider spy reports ``available`` and returns parseable JSON — so a
+    refusal here can only have come from the router. The reason string is
+    pinned to the router's own wording because a provider-unavailability
+    ``RuntimeError`` also becomes ``status="refused"``, and a bare status
+    assertion could not tell the two apart.
+    """
+    from creek_mcp import server as server_mod
+
+    _write_fragment(vault, frag_id="frag-int", privacy_tier="intimate")
+    spy = _ProviderSpy()
+    _patch_build_provider(monkeypatch, spy)
+    monkeypatch.setattr(
+        server_mod,
+        "load_config",
+        lambda: _RoutingConfigStub(default="anthropic", generation="anthropic"),
+    )
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-int"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=server_mod._build_compile_llm,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+
+    assert result["status"] == "refused"
+    assert "cannot route to cloud provider" in result["reason"]
+    assert "anthropic" in result["reason"]
+    # No provider was ever constructed, so nothing could have egressed.
+    assert spy.configs == []
+    assert spy.prompts == []
+    # A refused call leaves no page and no idempotency state behind.
+    assert not (vault / "02-Threads" / "Active" / "thread-x.md").exists()
+    assert not (vault / "00-Creek-Meta" / "audit" / "compile-thread-x.hash").exists()
+
+
+def test_compile_above_ceiling_refusal_gains_no_tier_field(vault: Path) -> None:
+    """Routing must not add a tier-derived field to the refusal or its audit row.
+
+    Anti-oracle guard for #928. The above-ceiling refusal deliberately names
+    nothing — see :data:`_ABOVE_CEILING_REASON` — and the computed routing
+    tier is exactly the kind of field a well-meaning implementation would
+    add "for debuggability". Echoing it would turn one refused call into the
+    bulk tier-classification oracle that constant exists to prevent, so the
+    key sets are pinned exactly rather than merely spot-checked.
+    """
+    _write_fragment(vault, frag_id="frag-sealed", privacy_tier="intimate")
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-sealed"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=_noop_llm_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert set(result) == {"status", "tool", "tier_ceiling", "reason"}
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+
+    entries = [e for e in _read_audit(vault) if e["tool"] == "creek.compile"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert {key for key in entry if "tier" in key} == {"tier_ceiling"}
+    args_summary = entry["args_summary"]
+    assert isinstance(args_summary, dict)
+    assert {key for key in args_summary if "tier" in key} == set()
 
 
 # ---------------------------------------------------------------------------

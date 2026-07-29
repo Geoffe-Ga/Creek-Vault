@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import frontmatter
 import pytest
 
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
@@ -565,6 +567,192 @@ def test_build_reflect_llm_factory_routes_then_degrades(
     )
     with pytest.raises(RuntimeError):
         server_mod._build_reflect_llm_factory()(PrivacyTier.OPEN)
+
+
+# --------------------------------------------------------------------------- #
+# Compile LLM: tier-routed production factory (#928) + real wiring (#929)
+# --------------------------------------------------------------------------- #
+
+
+class _CompletionStub:
+    """A provider completion exposing only the ``.text`` field callers read."""
+
+    def __init__(self, text: str) -> None:
+        """Store the completion *text*."""
+        self.text = text
+
+
+class _ProviderSpy:
+    """A ``build_provider`` stand-in recording the configs it was handed.
+
+    Doubles as the provider it returns so one object covers construction
+    (which resolved config the router produced) and use (which prompts were
+    completed). ``available`` mirrors the real provider flag so the
+    degraded path can be exercised without a live backend.
+    """
+
+    def __init__(self, *, available: bool = True, text: str = "{}") -> None:
+        """Start with empty recordings, the given availability and response."""
+        self.configs: list[object] = []
+        self.prompts: list[str] = []
+        self.available = available
+        self.text = text
+
+    def build(self, config: object) -> _ProviderSpy:
+        """Record *config* and return this spy as the constructed provider."""
+        self.configs.append(config)
+        return self
+
+    def complete(self, prompt: str) -> _CompletionStub:
+        """Record *prompt* and return the canned completion."""
+        self.prompts.append(prompt)
+        return _CompletionStub(self.text)
+
+    @property
+    def provider_names(self) -> list[object]:
+        """Return the ``provider`` of every recorded config, in call order."""
+        return [getattr(config, "provider", None) for config in self.configs]
+
+
+def _patch_build_provider(monkeypatch: pytest.MonkeyPatch, spy: _ProviderSpy) -> None:
+    """Route every ``build_provider`` import path through *spy*.
+
+    The factory is reachable as ``creek.classify.llm.providers.build_provider``
+    (the router/reflect import) and via the ``creek.classify.llm`` re-export
+    (what :func:`creek.compile.engine.default_llm` imports), so both names are
+    patched and the spy records whichever path production actually takes.
+    """
+    monkeypatch.setattr("creek.classify.llm.providers.build_provider", spy.build)
+    monkeypatch.setattr("creek.classify.llm.build_provider", spy.build)
+
+
+def _split_routing_config() -> object:
+    """Return a config stub whose ``default`` is local and ``generation`` cloud.
+
+    The two stages deliberately disagree so a resolved ``ollama`` proves the
+    ``Intimate``-never-cloud redirect ran, while a resolved ``anthropic``
+    proves the ``generation`` stage (not the ``default``) was consulted.
+    """
+    from creek.classify.llm.router import ModelRouter
+    from creek.config import LLMConfig, LLMRoutingConfig
+
+    routing = LLMRoutingConfig(
+        default=LLMConfig(provider="ollama"),
+        generation=LLMConfig(provider="anthropic"),
+    )
+
+    class _Config:
+        """Minimal ``CreekConfig`` stand-in exposing the LLM routing surface."""
+
+        llm = routing
+        model_router = ModelRouter(routing)
+
+    return _Config()
+
+
+def _write_open_fragment(vault: Path, frag_id: str) -> None:
+    """Write one ``open``-tier fragment under ``01-Fragments/Notes``."""
+    metadata = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": f"Title {frag_id}",
+        "created": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "ingested": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "privacy_tier": "open",
+        "eddies": [],
+    }
+    target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="Body text.", **metadata)),
+        encoding="utf-8",
+    )
+
+
+def test_build_compile_llm_routes_by_tier_then_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compile factory is tier-keyed and honours the router (#928/#929).
+
+    Mirrors :func:`test_build_reflect_llm_factory_routes_then_degrades`, but
+    against a *real* :class:`~creek.classify.llm.router.ModelRouter` so the
+    ``Intimate``-never-cloud redirect under test is the production one and
+    not a stub's opinion.
+
+    Three properties, each of which the pre-fix ``_build_compile_llm``
+    violates: it takes no tier at all, it builds straight from
+    ``load_config().llm`` (never touching the router), and it imports a name
+    (``creek.compile.engine._default_llm``) that does not exist — so every
+    production ``creek.compile`` call raises ``ImportError``.
+    """
+    from creek.models import PrivacyTier
+    from creek_mcp import server as server_mod
+
+    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    spy = _ProviderSpy(text="compiled")
+    _patch_build_provider(monkeypatch, spy)
+
+    # INTIMATE: the cloud ``generation`` stage is redirected to local default.
+    assert server_mod._build_compile_llm(PrivacyTier.INTIMATE)("p") == "compiled"
+    assert spy.provider_names == ["ollama"]
+
+    # OPEN: no redirect, and the ``generation`` stage (not ``default``) wins.
+    assert server_mod._build_compile_llm(PrivacyTier.OPEN)("p") == "compiled"
+    assert spy.provider_names == ["ollama", "anthropic"]
+    assert spy.prompts == ["p", "p"]
+
+    unavailable = _ProviderSpy(available=False)
+    _patch_build_provider(monkeypatch, unavailable)
+    with pytest.raises(RuntimeError) as excinfo:
+        server_mod._build_compile_llm(PrivacyTier.OPEN)
+    assert "unavailable" in str(excinfo.value).lower()
+
+
+def test_build_server_wires_the_production_compile_llm_factory(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek.compile`` works with no ``compile_llm_factory`` injected (#929).
+
+    This is the test that would have caught #929. Every existing compile
+    test injects ``compile_llm_factory``, which is exactly what hid a
+    production factory that raises ``ImportError`` on its first line — the
+    registered tool was never once exercised against the code path real
+    clients take.
+
+    So the injection point is deliberately left empty: ``build_server`` must
+    fall back to its own factory, and the tool must complete end to end
+    through the registered FastMCP handler.
+    """
+    from creek_mcp import server as server_mod
+
+    _write_open_fragment(vault, "frag-open")
+    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    spy = _ProviderSpy()
+    _patch_build_provider(monkeypatch, spy)
+
+    server = build_server(vault_path=vault)
+    result = asyncio.run(
+        server.call_tool(
+            "creek.compile",
+            {
+                "fragment_ids": ["frag-open"],
+                "target_kind": "thread",
+                "target_id": "thread-x",
+                "target_title": "Thread X",
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["compiled_path"] == "02-Threads/Active/thread-x.md"
+    assert (vault / "02-Threads" / "Active" / "thread-x.md").exists()
+    # An ``open`` ceiling over ``open`` sources routes to the cloud
+    # ``generation`` stage — the router ran, and did not over-restrict.
+    assert spy.provider_names == ["anthropic"]
 
 
 # --------------------------------------------------------------------------- #
