@@ -386,3 +386,28 @@ class TestMaterialRewriteRetiers:
         post = frontmatter.load(str(path))
         assert post["privacy_tier"] == _INTIMATE
         assert tier_allowed(_fragment_tier(post.metadata), TierCeiling.OPEN) is False
+
+    def test_unrecognised_disk_tier_fails_closed_to_intimate(
+        self, tmp_path: Path
+    ) -> None:
+        """An unparseable on-disk tier is read as ``intimate``, not ``open``.
+
+        Frontmatter is hand-editable and forward-dated vaults may carry tier
+        spellings this build has never heard of. ``_tier_on_disk`` refuses to
+        guess: an unrecognised value is one nobody can vouch for, so the merge
+        base becomes ``intimate`` and the escalate-only merge can only hold
+        there. The rewrite body is deliberately *benign* — the classifier's
+        candidate for it is ``open``, so the only route to an ``intimate``
+        result is the fail-closed parse of ``"bogus-tier"``. A recovery-keyword
+        body would have passed on the candidate alone and proved nothing.
+        """
+        vault = _make_vault(tmp_path)
+        frag, path = self._seed(vault, _ESSAY_SEED, tier="bogus-tier")
+
+        VaultWriter(vault_path=vault).update_fragment(
+            frag, _ESSAY_REWRITE_BENIGN, reclassify_threshold=0.9
+        )
+
+        post = frontmatter.load(str(path))
+        assert post["privacy_tier"] == _INTIMATE
+        assert tier_allowed(_fragment_tier(post.metadata), TierCeiling.OPEN) is False

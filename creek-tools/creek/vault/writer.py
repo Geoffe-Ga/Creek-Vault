@@ -36,6 +36,7 @@ from creek.models import (
     Authorship,
     DecisionStatus,
     PraxisType,
+    PrivacyTier,
     SourcePlatform,
 )
 from creek.vault.authors import (
@@ -81,6 +82,12 @@ _PLATFORM_SUBFOLDER: dict[str, str] = {
 
 # Destination for soft-tombed fragments whose source unit has vanished (#674).
 _ORPHANED_RELPARTS: tuple[str, ...] = ("10-Liminal", "Orphaned")
+
+# Frontmatter key holding the serialised ``Fragment.voice_proxy_eligible``
+# computed field (BUG-009). It is derived from ``privacy_tier`` +
+# ``source.author``, so any code path that rewrites the tier on disk owes this
+# key a refresh or the snapshot goes stale (#922).
+_VOICE_PROXY_ELIGIBLE_KEY: str = "voice_proxy_eligible"
 
 # Map an AuthorManifest.author_kind -> the fragment's Authorship axis (#470).
 # Any unrecognised kind (the manifest already fails closed to ``human_source``)
@@ -425,6 +432,124 @@ def _clear_classification(post: frontmatter.Post) -> None:
         post.metadata.pop(key, None)
 
 
+def _tier_on_disk(raw: object) -> PrivacyTier:
+    """Parse a frontmatter ``privacy_tier`` value, failing closed to INTIMATE.
+
+    Mirrors :func:`creek.classify.privacy_filter.tier_of` and
+    ``creek_mcp.tools.reflect._fragment_tier``: a value this build does not
+    recognise is a value nobody can vouch for, so it is treated as the
+    most-restrictive tier rather than allowed to raise (which would abort an
+    otherwise-valid in-place rewrite) or to fall through to ``open`` (which
+    would expose the body). The legacy ``"public"`` spelling is still accepted
+    — :meth:`creek.models.PrivacyTier._missing_` maps it to ``OPEN`` (INC-003).
+
+    Args:
+        raw: The frontmatter value, exactly as read from disk.
+
+    Returns:
+        The parsed tier, or ``INTIMATE`` when the value is unrecognised.
+    """
+    try:
+        return PrivacyTier(str(raw))
+    except ValueError:
+        logger.warning(
+            "Fragment file carries unrecognised privacy_tier %r; treating as "
+            "INTIMATE while re-tiering an edited body. Re-run `creek classify` "
+            "to assign a recognised tier.",
+            raw,
+        )
+        return PrivacyTier.INTIMATE
+
+
+def _retier_after_rewrite(
+    post: frontmatter.Post,
+    fragment: Fragment,
+    body: str,
+) -> None:
+    """Re-derive ``privacy_tier`` from the *new* body after a material edit (#922).
+
+    :func:`_clear_classification` drops the classification keys so the next
+    pass revisits the fragment, but ``privacy_tier`` is not one of them — it
+    would keep describing the body that was just overwritten. A fragment
+    rewritten from an essay into recovery content therefore kept its ``open``
+    tier and stayed admissible to an OPEN-ceiling MCP caller until someone
+    happened to re-run a privacy pass.
+
+    The policy mirrors :func:`creek.classify.privacy_pass.apply_tier` exactly,
+    expressed in frontmatter terms rather than model terms:
+
+    * The candidate comes from
+      :class:`~creek.classify.privacy.PrivacyClassifier`, which is pure
+      keyword/platform heuristics — no LLM call, no network, no config — so
+      re-tiering on every material edit is free.
+    * When the frontmatter still owes a tier
+      (:func:`~creek.classify.privacy_pass.needs_tier`: key absent, or present
+      but ``unclassified``) the candidate is taken outright; there is no
+      decision to escalate against.
+    * Otherwise the candidate is merged
+      :func:`~creek.classify.privacy_pass.escalate`-only against the tier **on
+      disk**, so an operator's ``intimate`` survives a benign rewrite. The
+      merge base must be the on-disk value, *not* ``tier_of(fragment)``: the
+      fragment the ingest pipeline hands us is freshly constructed and still
+      carries the model's ``unclassified`` default, which ranks *below*
+      ``open`` in ``privacy_pass._ESCALATION_RANK`` — escalating against it
+      would silently discard the operator's decision.
+    * ``voice_proxy_eligible`` is recomputed from the merged tier and the
+      fragment's authorship. It is a *derived* field
+      (:attr:`creek.models.Fragment.voice_proxy_eligible`, BUG-009) whose
+      on-disk copy is only a serialised snapshot, so leaving it alone would
+      strand a stale ``true`` on a now-intimate fragment and feed it straight
+      into voice-proxy generation.
+
+    Why re-derive, rather than either cheaper move that suggests itself:
+
+    * **Stamping a blanket ``intimate`` on every material rewrite is
+      permanent.** :func:`~creek.classify.privacy_pass.needs_tier` returns
+      ``False`` for any explicit non-``unclassified`` tier, so no ordinary
+      classify pass revisits it, and even ``creek classify --force`` merges
+      through :func:`~creek.classify.privacy_pass.escalate`, which never
+      lowers a tier. Nothing in the package downgrades ``privacy_tier`` — the
+      purge engine explicitly excludes the key — so a blanket stamp would bury
+      every edited fragment at ``intimate`` forever, with a hand edit of the
+      frontmatter the only way back out.
+    * **Resetting to ``unclassified`` is a no-op for exposure.**
+      ``creek_mcp.tier_ceiling`` ranks ``UNCLASSIFIED`` at the same level as
+      ``OPEN``, so a reset fragment stays admissible at an OPEN ceiling —
+      exactly the leak this exists to close.
+
+    Re-deriving avoids both: the tier always describes the current body, and
+    the escalate-only merge preserves operator curation.
+
+    Args:
+        post: Loaded frontmatter of the file being rewritten. Its metadata is
+            mutated in place; the caller writes the post back.
+        fragment: The fragment being re-ingested, supplying the platform and
+            authorship axes the classifier keys on. Never mutated.
+        body: The new markdown body, scanned for recovery keywords.
+    """
+    # Deferred import for the same load-time cycle documented on
+    # `_clear_classification`: `creek.classify.classify_engine` imports
+    # `VaultWriter` from this module.
+    from creek.classify.privacy import PrivacyClassifier
+    from creek.classify.privacy_pass import PRIVACY_TIER_KEY, escalate, needs_tier
+
+    # Mirrors `apply_tier`'s shape: assign outright when nothing is on record,
+    # otherwise merge escalate-only. The ternary short-circuits, so the
+    # subscript is only reached on the branch that proved the key is present.
+    assigning = needs_tier(post.metadata)
+    candidate = PrivacyClassifier().classify_tier(fragment, content=body)
+    tier = (
+        candidate
+        if assigning
+        else escalate(_tier_on_disk(post.metadata[PRIVACY_TIER_KEY]), candidate)
+    )
+    post.metadata[PRIVACY_TIER_KEY] = tier.value
+    post.metadata[_VOICE_PROXY_ELIGIBLE_KEY] = (
+        tier is not PrivacyTier.INTIMATE
+        and Authorship(fragment.source.author) is Authorship.SELF
+    )
+
+
 def _apply_other_author_attribution(
     fragment: Fragment,
     manifest: AuthorManifest,
@@ -628,6 +753,15 @@ class VaultWriter:
         trivial edit (ratio at/above the threshold) preserves classifications.
         The default ``0.0`` never flags — every edit preserves.
 
+        A material change also re-derives ``privacy_tier`` (and the
+        ``voice_proxy_eligible`` flag computed from it) from the **new** body
+        via :func:`_retier_after_rewrite` (#922). Unlike the classification
+        keys, the tier cannot simply be cleared and left for the next pass:
+        while it is stale it still governs read-side admission, so a fragment
+        rewritten into intimate content would stay visible at an OPEN ceiling
+        in the meantime. The re-derivation is escalate-only against the tier
+        already on disk, so it never lowers an operator's decision.
+
         Returns ``None`` when no file is mapped to ``fragment.id`` (e.g. the
         file was removed out of band), so the caller can fall back to a fresh
         :meth:`write_fragment`.
@@ -638,7 +772,8 @@ class VaultWriter:
             body: The new markdown body to write below the preserved
                 frontmatter.
             reclassify_threshold: Body-similarity floor below which the edit is
-                material and classifications are cleared for re-classification.
+                material — classifications are cleared for re-classification and
+                the privacy tier is re-derived from the new body.
 
         Returns:
             Path to the rewritten file, or ``None`` when no existing file
@@ -652,6 +787,7 @@ class VaultWriter:
             post = frontmatter.load(str(existing))
             if _is_material_change(post.content, body, reclassify_threshold):
                 _clear_classification(post)
+                _retier_after_rewrite(post, fragment, body)
             post.content = body
             _atomic_write_text(existing, frontmatter.dumps(post))
             # Record the in-place edit in the provenance log too, so the audit

@@ -57,6 +57,15 @@ to warrant re-classification:
   `classification_method` / `classified_at` / `classification_reasoning` are
   cleared so the next `creek classify` pass re-does **only that fragment**
   (cooperating with OPS-001 — no global `--force`).
+- A material edit additionally **re-derives `privacy_tier`** (and the
+  `voice_proxy_eligible` flag computed from it) from the *new* body (#922).
+  The tier cannot simply be cleared and left for the next pass the way the
+  classification keys are: while it is stale it still governs read-side
+  admission, so a fragment rewritten into intimate content would stay visible
+  to an `open`-ceiling reader in the meantime. The new tier comes from the
+  deterministic, LLM-free privacy heuristic and is merged **escalate-only**
+  against the tier already on disk — a rewrite can raise a tier but never
+  lower one, so an operator's `intimate` survives a benign rewrite.
 
 The threshold is the config knob
 `classification.reclassify_on_edit_threshold` (default `0.9`, range `0.0–1.0`).
