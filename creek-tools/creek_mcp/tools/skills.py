@@ -31,10 +31,19 @@ def skills_refresh_tool(
 ) -> dict[str, Any]:
     """Regenerate the voice-skill tree and return the written paths.
 
-    The generator already excludes ``intimate`` exemplars so the
-    operation is safe at any ceiling. The skill tree always lands under
-    ``<vault>/creek-skills``; the MCP surface does not expose an
-    override (the CLI flag is the right tool for that).
+    ``intimate`` exemplars are excluded — but by a hardcode in the
+    generator, not by the caller's ceiling: ``_is_snapshot_fragment`` in
+    ``creek/generate/skills.py`` defaults ``allow_intimate=False``, and
+    this tool never passes ``allow_intimate=True``. The ceiling itself is
+    never threaded (``to_privacy_override`` is never called here), so a
+    ``personal`` fragment contributes its *full body* at ``ceiling=open``
+    — looser than every sibling generation tool: ``creek.mine``,
+    ``creek.draft``, and ``creek.author`` all route through
+    ``filter_fragments_by_tier``, where a personal fragment at ``open``
+    contributes a title-only summary instead. Output lands in the
+    untiered ``<vault>/creek-skills`` directory; the MCP surface does not
+    expose an override (the CLI flag is the right tool for that).
+    Tracked by #971.
     """
     output = vault_path / _SKILLS_RELDIR
     written = SkillTreeGenerator().generate_all_skills(vault_path, output)

@@ -10,6 +10,21 @@ decision-signalling fragments, #581), ``rhetorical-patterns``
 deferred to the CLI because they need date arithmetic the MCP shape
 should not own. The wrapper writes one audit entry per invocation
 including ``created_path`` for the resulting report file(s).
+
+Read-side posture (#968): the ceiling is audited and echoed but never
+converted or threaded — ``to_privacy_override`` is never called here.
+Four of the six generators (``creek/generate/{tags,lexicon,decisions,
+wavelength}.py``) contain no tier filtering whatsoever;
+``creek/generate/voice.py`` is the only one with an ``allow_intimate``
+filter. Reproduced: ``report_type="tags"`` at ``ceiling=open`` wrote an
+``intimate`` fragment's tag verbatim into
+``00-Creek-Meta/Tag-Garden.md`` and
+``00-Creek-Meta/Processing-Log/tag-history.json``. The exposure is
+write-side, not read-side: this tool returns only ``report_paths``,
+never content, and no MCP tool reads an arbitrary vault file back — so
+a low-ceiling caller cannot read the leaked artifact *through MCP*.
+What it causes instead is above-ceiling content distilled into an
+unlabelled vault file.
 """
 
 from __future__ import annotations

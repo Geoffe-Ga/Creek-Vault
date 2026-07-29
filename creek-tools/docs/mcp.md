@@ -63,10 +63,10 @@ real desk. Only the `research` medium is wired — any other `medium` returns
 | `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused.     |
 | `creek.classify`        | `method` (`rules`\|`llm`), `force`                          | Rewrites in place; no new tier produced — any ceiling permitted.  |
 | `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`), `rebuild`    | Links existing artefacts in place — any ceiling permitted.        |
-| `creek.report`          | `report_type` (`tags`\|`voice`)                             | Renders a vault-state report — any ceiling permitted.             |
-| `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars already excluded.      |
+| `creek.report`          | `report_type` (`tags`\|`voice`\|`decisions`\|`lexicon`\|`rhetorical-patterns`\|`mode-profiles`) | Ceiling is recorded but not enforced — known gap #968; see "Read-side posture (#932)" below. |
+| `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars excluded by a generator hardcode, not by the ceiling — `personal` bodies pass unsummarised at `ceiling=open` (known gap #971). |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Gates the *source* fragments' tier, not the compiled page's tier — a source above `ceiling` refuses the whole call (#848). Idempotent per FEAT-003; no-op re-runs do not log a duplicate. |
-| `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. |
+| `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. The tier of the fragment an existing `external_id` already maps to is **not** consulted before the update-in-place overwrites it (known gap #970). |
 
 ### Purge tools (FEAT-012, elevated authorization required)
 
@@ -121,6 +121,29 @@ source fragment's tier exceeds `ceiling`, the whole call is refused
 before the compile LLM is invoked or the page is written — so an
 intimate fragment can never be laundered into an open-tier compiled
 page. The refusal is audited but names no fragment ids and no tiers.
+
+### Read-side posture (#932)
+
+Every registered tool's relationship to the caller's ceiling is now a
+machine-checked audit record: `creek_mcp/read_gate.py`'s `TOOL_POSTURES`
+names one of six postures per tool, verified against the live server
+surface and, for `GATED` entries, against a real call site in the
+named module, and for the rest against a runtime canary probe.
+
+Most of what the sweep found is **write-side**: a tool *acts on* content
+above the caller's ceiling (#968, #970, #971) rather than handing it
+back. That is a shape the ceiling language elsewhere on this page does
+not describe — it is written entirely in read-back terms ("omitted",
+"returned as a title-only stub"), which is why those gaps survived.
+
+One read-side leak was found, and it is worth stating how: the sweep
+first concluded there were none, having probed the tools that walk the
+corpus themselves. `creek.redact.scan` was set aside as "the caller
+named the path" — true, and not sufficient. Its path confinement is to
+the whole vault rather than to the FEAT-027 staging subtree, and it
+returns matching *filenames*, which are slugified fragment titles
+(#972). A posture whose name is accurate can still license a wrong
+conclusion; that is what the machine-checked manifest is for.
 
 ### Elevated-authorization model (FEAT-012)
 

@@ -17,6 +17,16 @@ Tier is honored end-to-end: the tier is written into the staged entry's
 frontmatter (which the markdown ingestor carries onto the fragment), and the
 write-side ceiling refuses an entry whose tier exceeds the caller's ceiling — so
 an INTIMATE entry is stored intimate and never admitted under a lower ceiling.
+
+The idempotent update-in-place has a gap this guarantee does not cover
+(#970): overwriting the fragment an existing ``external_id`` already maps to
+replaces whatever body is there **without consulting that fragment's own
+tier**. Reproduced: a caller at ``ceiling=open`` replaced the body of a
+fragment persisted at ``privacy_tier: intimate``. The persisted tier itself
+was not downgraded — the escalate-only privacy merge held — but the intimate
+body was destroyed. Contrast ``creek.purge.*``, which requires
+``CREEK_MCP_ELEVATED_TOKEN`` for exactly this kind of destruction; this path
+requires only the caller's own (lower) ceiling.
 """
 
 from __future__ import annotations
