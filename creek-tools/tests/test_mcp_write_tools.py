@@ -1795,6 +1795,58 @@ def test_compile_refuses_when_intimate_has_no_local_backend(
     assert not (vault / "00-Creek-Meta" / "audit" / "compile-thread-x.hash").exists()
 
 
+def test_compile_routing_refusal_can_preempt_the_not_found_refusal(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an all-cloud config, a zero-resolving compile refuses on routing.
+
+    Pins the one deployment-dependent seam in ``_survey_sources``'s
+    contract. ``llm_factory(tier)`` is evaluated as a call *argument* to
+    ``compile_to_vault``, so Python runs it before the engine can report
+    "Fragment(s) not found". When no requested id resolves, ``max_tier``
+    fails closed to ``INTIMATE``; if ``default`` and ``generation`` are
+    both cloud, the router refuses first and its message — not the
+    not-found one — reaches the caller.
+
+    Documented rather than fixed because it fails closed and names no id,
+    and because it turns on the operator's model config, not on anything
+    the caller sends. The test exists so a refactor that reorders the
+    argument evaluation has to do so deliberately. Contrast
+    :func:`test_compile_routing_fails_closed_when_no_source_id_resolves`,
+    which pins the ordinary local-default case where the caller *does*
+    still get the not-found message.
+    """
+    from creek_mcp import server as server_mod
+
+    spy = _ProviderSpy()
+    _patch_build_provider(monkeypatch, spy)
+    monkeypatch.setattr(
+        server_mod,
+        "load_config",
+        lambda: _RoutingConfigStub(default="anthropic", generation="anthropic"),
+    )
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-does-not-exist"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=server_mod._build_compile_llm,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert "cannot route to cloud provider" in result["reason"]
+    # The routing refusal preempted the engine's not-found message.
+    assert "not found" not in result["reason"]
+    # The refusal still names no fragment id, and nothing was ever built.
+    assert "frag-does-not-exist" not in result["reason"]
+    assert spy.configs == []
+    assert spy.prompts == []
+
+
 def test_compile_above_ceiling_refusal_gains_no_tier_field(vault: Path) -> None:
     """Routing must not add a tier-derived field to the refusal or its audit row.
 

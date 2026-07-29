@@ -241,7 +241,16 @@ def _survey_sources(
             matching fragment in the vault is **not** a violation — it falls
             through to the engine's ``ValueError("Fragment(s) not found in
             vault: ...")`` so a legitimate caller still learns the id does not
-            resolve.
+            resolve. One deployment-dependent exception: when *no* requested id
+            resolves, ``max_tier`` fails closed to ``INTIMATE`` (below), and
+            ``llm_factory(tier)`` is evaluated as a call *argument* to
+            ``compile_to_vault`` — so it runs before the engine's not-found
+            check. On a vault whose ``generation`` **and** ``default`` stages
+            are both cloud, the router's ``IntimateRoutingError`` therefore
+            wins over the not-found message. That is safe (it fails closed and
+            names no id) and it is not caller-influenced — it depends on the
+            operator's model config, not on the request — but the not-found
+            refusal is not guaranteed under that one configuration.
         ceiling: The caller's declared ceiling.
 
     Returns:
