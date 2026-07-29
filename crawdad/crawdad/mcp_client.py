@@ -29,15 +29,29 @@ from mcp.client.stdio import (
 )
 from pydantic import BaseModel, ConfigDict
 
+from crawdad.config import _PROVIDER_KEY_ENV
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
 _LOGGER = logging.getLogger("crawdad.mcp_client")
 
 #: Credential env vars the stdio SDK scrubs but the in-MCP cloud tools need.
-#: ``CREEK_ANTHROPIC_CONSENT`` gates cloud egress, so it is forwarded only when
-#: explicitly set in CrawDad's own environment (opt-in). See issue #549.
-_FORWARDED_ENV_VARS: Final = ("ANTHROPIC_API_KEY", "CREEK_ANTHROPIC_CONSENT")
+#: The provider API keys are derived from :data:`crawdad.config._PROVIDER_KEY_ENV`
+#: so adding a provider there forwards its key automatically — issue #918 exists
+#: because #610 added openai/gemini and this tuple was left Anthropic-only.
+#: Two consent gates follow: ``CREEK_CLOUD_CONSENT`` is the canonical,
+#: provider-neutral name and ``CREEK_ANTHROPIC_CONSENT`` its deprecated
+#: back-compat alias. Both are spelled as literals here — they mirror
+#: creek-tools' ``creek/classify/llm/consent.py`` rather than importing it,
+#: because CrawDad must not take a Python dependency on creek-tools. Consent is
+#: opt-in: each name is forwarded only when explicitly set in CrawDad's own
+#: environment. See issues #549 and #918.
+_FORWARDED_ENV_VARS: Final[tuple[str, ...]] = (
+    *_PROVIDER_KEY_ENV.values(),
+    "CREEK_CLOUD_CONSENT",
+    "CREEK_ANTHROPIC_CONSENT",
+)
 
 
 def _subprocess_env(source: Mapping[str, str]) -> dict[str, str]:
@@ -45,10 +59,19 @@ def _subprocess_env(source: Mapping[str, str]) -> dict[str, str]:
 
     The stdio SDK launches the server with a scrubbed environment limited to
     a small safe allowlist (:func:`get_default_environment`). That allowlist
-    drops ``ANTHROPIC_API_KEY``, so in-MCP cloud tools
-    (``draft``/``author``/``mine``/``classify``) silently fall back to
-    non-cloud behaviour — issue #549. Re-add the forwarded credential vars
-    that are present (and non-empty) in *source* on top of the safe defaults.
+    drops both the provider API keys and the cloud-consent vars, so an
+    in-MCP tool that would otherwise reach a cloud provider silently
+    degrades to non-cloud behaviour even though the operator consented —
+    issues #549 and #918. Re-add the :data:`_FORWARDED_ENV_VARS` that are
+    present (and non-empty) in *source* on top of the safe defaults.
+
+    Forwarding consent is *not* a tier decision. Which content may reach a
+    cloud provider stays the MCP server's call: creek-tools routes through
+    its own ``ModelRouter`` chokepoint, which keeps Intimate-tier content
+    local regardless of what this function forwards.
+
+    Forwarding is opt-in in both directions: only names actually set in
+    *source* are re-added, and nothing outside the allowlist is ever copied.
 
     Args:
         source: The parent environment to forward credentials from, normally
@@ -56,7 +79,7 @@ def _subprocess_env(source: Mapping[str, str]) -> dict[str, str]:
 
     Returns:
         The SDK safe-default environment augmented with any forwarded
-        credentials. Absent or blank credentials are omitted entirely so the
+        credentials. Absent or blank values are omitted entirely so the
         subprocess never sees an empty value.
     """
     env = dict(get_default_environment())
