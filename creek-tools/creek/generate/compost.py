@@ -19,7 +19,7 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -33,7 +33,7 @@ from creek.models import (
     Thread,
     ThreadStatus,
 )
-from creek.time import effective_authored_at
+from creek.time import effective_authored_at, ensure_aware, now_la
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -178,8 +178,14 @@ class CompostTracker:
             project_min_fragments: Minimum fragment count for a project
                 (tag) to be tracked. Defaults to 2.
             now: Reference "now" for age calculations. Defaults to
-                :func:`datetime.now` (timezone-naive). Useful for
-                deterministic tests.
+                :func:`creek.time.now_la` — tz-aware, America/Los_Angeles
+                — so the dates stamped on compost notes and the overview
+                report follow the same calendar as the rest of the vault
+                (issue #938; a UTC-derived clock ran a day ahead of LA
+                for the last several hours of every LA day). A naive
+                value passed here is still accepted and read as an LA
+                wall-clock reading, keeping existing callers working.
+                Useful for deterministic tests.
             similarity_fn: Closure mapping a text string to its maximum
                 cosine similarity against the compost exemplar set
                 (see :mod:`creek.generate.compost_embedding`). When
@@ -207,7 +213,7 @@ class CompostTracker:
         self.dormancy_days = dormancy_days
         self.project_gap_days = project_gap_days
         self.project_min_fragments = project_min_fragments
-        self._now = now or datetime.now(tz=UTC).replace(tzinfo=None)
+        self._now = ensure_aware(now) if now is not None else now_la()
         self._similarity_fn = similarity_fn
         self._verifier = verifier
         self._embedding_threshold = embedding_threshold
@@ -408,13 +414,27 @@ class CompostTracker:
         frags: list[Fragment],
         cutoff: datetime,
     ) -> CompostCandidate | None:
-        """Return a project candidate for *tag*, or ``None`` if still active."""
+        """Return a project candidate for *tag*, or ``None`` if still active.
+
+        Both sides of the silence comparison are timezone-aware before
+        they meet: ``cutoff`` derives from the aware clock, and each
+        fragment timestamp is passed through
+        :func:`creek.time.ensure_aware`. A vault mixing naive and aware
+        fragment timestamps — the ordinary result of round-tripping
+        frontmatter without an offset — therefore ranks and compares
+        instead of raising ``TypeError`` (issue #938; the underlying
+        model-level normalisation is issue #976).
+        """
         if len(frags) < self.project_min_fragments:
             return None
         # FEAT-031: measure silence against the authored-date precedence
         # so a project whose fragments were merely *ingested* recently
         # but authored long ago is still recognised as silent.
-        last_seen = max(effective_authored_at(frag) for frag in frags)
+        # ``max`` compares its own candidates, so the normalisation has to
+        # happen inside the generator rather than around it: without it a
+        # single naive timestamp in the group raises before ``cutoff`` is
+        # ever consulted.
+        last_seen = max(ensure_aware(effective_authored_at(frag)) for frag in frags)
         if last_seen >= cutoff:
             return None
         days = (self._now - last_seen).days

@@ -34,6 +34,7 @@ from creek.time import (
     LA_TZ,
     effective_authored_at,
     effective_authored_date,
+    ensure_aware,
     now_la,
     today_la,
 )
@@ -262,6 +263,80 @@ class TestEffectiveAuthoredDate:
             ingested=ingested,
         )
         assert effective_authored_date(frag) == ingested.date()
+
+
+class TestEnsureAware:
+    """``ensure_aware`` makes any datetime safe to compare (issue #938).
+
+    The helper exists because comparing a naive datetime against a
+    tz-aware one raises ``TypeError: can't compare offset-naive and
+    offset-aware datetimes``. Its contract is deliberately asymmetric:
+
+    * naive in → *attach* America/Los_Angeles, keeping the wall clock;
+    * aware in → return untouched, zone and all.
+
+    The second half matters as much as the first: a fragment whose
+    ``authored_at`` came off a Sydney source must keep its Sydney
+    rendering, exactly as ``effective_authored_at`` already promises.
+    """
+
+    def test_naive_input_gets_the_la_timezone(self) -> None:
+        """A naive input comes back anchored to America/Los_Angeles."""
+        result = ensure_aware(datetime(2026, 7, 28, 23, 0, 0, 123456))
+        assert result.tzinfo is not None
+        assert result.utcoffset() == ZoneInfo("America/Los_Angeles").utcoffset(result)
+
+    def test_naive_input_keeps_its_wall_clock_fields(self) -> None:
+        """The helper *attaches* a zone; it must not convert the wall clock.
+
+        Converting instead of attaching would shift 23:00 on the 28th to
+        16:00 (or 06:00 the next day, depending on direction) and silently
+        move fragments across day boundaries — the very class of bug that
+        issue #938 is about.
+        """
+        result = ensure_aware(datetime(2026, 7, 28, 23, 0, 0, 123456))
+        assert (result.year, result.month, result.day) == (2026, 7, 28)
+        assert (result.hour, result.minute, result.second) == (23, 0, 0)
+        assert result.microsecond == 123456
+
+    def test_already_aware_non_la_input_is_returned_unchanged(self) -> None:
+        """A Sydney-anchored datetime survives with its zone intact.
+
+        Mirrors ``TestEffectiveAuthoredAt.test_preserves_timezone_of_authored_at``:
+        no silent normalisation to LA or UTC, because callers downstream
+        render the source's local time.
+        """
+        sydney = ZoneInfo("Australia/Sydney")
+        moment = datetime(2024, 3, 15, 8, 30, 45, 123456, tzinfo=sydney)
+        result = ensure_aware(moment)
+        assert result == moment
+        assert result.tzinfo == sydney
+        assert result.hour == 8
+        assert result.microsecond == 123456
+
+    def test_already_aware_utc_input_is_returned_unchanged(self) -> None:
+        """A UTC-anchored datetime is passed straight through."""
+        moment = datetime(2026, 5, 24, 6, 0, 0, 654321, tzinfo=UTC)
+        result = ensure_aware(moment)
+        assert result == moment
+        assert result.tzinfo == UTC
+        assert result.hour == 6
+        assert result.microsecond == 654321
+
+    def test_result_is_always_comparable_with_now_la(self) -> None:
+        """The invariant that actually matters: comparisons never raise.
+
+        Both operand orders are exercised because Python dispatches to the
+        *left* operand's ``__lt__`` first — an implementation that only
+        normalised one side would still explode half the time.
+        """
+        past = ensure_aware(datetime(2020, 1, 1, 12, 0))
+        future = ensure_aware(datetime(2099, 1, 1, 12, 0))
+        reference = now_la()
+        assert past < reference
+        assert future >= reference
+        assert reference >= past
+        assert reference < future
 
 
 @pytest.mark.parametrize("tz_env", ["UTC", "Asia/Tokyo", "America/New_York"])

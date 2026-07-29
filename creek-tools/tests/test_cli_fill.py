@@ -9,17 +9,20 @@ compost step, and the summary reports real per-folder counts.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
 
 import creek.cli as cli_mod
+import creek.time as creek_time
 from creek.cli import app
 from creek.generate import compost as compost_mod
 from creek.generate import indexes as indexes_mod
 from creek.link import link_engine
 
 if TYPE_CHECKING:
+    from datetime import tzinfo
     from pathlib import Path
 
     import pytest
@@ -158,6 +161,90 @@ def test_fill_with_compost_appends_compost_step(
 
     assert result.exit_code == 0, result.output
     assert calls == [*_EXPECTED_ORDER, "compost/report"]
+
+
+# ---- Issue #938: the compost report is dated on the LA calendar -----------
+
+_LA_AHEAD_UTC_INSTANT = datetime(2026, 7, 29, 6, 0, tzinfo=UTC)
+"""One absolute instant whose UTC and LA calendar dates disagree.
+
+06:00 UTC on 2026-07-29 is 23:00 PDT on 2026-07-28. A clock reading the UTC
+calendar stamps ``2026-07-29``; a clock reading LA stamps ``2026-07-28``.
+Freezing here turns issue #938's date bug from "true for about seven hours a
+day" into a deterministic assertion.
+"""
+
+
+class _FrozenDatetime(datetime):
+    """A ``datetime`` frozen at :data:`_LA_AHEAD_UTC_INSTANT`.
+
+    Deliberately timezone-agnostic, unlike the narrower stub in
+    ``tests/test_time.py``: it answers ``now(tz=...)`` with the one fixed
+    instant expressed in whatever zone it is handed, and asserts nothing
+    about which zone that is. The buggy implementation asks for UTC and the
+    fixed one asks for America/Los_Angeles — both have to run through this
+    stub, or the test would be measuring the patch instead of the behaviour.
+    """
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> datetime:
+        """Return the frozen instant, expressed in *tz*.
+
+        Args:
+            tz: Target timezone. ``None`` yields the naive UTC reading,
+                matching :meth:`datetime.now`'s own default.
+
+        Returns:
+            The single frozen moment, converted into *tz*.
+        """
+        if tz is None:
+            return _LA_AHEAD_UTC_INSTANT.replace(tzinfo=None)
+        return _LA_AHEAD_UTC_INSTANT.astimezone(tz)
+
+
+def test_fill_with_compost_dates_the_report_on_the_la_calendar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``creek fill --with-compost`` stamps the LA date, never the UTC one.
+
+    Runs the **real** ``CompostTracker`` — every other test in this module
+    stubs it out — against a clock frozen at 23:00 PDT on 2026-07-28, which
+    is already 2026-07-29 in UTC. Both module-level ``datetime`` names are
+    replaced with the same stub: ``creek.generate.compost.datetime``, which
+    the buggy ``datetime.now(tz=UTC).replace(tzinfo=None)`` calls, and
+    ``creek.time.datetime``, which ``now_la()`` calls. Patching both is what
+    makes the failure a genuine date mismatch rather than an artefact of
+    which module happened to be frozen.
+
+    Args:
+        tmp_path: Pytest temporary directory used as the vault root.
+        monkeypatch: Fixture used to stub the steps and freeze the clock.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    calls: list[str] = []
+
+    # ``_install_recorders`` swaps in a fake tracker; capture the real class
+    # first and put it back, so this test exercises production compost code
+    # while every other fill step stays stubbed.
+    real_tracker = compost_mod.CompostTracker
+    _install_recorders(monkeypatch, calls)
+    monkeypatch.setattr(compost_mod, "CompostTracker", real_tracker)
+    # Both clocks are frozen to the same instant, and both with raising=True:
+    # the RED failure has to be a real date mismatch, not a typo in a module
+    # path silently tolerated. Contract for the fix: ``creek.generate.compost``
+    # must keep ``datetime`` bound at module scope (not moved under
+    # ``TYPE_CHECKING``) so this patch point survives.
+    monkeypatch.setattr(compost_mod, "datetime", _FrozenDatetime, raising=True)
+    monkeypatch.setattr(creek_time, "datetime", _FrozenDatetime, raising=True)
+
+    result = runner.invoke(app, ["fill", "--vault", str(vault), "--with-compost"])
+
+    assert result.exit_code == 0, result.output
+    report = vault / "10-Liminal" / "Compost" / "_Compost-Report.md"
+    text = report.read_text(encoding="utf-8")
+    generated = [ln for ln in text.splitlines() if ln.startswith("generated:")]
+    assert generated == ["generated: 2026-07-28"]
 
 
 # ---- Issue #876: the untiered-fragment hint -------------------------------
