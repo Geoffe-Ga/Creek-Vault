@@ -17,6 +17,7 @@ from creek.generate.wavelength import (
     PHASE_DOMAIN_MAPPINGS,
     ModeProfileGenerator,
     WavelengthTracker,
+    _most_common_classified,
 )
 from creek.models import (
     Confidence,
@@ -668,3 +669,117 @@ class TestModeProfileGenerator:
 
         assert written == []
         assert not (vault_path / "05-Wavelength" / "Mode-Profiles").exists()
+
+    def test_bucket_with_no_classified_frequency_or_phase_round_trips(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A classified *mode* with unclassified frequency/phase still serialises.
+
+        A fragment may carry a classified engagement mode while its
+        frequency and phase remain unclassified, so a mode bucket can
+        contain nothing classified along either of those axes. The
+        dominant-value fallback must yield a plain ``str``; a raw
+        ``StrEnum`` member reaches PyYAML, which has no representer for
+        it and raises ``yaml.representer.RepresenterError`` (issue #940).
+        """
+        _seed_fragments(
+            vault_path,
+            [
+                _make_fragment(
+                    frag_id="mu1",
+                    created=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+                    mode=Mode.EXPRESS,
+                    frequency=Frequency.UNCLASSIFIED,
+                    phase=Phase.UNCLASSIFIED,
+                ),
+            ],
+        )
+
+        written = ModeProfileGenerator().generate_mode_profiles(vault_path)
+
+        assert [p.name for p in written] == ["express.md"]
+        post = frontmatter.load(str(written[0]))
+        assert post["dominant_frequency"] == Frequency.UNCLASSIFIED.value
+        assert post["dominant_phase"] == Phase.UNCLASSIFIED.value
+
+    def test_bucket_with_classified_frequency_but_unclassified_phase(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The phase axis falls back independently of the frequency axis.
+
+        Guards the half-classified bucket: were only the frequency
+        sentinel repaired, this note would still fail to serialise.
+        """
+        _seed_fragments(
+            vault_path,
+            [
+                _make_fragment(
+                    frag_id="mp1",
+                    created=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+                    mode=Mode.INHABIT,
+                    frequency=Frequency.F6,
+                    phase=Phase.UNCLASSIFIED,
+                ),
+            ],
+        )
+
+        written = ModeProfileGenerator().generate_mode_profiles(vault_path)
+
+        post = frontmatter.load(str(written[0]))
+        assert post["dominant_frequency"] == Frequency.F6.value
+        assert post["dominant_phase"] == Phase.UNCLASSIFIED.value
+
+
+class TestUnclassifiedSentinelIsPlainStr:
+    """Every dominant-value fallback must be YAML-representable (#940).
+
+    ``Frequency``/``Mode``/``Phase`` are ``StrEnum`` subclasses, so a
+    member satisfies a ``str`` annotation, compares equal to its value,
+    and passes mypy — yet PyYAML's ``SafeDumper`` has no representer for
+    it and raises ``RepresenterError`` on dump. These tests pin the
+    class of bug rather than the single instance of it.
+    """
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        [
+            Frequency.UNCLASSIFIED,
+            Mode.UNCLASSIFIED,
+            Phase.UNCLASSIFIED,
+            Dosage.UNCLASSIFIED,
+            Frequency.UNCLASSIFIED.value,
+            "unclassified",
+        ],
+        ids=[
+            "frequency-member",
+            "mode-member",
+            "phase-member",
+            "dosage-member",
+            "frequency-value",
+            "bare-string",
+        ],
+    )
+    def test_fallback_returns_exact_str(self, sentinel: str) -> None:
+        """The no-classified-values fallback returns an exact ``str``.
+
+        ``type(...) is str`` rather than ``isinstance`` on purpose: a
+        ``StrEnum`` member passes ``isinstance(x, str)``, so only an
+        exact type check catches the leak.
+        """
+        result = _most_common_classified([], sentinel)
+
+        assert type(result) is str
+        assert result == "unclassified"
+
+    def test_fallback_result_is_yaml_representable(self) -> None:
+        """The fallback value survives a frontmatter round trip."""
+        result = _most_common_classified(
+            [Phase.UNCLASSIFIED.value],
+            Phase.UNCLASSIFIED,
+        )
+
+        dumped = frontmatter.dumps(frontmatter.Post(content="", phase=result))
+
+        assert frontmatter.loads(dumped)["phase"] == Phase.UNCLASSIFIED.value
