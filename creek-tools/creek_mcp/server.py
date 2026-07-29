@@ -65,7 +65,9 @@ if TYPE_CHECKING:
     from mcp.server.auth.provider import AccessToken, TokenVerifier
     from mcp.types import ContentBlock
 
+    from creek.compile.engine import CompileLLM
     from creek.models import PrivacyTier
+    from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
 
 SERVER_NAME = "creek-tools-mcp"
@@ -174,17 +176,45 @@ def _build_draft_llm() -> Callable[[str], str]:
     return classifier.invoke_prompt
 
 
-def _build_compile_llm() -> Callable[[str], str]:
-    """Return the compile-side LLM callable, mirroring ``creek compile``.
+def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
+    """Return the compile-side LLM callable, routed for *tier* (#928/#929).
 
-    Lazy import so the server still boots when the LLM provider is not
-    configured; only ``creek.compile`` then fails. Calls into the CLI's
-    private factory rather than re-deriving the configuration so the
-    behaviour stays in lock-step with ``creek compile``.
+    Mirrors :func:`_build_reflect_llm_factory`'s inner factory: the
+    ``generation`` stage is resolved through the config's
+    :class:`~creek.classify.llm.router.ModelRouter`, so an INTIMATE compile is
+    forced onto the local ``default`` model — or the router raises
+    ``IntimateRoutingError`` rather than egressing the source titles the
+    compile prompt carries. Nothing here re-checks the tier or picks a
+    provider: ``compile_tool`` derives the routing tier and this hands it to
+    the one chokepoint that owns the decision.
+
+    Lazy imports keep the server bootable with no provider configured — only a
+    ``creek.compile`` call then fails, and it fails as a structured refusal.
+
+    Args:
+        tier: The routing tier ``compile_tool`` computed from the caller's
+            ceiling and the source fragments' own classifications.
+
+    Returns:
+        A prompt → completion-text callable bound to the resolved provider.
+
+    Raises:
+        RuntimeError: When the resolved provider is unavailable, or — as
+            :class:`~creek.classify.llm.router.IntimateRoutingError`, a
+            subclass — when intimate content has no local backend to fall
+            back to. ``compile_tool`` turns either into a refusal.
     """
-    from creek.compile.engine import _default_llm as _engine_default_llm
+    from creek.classify.llm.providers import build_provider
 
-    return _engine_default_llm(load_config().llm)
+    cfg = load_config().model_router.resolve("generation", tier)
+    provider = build_provider(cfg)
+    if not provider.available:
+        msg = (
+            "LLM provider unavailable for compile. "
+            "Check Ollama or ANTHROPIC_API_KEY configuration."
+        )
+        raise RuntimeError(msg)
+    return lambda prompt: provider.complete(prompt).text
 
 
 def _build_reflect_llm_factory() -> _LLMFactory:
@@ -219,7 +249,7 @@ def build_server(
     *,
     vault_path: Path | None = None,
     draft_llm_factory: Callable[[], Callable[[str], str]] | None = None,
-    compile_llm_factory: Callable[[], Callable[[str], str]] | None = None,
+    compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     token_verifier: TokenVerifier | None = None,
 ) -> FastMCP:
@@ -232,9 +262,10 @@ def build_server(
         draft_llm_factory: Optional factory for the draft LLM. The
             factory is invoked lazily so only ``creek.draft`` needs an
             LLM provider.
-        compile_llm_factory: Optional factory for the compile LLM.
-            Invoked lazily so only ``creek.compile`` needs an LLM
-            provider.
+        compile_llm_factory: Optional tier-keyed factory for the compile
+            LLM — ``factory(tier)``. Passed straight to ``creek.compile``,
+            which invokes it lazily (and only after its source-tier gate),
+            so only ``creek.compile`` needs an LLM provider.
         reflect_llm_factory: Optional thunk returning the tier-keyed LLM
             factory for ``creek.reflect``. Invoked lazily per call so only
             ``creek.reflect`` needs an LLM provider.

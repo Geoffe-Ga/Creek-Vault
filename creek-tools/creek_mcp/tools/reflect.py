@@ -61,6 +61,7 @@ from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
     TierCeiling,
     refusal_response,
+    routing_tier,
     tier_allowed,
     to_privacy_override,
 )
@@ -91,30 +92,6 @@ class _LLMFactory(Protocol):
         """Return an LLM callable routed for *tier* (may raise to refuse)."""
 
 
-# ``ALL`` admits intimate content, so a reflection under it must route as INTIMATE.
-_CEILING_ROUTING_TIER: dict[TierCeiling, PrivacyTier] = {
-    TierCeiling.OPEN: PrivacyTier.OPEN,
-    TierCeiling.PERSONAL: PrivacyTier.PERSONAL,
-    TierCeiling.INTIMATE: PrivacyTier.INTIMATE,
-    TierCeiling.ALL: PrivacyTier.INTIMATE,
-}
-
-# Sensitivity rank for picking the more-restrictive of two tiers (mirrors the
-# canonical ranking in :mod:`creek_mcp.tier_ceiling`): open/unclassified < personal
-# < intimate. An unranked value is treated as the most sensitive (fail closed).
-_TIER_SENSITIVITY: dict[PrivacyTier, int] = {
-    PrivacyTier.OPEN: 0,
-    PrivacyTier.UNCLASSIFIED: 0,
-    PrivacyTier.PERSONAL: 1,
-    PrivacyTier.INTIMATE: 2,
-}
-
-
-def _sensitivity(tier: PrivacyTier) -> int:
-    """Return the routing sensitivity of *tier*, defaulting to the most restrictive."""
-    return _TIER_SENSITIVITY.get(tier, _TIER_SENSITIVITY[PrivacyTier.INTIMATE])
-
-
 def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> PrivacyTier:
     """Pick the routing tier — never below the entry's *actual* classification.
 
@@ -138,11 +115,13 @@ def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> Priva
     has no *entry_tier*) against the ceiling. It stays in place as defense in
     depth — the load-bearing INTIMATE-never-egresses guarantee — and must not be
     removed.
+
+    The reconciliation itself lives in
+    :func:`creek_mcp.tier_ceiling.routing_tier`, shared with ``creek.compile``
+    (#928); this wrapper keeps the reflect-specific reasoning above attached to
+    the call site that depends on it.
     """
-    ceiling_tier = _CEILING_ROUTING_TIER.get(ceiling, PrivacyTier.INTIMATE)
-    if entry_tier is None:
-        return ceiling_tier
-    return max(ceiling_tier, entry_tier, key=_sensitivity)
+    return routing_tier(ceiling, entry_tier)
 
 
 def _above_ceiling(entry_tier: PrivacyTier | None, ceiling: TierCeiling) -> bool:
