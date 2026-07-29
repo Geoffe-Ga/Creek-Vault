@@ -25,6 +25,19 @@ the package is already in the graph without declaring a dependency we
 never import (precedent: creek-tools' pyjwt>=2.13.0 constraint,
 DEP-003).
 
+``aiohttp`` (issue #978): aiohttp 3.13.5 carries eleven published
+advisories — PYSEC-2026-237 and PYSEC-2026-2104 through
+PYSEC-2026-2113, aliased to CVE-2026-34993, CVE-2026-47265,
+CVE-2026-50269, and CVE-2026-54273 through CVE-2026-54280. aiohttp is
+transitive-only via discord.py, which uses it as the REST client for
+every Discord call — including the user-supplied attachment downloads
+``crawdad.attachments`` performs — and as the gateway websocket
+client, so the surface is reachable rather than theoretical. All
+eleven are fixed in 3.14.1; 3.14.0 fixes only three of them.
+discord.py 2.7.1 declares ``aiohttp<4,>=3.7.4``, so nothing about
+discord.py changes, and the floor lives in
+``[tool.uv].constraint-dependencies`` alongside pyasn1.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
@@ -55,6 +68,10 @@ _PATCHED_VERSION = Version("1.28.1")
 #: First pyasn1 release containing the fixes for CVE-2026-59885 and
 #: CVE-2026-59886.
 _PYASN1_PATCHED_VERSION = Version("0.6.4")
+
+#: First aiohttp release with all eleven advisories fixed; 3.14.0
+#: fixed only PYSEC-2026-2104, PYSEC-2026-2105, and PYSEC-2026-2106.
+_AIOHTTP_PATCHED_VERSION = Version("3.14.1")
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -119,6 +136,47 @@ def _locked_pyasn1_version() -> Version:
         if package["name"] == "pyasn1":
             return Version(str(package["version"]))
     pytest.fail("pyasn1 has no [[package]] entry in uv.lock")
+
+
+def _aiohttp_constraint_specifier() -> SpecifierSet:
+    """Return the ``aiohttp`` specifier from uv constraint-dependencies.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``aiohttp`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``aiohttp`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "aiohttp":
+            return requirement.specifier
+    pytest.fail(
+        "aiohttp has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_aiohttp_version() -> Version:
+    """Return the resolved ``aiohttp`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``aiohttp`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``aiohttp`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "aiohttp":
+            return Version(str(package["version"]))
+    pytest.fail("aiohttp has no [[package]] entry in uv.lock")
 
 
 def test_mcp_floor_rejects_last_vulnerable_range() -> None:
@@ -213,4 +271,51 @@ def test_locked_pyasn1_at_or_above_patched_release() -> None:
         f"{_PYASN1_PATCHED_VERSION} (CVE-2026-59885 / CVE-2026-59886); "
         "pip-audit inspects the lock, so relock after adding the "
         "constraint"
+    )
+
+
+def test_aiohttp_floor_rejects_vulnerable_releases() -> None:
+    """The constraint excludes 3.13.5 and the partial-fix 3.14.0.
+
+    aiohttp 3.13.5 carries all eleven advisories. 3.14.0 clears only
+    three of them, so stopping the floor at ``>=3.14.0`` would still
+    ship a reachable-through-discord.py vulnerability; the floor has to
+    be ``>=3.14.1``, the first release OSV reports as clean.
+    """
+    specifier = _aiohttp_constraint_specifier()
+    assert "3.13.5" not in specifier, (
+        f"aiohttp constraint {specifier!r} admits 3.13.5, the release "
+        "carrying PYSEC-2026-237 and PYSEC-2026-2104 through -2113; the "
+        "floor must be >=3.14.1"
+    )
+    assert "3.14.0" not in specifier, (
+        f"aiohttp constraint {specifier!r} admits 3.14.0, which still "
+        "carries eight of the eleven advisories (PYSEC-2026-237 and "
+        "PYSEC-2026-2107 through -2113); the floor must be >=3.14.1, "
+        "not >=3.14.0"
+    )
+
+
+def test_aiohttp_floor_accepts_patched_release() -> None:
+    """The constraint accepts 3.14.1, the first fully patched release."""
+    specifier = _aiohttp_constraint_specifier()
+    assert "3.14.1" in specifier, (
+        f"aiohttp constraint {specifier!r} rejects 3.14.1; the patched "
+        "release itself must satisfy the constraint"
+    )
+
+
+def test_locked_aiohttp_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves aiohttp to >= 3.14.1.
+
+    The lockfile is what ``uv sync`` installs and what pip-audit
+    inspects; a correct constraint floor with a stale lock still ships
+    the vulnerable 3.13.5.
+    """
+    locked = _locked_aiohttp_version()
+    assert locked >= _AIOHTTP_PATCHED_VERSION, (
+        f"uv.lock pins aiohttp {locked}, below the patched "
+        f"{_AIOHTTP_PATCHED_VERSION} (PYSEC-2026-237 and PYSEC-2026-2104 "
+        "through -2113); pip-audit inspects the lock, so relock after "
+        "adding the constraint"
     )
