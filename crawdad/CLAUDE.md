@@ -22,6 +22,9 @@ These mirror `creek-tools/CLAUDE.md` at a smaller scale:
    - MyPy strict mode, zero violations
    - Ruff lint + format, zero violations
    - Bandit, zero medium-or-above findings
+   - pip-audit, zero known vulnerabilities across both the installed
+     environment and the exported `uv.lock` — no suppression without
+     a tracked issue
 
 ## 2. Project overview
 
@@ -145,3 +148,22 @@ The bot does **not** exit on MCP subprocess failure. The pattern is:
 | Type checking | strict, zero | `mypy --strict` |
 | Lint + format | zero | `ruff check` + `ruff format` |
 | Security | zero medium+ | `bandit -r crawdad/ -ll` |
+| Dependency vulnerabilities | zero known | `pip-audit` (installed env + exported `uv.lock` — `./scripts/security.sh`) |
+
+`scripts/security.sh` runs `pip-audit` twice because crawdad has two
+distinct dependency surfaces and each answers a different question.
+CI provisions with `pip install -e ".[dev]"`, and pip honours neither
+`uv.lock` nor `[tool.uv].constraint-dependencies` — both are invisible
+to it — so a bare `pip-audit` audits only what CI actually imports.
+The second run exports `uv.lock` (`uv export --quiet --locked
+--all-extras --no-emit-project`) and audits that instead, since
+`uv.lock` is the reproducibility contract `uv sync` users install and
+is where all eight advisories of #979 lived; an environment-only audit
+would have reported clean while the lock carried eight. `--locked`
+doubles as a lock-freshness gate — if `pyproject.toml` and `uv.lock`
+have drifted, the export fails with "The lockfile at `uv.lock` needs
+to be updated" and the fix is `uv lock`, never dropping `--locked`.
+Do not add `--strict` to either `pip-audit` call: the local `crawdad`
+package isn't published to PyPI, so pip-audit always reports it as a
+benign SKIP, and `--strict` would turn that permanent skip into a
+permanent false failure.
