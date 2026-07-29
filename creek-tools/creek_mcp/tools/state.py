@@ -29,6 +29,19 @@ def state_render_tool(
 
     The rendered file lives under ``00-Creek-Meta/State/<iso-week>.md``;
     ``latest.md`` is refreshed atomically by the underlying generator.
+
+    Walks the whole vault through ``StateReportGenerator``, which accepts
+    no privacy override, and returns the rendered content — the ceiling
+    is audited and echoed but never threaded into the walk (#969). Its
+    one fragment-derived section, ``section_suggested_questions``, is
+    safe by default: it calls ``phase_filtered_seeds`` with
+    ``override=None``, which ``filter_fragments_by_tier`` treats as
+    equivalent to ``open`` — intimate dropped, personal bodies
+    summarised. The eddy/thread/liminal *title* sections are unfiltered,
+    and unfilterable today: ``Eddy`` and ``Thread`` in ``creek/models.py``
+    carry no ``privacy_tier`` field at all. Tracked together with
+    ``creek.state.read`` under #969, because the fix is one design —
+    tier-stamped state artifacts — spanning both sides.
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,

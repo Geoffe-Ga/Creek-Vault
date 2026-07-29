@@ -90,7 +90,12 @@ _EXPECTED_PRIMITIVES = frozenset({"refuse_above_ceiling", "iter_admitted_fragmen
 
 _PINNED_GATE_ROWS = [
     ("creek.reflect", "creek_mcp.tools.reflect", "_above_ceiling"),
-    ("creek.compile", "creek_mcp.tools.compile", "_sources_above_ceiling"),
+    # NB: issue #932's "prior art" section names ``_sources_above_ceiling``.
+    # No such symbol exists — ``creek_mcp/tools/compile.py`` defines
+    # ``_survey_sources``, which returns a ``_SourceGate`` the caller branches
+    # on. Pinned to the real name; the wrong one would have made layer (c) a
+    # permanent, uninformative failure.
+    ("creek.compile", "creek_mcp.tools.compile", "_survey_sources"),
     ("creek.wheel", "creek_mcp.tools.wheel", "to_privacy_override"),
     ("creek.mine", "creek_mcp.tools.mine", "to_privacy_override"),
     ("creek.draft", "creek_mcp.tools.draft", "to_privacy_override"),

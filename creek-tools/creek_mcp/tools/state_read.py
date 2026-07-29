@@ -26,12 +26,16 @@ def state_read_tool(
 ) -> dict[str, Any]:
     """Return the latest audit-report bytes plus tool metadata.
 
-    The audit report aggregates eddy/thread/synchronicity *titles* —
-    it never embeds fragment bodies — so the tier-ceiling enforcement
-    here is the gate on whether the report itself can be returned at
-    all, not a body-level filter. A missing report yields a structured
-    "no report yet" status rather than a crash so a fresh vault stays
-    usable.
+    Returns ``00-Creek-Meta/State/latest.md`` verbatim at *any* ceiling:
+    the ceiling is audited and echoed here, never consulted (#969). The
+    artifact records no ceiling of its own, so it may have been rendered
+    by a caller at ``ceiling=all`` (or by the CLI with
+    ``--include-tier all``) and then be read back at ``open`` — a
+    cross-ceiling cache, not a body-level filter. What the audit report
+    does still bound is scope, not tier: it aggregates
+    eddy/thread/synchronicity *titles* and counts, never fragment
+    bodies. A missing report yields a structured "no report yet" status
+    rather than a crash so a fresh vault stays usable.
     """
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
