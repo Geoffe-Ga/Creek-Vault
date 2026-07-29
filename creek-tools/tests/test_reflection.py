@@ -554,3 +554,249 @@ def test_conductor_escalates_on_exhaustion(tmp_path: Path) -> None:
 
     assert draft.rounds == 2
     assert draft.verdict == "ESCALATE"
+
+
+def test_privacy_leak_flags_when_protected_body_ends_with_period(
+    tmp_path: Path,
+) -> None:
+    """A leak whose protected body ends in a period must still flag (#939).
+
+    The verbatim matcher wraps the escaped snippet in unconditional word-boundary
+    anchors. A trailing anchor can never assert after a period, so an exact,
+    word-for-word disclosure of an INTIMATE fragment passes the HARD privacy
+    gate in silence.
+    """
+    secret = "I cheated on my partner last spring."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "Here is the leak: I cheated on my partner last spring. That is all."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_leak_flags_when_protected_body_starts_with_a_quote(
+    tmp_path: Path,
+) -> None:
+    """A leak whose protected body opens on a quote mark must still flag (#939).
+
+    A leading word-boundary anchor cannot assert when the protected snippet's
+    first character is punctuation and the draft precedes it with a space, so a
+    quoted INTIMATE passage is reproduced verbatim with no privacy finding.
+    """
+    secret = '"I never told anyone what really happened'
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = 'She wrote: "I never told anyone what really happened in her diary.'
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_leak_flags_when_protected_body_is_punctuated_on_both_edges(
+    tmp_path: Path,
+) -> None:
+    """A leak punctuated on both edges must still flag (#939).
+
+    Both word-boundary anchors fail at once here, and a fully quoted sentence is
+    the most common real shape for a confession, so the HARD gate is completely
+    blind to an exact reproduction of the INTIMATE fragment.
+    """
+    secret = '"I lied to my therapist repeatedly."'
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = 'The note read: "I lied to my therapist repeatedly." Yikes.'
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_leak_flags_when_leading_punctuation_abuts_a_word_character(
+    tmp_path: Path,
+) -> None:
+    """A leak opening on an em dash glued to a word must keep flagging (#939).
+
+    Regression guard against the naive repair: the leading/trailing boundary
+    assertion must be dropped when the protected snippet's own edge character is
+    punctuation, otherwise this leak regresses (#939). Swapping the anchors for
+    unconditional lookarounds would fail here because the em dash abuts a word
+    character in the draft. Un-spaced em dashes are ordinary prose, so this is a
+    real disclosure path, not a synthetic one.
+    """
+    secret = "—the affair nobody knows about"  # leading em dash, U+2014
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "He said—the affair nobody knows about, quietly."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_leak_flags_when_trailing_punctuation_abuts_a_word_character(
+    tmp_path: Path,
+) -> None:
+    """A leak ending on a period glued to the next word must keep flagging (#939).
+
+    Regression guard against the naive repair: the leading/trailing boundary
+    assertion must be dropped when the protected snippet's own edge character is
+    punctuation, otherwise this leak regresses (#939). An unconditional trailing
+    lookahead would reject this match because the sentence-final period runs
+    straight into the following word.
+    """
+    secret = "I told a lie about the money."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "It reads I told a lie about the money.Then it stops."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_punctuated_secret_glued_inside_a_word_does_not_flag(
+    tmp_path: Path,
+) -> None:
+    """A punctuated secret glued onto a word at its word-char edge does not flag.
+
+    The snippet's first character is a word character, so that edge keeps its
+    boundary assertion even once the trailing one is dropped: the phrase is not
+    bounded here and must stay unflagged both before and after the fix (#939).
+    """
+    secret = "I cheated on my partner last spring."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "xI cheated on my partner last spring."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_paraphrase_of_punctuated_secret_does_not_flag(tmp_path: Path) -> None:
+    """A paraphrase of a punctuated INTIMATE secret raises no privacy finding.
+
+    Loosening the boundary assertions must not turn the deterministic verbatim
+    check into a fuzzy one. Paraphrase is out of deterministic scope and belongs
+    to the semantic judge (#474); it stays that way under #939.
+    """
+    secret = "I cheated on my partner last spring."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "He was unfaithful to his partner sometime in the spring."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_short_punctuated_secret_does_not_flag(tmp_path: Path) -> None:
+    """A sub-threshold punctuated secret stays unflagged.
+
+    The four-word short-circuit still fires first, so loosening the boundaries
+    does not widen the HARD gate for short, generic snippets that can co-occur
+    with innocuous prose by coincidence (#939).
+    """
+    secret = "I cheated badly."  # 3 words — below _MIN_PROTECTED_LEAK_WORDS
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "The confession was blunt: I cheated badly. Nothing more."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_open_tier_punctuated_body_does_not_flag(tmp_path: Path) -> None:
+    """An OPEN cited fragment quoted verbatim raises no privacy finding.
+
+    The tier-rank guard runs before the verbatim matcher, so a fragment sitting
+    at the contract's own ceiling is not over-tier and the loosened boundaries
+    cannot turn ordinary quotation of publishable material into a leak (#939).
+    """
+    secret = "I published this openly last spring."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.OPEN)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "Here it is: I published this openly last spring."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_punctuation_led_secret_glued_at_its_word_tail_does_not_flag(
+    tmp_path: Path,
+) -> None:
+    """A punctuation-led secret glued onto a word at its tail does not flag.
+
+    Isolates the trailing boundary assertion (#939): the snippet opens on a
+    quote, so the leading assertion is dropped and cannot mask the result. Its
+    last character is a word character, so that edge must keep its assertion
+    and refuse a match that runs straight into the next word.
+    """
+    secret = '"I never told anyone what really happened'
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = 'She wrote: "I never told anyone what really happenedX'
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    assert not any(f.dimension == "privacy_compliance" for f in result.findings)
+
+
+def test_privacy_punctuated_leak_finding_is_high_and_names_the_fragment(
+    tmp_path: Path,
+) -> None:
+    """The punctuation-edged leak finding keeps HIGH severity and full detail.
+
+    Pins the payload of the finding this fix restores (#939) so a downgrade of
+    the HARD privacy gate's severity, or a message that stops naming the
+    offending fragment and its tier, cannot pass silently.
+    """
+    secret = "I cheated on my partner last spring."
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+    body = "Here is the leak: I cheated on my partner last spring. That is all."
+
+    result = ReflectionNode().review(body, evidence, contract=contract, vault=tmp_path)
+
+    finding = next(f for f in result.findings if f.dimension == "privacy_compliance")
+    assert finding.severity == "HIGH"
+    assert "frag-a" in finding.message
+    assert "intimate" in finding.message
