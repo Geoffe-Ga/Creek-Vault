@@ -405,9 +405,10 @@ All code must meet these standards before merging to main:
 
 #### Linting and Formatting
 - **Ruff**: lint + format, configured in `pyproject.toml` (no `|| true`).
-- **Pylint**: ≥9.0 (`pylint creek/ --fail-under=9.0`, in CI and
-  `lint-extended.sh`; CI-002).
-- **Bandit**: zero medium-or-above findings (`bandit -r creek/ -ll`).
+- **Pylint**: ≥9.0 (`pylint creek/ creek_mcp/ --fail-under=9.0`, in CI
+  and `lint-extended.sh`; CI-002).
+- **Bandit**: zero medium-or-above findings
+  (`bandit -r creek/ creek_mcp/ -ll`).
 - **pip-audit**: zero vulnerabilities except documented unfixable
   CVEs in `scripts/security.sh` and `.github/workflows/ci.yml`
   (DEP-003).

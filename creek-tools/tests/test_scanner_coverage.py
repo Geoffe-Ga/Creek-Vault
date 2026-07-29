@@ -10,8 +10,10 @@ contract that keeps every one of those invocations widened.
 
 They also carry anti-weakening guards: the widened scan must not be made to
 pass by trading away Bandit's ``-ll`` severity threshold, Pylint's
-``--fail-under`` score threshold, or by re-excluding ``creek_mcp`` from
-``pyproject.toml``'s Bandit/MyPy configuration.
+``--fail-under`` score threshold, by re-excluding ``creek_mcp`` from
+``pyproject.toml``'s Bandit/MyPy configuration, or by naming ``creek_mcp``
+as a target and then carving it back out with an ``--exclude`` /
+``--ignore-paths`` flag on the same command line.
 
 Command lines are read with shell and YAML comments stripped first. Several
 of these files quote the very command they invoke inside an explanatory
@@ -23,6 +25,7 @@ against the command that actually runs.
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,16 @@ _CREEK_MCP_TARGET = re.compile(r"\bcreek_mcp\b")
 # threshold is not.
 _FAIL_UNDER_DEFAULT = re.compile(
     r'FAIL_UNDER="\$\{PYLINT_FAIL_UNDER:-([0-9]+(?:\.[0-9]+)?)\}"'
+)
+
+# Flags that carve a path back out of an already-widened target list, as
+# spelled by mypy (``--exclude``), pylint (``--ignore``/``--ignore-paths``/
+# ``--ignore-patterns``) and bandit (``-x``/``--exclude``). Naming
+# ``creek_mcp`` on the command line is necessary but not sufficient: an
+# ``--exclude 'creek_mcp/remote_auth\.py'`` would satisfy every
+# word-presence probe above while switching the scan back off.
+_EXCLUSION_FLAGS = frozenset(
+    {"--exclude", "-x", "--ignore", "--ignore-paths", "--ignore-patterns"}
 )
 
 # MyPy settings that would silently switch checking back off for a module.
@@ -77,6 +90,37 @@ def _command_lines(script: Path, pattern: str) -> list[str]:
     """Return non-comment lines of ``script`` matching ``pattern``."""
     regex = re.compile(pattern)
     return [line.strip() for line in _non_comment_lines(script) if regex.search(line)]
+
+
+def _exclusion_values(command: str) -> list[str]:
+    """Return every value passed to a path-exclusion flag in ``command``.
+
+    Handles both ``--exclude value`` and ``--exclude=value`` spellings. A
+    trailing shell line-continuation backslash is stripped first so
+    :func:`shlex.split` does not choke on a dangling escape.
+    """
+    values: list[str] = []
+    tokens = shlex.split(command.rstrip().rstrip("\\"))
+    for index, token in enumerate(tokens):
+        flag, separator, inline = token.partition("=")
+        if flag not in _EXCLUSION_FLAGS:
+            continue
+        if separator:
+            values.append(inline)
+        elif index + 1 < len(tokens):
+            values.append(tokens[index + 1])
+    return values
+
+
+def _all_scanner_invocations() -> list[str]:
+    """Return every gating mypy/bandit/pylint command line under test."""
+    return [
+        *_command_lines(SCRIPTS_DIR / "typecheck.sh", r"python -m mypy"),
+        *_command_lines(SCRIPTS_DIR / "security.sh", r"bandit -r"),
+        *_command_lines(SCRIPTS_DIR / "pylint.sh", r"python -m pylint"),
+        *_command_lines(SCRIPTS_DIR / "lint-extended.sh", r"^\s*pylint\s"),
+        *_ci_bandit_run_lines(),
+    ]
 
 
 def _assert_targets_both_packages(lines: list[str], source: str) -> None:
@@ -217,8 +261,7 @@ def test_pre_commit_pylint_hook_matches_creek_mcp_files() -> None:
     """The pylint-fast hook's `files` regex must select creek_mcp/ sources."""
     pattern = _pylint_fast_files_regex()
     assert pattern.search("creek-tools/creek_mcp/server.py"), (
-        f"pylint-fast `files` regex {pattern.pattern!r} skips creek_mcp/ "
-        "(issue #925)"
+        f"pylint-fast `files` regex {pattern.pattern!r} skips creek_mcp/ (issue #925)"
     )
 
 
@@ -278,6 +321,28 @@ def test_pylint_gate_keeps_fail_under_threshold() -> None:
     assert float(match.group(1)) >= 9.0, (
         f"pylint --fail-under default dropped below 9.0: {match.group(1)}"
     )
+
+
+def test_scanner_targets_are_not_carved_back_out_by_exclusions() -> None:
+    """Naming creek_mcp must not be undone by an --exclude/--ignore flag.
+
+    Every other assertion here only checks that ``creek_mcp`` appears
+    somewhere on the command line, which a re-narrowing edit such as
+    ``mypy creek/ creek_mcp/ --exclude 'creek_mcp/remote_auth\\.py'`` would
+    still satisfy -- the excluded path contains the word too. This closes
+    that loophole for all three scanners at once.
+    """
+    invocations = _all_scanner_invocations()
+    assert len(invocations) >= 6, (
+        f"expected every scanner invocation to be collected, got {invocations!r}"
+    )
+    for command in invocations:
+        offenders = [
+            value for value in _exclusion_values(command) if "creek_mcp" in value
+        ]
+        assert not offenders, (
+            f"invocation excludes part of creek_mcp again: {offenders!r} in {command!r}"
+        )
 
 
 def test_pyproject_bandit_config_does_not_exclude_creek_mcp() -> None:

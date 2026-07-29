@@ -82,9 +82,9 @@ jobs:
         run: ruff format --check .
 
       - name: Run Pylint (CI-002)
-        # ./scripts/pylint.sh runs `python -m pylint creek/` with the
-        # configured --fail-under threshold and optionally writes a JSON
-        # snapshot. Same script the local check-all.sh runs, so a
+        # ./scripts/pylint.sh runs `python -m pylint creek/ creek_mcp/`
+        # with the configured --fail-under threshold and optionally writes
+        # a JSON snapshot. Same script the local check-all.sh runs, so a
         # developer who passes locally cannot fail this gate (CI-004).
         env:
           PYLINT_FAIL_UNDER: ${{ env.PYLINT_FAIL_UNDER }}
@@ -92,7 +92,7 @@ jobs:
 
       - name: Run MyPy type checking (CI-001)
         # Project-wide strict mode is configured in pyproject.toml; the
-        # script runs `mypy creek/` so local and CI agree.
+        # script runs `mypy creek/ creek_mcp/` so local and CI agree.
         run: ./scripts/typecheck.sh
 
       - name: Run Refurb (STYLE-001 modernisation gate)
@@ -114,11 +114,16 @@ jobs:
       - name: Run Bandit security scan
         # The first invocation only produces the JSON artifact and is
         # intentionally non-gating (`|| true`). The SECOND invocation
-        # is the real gate: `bandit -r creek/ -ll` exits non-zero on
-        # any medium-or-above finding, with no escape hatch.
+        # is the real gate: `bandit -r creek/ creek_mcp/ -ll` exits
+        # non-zero on any medium-or-above finding, with no escape hatch.
+        #
+        # This step inlines bandit rather than calling
+        # creek-tools/scripts/security.sh, so the target list here must be
+        # kept in sync with that script by hand (issue #925 added
+        # creek_mcp/ to both).
         run: |
-          bandit -r creek/ -f json -o reports/bandit-report.json || true
-          bandit -r creek/ -ll
+          bandit -r creek/ creek_mcp/ -f json -o reports/bandit-report.json || true
+          bandit -r creek/ creek_mcp/ -ll
 
       - name: Run pip-audit dependency check
         # Documented CVE in build/install tooling. Excluded with a

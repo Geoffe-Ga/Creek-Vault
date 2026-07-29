@@ -62,15 +62,20 @@ echo "=== Security Checks (Bandit) ==="
 
 # Run Bandit.
 #
-# Severity threshold ``-ll`` (medium-or-above) matches both
-# .github/workflows/ci.yml and the CLAUDE.md §6.1 policy
-# ("Bandit: zero medium-or-above findings"). Aligning local with CI
-# closes the GAP-007 parity gap — a clean ``check-all.sh`` pass means
-# CI agrees on the same severity scope.
+# Both the target list and the severity threshold ``-ll``
+# (medium-or-above) match .github/workflows/ci.yml, and the threshold
+# also matches the CLAUDE.md §6.1 policy ("Bandit: zero medium-or-above
+# findings"). Aligning local with CI closes the GAP-007 parity gap — a
+# clean ``check-all.sh`` pass means CI agrees on the same scope.
+#
+# The targets cover creek_mcp/ (MCP server, auth, token policy, path
+# confinement) as well as creek/ since issue #925. CI does NOT call this
+# script — it inlines its own bandit step — so the two target lists must
+# be kept in sync by hand.
 if $VERBOSE; then
     echo "Running Bandit security scanner (medium-or-above)..."
 fi
-bandit -r creek/ -ll || { echo "✗ Bandit found issues" >&2; exit 1; }
+bandit -r creek/ creek_mcp/ -ll || { echo "✗ Bandit found issues" >&2; exit 1; }
 
 echo "=== Dependency Vulnerability Check (pip-audit) ==="
 
