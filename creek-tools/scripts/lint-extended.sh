@@ -72,8 +72,12 @@ run_or_skip() {
 
 echo "=== Extended Lint Suite ==="
 
+# Only pylint targets creek_mcp/ so far (issue #925). refurb,
+# tryceratops, vulture and interrogate stay on creek/ until their
+# creek_mcp backlog is groomed — widening them here would fail this
+# suite on findings nobody has triaged yet.
 run_or_skip "pylint"      pylint        \
-    pylint creek/ --fail-under="$PYLINT_FAIL_UNDER"
+    pylint creek/ creek_mcp/ --fail-under="$PYLINT_FAIL_UNDER"
 run_or_skip "refurb"      refurb        \
     refurb creek/
 run_or_skip "tryceratops" tryceratops   \

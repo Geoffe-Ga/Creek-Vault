@@ -166,7 +166,13 @@ def _build_draft_llm() -> Callable[[str], str]:
     from creek.classify.llm import LLMClassifier
 
     config = load_config()
-    classifier = LLMClassifier(config.llm)
+    # ``config.llm`` is an ``LLMRoutingConfig``; ``LLMClassifier`` declares a
+    # plain ``LLMConfig``. Correcting the type here means choosing a concrete
+    # per-stage model inline — which is precisely the decision
+    # :class:`~creek.classify.llm.router.ModelRouter` owns, and doing it here
+    # would stand up a second provider path with no Intimate-never-cloud gate
+    # on it. Left suppressed until #958 rewires this tool through the router.
+    classifier = LLMClassifier(config.llm)  # type: ignore[arg-type]  # Issue #958
     if not classifier.available:
         msg = (
             "LLM provider unavailable; cannot generate draft. "

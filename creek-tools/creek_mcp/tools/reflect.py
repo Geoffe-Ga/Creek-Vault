@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from creek.classify.privacy_filter import PrivacyTierOverride
+
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "creek.reflect"
@@ -334,7 +336,7 @@ def reflect_tool(
     llm_factory: _LLMFactory,
     content: str | None = None,
     entry_ref: str | None = None,
-    retrieve: Callable[[str, Path, object], list[str]] | None = None,
+    retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None = None,
     care_guard: Callable[[str], str | None] | None = None,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
@@ -474,7 +476,9 @@ def reflect_tool(
     return result
 
 
-def _default_retrieve(query: str, vault_path: Path, override: object) -> list[str]:
+def _default_retrieve(
+    query: str, vault_path: Path, override: PrivacyTierOverride
+) -> list[str]:
     """Production grounding: top corpus fragments related to *query*.
 
     Lazily imports the author retrieval specialist so the server still boots
@@ -485,6 +489,15 @@ def _default_retrieve(query: str, vault_path: Path, override: object) -> list[st
         from creek.author.agents import RetrievalSpecialist
 
         bundle = RetrievalSpecialist().gather(query, vault_path, override=override)
-        return [claim.text for claim in bundle.claims]
+        # ``EvidenceClaim`` carries ``claim``, not ``text``, so this access has
+        # always raised and been swallowed below: production grounding has
+        # never actually run. Renaming the attribute switches it on, and what
+        # it would then feed the prompt is corpus fragment *titles*
+        # (``_fragment_claim`` sets ``claim=fragment.title``) — grounding on
+        # titles rather than bodies is an undecided design question that needs
+        # its own privacy tests. Suppressed rather than "fixed" so bringing
+        # this package under mypy does not quietly turn that egress on; #964
+        # owns the decision.
+        return [claim.text for claim in bundle.claims]  # type: ignore[attr-defined]  # Issue #964
     except Exception:
         return []

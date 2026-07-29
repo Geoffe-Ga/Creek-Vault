@@ -26,7 +26,16 @@ TOOL_NAME = "creek.draft"
 
 
 class _DraftLLM(Protocol):
-    def __call__(self, prompt: str) -> str: ...
+    """A prompt-completion callable returning the draft body."""
+
+    # Positional-only (`/`) to match the canonical
+    # :data:`creek.generate.drafts.DraftLLM` alias, which is a bare
+    # ``Callable[[str], ...]`` and therefore names no parameter;
+    # ``DraftGenerator`` likewise calls ``self._llm(prompt)`` positionally.
+    # Without the `/` this Protocol would demand a keyword every real
+    # implementor is free not to offer — do not drop it.
+    def __call__(self, prompt: str, /) -> str:
+        """Return the completion for *prompt*."""
 
 
 def draft_tool(

@@ -58,7 +58,12 @@ if command -v mypy &> /dev/null; then
     # dependencies installed runs the type checker. This avoids
     # "Cannot find implementation" noise when mypy is installed via
     # pipx/uv into a different site-packages.
-    python -m mypy creek/ || {
+    #
+    # Both first-party packages are checked: creek/ (pipeline + CLI) and
+    # creek_mcp/ (MCP server, auth, token policy, path confinement).
+    # creek_mcp/ was outside the target list until issue #925 — keep the
+    # two of them together here and in .github/workflows/ci.yml.
+    python -m mypy creek/ creek_mcp/ || {
         echo "✗ Type checking failed" >&2
         exit 1
     }

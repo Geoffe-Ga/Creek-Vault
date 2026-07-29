@@ -66,7 +66,11 @@ echo "=== Pylint (--fail-under=$FAIL_UNDER) ==="
 # Gating run. Run via `python -m pylint` so the same interpreter that
 # has the project deps installed runs the linter — same hygiene
 # applied to typecheck.sh and test.sh.
-python -m pylint creek/ --output-format=colorized --fail-under="$FAIL_UNDER"
+#
+# Targets both first-party packages: creek/ (pipeline + CLI) and
+# creek_mcp/ (MCP server, auth, token policy, path confinement), which
+# was outside the target list until issue #925.
+python -m pylint creek/ creek_mcp/ --output-format=colorized --fail-under="$FAIL_UNDER"
 
 # Optional JSON snapshot (informational artifact only). The gating
 # decision was already made by the previous command; if pylint exits
@@ -74,7 +78,8 @@ python -m pylint creek/ --output-format=colorized --fail-under="$FAIL_UNDER"
 # via stderr but not propagated.
 if [[ -n "$JSON_OUTPUT" ]]; then
     mkdir -p "$(dirname "$JSON_OUTPUT")"
-    if ! python -m pylint creek/ --output-format=json > "$JSON_OUTPUT" 2>/dev/null; then
+    if ! python -m pylint creek/ creek_mcp/ --output-format=json \
+        > "$JSON_OUTPUT" 2>/dev/null; then
         echo "  ⚠ pylint JSON snapshot failed; see $JSON_OUTPUT" >&2
     fi
 fi
