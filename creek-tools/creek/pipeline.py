@@ -37,6 +37,7 @@ from creek.audit.yield_summary import (
     format_yield_line,
     write_yield_summary,
 )
+from creek.classify.audience import AudienceClassifier
 from creek.classify.classify_engine import build_tier_classifiers
 from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
@@ -223,6 +224,9 @@ class Pipeline:
         rule_classifier: Keyword-based classifier.
         privacy_classifier: Assigns each fragment's privacy tier before the
             per-tier router reads it (#876).
+        audience_classifier: Stamps the #634 audience axis on every fragment
+            this pipeline classifies (#937), because the classify engine is
+            not the only writer of that axis.
         tier_classifiers: Per-tier LLM classifiers (#666/#706) — the fragment's
             privacy tier selects the provider so Intimate stays local.
         review_generator: Review queue generator for uncertain fragments.
@@ -260,6 +264,12 @@ class Pipeline:
         # so without this the per-tier router below saw "not INTIMATE" for
         # every fragment and shipped journal entries to the cloud.
         self.privacy_classifier = PrivacyClassifier()
+        # Issue #937: the classify engine is not the only writer of the #634
+        # audience axis, and ``creek process`` never calls it — so this entry
+        # point needs its own instance or every fragment it ingests keeps the
+        # model default. Built bare, exactly as the engine builds it: the rules
+        # path needs no provider, which keeps ``process --no-llm`` egress-free.
+        self.audience_classifier = AudienceClassifier()
         # Per-tier routing (#666/#706): each fragment is classified by the
         # provider its privacy tier resolves to — Intimate stays local even when
         # ``classification`` is cloud. Building here is safe with any config:
@@ -525,6 +535,15 @@ class Pipeline:
         router reads that tier to keep Intimate content off cloud
         providers and a freshly-ingested fragment carries none.
 
+        Every fragment is also stamped with the #634 audience axis once the
+        tier is known (#937). ``creek process`` never calls the classify
+        engine, so without this every one-shot-processed fragment keeps
+        ``audience: mixed`` — which the voice fingerprint reads as neutral
+        (``_audience_factor``), so the user's audience-facing writing never
+        earns its weight and their private writing is never discounted. The
+        pass runs after the tier because the score reads it, and it is
+        deterministic and idempotent, so re-processing never churns the axis.
+
         Every fragment is likewise scored for praxis potential once the
         classifiers are done (#877). ``creek process`` never calls the
         classify engine, so without this the one-shot command would leave
@@ -571,6 +590,13 @@ class Pipeline:
                     frag = classifier.classify(frag, content=item.body)
             else:
                 result.deterministic_classified += 1
+            # Issue #937: stamp the #634 audience axis here, after ``apply_tier``
+            # above — the score reads ``privacy_tier``, and a fragment still
+            # ``unclassified`` contributes nothing, so an earlier call would
+            # return a different verdict than ``creek classify`` does. This
+            # placement mirrors the engine's (classify -> audience -> praxis)
+            # so the two entry points agree fragment for fragment.
+            frag = self.audience_classifier.classify_and_enforce(frag, item.body)
             # Issue #877: score the praxis axis last, so the escalate-only
             # merge sees whatever the optional LLM dispatch above produced.
             frag = apply_praxis(frag, item.body)
