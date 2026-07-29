@@ -1375,3 +1375,168 @@ class TestPipelinePraxisPass:
         # The rest of the same response *did* land, so the assertion above
         # cannot be passing because the LLM was never consulted.
         assert on_disk["frag-praxispipe04"]["frequency"]["primary"] == "F3"
+
+
+class TestPipelineAudiencePass:
+    """``creek process`` stamps the ``audience`` axis too (issue #937).
+
+    The #634 audience classifier reached production wired into
+    :mod:`creek.classify.classify_engine` alone. ``creek process`` never
+    calls that engine — it ingests and classifies in one shot — so every
+    fragment that entered a vault through the one-shot command kept the
+    :class:`~creek.models.Fragment` model default ``audience: mixed``,
+    which on disk is indistinguishable from a fragment the classifier
+    genuinely weighed and found ambiguous.
+
+    That default is not inert. The voice fingerprint reads the persisted
+    axis in
+    :func:`creek.generate.ai_style.fingerprint._audience_factor`, which
+    multiplies audience-facing material by ``2.0`` and private material
+    by ``0.1``. ``mixed`` is neither, so a process-built vault weighs a
+    published essay and a 3 a.m. journal entry at exactly the same
+    authority: the fingerprint learns the average instead of the voice.
+    Nothing raises and nothing is logged, which is how this same
+    wired-into-one-caller defect got through twice before — #876 (privacy
+    tiers) and #877 (praxis potential).
+    """
+
+    @staticmethod
+    def _ingested(
+        frag_id: str,
+        title: str,
+        body: str,
+        platform: str,
+        kind: str = "unclassified",
+    ):
+        """An IngestedFragment whose metadata drives the audience score.
+
+        Args:
+            frag_id: Fragment id (the assertion key).
+            title: Fragment title.
+            body: Markdown body the audience heuristic scans for
+                headings, block quotations and word count.
+            platform: ``SourcePlatform`` value — the heaviest audience
+                signal (essay/Substack positive, journal negative).
+            kind: ``SourceKind`` value; ``writing`` is a further
+                audience-facing vote. Defaults to ``unclassified``.
+
+        Returns:
+            The assembled :class:`~creek.ingest.base.IngestedFragment`.
+        """
+        from creek.ingest.base import IngestedFragment
+        from creek.models import (
+            Authorship,
+            Fragment,
+            FragmentSource,
+            SourceKind,
+            SourcePlatform,
+        )
+
+        fragment = Fragment(
+            id=frag_id,
+            title=title,
+            source=FragmentSource(
+                platform=SourcePlatform(platform),
+                author=Authorship.SELF,
+                kind=SourceKind(kind),
+            ),
+        )
+        return IngestedFragment(fragment=fragment, body=body)
+
+    def test_no_llm_run_stamps_the_audience_axis(self, vault_path: Path) -> None:
+        """A published essay and a private blip land on opposite axes.
+
+        ``no_llm=True`` guarantees Pass 3 never runs, so the verdict
+        provably comes from the free, local, deterministic heuristic in
+        :class:`creek.classify.audience.AudienceClassifier` with zero
+        egress — the point of #634 being a rules axis with an *optional*
+        LLM seam rather than one more mandatory model call.
+
+        Two fragments with two *distinct* expected outcomes, so an
+        implementation that stamps a single value over everything cannot
+        pass. The expected values follow the classifier's own published
+        weights: the essay sums platform ``+5``, ``kind: writing`` ``+3``,
+        tier ``open`` ``+1`` and heading/blockquote/long-form ``+3`` to
+        ``+12`` (``>= 3`` → ``audience-facing``); the short journal entry
+        sums platform ``-3``, tier ``intimate`` ``-3`` and the
+        under-40-word penalty ``-2`` to ``-8`` (``<= -2`` → ``private``).
+        """
+        pipeline = Pipeline(config=CreekConfig(), no_llm=True)
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested(
+                    "frag-audiencepipe01",
+                    "On equanimity",
+                    "# On equanimity\n\n> The wound is where the light enters.\n\n"
+                    + "Each paragraph turns the same stone to a new face. " * 60,
+                    "essay",
+                    kind="writing",
+                ),
+                self._ingested(
+                    "frag-audiencepipe02",
+                    "Tuesday",
+                    "felt wrung out today. couldn't say why. went to bed early.",
+                    "journal",
+                ),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert {
+            item.fragment.id: str(item.fragment.audience) for item in classified
+        } == {
+            "frag-audiencepipe01": "audience-facing",
+            "frag-audiencepipe02": "private",
+        }
+
+    def test_audience_is_scored_after_the_privacy_tier_is_stamped(
+        self, vault_path: Path
+    ) -> None:
+        """The audience pass must sit after ``apply_tier``, not before it.
+
+        :meth:`creek.classify.audience.AudienceClassifier.score` reads
+        ``fragment.privacy_tier`` (``creek/classify/audience.py:160``,
+        ``_PRIVACY_SCORE``) and a freshly-ingested fragment carries none,
+        so where the call lands inside ``_run_classification`` is
+        load-bearing — exactly as it is for the #876 tier-before-router
+        pin above. ``apply_tier`` runs at ``creek/pipeline.py:579``.
+
+        This fixture is engineered so the two orderings disagree. With
+        the tier stamped first the entry is ``intimate``, so the score is
+        journal ``-3``, privacy ``-3``, structure ``+3`` (heading,
+        blockquote, >= 300 words) = ``-3``, which is ``<= -2`` →
+        ``private``. Hoist the audience call above ``apply_tier`` and the
+        tier is still ``unclassified``, contributing ``0``: the score is
+        ``0``, which clears neither threshold → ``mixed``, and this test
+        fails. That is the whole reason it exists — a later refactor that
+        reorders the two passes cannot land silently.
+        """
+        paragraph = (
+            "I keep circling the same question about how the work fits the "
+            "life and the life fits the work, and every pass over it turns "
+            "up one more thing I had not noticed the time before. "
+        )
+        body = (
+            "# The long way round\n\n"
+            "> Not all those who wander are lost.\n\n"
+            + paragraph * 20
+            + "\n\n- [ ] write this up properly\n\nI will come back to it.\n"
+        )
+        pipeline = Pipeline(config=CreekConfig(), no_llm=True)
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested(
+                    "frag-audiencepipe03",
+                    "The long way round",
+                    body,
+                    "journal",
+                ),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert str(classified[0].fragment.audience) == "private"
