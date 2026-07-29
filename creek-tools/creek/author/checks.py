@@ -215,6 +215,15 @@ paraphrase and shorter snippets are left to the semantic judge (#474).
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
+_WORD_CHAR_RE = re.compile(r"\w")
+r"""Matches a single word character, testing whether an edge can carry a boundary.
+
+A ``\b`` anchor asserts a word/non-word *transition*, so it can never hold on an
+edge whose own character is already punctuation — as a whole fragment body's
+first/last character usually is (#939). :func:`_is_verbatim_leak` uses this to
+apply a boundary assertion to exactly the edges where one is meaningful.
+"""
+
 
 def _is_verbatim_leak(protected: str, body: str) -> bool:
     """Return whether *protected* appears in *body* as a substantive phrase.
@@ -224,7 +233,10 @@ def _is_verbatim_leak(protected: str, body: str) -> bool:
     * the protected snippet must be at least :data:`_MIN_PROTECTED_LEAK_WORDS`
       words long (a single common word/phrase is too coincidence-prone for a
       HARD gate), and
-    * it must match on word boundaries, so it cannot match inside a larger word.
+    * it must not be glued into a larger word. The boundary is asserted only on
+      an edge whose own character is a word character, so a snippet that starts
+      or ends with punctuation is still detected rather than silently missed
+      (#939).
 
     Whitespace is normalised on both sides first, so a reflowed line break in
     the draft cannot hide an otherwise-verbatim leak.
@@ -240,7 +252,14 @@ def _is_verbatim_leak(protected: str, body: str) -> bool:
         return False
     normalized_protected = _WHITESPACE_RE.sub(" ", protected).strip()
     normalized_body = _WHITESPACE_RE.sub(" ", body)
-    pattern = rf"\b{re.escape(normalized_protected)}\b"
+    # The word-count guard above makes the snippet non-empty here, so its edge
+    # characters are safe to index. Assert a boundary only where one can hold:
+    # a `\b` on a punctuation edge never matches when the draft's adjacent
+    # character is also punctuation or a string end, which let an exact
+    # reproduction of a protected body slip through the HARD gate (#939).
+    prefix = r"(?<!\w)" if _WORD_CHAR_RE.match(normalized_protected[0]) else ""
+    suffix = r"(?!\w)" if _WORD_CHAR_RE.match(normalized_protected[-1]) else ""
+    pattern = f"{prefix}{re.escape(normalized_protected)}{suffix}"
     return re.search(pattern, normalized_body) is not None
 
 
