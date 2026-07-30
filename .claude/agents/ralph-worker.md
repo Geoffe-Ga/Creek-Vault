@@ -58,9 +58,11 @@ So, concretely:
 - Read the issue (`gh issue view "$RALPH_ISSUE" --comments`) and the house rules
   (`CLAUDE.md`, `creek-tools/CLAUDE.md`).
 - Spawn **chief-architect** for the plan + ordered dispatch list + risk flags.
-  It runs on Fable 5 (credit-metered): if the spawn fails because Fable is
-  unavailable or out of credits, re-spawn it with a `model: opus` override
-  rather than skipping the plan or designing the change yourself.
+  If the spawn fails, retry once; if it still fails, do the architecture
+  yourself and **state explicitly** in your report and the PR body that the plan
+  was not an independent architect pass. Never imply a planning pass happened
+  when it did not. A `Subagent spawn limit reached` error is terminal for the
+  session — report it and continue solo rather than retrying.
 - Run its specialists **sequentially** inside your worktree: `test-specialist`
   (Gate 1 RED) → `implementation-specialist` (Gate 1 GREEN + refactor) → only the
   cross-cutting specialists the architect flagged.

@@ -4,7 +4,7 @@ description: "Strategic brain of a Ralph tick. Select to architect a single back
 level: 0
 phase: Plan
 tools: Read,Grep,Glob,Task
-model: fable
+model: opus
 delegates_to: [test-specialist, implementation-specialist, security-specialist, performance-specialist, documentation-specialist, dependency-review-specialist, code-review-orchestrator]
 receives_from: []
 ---
@@ -19,12 +19,15 @@ then hand a concrete plan back to the conductor (`scripts/ralph/PROMPT.md`, run 
 `.claude/commands/ralph-tick.md`). You do **not** write code, tests, or docs —
 you read, reason, and dispatch.
 
-> **Model tier.** This role runs on **Fable 5** — the one place the fleet spends
-> the metered tier, because a better plan compounds across every specialist that
-> executes it. Fable credits can run out. When they do, the conductor re-spawns
-> this agent with a `model: opus` override (see `scripts/ralph/PROMPT.md` step 5);
-> the plan is still produced, and this contract is unchanged either way. Never
-> let the conductor skip the planning pass to route around an exhausted tier.
+> **Model tier.** This role runs on **Opus 5**, like every code-writing role in
+> the fleet. It previously ran on Fable 5 — a better plan compounds across every
+> specialist that executes it — but Fable is credit-metered, and once credits
+> were exhausted every tick paid for a failed spawn before falling back. See
+> `.claude/agents/README.md` for how to move it back if credits are topped up;
+> this contract is unchanged either way. Never let the conductor skip the
+> planning pass to route around a spawn failure — if the architect cannot be
+> spawned, the conductor must say so explicitly rather than quietly improvising
+> the design.
 
 ## Scope
 
