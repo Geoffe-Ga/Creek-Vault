@@ -8,6 +8,34 @@
 # verdict only counts when it is fresher than the PR's HEAD commit (stale-verdict
 # guard). We put a fake, arg-aware `gh` on PATH and assert every classification.
 #
+# Beyond that baseline, these tests pin five more dimensions:
+#
+#   opt-out        a `do-not-auto-merge` label on the PR — or on the LAST issue
+#                  its body links — parks the lane (`optout`), checked BEFORE CI
+#                  so a human hold is honoured even mid-run. An UNDETERMINABLE
+#                  hold (any lookup failing) exits 2 and prints nothing, so the
+#                  caller can never read silence as consent.
+#   freshness      `ready` additionally requires the compare API's
+#                  `behind_by == 0`. `mergeStateStatus == CLEAN` is NOT a
+#                  freshness signal — GitHub happily reports UNSTABLE/MERGEABLE
+#                  for a branch 22 commits behind main. Fails CLOSED (`behind`)
+#                  on an API error, an empty answer, or a non-integer.
+#   ready-unreviewed  a PR with PROVABLY no review gate (dependabot-authored PR
+#                  AND a dependabot-authored HEAD commit AND a real non-review
+#                  SUCCESS AND every `claude-review` entry exactly SKIPPED) may
+#                  merge without a verdict. Anything less ⇒ `awaiting-review`.
+#   laziness       both new probes cost an extra API call per wake per lane, so
+#                  each must run ONLY on the path that would otherwise print
+#                  `ready`/`ready-unreviewed`. Sentinel files prove it.
+#   field counts   the multi-field `gh` answers are split with
+#                  `IFS='|' read -r a b c rest`; a non-empty `rest` (a `|` in a
+#                  branch name, a login, a date) must fail CLOSED, not silently
+#                  shift a field and merge on garbage.
+#
+# Plus one cross-file coupling check: pr-ready.sh matches the review check by the
+# literal name `claude-review`, so `.github/workflows/code-review.yml` must keep
+# that job key and must NOT add a `name:` override.
+#
 # Run:  bash scripts/ralph/test_pr_ready.sh
 set -euo pipefail
 
@@ -19,6 +47,12 @@ ok()  { PASS=$((PASS + 1)); printf '  ok  - %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL  - %s\n' "$1"; }
 check() { # check <desc> <expected> <actual>
   if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
+}
+probed() { # probed <desc> <yes|no> <sentinel path> — did the probe run?
+  if [[ -e "$3" ]]; then check "$1" "$2" "yes"; else check "$1" "$2" "no"; fi
+}
+no_merge_token() { # no_merge_token <desc> <token> — any token the loop won't merge on
+  if [[ "$2" != "ready" && "$2" != "ready-unreviewed" ]]; then ok "$1"; else bad "$1 (got '$2')"; fi
 }
 
 WORK="$(mktemp -d)"
@@ -35,6 +69,51 @@ mkdir -p "$BIN"
 #                      — CI just hasn't started, not failed.
 #   MERGE_STATE   — mergeStateStatus (CLEAN / BEHIND / ...)
 #   HEAD_DATE     — RFC3339 committedDate of the PR HEAD commit
+#   HEAD_AUTHOR   — login of the HEAD commit's author, the 3rd field of the
+#                   mergeStateStatus answer. Defaulted with `-` (not `:-`) so a
+#                   test can pin an EMPTY author too. Set it to a human login to
+#                   prove a human commit pushed on top of a bot PR revokes the
+#                   no-review-needed shortcut.
+#   BEHIND_BY     — what the compare API reports for `.behind_by`. Defaulted with
+#                   `-` (not `:-`) so `BEHIND_BY=''` reproduces an EMPTY answer,
+#                   which must fail closed rather than compare equal to 0.
+#   COMPARE_EC    — exit code of the compare call; a test sets 1 to prove a
+#                   failed freshness probe yields `behind`, never `ready`.
+#   COMPARE_SENTINEL — file the compare arm touches when it is called. The
+#                   laziness tests assert the probe did NOT run on lanes that
+#                   already decided (one wasted API call per lane per wake is
+#                   how a loop burns its rate limit).
+#   PR_LABELS     — comma-separated labels on the PR itself, emitted one per line
+#                   the way `--jq '.labels[].name'` does.
+#   PR_LABELS_EC  — exit code of that lookup; 1 proves an UNDETERMINABLE hold
+#                   exits 2 and prints nothing (silence must not read as consent).
+#   ISSUE_LABELS  — same, for the issue the PR body links.
+#   ISSUE_LABELS_EC — exit code of the linked-issue label lookup.
+#   ISSUE_LABELS_FOR — when set, ISSUE_LABELS is served ONLY for that issue
+#                   number; every other number gets an empty answer. This is what
+#                   pins "the LAST closes-link wins" against a Dependabot body
+#                   whose upstream changelog is full of `Fixes #456` noise.
+#   PR_BODY       — the PR body the `(closes|fixes|resolves) #N` regex reads.
+#   PR_BODY_EC    — exit code of the body lookup.
+#   BASE_REF / HEAD_OID — the `<base>|<headOid>` pair the compare URL is built from.
+#   BASE_LINE_RAW — emitted verbatim in place of that pair (honoured even when
+#                   empty), so a case can feed a malformed answer the well-formed
+#                   template cannot express — e.g. one with no separator at all.
+#   PR_AUTHOR     — `.author.login` for the review-gate probe; only the app slug
+#                   `app/dependabot` can clear the gate.
+#   REVIEW_CONCLUSIONS — comma-joined conclusions of the `claude-review` rollup
+#                   entries. Every one must be exactly SKIPPED to prove no review
+#                   ever gates this PR; `SKIPPED,SUCCESS` and a trailing-comma
+#                   `SKIPPED,` (an entry still queued, conclusion null) must not.
+#   NON_REVIEW_SUCCESSES — how many NON-review checks concluded SUCCESS; 0 means
+#                   nothing actually passed, so there is nothing to merge on.
+#                   Defaulted with `-` so a test can inject a surplus `|` field.
+#   REVIEW_EC     — exit code of the review-gate lookup; 1 must fail closed.
+#   REVIEW_SENTINEL — file the review-gate arm touches; laziness assertions.
+#   ROLLUP_JSON   — raw `--json author,statusCheckRollup` payload; when set, the
+#                   stub runs the REAL jq with pr-ready.sh's own `--jq`, so a
+#                   rollup expression that miscounts SKIPPED/null conclusions is
+#                   caught here (a scalar stub would mask it).
 #   VERDICT       — the "<createdAt>|<isLGTM>" scalar the verdict jq resolves to
 #   COMMENTS_JSON — raw `--json comments` payload; when set, the stub runs the
 #                   REAL jq with pr-ready.sh's own `--jq` expression against it,
@@ -46,13 +125,46 @@ cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  "api "*"compare"*)
+    [[ -n "${COMPARE_SENTINEL:-}" ]] && : > "$COMPARE_SENTINEL"
+    printf '%s\n' "${BEHIND_BY-0}"
+    exit "${COMPARE_EC:-0}" ;;
   *"pr checks"*)
     if [[ "${CHECKS_NO_CHECKS:-0}" == "1" ]]; then
       echo "no checks reported on the 'feature-x' branch" >&2
       exit 1
     fi
     exit "${CHECKS_EC:-0}" ;;
-  *"--json mergeStateStatus"*) printf '%s|%s\n' "${MERGE_STATE:-CLEAN}" "${HEAD_DATE:-}" ;;
+  *"pr view"*"--json labels"*)
+    printf '%s\n' "${PR_LABELS:-}" | tr ',' '\n'
+    exit "${PR_LABELS_EC:-0}" ;;
+  *"issue view"*"--json labels"*)
+    n=""
+    for a in "$@"; do
+      if [[ -z "$n" && "$a" =~ ^[0-9]+$ ]]; then n="$a"; fi
+    done
+    if [[ -z "${ISSUE_LABELS_FOR:-}" || "${ISSUE_LABELS_FOR}" == "$n" ]]; then
+      printf '%s\n' "${ISSUE_LABELS:-}" | tr ',' '\n'
+    fi
+    exit "${ISSUE_LABELS_EC:-0}" ;;
+  *"pr view"*"--json body"*)
+    printf '%s\n' "${PR_BODY:-}"
+    exit "${PR_BODY_EC:-0}" ;;
+  *"pr view"*"--json baseRefName"*)
+    if [[ -n "${BASE_LINE_RAW+set}" ]]; then printf '%s\n' "$BASE_LINE_RAW"; exit 0; fi
+    printf '%s|%s\n' "${BASE_REF:-main}" "${HEAD_OID:-c0ffee1}" ;;
+  *"pr view"*"--json author"*)
+    [[ -n "${REVIEW_SENTINEL:-}" ]] && : > "$REVIEW_SENTINEL"
+    if [[ -n "${ROLLUP_JSON:-}" ]]; then
+      expr="" prev=""
+      for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
+      printf '%s' "$ROLLUP_JSON" | jq -rc "$expr"
+    else
+      printf '%s|%s|%s\n' "${PR_AUTHOR:-}" "${REVIEW_CONCLUSIONS:-}" "${NON_REVIEW_SUCCESSES-1}"
+    fi
+    exit "${REVIEW_EC:-0}" ;;
+  *"--json mergeStateStatus"*)
+    printf '%s|%s|%s\n' "${MERGE_STATE:-CLEAN}" "${HEAD_DATE:-}" "${HEAD_AUTHOR-dependabot[bot]}" ;;
   *"--json comments"*)
     if [[ -n "${COMMENTS_JSON:-}" ]]; then
       expr="" prev=""
@@ -151,6 +263,423 @@ if command -v jq >/dev/null 2>&1; then
        run 100)"
 else
   echo "  skip - real-jq verdict-regex cases (jq not installed)"
+fi
+
+# --- opt-out: a human hold beats every other signal ------------------------
+# `do-not-auto-merge` is the kill switch a human reaches for when a lane is green
+# but must NOT be merged (a revert in flight, a coordinated release, a bump that
+# needs a manual smoke test). It is read from the PR's own labels AND from the
+# issue the PR closes, and it is checked FIRST — a hold applied while CI is still
+# running has to land before the loop can act on the green that follows.
+OPTOUT="do-not-auto-merge"
+
+check "opt-out label on the PR → optout" "optout" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_LABELS="dependencies,$OPTOUT" run 100)"
+
+# The hold usually lives on the ISSUE (that is where the human is arguing about
+# it), not on the bot-authored PR — so the PR's closes-link must be followed.
+check "opt-out label on the linked issue → optout" "optout" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_BODY="Bumps ruff to 0.16.0. Closes #944" ISSUE_LABELS="dependencies,$OPTOUT" \
+     run 100)"
+
+# Order matters: if CI were consulted first, a lane that is pending now and green
+# in ten minutes would be merged by the next wake without ever reading the hold.
+check "opt-out short-circuits pending CI → optout" "optout" \
+  "$(CHECKS_EC=8 PR_LABELS="dependencies,$OPTOUT" run 100)"
+
+# The mirror image: ordinary Dependabot labels must not be mistaken for a hold,
+# or every dependency bump silently stops merging.
+check "dependabot labels without the opt-out → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_LABELS="dependencies,python" run 100)"
+
+# A substring match would park `do-not-auto-merge-after-review` — a label that
+# means the OPPOSITE (merge it, just not yet automatically-before-review).
+check "label merely containing the opt-out name → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_LABELS="dependencies,$OPTOUT-after-review" run 100)"
+
+check "linked issue without the opt-out label → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_BODY="Closes #944" ISSUE_LABELS="dependencies,bug" run 100)"
+
+# UNDETERMINABLE hold ⇒ exit 2 with NO token. Printing `ready` (or any token) on a
+# failed lookup would merge straight through a hold nobody could read; printing a
+# refusal token would be a lie about what was checked. The caller must see the
+# tooling error, so: non-zero exit, empty stdout. Three lookups, three cases.
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       PR_LABELS_EC=1 run 100)" || rc=$?
+check "PR label lookup failure exits 2" "2" "$rc"
+check "PR label lookup failure prints nothing" "" "$out"
+
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       PR_BODY_EC=1 run 100)" || rc=$?
+check "PR body lookup failure exits 2" "2" "$rc"
+check "PR body lookup failure prints nothing" "" "$out"
+
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       PR_BODY="Closes #944" ISSUE_LABELS_EC=1 run 100)" || rc=$?
+check "linked-issue label lookup failure exits 2" "2" "$rc"
+check "linked-issue label lookup failure prints nothing" "" "$out"
+
+# Control for the three above: with all three lookups SUCCEEDING and no hold, the
+# same lane must still be a plain, exit-0 `ready` — so the exit-2 cases above are
+# provably about the failure, not about the opt-out check existing at all.
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       PR_LABELS="dependencies" PR_BODY="Closes #944" ISSUE_LABELS="dependencies" \
+       run 100)" || rc=$?
+check "all three opt-out lookups clean → ready" "ready" "$out"
+check "all three opt-out lookups clean → exit 0" "0" "$rc"
+
+# LAST link wins. A Dependabot body embeds the DEPENDENCY's changelog, which is
+# full of `Fixes #456` / `Resolves #789` referring to the UPSTREAM repo's issues.
+# A first-match parser reads one of those as "the issue this PR closes" and then
+# checks labels on a completely unrelated local issue number.
+CHANGELOG_BODY="$(printf '%s\n' \
+  'Bumps ruff from 0.15.0 to 0.16.0.' \
+  '' \
+  '<details><summary>Changelog</summary>' \
+  '* Fixes #456 in the upstream tool' \
+  '* Resolves #789 in the upstream tool' \
+  '</details>' \
+  '' \
+  'Closes #944')"
+
+check "changelog noise: hold on the LAST-linked issue → optout" "optout" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_BODY="$CHANGELOG_BODY" ISSUE_LABELS_FOR=944 ISSUE_LABELS="dependencies,$OPTOUT" \
+     run 100)"
+
+# The twin: the hold sits on the upstream-changelog number instead. Serving it for
+# #456 only means a first-match parser prints `optout` here — and that FALSE hold
+# would silently freeze the lane forever.
+check "changelog noise: hold on an upstream #456 is not ours → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_BODY="$CHANGELOG_BODY" ISSUE_LABELS_FOR=456 ISSUE_LABELS="$OPTOUT" \
+     run 100)"
+
+# --- freshness: mergeStateStatus is NOT a freshness signal ------------------
+# Live PR #943 reports UNSTABLE/MERGEABLE while sitting exactly 22 commits behind
+# main: GitHub only says BEHIND when the base branch requires strict up-to-date
+# merging. So `ready` must ask the compare API for `behind_by` directly, or the
+# loop merges branches that never ran against current main.
+check "green + CLEAN + fresh LGTM but 22 behind → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 run 100)"
+
+check "behind_by 0 → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
+
+# One commit is enough: "nearly current" is still not current.
+check "behind_by 1 → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=1 run 100)"
+
+# Fail CLOSED. A compare call that errors (rate limit, 404 on a force-pushed OID)
+# must not inherit the happy answer that happens to be on stdout.
+check "compare API error → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+     BEHIND_BY=0 COMPARE_EC=1 run 100)"
+
+# An EMPTY answer is the dangerous one: `[[ "" -eq 0 ]]` is TRUE in bash, so a
+# naive numeric test reads "no answer" as "up to date".
+check "empty behind_by answer → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY='' run 100)"
+
+# `--jq .behind_by` prints the literal `null` when the field is absent.
+check "null behind_by answer → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=null run 100)"
+
+# The new probe ADDS to the CLEAN requirement, it does not replace it: a BEHIND
+# mergeStateStatus still blocks even when compare says 0.
+check "BEHIND merge state with behind_by 0 → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=BEHIND HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
+
+# The compare INPUTS are parsed defensively too. `<base>|<headOid>` is split on
+# the LAST '|' (a branch name may legally contain one; a SHA may not) — but a
+# separator-free answer would leave base and headOid BOTH equal to the whole
+# string, and a base ref that looks like a short SHA would then be compared
+# against itself: `behind_by: 0`, a false `ready`. `c0ffee1` is exactly such a
+# name, so this case fails on any implementation that splits before checking.
+check "separator-free compare answer that looks like a SHA → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+     BASE_LINE_RAW="c0ffee1" BEHIND_BY=0 run 100)"
+
+# An empty answer (gh printing nothing while still exiting 0) is the same class.
+check "empty compare answer → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+     BASE_LINE_RAW="" BEHIND_BY=0 run 100)"
+
+# The legal twin: refusing every unusual base name would break a real one, so a
+# genuinely pipe-named base ref must still resolve and still read `ready`.
+check "pipe-named base ref still resolves → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+     BASE_REF='release|v2' HEAD_OID=deadbee BEHIND_BY=0 run 100)"
+
+# --- freshness probe is LAZY -----------------------------------------------
+# The compare call is an extra API request per lane per wake. It must fire ONLY on
+# the path that would otherwise print `ready`; every lane below has already
+# decided, so the probe is pure waste (and, on a rate-limited token, the thing
+# that makes the whole tick fail). BEHIND_BY=22 stays set throughout to prove the
+# printed token came from the EARLIER check, not from the freshness probe.
+# Each lane gets its OWN sentinel path: a shared one would let an earlier lane's
+# probe satisfy a later lane's assertion. `|| tok="exit-$?"` keeps a non-zero exit
+# from aborting the whole suite under `set -e` — it surfaces as a failed check.
+S_PENDING="$WORK/probe-pending"
+tok="$(CHECKS_EC=8 BEHIND_BY=22 COMPARE_SENTINEL="$S_PENDING" run 100)" || tok="exit-$?"
+check "lazy compare: pending lane token" "pending" "$tok"
+probed "lazy compare: pending lane does not probe" "no" "$S_PENDING"
+
+S_CIFAIL="$WORK/probe-cifail"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 COMPARE_SENTINEL="$S_CIFAIL" run 100)" || tok="exit-$?"
+check "lazy compare: ci-failed lane token" "ci-failed" "$tok"
+probed "lazy compare: ci-failed lane does not probe" "no" "$S_CIFAIL"
+
+S_STALE="$WORK/probe-stale"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" \
+       BEHIND_BY=22 COMPARE_SENTINEL="$S_STALE" run 100)" || tok="exit-$?"
+check "lazy compare: stale-verdict lane token" "awaiting-review" "$tok"
+probed "lazy compare: stale-verdict lane does not probe" "no" "$S_STALE"
+
+S_READY="$WORK/probe-ready"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=0 COMPARE_SENTINEL="$S_READY" run 100)" || tok="exit-$?"
+check "lazy compare: would-be-ready lane token" "ready" "$tok"
+probed "lazy compare: would-be-ready lane DOES probe" "yes" "$S_READY"
+
+S_OPTOUT="$WORK/probe-optout"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=22 PR_LABELS="$OPTOUT" COMPARE_SENTINEL="$S_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy compare: opt-out lane token" "optout" "$tok"
+probed "lazy compare: opt-out lane does not probe" "no" "$S_OPTOUT"
+
+# --- ready-unreviewed: PROVABLY no review gate ------------------------------
+# `.github/workflows/code-review.yml` skips its `claude-review` job on Dependabot
+# PRs (Actions secrets are not exposed to dependabot runs), so those PRs can never
+# earn an LGTM — `awaiting-review` forever. `ready-unreviewed` is the narrow
+# escape, and every one of its four conditions is load-bearing: bot-authored PR,
+# bot-authored HEAD commit, at least one real non-review SUCCESS, and every
+# `claude-review` rollup entry exactly SKIPPED. Miss any and this token becomes
+# "merge without review" on a PR a human still owes a look at.
+DEPENDABOT="app/dependabot"
+DEPENDABOT_COMMIT="dependabot[bot]"
+SKIPPED="SKIPPED"
+NO_VERDICT="|false"
+
+check "reviewless dependabot bump, green + fresh → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# Re-runs leave several `claude-review` rollup entries; all SKIPPED is still no gate.
+check "duplicate SKIPPED review entries → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED,$SKIPPED" run 100)"
+
+# A real verdict outranks the shortcut: the reviewed path must still report plain
+# `ready`, so the loop's own logs distinguish "reviewed" from "no review exists".
+check "reviewless setup WITH a fresh LGTM → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# Skipping review does NOT skip freshness or mergeability.
+check "reviewless but 22 behind → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=22 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+check "reviewless but DIRTY merge state → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=DIRTY HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# A human PR whose review job happened to be SKIPPED (a path filter, a cancelled
+# run) is exactly the case where merging unreviewed would be worst.
+check "human-authored PR with a SKIPPED review → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="Geoffe-Ga" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# EVERY entry must be SKIPPED. One that actually RAN means a review gate exists,
+# so its verdict — not this shortcut — decides.
+check "one review entry that ran (SKIPPED,SUCCESS) → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED,SUCCESS" run 100)"
+
+# An EMPTY conclusion is a review still queued — the review that is about to
+# happen. Treating empty as "not a blocker" merges out from under it.
+check "queued review entry (empty conclusion) → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED," run 100)"
+
+# No `claude-review` entry at all proves nothing — the workflow may simply not
+# have been dispatched yet. "Vacuously all SKIPPED" must not clear the gate.
+check "no claude-review entry at all → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="" run 100)"
+
+check "review-gate lookup failure → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" REVIEW_EC=1 run 100)"
+
+# If the ONLY checks are skipped ones, `gh pr checks` can exit 0 with nothing
+# having actually passed. Requiring a real non-review SUCCESS keeps "no checks
+# ran" from reading as "CI is green".
+check "zero non-review SUCCESSes → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" NON_REVIEW_SUCCESSES=0 run 100)"
+
+check "one non-review SUCCESS → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" NON_REVIEW_SUCCESSES=1 run 100)"
+
+# --- REAL jq: exercise the production rollup expression --------------------
+# The scalar stub above can't catch a `--jq` that miscounts: `statusCheckRollup`
+# mixes check runs and commit statuses, and a queued entry's `conclusion` is JSON
+# `null`, not a string. These two feed a real payload through pr-ready.sh's own
+# expression, so a `select(.conclusion == "SUCCESS")` that accidentally counts
+# nulls or SKIPPEDs is caught here.
+if command -v jq >/dev/null 2>&1; then
+  REVIEW_ENTRY='{"name":"claude-review","conclusion":"SKIPPED"}'
+  rj() { # rj <extra rollup entries> — a real --json author,statusCheckRollup payload
+    printf '{"author":{"login":"app/dependabot"},"statusCheckRollup":[%s,%s]}' \
+      "$REVIEW_ENTRY" "$1"
+  }
+
+  # Nothing actually passed: one skipped check and one still queued (null).
+  check "real rollup, no non-review SUCCESS → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+       HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+       ROLLUP_JSON="$(rj '{"name":"ci","conclusion":"SKIPPED"},{"name":"lint","conclusion":null}')" \
+       run 100)"
+
+  # One genuine SUCCESS alongside the same noise → the shortcut is earned.
+  check "real rollup with a non-review SUCCESS → ready-unreviewed" "ready-unreviewed" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+       HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+       ROLLUP_JSON="$(rj '{"name":"ci","conclusion":"SUCCESS"},{"name":"lint","conclusion":null}')" \
+       run 100)"
+else
+  echo "  skip - real-jq review-gate rollup cases (jq not installed)"
+fi
+
+# The PR author is not enough: anyone can push a commit onto a Dependabot branch
+# (that is how we fix a bump's fallout), and that commit is unreviewed code
+# riding a "no review needed" PR. The HEAD commit's author must be the bot too.
+check "human commit on top of a bot PR → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="Geoffe-Ga" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# The two spellings are NOT interchangeable: GitHub reports the PR author as the
+# app slug `app/dependabot` and the commit author as `dependabot[bot]`. Comparing
+# a commit author against the app slug never matches — and comparing it loosely
+# would match any login containing "dependabot".
+check "commit author spelled as the app slug → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# --- field-count parsing: a surplus `|` must fail CLOSED -------------------
+# Both multi-field answers are split with `IFS='|' read -r a b c rest`. A stray
+# `|` (in a login, a branch name, an injected value) shifts every field one place
+# and silently turns a garbage parse into a merge decision. A non-empty `rest`
+# means "this answer is not the shape I expected" — refuse.
+check "surplus field in the review-gate answer → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" NON_REVIEW_SUCCESSES='1|x' run 100)"
+
+# Same for the mergeState answer. Which refusal token it picks is an
+# implementation detail (the head_date/head_author it recovered may be garbage);
+# what is NOT negotiable is that it never merges on it.
+no_merge_token "surplus field in the mergeState answer is never mergeable" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT|x" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# The human hold outranks the no-review-needed shortcut too — otherwise the one
+# class of PR that merges without review is also the one that ignores the brake.
+check "opt-out on a would-be ready-unreviewed PR → optout" "optout" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" PR_LABELS="dependencies,$OPTOUT" run 100)"
+
+# --- review-gate probe is LAZY ---------------------------------------------
+# Same rate-limit argument as the compare probe: the rollup query is only worth
+# making when the answer can still change the outcome. PR_AUTHOR is set to the
+# value that WOULD clear the gate in every case, so a lane that probes anyway is
+# caught by the sentinel rather than by a wrong token.
+R_LGTM="$WORK/review-lgtm"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       PR_AUTHOR="$DEPENDABOT" REVIEW_SENTINEL="$R_LGTM" run 100)" || tok="exit-$?"
+check "lazy review-gate: fresh LGTM token" "ready" "$tok"
+probed "lazy review-gate: fresh LGTM does not probe" "no" "$R_LGTM"
+
+R_PENDING="$WORK/review-pending"
+tok="$(CHECKS_EC=8 PR_AUTHOR="$DEPENDABOT" REVIEW_SENTINEL="$R_PENDING" run 100)" || tok="exit-$?"
+check "lazy review-gate: pending token" "pending" "$tok"
+probed "lazy review-gate: pending does not probe" "no" "$R_PENDING"
+
+R_CIFAIL="$WORK/review-cifail"
+tok="$(CHECKS_EC=1 PR_AUTHOR="$DEPENDABOT" REVIEW_SENTINEL="$R_CIFAIL" run 100)" || tok="exit-$?"
+check "lazy review-gate: ci-failed token" "ci-failed" "$tok"
+probed "lazy review-gate: ci-failed does not probe" "no" "$R_CIFAIL"
+
+R_OPTOUT="$WORK/review-optout"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+       PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+       REVIEW_CONCLUSIONS="$SKIPPED" PR_LABELS="$OPTOUT" \
+       REVIEW_SENTINEL="$R_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy review-gate: opt-out token" "optout" "$tok"
+probed "lazy review-gate: opt-out does not probe" "no" "$R_OPTOUT"
+
+R_NOVERDICT="$WORK/review-noverdict"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
+       PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+       REVIEW_CONCLUSIONS="$SKIPPED" REVIEW_SENTINEL="$R_NOVERDICT" run 100)" || tok="exit-$?"
+check "lazy review-gate: no-verdict lane token" "ready-unreviewed" "$tok"
+probed "lazy review-gate: no-verdict lane DOES probe" "yes" "$R_NOVERDICT"
+
+# --- cross-file coupling: the review job's check NAME ----------------------
+# pr-ready.sh identifies the review check by the literal string `claude-review`,
+# which is the workflow's JOB KEY. Two edits to code-review.yml would silently
+# wedge every Dependabot lane at `awaiting-review` with no test failing anywhere
+# else: renaming the job key, or adding a `name:` override (GitHub then reports
+# the check under the display name, and the literal match stops matching).
+REVIEW_WORKFLOW="$(cd "$(dirname "$0")/../.." && pwd)/.github/workflows/code-review.yml"
+
+if grep -qx "  claude-review:" "$REVIEW_WORKFLOW"; then
+  ok "code-review.yml still defines the 'claude-review' job key"
+else
+  bad "code-review.yml no longer has the '  claude-review:' job key pr-ready.sh matches"
+fi
+
+# Keys one level inside the job block: stop at the next job (2-space key), skip
+# comments, and drop everything after the first colon.
+job_keys="$(awk '$0 == "  claude-review:" {j = 1; next}
+                 j && /^  [^[:space:]#]/ {exit}
+                 j && /^    [^[:space:]#]/ {sub(/:.*/, "", $1); print $1}' \
+            "$REVIEW_WORKFLOW" 2>/dev/null || true)"
+
+# Herestring, not a pipe: `grep -q` exits on its first match, so a `printf | grep -q`
+# pipeline can report non-zero on a MATCH under `pipefail` (printf dies with SIGPIPE).
+if grep -qx "name" <<<"$job_keys"; then
+  bad "claude-review declares a name: override — GitHub will report a different check name"
+else
+  ok "claude-review declares no name: override (check name stays 'claude-review')"
 fi
 
 # --- summary ---------------------------------------------------------------

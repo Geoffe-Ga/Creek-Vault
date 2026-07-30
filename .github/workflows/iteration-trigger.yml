@@ -6,6 +6,13 @@ name: Iteration Trigger
 # app via MCP so it can continue iterating on feedback. Capped at 10 self-posts
 # per PR to avoid runaway loops.
 #
+# The "cleared to squash merge" line this job emits is a merge instruction, so it
+# must enforce the SAME invariant as scripts/ralph/pr-ready.sh or it becomes a
+# second code path that falsifies it. It therefore also checks that the head is
+# current with its base (compare API `behind_by == 0`) and that no
+# `do-not-auto-merge` hold is set, and names the blocker instead of clearing when
+# either fails. Both fail closed on an unreadable answer.
+#
 # Required secrets:
 #   GEOFFE_GA_PAT  - personal access token for the repo owner with `pull-requests: write`.
 #                    Without this the comment would post as github-actions[bot]
@@ -95,8 +102,35 @@ jobs:
           TOTAL=$(jq '[.check_runs[] | select(.conclusion != "skipped" and .conclusion != "neutral")] | length' runs.json)
           GREEN=$(jq '[.check_runs[] | select(.conclusion == "success")] | length'                             runs.json)
 
+          # Green + LGTM is NOT enough to clear a merge, and this job used to
+          # clear on those two alone. That made it a second code path able to
+          # falsify the invariant scripts/ralph/pr-ready.sh enforces: it would
+          # tell the loop to merge the very lanes that helper refuses — a branch
+          # behind its base (whose own green proves nothing about today's main)
+          # and one a human put on hold with `do-not-auto-merge`. Both checks
+          # below fail CLOSED: a missing/unreadable PR object yields no labels
+          # (HELD="unknown") and an empty BEHIND, neither of which clears.
+          PR_JSON=$(gh api "repos/$REPO/pulls/$PR" 2>/dev/null || echo '{}')
+          BASE=$(jq -r '.base.ref // empty' <<<"$PR_JSON")
+          HELD=$(jq -r 'if .labels == null then "unknown"
+                        elif ([.labels[].name] | index("do-not-auto-merge")) then "yes"
+                        else "no" end' <<<"$PR_JSON")
+          # behind_by counts base commits the head lacks. GitHub only reports
+          # mergeStateStatus BEHIND when the base enforces strict status checks,
+          # which this repo does not — so a branch many commits behind main reads
+          # CLEAN and only this compare call can see it. Anything but a literal
+          # "0", including the empty string a failed or malformed compare leaves,
+          # is "not current".
+          BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA?per_page=1" --jq '.behind_by' 2>/dev/null || true)
+
           if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
-            ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
+            if [ "$HELD" != "no" ]; then
+              ACTION="NOT cleared to merge: the do-not-auto-merge hold is set on this PR (or its labels could not be read). A human owns this one - leave it alone."
+            elif [ "$BEHIND" != "0" ]; then
+              ACTION="NOT cleared to merge: this head is not current with ${BASE:-its base} (behind_by='${BEHIND}'). Run scripts/ralph/fleet.sh sync and let CI re-run first."
+            else
+              ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
+            fi
           else
             ACTION="pull comment ${ID} to see in-depth feedback and continue iterating"
           fi
