@@ -114,10 +114,16 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
   orchestrator handles).
 - Never force-push. Rewrite on a fresh branch if needed.
 - **`dependencies` issues:** the in-flight PR is Dependabot's own branch
-  (linked via `Closes`); push fixes **there**, not a fresh branch. A breaking
-  major is a normal Gate-1 TDD adaptation — never pin back, suppress, or weaken
-  a gate. If a dependency is deliberately pinned pending a larger upgrade epic,
-  note that epic's issue number in `.github/dependabot.yml`'s `ignore` comment.
+  (linked via `Closes`); push fixes **there**, not a fresh branch. In the
+  fleet loop this is now implemented, not just promised: the orchestrator runs
+  `scripts/ralph/fleet.sh adopt <issue> <pr>` to attach the lane to that
+  branch, and your first action inside an adopted lane is
+  `scripts/ralph/fleet.sh sync <issue>` — a bot branch is typically many
+  commits behind `main`, and debugging its CI against a stale base wastes the
+  whole lane. A breaking major is a normal Gate-1 TDD adaptation — never pin
+  back, suppress, or weaken a gate. If a dependency is deliberately pinned
+  pending a larger upgrade epic, note that epic's issue number in
+  `.github/dependabot.yml`'s `ignore` comment.
 - Never disable a CI check or pre-commit hook, and never lower a quality
   threshold to pass. No `# noqa` / `# type: ignore` /
   `@pytest.mark.skip` without an `Issue #N`

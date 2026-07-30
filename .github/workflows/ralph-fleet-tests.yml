@@ -28,6 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
+      # These scripts are the merge gate, and nothing else in CI lints them:
+      # creek-tools/scripts/lint-extended.sh only shellchecks `scripts/*.sh`
+      # relative to creek-tools/, so `scripts/ralph/*.sh` was covered by the
+      # pre-commit hook alone — i.e. not at all for anyone who bypassed it.
+      # `--severity=warning` matches the bar these files are written to.
+      - name: Shellcheck the ralph scripts
+        run: shellcheck --severity=warning scripts/ralph/*.sh
+
       - name: Run fleet + picker + pr-ready shell tests
         run: |
           git config --global user.email ci@example.com
