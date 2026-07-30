@@ -662,8 +662,11 @@ class RedactionConfig(BaseModel):
 
     Higher values demand more entropy before flagging a substring; ``0.0``
     catches everything that looks base64-ish, ``1.0`` requires near-random
-    output. The default ``0.6`` corresponds to roughly 4.2 bits/char which
-    suppresses most natural-language false positives.
+    output. The default ``0.6`` corresponds to exactly 3.7 bits/char —
+    the ``2.5`` floor plus ``0.6`` of the span up to the ``4.5`` ceiling —
+    which suppresses most natural-language false positives. Raising it is
+    the supported way to trade detector reach for fewer false positives:
+    it narrows both the whole-run and the sub-run window gate.
     """
 
     replacement_template: str = "[REDACTED:{name}]"
