@@ -1307,7 +1307,7 @@ def test_run_classify_assigns_the_exact_privacy_tier_per_fragment(
 def test_run_classify_never_persists_unclassified_tier(tmp_path: Path) -> None:
     """No file under ``01-Fragments`` retains ``privacy_tier: unclassified``.
 
-    The #934 pin. ``creek_mcp.tools.compile._tier_of`` and
+    The #934 pin. ``creek_mcp.source_tiers.fragment_tier`` and
     ``creek_mcp.tools.reflect._fragment_tier`` fail closed to INTIMATE only
     when the ``privacy_tier`` key is **absent**; an *explicit*
     ``unclassified`` is admitted at every ceiling. So a vault full of

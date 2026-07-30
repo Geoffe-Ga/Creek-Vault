@@ -225,7 +225,7 @@ def test_remote_call_above_personal_is_refused_before_dispatch(
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = _structured(
         asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": ceiling}))
@@ -247,7 +247,7 @@ def test_remote_call_at_or_below_personal_dispatches(
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = _structured(
         asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": ceiling}))
@@ -266,7 +266,7 @@ def test_remote_call_is_audited_under_token_consumer(
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
 
@@ -287,7 +287,7 @@ def test_local_stdio_call_is_not_capped(
     monkeypatch.setattr(server_mod, "_current_access_token", lambda: None)
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = _structured(
         asyncio.run(
@@ -322,7 +322,7 @@ def test_streamable_http_rejects_unauthenticated_request(vault: Path) -> None:
     """A POST with no / wrong bearer is refused 401 before any tool runs."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
         token_verifier=ConsumerTokenVerifier({"adepthood": "secret123"}),
     )
     client = TestClient(server.streamable_http_app())
@@ -358,7 +358,7 @@ def _network_server(vault: Path, token: str) -> FastMCP:
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
         token_verifier=ConsumerTokenVerifier({"adepthood": token}),
     )
     server.settings.transport_security = TransportSecuritySettings(

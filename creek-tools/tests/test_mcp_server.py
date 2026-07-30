@@ -16,7 +16,7 @@ from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
 from creek_mcp.server import SERVER_NAME, build_server
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -78,7 +78,7 @@ def test_build_server_returns_fastmcp_instance(vault: Path) -> None:
     """The bootstrap returns a configured :class:`FastMCP` instance."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     assert server.name == SERVER_NAME
 
@@ -87,7 +87,7 @@ def test_build_server_registers_all_tools(vault: Path) -> None:
     """All FEAT-010 read + FEAT-011 write tools surface via ``list_tools``."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     tools = asyncio.run(server.list_tools())
     names = {tool.name for tool in tools}
@@ -103,7 +103,7 @@ def test_call_tool_handshake_reflects_registered_tools(vault: Path) -> None:
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     registered = {tool.name for tool in asyncio.run(server.list_tools())}
     result = asyncio.run(
@@ -132,7 +132,7 @@ def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
     payload = '{"notes": [' + note + "]}"
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
         reflect_llm_factory=lambda: lambda tier: lambda prompt: payload,
     )
     result = asyncio.run(
@@ -156,7 +156,7 @@ def test_call_tool_reflect_escalates_on_acute_distress(vault: Path) -> None:
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
         reflect_llm_factory=lambda: lambda tier: lambda prompt: '{"notes": []}',
     )
     result = asyncio.run(
@@ -181,7 +181,7 @@ def test_call_tool_journal_ingests_entry_idempotently(vault: Path) -> None:
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     payload = {
         "content": "A registered journal entry.",
@@ -209,7 +209,7 @@ def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}),
@@ -230,7 +230,7 @@ def test_call_tool_save_through_mcp(vault: Path) -> None:
         (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool(
@@ -258,7 +258,7 @@ def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     tools = asyncio.run(server.list_tools())
     for tool in tools:
@@ -274,7 +274,7 @@ def test_purge_tools_require_auth_token_parameter(vault: Path) -> None:
     """FEAT-012: every ``creek.purge.*`` tool exposes an ``auth_token`` slot."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     tools = asyncio.run(server.list_tools())
     purge_tools = [t for t in tools if t.name.startswith("creek.purge.")]
@@ -294,7 +294,7 @@ def test_call_tool_state_read_through_mcp(vault: Path) -> None:
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool("creek.state.read", {"privacy_tier_ceiling": "open"}),
@@ -309,7 +309,7 @@ def test_call_tool_state_render_through_mcp(vault: Path) -> None:
     """The render path is reachable via ``call_tool``."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool(
@@ -325,7 +325,7 @@ def test_call_tool_lint_through_mcp(vault: Path) -> None:
     """The lint path is reachable via ``call_tool`` and returns ``checks``."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool("creek.lint", {"privacy_tier_ceiling": "open"}),
@@ -339,7 +339,7 @@ def test_call_tool_mine_through_mcp(vault: Path) -> None:
     """The mine path is reachable via ``call_tool``."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool(
@@ -355,7 +355,7 @@ def test_call_tool_draft_through_mcp(vault: Path) -> None:
     """The draft path is reachable via ``call_tool``."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = asyncio.run(
         server.call_tool(
@@ -378,55 +378,20 @@ def test_build_server_falls_back_to_load_config(
         vault_path = vault
 
     monkeypatch.setattr("creek_mcp.server.load_config", lambda: _StubConfig())
-    server = build_server(draft_llm_factory=lambda: lambda prompt: "x")
+    server = build_server(draft_llm_factory=lambda tier: lambda prompt: "x")
     assert server.name == SERVER_NAME
 
 
-def test_build_draft_llm_raises_when_classifier_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The production factory bubbles a clear error when no LLM is reachable."""
-    from creek_mcp import server as server_module
-
-    class _UnavailableClassifier:
-        available = False
-
-        def __init__(self, _config: object) -> None:
-            pass
-
-        def invoke_prompt(self, prompt: str) -> str:  # pragma: no cover
-            return ""
-
-    monkeypatch.setattr(
-        "creek.classify.llm.LLMClassifier",
-        _UnavailableClassifier,
-    )
-    with pytest.raises(RuntimeError, match="LLM provider unavailable"):
-        server_module._build_draft_llm()
-
-
-def test_build_draft_llm_returns_invoke_prompt_when_available(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When the classifier reports ``available``, the factory returns the callable."""
-    from creek_mcp import server as server_module
-
-    class _AvailableClassifier:
-        available = True
-
-        def __init__(self, _config: object) -> None:
-            pass
-
-        def invoke_prompt(self, prompt: str) -> str:
-            return "drafted body"
-
-    monkeypatch.setattr(
-        "creek.classify.llm.LLMClassifier",
-        _AvailableClassifier,
-    )
-    llm = server_module._build_draft_llm()
-    assert callable(llm)
-    assert llm("hi") == "drafted body"
+# The two ``_build_draft_llm`` unit tests that used to sit here monkeypatched
+# ``creek.classify.llm.LLMClassifier`` with a stub accepting any config, then
+# called the untiered ``_build_draft_llm()``. That stub is what hid #958: the
+# real ``LLMClassifier`` reads ``.provider`` off the ``LLMRoutingConfig`` it is
+# handed and raises ``AttributeError`` on every production call, and the
+# router's Intimate-never-cloud gate was never in the path at all. Both
+# properties they claimed to pin ("returns a usable callable when the provider
+# is available" / "raises a clear RuntimeError when it is not") are asserted
+# against the *routed* factory by
+# ``test_build_draft_llm_routes_by_tier_then_degrades`` below.
 
 
 def test_main_invokes_server_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -753,6 +718,174 @@ def test_build_server_wires_the_production_compile_llm_factory(
     # An ``open`` ceiling over ``open`` sources routes to the cloud
     # ``generation`` stage — the router ran, and did not over-restrict.
     assert spy.provider_names == ["anthropic"]
+
+
+# --------------------------------------------------------------------------- #
+# Draft LLM: tier-routed production factory + real wiring (#958)
+# --------------------------------------------------------------------------- #
+
+
+def _open_source_seed(frag_id: str) -> object:
+    """Return an ``IdeaSeed`` whose single source fragment is *frag_id*."""
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+
+    return IdeaSeed(
+        strategy=MiningStrategy.THREAD_TERMINUS,
+        title="Wired seed",
+        source_fragments=(frag_id,),
+        threads=(),
+        eddies=(),
+        frequency_affinity=(),
+        brief_description="brief",
+        score=0.5,
+    )
+
+
+def _patch_draft_miner(monkeypatch: pytest.MonkeyPatch, seed: object) -> None:
+    """Force ``draft_tool``'s ``IdeaMiner`` to surface exactly *seed*.
+
+    A bare fixture vault legitimately mines zero seeds, which would let
+    ``creek.draft`` answer ``status="empty"`` before the LLM factory is ever
+    consulted — and a provider assertion would then pass vacuously.
+    """
+    monkeypatch.setattr(
+        "creek_mcp.tools.draft.IdeaMiner",
+        lambda **kwargs: type(
+            "_Miner",
+            (),
+            {"mine_all": lambda self, vault_path, *, current_phase: [seed]},
+        )(),
+    )
+
+
+def test_build_draft_llm_routes_by_tier_then_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The draft factory is tier-keyed and honours the router (#958).
+
+    Mirrors :func:`test_build_compile_llm_routes_by_tier_then_degrades`
+    against a *real* :class:`~creek.classify.llm.router.ModelRouter`, so the
+    ``Intimate``-never-cloud redirect under test is the production one and
+    not a stub's opinion.
+
+    Three properties, each of which the pre-fix ``_build_draft_llm``
+    violates: it takes no tier at all, it builds straight from
+    ``load_config().llm`` (never touching the router or ``build_provider``),
+    and it hands that ``LLMRoutingConfig`` to ``LLMClassifier``, which reads
+    ``.provider`` off it — so every production ``creek.draft`` call raises
+    ``AttributeError: 'LLMRoutingConfig' object has no attribute 'provider'``
+    and the tool is dead by accident rather than routed by design.
+    """
+    from creek.models import PrivacyTier
+    from creek_mcp import server as server_mod
+
+    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    spy = _ProviderSpy(text="drafted")
+    _patch_build_provider(monkeypatch, spy)
+
+    # INTIMATE: the cloud ``generation`` stage is redirected to local default.
+    assert server_mod._build_draft_llm(PrivacyTier.INTIMATE)("p") == "drafted"
+    assert spy.provider_names == ["ollama"]
+
+    # OPEN: no redirect, and the ``generation`` stage (not ``default``) wins.
+    assert server_mod._build_draft_llm(PrivacyTier.OPEN)("p") == "drafted"
+    assert spy.provider_names == ["ollama", "anthropic"]
+    assert spy.prompts == ["p", "p"]
+
+    unavailable = _ProviderSpy(available=False)
+    _patch_build_provider(monkeypatch, unavailable)
+    with pytest.raises(RuntimeError) as excinfo:
+        server_mod._build_draft_llm(PrivacyTier.OPEN)
+    assert "unavailable" in str(excinfo.value).lower()
+
+
+def test_build_server_wires_the_production_draft_llm_factory(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek.draft`` works with no ``draft_llm_factory`` injected (#958).
+
+    This is the test that would have caught #958. Every other server test
+    injects ``draft_llm_factory``, which is exactly what hid a production
+    factory that raises ``AttributeError`` on its ``LLMClassifier(config.llm)``
+    line — the registered tool was never once exercised against the code path
+    real clients take. So the injection point is deliberately left empty:
+    ``build_server`` must fall back to its own factory, that factory must go
+    through :class:`~creek.classify.llm.router.ModelRouter`, and the tool must
+    complete end to end through the registered FastMCP handler.
+
+    The miner and the generator are stubbed so the call is *guaranteed* to
+    reach the factory. Without that, a bare fixture vault answers
+    ``status="empty"`` (no seeds) or a ``refused`` envelope from the generator
+    scaffolding, the factory is never invoked, and every provider assertion
+    below would hold vacuously while the production path stayed dead.
+    """
+    from creek.generate.drafts import Draft
+    from creek_mcp import server as server_mod
+
+    _write_open_fragment(vault, "frag-open")
+    _patch_draft_miner(monkeypatch, _open_source_seed("frag-open"))
+    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    spy = _ProviderSpy(text="drafted body")
+    _patch_build_provider(monkeypatch, spy)
+
+    recorded: list[Callable[[str], str]] = []
+
+    class _RecordingGenerator:
+        """A ``DraftGenerator`` stand-in recording the llm it was built with."""
+
+        def __init__(self, *, llm: Callable[[str], str], **kwargs: object) -> None:
+            """Record *llm*; the remaining generator options are irrelevant."""
+            del kwargs
+            self._llm = llm
+            recorded.append(llm)
+
+        def generate_draft(self, idea: object, *, vault_path: Path) -> Draft:
+            """Call the recorded llm once and return a minimal draft."""
+            del idea, vault_path
+            self._llm("draft prompt")
+            return Draft(
+                title="Wired seed",
+                body="drafted body",
+                idea_strategy="thread_terminus",
+                source_fragments=("frag-open",),
+                threads=(),
+                eddies=(),
+                skill_stack=(),
+                prompt="draft prompt",
+                generated_date=datetime(2026, 5, 11, tzinfo=UTC),
+            )
+
+        def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+            """Persist a placeholder file so the tool can report its path."""
+            del draft
+            target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-wired.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("body", encoding="utf-8")
+            return target
+
+    monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _RecordingGenerator)
+
+    server = build_server(vault_path=vault)
+    result = asyncio.run(
+        server.call_tool(
+            "creek.draft",
+            {"privacy_tier_ceiling": "open", "phase": "unclassified", "index": 0},
+        ),
+    )
+
+    structured = _structured(result)
+    assert structured["status"] == "ok"
+    assert structured["draft_path"] == "07-Voice/Drafts/2026-05-11-wired.md"
+    # An ``open`` ceiling over ``open`` sources routes to the cloud
+    # ``generation`` stage — the router ran, and did not over-restrict.
+    assert spy.provider_names == ["anthropic"]
+    # ...and the callable the generator was handed is the routed provider's,
+    # not some other object that merely happens to be callable.
+    assert spy.prompts == ["draft prompt"]
+    assert len(recorded) == 1
+    assert recorded[0]("second prompt") == "drafted body"
+    assert spy.prompts == ["draft prompt", "second prompt"]
 
 
 # --------------------------------------------------------------------------- #
