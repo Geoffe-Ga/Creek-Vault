@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from creek.compile.engine import CompileLLM
     from creek.models import PrivacyTier
     from creek_mcp.tools.compile import CompileLLMFactory
+    from creek_mcp.tools.draft import DraftLLMFactory
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
 
 SERVER_NAME = "creek-tools-mcp"
@@ -155,31 +156,47 @@ def _consumer_from_env() -> str:
     return os.environ.get("CREEK_MCP_CONSUMER", "unknown")
 
 
-def _build_draft_llm() -> Callable[[str], str]:
-    """Return the production LLM callable, mirroring ``creek draft``.
+def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
+    """Return the draft-side LLM callable, routed for *tier* (#958).
 
-    Imported lazily so an absent LLM provider only fails the ``draft``
-    invocation, not the whole server startup. ``state``/``lint``/``mine``
-    must remain callable on hosts without an Anthropic key or running
-    Ollama.
+    Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
+    through the config's :class:`~creek.classify.llm.router.ModelRouter`, so
+    an INTIMATE draft is forced onto the local ``default`` model — or the
+    router raises ``IntimateRoutingError`` rather than egressing the source
+    ids and titles the draft prompt carries. Nothing here re-checks the tier
+    or picks a provider: ``draft_tool`` derives the routing tier from the
+    seed's source fragments and this hands it to the one chokepoint that owns
+    the decision.
+
+    Lazy imports keep the server bootable with no provider configured — only
+    a ``creek.draft`` call then fails, and it fails as a structured refusal.
+    ``state``/``lint``/``mine`` stay callable on hosts with neither an
+    Anthropic key nor a running Ollama.
+
+    Args:
+        tier: The routing tier ``draft_tool`` computed from the caller's
+            ceiling and the seed's source fragments' own classifications.
+
+    Returns:
+        A prompt → completion-text callable bound to the resolved provider.
+
+    Raises:
+        RuntimeError: When the resolved provider is unavailable, or — as
+            :class:`~creek.classify.llm.router.IntimateRoutingError`, a
+            subclass — when intimate content has no local backend to fall
+            back to. ``draft_tool`` turns either into a refusal.
     """
-    from creek.classify.llm import LLMClassifier
+    from creek.classify.llm.providers import build_provider
 
-    config = load_config()
-    # ``config.llm`` is an ``LLMRoutingConfig``; ``LLMClassifier`` declares a
-    # plain ``LLMConfig``. Correcting the type here means choosing a concrete
-    # per-stage model inline — which is precisely the decision
-    # :class:`~creek.classify.llm.router.ModelRouter` owns, and doing it here
-    # would stand up a second provider path with no Intimate-never-cloud gate
-    # on it. Left suppressed until #958 rewires this tool through the router.
-    classifier = LLMClassifier(config.llm)  # type: ignore[arg-type]  # Issue #958
-    if not classifier.available:
+    cfg = load_config().model_router.resolve("generation", tier)
+    provider = build_provider(cfg)
+    if not provider.available:
         msg = (
-            "LLM provider unavailable; cannot generate draft. "
+            "LLM provider unavailable for draft. "
             "Check Ollama or ANTHROPIC_API_KEY configuration."
         )
         raise RuntimeError(msg)
-    return classifier.invoke_prompt
+    return lambda prompt: provider.complete(prompt).text
 
 
 def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
@@ -254,7 +271,7 @@ def _build_reflect_llm_factory() -> _LLMFactory:
 def build_server(
     *,
     vault_path: Path | None = None,
-    draft_llm_factory: Callable[[], Callable[[str], str]] | None = None,
+    draft_llm_factory: DraftLLMFactory | None = None,
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     token_verifier: TokenVerifier | None = None,
@@ -265,9 +282,10 @@ def build_server(
         vault_path: Override vault root. Defaults to
             ``load_config().vault_path`` so the MCP surface honours the
             same configuration as the CLI.
-        draft_llm_factory: Optional factory for the draft LLM. The
-            factory is invoked lazily so only ``creek.draft`` needs an
-            LLM provider.
+        draft_llm_factory: Optional tier-keyed factory for the draft LLM —
+            ``factory(tier)``. Passed straight to ``creek.draft``, which
+            invokes it lazily (and only once it knows which seed it is
+            drafting), so only ``creek.draft`` needs an LLM provider.
         compile_llm_factory: Optional tier-keyed factory for the compile
             LLM — ``factory(tier)``. Passed straight to ``creek.compile``,
             which invokes it lazily (and only after its source-tier gate),
@@ -416,7 +434,7 @@ def build_server(
         """Generate an essay draft from a mined idea."""
         return draft_tool(
             vault_path=vault,
-            llm=factory(),
+            llm_factory=factory,
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,

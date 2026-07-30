@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.models import PrivacyTier
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.author import author_tool
@@ -19,7 +20,7 @@ from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -260,7 +261,7 @@ def test_draft_returns_empty_when_no_seeds(vault: Path) -> None:
     """No seeds → structured empty (not a crash, not a refusal)."""
     result = draft_tool(
         vault_path=vault,
-        llm=lambda prompt: "ignored",
+        llm_factory=lambda tier: lambda prompt: "ignored",
         phase="rising",
     )
     assert result["status"] == "empty"
@@ -271,7 +272,7 @@ def test_draft_writes_audit_entry_for_empty_seed_path(vault: Path) -> None:
     """Audit happens even when the draft cannot proceed (empty seeds)."""
     draft_tool(
         vault_path=vault,
-        llm=lambda prompt: "ignored",
+        llm_factory=lambda tier: lambda prompt: "ignored",
         phase="rising",
         consumer="crawdad",
     )
@@ -325,7 +326,7 @@ def test_draft_success_path_saves_file(
     monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _StubGenerator)
     result = draft_tool(
         vault_path=vault,
-        llm=lambda prompt: "drafted",
+        llm_factory=lambda tier: lambda prompt: "drafted",
         phase="rising",
     )
     assert result["status"] == "ok"
@@ -359,7 +360,7 @@ def test_draft_refuses_when_llm_returns_empty(
     monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _BrokenGenerator)
     result = draft_tool(
         vault_path=vault,
-        llm=lambda prompt: "",
+        llm_factory=lambda tier: lambda prompt: "",
         phase="rising",
     )
     assert result["status"] == "refused"
@@ -388,13 +389,457 @@ def test_draft_refuses_for_out_of_range_index(
     )
     result = draft_tool(
         vault_path=vault,
-        llm=lambda prompt: "x",
+        llm_factory=lambda tier: lambda prompt: "x",
         phase="rising",
         index=99,
     )
     assert result["status"] == "refused"
     assert result["tool"] == "creek.draft"
     assert "out of range" in result["reason"]
+
+
+# ---------------------------------------------------------------------------
+# draft — LLM routing tier (#958)
+# ---------------------------------------------------------------------------
+
+
+class _TierRecordingFactory:
+    """A ``draft_tool`` ``llm_factory`` recording the routing tier it was handed.
+
+    Doubles as the LLM callable it returns, so one object captures both the
+    tier the tool derived (local-vs-cloud routing) and the prompt text that
+    actually reached the model.
+    """
+
+    def __init__(self, body: str = "drafted") -> None:
+        """Start with empty recordings and the canned completion *body*."""
+        self.tiers: list[PrivacyTier] = []
+        self.prompts: list[str] = []
+        self._body = body
+
+    def __call__(self, tier: PrivacyTier) -> Callable[[str], str]:
+        """Record *tier* and return the recording LLM callable."""
+        self.tiers.append(tier)
+        return self._complete
+
+    def _complete(self, prompt: str) -> str:
+        """Record *prompt* and return the canned body."""
+        self.prompts.append(prompt)
+        return self._body
+
+
+def _seed_with_sources(source_fragments: tuple[str, ...]) -> object:
+    """Return an ``IdeaSeed`` naming *source_fragments* as its only sources."""
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+
+    return IdeaSeed(
+        strategy=MiningStrategy.THREAD_TERMINUS,
+        title="Routing seed",
+        source_fragments=source_fragments,
+        threads=(),
+        eddies=(),
+        frequency_affinity=(),
+        brief_description="brief",
+        score=0.5,
+    )
+
+
+def _unexplored_ontology_seed() -> object:
+    """Return the real ``UNEXPLORED_ONTOLOGY`` seed shape: no vault content.
+
+    ``creek/generate/mining.py::_seed_from_ontology_tuple`` (line 1511) builds
+    the title and description purely from ontology enum labels and leaves
+    ``source_fragments`` / ``threads`` / ``eddies`` empty (line 1529), so no
+    fragment, thread, or eddy text reaches the prompt at all.
+    """
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+
+    return IdeaSeed(
+        strategy=MiningStrategy.UNEXPLORED_ONTOLOGY,
+        title="Unexplored: F1 / rising / structural / plain / micro",
+        source_fragments=(),
+        threads=(),
+        eddies=(),
+        frequency_affinity=(),
+        brief_description="a corner you have never inhabited",
+        score=1.0,
+    )
+
+
+def _patch_miner(monkeypatch: pytest.MonkeyPatch, seed: object) -> None:
+    """Force ``draft_tool``'s ``IdeaMiner`` to surface exactly *seed*."""
+    monkeypatch.setattr(
+        "creek_mcp.tools.draft.IdeaMiner",
+        lambda **kwargs: type(
+            "_M",
+            (),
+            {"mine_all": lambda self, vault_path, *, current_phase: [seed]},
+        )(),
+    )
+
+
+def _patch_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub ``DraftGenerator`` so routing tests never touch the skill tree.
+
+    The stub still *calls* the llm it was handed once, so a factory that was
+    invoked but whose result was dropped on the floor is still distinguishable
+    from one that was genuinely wired into generation.
+    """
+    from creek.generate.drafts import Draft
+
+    class _Generator:
+        """Minimal generator returning a fixed draft and saving a stub file."""
+
+        def __init__(self, *, llm: Callable[[str], str], **kwargs: object) -> None:
+            """Record the llm callable; other generator options are ignored."""
+            del kwargs
+            self._llm = llm
+
+        def generate_draft(self, idea: object, *, vault_path: Path) -> Draft:
+            """Call the llm once and return a fixed draft."""
+            del idea, vault_path
+            self._llm("stub prompt")
+            return Draft(
+                title="Routing seed",
+                body="drafted",
+                idea_strategy="thread_terminus",
+                source_fragments=(),
+                threads=(),
+                eddies=(),
+                skill_stack=(),
+                prompt="stub prompt",
+                generated_date=datetime(2026, 5, 11, tzinfo=UTC),
+            )
+
+        def save_draft(self, draft: Draft, vault_path: Path) -> Path:
+            """Write a placeholder draft file and return its path."""
+            del draft
+            target = vault_path / "07-Voice" / "Drafts" / "2026-05-11-routing.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("body", encoding="utf-8")
+            return target
+
+    monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _Generator)
+
+
+def test_draft_routes_personal_sources_above_the_open_ceiling(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``personal`` source outranks an ``open`` ceiling for LLM routing.
+
+    ``creek/generate/drafts.py::_render_fragment_section`` (line 2604) emits
+    ``### {fid}: {fragment.title}`` unconditionally, and at an ``open``
+    ceiling ``filter_fragments_by_tier`` replaces a personal body with
+    ``[Personal-tier summary: {title}]`` rather than dropping the fragment —
+    so the personal fragment's id *and* title reach the prompt even though its
+    body was redacted. The ceiling-derived tier alone therefore understates
+    what reaches the model: an implementation that routed on
+    ``routing_tier(ceiling, None)`` would hand personal titles to the cloud
+    ``generation`` stage on the caller's say-so. The tier must be the more
+    sensitive of the ceiling and the sources' own classifications.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-personal",
+        title="Personal note",
+        privacy_tier="personal",
+    )
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-personal",)))
+    _patch_generator(monkeypatch)
+    factory = _TierRecordingFactory()
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        phase="rising",
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.PERSONAL]
+    assert factory.prompts == ["stub prompt"]
+
+
+def test_draft_prompt_carries_the_personal_title_at_an_open_ceiling(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The payload check behind the routing rule: the real prompt carries it.
+
+    The sibling routing test asserts what ``draft_tool`` *intends*; this one
+    drives the **real** :class:`~creek.generate.drafts.DraftGenerator` and
+    asserts on the bytes that actually reach the model. Under an ``open``
+    ceiling the personal fragment is not dropped — its body is swapped for
+    ``[Personal-tier summary: {title}]`` and rendered under a
+    ``### {id}: {title}`` heading — so the personal fragment's title is in the
+    prompt string verbatim. Without this, the routing rule rests on a reading
+    of the code rather than on its output.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-personal",
+        title="Personal note about my marriage",
+        privacy_tier="personal",
+        body="the private body that must not appear",
+    )
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-personal",)))
+    skills_root = vault / "empty-skills"
+    skills_root.mkdir()
+    factory = _TierRecordingFactory(body="drafted body")
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        skills_root=skills_root,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        phase="rising",
+    )
+
+    assert result["status"] == "ok"
+    assert len(factory.prompts) == 1
+    prompt = factory.prompts[0]
+    assert "Personal note about my marriage" in prompt
+    assert "[Personal-tier summary: " in prompt
+    assert "the private body that must not appear" not in prompt
+    assert factory.tiers == [PrivacyTier.PERSONAL]
+
+
+def test_draft_routes_intimate_sources_local_under_an_all_ceiling(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``intimate`` source routes INTIMATE, which the router forces local.
+
+    ``ALL`` already maps to ``INTIMATE`` via ``CEILING_ROUTING_TIER``, so this
+    pins the whole chain end to end: the tool must key the factory with a
+    :class:`~creek.models.PrivacyTier` at all (the pre-fix factory takes no
+    tier), and it must be the intimate one so
+    :class:`~creek.classify.llm.router.ModelRouter` redirects the cloud
+    ``generation`` stage onto the local ``default`` — or refuses.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-intimate",
+        title="Intimate note",
+        privacy_tier="intimate",
+    )
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-intimate",)))
+    _patch_generator(monkeypatch)
+    factory = _TierRecordingFactory()
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.ALL,
+        phase="rising",
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.INTIMATE]
+
+
+def test_draft_fails_closed_when_no_named_source_resolves(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seed whose named sources do not resolve routes INTIMATE, not OPEN.
+
+    Mirrors ``compile``'s ``max(..., default=PrivacyTier.INTIMATE)``: with no
+    evidence about what the call would carry, the safe assumption is the worst
+    one. The vault deliberately holds an unrelated ``open`` fragment, so an
+    implementation that took the maximum over *every* fragment in the vault
+    (rather than over the seed's named sources) would answer ``OPEN`` here and
+    fail — as would one that treated "no tiers found" as tier zero.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-other",
+        title="Unrelated",
+        privacy_tier="open",
+    )
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-missing",)))
+    _patch_generator(monkeypatch)
+    factory = _TierRecordingFactory()
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        phase="rising",
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.INTIMATE]
+
+
+def test_draft_routes_a_sourceless_seed_by_the_ceiling_alone(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``UNEXPLORED_ONTOLOGY`` seed routes by its ceiling, not fail-closed.
+
+    ``source_fragments == ()`` is not "no tiers resolved" — it is "there is no
+    vault content in this prompt at all". ``mining.py::_seed_from_ontology_tuple``
+    builds that seed's title and description purely from ontology enum labels,
+    so forcing INTIMATE here would push every unexplored-ontology draft onto
+    the local model for no privacy gain whatsoever. The distinction is exactly
+    the ``content_tier is None`` branch of
+    :func:`creek_mcp.tier_ceiling.routing_tier`, and it is the one case where
+    the ``no ids resolved`` fail-closed rule must *not* fire.
+
+    The vault holds an intimate fragment the seed does not name, so an
+    implementation that scanned the vault instead of the seed's sources would
+    answer INTIMATE and fail.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-intimate",
+        title="Intimate note",
+        privacy_tier="intimate",
+    )
+    _patch_miner(monkeypatch, _unexplored_ontology_seed())
+    _patch_generator(monkeypatch)
+    factory = _TierRecordingFactory()
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        phase="rising",
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.OPEN]
+
+
+def test_draft_fails_closed_when_a_source_fragment_has_no_privacy_tier(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source whose frontmatter omits ``privacy_tier`` routes INTIMATE.
+
+    :class:`~creek.models.Fragment` defaults a *missing* ``privacy_tier`` to
+    ``unclassified``, which ranks alongside ``open`` — so reading the tier off
+    the validated model alone fails **open** on exactly the file nobody can
+    vouch for (a hand-edited or legacy fragment). The raw frontmatter is the
+    only place the two cases are still distinguishable, which is why
+    the shared ``fragment_tier`` consults it; draft must agree with compile
+    rather than route the same file two different ways.
+    """
+    metadata = {
+        "type": "fragment",
+        "id": "frag-untiered",
+        "title": "Untiered note",
+        "created": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "ingested": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "eddies": [],
+    }
+    (vault / "01-Fragments" / "Notes" / "frag-untiered.md").write_text(
+        frontmatter.dumps(frontmatter.Post(content="body text", **metadata)),
+        encoding="utf-8",
+    )
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-untiered",)))
+    _patch_generator(monkeypatch)
+    factory = _TierRecordingFactory()
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        phase="rising",
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.INTIMATE]
+
+
+def test_draft_refuses_when_the_router_has_no_local_backend(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``IntimateRoutingError`` becomes a refusal, not an MCP transport error.
+
+    The router raises it — a ``RuntimeError`` subclass — when intimate content
+    hits a cloud stage and ``llm.default`` is also cloud, so there is no local
+    backend to redirect to. That must cross the MCP boundary as the same
+    structured ``refused`` envelope every other draft failure uses; letting it
+    propagate turns an operator misconfiguration into an unhandled exception
+    for the client. The reason must also name no fragment id: the caller
+    learns the provider is misconfigured, not which of their fragments is
+    intimate.
+    """
+    from creek.classify.llm.router import IntimateRoutingError
+
+    _write_fragment(
+        vault,
+        frag_id="frag-intimate",
+        title="Intimate note",
+        privacy_tier="intimate",
+    )
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-intimate",)))
+    _patch_generator(monkeypatch)
+
+    def _explode(tier: PrivacyTier) -> Callable[[str], str]:
+        """Refuse to build a provider, as the router does with no local stage."""
+        del tier
+        raise IntimateRoutingError(stage_provider="anthropic")
+
+    result = draft_tool(
+        vault_path=vault,
+        llm_factory=_explode,
+        privacy_tier_ceiling=TierCeiling.ALL,
+        phase="rising",
+    )
+
+    assert result["status"] == "refused"
+    assert result["tool"] == "creek.draft"
+    assert result["tier_ceiling"] == "all"
+    assert "no local backend" in result["reason"]
+    assert "frag-intimate" not in result["reason"]
+
+
+def test_draft_does_not_build_a_provider_when_it_cannot_draft(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither non-drafting exit path may build an LLM provider.
+
+    Both the "no idea seeds" empty response and the out-of-range-index refusal
+    return before any prompt exists, so invoking the factory would spend a
+    provider handshake (and, on a cloud stage, an API credential) on a call
+    that never drafts. Today's ``draft_tool`` takes an already-built ``llm``
+    and the server hands it ``factory()`` eagerly in the handler
+    (``server.py:419``), so both paths pay that cost unconditionally — this
+    test pins the laziness the tier-keyed factory makes possible.
+    """
+    invocations: list[PrivacyTier] = []
+
+    def _must_not_run(tier: PrivacyTier) -> Callable[[str], str]:
+        """Record the call and fail: nothing here should reach a provider."""
+        invocations.append(tier)
+        msg = "llm_factory must not be invoked when no draft is produced"
+        raise AssertionError(msg)
+
+    empty = draft_tool(
+        vault_path=vault,
+        llm_factory=_must_not_run,
+        phase="rising",
+    )
+    assert empty["status"] == "empty"
+
+    _patch_miner(monkeypatch, _seed_with_sources(("frag-1",)))
+    refused = draft_tool(
+        vault_path=vault,
+        llm_factory=_must_not_run,
+        phase="rising",
+        index=99,
+    )
+    assert refused["status"] == "refused"
+    assert "out of range" in refused["reason"]
+    assert invocations == []
 
 
 def test_author_tool_returns_draft_envelope(vault: Path) -> None:

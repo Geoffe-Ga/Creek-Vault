@@ -414,7 +414,7 @@ def registered_tools(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Tool
         (vault / sub).mkdir(parents=True, exist_ok=True)
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     tools = asyncio.run(server.list_tools())
     return {tool.name: tool for tool in tools}

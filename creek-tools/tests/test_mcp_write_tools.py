@@ -1724,7 +1724,7 @@ def test_compile_routing_fails_closed_when_privacy_tier_key_is_absent(
     covers the *admission* side of the same file. ``ceiling=all`` admits the
     hand-edited / legacy fragment, so the routing tier is the only thing
     standing between its title and a cloud provider;
-    ``creek_mcp.tools.compile._tier_of`` reports ``INTIMATE`` for it and the
+    ``creek_mcp.source_tiers.fragment_tier`` reports ``INTIMATE`` for it and the
     factory must be keyed with exactly that.
     """
     _write_fragment_without_tier(vault, frag_id="frag-legacy")

@@ -54,14 +54,12 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
 from creek.compile.engine import TARGET_KINDS, compile_to_vault
-from creek.models import PrivacyTier
-from creek.vault.reader import iter_vault_fragments
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.source_tiers import max_source_tier, source_tiers
 from creek_mcp.tier_ceiling import (
     TierCeiling,
     refusal_response,
     routing_tier,
-    tier_sensitivity,
     write_tier_allowed,
 )
 
@@ -69,7 +67,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.compile.engine import CompileLLM
-    from creek.models import CompileTargetKind, Fragment
+    from creek.models import CompileTargetKind, PrivacyTier
 
 TOOL_NAME = "creek.compile"
 
@@ -90,18 +88,15 @@ TOOL_NAME = "creek.compile"
 #   from a single admitted parent id a caller can enumerate every child id with
 #   no knowledge of the content. The id space around known content IS sweepable;
 #   only a blind sweep of the full 48-bit space is infeasible.
-# - *Probe cost does NOT leak where the offending fragment sits.* Worth stating
-#   because the symmetry is accidental and a refactor could destroy it:
-#   ``iter_vault_fragments`` materialises the whole directory into a list before
-#   returning, so the rglob + parse cost is paid in full before
-#   ``_survey_sources``'s loop begins. The loop no longer short-circuits
-#   at all — it runs to completion, collecting every requested fragment's tier
-#   before anything is decided — so the probe cost is now uniform *by
-#   construction* rather than resting on that accident. Unlike
-#   ``reflect.py::_resolve_entry``, which walks a raw lazy ``rglob`` and returns
-#   at the match — a genuine timing channel that comment correctly records. If
-#   this gate is ever switched to a lazy loader (see the load-once follow-up),
-#   that channel appears here too and must be re-analysed.
+# - *Probe cost does NOT leak where the offending fragment sits.* The walk that
+#   makes that true left this module with the code it describes (#958): it is
+#   now ``creek_mcp.source_tiers.source_tiers``, whose docstring carries the
+#   full analysis — the loader materialises the whole directory before
+#   returning and the id filter runs to completion, so the cost of a probe is
+#   uniform *by construction* rather than resting on an accident of iteration
+#   order. The reasoning moved rather than being dropped because the property
+#   is now shared: switching that one function to a lazy loader would re-open
+#   the timing channel here and in ``creek.draft`` at the same time.
 #
 # Accepted because the real control is the audit trail, not id entropy: every
 # True probe appends a ``creek.compile`` entry distinguishable from a success
@@ -141,46 +136,11 @@ def _fingerprint(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _tier_of(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
-    """Return *fragment*'s tier, failing closed when the key is absent.
-
-    :class:`~creek.models.Fragment` defaults a *missing* ``privacy_tier``
-    to ``unclassified``, which ranks alongside ``open`` and so would be
-    admitted at every ceiling. Reading the tier off the model alone
-    would therefore fail **open** on exactly the file whose tier nobody
-    can vouch for — a hand-edited or legacy fragment. The raw
-    frontmatter is consulted because it is the only place the two cases
-    are still distinguishable once the model has applied its default.
-
-    This mirrors :func:`creek_mcp.tools.reflect._fragment_tier` (#847)
-    and :func:`creek.classify.privacy_filter.tier_of`, both of which
-    treat an absent tier as ``intimate``. Compile must agree with them:
-    two MCP tools that disagree about the same file is precisely the
-    divergence this module's shared-loader design exists to prevent.
-
-    A fragment carrying an *explicit* ``privacy_tier: unclassified`` —
-    what every pipeline-written, not-yet-classified fragment has — is
-    untouched here and stays admitted at any ceiling. That ranking is
-    deliberate policy owned by ``creek_mcp.tier_ceiling._TIER_RANK``
-    (#923), not by this fail-closed path.
-
-    Args:
-        fragment: The validated fragment as loaded by the shared reader.
-        raw: The file's raw frontmatter, before model defaults applied.
-
-    Returns:
-        ``PrivacyTier.INTIMATE`` when ``privacy_tier`` is absent from
-        *raw*, else the fragment's own classified tier.
-    """
-    if "privacy_tier" not in raw:
-        return PrivacyTier.INTIMATE
-    return fragment.privacy_tier
-
-
 class _SourceGate(NamedTuple):
     """The two signals one walk over the requested source fragments yields.
 
-    Both are derived from the same :func:`_tier_of` reading of the same
+    Both are derived from the same
+    :func:`creek_mcp.source_tiers.fragment_tier` reading of the same
     file, so admission and routing can never disagree about a fragment.
 
     Attributes:
@@ -271,17 +231,13 @@ def _survey_sources(
         names the rank. That invariant is the one new leak surface returning
         the pair creates, so it is stated here rather than left implied.
     """
-    requested = set(fragment_ids)
-    tiers = [
-        _tier_of(fragment, raw)
-        for _path, fragment, _body, raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
-        )
-        if fragment.id in requested
-    ]
+    # Both signals come off one shared survey (#958) so ``creek.compile`` and
+    # ``creek.draft`` can never read the same file's tier two different ways —
+    # and the fail-closed reduction is shared for the same reason.
+    tiers = source_tiers(vault_path, fragment_ids)
     return _SourceGate(
         above_ceiling=any(not write_tier_allowed(tier, ceiling) for tier in tiers),
-        max_tier=max(tiers, key=tier_sensitivity, default=PrivacyTier.INTIMATE),
+        max_tier=max_source_tier(tiers),
     )
 
 
