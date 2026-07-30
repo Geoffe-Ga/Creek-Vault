@@ -271,15 +271,21 @@ def _resolve_entry(
     separately folds it into :func:`_routing_tier` so an admitted INTIMATE
     fragment still routes local. A fragment with the ``privacy_tier`` key
     missing entirely fails closed to INTIMATE (:func:`_fragment_tier`) — but
-    that only fires for hand-edited or legacy files. A normally
-    pipeline-written, not-yet-classified fragment carries an *explicit*
+    that only fires for hand-edited or legacy files, and is refused at
+    every ceiling below ``intimate``. A normally pipeline-written,
+    not-yet-classified fragment carries an *explicit*
     ``privacy_tier: unclassified`` (the ``Fragment`` model default,
-    serialised by every write), which ranks as open and is admitted at any
-    ceiling; that is a separate, deliberate policy owned by
-    ``creek_mcp.tier_ceiling._TIER_RANK`` and
-    :func:`creek.classify.privacy_filter.tier_of`, not by this fail-closed
-    path. A blank result yields ``("", None)``, which the caller turns into
-    a refusal.
+    serialised by every write), which ranks with ``personal`` (#876,
+    extended to the MCP ceiling by #961) and is refused by this same
+    #846 gate at ``ceiling=open`` — it needs at least ``personal`` to be
+    admitted. The distinction between the two cases still matters and is
+    now visible at ``ceiling=personal``: there, an explicit
+    ``unclassified`` entry is admitted while one with a missing key is
+    still refused (routing INTIMATE only, per :func:`_fragment_tier`).
+    That ranking is owned by ``creek_mcp.tier_ceiling._TIER_RANK`` and
+    matches ``creek.classify.privacy_filter._TIER_RANK``, not this
+    fail-closed path. A blank result yields ``("", None)``, which the
+    caller turns into a refusal.
 
     A fragment file that cannot be parsed or even read is skipped, debug-logged,
     and the scan continues (#847) — one hand-edited or half-written file must not

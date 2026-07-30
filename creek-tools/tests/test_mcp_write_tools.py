@@ -1205,18 +1205,45 @@ def test_compile_source_tier_ceiling_matrix(
         assert factory.calls == 0
 
 
-def test_compile_admits_unclassified_source_at_open_ceiling(
+@pytest.mark.parametrize(
+    ("ceiling", "allowed"),
+    [
+        (TierCeiling.OPEN, False),
+        (TierCeiling.PERSONAL, True),
+    ],
+)
+def test_compile_refuses_unclassified_source_at_open_ceiling(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,
+    ceiling: TierCeiling,
+    allowed: bool,
 ) -> None:
-    """An ``unclassified`` source is admitted at ``ceiling=open``.
+    """An ``unclassified`` source needs a ``personal`` ceiling (#961).
 
-    This pins existing, deliberate policy rather than proposing new
-    policy: ``creek_mcp.tier_ceiling._TIER_RANK`` ranks ``unclassified``
-    alongside ``open`` (rank 0), and every ceiling comparison in the MCP
-    surface inherits that. Issue #923 owns any change to the ranking; if
-    it lands, update ``_TIER_RANK`` and this test together — do not
-    weaken the ceiling gate here.
+    Inverted by #961. This test previously asserted that ``ceiling=open``
+    *admitted* an explicitly-unclassified source, because
+    ``creek_mcp.tier_ceiling._TIER_RANK`` ranked ``unclassified``
+    alongside ``open`` (rank 0). It now ranks 1, with ``personal``,
+    matching ``creek.classify.privacy_filter._TIER_RANK``: an untiered
+    fragment is content nobody has vouched for, and every
+    pipeline-written pre-classification fragment carries an *explicit*
+    ``privacy_tier: unclassified`` (the ``Fragment`` model default), so
+    the old ranking let an ``open``-ceiling caller compile a whole
+    freshly-ingested vault. (The docstring here used to cite #923 for the
+    ranking; that was a mis-citation — #923 is the separate bare
+    ``_TIER_RANK`` subscript bug. #961 owns the policy.)
+
+    Both halves are asserted, following
+    :func:`test_compile_fails_closed_when_privacy_tier_key_is_absent`:
+    the refused row pins the reason constant and a never-invoked factory,
+    and the admitted row pins that ``personal`` still gets the work done,
+    so a rank that overshot to ``intimate`` cannot pass.
+
+    Args:
+        vault: The seeded vault fixture.
+        monkeypatch: Used to stub the compile engine on the admitted row.
+        ceiling: The caller's declared ceiling.
+        allowed: Whether *ceiling* must admit the unclassified source.
     """
     _write_fragment(vault, frag_id="frag-src", privacy_tier="unclassified")
     target_path = vault / "02-Threads" / "Active" / "thread-x.md"
@@ -1228,7 +1255,8 @@ def test_compile_admits_unclassified_source_at_open_ceiling(
             target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
         return target_path
 
-    monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
+    if allowed:
+        monkeypatch.setattr("creek_mcp.tools.compile.compile_to_vault", _stub_compile)
     factory = _RecordingLLMFactory()
 
     result = compile_tool(
@@ -1238,11 +1266,16 @@ def test_compile_admits_unclassified_source_at_open_ceiling(
         target_id="thread-x",
         target_title="Thread X",
         llm_factory=factory,
-        privacy_tier_ceiling=TierCeiling.OPEN,
+        privacy_tier_ceiling=ceiling,
     )
 
-    assert result["status"] == "ok"
-    assert factory.calls == 1
+    if allowed:
+        assert result["status"] == "ok"
+        assert factory.calls == 1
+    else:
+        assert result["status"] == "refused"
+        assert result["reason"] == _ABOVE_CEILING_REASON
+        assert factory.calls == 0
 
 
 def _write_fragment_without_tier(vault: Path, *, frag_id: str) -> None:
@@ -1289,18 +1322,25 @@ def test_compile_fails_closed_when_privacy_tier_key_is_absent(
     """A fragment with no ``privacy_tier`` key is treated as ``intimate``.
 
     The :class:`~creek.models.Fragment` model defaults a *missing*
-    ``privacy_tier`` to ``unclassified``, which ranks 0 and would be
-    admitted at every ceiling — so reading the tier off the model alone
-    fails **open** on exactly the hand-edited or legacy file whose tier
-    nobody can vouch for.
+    ``privacy_tier`` to ``unclassified``, which since #961 ranks 1 (with
+    ``personal``) and so would be admitted at ``personal`` and above — so
+    reading the tier off the model alone still fails **open** on exactly
+    the hand-edited or legacy file whose tier nobody can vouch for. That
+    is why ``fragment_tier`` consults the raw frontmatter rather than the
+    validated model: only the raw dict can tell "the key is absent" from
+    "the key says unclassified". The #961 ranking narrowed the blast
+    radius of getting this wrong (``open`` no longer leaks) without
+    removing the need for it — the ``PERSONAL`` row below is the one that
+    would flip if the raw-frontmatter read were dropped.
 
     ``creek.reflect`` already refuses that file closed to ``intimate``
     (``creek_mcp.tools.reflect._fragment_tier``, #847), mirroring
     :func:`creek.classify.privacy_filter.tier_of`. Compile must agree:
     two MCP tools that disagree about the same file is the divergence
     the shared-loader design exists to prevent. Contrast
-    :func:`test_compile_admits_unclassified_source_at_open_ceiling`,
-    where the key is present and explicitly ``unclassified``.
+    :func:`test_compile_refuses_unclassified_source_at_open_ceiling`,
+    where the key is present and explicitly ``unclassified`` — admitted
+    at ``personal``, where this file is refused.
     """
     _write_fragment_without_tier(vault, frag_id="frag-legacy")
     target_path = vault / "02-Threads" / "Active" / "thread-x.md"

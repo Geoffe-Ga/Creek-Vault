@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.1.0"
+CONTRACT_VERSION: Final[str] = "0.2.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft)."""
 
 ONTOLOGY_VERSION: Final[str] = "aptitude-wavelength/2026-05-23"

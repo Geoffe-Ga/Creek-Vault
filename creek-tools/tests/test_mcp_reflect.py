@@ -631,9 +631,14 @@ def test_intimate_entry_ref_is_allowed_under_intimate_ceiling_and_routes_local(
         # The ceiling wins when it is the more sensitive of the two...
         (TierCeiling.INTIMATE, PrivacyTier.OPEN, PrivacyTier.INTIMATE),
         (TierCeiling.ALL, PrivacyTier.OPEN, PrivacyTier.INTIMATE),
-        # ...and on a rank tie, which keeps ``unclassified`` from downgrading
-        # the routing tier below the ceiling's own.
-        (TierCeiling.OPEN, PrivacyTier.UNCLASSIFIED, PrivacyTier.OPEN),
+        # ...and ``unclassified`` now *raises* the routing tier to ``personal``
+        # rather than tying with ``open`` (#961): it ranks with ``personal``,
+        # and is normalised into the routing vocabulary because "unclassified"
+        # is not a routing key. This row is unreachable through ``reflect_tool``
+        # — the #846 gate refuses an unclassified ``entry_ref`` at ``open``
+        # before ``_routing_tier`` runs — which is why it is asserted against
+        # the helper directly (see the docstring below).
+        (TierCeiling.OPEN, PrivacyTier.UNCLASSIFIED, PrivacyTier.PERSONAL),
         # Raw inline ``content`` has no classification: the ceiling alone routes.
         (TierCeiling.OPEN, None, PrivacyTier.OPEN),
         (TierCeiling.PERSONAL, None, PrivacyTier.PERSONAL),
@@ -695,14 +700,42 @@ def test_intimate_entry_ref_is_allowed_under_all_ceiling(tmp_path: Path) -> None
     assert result["status"] == "ok"
 
 
-def test_explicitly_unclassified_entry_ref_is_allowed_under_open_ceiling(
+@pytest.mark.parametrize(
+    ("ceiling", "admitted"),
+    [
+        (TierCeiling.OPEN, False),
+        (TierCeiling.PERSONAL, True),
+    ],
+)
+def test_explicitly_unclassified_entry_ref_is_refused_under_open_ceiling(
     tmp_path: Path,
+    ceiling: TierCeiling,
+    admitted: bool,
 ) -> None:
-    """An explicit ``privacy_tier: unclassified`` is admitted at the OPEN ceiling.
+    """An explicit ``privacy_tier: unclassified`` needs a PERSONAL ceiling (#961).
 
-    ``unclassified`` shares rank 0 with ``open`` in the canonical ranking, so a
-    fragment that was *classified as* unclassified is admissible to the most
-    restrictive ceiling. Paired with the fail-closed test below.
+    Inverted by #961. This test previously asserted the OPEN ceiling *admitted*
+    an explicitly-unclassified fragment, because ``unclassified`` shared rank 0
+    with ``open`` in ``creek_mcp.tier_ceiling._TIER_RANK``. It now ranks 1, with
+    ``personal``: an untiered fragment is content nobody has vouched for, and
+    every pipeline-written pre-classification fragment carries an *explicit*
+    ``privacy_tier: unclassified`` (the ``Fragment`` model default), so the old
+    policy made a whole freshly-ingested vault readable through ``creek.reflect``
+    at ``ceiling=open``.
+
+    Both halves of the new policy are asserted, and the PERSONAL row is the
+    load-bearing one. A refusal at OPEN alone would be satisfied by any rank
+    above 0 — including a fail-closed-to-INTIMATE reading — which would erase
+    the distinction this file depends on: an *explicit* ``unclassified``
+    (rank 1, admitted at ``personal``) versus a *missing* ``privacy_tier`` key
+    (fails closed to INTIMATE, refused at ``personal`` — see
+    :func:`test_untiered_entry_ref_is_refused_fail_closed` below). The PERSONAL
+    row is what keeps those two cases distinguishable.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The caller's declared ceiling.
+        admitted: Whether *ceiling* must admit the unclassified fragment.
     """
     vault = _vault(tmp_path)
     body = "a note I never got round to sorting"
@@ -715,10 +748,16 @@ def test_explicitly_unclassified_entry_ref_is_allowed_under_open_ceiling(
         entry_ref="frag-unclassified",
         llm_factory=factory,
         retrieve=_no_retrieval,
-        privacy_tier_ceiling=TierCeiling.OPEN,
+        privacy_tier_ceiling=ceiling,
     )
-    assert result["status"] == "ok"
-    assert result["notes"][0]["quote"] == body
+    if admitted:
+        assert result["status"] == "ok"
+        assert result["notes"][0]["quote"] == body
+    else:
+        assert body not in json.dumps(result), "unclassified content egressed"
+        assert result["status"] == "refused"
+        assert result["reason"] == _REFUSAL_REASON
+        assert factory.asked_tier is None
 
 
 @pytest.mark.parametrize("ceiling", [TierCeiling.OPEN, TierCeiling.PERSONAL])
@@ -735,10 +774,19 @@ def test_untiered_entry_ref_is_refused_fail_closed(
     most-restrictive tier.
 
     Deliberately paired with
-    :func:`test_explicitly_unclassified_entry_ref_is_allowed_under_open_ceiling`:
-    an *explicit* ``unclassified`` is a classification decision and ranks 0,
-    whereas a *missing* key means the fragment was never classified at all.
-    ``_fragment_tier`` treats that as INTIMATE, so the gate must refuse it.
+    :func:`test_explicitly_unclassified_entry_ref_is_refused_under_open_ceiling`:
+    an *explicit* ``unclassified`` is a classification decision and ranks 1
+    (with ``personal``, #961), whereas a *missing* key means the fragment was
+    never classified at all. ``_fragment_tier`` treats that as INTIMATE, so the
+    gate must refuse it at ``personal`` too.
+
+    That pairing is what makes the PERSONAL row discriminating, and #961 made it
+    sharper rather than weaker. Both cases are now refused at OPEN, so only the
+    PERSONAL ceiling still tells them apart — and there they diverge outright:
+    an explicit ``unclassified`` is **admitted** while a missing key is
+    **refused**. Before #961 the two differed at OPEN and agreed nowhere else;
+    now the discrimination sits exactly on the rank boundary the fail-closed
+    default is supposed to clear.
 
     Scope, stated precisely: this fail-closed covers fragments missing the key
     *entirely* — hand-edited, legacy, or otherwise not written by the pipeline.
@@ -746,10 +794,10 @@ def test_untiered_entry_ref_is_refused_fail_closed(
     serialises via ``model_dump(mode="json")`` and ``Fragment.privacy_tier``
     defaults to ``PrivacyTier.UNCLASSIFIED``, so every pipeline-written
     pre-classification fragment carries an *explicit* ``privacy_tier:
-    unclassified``, which ranks 0 and is admitted at the OPEN ceiling (the test
-    above). Those fragments are governed by the separate, systemic
-    "``unclassified`` ranks as open" policy in :mod:`creek_mcp.tier_ceiling` /
-    :mod:`creek.classify.privacy_filter` — deliberate, and out of scope here.
+    unclassified``. Those fragments are governed by the separate, systemic
+    "``unclassified`` ranks with ``personal``" policy shared by
+    :mod:`creek_mcp.tier_ceiling` and :mod:`creek.classify.privacy_filter`
+    (#876/#961) — deliberate, and out of scope here.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
