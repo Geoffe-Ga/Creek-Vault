@@ -9,7 +9,10 @@ surface and ``--include-tier`` stay in lock-step.
 Two distinct questions are answered here, both off the same ranking:
 
 - *admission* — :func:`tier_allowed` / :func:`write_tier_allowed`: may this
-  content be read (or created) under the caller's ceiling at all?
+  content be read (or created) under the caller's ceiling at all? An
+  explicit ``unclassified`` tier is *not* open-equivalent here: it ranks
+  with ``personal`` (#961), so only a ``personal`` ceiling or broader
+  admits it.
 - *routing* — :func:`routing_tier`: given that it was admitted, which
   :class:`~creek.models.PrivacyTier` must the LLM call be keyed with so
   :class:`creek.classify.llm.router.ModelRouter` applies the
@@ -29,8 +32,10 @@ class TierCeiling(StrEnum):
     """MCP-side ceiling parameter values.
 
     Ordering: ``OPEN`` is the most restrictive (only ``open`` content is
-    visible) and ``ALL`` is the broadest (every tier, including
-    ``unclassified``, is visible).
+    visible) and ``ALL`` is the broadest (every tier is visible, including
+    ``intimate``). ``unclassified`` is not an ``ALL``-only tier — it ranks
+    with ``personal`` (#961), so ``PERSONAL``, ``INTIMATE`` and ``ALL`` all
+    admit it and ``OPEN`` alone refuses it.
     """
 
     OPEN = "open"
@@ -57,13 +62,45 @@ _CEILING_TO_OVERRIDE = {
 }
 
 
-# The one sensitivity ranking in the MCP surface: open/unclassified <
-# personal < intimate. Both the admission predicates and the routing helpers
-# read it through :func:`tier_sensitivity` so a tier can never rank one way
-# for "may I read this?" and another for "where may I send it?".
+# The one sensitivity ranking in the MCP surface:
+# open < personal/unclassified < intimate. Both the admission predicates and
+# the routing helpers read it through :func:`tier_sensitivity` so a tier can
+# never rank one way for "may I read this?" and another for "where may I send
+# it?".
+#
+# #961, following #876, moved UNCLASSIFIED up to rank with PERSONAL. This is
+# the *reader's* caution ordering: an untiered fragment is content nobody has
+# vouched for, and ranking it alongside ``open`` exposed a freshly-ingested,
+# not-yet-classified corpus to an ``open``-ceiling MCP caller — including a
+# remote one. Every fragment carries an explicit ``privacy_tier:
+# unclassified`` until ``creek classify`` or ``creek process`` runs, so that
+# was the whole vault.
+#
+# This table now matches :data:`creek.classify.privacy_filter._TIER_RANK`
+# deliberately: both answer the *reader's* question, and
+# :mod:`creek_mcp.read_gate` exports two canonical gate primitives —
+# ``refuse_above_ceiling`` (which reads this table via :func:`tier_allowed`)
+# and ``iter_admitted_fragments`` (which reads ``privacy_filter``'s) — so a
+# divergence made the two halves of one module disagree about the same
+# fragment.
+#
+# Two OTHER rank tables rank UNCLASSIFIED differently on purpose and must not
+# be "unified" with this one:
+#
+# - :data:`creek.classify.privacy_pass._ESCALATION_RANK` ranks it *below*
+#   OPEN (-1), because in an escalate-only merge it means "no claim made"
+#   rather than "handle carefully" — it must lose every merge so a real tier
+#   can be assigned.
+# - :data:`creek.author.checks._TIER_RANK` ranks it *above* INTIMATE (3),
+#   because there it is the fail-closed rank for a *cited* fragment in the
+#   Writing Desk leak gate.
+#
+# All four are pinned by
+# ``test_unclassified_ranks_differ_by_context_on_purpose`` in
+# ``tests/test_mcp_tier_ceiling.py``.
 _TIER_RANK = {
     PrivacyTier.OPEN: 0,
-    PrivacyTier.UNCLASSIFIED: 0,
+    PrivacyTier.UNCLASSIFIED: 1,
     PrivacyTier.PERSONAL: 1,
     PrivacyTier.INTIMATE: 2,
 }
@@ -96,12 +133,47 @@ def tier_sensitivity(tier: PrivacyTier) -> int:
         tier: The tier to rank.
 
     Returns:
-        ``0`` for ``open`` and ``unclassified``, ``1`` for ``personal``,
-        ``2`` for ``intimate``. A tier the ranking has never heard of is a
-        tier nobody can vouch for, so it ranks *with* ``intimate`` rather
-        than defaulting to ``0`` and being routed to a cloud provider.
+        ``0`` for ``open``; ``1`` for ``personal`` and ``unclassified``
+        (#961); ``2`` for ``intimate``. A tier the ranking has never heard
+        of is a tier nobody can vouch for, so it ranks *with* ``intimate``
+        rather than defaulting to ``0`` and being routed to a cloud
+        provider.
     """
     return _TIER_RANK.get(tier, _TIER_RANK[PrivacyTier.INTIMATE])
+
+
+def _routable_tier(content_tier: PrivacyTier) -> PrivacyTier:
+    """Return *content_tier* expressed in the routing vocabulary (#961).
+
+    Normalises ``UNCLASSIFIED`` to ``PERSONAL``: the same rank in
+    :data:`_TIER_RANK`, expressed in a word a router understands. Mirrors
+    :func:`creek.classify.privacy_filter._effective_tier`, which makes the
+    identical substitution for the body-level filter, and is kept separate
+    from the admission path for the same reason that helper is kept separate
+    from ``tier_of`` — :func:`tier_allowed` must keep ranking the tier that
+    is genuinely on the fragment.
+
+    Provider-neutral today, so this is a vocabulary invariant rather than a
+    routing behaviour change:
+    :meth:`creek.classify.llm.router.ModelRouter._enforce_local_for_intimate`
+    gates ``INTIMATE`` alone, so ``open``, ``personal`` and ``unclassified``
+    all select the same provider. It is load-bearing nonetheless, because it
+    stops an out-of-vocabulary tier reaching ``ModelRouter`` at all: that
+    gate is written as "not intimate, or not cloud", so any value it has no
+    rule for falls through as the *least* restrictive.
+    ``test_routing_tier_answers_only_in_routing_vocabulary`` in
+    ``tests/test_mcp_tier_ceiling.py`` pins it.
+
+    Args:
+        content_tier: The classified tier of the content being sent.
+
+    Returns:
+        ``PERSONAL`` when *content_tier* is ``unclassified``; *content_tier*
+        unchanged otherwise.
+    """
+    if content_tier is PrivacyTier.UNCLASSIFIED:
+        return PrivacyTier.PERSONAL
+    return content_tier
 
 
 def routing_tier(ceiling: TierCeiling, content_tier: PrivacyTier | None) -> PrivacyTier:
@@ -123,18 +195,31 @@ def routing_tier(ceiling: TierCeiling, content_tier: PrivacyTier | None) -> Priv
         content_tier: The classified tier of the content being sent, or
             ``None`` when there is nothing classified to reconcile against
             (raw caller-supplied text). ``None`` must not be read as "tier
-            zero" — it falls back to the ceiling-derived tier.
+            zero" — it falls back to the ceiling-derived tier. An
+            ``unclassified`` tier enters the comparison as ``PERSONAL`` via
+            :func:`_routable_tier`, which is where the reasoning lives.
 
     Returns:
-        The more sensitive of the ceiling-derived tier and *content_tier*.
-        An unrecognised ceiling — like an unrecognised tier (see
+        The more sensitive of the ceiling-derived tier and *content_tier*,
+        always within the routing vocabulary — the three tiers in
+        :data:`CEILING_ROUTING_TIER` plus ``PERSONAL``, i.e. ``open`` /
+        ``personal`` / ``intimate``, never ``unclassified`` (#961). That is
+        a vocabulary invariant, not a routing behaviour change: only
+        ``INTIMATE`` is gated, so ``open``, ``personal`` and
+        ``unclassified`` would all select the same provider today. It is
+        load-bearing anyway, because it keeps an out-of-vocabulary tier away
+        from :class:`~creek.classify.llm.router.ModelRouter`, whose gate
+        treats a tier it has no rule for as the least restrictive. An
+        unrecognised ceiling — like an unrecognised tier (see
         :func:`tier_sensitivity`) — fails closed to
         :attr:`~creek.models.PrivacyTier.INTIMATE`, i.e. local-only.
+        ``test_routing_tier_answers_only_in_routing_vocabulary`` in
+        ``tests/test_mcp_tier_ceiling.py`` pins the invariant.
     """
     ceiling_tier = CEILING_ROUTING_TIER.get(ceiling, PrivacyTier.INTIMATE)
     if content_tier is None:
         return ceiling_tier
-    return max(ceiling_tier, content_tier, key=tier_sensitivity)
+    return max(ceiling_tier, _routable_tier(content_tier), key=tier_sensitivity)
 
 
 def to_privacy_override(ceiling: TierCeiling) -> PrivacyTierOverride:
@@ -150,9 +235,11 @@ def to_privacy_override(ceiling: TierCeiling) -> PrivacyTierOverride:
 def tier_allowed(tier: PrivacyTier, ceiling: TierCeiling) -> bool:
     """Return ``True`` when *tier* is admissible under *ceiling*.
 
-    ``ALL`` admits every tier (including ``unclassified``); other
-    ceilings compare by rank so ``PERSONAL`` admits ``open`` +
-    ``personal`` but rejects ``intimate``. The rank comes from
+    ``ALL`` admits every tier; other ceilings compare by rank, so
+    ``PERSONAL`` admits ``open`` + ``personal`` but rejects ``intimate``,
+    and ``open`` admits ``open`` only. ``PERSONAL`` is the lowest ceiling
+    that admits ``unclassified`` (#961), which ranks with ``personal``
+    rather than with ``open``. The rank comes from
     :func:`tier_sensitivity`, so an unrecognised tier is refused rather
     than raising across the MCP boundary.
     """

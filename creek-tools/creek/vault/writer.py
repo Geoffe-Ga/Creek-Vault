@@ -512,10 +512,14 @@ def _retier_after_rewrite(
       purge engine explicitly excludes the key — so a blanket stamp would bury
       every edited fragment at ``intimate`` forever, with a hand edit of the
       frontmatter the only way back out.
-    * **Resetting to ``unclassified`` is a no-op for exposure.**
-      ``creek_mcp.tier_ceiling`` ranks ``UNCLASSIFIED`` at the same level as
-      ``OPEN``, so a reset fragment stays admissible at an OPEN ceiling —
-      exactly the leak this exists to close.
+    * **Resetting to ``unclassified`` would silently narrow exposure rather
+      than describe the new body.** Since #961, ``creek_mcp.tier_ceiling``
+      ranks ``UNCLASSIFIED`` with ``PERSONAL`` (#876), so a reset fragment
+      would need an operator to re-run ``creek classify`` before an
+      OPEN-ceiling MCP caller could read it again — correct as a side
+      effect of the ranking, but the wrong tool for the job: a reset says
+      nothing about what the *edited* body actually contains, whereas
+      re-deriving keeps the tier truthful about it.
 
     Re-deriving avoids both: the tier always describes the current body, and
     the escalate-only merge preserves operator curation.

@@ -49,12 +49,18 @@ def fragment_tier(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
     """Return *fragment*'s tier, failing closed when the key is absent.
 
     :class:`~creek.models.Fragment` defaults a *missing* ``privacy_tier``
-    to ``unclassified``, which ranks alongside ``open`` and so would be
-    admitted at every ceiling. Reading the tier off the model alone
-    would therefore fail **open** on exactly the file whose tier nobody
-    can vouch for — a hand-edited or legacy fragment. The raw
-    frontmatter is consulted because it is the only place the two cases
-    are still distinguishable once the model has applied its default.
+    to ``unclassified``, which ranks with ``personal`` (#876, extended to
+    the MCP ceiling by #961) and so would be admitted at ``personal`` and
+    above, but refused at ``open``. Reading the tier off the model alone
+    would therefore still fail open relative to the raw file at an
+    ``open`` ceiling — #961 narrowed the blast radius, but did not remove
+    the need to read the raw frontmatter: a *missing* key must still be
+    distinguished from an *explicit* ``unclassified`` and fail all the way
+    closed to INTIMATE, since a hand-edited or legacy fragment with no key
+    at all carries even less assurance than a pipeline-written one that at
+    least says ``unclassified`` out loud. The raw frontmatter is consulted
+    because it is the only place the two cases are still distinguishable
+    once the model has applied its default.
 
     This mirrors :func:`creek_mcp.tools.reflect._fragment_tier` (#847)
     and :func:`creek.classify.privacy_filter.tier_of`, both of which
@@ -64,9 +70,10 @@ def fragment_tier(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
 
     A fragment carrying an *explicit* ``privacy_tier: unclassified`` —
     what every pipeline-written, not-yet-classified fragment has — is
-    untouched here and stays admitted at any ceiling. That ranking is
-    deliberate policy owned by ``creek_mcp.tier_ceiling._TIER_RANK``
-    (#923), not by this fail-closed path.
+    untouched here and now needs a ``personal`` ceiling to be admitted.
+    That ranking is deliberate policy owned by
+    ``creek_mcp.tier_ceiling._TIER_RANK`` (#961), not by this fail-closed
+    path.
 
     Args:
         fragment: The validated fragment as loaded by the shared reader.

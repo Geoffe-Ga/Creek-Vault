@@ -2,7 +2,7 @@
 
 - **Status**: Draft — pending agreement
 - **Date**: 2026-06-30
-- **Contract version**: `0.1.0` (draft)
+- **Contract version**: `0.2.0` (draft)
 - **Ontology version**: `aptitude-wavelength/2026-05-23` (see [Ontology version](#ontology-version))
 - **Driving issues**: [#748](https://github.com/Geoffe-Ga/Creek-Vault/issues/748) (epic), [#749](https://github.com/Geoffe-Ga/Creek-Vault/issues/749) (this doc)
 - **Mirrors**: [`geoffe-ga/adepthood#950`](https://github.com/geoffe-ga/adepthood/issues/950) (Adepthood's required side)
@@ -90,7 +90,7 @@ not this version.
 ### Handshake / capabilities — *Exists* (#750)
 
 A read-only, LLM-free tool that lets a consumer discover, in one call: whether a
-vault is present (`available`), the **contract version** (`0.1.0`, from
+vault is present (`available`), the **contract version** (`0.2.0`, from
 `creek_mcp/contract.py`), the **ontology version**
 (`aptitude-wavelength/2026-05-23`), the **tier model** (the `TierCeiling`
 ceilings and the INTIMATE-never-egresses guarantee), and the **capabilities**
@@ -105,7 +105,7 @@ both sides speak the same contract before any read/write. Return shape:
   "server": "creek-tools-mcp",
   "transport": "stdio",
   "available": true,
-  "contract_version": "0.1.0",
+  "contract_version": "0.2.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
@@ -152,10 +152,20 @@ frequency — without egressing fragment bodies.
 
 | Ceiling | Admits content up to tier |
 |---|---|
-| `open` (default) | open / unclassified only |
-| `personal` | open + personal |
+| `open` (default) | open only |
+| `personal` | open + personal + unclassified |
 | `intimate` | open + personal + intimate |
 | `all` | everything |
+
+> **Amendment (2026-07-30, #961):** `unclassified` (untiered) content now
+> ranks with `personal`, not `open`. It is content nobody has classified,
+> so it needs an explicit `personal` ceiling to be admitted — matching the
+> ranking `creek.classify.privacy_filter` has used since #876. Previously
+> the MCP ceiling ranked it with `open`, so an `open`-ceiling consumer
+> could read untiered content; that is no longer true. Operator remedy: run
+> `creek classify` (or `creek process`) to assign every fragment a
+> deliberate tier — an `open`-ceiling consumer reads nothing from a vault
+> that has been ingested but not yet classified.
 
 - A fragment is admitted only when `rank(tier) <= rank(ceiling)`. **INTIMATE
   (rank 2) is therefore excluded under any ceiling below `intimate`** — this is
@@ -230,4 +240,5 @@ phase.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.2.0` | 2026-07-30 | `unclassified` (untiered) content now ranks with `personal`, not `open`, on the MCP ceiling — matching `creek.classify.privacy_filter` since #876 (#961). `open`-ceiling consumers no longer read untiered content; remedy is `creek classify`. See the amendment note under [Tier ceiling semantics](#tier-ceiling-semantics). |
 | `0.1.0` | 2026-06-30 | Initial draft, mirroring `adepthood#950`. Enumerates capabilities, maps to existing (`creek.ingest`, `creek.classify`) and planned (`creek.handshake`/`reflect`/`wheel`) tools, fixes tier/care/auth/transport semantics, pins ontology version. |

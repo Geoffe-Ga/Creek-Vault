@@ -213,6 +213,14 @@ _INTIMATE_BODY = "CANARY-INTIMATE-BODY-9f3a"
 _PERSONAL_TITLE = "Personal note"
 _PERSONAL_SUMMARY = f"[Personal-tier summary: {_PERSONAL_TITLE}]"
 
+# Used only by the #961 agreement test below. The title is deliberately shared
+# between an ``unclassified`` and a ``personal`` fragment there: the personal
+# summary is derived from the title, so identical titles make "treated exactly
+# as personal" assertable as string equality between the two yielded bodies,
+# with no hardcoded stub format to drift.
+_UNCLASSIFIED_BODY = "CANARY-UNCLASSIFIED-BODY-1d58"
+_TWIN_TITLE = "Twinned note"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -809,7 +817,7 @@ def test_canonical_gate_primitives_name_the_exported_callables() -> None:
     ("tier", "ceiling"),
     [
         (PrivacyTier.OPEN, TierCeiling.OPEN),
-        (PrivacyTier.UNCLASSIFIED, TierCeiling.OPEN),
+        (PrivacyTier.UNCLASSIFIED, TierCeiling.PERSONAL),
         (PrivacyTier.OPEN, TierCeiling.PERSONAL),
         (PrivacyTier.PERSONAL, TierCeiling.PERSONAL),
         (PrivacyTier.INTIMATE, TierCeiling.INTIMATE),
@@ -828,11 +836,15 @@ def test_refuse_above_ceiling_admits_content_within_the_ceiling(
     ranking inside the read gate is exactly how two parts of the MCP surface
     end up disagreeing about whether a fragment is readable.
 
-    ``unclassified`` at ``ceiling=open`` is included on purpose: the MCP-side
-    ranking admits it (``creek_mcp.tier_ceiling._TIER_RANK``), which differs
-    from the reader-caution ranking in ``creek.classify.privacy_filter`` — a
-    deliberate, documented split that this primitive must not quietly
-    re-decide.
+    ``unclassified`` at ``ceiling=personal`` is included on purpose, and #961
+    is why it reads ``personal`` rather than ``open``. The MCP-side ranking
+    (``creek_mcp.tier_ceiling._TIER_RANK``) used to admit ``unclassified`` at
+    ``open``, diverging from the reader-caution ranking in
+    ``creek.classify.privacy_filter``. That split is now **closed**: both rank
+    it with ``personal``, so ``personal`` is the lowest ceiling that admits it.
+    The row stays here for the same reason it was here before — this primitive
+    must not re-decide admission either way, and pinning the tier the two
+    rankings now agree on is what makes a future re-divergence fail here.
     """
     assert (
         refuse_above_ceiling(tool="creek.reflect", content_tier=tier, ceiling=ceiling)
@@ -1063,6 +1075,104 @@ def test_iter_admitted_fragments_tolerates_a_missing_fragments_directory(
     ceiling.
     """
     assert list(iter_admitted_fragments(tmp_path, ceiling)) == []
+
+
+# ---------------------------------------------------------------------------
+# The two primitives must agree with each other (#961)
+#
+# Everything above tests each primitive on its own terms. This section tests
+# the one property neither can establish alone: that a caller who satisfies
+# the ceiling through ``refuse_above_ceiling`` and a caller who satisfies it
+# through ``iter_admitted_fragments`` are told the same thing about the same
+# fragment. They were not, before #961.
+# ---------------------------------------------------------------------------
+
+
+def test_both_gate_primitives_treat_unclassified_exactly_as_personal(
+    tmp_path: Path,
+) -> None:
+    """The two canonical primitives agree about an explicit ``unclassified`` (#961).
+
+    This module's whole premise is that a tool satisfies the ceiling through one
+    of exactly two primitives (:data:`CANONICAL_GATE_PRIMITIVES`) rather than
+    re-deriving policy. That premise is worth nothing if the two primitives
+    disagree — and they did: ``refuse_above_ceiling`` delegates to
+    ``creek_mcp.tier_ceiling.tier_allowed``, which ranked ``unclassified`` with
+    ``open`` and therefore *admitted* it at ``ceiling=open``, while
+    ``iter_admitted_fragments`` delegates to
+    ``creek.classify.privacy_filter.filter_fragments_by_tier``, which has
+    treated the same value as ``personal`` since #876. Two adopters of "the
+    canonical gate" reached opposite conclusions about one fragment. #961 closes
+    that by moving the MCP ranking to 1, with ``personal``.
+
+    "Agree" needs stating carefully, because the primitives are not the same
+    shape: ``refuse_above_ceiling`` is a hard cutoff (admit or refuse) and
+    ``iter_admitted_fragments`` summarises rather than drops. So agreement is
+    asserted as *both treat ``unclassified`` exactly as they treat ``personal``*:
+
+    - the refusal payload for ``unclassified`` must be non-``None`` **and**
+      equal to the one ``personal`` produces at the same ceiling;
+    - the body yielded for the unclassified fragment must equal the body
+      yielded for a ``personal`` fragment with the same title — string
+      equality against a sibling's real treatment, not against a hardcoded
+      ``"[Personal-tier summary: ..."`` this test would have to keep in sync.
+
+    The ``open`` fragment is seeded alongside them so a degenerate filter that
+    summarised or emptied everything — which would satisfy both equalities —
+    still fails.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory, used as the vault root
+            (the seeded fixture holds no unclassified fragment, and adding one
+            to it would change the exact-set assertions its other users make).
+    """
+    _write_fragment(
+        tmp_path,
+        frag_id="frag-unclassified",
+        title=_TWIN_TITLE,
+        body=_UNCLASSIFIED_BODY,
+        privacy_tier="unclassified",
+    )
+    _write_fragment(
+        tmp_path,
+        frag_id="frag-personal-twin",
+        title=_TWIN_TITLE,
+        body=_PERSONAL_BODY,
+        privacy_tier="personal",
+    )
+    _write_fragment(
+        tmp_path,
+        frag_id="frag-open",
+        title="Open note",
+        body=_OPEN_BODY,
+        privacy_tier="open",
+    )
+
+    as_unclassified = refuse_above_ceiling(
+        tool="creek.reflect",
+        content_tier=PrivacyTier.UNCLASSIFIED,
+        ceiling=TierCeiling.OPEN,
+    )
+    as_personal = refuse_above_ceiling(
+        tool="creek.reflect",
+        content_tier=PrivacyTier.PERSONAL,
+        ceiling=TierCeiling.OPEN,
+    )
+    assert as_unclassified is not None, (
+        "refuse_above_ceiling admitted an explicitly-unclassified fragment at "
+        "ceiling=open while iter_admitted_fragments summarises the same "
+        "fragment as personal; the two canonical gates disagree (#961)"
+    )
+    assert as_unclassified == as_personal
+
+    admitted = _admitted_by_id(tmp_path, TierCeiling.OPEN)
+    blob = json.dumps({key: value[1] for key, value in admitted.items()})
+    assert _UNCLASSIFIED_BODY not in blob
+    assert (
+        admitted["frag-unclassified"][1].strip()
+        == admitted["frag-personal-twin"][1].strip()
+    )
+    assert admitted["frag-open"][1].strip() == _OPEN_BODY
 
 
 # ---------------------------------------------------------------------------

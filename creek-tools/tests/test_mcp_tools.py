@@ -720,12 +720,13 @@ def test_draft_fails_closed_when_a_source_fragment_has_no_privacy_tier(
     """A source whose frontmatter omits ``privacy_tier`` routes INTIMATE.
 
     :class:`~creek.models.Fragment` defaults a *missing* ``privacy_tier`` to
-    ``unclassified``, which ranks alongside ``open`` — so reading the tier off
-    the validated model alone fails **open** on exactly the file nobody can
-    vouch for (a hand-edited or legacy fragment). The raw frontmatter is the
-    only place the two cases are still distinguishable, which is why
-    the shared ``fragment_tier`` consults it; draft must agree with compile
-    rather than route the same file two different ways.
+    ``unclassified``, which since #961 ranks alongside ``personal`` — so
+    reading the tier off the validated model alone would route the file nobody
+    can vouch for (a hand-edited or legacy fragment) as ``personal``, i.e.
+    cloud-eligible, rather than local-only. The raw frontmatter is the only
+    place the two cases are still distinguishable, which is why the shared
+    ``fragment_tier`` consults it; draft must agree with compile rather than
+    route the same file two different ways.
     """
     metadata = {
         "type": "fragment",
