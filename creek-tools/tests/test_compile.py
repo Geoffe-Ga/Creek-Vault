@@ -726,6 +726,140 @@ def test_compile_fragments_rejects_non_array_claims() -> None:
         )
 
 
+def test_compile_fragments_rejects_string_claim_elements() -> None:
+    """Bare-string ``claims`` elements are rejected at the parse boundary.
+
+    An LLM returning ``{"claims": ["insight one"]}`` — prose strings
+    where claim objects belong — cleared the list-shape check and then
+    crashed downstream in ``_filter_valid_claims`` with
+    ``AttributeError: 'str' object has no attribute 'get'``. Element
+    types are part of the payload schema, so the rejection belongs at
+    the parse boundary with the other schema errors.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    bad = json.dumps({"claims": ["insight one", "insight two"], "paradoxes": []})
+    llm, _ = _make_llm([bad])
+    with pytest.raises(ValueError, match="must contain JSON objects"):
+        compile_fragments(
+            [(frag, "body")],
+            llm=llm,
+            target_kind="thread",
+            target_id="t",
+            target_title="T",
+        )
+
+
+def test_compile_fragments_rejects_string_paradox_elements() -> None:
+    """Bare-string ``paradoxes`` elements fail under the same guard.
+
+    ``_payload_to_paradox_entries`` calls ``item.get`` exactly the way
+    the claim filter does, so a string paradox crashes identically.
+    Well-formed claims must not rescue a payload whose paradoxes are
+    malformed — both arrays are validated, not just the first one.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    bad = json.dumps(
+        {
+            "claims": [{"id": "c1", "text": "X", "fragment_ids": ["frag-aaa"]}],
+            "paradoxes": ["they contradict"],
+        },
+    )
+    llm, _ = _make_llm([bad])
+    with pytest.raises(ValueError, match="must contain JSON objects"):
+        compile_fragments(
+            [(frag, "body")],
+            llm=llm,
+            target_kind="thread",
+            target_id="t",
+            target_title="T",
+        )
+
+
+def test_compile_fragments_rejects_mixed_claim_elements() -> None:
+    """One bad element rejects the whole payload; the good claim is not kept.
+
+    Whole-payload rejection is the deliberate design decision here, and
+    this test is where it is encoded. The alternative — silently
+    dropping the bad element and compiling the survivors — would let a
+    truncated or prose-contaminated response write a compiled page whose
+    body is wiped down to just the title while stale provenance survives
+    in frontmatter. A quietly corrupted note is worse than a loud
+    failure the operator can retry, so the parser refuses the payload
+    whole rather than salvaging part of it.
+
+    This is distinct from ``_filter_valid_claims``, which keeps its
+    silent-drop semantics for structurally valid claim objects that are
+    merely incomplete (see
+    ``test_compile_fragments_skips_claim_with_missing_id``).
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload: dict[str, object] = {
+        "claims": [
+            {"id": "c1", "text": "X", "fragment_ids": ["frag-aaa"]},
+            "a bare string",
+        ],
+        "paradoxes": [],
+    }
+    llm, _ = _make_llm([json.dumps(payload)])
+    with pytest.raises(ValueError, match="must contain JSON objects"):
+        compile_fragments(
+            [(frag, "body")],
+            llm=llm,
+            target_kind="thread",
+            target_id="t",
+            target_title="T",
+        )
+
+
+def test_compile_to_vault_leaves_existing_page_untouched_on_string_claims(
+    vault: Path,
+) -> None:
+    """A malformed re-compile aborts before it touches the page on disk.
+
+    ``compile_to_vault`` parses the LLM payload before ``_write_compiled_page``
+    runs, so a schema violation on a re-run must leave the previously
+    compiled page byte-identical. This pins the conservative
+    abort-before-write contract and guards against any future slide
+    toward drop-the-bad-element-and-continue, which would rewrite the
+    page with a hollowed-out body.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    _write_fragment_to_vault(vault, frag, "body")
+    good = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "Stable claim.",
+                "fragment_ids": ["frag-aaa"],
+            },
+        ],
+    )
+    bad = json.dumps({"claims": ["insight one"], "paradoxes": []})
+    llm, _ = _make_llm([good, bad])
+
+    target = compile_to_vault(
+        fragment_ids=["frag-aaa"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-untouched",
+        target_title="Untouched",
+        llm=llm,
+    )
+    before = target.read_text(encoding="utf-8")
+    assert "Stable claim." in before
+
+    with pytest.raises(ValueError, match="must contain JSON objects"):
+        compile_to_vault(
+            fragment_ids=["frag-aaa"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="thread-untouched",
+            target_title="Untouched",
+            llm=llm,
+        )
+    assert target.read_text(encoding="utf-8") == before
+
+
 def test_compile_fragments_skips_claim_with_missing_id() -> None:
     """Claims with a missing or empty ``id`` are dropped before body render.
 

@@ -127,7 +127,8 @@ def compile_fragments(
 
     Raises:
         ValueError: If *target_kind* is not one of the supported
-            compiled-page surfaces.
+            compiled-page surfaces, or if the LLM payload's ``claims``
+            or ``paradoxes`` are not arrays of JSON objects.
     """
     _validate_target_kind(target_kind)
     pairs = list(fragments_with_bodies)
@@ -455,6 +456,9 @@ def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
     if not isinstance(claims, list) or not isinstance(paradoxes, list):
         msg = "Compile LLM payload claims/paradoxes must be arrays."
         raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
+    if any(not isinstance(item, dict) for item in (*claims, *paradoxes)):
+        msg = "Compile LLM payload claims/paradoxes must contain JSON objects."
+        raise ValueError(msg)
     return {"claims": list(claims), "paradoxes": list(paradoxes)}
 
 
