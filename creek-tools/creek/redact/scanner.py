@@ -34,7 +34,11 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
-from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
+from creek.redact.patterns import (
+    HIGH_ENTROPY_MIN_RUN,
+    PATTERN_METADATA,
+    REDACTION_PATTERNS,
+)
 
 HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
 """Pattern key used by the generic high-entropy detector."""
@@ -43,6 +47,28 @@ HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
 # so reports and the detector cannot drift apart silently.
 HIGH_ENTROPY_CANDIDATE = PATTERN_METADATA[HIGH_ENTROPY_PATTERN_NAME].pattern
 """Substring shape for the generic-secret detector (≥20 base64url chars)."""
+
+_LOG2_MIN_RUN: float = math.log2(HIGH_ENTROPY_MIN_RUN)
+"""``log2`` of the sub-run window width, precomputed for the window scan.
+
+Also the hard ceiling on any window's entropy: a window of
+``HIGH_ENTROPY_MIN_RUN`` characters cannot carry more than
+``log2(HIGH_ENTROPY_MIN_RUN)`` bits/char even when every character in it
+is distinct.
+"""
+
+_COUNT_LOG_TABLE: tuple[float, ...] = tuple(
+    count * math.log2(count) if count else 0.0
+    for count in range(HIGH_ENTROPY_MIN_RUN + 1)
+)
+"""Lookup of ``c * log2(c)`` for every count a fixed-width window can hold.
+
+A character's count inside a window of ``HIGH_ENTROPY_MIN_RUN`` characters
+is bounded by the window width, so the table needs no more entries than
+that. Index ``0`` is defined as ``0.0`` — the limit of ``c * log2(c)`` as
+``c`` approaches zero — which lets the sliding window drop a character to
+a zero count without a special case.
+"""
 
 _ENTROPY_FLOOR_BITS = 2.5
 """Lower bound (bits/char) for the entropy threshold at min_confidence=0.0.
@@ -279,6 +305,16 @@ class RedactionScanner:
         ``0.0`` flags any ≥20-char base64url-ish run, ``1.0`` requires the
         substring to be effectively random.
 
+        Gating is delegated to :func:`has_high_entropy_region`, so a run
+        counts as high-entropy when the whole run clears the threshold
+        **or** when any contiguous ``HIGH_ENTROPY_MIN_RUN``-character
+        window of it does. Averaging over a whole run alone let a
+        predictable neighbour mask a genuine secret (Issue #942). What
+        gets reported is still the whole candidate run, never the hot
+        sub-window: the match is hashed for deduplication, and hashing a
+        fragment would neither dedupe against nor describe the span that
+        ``--apply`` removes.
+
         Args:
             file_path: Path to the file being scanned (passed through to
                 the resulting :class:`RedactionMatch`).
@@ -294,7 +330,7 @@ class RedactionScanner:
             text = candidate.group()
             if self._is_allowlisted(text):
                 continue
-            if shannon_entropy(text) < threshold:
+            if not has_high_entropy_region(text, threshold):
                 continue
             results.append(
                 RedactionMatch(
@@ -644,6 +680,21 @@ class RedactionScanner:
         return "\n".join(lines)
 
 
+def _entropy_from_counts(counts: dict[str, int], length: int) -> float:
+    """Return the Shannon entropy of a string given its character counts.
+
+    Args:
+        counts: Character frequencies of a non-empty string.
+        length: Total number of characters the counts were taken over.
+
+    Returns:
+        Entropy in bits per character.
+    """
+    return -sum(
+        (count / length) * math.log2(count / length) for count in counts.values()
+    )
+
+
 def shannon_entropy(text: str) -> float:
     """Return the Shannon entropy (bits/char) of *text*.
 
@@ -655,11 +706,102 @@ def shannon_entropy(text: str) -> float:
     """
     if not text:
         return 0.0
+    return _entropy_from_counts(Counter(text), len(text))
+
+
+def has_high_entropy_region(text: str, threshold: float) -> bool:
+    """Report whether *text* carries a dense enough region to be a secret.
+
+    The single decision point shared by ``--scan``
+    (:meth:`RedactionScanner._scan_high_entropy`) and ``--apply``
+    (:meth:`creek.redact.redactor.Redactor._collect_high_entropy_spans`),
+    so the two cannot drift apart.
+
+    A run qualifies when its *whole-run* Shannon entropy reaches
+    *threshold*, or when any contiguous window of exactly
+    :data:`~creek.redact.patterns.HIGH_ENTROPY_MIN_RUN` characters does.
+    The window gate exists because concatenation averages: gluing
+    predictable filler to a genuine secret drags the whole-run average
+    below the threshold and used to hide the secret from both call sites
+    (Issue #942). The window width equals the candidate regex's own
+    repetition floor, so the invariant restored is precisely "a run the
+    detector would flag standing alone stays flagged when concatenated to
+    a neighbour".
+
+    Args:
+        text: The candidate run to measure.
+        threshold: Entropy bar in bits/char, from
+            :func:`entropy_threshold`. A value landing exactly on the bar
+            counts as clearing it.
+
+    Returns:
+        ``True`` when the whole run or any window of it reaches
+        *threshold*; ``False`` for the empty string.
+    """
+    if not text:
+        return False
+
     counts = Counter(text)
-    length = len(text)
-    return -sum(
-        (count / length) * math.log2(count / length) for count in counts.values()
-    )
+    if _entropy_from_counts(counts, len(text)) >= threshold:
+        return True
+
+    # At or below the window width the only window is the whole run,
+    # which the check above already decided.
+    if len(text) <= HIGH_ENTROPY_MIN_RUN:
+        return False
+
+    # Entropy is bounded above by log2(distinct symbols), and a window can
+    # hold neither more symbols than the run has nor more than its own
+    # width. When even that ceiling falls short, no window can reach the
+    # bar. The comparison is strict: a perfectly uniform window *attains*
+    # the ceiling, so an exact tie must still be scanned. This is also why
+    # the gate is provably inert at ``min_confidence=1.0``, where the
+    # threshold (4.5) exceeds log2(HIGH_ENTROPY_MIN_RUN).
+    if math.log2(min(len(counts), HIGH_ENTROPY_MIN_RUN)) < threshold:
+        return False
+
+    return _window_entropy_clears(text, threshold)
+
+
+def _window_entropy_clears(text: str, threshold: float) -> bool:
+    """Slide a fixed-width window over *text*, testing entropy at each step.
+
+    Each step costs O(1) rather than O(window width): for a window of
+    fixed width ``L`` the entropy is exactly ``log2(L) - acc / L`` where
+    ``acc`` is ``sum(c * log2(c))`` over the window's character counts, so
+    only the outgoing and incoming characters' contributions need
+    adjusting. Re-measuring each window from scratch instead is roughly
+    48x slower on a token-dense body.
+
+    Args:
+        text: A run strictly longer than
+            :data:`~creek.redact.patterns.HIGH_ENTROPY_MIN_RUN`.
+        threshold: Entropy bar in bits/char; an exact tie clears it.
+
+    Returns:
+        ``True`` when any window reaches *threshold*.
+    """
+    width = HIGH_ENTROPY_MIN_RUN
+    counts: Counter[str] = Counter(text[:width])
+    acc = sum(_COUNT_LOG_TABLE[count] for count in counts.values())
+    if _LOG2_MIN_RUN - acc / width >= threshold:
+        return True
+
+    for index in range(width, len(text)):
+        outgoing = text[index - width]
+        leaving = counts[outgoing]
+        acc += _COUNT_LOG_TABLE[leaving - 1] - _COUNT_LOG_TABLE[leaving]
+        counts[outgoing] = leaving - 1
+
+        incoming = text[index]
+        arriving = counts[incoming]
+        acc += _COUNT_LOG_TABLE[arriving + 1] - _COUNT_LOG_TABLE[arriving]
+        counts[incoming] = arriving + 1
+
+        if _LOG2_MIN_RUN - acc / width >= threshold:
+            return True
+
+    return False
 
 
 def entropy_threshold(min_confidence: float) -> float:

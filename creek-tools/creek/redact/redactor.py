@@ -14,16 +14,28 @@ detector inside that same union is what stops a regex match that covers
 only *part* of a high-entropy run from leaving the remainder — now too
 short for the detector to re-find — in cleartext (Issue #909).
 
-That union alone is not sufficient, because the entropy detector only
-fires when the *whole* run clears the confidence-derived threshold: a
-key with a low-entropy tail (or any operator who raises
-``min_confidence`` to cut false positives) would reopen the same leak.
-So spans are also **snapped to token boundaries** before merging — a
-span whose edge falls strictly inside a ``HIGH_ENTROPY_CANDIDATE`` run
-is widened to that run's edge, making the fix boundary-driven rather
-than threshold-driven. Runs the operator explicitly allowlisted are
-excluded from snapping: user intent wins, and a regex match inside such
-a run still redacts its own span unwidened.
+The coverage is layered, and each layer is needed. The entropy detector
+itself has two gates: it fires when the *whole* run clears the
+confidence-derived threshold, and also when any contiguous
+``HIGH_ENTROPY_MIN_RUN``-character window of the run does. The second
+gate exists because concatenation averages — predictable filler glued to
+a genuine secret used to drag the whole-run average below the bar and
+hide the secret outright (Issue #942).
+
+Even both entropy gates together are not sufficient, because a run can
+fail both and still need covering. A documented AWS example key followed
+by fourteen repeats of a single character measures 3.14 bits/char
+whole-run with no clearing window, so the entropy detector contributes
+no span at all — yet an ``api_key`` match covers only the key half and
+would leave the tail of that same token in cleartext. Raising
+``min_confidence`` to cut false positives widens that class of run. So
+spans are also **snapped to token boundaries** before merging, as the
+threshold-independent backstop (Issue #909): a span whose edge falls
+strictly inside a ``HIGH_ENTROPY_CANDIDATE`` run is widened to that
+run's edge, making the last layer boundary-driven rather than
+threshold-driven. Runs the operator explicitly allowlisted are excluded
+from snapping: user intent wins, and a regex match inside such a run
+still redacts its own span unwidened.
 
 A consequence worth stating plainly: ``--apply`` may therefore redact
 slightly **more** than ``--scan`` reported, because snapping widens on
@@ -48,8 +60,8 @@ from creek.redact.scanner import (
     HIGH_ENTROPY_PATTERN_NAME,
     RedactionMatch,
     entropy_threshold,
+    has_high_entropy_region,
     post_validate,
-    shannon_entropy,
 )
 
 _SEVERITY_RANKS: dict[str, int] = {
@@ -316,13 +328,19 @@ class Redactor:
     ) -> list[_Span]:
         """Widen every span that bisects a contiguous high-entropy run.
 
-        The entropy detector only emits a span when the *whole* run
-        clears :func:`~creek.redact.scanner.entropy_threshold`, so a
-        low-entropy tail appended to a secret (or any threshold raised
-        via :pyattr:`RedactionConfig.min_confidence`) would otherwise
-        leave part of a single contiguous token in cleartext after a
-        regex matched only its prefix. Snapping makes the fix
-        boundary-driven instead of threshold-driven (Issue #909).
+        The entropy detector emits a span when the *whole* run clears
+        :func:`~creek.redact.scanner.entropy_threshold` or when any
+        contiguous ``HIGH_ENTROPY_MIN_RUN``-character window of it does
+        (Issue #942) — but a run can fail *both* of those gates and still
+        need covering. A documented AWS example key followed by fourteen
+        repeats of a single character measures 3.14 bits/char whole-run
+        with no clearing window, so the detector contributes no span at
+        all, and a regex matching only the key half would leave the tail
+        of that same token in cleartext; raising
+        :pyattr:`RedactionConfig.min_confidence` widens that class of
+        run. Snapping is the layer beneath both entropy gates, making
+        that coverage boundary-driven instead of threshold-driven
+        (Issue #909).
 
         Runs on the false-positive allowlist are excluded, so an
         explicitly allowlisted token is never widened onto — user intent
@@ -418,16 +436,23 @@ class Redactor:
 
         The gating mirrors
         :meth:`creek.redact.scanner.RedactionScanner._scan_high_entropy`
-        exactly — the shared ``HIGH_ENTROPY_CANDIDATE`` regex, the same
-        allowlist check, and the same
+        *by construction* — the shared ``HIGH_ENTROPY_CANDIDATE`` regex,
+        the same allowlist check, and one
+        :func:`~creek.redact.scanner.has_high_entropy_region` helper
+        called from both sites against the same
         :func:`~creek.redact.scanner.entropy_threshold` derived from
-        :pyattr:`RedactionConfig.min_confidence` — so a ``--scan`` finding
-        cannot survive a ``--apply`` step. ``post_validate`` is
-        deliberately *not* consulted: no validator is registered for
-        ``high_entropy_string`` (it would return ``True`` unconditionally)
-        and ``_scan_high_entropy`` does not call it either, so calling it
-        here would both diverge from the scanner and add a
-        permanently-true branch.
+        :pyattr:`RedactionConfig.min_confidence`. Because the entropy
+        decision lives in a single function rather than in two
+        hand-synchronised copies, scan/apply parity cannot drift: a
+        ``--scan`` finding cannot survive a ``--apply`` step, and
+        ``--apply`` cannot start firing on runs ``--scan`` reported as
+        clean.
+
+        ``post_validate`` is deliberately *not* consulted: no validator
+        is registered for ``high_entropy_string`` (it would return
+        ``True`` unconditionally) and ``_scan_high_entropy`` does not
+        call it either, so calling it here would both diverge from the
+        scanner and add a permanently-true branch.
 
         Offsets are taken against the whole *content* — never per line —
         so the spans can be unioned with the regex spans that
@@ -441,8 +466,11 @@ class Redactor:
                 stays deterministic.
 
         Returns:
-            Spans for every candidate that is not allowlisted and whose
-            Shannon entropy clears the configured threshold.
+            Spans for every candidate that is not allowlisted and that
+            has a high-entropy region — the whole run, or any contiguous
+            ``HIGH_ENTROPY_MIN_RUN``-character window of it — clearing
+            the configured threshold. The span is always the whole
+            candidate run, never the hot sub-window.
         """
         threshold = entropy_threshold(self.config.min_confidence)
         spans: list[_Span] = []
@@ -450,7 +478,7 @@ class Redactor:
             text = candidate.group()
             if self._is_allowlisted(text):
                 continue
-            if shannon_entropy(text) < threshold:
+            if not has_high_entropy_region(text, threshold):
                 continue
             spans.append(
                 _Span(

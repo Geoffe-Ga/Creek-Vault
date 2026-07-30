@@ -39,7 +39,7 @@ The pattern set lives in `creek.redact.patterns.PATTERN_METADATA` and currently 
 - Discord bot tokens (three dot-separated base64url segments).
 - Stripe keys (`sk_live_…`, `sk_test_…`, `pk_…`, `rk_…`).
 - Anthropic keys (`sk-ant-…`) and OpenAI project keys (`sk-proj-…`).
-- Generic high-entropy strings (≥20 chars, threshold from `min_confidence`).
+- Generic high-entropy strings (≥20 chars). A run is flagged when its *whole-run* Shannon entropy clears the `min_confidence`-derived threshold, or when any contiguous 20-character window of it does — so a secret can't be hidden by gluing predictable filler alongside it.
 - Email addresses and `email:password` combos.
 - US phone numbers.
 - Social Security numbers.
@@ -59,7 +59,7 @@ Configuration in `RedactionConfig`:
 | `false_positive_allowlist`  | Strings whose presence cancels a match (test fixtures, sample keys). |
 | `supported_extensions`      | File extensions the scanner walks. |
 | `exclude_patterns`          | Path/dir name fragments to skip (`.git`, `node_modules`). |
-| `min_confidence`            | Generic high-entropy threshold; `0.0` flags any base64url-ish ≥20 chars, `1.0` requires near-random. Default `0.6`. |
+| `min_confidence`            | Generic high-entropy threshold; `0.0` flags any base64url-ish ≥20 chars, `1.0` requires near-random. Default `0.6` (3.7 bits/char), governing both the whole-run and the sub-run window gate — see [What `--apply` does](#what---apply-does). |
 | `replacement_template`      | Marker template used by `--apply`; must contain `{name}`. Default `[REDACTED:{name}]`. |
 
 ## Output formats
@@ -92,12 +92,21 @@ For every queued match:
    merging, any match whose start or end falls strictly inside a
    contiguous high-entropy candidate run (base64url-ish, 20+ characters)
    is widened out to that run's edge, so a match can never bisect one
-   token. This holds regardless of `min_confidence`: without it, a
-   low-entropy tail glued to a secret (e.g. an AWS key followed by a run
-   of the same character) would evade the entropy detector entirely and
-   leak in cleartext. Strings on `false_positive_allowlist` are exempt
-   from this widening — a regex match inside such a string still redacts
-   only its own span.
+   token. The entropy detector itself is layered: a candidate run is
+   flagged when its *whole-run* Shannon entropy clears the
+   `min_confidence`-derived threshold, or when any contiguous
+   20-character window of it does (issue #942) — so gluing predictable
+   filler to a genuine secret can no longer drag the whole-run average
+   below the bar and hide it from either `--scan` or `--apply`. Snapping
+   is the threshold-independent backstop beneath both entropy gates, for
+   runs that clear neither: an AWS example key followed by fourteen
+   repeats of a single character measures 3.14 bits/char whole-run and
+   has no clearing 20-character window, so the entropy detector
+   contributes no span at all — only snapping keeps a regex match that
+   covers just the key half from leaving that tail in cleartext (issue
+   #909). Strings on `false_positive_allowlist` are exempt from this
+   widening — a regex match inside such a string still redacts only its
+   own span.
 2. Marks the queue entry as `applied: true` and stamps the timestamp.
 3. Refuses to write through symlinks (path-traversal guard): before any
    file is read or rewritten the source tree is walked and the run is
@@ -112,6 +121,23 @@ directly to a longer token is removed whole as a single
 fail-closed behaviour — a missed secret is unrecoverable once written,
 whereas over-redaction is visible in the output and fixable by adding the
 token to `false_positive_allowlist`.
+
+The sub-run window gate has a measured over-redaction cost, from a sweep
+of this repository (~9.9 MB of `.md`, `.py`, `.txt`, `.yaml`, `.toml`,
+`.json`; 29,533 candidate runs, 9,825 flagged before the gate): it flags
+**+928 runs (+9.4%)**, concentrated in code identifiers (`.py`: +876);
+ordinary markdown prose rises only **+3.0%** (+31 of 1,028). Every newly
+flagged run contains a 20-character substring the detector already
+flagged when that substring stood alone, so this is the existing
+false-positive rate applied consistently, not a new class of false
+positive. By `min_confidence`: `0.0` → +0%, `0.4` → +1.1%, `0.6`
+(default) → +9.4%, `0.8` → +1.2%, `1.0` → +0%.
+
+This cost is the accepted side of the same fail-closed trade-off: the
+alternative considered and rejected was restricting the window scan to
+runs of 40+ characters, which measured a **0%** detection rate for a
+full 20-character secret hidden behind a 12–19 character masker — a
+constructible, total, silent leak.
 
 `--dry-run` walks the queue without modifying any source file — useful for sanity-checking a big batch before committing.
 
