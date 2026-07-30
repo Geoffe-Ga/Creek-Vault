@@ -360,3 +360,61 @@ def test_unclassified_ranks_differ_by_context_on_purpose() -> None:
         _AUTHOR_LEAK_RANK[PrivacyTier.UNCLASSIFIED]
         > _AUTHOR_LEAK_RANK[PrivacyTier.INTIMATE]
     )
+
+
+def test_privacy_filter_and_mcp_tier_sensitivity_agree_on_every_tier() -> None:
+    """The two reader-side ``tier_sensitivity`` tables agree, tier for tier (#962).
+
+    #962 moves ``fragment_tier`` and ``max_source_tier`` out of
+    :mod:`creek.classify.privacy_filter` into
+    :mod:`creek.classify.privacy_filter`, so ``creek.compile.engine`` can
+    derive its own routing tier without importing the MCP package.
+    ``max_source_tier`` reduces with ``max(..., key=tier_sensitivity)``, so
+    after the move MCP **routing** ranks tiers through *creek's* table while
+    MCP **admission** (:func:`tier_allowed` / ``write_tier_allowed``) still
+    ranks them through the MCP's.
+
+    Those two rankings were incidentally equal before and are load-bearing
+    now. If they diverged, ``creek_mcp.tools.compile`` could admit a batch
+    under one ordering and then route it as though its most sensitive member
+    were a different tier — precisely the "admission and routing disagree
+    about the same fragment" failure the shared-loader design exists to
+    prevent.
+
+    **This does not license merging the tables.** Two of the four rankings
+    pinned by :func:`test_unclassified_ranks_differ_by_context_on_purpose`
+    rank ``UNCLASSIFIED`` differently *on purpose* — the escalate-only merge
+    below ``OPEN``, the Writing Desk leak gate above ``INTIMATE``. Agreement
+    is asserted here for the two reader-side tables only, and asserting it
+    is exactly what lets them stay two deliberate declarations rather than
+    collapsing into one unexamined import.
+
+    The absolute ranks are pinned alongside the equality: two tables
+    agreeing on a *wrong* ranking would satisfy equality on its own.
+    """
+    # Imported locally rather than at module scope: this module's top-level
+    # ``tier_sensitivity`` is the MCP one that ~a dozen tests here call by
+    # bare name, and adding a second import of the same name — even aliased
+    # — invites a later edit to shadow it silently.
+    from creek.classify.privacy_filter import (
+        tier_sensitivity as creek_tier_sensitivity,
+    )
+
+    expected = {
+        PrivacyTier.OPEN: 0,
+        PrivacyTier.UNCLASSIFIED: 1,
+        PrivacyTier.PERSONAL: 1,
+        PrivacyTier.INTIMATE: 2,
+    }
+    # Every enum member, not a hand-picked subset: a tier added later with no
+    # entry in one of the two tables has to fail here.
+    assert set(PrivacyTier) == set(expected)
+    assert {tier: creek_tier_sensitivity(tier) for tier in PrivacyTier} == expected
+    assert {tier: tier_sensitivity(tier) for tier in PrivacyTier} == expected
+
+    # Both must fail closed identically on a tier neither table has heard of.
+    # A divergence there would route an out-of-vocabulary tier to a cloud
+    # provider on one side while refusing to admit it on the other.
+    unknown = cast("PrivacyTier", "not-a-tier")
+    assert creek_tier_sensitivity(unknown) == tier_sensitivity(unknown)
+    assert creek_tier_sensitivity(unknown) == expected[PrivacyTier.INTIMATE]

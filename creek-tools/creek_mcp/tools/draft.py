@@ -38,9 +38,12 @@ site, all of them load-bearing:
 - **The derived tier never leaves this module.** It must not appear in
   any response, refusal reason, or audit payload: echoing it would hand
   the caller a per-call tier-classification oracle over the corpus — the
-  same invariant :mod:`creek_mcp.tools.compile` documents for its
-  ``max_tier``. The audit append records only the caller's own declared
-  ceiling, and an ``ok`` response carries no tier at all.
+  same invariant :mod:`creek_mcp.tools.compile` documents in
+  :func:`~creek_mcp.tools.compile._survey_sources`, where since #962 it
+  holds structurally: that wrapper derives no tier at all, because the
+  compile engine derives its own. The audit append records only the
+  caller's own declared ceiling, and an ``ok`` response carries no tier
+  at all.
 
   One narrow exception, stated rather than left implied because the
   claim above would otherwise be false: when the router refuses, the
@@ -61,11 +64,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
+from creek.classify.privacy_filter import max_source_tier, source_tiers
 from creek.generate.drafts import DraftGenerator
 from creek.generate.mining import IdeaMiner
 from creek.models import Phase, PrivacyTier
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.source_tiers import max_source_tier, source_tiers
 from creek_mcp.tier_ceiling import (
     TierCeiling,
     refusal_response,
@@ -126,7 +129,7 @@ def _source_routing_tier(
 
     **An empty ``source_fragments`` is not the same as "nothing
     resolved".** The distinction has to be made *before* the survey runs,
-    because :func:`creek_mcp.source_tiers.source_tiers` returns an empty
+    because :func:`creek.classify.privacy_filter.source_tiers` returns an empty
     list for both cases and the two must route differently:
 
     - ``source_fragments == ()`` means there is no vault content in this
@@ -137,10 +140,12 @@ def _source_routing_tier(
       ontology enum labels. Failing closed to ``INTIMATE`` here would
       push every unexplored-ontology draft onto the local model for no
       privacy gain whatsoever, so the ceiling alone decides.
-    - Sources were named but none resolved: fail closed to ``INTIMATE``,
-      mirroring ``creek_mcp.tools.compile._survey_sources``. With no
-      evidence about what the call would carry, the safe assumption is
-      the worst one.
+    - Sources were named but none resolved: fail closed to ``INTIMATE``.
+      That default is not spelled out here — it belongs to the shared
+      :func:`creek.classify.privacy_filter.max_source_tier` called below,
+      which ``creek.compile.engine._routing_tier_for`` reduces with too,
+      so the two tools cannot drift. With no evidence about what the call
+      would carry, the safe assumption is the worst one.
 
     Reconciliation goes through the shared
     :func:`creek_mcp.tier_ceiling.routing_tier` rather than a bespoke
