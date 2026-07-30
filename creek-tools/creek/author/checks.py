@@ -46,8 +46,18 @@ if TYPE_CHECKING:
     from creek.models import MediumContract
 
 #: Privacy tiers from least to most restrictive; index = restrictiveness rank.
-#: ``UNCLASSIFIED`` is treated as the most restrictive (fail closed), matching
-#: :mod:`creek.classify.privacy_filter`.
+#: ``UNCLASSIFIED`` is treated as the most restrictive (fail closed) — this
+#: table deliberately differs from :mod:`creek.classify.privacy_filter` (which
+#: ranks ``UNCLASSIFIED`` with ``PERSONAL``, #876) and from
+#: :mod:`creek_mcp.tier_ceiling` (which now matches ``privacy_filter``, #961).
+#: This is the *leak gate* ordering: a cited fragment nobody has vouched for
+#: must always count as over-tier here, regardless of what the caller's
+#: ceiling admits on read, so it is pinned at the top rather than alongside
+#: ``PERSONAL``. All four tables (this one, ``privacy_filter``,
+#: ``tier_ceiling``, and the escalate-only merge in
+#: :mod:`creek.classify.privacy_pass`, which ranks ``UNCLASSIFIED`` *below*
+#: ``OPEN``) are pinned together by ``tests/test_mcp_tier_ceiling.py`` (see
+#: ``test_unclassified_ranks_differ_by_context_on_purpose``).
 _TIER_RANK: dict[PrivacyTier, int] = {
     PrivacyTier.OPEN: 0,
     PrivacyTier.PERSONAL: 1,

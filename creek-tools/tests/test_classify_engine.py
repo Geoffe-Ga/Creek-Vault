@@ -1307,14 +1307,18 @@ def test_run_classify_assigns_the_exact_privacy_tier_per_fragment(
 def test_run_classify_never_persists_unclassified_tier(tmp_path: Path) -> None:
     """No file under ``01-Fragments`` retains ``privacy_tier: unclassified``.
 
-    The #934 pin. ``creek_mcp.source_tiers.fragment_tier`` and
+    The #934 pin, still load-bearing after #961 — in the opposite direction.
+    ``creek_mcp.source_tiers.fragment_tier`` and
     ``creek_mcp.tools.reflect._fragment_tier`` fail closed to INTIMATE only
-    when the ``privacy_tier`` key is **absent**; an *explicit*
-    ``unclassified`` is admitted at every ceiling. So a vault full of
-    explicitly-unclassified fragments is not "safely unknown" — it is the
-    whole private corpus exposed at the open tier. The engine's invariant
-    is therefore stronger than "eventually classify": it must never write
-    ``unclassified`` back to disk at all.
+    when the ``privacy_tier`` key is **absent**. An *explicit*
+    ``unclassified`` used to be admitted at every ceiling, which made a vault
+    full of them the whole private corpus exposed at the open tier. #961
+    re-ranked it with ``personal``, so the exposure is gone and the cost
+    landed on the other side: an explicitly-unclassified vault is now
+    *unreadable* to an ``open``-ceiling MCP caller and is summarised out of
+    the CLI generation flows. Either way the engine's invariant is stronger
+    than "eventually classify" — never writing ``unclassified`` back to disk
+    is what keeps a classified vault usable rather than uniformly walled off.
 
     The corpus deliberately includes one fragment written through the raw
     frontmatter path so its ``privacy_tier`` key is genuinely **missing**,

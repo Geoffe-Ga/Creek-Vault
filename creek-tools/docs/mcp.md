@@ -94,15 +94,15 @@ personal allowed, and untiered content — see below) → `intimate`
 ceiling is omitted or returned as a title-only stub — the ceiling
 cannot be bypassed by the caller.
 
-For the tools that admit content through
-`creek.classify.privacy_filter` (`creek.wheel`, the Writing Desk
-specialists), an `unclassified` (untiered) fragment ranks with
-`personal`, not with `open` (#876): it is content nobody has vouched
-for, so it needs an explicit `personal` ceiling to be admitted.
-`creek.compile` and `creek.reflect` still carry their own rank tables
-and admit an explicit `unclassified` at any ceiling — tracked
-separately (#923). Run `creek classify` so every fragment carries a
-deliberate tier and the distinction stops mattering.
+Across the whole MCP surface, an `unclassified` (untiered) fragment
+ranks with `personal`, not with `open` (#876, extended to the MCP
+ceiling by #961): it is content nobody has vouched for, so it needs
+an explicit `personal` ceiling to be admitted. Run `creek classify`
+(or `creek process`) so every fragment carries a deliberate tier and
+the distinction stops mattering — **on a vault that has been
+ingested but not yet classified, every fragment carries an explicit
+`privacy_tier: unclassified`, so an `open`-ceiling MCP consumer will
+read nothing until `creek classify` runs.**
 
 ### Write-side tier-ceiling rule (FEAT-011)
 

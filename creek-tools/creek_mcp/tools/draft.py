@@ -8,7 +8,7 @@ forced onto the local model — or refused — instead of egressing (#958).
 This module never picks a provider itself; it derives the routing tier
 and hands it over.
 
-Four properties of that routing rule, none of them visible at the call
+Three properties of that routing rule, none of them visible at the call
 site, all of them load-bearing:
 
 - **The tier is derived from the seed's *source fragments* only.** The
@@ -55,15 +55,6 @@ site, all of them load-bearing:
   cloud, i.e. when no intimate content could be processed at all. This
   is the same residual ``creek.compile`` already accepts for the same
   error, and it is deliberately not widened here.
-- **ACCEPTED RESIDUAL RISK (#876/#923).** An *explicit*
-  ``privacy_tier: unclassified`` ranks cloud-eligible via
-  :func:`creek_mcp.tier_ceiling.tier_sensitivity`, while
-  ``filter_fragments_by_tier`` treats the same value as *personal* for
-  redaction. Such a fragment is therefore redacted as personal yet
-  routed as open. The asymmetry is pre-existing, is owned by
-  ``creek_mcp.tier_ceiling._TIER_RANK``, and is shared with
-  ``creek.compile``; it is not repaired here, because a fix belongs in
-  the one ranking both tools read rather than in this wrapper.
 """
 
 from __future__ import annotations
