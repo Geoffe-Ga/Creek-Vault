@@ -23,6 +23,35 @@ above lives in :func:`_effective_tier`, not here. It is also used outside
 generation — per-tier classification routing (#666) calls it to decide whether a
 fragment must be classified locally — so keep it public and behaviour-stable.
 
+Four more fail-closed primitives sit alongside it, and together they answer
+"how sensitive is the call I am about to make?": :func:`tier_sensitivity`
+(the reader-caution rank, read off the one :data:`_TIER_RANK` table),
+:func:`fragment_tier` (a *missing* ``privacy_tier`` key — distinguishable from
+an explicit ``unclassified`` only in the raw frontmatter — is ``INTIMATE``),
+:func:`source_tiers` (one vault walk surveying the fragments a call names) and
+:func:`max_source_tier` (the reduction over the tiers a call would carry,
+``INTIMATE`` when empty).
+
+The last three moved here from ``creek_mcp.source_tiers`` in #962, which they
+emptied, so that module is gone and this is now the single home for the
+survey. They had to move because :mod:`creek.compile.engine` derives its own
+LLM routing tier — the ``creek compile`` CLI has no MCP wrapper to derive one
+for it, which is exactly how the ``Intimate``-never-cloud invariant (#647)
+came to be unenforced there — and ``creek`` may never import ``creek_mcp``.
+That layering rule is the one pinned at ``creek/ingest/journal_staging.py:10``
+and ``creek/care/__init__.py:5``: ``creek_mcp`` imports ``creek``, never the
+reverse, so anything both layers need lives on the ``creek`` side. Keeping the
+survey whole rather than splitting it across the boundary is the point — it
+was extracted in #958 precisely so ``creek.compile`` and ``creek.draft`` could
+not come to disagree about the same file, and a split would have re-opened
+that seam from the other direction.
+
+Nothing here decides *admission* and nothing here refuses: these four only
+report tiers and reduce them. Refusing on them, and choosing what an *empty*
+id list means, stay with the callers (``creek.compile.engine``,
+``creek_mcp.tier_ceiling``, ``creek_mcp.tools.compile``,
+``creek_mcp.tools.draft``).
+
 The filter accepts an optional :class:`PrivacyTierOverride` representing
 the operator-supplied ``--include-tier`` flag. When the override raises
 the included tier above the default, the caller is responsible for
@@ -42,6 +71,7 @@ from typing import TYPE_CHECKING, Any, TypeGuard
 
 from creek.audit import AuditLog
 from creek.models import PrivacyTier
+from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -134,6 +164,49 @@ _OVERRIDE_RANK: dict[PrivacyTierOverride, int] = {
     PrivacyTierOverride.INTIMATE: 2,
     PrivacyTierOverride.ALL: 3,
 }
+
+
+def tier_sensitivity(tier: PrivacyTier) -> int:
+    """Return the reader-caution rank of *tier*, failing closed.
+
+    Reads :data:`_TIER_RANK` — the ordering this module already applies in
+    :func:`tier_within_override` — rather than introducing a second table,
+    so "how sensitive is this?" cannot come to mean one thing for the hard
+    cutoff and another for LLM routing. :func:`max_source_tier` reduces
+    with it, which is how :mod:`creek.compile.engine` derives a routing
+    tier without importing the MCP layer.
+
+    A tier the table has never heard of is a tier nobody can vouch for, so
+    it ranks *with* ``intimate`` rather than defaulting to ``0`` and being
+    routed to a cloud provider. That is the same fail-closed reflex
+    :func:`tier_of` applies to an unrecognised ``privacy_tier`` string, and
+    it is the reason this is a lookup with a default rather than a bare
+    ``_TIER_RANK[tier]`` (which would raise across a caller's boundary) or
+    a ``.get(tier, 0)`` (which would fail open).
+
+    **Do not merge this with** :func:`creek_mcp.tier_ceiling.tier_sensitivity`.
+    The two agree tier for tier today, and that agreement is load-bearing
+    now that MCP *routing* ranks through this table while MCP *admission*
+    still ranks through the MCP's — ``tests/test_mcp_tier_ceiling.py``'s
+    ``test_privacy_filter_and_mcp_tier_sensitivity_agree_on_every_tier``
+    asserts it rather than leaving it to coincidence. Asserting the
+    agreement is exactly what lets the two stay two deliberate
+    declarations. Four rank tables in this codebase answer four different
+    questions with the same word ``unclassified``, and two of them rank it
+    differently *on purpose* (the escalate-only merge below ``open``, the
+    Writing Desk leak gate above ``intimate``); the same file's
+    ``test_unclassified_ranks_differ_by_context_on_purpose``
+    pins all four with the reasons attached. Collapsing them into one
+    "obvious" ranking is a privacy regression wearing a cleanup's costume.
+
+    Args:
+        tier: The tier to rank.
+
+    Returns:
+        ``0`` for ``open``; ``1`` for ``personal`` and ``unclassified``
+        (#876); ``2`` for ``intimate`` and for any tier not in the table.
+    """
+    return _TIER_RANK.get(tier, _TIER_RANK[PrivacyTier.INTIMATE])
 
 
 def tier_within_override(
@@ -246,6 +319,162 @@ def tier_of(fragment: Fragment) -> PrivacyTier:
             fragment.privacy_tier,
         )
         return PrivacyTier.INTIMATE
+
+
+def fragment_tier(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
+    """Return *fragment*'s tier, failing closed when the key is absent.
+
+    :class:`~creek.models.Fragment` defaults a *missing* ``privacy_tier``
+    to ``unclassified``, which ranks with ``personal`` (#876, extended to
+    the MCP ceiling by #961) and so would be admitted at ``personal`` and
+    above, but refused at ``open``. Reading the tier off the model alone
+    would therefore still fail open relative to the raw file at an
+    ``open`` ceiling — #961 narrowed the blast radius, but did not remove
+    the need to read the raw frontmatter: a *missing* key must still be
+    distinguished from an *explicit* ``unclassified`` and fail all the way
+    closed to INTIMATE, since a hand-edited or legacy fragment with no key
+    at all carries even less assurance than a pipeline-written one that at
+    least says ``unclassified`` out loud. The raw frontmatter is consulted
+    because it is the only place the two cases are still distinguishable
+    once the model has applied its default.
+
+    This sits directly beneath :func:`tier_of` because the two are halves
+    of one fail-closed reading: ``tier_of`` fails closed on a tier string
+    it does not recognise, this one on a tier that was never written down.
+    :func:`creek_mcp.tools.reflect._fragment_tier` (#847) is the third,
+    and every caller of the three must agree: two tools that disagree
+    about the same file is precisely the divergence the shared-loader
+    design of :func:`source_tiers` below exists to prevent.
+
+    It was written in ``creek_mcp.source_tiers`` (#958) and moved here in
+    #962 — not into ``reflect``, which keeps its own copy — because
+    :mod:`creek.compile.engine` needs it to derive its own routing tier
+    and ``creek`` may never import ``creek_mcp``.
+
+    A fragment carrying an *explicit* ``privacy_tier: unclassified`` —
+    what every pipeline-written, not-yet-classified fragment has — is
+    untouched here and now needs a ``personal`` ceiling to be admitted.
+    That ranking is deliberate policy owned by :data:`_TIER_RANK` and its
+    MCP counterpart ``creek_mcp.tier_ceiling._TIER_RANK`` (#961), not by
+    this fail-closed path.
+
+    Args:
+        fragment: The validated fragment as loaded by the shared reader.
+        raw: The file's raw frontmatter, before model defaults applied.
+
+    Returns:
+        ``PrivacyTier.INTIMATE`` when ``privacy_tier`` is absent from
+        *raw*, else the fragment's own classified tier.
+    """
+    if "privacy_tier" not in raw:
+        return PrivacyTier.INTIMATE
+    return fragment.privacy_tier
+
+
+def max_source_tier(tiers: Iterable[PrivacyTier]) -> PrivacyTier:
+    """Return the most sensitive tier in *tiers*, failing closed when empty.
+
+    The fail-closed reduction over the tiers of the fragments one LLM call
+    would carry, kept in one place rather than repeated at each call site.
+    Its callers — ``creek.compile.engine._routing_tier_for`` and
+    ``creek_mcp.tools.draft._source_routing_tier`` — were otherwise each
+    spelling out the same ``max(..., key=tier_sensitivity,
+    default=INTIMATE)``, and a reduction that two tools write separately
+    is a reduction two tools can come to disagree about, which is the
+    whole failure mode the shared source-tier survey exists to prevent.
+
+    Sensitivity is ranked by :func:`tier_sensitivity`, so this is the
+    *reader's* caution ordering — the same one :func:`tier_within_override`
+    cuts off on — and "most sensitive" cannot mean one thing here and
+    another at an admission gate. The MCP surface admits through its own
+    table, and ``tests/test_mcp_tier_ceiling.py``'s
+    ``test_privacy_filter_and_mcp_tier_sensitivity_agree_on_every_tier``
+    pins the two rankings equal so an MCP call cannot be admitted under
+    one ordering and routed under another.
+
+    Args:
+        tiers: The resolved tiers of the fragments a call would carry,
+            typically from :func:`source_tiers` or from the compile
+            engine's own load.
+
+    Returns:
+        The most sensitive tier present, or
+        :attr:`~creek.models.PrivacyTier.INTIMATE` when *tiers* is empty.
+        Empty means no requested id resolved, and with no evidence about
+        what a call would carry the safe assumption is the worst one. A
+        caller for which "empty" can also mean "nothing was asked for"
+        must separate that case out *before* calling — see
+        :func:`creek_mcp.tools.draft._source_routing_tier`.
+    """
+    return max(tiers, key=tier_sensitivity, default=PrivacyTier.INTIMATE)
+
+
+def source_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyTier]:
+    """Return the tiers of the *fragment_ids* that resolve, in one vault walk.
+
+    Exactly one pass of :func:`creek.vault.reader.iter_vault_fragments`
+    over ``<vault>/01-Fragments``, filtered by an id **set** so a caller
+    naming a thousand ids still pays one walk of the corpus rather than a
+    thousand.
+
+    The walk deliberately goes through that shared loader — the same one
+    ``creek.compile.engine._load_fragments_for_compile`` uses — so the set
+    of files this survey inspects and the set the compile engine would
+    actually roll up are identical *by construction*. A bespoke
+    ``frontmatter.load`` scan would diverge:
+    :func:`creek.vault.reader.try_load_fragment` rejects files whose
+    ``type`` is not ``fragment`` and files that fail
+    :class:`~creek.models.Fragment` schema validation, both of which a raw
+    scan happily reads. That divergence would create a class of file one
+    side sees and the other does not — precisely the bug class the compile
+    gate exists to prevent. A file the shared loader skips (unreadable,
+    non-fragment, schema-invalid) is invisible to every caller here, and so
+    fails closed to whatever the caller does with an unresolved id.
+
+    **The walk never short-circuits, and that property is load-bearing.**
+    ``iter_vault_fragments`` materialises the whole directory into a list
+    before returning, so the rglob + parse cost is paid in full before the
+    filter below runs at all; the filter then runs to completion,
+    collecting every requested fragment's tier before the caller decides
+    anything. The cost of a call is therefore uniform *by construction*,
+    not by accident of iteration order — which is what stops
+    ``creek.compile``'s deliberately content-free above-ceiling refusal
+    (``creek_mcp.tools.compile._ABOVE_CEILING_REASON``) from leaking
+    *where* the offending fragment sits through timing. Contrast
+    ``creek_mcp.tools.reflect._resolve_entry``, which walks a raw lazy
+    ``rglob`` and returns at the match: a genuine timing channel, which
+    the comment there correctly records. Switching this function to a lazy
+    loader would open that same channel for every caller at once, so it
+    must be re-analysed here before it is done. That the analysis is about
+    an MCP refusal while the function now lives in ``creek`` is not an
+    argument for splitting the two apart: the property belongs to *this*
+    loop, and only stays true if it is stated where the loop is.
+
+    Args:
+        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        fragment_ids: The ids whose tiers the caller needs. Duplicates
+            collapse, and an id that does not resolve is simply absent
+            from the result rather than an error — what "missing" means is
+            the caller's policy, not this function's.
+
+    Returns:
+        One :class:`~creek.models.PrivacyTier` per *resolved* id, in vault
+        walk order. The list is shorter than *fragment_ids* whenever an id
+        does not resolve, and an **empty list is ambiguous**: it means
+        either "nothing was asked for" or "nothing asked for resolved".
+        Those two cases must route differently, so a caller that cannot
+        tell them apart from the result alone has to separate them before
+        calling (``creek.draft``) or fail closed to
+        :attr:`~creek.models.PrivacyTier.INTIMATE` (``creek.compile``).
+    """
+    requested = set(fragment_ids)
+    return [
+        fragment_tier(fragment, raw)
+        for _path, fragment, _body, raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+        if fragment.id in requested
+    ]
 
 
 def record_privacy_override(

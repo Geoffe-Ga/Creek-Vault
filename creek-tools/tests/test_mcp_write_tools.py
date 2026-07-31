@@ -36,7 +36,7 @@ from creek_mcp.tools.save import save_tool
 from creek_mcp.tools.skills import skills_refresh_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
@@ -964,6 +964,18 @@ class _RecordingLLMFactory:
     ``ValueError``/``RuntimeError`` produces a refusal even with no gate
     at all. Counting invocations separates "refused by the ceiling
     gate" from "blew up on the way to the engine".
+
+    **Who invokes the factory moved in #962, and the stubs had to follow.**
+    ``compile_tool`` no longer calls it; ``compile_to_vault`` does, from
+    inside the engine, once it has loaded the fragments and can say how
+    sensitive the call is. So a test that monkeypatches the engine away
+    must have its stub honour that half of the contract, or ``calls``
+    silently becomes a dead signal — zero for admitted *and* refused rows
+    alike, which would make every ``assert factory.calls == 1`` below
+    vacuous rather than failing loudly. The stubs therefore invoke
+    ``llm_factory`` themselves. The *tier* they pass is immaterial to
+    these tests, which count invocations rather than inspect tiers; see
+    :class:`_TierRecordingLLMFactory` for the tests that pin the value.
     """
 
     def __init__(self) -> None:
@@ -1175,8 +1187,22 @@ def test_compile_source_tier_ceiling_matrix(
     _write_fragment(vault, frag_id="frag-src", privacy_tier=privacy_tier)
     target_path = vault / "02-Threads" / "Active" / "thread-x.md"
 
-    def _stub_compile(**_kw: object) -> object:
-        """Write a placeholder target page instead of running the engine."""
+    def _stub_compile(
+        *,
+        llm_factory: Callable[[PrivacyTier], object],
+        **_kw: object,
+    ) -> object:
+        """Stand in for the engine: build the client, then write a page.
+
+        The ``llm_factory`` call is load-bearing, not decorative. Since
+        #962 the engine builds the compile client itself instead of
+        receiving a pre-built one, so a stub that swallowed the factory
+        would drive ``factory.calls`` to 0 on every row and the allowed-row
+        assertion below would silently stop distinguishing "the gate
+        passed" from "the wrapper short-circuited". The tier passed is the
+        one the real engine derives from this row's single source fragment.
+        """
+        llm_factory(PrivacyTier(privacy_tier))
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not target_path.exists():
             target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
@@ -1248,8 +1274,19 @@ def test_compile_refuses_unclassified_source_at_open_ceiling(
     _write_fragment(vault, frag_id="frag-src", privacy_tier="unclassified")
     target_path = vault / "02-Threads" / "Active" / "thread-x.md"
 
-    def _stub_compile(**_kw: object) -> object:
-        """Write a placeholder target page instead of running the engine."""
+    def _stub_compile(
+        *,
+        llm_factory: Callable[[PrivacyTier], object],
+        **_kw: object,
+    ) -> object:
+        """Stand in for the engine: build the client, then write a page.
+
+        Calls ``llm_factory`` because the engine does (#962); a stub that
+        swallowed it would zero out ``factory.calls`` and quietly retire the
+        admitted row's "the work really got done" assertion. The tier is the
+        explicit ``unclassified`` this row's source carries.
+        """
+        llm_factory(PrivacyTier.UNCLASSIFIED)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not target_path.exists():
             target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
@@ -1345,8 +1382,20 @@ def test_compile_fails_closed_when_privacy_tier_key_is_absent(
     _write_fragment_without_tier(vault, frag_id="frag-legacy")
     target_path = vault / "02-Threads" / "Active" / "thread-x.md"
 
-    def _stub_compile(**_kw: object) -> object:
-        """Write a placeholder target page instead of running the engine."""
+    def _stub_compile(
+        *,
+        llm_factory: Callable[[PrivacyTier], object],
+        **_kw: object,
+    ) -> object:
+        """Stand in for the engine: build the client, then write a page.
+
+        Calls ``llm_factory`` because the engine does (#962); a stub that
+        swallowed it would zero out ``factory.calls`` and quietly retire the
+        admitted rows' "the work really got done" assertion. The tier is the
+        fail-closed ``INTIMATE`` the engine derives for a fragment whose
+        ``privacy_tier`` key is absent — the very reading this test is about.
+        """
+        llm_factory(PrivacyTier.INTIMATE)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not target_path.exists():
             target_path.write_text("# Thread X\n\nclaim\n", encoding="utf-8")
@@ -1382,6 +1431,16 @@ def test_compile_missing_fragment_id_still_reports_not_found(vault: Path) -> Non
     the new gate must let the call through so the caller still learns
     the id does not exist, instead of the ceiling check swallowing
     every unresolvable id behind a generic refusal.
+
+    The factory is never invoked (#962). It used to be built once, because
+    ``llm_factory(tier)`` was evaluated as a call *argument* to
+    ``compile_to_vault`` and Python therefore ran it before the engine
+    could look anything up. The engine now calls the factory itself, after
+    ``_load_fragments_for_compile`` has already raised for ``frag-missing``
+    — so a request the engine cannot resolve builds no provider at all.
+    That is strictly better than building one: a provider handshake is the
+    last step before a real backend client exists, and a request that will
+    be refused has no business reaching it.
     """
     _write_fragment(vault, frag_id="frag-open", privacy_tier="open")
     factory = _RecordingLLMFactory()
@@ -1400,7 +1459,7 @@ def test_compile_missing_fragment_id_still_reports_not_found(vault: Path) -> Non
     assert "not found" in result["reason"]
     assert "frag-missing" in result["reason"]
     assert result["reason"] != _ABOVE_CEILING_REASON
-    assert factory.calls == 1
+    assert factory.calls == 0
 
 
 def test_compile_above_ceiling_wins_over_missing_id(vault: Path) -> None:
@@ -1721,13 +1780,25 @@ def test_compile_keys_the_llm_factory_with_the_routing_tier(
 def test_compile_routing_fails_closed_when_no_source_id_resolves(
     vault: Path,
 ) -> None:
-    """An unresolvable request routes ``INTIMATE`` and still says "not found".
+    """An unresolvable request reaches no model at all and still says "not found".
 
-    Two halves, and both matter. The routing half is the only row in the
-    #928 table where the *source* term strictly dominates the ceiling term:
-    with nothing found in the vault there is no evidence about what the call
-    would carry, so the max-source tier fails closed to ``INTIMATE`` even
-    under ``ceiling=open``.
+    Two halves, and both matter. The routing half's original premise is
+    **superseded by #962**, in the safe direction. It used to be the one row
+    in the #928 table where the *source* term strictly dominated the ceiling
+    term: with nothing found in the vault the max-source tier failed closed
+    to ``INTIMATE`` even under ``ceiling=open``, so the call was routed
+    local. Now the factory is invoked by the engine, *after* the load — and
+    the load raises for an id that does not resolve — so a zero-resolving
+    request never reaches a model at all. Routing something local is a
+    guarantee about where it goes; building nothing is the strictly stronger
+    guarantee that there was no "it".
+
+    The fail-closed ``INTIMATE`` default itself is untouched and still
+    exercised: an *empty* ``fragment_ids`` loads nothing without raising, and
+    ``tests/test_compile.py``'s
+    ``test_compile_to_vault_fails_closed_when_no_fragments_are_requested``
+    pins that path keying the factory ``INTIMATE`` rather than ``OPEN``. What
+    changed here is only which of the two refusals gets there first.
 
     The UX half guards the fix's blast radius: routing local must not turn
     the engine's ordinary not-found refusal into a generic one. A caller
@@ -1747,7 +1818,7 @@ def test_compile_routing_fails_closed_when_no_source_id_resolves(
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
 
-    assert factory.tiers == [PrivacyTier.INTIMATE]
+    assert factory.tiers == []
     assert result["status"] == "refused"
     assert "not found" in result["reason"]
     assert "frag-missing" in result["reason"]
@@ -1764,7 +1835,7 @@ def test_compile_routing_fails_closed_when_privacy_tier_key_is_absent(
     covers the *admission* side of the same file. ``ceiling=all`` admits the
     hand-edited / legacy fragment, so the routing tier is the only thing
     standing between its title and a cloud provider;
-    ``creek_mcp.source_tiers.fragment_tier`` reports ``INTIMATE`` for it and the
+    ``creek.classify.privacy_filter.fragment_tier`` reports ``INTIMATE`` for it and the
     factory must be keyed with exactly that.
     """
     _write_fragment_without_tier(vault, frag_id="frag-legacy")
@@ -1835,27 +1906,36 @@ def test_compile_refuses_when_intimate_has_no_local_backend(
     assert not (vault / "00-Creek-Meta" / "audit" / "compile-thread-x.hash").exists()
 
 
-def test_compile_routing_refusal_can_preempt_the_not_found_refusal(
+def test_compile_not_found_refusal_no_longer_depends_on_model_config(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With an all-cloud config, a zero-resolving compile refuses on routing.
+    """A zero-resolving compile says "not found" under any model config (#962).
 
-    Pins the one deployment-dependent seam in ``_survey_sources``'s
-    contract. ``llm_factory(tier)`` is evaluated as a call *argument* to
-    ``compile_to_vault``, so Python runs it before the engine can report
-    "Fragment(s) not found". When no requested id resolves, ``max_tier``
-    fails closed to ``INTIMATE``; if ``default`` and ``generation`` are
-    both cloud, the router refuses first and its message — not the
-    not-found one — reaches the caller.
+    **The seam this test documented is now closed.** It previously pinned a
+    real deployment-dependent quirk of ``_survey_sources``'s contract:
+    ``llm_factory(tier)`` was evaluated as a call *argument* to
+    ``compile_to_vault``, so Python ran it before the engine could report
+    "Fragment(s) not found". With no requested id resolving, the fail-closed
+    ``INTIMATE`` tier made an all-cloud router refuse first, and its message
+    — not the not-found one — reached the caller. That was documented rather
+    than fixed, on the grounds that it failed closed and named no id.
 
-    Documented rather than fixed because it fails closed and names no id,
-    and because it turns on the operator's model config, not on anything
-    the caller sends. The test exists so a refactor that reorders the
-    argument evaluation has to do so deliberately. Contrast
-    :func:`test_compile_routing_fails_closed_when_no_source_id_resolves`,
-    which pins the ordinary local-default case where the caller *does*
-    still get the not-found message.
+    #962 removes the argument-evaluation seam entirely: ``compile_to_vault``
+    now takes a ``llm_factory`` and invokes it *itself*, after
+    ``_load_fragments_for_compile`` has already raised for the unresolvable
+    id. So the ordering no longer turns on when Python evaluates an
+    argument, and every assertion below is the inverse of the one it
+    replaces. The two calls at the end are what "config-independent" means,
+    asserted rather than merely claimed.
+
+    The residual guarantees are unchanged and still pinned: nothing is
+    built, nothing egresses, and a legitimate caller with a typo'd id still
+    learns *which* id does not resolve — from the engine, not from the
+    ceiling gate, whose deliberately content-free
+    :data:`_ABOVE_CEILING_REASON` names nothing. This now agrees with
+    :func:`test_compile_routing_fails_closed_when_no_source_id_resolves` on
+    every config rather than only on local-default ones.
     """
     from creek_mcp import server as server_mod
 
@@ -1878,11 +1958,37 @@ def test_compile_routing_refusal_can_preempt_the_not_found_refusal(
     )
 
     assert result["status"] == "refused"
-    assert "cannot route to cloud provider" in result["reason"]
-    # The routing refusal preempted the engine's not-found message.
-    assert "not found" not in result["reason"]
-    # The refusal still names no fragment id, and nothing was ever built.
-    assert "frag-does-not-exist" not in result["reason"]
+    # Inverted: the routing refusal no longer preempts the engine's.
+    assert "cannot route to cloud provider" not in result["reason"]
+    assert "not found" in result["reason"]
+    # Inverted: the caller does learn which id failed to resolve.
+    assert "frag-does-not-exist" in result["reason"]
+    assert result["reason"] != _ABOVE_CEILING_REASON
+    # Unchanged: nothing was ever built, so nothing could have egressed.
+    assert spy.configs == []
+    assert spy.prompts == []
+
+    # Config-independence, asserted rather than described: the same call on
+    # a config with a *local* default — where the router would never have
+    # refused at all — produces the byte-identical refusal. The message now
+    # turns on the vault's contents, not on the operator's model choice.
+    monkeypatch.setattr(
+        server_mod,
+        "load_config",
+        lambda: _RoutingConfigStub(default="ollama", generation="anthropic"),
+    )
+    with_local_default = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-does-not-exist"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=server_mod._build_compile_llm,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert with_local_default["reason"] == result["reason"]
+    assert with_local_default["status"] == "refused"
     assert spy.configs == []
     assert spy.prompts == []
 

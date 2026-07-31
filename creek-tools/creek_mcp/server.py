@@ -208,15 +208,18 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     forced onto the local ``default`` model — or the router raises
     ``IntimateRoutingError`` rather than egressing the source titles the
     compile prompt carries. Nothing here re-checks the tier or picks a
-    provider: ``compile_tool`` derives the routing tier and this hands it to
-    the one chokepoint that owns the decision.
+    provider: the tier arrives already reconciled and this hands it to the one
+    chokepoint that owns the decision.
 
     Lazy imports keep the server bootable with no provider configured — only a
     ``creek.compile`` call then fails, and it fails as a structured refusal.
 
     Args:
-        tier: The routing tier ``compile_tool`` computed from the caller's
-            ceiling and the source fragments' own classifications.
+        tier: The routing tier, reconciled from two signals: since #962
+            ``creek.compile.engine`` derives the source fragments' own
+            classification (it is the layer that loaded them) and
+            ``compile_tool`` folds in the caller's declared ceiling on the way
+            through. This function sees only the result.
 
     Returns:
         A prompt → completion-text callable bound to the resolved provider.

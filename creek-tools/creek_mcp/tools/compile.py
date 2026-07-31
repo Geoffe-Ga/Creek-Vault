@@ -20,7 +20,13 @@ of them was asserted in this docstring and implemented nowhere):
   sensitive of the ceiling and the admitted sources — so the source
   titles the prompt carries reach a model only through
   :class:`creek.classify.llm.router.ModelRouter`'s
-  ``Intimate``-never-cloud chokepoint (#928).
+  ``Intimate``-never-cloud chokepoint (#928). Since #962 the *content*
+  half of that tier is derived inside
+  :func:`creek.compile.engine.compile_to_vault`, from the fragments it
+  loaded itself, and the engine calls the factory; this wrapper
+  contributes only the ceiling half, by wrapping the factory it was
+  handed. The client is therefore still built after the gate and before
+  any write, but no longer by evaluating a call argument here.
 - **The refusal names nothing.** It carries the fixed
   :data:`_ABOVE_CEILING_REASON`: no ids, no titles, no tiers, not even a
   count of how many sources were above the ceiling.
@@ -53,9 +59,9 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
+from creek.classify.privacy_filter import source_tiers
 from creek.compile.engine import TARGET_KINDS, compile_to_vault
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.source_tiers import max_source_tier, source_tiers
 from creek_mcp.tier_ceiling import (
     TierCeiling,
     refusal_response,
@@ -90,7 +96,7 @@ TOOL_NAME = "creek.compile"
 #   only a blind sweep of the full 48-bit space is infeasible.
 # - *Probe cost does NOT leak where the offending fragment sits.* The walk that
 #   makes that true left this module with the code it describes (#958): it is
-#   now ``creek_mcp.source_tiers.source_tiers``, whose docstring carries the
+#   now ``creek.classify.privacy_filter.source_tiers``, whose docstring carries the
 #   full analysis — the loader materialises the whole directory before
 #   returning and the id filter runs to completion, so the cost of a probe is
 #   uniform *by construction* rather than resting on an accident of iteration
@@ -116,9 +122,10 @@ class CompileLLMFactory(Protocol):
     content. The production factory resolves through
     :class:`creek.classify.llm.router.ModelRouter`, so an ``INTIMATE``
     tier is forced onto the local model — or refused — rather than
-    egressing (#928); this module never picks a provider itself, it only
-    derives the routing tier (:func:`creek_mcp.tier_ceiling.routing_tier`)
-    and hands it over.
+    egressing (#928); this module never picks a provider itself. Nor,
+    since #962, does it derive the whole tier: the engine supplies the
+    sources' content tier and this module reconciles it against the
+    caller's ceiling (:func:`creek_mcp.tier_ceiling.routing_tier`).
 
     The factory is invoked lazily so an unconfigured LLM provider only
     fails the ``creek.compile`` invocation, not server startup — and not
@@ -137,27 +144,27 @@ def _fingerprint(path: Path) -> str | None:
 
 
 class _SourceGate(NamedTuple):
-    """The two signals one walk over the requested source fragments yields.
+    """The admission signal one walk over the requested source fragments yields.
 
-    Both are derived from the same
-    :func:`creek_mcp.source_tiers.fragment_tier` reading of the same
-    file, so admission and routing can never disagree about a fragment.
+    A single field, and still a :class:`~typing.NamedTuple` rather than a
+    bare ``bool``: the anti-vacuous-truth property in :func:`_survey_sources`
+    depends on the return type not being truthy-by-construction, and
+    :mod:`creek_mcp.read_gate` pins ``_survey_sources`` as this tool's gate
+    symbol. It carried a second ``max_tier`` field until #962 moved routing
+    into the engine.
 
     Attributes:
         above_ceiling: Whether at least one requested fragment sits above
             the caller's ceiling, i.e. whether the call must be refused.
-        max_tier: The most sensitive tier among the requested fragments
-            that resolved — what the LLM call must be routed as.
     """
 
     above_ceiling: bool
-    max_tier: PrivacyTier
 
 
 def _survey_sources(
     vault_path: Path, fragment_ids: list[str], ceiling: TierCeiling
 ) -> _SourceGate:
-    """Survey the requested source fragments: admission decision + routing tier.
+    """Survey the requested source fragments for an admission decision.
 
     Deliberately *not* named as a predicate. It returns a
     :class:`_SourceGate`, not a bool, so ``if _survey_sources(...)`` would be
@@ -179,10 +186,13 @@ def _survey_sources(
     That parity is by construction but not instantaneous: the gate walks the
     vault, returns, and the engine then walks it again. A concurrent writer that
     *raises* a fragment's tier inside that window (``creek classify``, the
-    ``creek.classify`` MCP tool, a text editor) would be compiled under the
-    pre-write tier. The window is not caller-controlled and closing it means
-    handing the loaded fragments to the engine — an engine signature change,
-    tracked as a follow-up along with eliminating the duplicated walk.
+    ``creek.classify`` MCP tool, a text editor) would be **admitted** under the
+    pre-write tier. #962 closed the *routing* half of that window and only that
+    half: the engine now derives its routing tier from the fragments it has in
+    hand, so no window separates the tier a call is routed by from the bytes it
+    sends. The admission half above is unchanged — this walk still precedes the
+    engine's — and closing it still means handing the loaded fragments to the
+    engine, tracked as a follow-up along with eliminating the duplicated walk.
 
     Admission is decided by :func:`creek_mcp.tier_ceiling.write_tier_allowed`
     rather than the :func:`~creek_mcp.tier_ceiling.tier_allowed` it delegates
@@ -201,43 +211,33 @@ def _survey_sources(
             matching fragment in the vault is **not** a violation — it falls
             through to the engine's ``ValueError("Fragment(s) not found in
             vault: ...")`` so a legitimate caller still learns the id does not
-            resolve. One deployment-dependent exception: when *no* requested id
-            resolves, ``max_tier`` fails closed to ``INTIMATE`` (below), and
-            ``llm_factory(tier)`` is evaluated as a call *argument* to
-            ``compile_to_vault`` — so it runs before the engine's not-found
-            check. On a vault whose ``generation`` **and** ``default`` stages
-            are both cloud, the router's ``IntimateRoutingError`` therefore
-            wins over the not-found message. That is safe (it fails closed and
-            names no id) and it is not caller-influenced — it depends on the
-            operator's model config, not on the request — but the not-found
-            refusal is not guaranteed under that one configuration.
+            resolve. Since #962 that holds unconditionally: the engine builds
+            the LLM client *itself*, after its own load, so the not-found
+            refusal no longer races an eagerly-evaluated ``llm_factory(tier)``
+            call argument and no longer depends on the operator's model config.
         ceiling: The caller's declared ceiling.
 
     Returns:
-        A :class:`_SourceGate`. Its ``above_ceiling`` is ``True`` when at least
-        one requested fragment is above *ceiling*; its ``max_tier`` is the most
-        sensitive tier among the requested fragments that resolved, failing
-        closed to ``INTIMATE`` when *none* of them did — with no evidence about
-        what the call would carry, the safe assumption is the worst one.
+        A :class:`_SourceGate` whose ``above_ceiling`` is ``True`` when at
+        least one requested fragment is above *ceiling*.
 
-        The *refusal decision* is still deliberately a bare bool: the offending
-        ids never leave this function; see :data:`_ABOVE_CEILING_REASON` for
-        why. ``max_tier`` is returned alongside it solely to key the LLM router
-        (#928) and **must never appear in any response, refusal reason, or
-        audit payload** — echoing it would hand the caller exactly the per-call
-        tier-classification oracle :data:`_ABOVE_CEILING_REASON` exists to
-        prevent, and would be strictly worse than the bare bool: the bool says
-        only "something you named is above your ceiling", while ``max_tier``
-        names the rank. That invariant is the one new leak surface returning
-        the pair creates, so it is stated here rather than left implied.
+        The refusal decision is deliberately a bare bool: the offending ids
+        never leave this function; see :data:`_ABOVE_CEILING_REASON` for why.
+        The companion invariant — that a tier derived from the sources **must
+        never appear in any response, refusal reason, or audit payload**,
+        because echoing it would hand the caller the per-call
+        tier-classification oracle that constant exists to prevent, strictly
+        worse than the bool (which says only "something you named is above
+        your ceiling") — is now enforced structurally rather than by
+        discipline: since #962 the routing tier is derived inside
+        ``creek.compile.engine`` from fragments it loaded itself and never
+        reaches this wrapper at all, so there is nothing here to leak.
     """
-    # Both signals come off one shared survey (#958) so ``creek.compile`` and
-    # ``creek.draft`` can never read the same file's tier two different ways —
-    # and the fail-closed reduction is shared for the same reason.
+    # One shared survey (#958) so ``creek.compile`` and ``creek.draft`` can
+    # never read the same file's tier two different ways.
     tiers = source_tiers(vault_path, fragment_ids)
     return _SourceGate(
         above_ceiling=any(not write_tier_allowed(tier, ceiling) for tier in tiers),
-        max_tier=max_source_tier(tiers),
     )
 
 
@@ -260,12 +260,14 @@ def compile_tool(
 
     Args:
         llm_factory: Tier-keyed builder for the compile LLM client;
-            ``llm_factory(tier)`` returns it. Invoked lazily so the LLM
-            provider only matters when this tool is actually called — and
-            not at all when the source-tier gate refuses. The tier is the
-            more sensitive of *privacy_tier_ceiling* and the sources'
-            own classifications, so the production factory's router
-            forces an intimate compile onto the local model (#928).
+            ``llm_factory(tier)`` returns it. It is not called here: it is
+            wrapped and handed to the engine, which calls it once, with the
+            content tier of the fragments it loaded. The wrapper folds in
+            *privacy_tier_ceiling* so the tier the factory finally sees is
+            the more sensitive of the two, and the production factory's
+            router forces an intimate compile onto the local model
+            (#928/#962). Nothing is built when the source-tier gate refuses,
+            nor when the engine cannot resolve a requested id.
         privacy_tier_ceiling: The caller's ceiling. Compile's variant of
             the FEAT-011 write-side rule gates the *source* fragments'
             classified tiers, not the tier of the content created (which
@@ -316,16 +318,17 @@ def compile_tool(
     # It sits *above* everything that follows, because each of those steps
     # hands the source fragments somewhere the caller is not admitted to:
     #
-    # - ``llm_factory(tier)`` is evaluated as an *argument* to
-    #   ``compile_to_vault`` below, and the prompt the engine builds emits
-    #   ``id:`` and ``title:`` for every source unconditionally
-    #   (``_fragment_excerpt_for_prompt`` redacts only the *body*). That
-    #   provider is now tier-routed — the factory is keyed with the routing
-    #   tier, so an admitted intimate source is forced onto the local model
-    #   or refused (#928). Routing is not admission, though: sending a
-    #   fragment the caller may not read to a *local* model still hands it
-    #   to a summariser they were never admitted to, and the compiled page
-    #   that summary lands in is the leak. So the gate must still win.
+    # - ``compile_to_vault`` builds an LLM client from the factory passed
+    #   below, and the prompt the engine builds emits ``id:`` and ``title:``
+    #   for every source unconditionally (``_fragment_excerpt_for_prompt``
+    #   redacts only the *body*). That provider is tier-routed — the engine
+    #   keys the factory with the sources' content tier and the wrapper below
+    #   folds in the ceiling, so an admitted intimate source is forced onto
+    #   the local model or refused (#928/#962). Routing is not admission,
+    #   though: sending a fragment the caller may not read to a *local* model
+    #   still hands it to a summariser they were never admitted to, and the
+    #   compiled page that summary lands in is the leak. So the gate must
+    #   still win.
     # - ``compile_to_vault`` writes the compiled page — carrying per-claim
     #   provenance that names the source ids — into ``02-Threads`` /
     #   ``03-Eddies`` / ``06-Frequencies``, pages any ``open``-ceiling read
@@ -373,13 +376,6 @@ def compile_tool(
         )
 
     kind = cast("CompileTargetKind", target_kind)
-    # The more sensitive of the ceiling and the admitted sources, so no
-    # declaration a caller can make buys cloud routing for intimate content:
-    # a low ceiling loses to the sources' own tiers, and low-tier sources lose
-    # to a high ceiling. Built here rather than by the factory because only the
-    # wrapper has seen both signals — and only *after* the gate above, so a
-    # refused call never reaches a provider at all.
-    tier = routing_tier(privacy_tier_ceiling, gate.max_tier)
     try:
         written = compile_to_vault(
             fragment_ids=list(fragment_ids),
@@ -387,7 +383,20 @@ def compile_tool(
             target_kind=kind,
             target_id=target_id,
             target_title=target_title,
-            llm=llm_factory(tier),
+            # The engine supplies the *content* tier, from the fragments it
+            # loaded; this wrapper reconciles it against the ceiling the caller
+            # declared, taking the more sensitive of the two. That
+            # reconciliation belongs here and only here: it is the MCP's,
+            # because only the MCP has a caller to reconcile against. So no
+            # declaration buys cloud routing for intimate content — a low
+            # ceiling loses to the sources' own tiers, and low-tier sources
+            # lose to a high ceiling. (``creek compile`` correctly has no
+            # ceiling term at all; its operator is the vault owner.) The engine
+            # runs this only after the gate above, so a refused call still
+            # reaches no provider.
+            llm_factory=lambda content_tier: llm_factory(
+                routing_tier(privacy_tier_ceiling, content_tier),
+            ),
         )
     except (ValueError, RuntimeError) as exc:
         return refusal_response(

@@ -1793,6 +1793,11 @@ def _run_calibration_cli(
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
+    # No tier argument, and none exists to pass: the classifier only ever sees
+    # `creek.classify.calibration.load_fixture(...)` output — a labelled fixture
+    # (default `tests/fixtures/classification/calibration_set.yaml`) that carries
+    # no `privacy_tier` and is not vault content. Unlike `creek compile` (#962),
+    # there is no fragment here whose tier the router could enforce.
     classifier = LLMClassifier(config=config.model_router.resolve("classification"))
     report = run_calibration(classifier, load_fixture(resolved))
     console.print(report.render())
@@ -2455,7 +2460,12 @@ def compile_(
     compiled-layer directory. LLM-detected paradoxes are routed to the
     side-channel log under ``00-Creek-Meta/Processing-Log/`` rather
     than flattened into the synthesis page.
+
+    The privacy tier of the fragments being rolled up decides where the
+    synthesis runs: an intimate source is forced onto the local model, and
+    refused outright when no local model is configured to fall back to.
     """
+    from creek.classify.llm.router import IntimateRoutingError
     from creek.compile.engine import TARGET_KINDS, compile_to_vault, default_llm
 
     if target_kind not in TARGET_KINDS:
@@ -2468,14 +2478,34 @@ def compile_(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
     kind = cast("CompileTargetKind", target_kind)
-    written = compile_to_vault(
-        fragment_ids=[fragment_id],
-        vault_path=vault_path,
-        target_kind=kind,
-        target_id=target_id,
-        target_title=target_title,
-        llm=default_llm(config.model_router.resolve("generation")),
-    )
+    try:
+        written = compile_to_vault(
+            fragment_ids=[fragment_id],
+            vault_path=vault_path,
+            target_kind=kind,
+            target_id=target_id,
+            target_title=target_title,
+            # The content tier alone, with no ceiling term — unlike
+            # ``creek_mcp.tools.compile``, which reconciles the two via
+            # ``routing_tier``. The CLI operator *is* the vault owner, so
+            # there is no caller declaration to reconcile against. Modelling
+            # the CLI as ``ceiling=all`` would not be conservative but
+            # wrong: ``CEILING_ROUTING_TIER[ALL] == INTIMATE``, which would
+            # pin every compile of every open fragment to the local model.
+            llm_factory=lambda tier: default_llm(
+                config.model_router.resolve("generation", tier),
+            ),
+        )
+    except IntimateRoutingError as exc:
+        # The one refusal that must be legible. Threading the tier through
+        # *introduces* this failure mode on a P1 operator path (all-cloud
+        # config + intimate content), and a stack trace would read as a
+        # crash rather than as the privacy guarantee doing its job.
+        # Deliberately narrow: the not-found and target-escape ``ValueError``s
+        # already surface as tracebacks today, and widening the handler here
+        # would fold an unrelated UX gap into a privacy fix.
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     console.print(
         f"[bold green]Compiled {fragment_id} -> {written}[/bold green]",
     )
@@ -3848,6 +3878,11 @@ def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
     effective_max_tokens = (
         max_tokens if max_tokens is not None else config.draft.max_tokens
     )
+    # Issue #1031: a real, unfixed tier leak — unlike the deliberate no-tier
+    # sites in this file, this client is fed vault fragment *bodies*, and
+    # `--include-tier intimate|all` lets intimate ones through untouched. Not a
+    # considered decision; tracked separately because the fix shape differs
+    # (the tier is per-fragment here, not per-call as in `creek compile` #962).
     classifier = LLMClassifier(config.model_router.resolve("classification"))
     if not classifier.available:
         console.print(
@@ -3947,6 +3982,11 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
     config = _load_config_for_vault(vault)
 
     def _detect(prompt: str) -> PromptOntology:
+        # No tier argument, and none exists to pass: `prompt` is only ever an
+        # `OutlineSection.seed_text`, i.e. operator-supplied `--seed-outline` /
+        # `--seed-outline-text` copy. No fragment content reaches this provider,
+        # so there is no classified tier for the router to enforce. Contrast
+        # `_build_draft_llm` above, which does see fragment bodies (#1031).
         return detect_ontology(prompt, config.model_router.resolve("classification"))
 
     return _detect
@@ -5514,6 +5554,18 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     # constructor and may raise (build_provider contract); a local provider
     # constructs but reports ``available is False`` when its host is down — both
     # fall back to embedding-only scoring.
+    #
+    # No tier argument, and this is *not* the same class of site as the
+    # `creek compile` bug (#962). The only call site is
+    # `_run_compost_calibration` above, reached only from `creek compost
+    # calibrate`, and the verifier this builds only ever sees
+    # `CompostCalibrationEntry` fields loaded from a YAML fixture — it never
+    # reads the vault, so no fragment tier exists to thread.
+    #
+    # Durable caveat: `creek.generate.compost.CompostDetector` accepts a
+    # `verifier`, so if a vault-scanning compost path ever wires this builder
+    # in, its input becomes fragment content and this call MUST resolve with a
+    # tier. Re-derive it there rather than assuming this comment still holds.
     try:
         provider = build_provider(config.model_router.resolve("generation"))
     except RuntimeError as exc:
