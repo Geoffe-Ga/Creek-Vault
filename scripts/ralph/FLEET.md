@@ -90,13 +90,18 @@ On each wake it:
 4. **Refills every open slot** — while `fleet.sh free > 0` and `pick-next.sh`
    yields a compatible issue, `assign` (or, for a `dependencies` issue already
    riding a bot PR, `adopt`) a worktree and launch a `ralph-worker`.
-5. **Arms per-lane wakes** — background workers wake it on their own completion;
-   each in-flight PR is `subscribe_pr_activity`-subscribed so its CI/verdict wakes
-   it independently; a modest `ScheduleWakeup` backstops the CI-success /
-   `behind→green` transitions the webhook doesn't deliver. **A lane going stale
-   is invisible to webhooks entirely** — `main` moving emits no event on the
-   lane's own PR — so this periodic fallback wake is the *only* thing that
-   ever notices it. Then it ends the turn.
+5. **Arms per-lane wakes (platform-aware)** — background workers wake it on
+   their own completion regardless of platform. On a **remote/webhook-capable**
+   session, each in-flight PR is `subscribe_pr_activity`-subscribed and an
+   **adaptive** `ScheduleWakeup` backstops the transitions webhooks don't
+   deliver: ~180s while any lane's PR is in CI/review (bounding a dropped
+   webhook, a `behind→ready` flip, or a sibling-merge staleness — all
+   event-less — to ~3 minutes), the long ~1200–1800s fallback when every lane
+   is still building. On a **local terminal** session (no webhook MCP), it
+   launches `scripts/ralph/watch-pr.sh <PR>` as a background task per
+   in-flight PR — pidfile-idempotent, and the watcher's exit (the moment
+   `pr-ready.sh`'s token settles) IS the wake — with the long fallback kept
+   as the safety net. Then it ends the turn.
 
 **Workers are background tasks.** Each `ralph-worker` is launched with
 `run_in_background: true` and **never awaited** — launch, end the turn, and let its
@@ -176,7 +181,7 @@ rather than reading as "no hold."
 
 ## Tests
 
-Three offline suites cover the fleet, all run in CI by
+Four offline suites cover the fleet, all run in CI by
 `.github/workflows/ralph-fleet-tests.yml` on any `scripts/ralph/**` change —
 which also runs `shellcheck --severity=warning scripts/ralph/*.sh` first.
 (`creek-tools/scripts/lint-extended.sh` only shellchecks `scripts/*.sh`
@@ -212,11 +217,19 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   and gives it no `name:` override, because this classifier matches the review
   check by that literal string and an override would silently wedge every
   Dependabot lane at `awaiting-review` forever.
+- `scripts/ralph/test_watch_pr.sh` stubs `pr-ready.sh` (a sequence-driven fake
+  next to a copy of the script under test) and `gh`, and exercises the local
+  per-lane hot watcher: pidfile idempotence (`already-watching` on a live pid,
+  takeover of a stale/garbage one, removal on exit), settling on the first
+  token outside `pending`/`awaiting-review`, `gone` on a merged/closed PR,
+  `timeout <last-token>` at the deadline, and that transient `pr-ready.sh` /
+  `gh` failures never kill the watcher — every wait outcome exits 0.
 
 ```bash
 bash scripts/ralph/test_fleet.sh
 bash scripts/ralph/test_pick_next.sh
 bash scripts/ralph/test_pr_ready.sh
+bash scripts/ralph/test_watch_pr.sh
 ```
 
 ## Failure modes and how they're handled
