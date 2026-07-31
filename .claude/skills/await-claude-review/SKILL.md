@@ -19,7 +19,7 @@ description: >-
   status polling (use `pull_request_read` directly).
 metadata:
   author: Geoff
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # Await Claude Review
@@ -89,6 +89,16 @@ This comment is not authored by `claude[bot]` — it's authored by the human use
 **Currency check still applies.** The trigger fires on a `workflow_run` for a specific HEAD SHA, but the comment may arrive minutes after the push. Use the standard `created_at >= headPushedAt` guard before treating it as authoritative for the current HEAD.
 
 **Cap awareness.** The workflow caps itself at 10 self-posts per PR (it counts prior `<!-- iteration-trigger -->` markers). If you don't get a wake event after the eleventh push, the trigger has gone silent — fall back to checking the underlying claude-review comment directly via `get_comments`.
+
+**Dropped-webhook bound.** Webhooks can drop; callers that arm a periodic fallback (e.g. the Ralph orchestrator's adaptive short `ScheduleWakeup`, ~180s while any PR is in CI/review) bound that failure mode to ~3 minutes instead of a full long-fallback sleep.
+
+## Local Sessions (No Webhook MCP)
+
+A **local terminal** Claude Code session has no `mcp__github__subscribe_pr_activity` tool at all — no `<github-webhook-activity>` event will ever arrive, and Steps 1–3 below cannot run as written. The substitute keeps the same event semantics by exploiting the one wake primitive local sessions do have: **a background Bash task's exit re-invokes the session**, so a process that exits exactly when the verdict/CI state settles IS the wake.
+
+- **Preferred (repos that ship it, like this one):** launch the per-lane hot watcher as a background task — `scripts/ralph/watch-pr.sh <PR>` (`run_in_background: true`) — and end the turn. It polls `scripts/ralph/pr-ready.sh` and exits printing `WATCH <PR> <token>` the moment the token leaves `pending`/`awaiting-review` (verdict landed, CI failed, lane went stale, PR merged/closed, or ~30 min timeout). Its pidfile makes relaunching idempotent (`already-watching`), and every wait outcome exits 0. On wake, route the token exactly as a webhook event: `ready`/verdict tokens → Step 4's currency check; `ci-failed` → Step 5.
+- **Fallback (no watcher script):** run `gh pr checks <PR> --watch` plus a verdict poll (`gh pr view <PR> --json comments` filtered by the canonical regex) as a background task that exits when either settles — same shape, hand-rolled.
+- **Never foreground-sleep or poll in-turn.** The webhook prohibition on polling is about *foreground* waiting; a background watcher whose exit is the wake is the local-session equivalent of subscribing and ending the turn.
 
 ## Instructions
 
@@ -196,7 +206,7 @@ Don't. The subscription does not deliver CI passes. Wait on the comment event di
 
 ### Error: Tempted to poll with `sleep` or `Bash run_in_background`
 
-Don't. The session is woken by `<github-webhook-activity>`. Polling burns time and conflicts with the harness's wake mechanism. Subscribe and end the turn.
+In a webhook-capable session: don't. The session is woken by `<github-webhook-activity>`. Polling burns time and conflicts with the harness's wake mechanism. Subscribe and end the turn. (In a **local** session, where no webhook exists, a background watcher whose exit is the wake — see "Local Sessions (No Webhook MCP)" — is the sanctioned substitute; the prohibition is on *foreground* sleeping/polling.)
 
 ### Error: Webhook arrives but `get_comments` shows no matching verdict
 
