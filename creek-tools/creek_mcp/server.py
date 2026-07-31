@@ -512,7 +512,12 @@ def build_server(
         input_path: str,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Read-only PII / secret scan over a vault-relative directory (FEAT-027)."""
+        """Read-only PII / secret scan of the FEAT-027 staging subtree.
+
+        Scoped to ``00-Creek-Meta/Inbound/``, which every ceiling admits. The
+        scan reads no per-file privacy tier, so any other vault path is ranked
+        as intimate content and needs privacy_tier_ceiling=intimate or all.
+        """
         return redact_scan_tool(
             vault_path=vault,
             input_path=input_path,

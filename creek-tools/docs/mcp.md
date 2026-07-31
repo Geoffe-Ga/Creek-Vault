@@ -41,6 +41,7 @@ cross-repo contract is
 | `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
+| `creek.redact.scan`   | Regex-scan a path for secrets/PII (FEAT-027); scoped to `00-Creek-Meta/Inbound/` at every ceiling, `intimate`/`all` elsewhere in the vault (#972). |
 
 #### The two `creek.state.*` tools gate in different shapes (#969)
 
@@ -126,6 +127,47 @@ artefacts in the operator's vault and break `latest.md` as the documented
 session-start context. `creek.state.render`'s default ceiling is `open`, so a
 **bare MCP render narrows `latest.md` for everyone**, including subsequent CLI
 reads. A caller that wants the richer report re-renders at the broader ceiling.
+
+#### `creek.redact.scan` is scoped, not tier-filtered (#972)
+
+The scan is a regex pass over bytes: it opens no front matter and reads no
+`privacy_tier` from anything it walks, so it has nothing to rank a fragment
+*with*. Its gate (`_refuse_outside_scan_scope`) therefore decides *where*
+the tool may look, in two parts. `00-Creek-Meta/Inbound/` — the FEAT-027
+staging subtree, where CrawDad stages Discord attachments before
+`creek.ingest` runs — is admitted at **every** ceiling, because that is the
+one call CrawDad makes, and it runs the safety pass there at the channel's
+own configured ceiling (`personal` by default, `open` only where an operator
+explicitly mapped that channel — `crawdad/crawdad/bot.py::_channel_tier`),
+so admission has to hold at the lowest of them. Every other in-vault target
+— `09-Reference/` as much as `01-Fragments/` — is ranked as if it held
+`intimate` content, because for all the scan knows it does; only
+`ceiling=intimate` or `all` admits it.
+
+That escape hatch doubles as the recovery path. A local stdio caller at
+`ceiling=intimate`/`all` can scan any vault path, and a bad path there gets
+the precise "resolves outside the vault root" diagnostic rather than the
+generic out-of-scope refusal. A **remote** consumer token is capped at
+`ceiling=personal` (see "INTIMATE is never reachable remotely" below), so it
+can never reach that escape — the whole-vault scan is a local-operator
+capability only.
+
+Two residuals are accepted rather than closed by this fix. **Existence
+probing within `Inbound/` still works** — a caller can still ask whether a
+given staged filename is there — and that is the tool's job, not a leak.
+**`RedactionScanner.scan_batch` still follows symlinked files** it walks
+into, so a symlink staged under `Inbound/` still discloses its target's PII
+types, line numbers, and whether it exists at all (it still counts toward
+`statistics.files_scanned`) — even though the fix stops the response from
+disclosing the target's *path* — tracked by #1087. `rglob` does not descend
+into symlinked *directories*, which bounds the residual to symlinked files.
+
+One deployment knob is worth flagging on top of the fix itself: CrawDad's
+staging root is a configurable `staging_subpath`
+(`AttachmentConfig`, default `00-Creek-Meta/Inbound`), not a hardcoded
+constant, so an operator who points it elsewhere gets a subtree the scan's
+hardcoded scope does not recognise as admitted-at-every-ceiling — a real
+deployment gap, tracked by #1088.
 
 ### Author tools (FEAT-041)
 
@@ -298,11 +340,28 @@ guard against a write this gate now refuses.
 One read-side leak was found, and it is worth stating how: the sweep
 first concluded there were none, having probed the tools that walk the
 corpus themselves. `creek.redact.scan` was set aside as "the caller
-named the path" — true, and not sufficient. Its path confinement is to
+named the path" — true, and not sufficient. Its path confinement was to
 the whole vault rather than to the FEAT-027 staging subtree, and it
-returns matching *filenames*, which are slugified fragment titles
-(#972). A posture whose name is accurate can still license a wrong
+returned matching *filenames*, which are slugified fragment titles — the
+filename was the content — plus which PII types and line numbers each one
+carried (#972). A posture whose name is accurate can still license a wrong
 conclusion; that is what the machine-checked manifest is for.
+
+The fix taught a second lesson on top of the first: narrowing *where* a
+tool may look only closes the caller-visible half of a leak like this one.
+`00-Creek-Meta/Inbound/` is now admitted at every ceiling and every other
+vault path is ranked as intimate, because the scan reads no per-file tier
+— but scoping alone would not have stopped a symlink staged under
+`Inbound/` from disclosing its target's slugified title from *inside* the
+admitted subtree. Closing that took a separate look at *how* paths are
+rendered: every finding and the markdown summary CrawDad posts to Discord
+now go through one renderer that names a path **as scanned**, never as
+resolved — because `RedactionScanner.scan_batch` yields symlinked children
+unresolved, and a renderer that resolved first reported such a symlink
+under its target's name, out of a scan the scope fix alone would still
+have admitted. See "`creek.redact.scan` is scoped, not tier-filtered" under
+Read tools above for the full shape of the fix, including the two residuals
+it accepts.
 
 ### Elevated-authorization model (FEAT-012)
 

@@ -92,6 +92,25 @@ refuses, on ``refuse_above_ceiling``. Read that as #1068's compile/reflect
 reasoning one level up: read's target is not caller-*named*, but it is
 caller-*addressed* and singular, which is the property that decides.
 
+#972 closed ``creek.redact.scan`` one step further out again: by narrowing the
+tool's *domain* rather than filtering its output. There was nothing to filter.
+The scan is a regex pass over bytes that opens no front matter, so it holds no
+tier for any file it names, and the leak was the filename itself — Creek
+fragment filenames are slugified titles. Its gate therefore decides *where*:
+the FEAT-027 staging subtree at every ceiling, because that is the one call
+CrawDad makes and it makes it at whatever ceiling the channel is configured
+for — ``personal`` unless an operator mapped that channel, ``open`` where one
+did — so the subtree has to be admitted at the lowest of them; everything else
+in the vault ranked as ``intimate``, because for all this tool knows it is.
+``refuse_above_ceiling`` was deliberately not adopted, for a sharper reason
+than ``report``'s: :data:`GENERIC_ABOVE_CEILING_REASON` asserts that *resolved
+content* exceeds the ceiling, which would be false here — nothing was resolved
+and nothing was ranked — and useless to a CrawDad operator, whose only
+actionable fact is where they pointed the scan. The gap also had a second half
+no gate could have closed, and it belongs to the same lesson: the response
+rendered a symlinked child under its target's name, so the scope fix is paired
+with a single as-scanned path renderer every field goes through.
+
 :data:`TOOL_POSTURES` is verified by ``tests/test_mcp_read_gate.py``, which
 fails if an entry lies: the manifest must match ``server.list_tools()``
 exactly, a ``GATED`` claim is checked against a real call site in the named
@@ -429,18 +448,71 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         rationale=_COUNTS_ONLY_RATIONALE,
     ),
     "creek.redact.scan": ToolPosture(
-        posture=ReadPosture.UNGATED_KNOWN_GAP,
+        posture=ReadPosture.GATED,
         rationale=(
-            "The caller names the path and resolve_within_vault confines it to "
-            "the vault, and no matched text is returned — but the confinement "
-            "is to the whole vault, not to the FEAT-027 staging subtree, and "
-            "the tier is never consulted. An open-ceiling caller pointed at "
-            "01-Fragments gets back the filenames of intimate fragments, which "
-            "are slugified titles, plus which PII types each contains. This "
-            "posture was CALLER_NAMED_PATHS until the #932 review; the name "
-            "was true and the conclusion drawn from it was not (#972)."
+            "Closed by narrowing the tool's domain, not by filtering its "
+            "output: the scan is a regex pass over bytes that reads no "
+            "per-file privacy_tier at all, so it has nothing to rank a "
+            "fragment with. _refuse_outside_scan_scope admits the FEAT-027 "
+            "staging subtree 00-Creek-Meta/Inbound/ at every ceiling — "
+            "CrawDad's safety pass runs there at the channel's configured "
+            "ceiling, personal by default and open only where an operator "
+            "mapped that channel (crawdad/crawdad/bot.py::_channel_tier), so "
+            "it has to keep working at the lowest of them — and ranks every "
+            "other in-vault target as if it held intimate content, so only "
+            "ceiling=intimate or all admits it. Consequence to know: that is "
+            "why a personal-ceiling caller cannot scan 09-Reference/ either — "
+            "the tool cannot tell it from 01-Fragments. Ordering is "
+            "load-bearing: the gate sits ABOVE the existence check, because "
+            "'input_path not found' versus a successful scan is a one-bit "
+            "existence oracle over every slugified fragment title in the "
+            "vault. Below ceiling=intimate all three out-of-scope answers are "
+            "now the same fixed string, derived from the caller's own "
+            "input_path and their own declared ceiling and echoing no tier, "
+            "no counts and no path: the file that is there, the name that is "
+            "nothing, and the symlink that resolves off the vault — which "
+            "resolve_within_vault necessarily catches ABOVE the gate, having "
+            "no resolved path to hand it, and which therefore collapses onto "
+            "the same reason in _outside_vault_reason rather than being "
+            "reordered under it. So for a caller the ceiling does not admit "
+            "vault-wide, the refusal is an oracle for neither existence nor "
+            "rank. The precise 'resolves outside the vault root' message "
+            "survives at ceiling=intimate and all, where it discloses nothing "
+            "the caller could not already read and a dangling link — a stale "
+            "sync folder, a moved drive — is the operator's one actionable "
+            "diagnostic. "
+            "refuse_above_ceiling was deliberately not adopted because its "
+            "generic reason asserts that resolved content was ranked, which "
+            "nothing here ever was. Deliberate divergence from rule 1 above: "
+            "the audit entry DOES record the probed target. It records the "
+            "caller's own input_path string and not the resolved path — which "
+            "for a staged symlink would be an intimate fragment's path — "
+            "because 'where did consumer X aim the scanner' is the actionable "
+            "fact about a security tool, and the string was already the "
+            "caller's. The second, independent half: every path in the "
+            "response — findings, the report_markdown headings CrawDad posts "
+            "verbatim into a channel, and the input_path echo — is "
+            "vault-relative through the single helper _vault_relative, and "
+            "rendered as scanned rather than as resolved, because a renderer "
+            "that resolved first let a symlink staged under Inbound/ disclose "
+            "an intimate fragment's slugified title from inside the admitted "
+            "subtree (#972). The echo is the one exception — it renders the "
+            "already-resolved target — and it is safe only because the gate "
+            "refuses an out-of-scope symlink before there is anything to "
+            "echo. Residuals to know: RedactionScanner.scan_batch still "
+            "follows symlinked children, so such a target's PII types and "
+            "line numbers are still disclosed even though its path no longer "
+            "is, and it counts toward statistics.files_scanned whether or not "
+            "it yields a finding, which is an existence-and-readability bit "
+            "about the target on top of the finding detail (#1087) — bounded "
+            "to symlinked FILES, since rglob does not descend into symlinked "
+            "directories and scan_batch keeps only is_file() children, so a "
+            "link to 01-Fragments/ staged as a directory yields nothing; and "
+            "existence probing *within* Inbound/ still works, which is the "
+            "tool's job rather than a leak."
         ),
-        gap_issue=972,
+        gate_module="creek_mcp.tools.redact",
+        gate_symbol="_refuse_outside_scan_scope",
     ),
     "creek.save": ToolPosture(
         posture=ReadPosture.NO_UNSUPPLIED_READ,
