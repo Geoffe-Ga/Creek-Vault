@@ -167,9 +167,13 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     "creek.reflect": ToolPosture(
         posture=ReadPosture.GATED,
         rationale=(
-            "An entry_ref resolves a fragment the caller did not supply; "
-            "_above_ceiling refuses it before the care seam, the grounding "
-            "retrieval, or the model (#846)."
+            "Two unsupplied reads, under two gates. (1) An entry_ref resolves "
+            "a fragment the caller did not supply; _above_ceiling refuses it "
+            "before the care seam, the grounding retrieval, or the model "
+            "(#846). (2) The grounding corpus walk, live since #964, is gated "
+            "by to_privacy_override -> tier_within_override's hard rank cutoff "
+            "inside RetrievalSpecialist: only within-ceiling fragments are "
+            "admitted, and they contribute their titles only."
         ),
         gate_module="creek_mcp.tools.reflect",
         gate_symbol="_above_ceiling",
