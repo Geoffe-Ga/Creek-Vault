@@ -1,0 +1,83 @@
+{
+  "$defs": {
+    "WheelFrequency": {
+      "additionalProperties": false,
+      "description": "One APTITUDE frequency's slice of the wheel.\n\nAttributes:\n    name: The canonical frequency name from\n        :data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES`.\n    count: Classified fragments at this frequency. A tally, so never\n        negative.\n    share: Fraction of *classified* fragments at this frequency, bounded to\n        ``[0.0, 1.0]``.",
+      "properties": {
+        "count": {
+          "description": "Classified fragments here.",
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        },
+        "name": {
+          "description": "Canonical APTITUDE frequency name.",
+          "title": "Name",
+          "type": "string"
+        },
+        "share": {
+          "description": "Fraction of classified fragments at this frequency.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Share",
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "count",
+        "share"
+      ],
+      "title": "WheelFrequency",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "All ten frequencies, as ten separate required fields.\n\nTen declared fields rather than a mapping, on purpose. It is what makes the\npublished JSON Schema say ``required: [F1 .. F10]`` \u2014 a consumer generating\ncode from the schema gets ten guaranteed members instead of an open\ndictionary it has to defend against \u2014 and it fixes the emission order at\nthe canonical one, so a diff of two wheels is a diff of numbers rather than\nof key ordering.\n\nFields are declared in the order of\n:data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES`. An eleventh\nfrequency is a change to the shared ontology vocabulary \u2014 a contract change\nwith a version bump \u2014 which is why ``extra=\"forbid\"`` rejects one rather\nthan passing it through.\n\nAttributes:\n    F1: Agency.\n    F2: Receptivity.\n    F3: Self-Love / Power.\n    F4: Community Love / Conformity.\n    F5: Achievism.\n    F6: Pluralism.\n    F7: Integration.\n    F8: True Self / Transcendence.\n    F9: Unity.\n    F10: Emptiness.",
+  "properties": {
+    "F1": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F10": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F2": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F3": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F4": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F5": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F6": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F7": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F8": {
+      "$ref": "#/$defs/WheelFrequency"
+    },
+    "F9": {
+      "$ref": "#/$defs/WheelFrequency"
+    }
+  },
+  "required": [
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10"
+  ],
+  "title": "WheelFrequencies",
+  "type": "object"
+}

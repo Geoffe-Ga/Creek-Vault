@@ -1,0 +1,23 @@
+{
+  "additionalProperties": false,
+  "description": "Marks a fixture-matrix cell that has no response shape to document.\n\nThe published example matrix is 4 capabilities x 7 states. Three of those\ncells \u2014 care escalation for ``capabilities``, ``journal-upsert`` and\n``wheel`` \u2014 are *structurally* unreachable: the acute-distress guard runs\nonly inside :func:`creek_mcp.tools.reflect.reflect_tool`, so no other\ncapability can ever escalate.\n\nBoth alternatives were worse. Fabricating a care-escalation response for\nthose cells would publish a shape the server can never emit, and a consumer\nwould write handling code for a branch that cannot be taken. Omitting the\ncells would break the rectangular matrix, and a hole in a matrix reads as\n\"not documented yet\" rather than \"cannot happen\" \u2014 which is exactly the\ndistinction a cross-repo consumer needs.\n\nSo the cell is filled with an explicit, machine-checkable statement of\nunreachability that says *why*.\n\nAttributes:\n    unreachable: ``Literal[True]``. The claim is the whole point of the\n        model, so the schema admits no other value.\n    reason: Why this cell cannot occur.",
+  "properties": {
+    "reason": {
+      "description": "Why this cell is structurally unreachable.",
+      "title": "Reason",
+      "type": "string"
+    },
+    "unreachable": {
+      "const": true,
+      "description": "Always true; this cell has no reachable response shape.",
+      "title": "Unreachable",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "unreachable",
+    "reason"
+  ],
+  "title": "NotApplicableExample",
+  "type": "object"
+}

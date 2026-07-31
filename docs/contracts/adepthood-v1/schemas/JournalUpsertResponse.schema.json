@@ -1,0 +1,65 @@
+{
+  "$defs": {
+    "JournalAction": {
+      "description": "What an idempotent journal upsert actually did.\n\n``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is\nthe steady state of a continuous sync, and a client must be able to tell it\napart from a write without diffing content itself.\n\nAttributes:\n    CREATED: A new fragment was written.\n    UPDATED: An existing fragment was updated in place.\n    UNCHANGED: The content hash matched; nothing was written.",
+      "enum": [
+        "created",
+        "updated",
+        "unchanged"
+      ],
+      "title": "JournalAction",
+      "type": "string"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool` refuses any remote call\ndeclaring a ceiling outside\n:data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` *before dispatch*. This\nenum mirrors that frozenset, so ``intimate`` and ``all`` are not merely\nrefused at runtime \u2014 they cannot be constructed at all.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The result of an idempotent journal write.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call was served under \u2014 the caller's own\n        declared value, echoed for correlation.\n    external_id: The consumer-side identity of the entry, unchanged.\n    fragment_id: The vault-side identity now backing it.\n    action: Whether the write created, updated, or changed nothing.\n    tier: The tier the entry was created at. Not expressible as\n        ``intimate``, for the same reason as on the request.",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/JournalAction",
+      "description": "Created, updated, or unchanged."
+    },
+    "external_id": {
+      "description": "Consumer-side entry identity.",
+      "title": "External Id",
+      "type": "string"
+    },
+    "fragment_id": {
+      "description": "Vault-side fragment identity.",
+      "title": "Fragment Id",
+      "type": "string"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier the entry was created at."
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "external_id",
+    "fragment_id",
+    "action",
+    "tier"
+  ],
+  "title": "JournalUpsertResponse",
+  "type": "object"
+}

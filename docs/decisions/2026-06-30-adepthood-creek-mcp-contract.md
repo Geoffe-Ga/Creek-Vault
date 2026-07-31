@@ -15,6 +15,14 @@
 > that **do not exist yet** are explicitly labelled *Planned* with their tracking
 > issue.
 
+> **Sibling document (2026-07-31, #1072).** Adepthood also reaches Creek over
+> a second, HTTP/JSON application adapter, `/v1`, documented separately in
+> [`2026-07-31-adepthood-http-application-api.md`](./2026-07-31-adepthood-http-application-api.md)
+> (status `Accepted (Creek side)`). Both adapters call the same
+> `creek_mcp.tools.*` implementations and share one `contract_version` /
+> `ontology_version`; this document remains the record for the MCP **agent**
+> adapter described below, and does not itself change status as a result.
+
 ## Purpose
 
 The Adepthood app reaches a user's local Creek vault to: read and write journal

@@ -1,0 +1,19 @@
+{
+  "care_signal": {
+    "kind": "acute_distress",
+    "message": "This sounds urgent and heavy, and you deserve real human support right now \u2014 more than a chatbot can give. Please reach out to someone you trust, or contact a crisis service. You are not alone in this.",
+    "resources": [
+      {
+        "contact": "Call or text 988",
+        "name": "988 Suicide & Crisis Lifeline (US)"
+      },
+      {
+        "contact": "https://findahelpline.com",
+        "name": "Find a Helpline (international directory)"
+      }
+    ]
+  },
+  "reason": "acute_distress",
+  "status": "escalate",
+  "tier_ceiling": "personal"
+}

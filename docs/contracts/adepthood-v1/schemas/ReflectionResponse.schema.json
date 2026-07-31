@@ -1,0 +1,111 @@
+{
+  "$defs": {
+    "NoteKind": {
+      "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
+      "enum": [
+        "fear",
+        "gift",
+        "longing",
+        "pattern",
+        "reframe",
+        "tension",
+        "value"
+      ],
+      "title": "NoteKind",
+      "type": "string"
+    },
+    "ReflectionNote": {
+      "additionalProperties": false,
+      "description": "One margin note: a verbatim span, a kind, and the reflection itself.\n\nAttributes:\n    quote: A span copied verbatim from the entry. The producing tool\n        verifies this; a note whose quote is not verbatim is dropped rather\n        than returned.\n    kind: One of the seven :class:`NoteKind` values.\n    note: The reflection, addressed to the writer in second person.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/NoteKind",
+          "description": "Margin-note kind."
+        },
+        "note": {
+          "description": "The reflection itself.",
+          "title": "Note",
+          "type": "string"
+        },
+        "quote": {
+          "description": "Verbatim span copied from the entry.",
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "quote",
+        "kind",
+        "note"
+      ],
+      "title": "ReflectionNote",
+      "type": "object"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool` refuses any remote call\ndeclaring a ceiling outside\n:data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` *before dispatch*. This\nenum mirrors that frozenset, so ``intimate`` and ``all`` are not merely\nrefused at runtime \u2014 they cannot be constructed at all.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier \u2014 the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field \u2014 do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.",
+  "properties": {
+    "essay": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional free prose.",
+      "title": "Essay"
+    },
+    "essay_grounded": {
+      "const": false,
+      "description": "Required; only False is admissible at contract 0.2.",
+      "title": "Essay Grounded",
+      "type": "boolean"
+    },
+    "notes": {
+      "description": "Margin notes; may be empty.",
+      "items": {
+        "$ref": "#/$defs/ReflectionNote"
+      },
+      "title": "Notes",
+      "type": "array"
+    },
+    "routed_tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier the call was keyed with; a function of tier_ceiling."
+    },
+    "status": {
+      "description": "ok or empty; escalate is CareEscalationResponse instead.",
+      "enum": [
+        "ok",
+        "empty"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Caller's declared ceiling."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "routed_tier",
+    "notes",
+    "essay_grounded"
+  ],
+  "title": "ReflectionResponse",
+  "type": "object"
+}

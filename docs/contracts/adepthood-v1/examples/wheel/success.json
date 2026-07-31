@@ -1,0 +1,58 @@
+{
+  "status": "ok",
+  "tier_ceiling": "open",
+  "total_classified": 10,
+  "unclassified": 0,
+  "wheel": {
+    "F1": {
+      "count": 1,
+      "name": "Agency",
+      "share": 0.1
+    },
+    "F10": {
+      "count": 1,
+      "name": "Emptiness",
+      "share": 0.1
+    },
+    "F2": {
+      "count": 1,
+      "name": "Receptivity",
+      "share": 0.1
+    },
+    "F3": {
+      "count": 1,
+      "name": "Self-Love / Power",
+      "share": 0.1
+    },
+    "F4": {
+      "count": 1,
+      "name": "Community Love / Conformity",
+      "share": 0.1
+    },
+    "F5": {
+      "count": 1,
+      "name": "Achievism",
+      "share": 0.1
+    },
+    "F6": {
+      "count": 1,
+      "name": "Pluralism",
+      "share": 0.1
+    },
+    "F7": {
+      "count": 1,
+      "name": "Integration",
+      "share": 0.1
+    },
+    "F8": {
+      "count": 1,
+      "name": "True Self / Transcendence",
+      "share": 0.1
+    },
+    "F9": {
+      "count": 1,
+      "name": "Unity",
+      "share": 0.1
+    }
+  }
+}

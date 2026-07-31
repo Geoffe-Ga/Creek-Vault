@@ -1,0 +1,14 @@
+{
+  "essay": null,
+  "essay_grounded": false,
+  "notes": [
+    {
+      "kind": "pattern",
+      "note": "Synthetic example prose. A real note mirrors the writer's own words back to them and never advises.",
+      "quote": "I keep saying yes to things I do not want"
+    }
+  ],
+  "routed_tier": "personal",
+  "status": "ok",
+  "tier_ceiling": "personal"
+}

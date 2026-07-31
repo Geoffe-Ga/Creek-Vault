@@ -1,0 +1,98 @@
+{
+  "$defs": {
+    "CareResource": {
+      "additionalProperties": false,
+      "description": "A way to reach a human, named and contactable.\n\nAttributes:\n    name: What the resource is called.\n    contact: How to reach it. Required \u2014 a resource without a contact\n        dead-ends the person reading it at the worst possible moment.",
+      "properties": {
+        "contact": {
+          "description": "How to reach it; required.",
+          "title": "Contact",
+          "type": "string"
+        },
+        "name": {
+          "description": "Name of the care resource.",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "contact"
+      ],
+      "title": "CareResource",
+      "type": "object"
+    },
+    "CareSignal": {
+      "additionalProperties": false,
+      "description": "The structured \"reach a human\" envelope, mirroring the runtime constant.\n\nValidates :data:`creek.care.guardrail.CARE_SIGNAL` itself rather than an\nabridged copy of it, so the wire shape cannot fall behind the guardrail.\n\nAttributes:\n    kind: The care guard that fired.\n    message: Prose addressed to the person, not to the client.\n    resources: At least one contactable resource. The signal never\n        dead-ends.",
+      "properties": {
+        "kind": {
+          "description": "The care guard that fired.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "description": "Prose addressed to the person.",
+          "title": "Message",
+          "type": "string"
+        },
+        "resources": {
+          "description": "At least one contactable resource.",
+          "items": {
+            "$ref": "#/$defs/CareResource"
+          },
+          "minItems": 1,
+          "title": "Resources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "message",
+        "resources"
+      ],
+      "title": "CareSignal",
+      "type": "object"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool` refuses any remote call\ndeclaring a ceiling outside\n:data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` *before dispatch*. This\nenum mirrors that frozenset, so ``intimate`` and ``all`` are not merely\nrefused at runtime \u2014 they cannot be constructed at all.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A 200-shaped escalation: the care signal instead of model prose.\n\nNot an error, and there is no ``care_escalation`` member of\n:class:`ErrorCode`, because a person in acute distress must not have their\nresponse swallowed by a client's error path.\n\nAttributes:\n    status: Pinned to :attr:`ReflectionStatus.ESCALATE`.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    reason: Which care guard fired.\n    care_signal: The runtime :data:`creek.care.guardrail.CARE_SIGNAL`,\n        whole.",
+  "properties": {
+    "care_signal": {
+      "$ref": "#/$defs/CareSignal",
+      "description": "The runtime care signal, whole."
+    },
+    "reason": {
+      "description": "Which care guard fired.",
+      "title": "Reason",
+      "type": "string"
+    },
+    "status": {
+      "const": "escalate",
+      "description": "Always escalate.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Caller's declared ceiling."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "reason",
+    "care_signal"
+  ],
+  "title": "CareEscalationResponse",
+  "type": "object"
+}

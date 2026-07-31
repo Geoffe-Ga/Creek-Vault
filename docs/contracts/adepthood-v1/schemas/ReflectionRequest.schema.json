@@ -1,0 +1,42 @@
+{
+  "additionalProperties": false,
+  "description": "A request for margin notes on exactly one source.\n\nAttributes:\n    content: Inline text supplied by the caller \u2014 their own words, so no\n        vault tier applies to it.\n    entry_ref: A vault fragment reference instead. Resolving it is a read,\n        so it is subject to the ceiling gate.\n    max_notes: How many notes at most, bounded to ``[1, 10]`` inclusive.",
+  "properties": {
+    "content": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Inline text to reflect on.",
+      "title": "Content"
+    },
+    "entry_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Vault fragment reference to reflect on.",
+      "title": "Entry Ref"
+    },
+    "max_notes": {
+      "default": 3,
+      "description": "Maximum margin notes to return.",
+      "maximum": 10,
+      "minimum": 1,
+      "title": "Max Notes",
+      "type": "integer"
+    }
+  },
+  "title": "ReflectionRequest",
+  "type": "object"
+}
