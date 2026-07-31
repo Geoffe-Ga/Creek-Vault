@@ -22,6 +22,15 @@ contract this suite pins, in order of stakes:
 4. Corpus-grounded retrieval, audit logging, read-only wrt the corpus, clean
    degradation with no provider, the care seam (#753), and tolerance of
    malformed fragment frontmatter under ``01-Fragments`` (#847).
+5. **The default (production) grounder actually grounds (#964)** — every other
+   test in this file injects a ``retrieve=`` stub, so the retrieval
+   ``build_server`` really wires had zero coverage and silently returned no
+   grounding at all. The final section drives that path with no ``retrieve=``:
+   it feeds the prompt corpus fragment **titles** (never bodies), admits
+   exactly the within-ceiling corpus and leaves no trace of anything above it,
+   routes at a tier dominating every fragment it retrieved, and on a retrieval
+   failure degrades to ``(none)`` while logging the exception's *type name*
+   only.
 
 The LLM and retrieval are injected — no live calls.
 """
@@ -29,20 +38,27 @@ The LLM and retrieval are injected — no live calls.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
 import pytest
 
+from creek.author.agents import RetrievalSpecialist
 from creek.care.guardrail import CARE_SIGNAL
 from creek.classify.llm.router import IntimateRoutingError
 from creek.models import PrivacyTier
+from creek_mcp import tier_ceiling
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 from creek_mcp.tools.reflect import TOOL_NAME, _routing_tier, reflect_tool
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.author.models import EvidenceBundle
 
 _ENTRY = (
     "I keep circling the same fear: that if I rest, everything I built quietly "
@@ -1427,3 +1443,553 @@ def test_nonstring_frontmatter_key_is_skipped_not_crashed(tmp_path: Path) -> Non
     )
     assert result["status"] == "refused"
     assert result["reason"] == "entry_ref not found"
+
+
+# --- Default (production) grounding retrieval (#964) ------------------------------
+
+# Every test above injects ``retrieve=``, so ``_default_retrieve`` — the grounder
+# ``build_server`` actually wires — has never been executed by this suite. Nothing
+# below passes ``retrieve=`` (except the last test, whose subject *is* the seam),
+# so these drive the production path end to end.
+
+# A verbatim span of ``_ENTRY``, so the canned response survives ``_clean_notes``
+# and the call lands on ``status: "ok"``. Reused wherever a test needs to tell
+# "grounding degraded" apart from "the whole call degraded".
+_GROUNDED_QUOTE = "the garden grew while I slept"
+
+# The literal ``_build_prompt`` renders when the grounding list is empty — i.e.
+# exactly what #964 shipped for every production reflection.
+_NO_GROUNDING = "(none)"
+
+# Grounding supplied by an injected stub, distinct from every corpus sentinel.
+_INJECTED_SNIPPET = "INJECTED-GROUNDING-0d5e"
+
+# A vault-content-shaped marker carried in a retrieval exception's *message*.
+_RETRIEVAL_FAILURE_SENTINEL = "VAULT-SECRET-4c19"
+
+
+@dataclass(frozen=True)
+class _CorpusSentinels:
+    """The three markers identifying one corpus-fixture fragment in a prompt.
+
+    Title, body and id are deliberately distinct, mutually non-substring
+    strings that appear nowhere in :data:`_ENTRY`. That is what lets an
+    assertion say *which* of the three reached the model: a title/body mix-up
+    (the whole subject of #964 — grounding feeds titles, not bodies) and a
+    stray id both become impossible to miss rather than silently equivalent.
+    """
+
+    frag_id: str
+    title: str
+    body: str
+
+
+#: One corpus fixture per ``privacy_tier``, keyed by the tier's front-matter
+#: value. Four entries on purpose: ``author.retrieval_top_k`` defaults to 5, so
+#: nothing here is ever truncated by the top-k slice and "admitted" is exactly
+#: set-equal to "retrieved".
+_CORPUS: dict[str, _CorpusSentinels] = {
+    "open": _CorpusSentinels(
+        frag_id="frag-corpus-open-9f2a",
+        title="TITLE-OPEN-9f2a",
+        body="BODY-OPEN-3c71",
+    ),
+    "personal": _CorpusSentinels(
+        frag_id="frag-corpus-personal-5b8d",
+        title="TITLE-PERSONAL-5b8d",
+        body="BODY-PERSONAL-1a46",
+    ),
+    "unclassified": _CorpusSentinels(
+        frag_id="frag-corpus-unclassified-2e93",
+        title="TITLE-UNCLASSIFIED-2e93",
+        body="BODY-UNCLASSIFIED-7d05",
+    ),
+    "intimate": _CorpusSentinels(
+        frag_id="frag-corpus-intimate-8c4f",
+        title="TITLE-INTIMATE-8c4f",
+        body="BODY-INTIMATE-6b29",
+    ),
+}
+
+_SOURCES_MARKER = "SOURCE FRAGMENTS:\n"
+_ENTRY_MARKER = "\n\nENTRY:\n"
+
+
+def _source_section(prompt: str) -> str:
+    """Return only the ``SOURCE FRAGMENTS`` block of *prompt*.
+
+    **Every grounding assertion in this section runs against this slice, never
+    against the raw prompt**, and both directions of that matter:
+
+    * a bare ``title in prompt`` can pass off the ``ENTRY:`` block (or the
+      schema preamble) and report grounding that never happened;
+    * a bare ``body not in prompt`` can fail off the ``ENTRY:`` block whenever
+      the entry legitimately quotes the same words.
+
+    Slicing first makes each assertion mean what it says. The one deliberate
+    exception is :func:`_assert_tier_left_no_trace`, which asserts *absence*
+    from the whole prompt — nothing above the ceiling may reach the provider by
+    any route, grounding block or not.
+
+    Args:
+        prompt: The full prompt recorded by :class:`_RecordingFactory`.
+
+    Returns:
+        The text between the ``SOURCE FRAGMENTS:`` header and the ``ENTRY:``
+        header — ``"(none)"`` when the grounding list was empty.
+    """
+    assert _SOURCES_MARKER in prompt, "prompt carries no SOURCE FRAGMENTS block"
+    after = prompt.split(_SOURCES_MARKER, 1)[1]
+    assert _ENTRY_MARKER in after, "SOURCE FRAGMENTS block is never terminated"
+    return after.split(_ENTRY_MARKER, 1)[0]
+
+
+def _write_corpus_fragment(
+    vault: Path,
+    *,
+    frag_id: str,
+    title: str,
+    body: str,
+    privacy_tier: str,
+) -> None:
+    """Write a fragment the *retrieval corpus* can actually see.
+
+    **Do not "de-duplicate" this against :func:`_write_fragment`.** They look
+    alike and are not interchangeable. ``_write_fragment`` writes only ``id``
+    and ``privacy_tier``, which is all an ``entry_ref`` lookup needs — that path
+    reads front matter directly. Corpus retrieval goes through
+    ``creek.vault.reader.try_load_fragment``, which returns ``None`` for any
+    file without ``type: fragment`` and for anything the ``Fragment`` model
+    rejects. A ``_write_fragment`` file is therefore **invisible** to
+    ``_load_corpus``, so a grounding test built on it would run against an empty
+    corpus and pass vacuously — the exact false green that let #964 sit
+    undetected. This writer mirrors the full, model-valid recipe instead.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        frag_id: The fragment ``id`` (also the file stem).
+        title: The fragment ``title`` — what ``_fragment_claim`` turns into an
+            ``EvidenceClaim.claim``, i.e. what grounding is made of.
+        body: The markdown body, which grounding must *not* carry.
+        privacy_tier: The ``privacy_tier`` front-matter value.
+    """
+    stamp = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
+    metadata: dict[str, Any] = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": title,
+        "created": stamp,
+        "ingested": stamp,
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "privacy_tier": privacy_tier,
+        "eddies": [],
+    }
+    target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
+        encoding="utf-8",
+    )
+
+
+def _write_tiered_corpus(vault: Path) -> None:
+    """Write every :data:`_CORPUS` fixture — one fragment per privacy tier.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+    """
+    for tier, sentinels in _CORPUS.items():
+        _write_corpus_fragment(
+            vault,
+            frag_id=sentinels.frag_id,
+            title=sentinels.title,
+            body=sentinels.body,
+            privacy_tier=tier,
+        )
+
+
+def _tiers_grounded_in(prompt: str) -> set[str]:
+    """Return the tiers whose corpus fixture reached *prompt*'s grounding block.
+
+    ORDERING HAZARD, and why this returns a *set*. The conftest's autouse
+    sentence-transformer mock seeds each vector from ``hash(text)``, which
+    Python randomises per process, so the similarity ranking of these fixtures
+    differs run to run. Nothing here may assert on order or index; membership is
+    the only stable observable. It is also the one that matters: the contract is
+    *which* fragments are admitted, not what order they came back in.
+
+    Args:
+        prompt: The full prompt recorded by :class:`_RecordingFactory`.
+
+    Returns:
+        The subset of :data:`_CORPUS` keys whose ``title`` appears in the
+        grounding block.
+    """
+    sources = _source_section(prompt)
+    return {tier for tier, marks in _CORPUS.items() if marks.title in sources}
+
+
+def _assert_tier_left_no_trace(prompt: str, tier: str) -> None:
+    """Assert nothing of the *tier* corpus fixture appears anywhere in *prompt*.
+
+    Checked against the **whole** prompt rather than :func:`_source_section`,
+    unlike every positive assertion here. An above-ceiling fragment crossing to
+    the provider is a leak wherever in the prompt it lands, so restricting this
+    to the grounding block would let a future "helpful context" section egress
+    it while the suite stayed green.
+
+    All three markers are checked because they fail differently: a *title* means
+    the ceiling filter admitted the fragment outright, a *body* means grounding
+    switched from titles to bodies (the design question #964 settles), and an
+    *id* means attribution metadata leaked without any prose to explain it.
+
+    Args:
+        prompt: The full prompt recorded by :class:`_RecordingFactory`.
+        tier: The :data:`_CORPUS` key that must be absent.
+    """
+    marks = _CORPUS[tier]
+    assert marks.title not in prompt, f"{tier} fragment title reached the model"
+    assert marks.body not in prompt, f"{tier} fragment body reached the model"
+    assert marks.frag_id not in prompt, f"{tier} fragment id reached the model"
+
+
+def _patch_gather_to_raise(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    """Make every :meth:`RetrievalSpecialist.gather` call raise *exc*.
+
+    Patches the class attribute rather than the module binding because
+    ``_default_retrieve`` imports ``RetrievalSpecialist`` lazily *inside* its own
+    body: it resolves the same class object this patch mutates, so the
+    substitution is picked up without reaching into the tool's import machinery.
+
+    Args:
+        monkeypatch: The builtin pytest fixture; restores the real ``gather``.
+        exc: The exception instance every ``gather`` call raises.
+    """
+
+    def _raise(*args: Any, **kwargs: Any) -> EvidenceBundle:
+        """Raise *exc* instead of gathering evidence."""
+        raise exc
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _raise)
+
+
+def test_default_grounding_feeds_fragment_titles_not_bodies(tmp_path: Path) -> None:
+    """The production grounder retrieves, and what it retrieves is titles (#964).
+
+    The anti-vacuity test for this whole section, and the direct regression for
+    #964: ``_default_retrieve`` read ``claim.text`` off an ``EvidenceClaim``
+    that carries ``claim``, so it raised ``AttributeError`` into a bare
+    ``except`` and every production reflection was grounded on ``(none)``.
+    Nothing in the response shows that — only the prompt does.
+
+    Both halves are load-bearing. The grounding block must be the fragment's
+    **title**, asserted by exact equality so the rendering (``"- " + claim``)
+    is pinned rather than merely "the title is in there somewhere"; and the
+    fragment **body** must appear nowhere in the prompt at all, because
+    ``EvidenceClaim`` could just as easily have been made to carry body text,
+    and grounding on bodies would push whole corpus fragments to the provider on
+    every call.
+    """
+    vault = _vault(tmp_path)
+    marks = _CORPUS["open"]
+    _write_corpus_fragment(
+        vault,
+        frag_id=marks.frag_id,
+        title=marks.title,
+        body=marks.body,
+        privacy_tier="open",
+    )
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+    prompt = factory.prompt
+    assert prompt is not None
+    sources = _source_section(prompt)
+    assert sources != _NO_GROUNDING, "production grounding retrieved nothing (#964)"
+    assert sources == f"- {marks.title}"
+    assert marks.body not in prompt, "grounding carried the body, not the title"
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected_tiers"),
+    [
+        (TierCeiling.OPEN, {"open"}),
+        (TierCeiling.PERSONAL, {"open", "personal", "unclassified"}),
+        (TierCeiling.INTIMATE, {"open", "personal", "unclassified", "intimate"}),
+        (TierCeiling.ALL, {"open", "personal", "unclassified", "intimate"}),
+    ],
+)
+def test_grounding_admits_exactly_the_within_ceiling_corpus(
+    tmp_path: Path, ceiling: TierCeiling, expected_tiers: set[str]
+) -> None:
+    """Production grounding admits the within-ceiling corpus — no more, no less.
+
+    Switching ``_default_retrieve`` on (#964) opens a *second* read path into
+    the vault, alongside the ``entry_ref`` resolution the #846 gate guards. This
+    one is not gated by tier at the tool: it relies entirely on the ceiling
+    being converted to a ``PrivacyTierOverride`` and handed to
+    ``RetrievalSpecialist.gather``, which drops above-override fragments inside
+    ``_load_corpus``. That is the only thing standing between an ``open``-ceiling
+    caller and the intimate half of their corpus, so it is pinned per ceiling.
+
+    Asserted as **set equality**, not as a leak check, so an *omission* fails as
+    loudly as a leak: a filter tightened to "open only" would silently strip
+    real grounding from every personal-tier caller, and a leak-only assertion
+    would call that a pass. The excluded fragments then get the stronger
+    whole-prompt check via :func:`_assert_tier_left_no_trace`.
+
+    ``ALL`` and ``INTIMATE`` deliberately share an expectation: ``ALL`` is a
+    ceiling, not a tier, and must not admit anything ``INTIMATE`` does not.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The caller's declared ceiling.
+        expected_tiers: The :data:`_CORPUS` keys whose titles must ground the
+            prompt at *ceiling* — exactly those, and no others.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+    prompt = factory.prompt
+    assert prompt is not None
+    assert _tiers_grounded_in(prompt) == expected_tiers
+    for tier in _CORPUS:
+        if tier not in expected_tiers:
+            _assert_tier_left_no_trace(prompt, tier)
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected_routed"),
+    [
+        (TierCeiling.OPEN, PrivacyTier.OPEN),
+        (TierCeiling.PERSONAL, PrivacyTier.PERSONAL),
+        (TierCeiling.INTIMATE, PrivacyTier.INTIMATE),
+        (TierCeiling.ALL, PrivacyTier.INTIMATE),
+    ],
+)
+def test_routing_tier_dominates_every_retrieved_fragment_tier(
+    tmp_path: Path, ceiling: TierCeiling, expected_routed: PrivacyTier
+) -> None:
+    """Whatever grounding pulled in, the routing tier is at least as sensitive.
+
+    This is the INTIMATE-never-egresses guarantee restated for the read path
+    #964 switches on. Retrieval widens what crosses to the provider from "the
+    caller's own entry" to "titles drawn from their corpus", so the routing tier
+    must dominate the most sensitive fragment *actually retrieved* — otherwise a
+    ceiling that admits intimate fragments into grounding while routing at a
+    cloud-eligible tier would egress them.
+
+    Two assertions, deliberately redundant, because each catches what the other
+    cannot:
+
+    (a) the hard-coded expected :class:`PrivacyTier` per ceiling, which fails if
+        ``_CEILING_ROUTING_TIER`` is ever retuned — the table is a policy
+        decision and a silent change to it must not pass;
+    (b) the inequality itself, derived from the tiers whose titles actually
+        reached the prompt rather than restated from the table above, so it
+        still holds if a *new* tier is added to the vocabulary and the fixtures
+        grow to match, and it fails if the admission filter and the routing
+        table ever drift apart.
+
+    (b) would be vacuous over an empty retrieval set — which is precisely the
+    #964 state — so a non-empty grounding set is asserted first.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The caller's declared ceiling.
+        expected_routed: The tier the factory must be asked for.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+    asked = factory.asked_tier
+    assert asked is not None, "the model was never reached"
+    assert asked is expected_routed
+    prompt = factory.prompt
+    assert prompt is not None
+    grounded = _tiers_grounded_in(prompt)
+    assert grounded, "no grounding reached the prompt (#964): (b) would be vacuous"
+    assert tier_ceiling.tier_sensitivity(asked) >= max(
+        tier_ceiling.tier_sensitivity(PrivacyTier(tier)) for tier in grounded
+    )
+
+
+def test_above_ceiling_fragment_contributes_nothing_not_even_a_title(
+    tmp_path: Path,
+) -> None:
+    """An intimate corpus fragment leaves no residue at an ``open`` ceiling.
+
+    Distinct from the residue #931/#1032 found on the compile/structural paths,
+    and the distinction is structural rather than lucky. Those paths run
+    ``filter_fragments_by_tier``, which *keeps* an above-ceiling fragment as a
+    summarised stub — so its title survives by design and the leak is the
+    surviving stub. Grounding retrieval does not go near that: ``_load_corpus``
+    applies ``tier_within_override``, a hard rank cutoff that drops the record
+    entirely before ranking, so there is no summarise-the-body step and nothing
+    can survive it. This test pins that *by construction* property, so a future
+    "reuse the compile filter here for consistency" refactor — which would look
+    like a tidy-up and would import the residue wholesale — fails loudly.
+
+    The ``open`` fragment is not decoration: it is the control that proves
+    grounding ran at all. Without it the intimate absences would hold trivially
+    under the #964 bug, and the test would be a permanent false green.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    prompt = factory.prompt
+    assert prompt is not None
+    # The control: grounding really ran, so the absences below mean something.
+    assert _CORPUS["open"].title in _source_section(prompt)
+    _assert_tier_left_no_trace(prompt, "intimate")
+
+
+def test_retrieval_failure_degrades_to_no_grounding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retrieval failure costs the reflection its grounding, not its answer.
+
+    Grounding is an enhancement; the entry is the subject. A corpus whose
+    embedding model is missing, whose cache is corrupt, or whose fragments fail
+    to load must not turn an ordinary journal reflection into a refusal — so
+    ``_default_retrieve`` swallows the failure and returns no snippets.
+
+    Pinned on both sides: the envelope is a normal ``ok`` (never ``refused``),
+    *and* the grounding block is exactly ``(none)``. The second half is what
+    stops a future "degrade to whatever we had" from shipping partial or stale
+    grounding out of a half-failed retrieval.
+
+    That broad ``except`` is also what hid #964 for the entire life of the
+    feature, which is why the degradation must stay observable — see
+    :func:`test_retrieval_failure_logs_the_exception_type_not_its_message`.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    _patch_gather_to_raise(monkeypatch, RuntimeError("embedding backend unavailable"))
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "ok"
+    assert result["notes"][0]["quote"] == _GROUNDED_QUOTE
+    prompt = factory.prompt
+    assert prompt is not None
+    assert _source_section(prompt) == _NO_GROUNDING
+
+
+def test_retrieval_failure_logs_the_exception_type_not_its_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The silent degradation must leave a trace — a *type name*, never a message.
+
+    #964 is a bug that ran in production for the whole life of the feature
+    precisely because ``except Exception: return []`` says nothing. Every
+    reflection was ungrounded and no operator could tell. A DEBUG line naming
+    the exception type is what makes the next such failure findable.
+
+    Naming only ``type(exc).__name__`` is not fastidiousness, it is the same
+    rule ``_resolve_entry`` already follows at ``reflect.py:326-331``:
+    ``yaml.MarkedYAMLError`` stringifies *with the offending source snippet*, so
+    ``str(exc)``, ``exc_info=True`` or ``logger.exception`` would write
+    tier-unknown vault content into a log file that carries no tier and is not
+    covered by the ceiling. The failure paths here are the same corpus files, so
+    the same rule applies — and a retrieval exception can just as easily carry a
+    fragment's text in its message.
+
+    Asserted both ways round: the type name must be present (a silent swallow
+    fails) and the message sentinel absent (a chatty log fails).
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    _patch_gather_to_raise(monkeypatch, RuntimeError(_RETRIEVAL_FAILURE_SENTINEL))
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    with caplog.at_level(logging.DEBUG, logger="creek_mcp.tools.reflect"):
+        result = reflect_tool(
+            vault_path=vault,
+            content=_ENTRY,
+            llm_factory=factory,
+            privacy_tier_ceiling=TierCeiling.PERSONAL,
+        )
+    assert result["status"] == "ok"
+    assert "RuntimeError" in caplog.text, "the degradation was swallowed silently"
+    assert _RETRIEVAL_FAILURE_SENTINEL not in caplog.text, "exception message logged"
+
+
+def test_injected_retrieve_bypasses_the_default_grounder(tmp_path: Path) -> None:
+    """An injected ``retrieve=`` still wins outright over the default grounder.
+
+    The seam every other test in this file depends on. ``reflect_tool`` picks
+    ``_default_retrieve`` only when ``retrieve is None``, and switching the
+    default on (#964) is exactly the change that could turn that into a merge —
+    grounding from both sources — without any existing test noticing, since they
+    all run against empty vaults where the default contributes nothing anyway.
+
+    Asserted with a populated corpus, so "the default did not also run" is a
+    real observation rather than a tautology, and by exact equality on the
+    grounding block: the injected snippet is not merely *present*, it is the
+    *only* thing there.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    calls: list[str] = []
+
+    def _stub_retrieve(query: str, vault_arg: Path, override: object) -> list[str]:
+        """Record the call and return one sentinel grounding snippet."""
+        del vault_arg, override
+        calls.append(query)
+        return [_INJECTED_SNIPPET]
+
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        retrieve=_stub_retrieve,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert calls == [_ENTRY]
+    prompt = factory.prompt
+    assert prompt is not None
+    assert _source_section(prompt) == f"- {_INJECTED_SNIPPET}"
+    assert _tiers_grounded_in(prompt) == set()
