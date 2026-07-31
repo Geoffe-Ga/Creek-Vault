@@ -43,7 +43,10 @@ The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types co
 
 ```bash
 creek state --vault ~/Obsidian/Creek-Vault
+creek state --vault ~/Obsidian/Creek-Vault --include-tier open
 ```
+
+`--include-tier` runs the same way round as it does on `creek report` (#968): **omitting it leaves the render unfiltered** — the CLI operator is the vault owner — and supplying it *narrows* what the artefact may contain. Only an explicitly supplied flag is recorded in `00-Creek-Meta/audit/privacy.jsonl`; a bare `creek state` writes no privacy-override entry, because `override_elevates` answers `True` for `all` and auditing the resolved ceiling would log the one case where the operator asked for nothing.
 
 The report is organised in eleven sections, in this order (FEAT-006 + FEAT-007 + FEAT-008):
 
@@ -61,7 +64,59 @@ The report is organised in eleven sections, in this order (FEAT-006 + FEAT-007 +
 
 Empty sections render an explicit `_No surfacing this week._` placeholder rather than disappearing — operators can tell at a glance whether a section had nothing to surface or whether the generator skipped it. Re-running in the same ISO week overwrites the existing file (idempotent).
 
-`latest.md` is created as a symlink where the filesystem supports it (POSIX hosts) and falls back to a copy on Windows or networked filesystems that reject `symlink(2)`. The report header renders the vault's leaf directory name only — never the absolute path — so committing or sharing the artefact does not leak an operator's home directory.
+`latest.md` is created as a symlink where the filesystem supports it (POSIX hosts) and falls back to a copy on Windows or networked filesystems that reject `symlink(2)`. No path anywhere in the artefact is absolute — the header renders the vault's leaf directory name only, section 9's drift rows are rendered vault-relative, and section 11's appended lint report is too — so committing or sharing the artefact does not leak an operator's home directory. Sections 9 and 11 are the reason that sentence used to be false, and both trace to the same scanner: `BrokenLinkScanner` and `OrphanScanner` return `str(path)`, which is absolute on a normal call. Section 9 rendered those paths verbatim, and `creek lint`'s `broken-links` check did too — which matters because section 11 appends the lint report *verbatim*, at `intimate` and above, and that includes a bare `creek state` (default ceiling `all`). Either route put an aged, unlinked `intimate` fragment's slugified title into the artefact inside a `/Users/...` path. Both are now rendered `relative_to(vault_path)`, as every other lint check already was.
+
+### What each section does at a tier ceiling (#969)
+
+Every section except **Pre-LLM yield** narrows with the ceiling, and the artefact then records the highest tier it actually admitted (see below). Read this table before choosing a ceiling — several of these exclusions are surprising the first time:
+
+| # | Section | Behaviour below the ceiling |
+|---|---------|-----------------------------|
+| 1 | Wavelength snapshot | Surveys the admitted corpus only. `Fragments observed:` is a per-tier count, and a count discloses the existence of what the rest of the report omitted. |
+| 2 | Vault summary | Same: counts and the frequency histogram are over admitted fragments, and the eddy/thread counts count *admitted* eddies and threads, so §2 cannot contradict §5/§6. |
+| 3 | Pre-LLM yield | **Ungated, deliberately.** The last line of `run-summary.jsonl` describes one pipeline *run* — a run id, a timestamp and four integers — and names no fragment, so there is nothing in it to filter by. |
+| 4 | Liminal Watch | A note is admitted only if its *raw* front matter is within the ceiling. `10-Liminal/Paradoxes/` notes are `type: paradox` and have no `privacy_tier` field in their model at all, so **they fail closed to `intimate` and disappear below `--include-tier intimate`**. Any hand-written note missing the key behaves the same way. |
+| 5 | Active eddies | `Eddy` carries no `privacy_tier`, so its tier is *derived*: the maximum over the tiers of every fragment whose `eddies` wikilinks name it. An eddy with one `open` and one `intimate` member is `intimate`. **An eddy no fragment names has no tier evidence at all and is admitted only at `intimate` or broader** — including the "no fragments loaded, fall back to the stored `fragment_count`" path. |
+| 6 | Active threads | The same rule over `threads` wikilinks. |
+| 7 | Surprising connections | A row survives only when *both* endpoint ids resolve to admitted fragments. |
+| 8 | Hyperedges | A praxis is admitted only when **every** id in its `derived_from` resolves to an admitted fragment; an empty `derived_from` names no evidence and is excluded. The spanned eddy set is then **intersected with the admitted eddies of §5** — being named by an admitted fragment is not enough, since an `open` fragment's front matter can name an eddy that derived `intimate` from a sibling member. The intersection runs before the "spans 2+ eddies" cut, so an excluded eddy can neither render in `spans:` nor pad the count that decides whether the row appears at all. |
+| 9 | Drift warnings | Broken-link sources and orphan paths are kept only when they are admitted fragment files. A broken link's *target* has no note to tier, but the target string is text authored inside the source fragment, so it carries the source's tier — which is gated. Every rendered row is attributable to an admitted fragment. |
+| 10 | Suggested questions | **The whole section is dropped below `--include-tier personal`**: the shared tier filter *summarises* a personal fragment as `[Personal-tier summary: <title>]` rather than dropping it, so at an `open` ceiling a personal title could otherwise ride out inside a prompt. At `personal` and above the miner runs under the ceiling *and* is handed a corpus this generator has already narrowed — the mining loaders gate `01-Fragments` and `10-Liminal` but take no override at all for `02-Threads` / `03-Eddies`, so a thread whose every member is above the ceiling would otherwise title a prompt. Threads and eddies are replaced with §5/§6's admitted lists; fragments are intersected by id, because the miner reads the tier off the *model* (missing key → `unclassified`) where §5's cutoff reads the raw front matter (missing key → `intimate`). |
+| 11 | Lint summary | Rendered **only at `--include-tier intimate` or broader**. It is a verbatim copy of a `00-Creek-Meta/Processing-Log/lint-*.md` artefact that embeds titles and tag names, and `creek lint`'s tag survey deliberately runs at `all` so it cannot report "no orphan tags" about a vault that has them. There is no row-level tier to filter on, so the section is admitted whole or not at all. |
+
+### The artefact stamps its own tier
+
+`write()` prefixes the report with three scalar front-matter keys:
+
+```yaml
+---
+type: state-report
+privacy_tier: <highest tier the render actually admitted>
+tier_ceiling: <the --include-tier the render ran under>
+---
+```
+
+`privacy_tier` is what `creek.state.read` compares an MCP caller's ceiling against — not `tier_ceiling`, which is recorded for the audit trail only. Comparing the render ceiling would refuse a broad render over a narrow corpus for no reason: a report produced at `--include-tier all` over a vault holding nothing above `open` contains nothing above `open` and stays readable at `open`.
+
+A report that admitted nothing stamps `open`, not `intimate`. The empty case here means "the document contains no tiered content", which is knowledge; failing closed would make a freshly-`creek init`-ed vault's first report unreadable at every ceiling below `intimate`.
+
+"Highest tier the render actually admitted" is the maximum over one entry per admitted fragment, eddy, thread, praxis and Liminal-Watch note, plus two contributions that are only knowable once the sections have rendered: the `10-Liminal` notes §10 mined from subfolders the Liminal Watch does not walk (`Compost`, chiefly), and an escalation to `intimate` whenever §11 rendered a lint report. **Every section that can emit content has to be accounted for in exactly one of those three places.** A section that emits a title without contributing a tier makes the stamp under-report, and `creek.state.read` then serves the document below the tier it actually carries — the read gate fails open. That was the shape of both bugs the #969 review found: §8 rendered an eddy that was not in §5's admitted list, and §10 titled a prompt with a thread that was not in §6's.
+
+Three scalars is a constraint, not a coincidence: CrawDad keeps a report's `raw_markdown` *including* front matter and feeds it into prompts, and its bullet regex is `^\s*-\s+`, so a block-style YAML list in the stamp would be misread as a report bullet.
+
+### Upgrading a `latest.md` written before the stamp
+
+A pre-#969 `latest.md` carries no stamp, and an unreadable or absent `privacy_tier` fails closed to `intimate`. That is *accurate* rather than merely cautious: every such report was rendered completely unfiltered, i.e. at the equivalent of `--include-tier all`.
+
+The consequence is that the next `creek.state.read` at the MCP default `ceiling=open` (CrawDad, `/creek`, `/creek phase`, `/creek wavelength`) answers `status: "refused"`. Recovery is one command and loses nothing:
+
+```bash
+creek state --vault ~/Obsidian/Creek-Vault --include-tier open
+```
+
+or an MCP `creek.state.render`, which re-renders and re-stamps at the caller's ceiling. The ISO-week archive files are untouched, and `ceiling=all` admits every stamp — including the unstamped legacy one — so no report is ever permanently unreachable.
+
+**`latest.md` is a single slot shared across ceilings**, kept single deliberately: per-ceiling filenames would multiply artefacts in the operator's vault and break `latest.md` as the documented session-start context. So an `open` render replaces a richer `all` render's report for *everybody*, including subsequent CLI reads. A caller that wants the broader report re-renders at the broader ceiling. Note that the MCP `creek.state.render` default ceiling is `open`, so a bare MCP render narrows `latest.md` for the whole vault.
 
 ### Size budget (FEAT-007)
 

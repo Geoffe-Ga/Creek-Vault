@@ -1322,6 +1322,7 @@ def current_phase_summary(
     today: date | None = None,
     window_days: int = DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
     level_policy: LevelPolicy = "all",
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
 ) -> CurrentPhaseSummary:
     """Return a :class:`CurrentPhaseSummary` for the trailing *window_days*.
 
@@ -1344,13 +1345,23 @@ def current_phase_summary(
             ``"all"`` (default) reproduces the pre-FEAT-025 behaviour.
             ``creek state`` passes ``"documents"`` so the snapshot is
             read at whole-source granularity.
+        override: Tier ceiling (#969), handed to
+            :func:`load_fragments_from_vault`, which already applies the
+            raw-frontmatter cutoff #968 added. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`
+            — "no ceiling declared" — so every pre-#969 caller is unchanged.
+            ``creek state`` states one explicitly, because the summary's
+            ``fragment_count`` is a per-tier count and therefore content: the
+            same one-bit disclosure ``creek.wheel``'s frequency tally is
+            ``GATED`` against. ``transitions`` renders phases and dates only,
+            so it names nothing that needs its own gate.
 
     Returns:
         A :class:`CurrentPhaseSummary`.
     """
     anchor = today or datetime.now(tz=UTC).date()
     start = anchor - timedelta(days=window_days - 1)
-    fragments = load_fragments_from_vault(vault_path)
+    fragments = load_fragments_from_vault(vault_path, override=override)
     fragments = select_by_policy(fragments, level_policy)
     tracker = WavelengthTracker()
     snapshot = tracker.analyze_period(fragments, start, anchor)

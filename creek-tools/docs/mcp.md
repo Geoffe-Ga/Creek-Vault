@@ -36,11 +36,96 @@ cross-repo contract is
 
 | Tool                  | Purpose                                                    |
 |-----------------------|------------------------------------------------------------|
-| `creek.state.read`    | Return the latest `00-Creek-Meta/State/latest.md` content. |
-| `creek.state.render`  | Re-render the audit report (expensive).                    |
+| `creek.state.read`    | Return the latest `00-Creek-Meta/State/latest.md` content, **refusing** when the artefact's own `privacy_tier` stamp exceeds `ceiling` (#969). |
+| `creek.state.render`  | Re-render the audit report (expensive), **excluding** above-ceiling content section by section and stamping what it admitted (#969). |
 | `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
 | `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
+
+#### The two `creek.state.*` tools gate in different shapes (#969)
+
+`render` **excludes**; `read` **refuses**. The asymmetry is deliberate and is
+the same rule `compile` and `reflect` follow, read one level up. `render` names
+no target — it is a corpus walk like `report` / `wheel` / `mine` — so refusing
+it would make the audit report unreachable, which is #968's explicit anti-goal.
+`read` addresses one atomic cached artefact, and there is nothing to partially
+admit: you cannot exclude half a rendered markdown document without
+re-rendering it, and re-rendering is what `render` is.
+
+`render`'s gap was **write-side**, which is why it survived earlier
+response-level sweeps: its envelope happens to echo `content`, but the durable
+evidence is the bytes under `00-Creek-Meta/State`, and three leaks were
+reproduced there — an `intimate` fragment's slugified title inside an
+**absolute** orphan path, a `10-Liminal/Unnamed` note's file stem, and an eddy
+title derived from an above-ceiling member fragment.
+
+What `render` excludes at each ceiling is tabulated in
+[`generation.md`](generation.md#what-each-section-does-at-a-tier-ceiling-969).
+The four exclusions worth knowing before you call it:
+
+* `10-Liminal/Paradoxes` notes are `type: paradox` and carry no `privacy_tier`
+  field at all, so they fail closed and vanish from the Liminal Watch below
+  `ceiling=intimate`. Any note missing the key behaves the same way.
+* The **lint summary** is a verbatim copy of a Processing-Log artefact and is
+  untierable row by row, so it is rendered only at `ceiling=intimate` or
+  broader. This closes the caveat `creek_mcp/read_gate.py` recorded under
+  `creek.lint` — `creek state` is the surface that serves that artefact back.
+* **Suggested questions** are dropped entirely below `ceiling=personal`,
+  because the shared tier filter *summarises* a personal fragment as
+  `[Personal-tier summary: <title>]` rather than dropping it, so a personal
+  title could otherwise ride out inside a mined prompt.
+* An **eddy or thread no fragment names** has no tier evidence and is admitted
+  only at `ceiling=intimate` or broader.
+
+One axis is **accounted for on the stamp rather than narrowed**, and it is worth
+knowing which. The mining corpus behind the suggested questions walks all of
+`10-Liminal` except `Synchronicities` — including `Compost`, which the Liminal
+Watch never reads — so `render` has no admitted list to narrow it against.
+Those notes' tiers are folded into the artefact's stamp instead, which means an
+untiered one pushes the stamp to `unclassified` (ranked with `personal`, #961)
+and the report is refused at `ceiling=open` — the one ceiling at which the
+section does not render anyway. Nothing identifying escapes regardless: the only
+liminal field a prompt renders is the fragment's opaque generated id. The
+consequence to know is a **posture split on the same file**: an `Unnamed` note
+with no `privacy_tier` key needs `ceiling=intimate` to appear in the Liminal
+Watch (read fail-closed off raw frontmatter) but only `ceiling=personal` for its
+id to reach a prompt (read through the validated model's `unclassified`
+default). Tracked as #1079.
+
+`read` compares the artefact's stamped `privacy_tier` — the highest tier the
+render admitted — never the `tier_ceiling` the render ran under. Comparing the
+latter would refuse an `all`-ceiling render over an all-`open` vault for no
+reason. The refusal is the canonical four-key payload with
+`GENERIC_ABOVE_CEILING_REASON`: no `content` key at all, and no echo of the
+stamped tier. A **missing** report stays `status: "empty"` rather than refused
+— there is no content for a ceiling to be above, and refusing there would be a
+vault-emptiness oracle in the other direction, as well as making a first run of
+CrawDad or `/creek` look like a permissions failure.
+
+#### Upgrading a `latest.md` written before #969
+
+A pre-#969 `latest.md` carries no stamp, and an absent or unreadable
+`privacy_tier` fails closed to `intimate`. That is accurate rather than
+cautious: every such report was rendered completely unfiltered, i.e. at the
+equivalent of `--include-tier all`. So the next `creek.state.read` at the
+default `ceiling=open` — CrawDad, `/creek`, `/creek phase`, `/creek wavelength`
+— returns `status: "refused"` with the generic reason, which is byte-identical
+to an above-ceiling refusal. That identity is the point: a distinguishable
+"this report predates the stamp" reason would itself be an oracle for whether
+the vault holds above-ceiling content.
+
+Recovery is one command and loses nothing: call `creek.state.render` (which
+re-renders and re-stamps at the caller's ceiling), or run `creek state
+--include-tier open` from the CLI. The ISO-week archive files are untouched,
+and `ceiling=all` admits every stamp — including the unstamped legacy one — so
+no report is ever permanently unreachable.
+
+**Cache thrash, stated on the tin.** `latest.md` is a single slot shared across
+ceilings, kept single deliberately: per-ceiling filenames would multiply
+artefacts in the operator's vault and break `latest.md` as the documented
+session-start context. `creek.state.render`'s default ceiling is `open`, so a
+**bare MCP render narrows `latest.md` for everyone**, including subsequent CLI
+reads. A caller that wants the richer report re-renders at the broader ceiling.
 
 ### Author tools (FEAT-041)
 
@@ -144,6 +229,13 @@ in mind when reading that fix — `report_tool` returns only `report_paths`,
 so its response envelope was clean at `ceiling=open` for the whole life of
 the bug and no response-level test could have caught it. The evidence was
 always the bytes of the artifact the call wrote.
+
+`creek.state.render` was the fourth, and it is the same shape (#969) — its
+envelope *does* echo `content` today, but that is a response shape rather than
+a guarantee, so the evidence for it is likewise the bytes under
+`00-Creek-Meta/State`. `creek.state.read` is the counterpart on the read side
+and the **first production adopter** of `read_gate.refuse_above_ceiling`; both
+are documented above under "Read tools".
 
 One read-side leak was found, and it is worth stating how: the sweep
 first concluded there were none, having probed the tools that walk the
