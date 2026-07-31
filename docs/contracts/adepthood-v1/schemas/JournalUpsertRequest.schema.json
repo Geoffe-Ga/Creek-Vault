@@ -1,0 +1,45 @@
+{
+  "$defs": {
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool` refuses any remote call\ndeclaring a ceiling outside\n:data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` *before dispatch*. This\nenum mirrors that frozenset, so ``intimate`` and ``all`` are not merely\nrefused at runtime \u2014 they cannot be constructed at all.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "An idempotent journal write from a remote consumer.\n\nAttributes:\n    content: The entry body. Whitespace-only is refused rather than\n        written: an empty fragment is indistinguishable from a corrupted\n        one once it is in the vault, and it would still consume an\n        ``external_id``.\n    timestamp: Optional client-supplied entry time. Omitted means \"the\n        server stamps it\", so a client with no reliable clock is still a\n        valid client.\n    tier: The tier to create the entry at. Typed\n        :class:`WireTierCeiling`, so ``intimate`` is not expressible \u2014 a\n        remote consumer cannot even *ask* for an intimate write.",
+  "properties": {
+    "content": {
+      "description": "Entry body; must not be blank.",
+      "title": "Content",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier to create the entry at."
+    },
+    "timestamp": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional client-supplied entry time.",
+      "title": "Timestamp"
+    }
+  },
+  "required": [
+    "content",
+    "tier"
+  ],
+  "title": "JournalUpsertRequest",
+  "type": "object"
+}

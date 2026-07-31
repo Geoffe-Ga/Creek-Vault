@@ -1,0 +1,5 @@
+{
+  "code": "invalid_request",
+  "message": "the request does not satisfy the published schema",
+  "request_id": "req-example-reflections-malformed-input"
+}

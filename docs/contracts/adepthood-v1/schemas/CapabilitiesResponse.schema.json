@@ -1,0 +1,142 @@
+{
+  "$defs": {
+    "CapabilitiesStatus": {
+      "description": "Overall readiness reported by the capabilities handshake.\n\nAttributes:\n    OK: The vault is present and this server can serve the contract.\n    UNINITIALIZED: No vault has been scaffolded yet. Both version strings\n        are still reported, so a client can always negotiate versions\n        against a server whose vault does not exist.\n    INCOMPATIBLE: The client's requested contract minor is not in\n        :data:`SUPPORTED_CONTRACT_MINORS`.",
+      "enum": [
+        "ok",
+        "uninitialized",
+        "incompatible"
+      ],
+      "title": "CapabilitiesStatus",
+      "type": "string"
+    },
+    "Capability": {
+      "description": "The four capabilities ``/v1`` publishes at contract 0.2.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.",
+      "enum": [
+        "capabilities",
+        "journal-upsert",
+        "reflections",
+        "wheel"
+      ],
+      "title": "Capability",
+      "type": "string"
+    },
+    "TierModel": {
+      "additionalProperties": false,
+      "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits \u2014 the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it.",
+      "properties": {
+        "ceilings": {
+          "description": "Tier ceilings this surface admits.",
+          "items": {
+            "$ref": "#/$defs/WireTierCeiling"
+          },
+          "title": "Ceilings",
+          "type": "array"
+        },
+        "default": {
+          "const": "open",
+          "description": "Ceiling applied when the caller declares none.",
+          "title": "Default",
+          "type": "string"
+        },
+        "intimate_never_egresses": {
+          "const": true,
+          "description": "Standing promise that intimate content never egresses.",
+          "title": "Intimate Never Egresses",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ceilings",
+        "default",
+        "intimate_never_egresses"
+      ],
+      "title": "TierModel",
+      "type": "object"
+    },
+    "VaultState": {
+      "additionalProperties": false,
+      "description": "Whether a vault exists behind this server.\n\nDeliberately one boolean. Anything richer \u2014 fragment counts, last-write\ntimestamps, initialisation progress \u2014 is a measurement of the corpus, and\nthe handshake is reachable before any tier gate has run.\n\nAttributes:\n    available: ``True`` when a scaffolded vault is readable.",
+      "properties": {
+        "available": {
+          "description": "True when a scaffolded vault is readable.",
+          "title": "Available",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "available"
+      ],
+      "title": "VaultState",
+      "type": "object"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool` refuses any remote call\ndeclaring a ceiling outside\n:data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` *before dispatch*. This\nenum mirrors that frozenset, so ``intimate`` and ``all`` are not merely\nrefused at runtime \u2014 they cannot be constructed at all.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n\u2014 which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` \u2014 the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.",
+  "properties": {
+    "capabilities": {
+      "description": "Capabilities served; empty on an uninitialised vault.",
+      "items": {
+        "$ref": "#/$defs/Capability"
+      },
+      "title": "Capabilities",
+      "type": "array"
+    },
+    "contract_minor": {
+      "description": "The major.minor spoken here.",
+      "title": "Contract Minor",
+      "type": "string"
+    },
+    "contract_version": {
+      "description": "Full semantic contract version.",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "ontology_version": {
+      "description": "Shared APTITUDE frequency / Wavelength phase vocabulary.",
+      "title": "Ontology Version",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/CapabilitiesStatus",
+      "description": "Overall server readiness."
+    },
+    "supported_contract_minors": {
+      "description": "Every contract minor this server still serves.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Supported Contract Minors",
+      "type": "array"
+    },
+    "tier_model": {
+      "$ref": "#/$defs/TierModel",
+      "description": "Standing privacy-tier promise."
+    },
+    "vault": {
+      "$ref": "#/$defs/VaultState",
+      "description": "Vault readiness."
+    }
+  },
+  "required": [
+    "status",
+    "contract_version",
+    "contract_minor",
+    "supported_contract_minors",
+    "ontology_version",
+    "vault",
+    "tier_model",
+    "capabilities"
+  ],
+  "title": "CapabilitiesResponse",
+  "type": "object"
+}

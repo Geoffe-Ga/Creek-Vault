@@ -1,0 +1,11 @@
+{
+  "incompatible_version": "terminal",
+  "internal_error": "retry_with_backoff",
+  "invalid_request": "terminal",
+  "not_found": "terminal",
+  "privacy_refused": "terminal",
+  "temporarily_unavailable": "retry_with_backoff",
+  "unauthenticated": "terminal",
+  "unavailable": "retry_after_operator_action",
+  "unsupported_capability": "terminal"
+}

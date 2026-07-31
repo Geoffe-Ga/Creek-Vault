@@ -1,0 +1,43 @@
+{
+  "$defs": {
+    "NoteKind": {
+      "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
+      "enum": [
+        "fear",
+        "gift",
+        "longing",
+        "pattern",
+        "reframe",
+        "tension",
+        "value"
+      ],
+      "title": "NoteKind",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One margin note: a verbatim span, a kind, and the reflection itself.\n\nAttributes:\n    quote: A span copied verbatim from the entry. The producing tool\n        verifies this; a note whose quote is not verbatim is dropped rather\n        than returned.\n    kind: One of the seven :class:`NoteKind` values.\n    note: The reflection, addressed to the writer in second person.",
+  "properties": {
+    "kind": {
+      "$ref": "#/$defs/NoteKind",
+      "description": "Margin-note kind."
+    },
+    "note": {
+      "description": "The reflection itself.",
+      "title": "Note",
+      "type": "string"
+    },
+    "quote": {
+      "description": "Verbatim span copied from the entry.",
+      "title": "Quote",
+      "type": "string"
+    }
+  },
+  "required": [
+    "quote",
+    "kind",
+    "note"
+  ],
+  "title": "ReflectionNote",
+  "type": "object"
+}
