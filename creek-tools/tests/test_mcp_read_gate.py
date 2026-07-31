@@ -98,6 +98,7 @@ from creek_mcp.read_gate import (
 from creek_mcp.server import build_server
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
+from creek_mcp.tools.journal import journal_ingest_tool
 from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
@@ -160,6 +161,21 @@ _PINNED_GATE_ROWS = [
     # caller-*addressed* and singular, which is the property that matters.
     ("creek.state.read", "creek_mcp.tools.state_read", "refuse_above_ceiling"),
     ("creek.state.render", "creek_mcp.tools.state", "to_privacy_override"),
+    # #970 closed the journal gap, and this row is a *re-point* of the same
+    # kind #968 made for ``report`` and #969 made for the two ``state.*``
+    # entries: the entry moves from a gap claim to a gate claim layers (c),
+    # (e) and (f) can check, rather than being deleted. ``creek.journal``'s
+    # gap was never on its *response* — the entry body is the caller's own —
+    # but on its idempotent update-in-place, which overwrote whatever fragment
+    # an ``external_id`` already mapped to without ranking that fragment's
+    # tier. It now refuses on the rule *you may only overwrite what you could
+    # have read*, which is a read question, so it goes through
+    # ``refuse_above_ceiling`` (and thus ``tier_allowed``) rather than through
+    # the write-side ``write_tier_allowed`` that still gates the incoming
+    # entry's own tier. Pinning the exact pair is what keeps the posture and
+    # the behaviour from drifting apart — the property the deleted
+    # ``test_journal_is_pinned_as_no_unsupplied_read`` used to hold.
+    ("creek.journal", "creek_mcp.tools.journal", "refuse_above_ceiling"),
 ]
 
 _PINNED_GAPS = {
@@ -172,8 +188,6 @@ _PINNED_GAPS = {
     # reassuring label while the behaviour is unchanged.
     "creek.redact.scan": 972,
 }
-
-_PINNED_JOURNAL_GAP_ISSUE = 970
 
 _PINNED_AUTH_TOKEN_TOOLS = [
     "creek.purge.fragment",
@@ -581,18 +595,27 @@ def test_pinned_gaps_keep_their_posture_and_issue(tool: str, issue: int) -> None
     assert entry.gap_issue == issue
 
 
-def test_journal_is_pinned_as_no_unsupplied_read() -> None:
-    """``creek.journal`` never returns content the caller did not supply.
+def test_journal_carries_no_residual_gap_issue() -> None:
+    """``creek.journal``'s posture and its story stay in step (#970).
 
-    Its posture is ``NO_UNSUPPLIED_READ`` rather than a gate: the write-side is
-    guarded by ``write_tier_allowed``, and the read-side gap it still carries
-    (#970) is recorded on the same entry. Pinning both together keeps the two
-    halves of that story from drifting apart — a reader must not be able to
-    conclude "journal has no gap" from the posture alone.
+    The other half of the re-point recorded in :data:`_PINNED_GATE_ROWS`,
+    which pins the gate itself. What is pinned *here* is the property the
+    deleted ``test_journal_is_pinned_as_no_unsupplied_read`` held before the
+    gap closed: a reader must not be able to draw the wrong conclusion about
+    journal from the manifest alone. That test said "the posture is
+    reassuring, so the gap must be recorded next to it"; with the gap closed,
+    the same intent inverts — a leftover ``gap_issue`` on a now-``GATED``
+    entry would advertise a hole that is not there, send an auditor hunting
+    #970 in a module that fixed it, and (via ``_GAP_ISSUE_TOOLS``) keep
+    demanding the tool's own source still mention the issue as an open gap.
     """
     entry = TOOL_POSTURES["creek.journal"]
-    assert entry.posture is ReadPosture.NO_UNSUPPLIED_READ
-    assert entry.gap_issue == _PINNED_JOURNAL_GAP_ISSUE
+    assert entry.posture is ReadPosture.GATED
+    assert entry.gap_issue is None, (
+        "creek.journal is GATED by the #970 overwrite gate but still names a "
+        f"gap issue (#{entry.gap_issue}). Drop gap_issue, or explain in the "
+        "rationale what remains ungated."
+    )
 
 
 @pytest.mark.parametrize("tool", _PINNED_AUTH_TOKEN_TOOLS)
@@ -1233,6 +1256,17 @@ _RUNTIME_INTIMATE_ID = "frag-runtime-intimate"
 # simply stopped resolving the fragment, which proves nothing about the gate.
 _REFLECT_ABOVE_CEILING_REASON = "entry_ref tier exceeds ceiling"
 
+# ``creek.journal``'s probe writes its own entry (see ``_seed_journal_canary``),
+# so it needs an idempotency key and a stable timestamp. The key is deliberately
+# canary-free: it is the caller's own string and the tool echoes it back on
+# success, so a sentinel in it would make a leak assertion ambiguous.
+_JOURNAL_PROBE_EXTERNAL_ID = "runtime-probe-journal-970"
+_JOURNAL_PROBE_TS = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
+# The refused caller's *own* text. It must reach no file in the vault: a
+# refusal that still staged or wrote this body would be the #970 bug with a
+# tidier response.
+_JOURNAL_REPLACEMENT_CANARY = "CANARY-RUNTIME-JOURNAL-REPLACEMENT-3a6c"
+
 _PROBE_EXEMPT: dict[str, str] = {
     "creek.draft": (
         "draft_tool needs a DraftGenerator driven over a deployed skills tree; "
@@ -1490,6 +1524,92 @@ def _probe_state_read(vault: Path) -> dict[str, Any]:
     )
 
 
+def _seed_journal_canary(vault: Path) -> None:
+    """Ingest one ``intimate`` journal entry the later overwrite attempt targets.
+
+    The probe has to create its own entry rather than reuse the fixture's
+    fragments: ``creek.journal``'s gate resolves its target through the
+    **source ledger**, keyed on the staged entry's stable path, so a fragment
+    that was never ingested through this tool has no ledger record and the
+    call would be a plain creation. ``canary_vault`` is a bare fragment vault,
+    so the meta subtree is created first — the same reason
+    :func:`_probe_report` creates ``00-Creek-Meta``, widened to the layout
+    ``tests/test_mcp_journal.py`` gives the real ingest.
+
+    Seeded at ``ceiling=all`` so the intimate entry is genuinely admitted and
+    genuinely stored — the probe below then attempts to destroy it from
+    ``ceiling=open``.
+
+    Args:
+        vault: The seeded canary vault, mutated in place.
+    """
+    for sub in ("00-Creek-Meta/State", "00-Creek-Meta/audit"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+    seeded = journal_ingest_tool(
+        vault_path=vault,
+        content=f"Intimate journal canary body {_RUNTIME_INTIMATE_CANARY}",
+        external_id=_JOURNAL_PROBE_EXTERNAL_ID,
+        timestamp=_JOURNAL_PROBE_TS,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert seeded["status"] == "ok"
+    assert seeded["action"] == "created"
+
+
+def _journal_overwrite_at_open(vault: Path) -> dict[str, Any]:
+    """Re-send the seeded ``external_id`` as ``open`` text at ``ceiling=open``.
+
+    The incoming tier is ``open``, so the pre-existing ``write_tier_allowed``
+    gate admits it; only a gate that ranks the tier of the fragment being
+    *overwritten* refuses this call.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return journal_ingest_tool(
+        vault_path=vault,
+        content=f"Open replacement body {_JOURNAL_REPLACEMENT_CANARY}",
+        external_id=_JOURNAL_PROBE_EXTERNAL_ID,
+        timestamp=_JOURNAL_PROBE_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _probe_journal(vault: Path) -> dict[str, Any]:
+    """Seed an intimate entry, then attempt to overwrite it at ``ceiling=open``.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope for the overwrite attempt.
+    """
+    _seed_journal_canary(vault)
+    return _journal_overwrite_at_open(vault)
+
+
+def _fragment_bytes(vault: Path) -> dict[Path, bytes]:
+    """Return every fragment file under ``01-Fragments`` mapped to its bytes.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        ``{path: bytes}``. A mapping rather than a list so a file that
+        appeared, vanished or moved shows up as a changed key rather than as
+        an off-by-one in a positional comparison.
+    """
+    return {
+        path: path.read_bytes()
+        for path in sorted((vault / "01-Fragments").rglob("*.md"))
+    }
+
+
 _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.wheel": _probe_wheel,
     "creek.mine": _probe_mine,
@@ -1498,6 +1618,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.report": _probe_report,
     "creek.state.render": _probe_state_render,
     "creek.state.read": _probe_state_read,
+    "creek.journal": _probe_journal,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -1872,4 +1993,80 @@ def test_state_read_probe_refuses_rather_than_merely_staying_quiet(
         "creek.state.read's refusal carries keys beyond the canonical four. "
         "Every extra key on a refusal is derived from content the caller was "
         f"not admitted to.\n\n{response}"
+    )
+
+
+def test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched(
+    canary_vault: Path,
+) -> None:
+    """``creek.journal``'s evidence is the fragment bytes, not the envelope (#970).
+
+    The shared assertion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling``
+    passes **vacuously** for this tool. ``creek.journal``'s gate answers with
+    the canonical four-key refusal, which carries no content at all — so its
+    envelope is canary-free at ``ceiling=open`` whether or not the ceiling is
+    enforced, and it was canary-free for the whole life of the gap. Worse, the
+    *unfixed* tool answered ``status="ok"`` with a fragment id and no canary
+    either. The envelope check still earns its place as a tripwire against a
+    future response shape that does carry content, but presenting a green
+    layer (f) as evidence that this write path is gated is exactly the #968
+    blind spot: there, a response-level guardrail passed 5/5 while all six
+    report generators went on leaking to disk.
+
+    The evidence that means anything is the bytes on disk, so the fragment
+    files are snapshotted across the refused call and compared. Three
+    directions are pinned: the protected bytes are identical, the intimate
+    canary and its ``intimate`` stamp both survive, and the refused caller's
+    own replacement text reached **no** markdown file anywhere in the vault —
+    the staged copy under ``00-Creek-Meta/adepthood/journal/`` included, which
+    is what makes the gate's position above ``_stage_entry`` checkable here.
+    The seeded canary is asserted present first, as the positive control:
+    without it every exclusion below would hold over a vault where nothing was
+    ever written.
+    """
+    fixture_fragments = set(_fragment_bytes(canary_vault))
+    _seed_journal_canary(canary_vault)
+    before = _fragment_bytes(canary_vault)
+    # Identified as "the file that was not there before the seed" rather than
+    # by directory or by canary match: the fixture's own intimate fragment
+    # carries the same sentinel, and the journal routing directory is an
+    # implementation detail this test has no reason to pin.
+    seeded = sorted(set(before) - fixture_fragments)
+    assert len(seeded) == 1, (
+        "the journal probe's intimate entry is not on disk as exactly one new "
+        f"fragment, so every assertion below is vacuous: {seeded}"
+    )
+    assert _RUNTIME_INTIMATE_CANARY in before[seeded[0]].decode("utf-8")
+
+    response = _journal_overwrite_at_open(canary_vault)
+
+    assert _fragment_bytes(canary_vault) == before, (
+        "creek.journal's update-in-place rewrote an intimate fragment for a "
+        "caller at privacy_tier_ceiling=open. The response envelope carries "
+        "no content either way, so nothing in layer (f)'s shared canary sweep "
+        "could have caught this."
+    )
+    protected = frontmatter.load(seeded[0])
+    assert _RUNTIME_INTIMATE_CANARY in protected.content
+    assert protected.metadata["privacy_tier"] == "intimate"
+    leaked = [
+        path
+        for path in sorted(canary_vault.rglob("*.md"))
+        if _JOURNAL_REPLACEMENT_CANARY in path.read_text(encoding="utf-8")
+    ]
+    assert leaked == [], (
+        "the refused caller's own text was written to the vault anyway: "
+        f"{leaked}. A refusal returned above _stage_entry writes nothing; one "
+        "returned below it leaves a staged entry whose privacy_tier has "
+        "already been rewritten downward."
+    )
+    assert response == refusal_response(
+        tool="creek.journal",
+        ceiling=TierCeiling.OPEN,
+        reason=GENERIC_ABOVE_CEILING_REASON,
+    ), (
+        "creek.journal's refusal carries keys beyond the canonical four. Every "
+        "extra key is derived from a fragment the caller was not admitted to — "
+        f"including the id it resolved.\n\n{response}"
     )

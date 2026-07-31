@@ -151,7 +151,7 @@ real desk. Only the `research` medium is wired — any other `medium` returns
 | `creek.report`          | `report_type` (`tags`\|`voice`\|`decisions`\|`lexicon`\|`rhetorical-patterns`\|`mode-profiles`) | Ceiling is enforced on the *inputs* of all six generators (#968): a note enters the artifact only if its raw front matter is within `ceiling`, and a missing `privacy_tier` fails closed to `intimate`. Consequence for `tags`: the Tag Garden scans five directories, and the four beyond `01-Fragments` hold note types with no `privacy_tier` field at all, so **a ceiling-filtered tag garden is fragment-derived only**. `tag-history.json` entries record the `tier_ceiling` they were taken under, and growth is only ever compared between entries at the same ceiling. |
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars excluded by a generator hardcode, not by the ceiling — `personal` bodies pass unsummarised at `ceiling=open` (known gap #971). |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Gates the *source* fragments' tier, not the compiled page's tier — a source above `ceiling` refuses the whole call (#848). Idempotent per FEAT-003; no-op re-runs do not log a duplicate. |
-| `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. The tier of the fragment an existing `external_id` already maps to is **not** consulted before the update-in-place overwrites it (known gap #970). |
+| `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. Two gates, in this order. (1) The *incoming* entry's tier is honored — a ceiling that would not admit it is refused, never downgraded. (2) An `external_id` that already maps to a fragment is an **update-in-place**, so the tier of the fragment it would destroy is ranked too: **you may only overwrite what you could have read** (#970). That second gate reads the fragment's *current* vault tier (not the caller's declared tier, not the staged copy's stamp) and refuses through the shared `read_gate.refuse_above_ceiling`, so the refusal names neither the fragment nor its tier. It sits **above** staging, so a refusal leaves the staged entry under `00-Creek-Meta/adepthood/journal/` untouched as well. Fail-closed rules: an `external_id` with no ledger record at all is a plain **creation** and still works at every ceiling; an `external_id` whose ledger record points at a fragment that no longer resolves ranks as `intimate` and is refused below `ceiling=intimate` — recovery is one re-send at a broader ceiling from a **local stdio** caller only (remote consumers cannot; see "INTIMATE is never reachable remotely" and the consequence spelled out under "Read-side posture" below), not a ledger hand-edit. |
 
 ### Purge tools (FEAT-012, elevated authorization required)
 
@@ -236,6 +236,64 @@ a guarantee, so the evidence for it is likewise the bytes under
 `00-Creek-Meta/State`. `creek.state.read` is the counterpart on the read side
 and the **first production adopter** of `read_gate.refuse_above_ceiling`; both
 are documented above under "Read tools".
+
+`creek.journal` was the sharpest of the write-side gaps, the last to close
+(#970), and the **second adopter** of `refuse_above_ceiling` — the first that
+is a *write* gate. It did not merely act on above-ceiling content: its
+idempotent update-in-place *destroyed* it, replacing the body of the fragment
+an `external_id` already mapped to without ever ranking that fragment's tier.
+No read-back wording covered that, and its response envelope was clean either
+way, which is why the gap survived a response-level sweep. The rule it now
+enforces is **you may only overwrite what you could have read**, which is a
+read question — hence the read primitive, and hence `tier_allowed` rather than
+`write_tier_allowed` (that one still gates the incoming entry's own tier,
+above it). Because remote consumers are capped at `personal` (see "INTIMATE is
+never reachable remotely" below), the crisp consequence is this: **a remote
+consumer token can no longer destroy an `intimate` journal fragment.** Before
+the fix it could — `creek.journal` is a write tool a consumer token reaches,
+and overwriting an entry required only the caller's own, lower ceiling, while
+the equivalent destruction through `creek.purge.*` demands
+`CREEK_MCP_ELEVATED_TOKEN`.
+
+**Consequence to know: that same cap means a remote consumer can never touch
+an `intimate` journal `external_id` again, period** — not to edit it, and not
+even to re-send it unchanged. `creek classify`'s privacy pass is
+escalate-only, so once an entry reaches `intimate` the overwrite gate refuses
+every call below `ceiling=intimate`, and the gate sits above the
+`record.content_hash != new_hash` comparison in `write_fragment_idempotent`,
+so an unchanged idempotent re-sync is refused identically to a genuine edit.
+Adepthood, the primary journal producer, is itself a remote consumer, so this
+is the single operational consequence of #970 most likely to bite in
+production — the earlier "recovery is one re-send" language elsewhere on this
+page holds only for a **local stdio** caller. #1082 tracks a possible
+content-hash carve-out that would let an unchanged re-send through below
+`ceiling=intimate`; that is a design decision for a later architecture pass,
+not implemented here.
+
+**Recovering an already-clobbered vault.** The fix is *preventive only*. A
+body overwritten by the pre-#970 behaviour survives nowhere in the vault:
+provenance records hashes and paths, not content. In order of preference:
+
+1. **Re-send at `ceiling=intimate`/`all`, from a local stdio caller.**
+   Adepthood is the system of record for the original content, but it cannot
+   perform this step itself — it is a remote consumer, and remote requests
+   are capped at `ceiling=personal` (see "INTIMATE is never reachable
+   remotely" below), so it can never request `ceiling=intimate`/`all`. An
+   operator with local stdio access re-sends the original entry with the
+   same `external_id` at that ceiling. The body is restored, and the
+   fragment's persisted `intimate` tier is preserved by the escalate-only
+   privacy merge — re-sending never downgrades a tier.
+2. **Vault-level backup** — Obsidian's file recovery, `git`, or Time Machine
+   on the vault directory.
+3. **Scope the damage** from `00-Creek-Meta/audit/mcp.jsonl`: look for
+   `creek.journal` entries whose `args_summary.external_id` matches and whose
+   `tier_ceiling` is below the affected fragment's tier. The refusal audit
+   records only the caller's own arguments, so the trail shows attempts and
+   ceilings, never which fragment was behind an id.
+
+There is deliberately **no pre-image backup** taken before an update. It would
+mint a second plaintext copy of intimate content — a new leak surface — to
+guard against a write this gate now refuses.
 
 One read-side leak was found, and it is worth stating how: the sweep
 first concluded there were none, having probed the tools that walk the
@@ -420,7 +478,12 @@ routable by design and requires TLS.
   is intentional (Adepthood writes journal entries remotely), so treat each
   token as a write-capable credential — a meaningfully larger attack surface
   than "remote read-only." Purge tools stay gated separately by
-  `CREEK_MCP_ELEVATED_TOKEN` (a per-consumer bearer alone cannot purge).
+  `CREEK_MCP_ELEVATED_TOKEN` (a per-consumer bearer alone cannot purge). The
+  one *destructive* path a consumer token could reach without the elevated
+  token is now closed: `creek.journal`'s update-in-place refuses to overwrite a
+  fragment above the caller's ceiling (#970), and remote callers are capped at
+  `personal`, so a remote consumer can no longer destroy an `intimate` journal
+  fragment.
 - **INTIMATE is never reachable remotely.** The boundary caps a remote
   caller at `personal`: a request for a `privacy_tier_ceiling` above it
   (`intimate` / `all`, or any unrecognised value) is **refused before
