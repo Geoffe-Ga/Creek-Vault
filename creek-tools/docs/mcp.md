@@ -90,7 +90,7 @@ consequence to know is a **posture split on the same file**: an `Unnamed` note
 with no `privacy_tier` key needs `ceiling=intimate` to appear in the Liminal
 Watch (read fail-closed off raw frontmatter) but only `ceiling=personal` for its
 id to reach a prompt (read through the validated model's `unclassified`
-default). Tracked as a follow-up.
+default). Tracked as #1079.
 
 `read` compares the artefact's stamped `privacy_tier` — the highest tier the
 render admitted — never the `tier_ceiling` the render ran under. Comparing the
