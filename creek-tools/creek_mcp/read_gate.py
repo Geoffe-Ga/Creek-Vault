@@ -43,9 +43,25 @@ RESIDUAL RISK" block documents exactly why its reason must stay distinct from
 ``entry_ref not found`` — including the timing-equalisation caveat that would
 have to be handled if the two were ever unified — and folding it into a shared
 reason would delete that reasoning along with the behaviour. The primitives
-exist so the four filed gaps (#968/#969/#970/#971) can be closed by *adoption*
-rather than by each tool re-deriving the policy, and so that a *new* tool
-finds an already-gated corpus walk on the path of least resistance.
+exist so a filed gap can be closed by *adoption* rather than by each tool
+re-deriving the policy, and so that a *new* tool finds an already-gated corpus
+walk on the path of least resistance.
+
+**Adoption is not the only honest way to close a gap, and #968 is the worked
+example.** ``creek.report`` is now ``GATED`` without adopting either
+primitive, deliberately. ``refuse_above_ceiling`` *refuses*, and the issue's
+explicit anti-goal forbids refusing ``creek.report``: that breaks every
+legitimate caller and makes the reports unreachable rather than tier-correct,
+so the inputs are filtered instead. ``iter_admitted_fragments`` summarises
+``PERSONAL`` bodies rather than dropping them — a title-only stub written into
+a voice profile's ``### Sample Passages`` leaks the title and poisons the
+corpus — and it reads the tier through the validated
+:class:`~creek.models.Fragment`, so it fails open on a *missing*
+``privacy_tier`` key. ``creek.report`` therefore joins ``wheel``, ``mine``,
+``draft`` and ``author``, all ``GATED`` on
+:func:`creek_mcp.tier_ceiling.to_privacy_override` without adopting either
+primitive. What the manifest checks is that the named gate exists and decides
+something, not which of two shapes it takes.
 
 :data:`TOOL_POSTURES` is verified by ``tests/test_mcp_read_gate.py``, which
 fails if an entry lies: the manifest must match ``server.list_tools()``
@@ -230,15 +246,23 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gate_symbol="to_privacy_override",
     ),
     "creek.report": ToolPosture(
-        posture=ReadPosture.UNGATED_KNOWN_GAP,
+        posture=ReadPosture.GATED,
         rationale=(
-            "The ceiling is audited and echoed but never converted or "
-            "threaded: creek/generate/{tags,lexicon,decisions,wavelength}.py "
-            "contain no tier filtering at all, so report_type='tags' at "
-            "ceiling=open writes an intimate fragment's tags into "
-            "00-Creek-Meta/Tag-Garden.md. Reproduced (#968)."
+            "Converts the ceiling with to_privacy_override and threads it "
+            "into all six generators (tags, voice, lexicon, decisions, "
+            "rhetorical-patterns, mode-profiles), each of which admits a note "
+            "only when within_ceiling clears tier_within_override's hard rank "
+            "cutoff against the file's *raw* frontmatter — so a missing "
+            "privacy_tier fails closed to intimate rather than to the model's "
+            "unclassified default (#968). The gap was write-side: the "
+            "response carries only report_paths, so the evidence was always "
+            "the artifact bytes. Consequence to know: TagGardenGenerator's "
+            "four non-fragment scan directories hold note types with no "
+            "privacy_tier field, so a ceiling-filtered tag garden is "
+            "fragment-derived only."
         ),
-        gap_issue=968,
+        gate_module="creek_mcp.tools.report",
+        gate_symbol="to_privacy_override",
     ),
     "creek.state.read": ToolPosture(
         posture=ReadPosture.UNGATED_KNOWN_GAP,
@@ -288,7 +312,17 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "The checks read fragment frontmatter (paradox, unnamed and "
             "orphan-compiled scan 01-Fragments), never bodies; the MCP "
             "response returns only check names, count-shaped summaries and "
-            "len(findings). Titles live in findings, which is never returned."
+            "len(findings). Titles live in findings, which is never returned. "
+            "The posture is about the *response* only: the lint run also "
+            "writes a markdown report under 00-Creek-Meta/Processing-Log/ "
+            "that does embed above-ceiling titles and tag names, and the "
+            "tags check deliberately surveys the whole vault "
+            "(creek/lint/checks/tags.py passes PrivacyTierOverride.ALL) so it "
+            "cannot report 'no orphan tags' about a vault that has them. That "
+            "artifact is unreachable through MCP today, which is the same "
+            "argument #968 disproved for creek.report's Tag-Garden.md — it "
+            "holds here only while nothing serves Processing-Log/ back, so "
+            "read it against #969's state-artifact gap rather than alone."
         ),
     ),
     "creek.link": ToolPosture(

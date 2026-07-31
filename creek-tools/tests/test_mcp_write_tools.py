@@ -662,11 +662,22 @@ def test_report_tags_writes_audit_entry(vault: Path) -> None:
 
 
 def test_report_decisions_generates_note(vault: Path) -> None:
-    """The ``decisions`` report now generates a real Decision note (#581)."""
+    """The ``decisions`` report now generates a real Decision note (#581).
+
+    The fixture states ``privacy_tier: open`` explicitly since #968. It used to
+    omit the key, and an omitted key now fails closed to ``intimate``
+    (``creek.classify.privacy_filter.raw_privacy_tier``) rather than falling
+    back to the model's ``unclassified`` default, so at ``ceiling=open`` the
+    fragment would never reach the detector. The tier is fixture bookkeeping
+    here — this test is about *whether a Decision note is written*, and the
+    ceiling behaviour it now depends on is pinned by
+    ``tests/test_mcp_report_tier_ceiling.py``.
+    """
     frags = vault / "01-Fragments" / "Notes"
     frags.mkdir(parents=True, exist_ok=True)
     (frags / "frag-decide50.md").write_text(
         '---\ntype: fragment\nid: frag-decide50\ntitle: "Should I switch frameworks"\n'
+        "privacy_tier: open\n"
         "source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
@@ -694,11 +705,17 @@ def test_report_decisions_no_candidates_returns_empty_paths(vault: Path) -> None
 
 
 def test_report_rhetorical_patterns_generates(vault: Path) -> None:
-    """The ``rhetorical-patterns`` report writes a per-register note (#582)."""
+    """The ``rhetorical-patterns`` report writes a per-register note (#582).
+
+    ``privacy_tier: open`` is stated explicitly since #968 — see
+    ``test_report_decisions_generates_note`` for why an omitted key no longer
+    reaches an ``open``-ceiling report.
+    """
     frags = vault / "01-Fragments" / "Notes"
     frags.mkdir(parents=True, exist_ok=True)
     (frags / "ex-1.md").write_text(
         '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        "privacy_tier: open\n"
         "source:\n  platform: journal\n  author: self\n"
         "voice:\n  voice_register: confessional\n  confidence: conviction\n"
         "---\nThe truth is we rise; as I said before, we rise.\n",
@@ -729,11 +746,17 @@ def test_report_rhetorical_patterns_no_exemplars_returns_empty_paths(
 
 
 def test_report_mode_profiles_generates(vault: Path) -> None:
-    """The ``mode-profiles`` report writes a per-mode note (#583)."""
+    """The ``mode-profiles`` report writes a per-mode note (#583).
+
+    ``privacy_tier: open`` is stated explicitly since #968 — see
+    ``test_report_decisions_generates_note`` for why an omitted key no longer
+    reaches an ``open``-ceiling report.
+    """
     frags = vault / "01-Fragments" / "Notes"
     frags.mkdir(parents=True, exist_ok=True)
     (frags / "m1.md").write_text(
         '---\ntype: fragment\nid: m1\ntitle: "Building momentum"\n'
+        "privacy_tier: open\n"
         "source:\n  platform: journal\n  author: self\n"
         "wavelength:\n  mode: express\n  phase: rising\n"
         "frequency:\n  primary: F3\n---\nbody\n",
@@ -779,7 +802,18 @@ def _seed_voice_exemplar(vault: Path, frag_id: str, body: str) -> None:
 
 
 def test_report_lexicon_generates_glossary(vault: Path) -> None:
-    """The ``lexicon`` report now generates a real glossary (#580), not a stub."""
+    """The ``lexicon`` report now generates a real glossary (#580), not a stub.
+
+    Called at ``ceiling=personal`` since #968, and the fixture's
+    ``privacy_tier: personal`` is deliberately **not** downgraded to make it
+    pass. The glossary quotes exemplar sentences verbatim, so a personal-tier
+    exemplar reaching it at ``ceiling=open`` is precisely the leak #968 closed;
+    a caller entitled to that exemplar is one that declares ``personal``. This
+    test's subject is whether a glossary is produced at all, and the tier
+    behaviour it now depends on is pinned by
+    ``tests/test_mcp_report_tier_ceiling.py::test_report_at_open_ceiling_excludes_above_ceiling_content``
+    (the ``lexicon`` row), which asserts the opposite outcome at ``open``.
+    """
     _seed_voice_exemplar(
         vault,
         "ex-1",
@@ -788,7 +822,7 @@ def test_report_lexicon_generates_glossary(vault: Path) -> None:
     result = report_tool(
         vault_path=vault,
         report_type="lexicon",
-        privacy_tier_ceiling=TierCeiling.OPEN,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
         consumer="crawdad",
     )
     assert result["status"] == "ok"

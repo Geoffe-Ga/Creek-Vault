@@ -503,11 +503,28 @@ class TestGenerateGarden:
         generator: TagGardenGenerator,
         vault: Path,
     ) -> None:
-        """generate_garden loads previous scan for growth detection."""
+        """generate_garden loads previous scan for growth detection.
+
+        The seeded entry states ``tier_ceiling`` since #968. A history entry is
+        only a valid growth baseline for a scan taken at the *same* ceiling, and
+        a legacy entry that records none is skipped as non-comparable — so
+        without the key this test would still pass while exercising none of the
+        growth path, because ``python`` also appears in the unconditional "All
+        Tags" table. ``"all"`` is what the ``generator`` fixture runs at
+        (``TagGardenGenerator``'s default ``PrivacyTierOverride.ALL``).
+
+        The assertion is on the "Rapidly Growing" row rather than on the bare
+        tag name, for the same reason: only that row can distinguish "the
+        baseline was loaded and compared" from "the tag exists".
+        """
         # Write initial history
         history_path = vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
         initial_history = [
-            {"tag_counts": {"python": 2}, "timestamp": "2026-01-01T00:00:00"},
+            {
+                "tag_counts": {"python": 2},
+                "timestamp": "2026-01-01T00:00:00",
+                "tier_ceiling": "all",
+            },
         ]
         history_path.write_text(
             json.dumps(initial_history),
@@ -524,6 +541,7 @@ class TestGenerateGarden:
         content = path.read_text(encoding="utf-8")
         # python grew from 2 to 4 (100% growth), should appear in growing section
         assert "python" in content
+        assert "| python | 2 | 4 | +100% |" in content
 
     def test_renders_clusters_in_output(
         self,

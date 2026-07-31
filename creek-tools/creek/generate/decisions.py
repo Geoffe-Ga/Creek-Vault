@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import yaml
 
+from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.models import (
     Decision,
     DecisionCandidate,
@@ -1036,7 +1037,11 @@ def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
     return seen
 
 
-def generate_decisions(vault_path: Path) -> list[Path]:
+def generate_decisions(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> list[Path]:
     """Detect decision candidates across the vault and write new notes (#581).
 
     Loads fragments via :func:`creek.vault.reader.iter_vault_fragments` (the
@@ -1047,6 +1052,18 @@ def generate_decisions(vault_path: Path) -> list[Path]:
 
     Args:
         vault_path: Root of the Obsidian vault.
+        override: Tier ceiling (#968), applied to each fragment's *raw*
+            frontmatter — which the shared reader already yields, so no
+            second read is introduced. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared" — a genuine no-op for callers that
+            predate #968, and safe because both production report surfaces
+            state an override explicitly (pinned by
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_report_callers_always_state_an_override``).
+            The stakes here are unusually concrete: a generated note's
+            ``title:`` frontmatter *and* its filename are a source
+            fragment's title verbatim.
 
     Returns:
         Paths of the newly written Decision notes; empty when there are no new
@@ -1054,9 +1071,10 @@ def generate_decisions(vault_path: Path) -> list[Path]:
     """
     fragments = [
         fragment
-        for _path, fragment, _body, _raw in iter_vault_fragments(
+        for _path, fragment, _body, raw in iter_vault_fragments(
             vault_path / "01-Fragments",
         )
+        if within_ceiling(raw, override)
     ]
     detector = DecisionDetector()
     already = _existing_decision_fragment_ids(vault_path)

@@ -32,6 +32,12 @@ an explicit ``unclassified`` only in the raw frontmatter — is ``INTIMATE``),
 :func:`max_source_tier` (the reduction over the tiers a call would carry,
 ``INTIMATE`` when empty).
 
+:func:`raw_privacy_tier` and :func:`within_ceiling` (#968) are the
+raw-frontmatter siblings of that pair, for generation flows that never build a
+:class:`~creek.models.Fragment` at all. They live here, and not in a new
+module, for the same reason everything above does: a tier reader somewhere
+else is a tier opinion the others can drift from.
+
 The last three moved here from ``creek_mcp.source_tiers`` in #962, which they
 emptied, so that module is gone and this is now the single home for the
 survey. They had to move because :mod:`creek.compile.engine` derives its own
@@ -74,7 +80,7 @@ from creek.models import PrivacyTier
 from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Mapping
 
     from creek.models import Fragment
 
@@ -369,6 +375,96 @@ def fragment_tier(fragment: Fragment, raw: dict[str, object]) -> PrivacyTier:
     if "privacy_tier" not in raw:
         return PrivacyTier.INTIMATE
     return fragment.privacy_tier
+
+
+def raw_privacy_tier(raw: Mapping[str, object]) -> PrivacyTier:
+    """Return a vault note's tier read straight off raw frontmatter, failing closed.
+
+    The raw-frontmatter sibling of :func:`fragment_tier`, and deliberately
+    *not* a merge with it. ``fragment_tier`` needs a validated
+    :class:`~creek.models.Fragment`, and the report generators #968 had to
+    gate do not all have one:
+    :class:`creek.generate.tags.TagGardenGenerator` builds no model at
+    all — ``_extract_tags`` is a bare ``frontmatter.load`` — and it scans
+    four directories (``02-Threads``, ``03-Eddies``, ``04-Praxis``,
+    ``08-Decisions``) whose note types have no ``privacy_tier`` field in
+    their models in the first place. Asking those files for a ``Fragment``
+    would mean inventing one.
+
+    The two readers are pinned equal for every fragment by
+    ``tests/test_mcp_report_tier_ceiling.py``'s
+    ``test_raw_and_model_tier_readers_agree_on_every_fragment``, walking the
+    shared vault loader tier by tier. That pin is what stops this reader
+    becoming the third, diverging tier opinion the module docstring above
+    warns about — "two tools that disagree about the same file" is a bug
+    class, not a style question, and an assertion is the only thing that
+    keeps two deliberate implementations honest about agreeing.
+
+    A *missing* key resolves to ``INTIMATE`` rather than to the model's
+    ``unclassified`` default, and the distinction is the whole point. An
+    explicit ``unclassified`` ranks with ``personal`` (#876/#961), so it is
+    *admitted* at ``ceiling=personal``; reading a missing key through the
+    model would therefore fail open relative to what the file actually says.
+    A hand-edited or legacy note with no key at all carries less assurance
+    than a pipeline-written one that says ``unclassified`` out loud.
+
+    Args:
+        raw: The note's raw frontmatter, before any model defaults are
+            applied. ``frontmatter.Post.metadata`` satisfies this directly.
+
+    Returns:
+        ``PrivacyTier.INTIMATE`` when ``privacy_tier`` is absent, ``None``,
+        empty, or a string the enum does not recognise; otherwise the
+        declared tier.
+    """
+    value = raw.get("privacy_tier")
+    if value is None or value == "":
+        return PrivacyTier.INTIMATE
+    try:
+        return PrivacyTier(str(value))
+    except ValueError:
+        logger.warning(
+            "Vault note carries unrecognised privacy_tier %r; "
+            "treating as INTIMATE for fail-closed filtering. "
+            "Re-run `creek classify` to assign a recognised tier.",
+            value,
+        )
+        return PrivacyTier.INTIMATE
+
+
+def within_ceiling(raw: Mapping[str, object], override: PrivacyTierOverride) -> bool:
+    """Return whether the note described by *raw* is admitted under *override*.
+
+    The admission gate the six ``creek report`` generators share (#968).
+    It reduces to :func:`tier_within_override` — the **hard rank cutoff** —
+    rather than to :func:`filter_fragments_by_tier`, and that choice is not
+    incidental:
+
+    * Three of the six generators (``tags``, ``decisions``, ``mode-profiles``)
+      never read a body at all. They read frontmatter ``tags`` / ``id``, the
+      ``title``, and ``wavelength.mode``. Summarising a ``PERSONAL`` *body*
+      there is a literal no-op — a gesture, not a gate — while the title and
+      tags it does read would sail straight through.
+    * For the three that do read bodies (``voice``, ``lexicon``,
+      ``rhetorical-patterns``) summarisation is worse than useless: the
+      ``"[Personal-tier summary: <title>]"`` stub would be written into
+      ``### Sample Passages`` as a *voice exemplar*, leaking the title and
+      poisoning the voice corpus with a synthetic sentence in nobody's voice.
+
+    A report must omit. Note this gate is additive to, not a replacement for,
+    the ``allow_intimate`` consent gate in :mod:`creek.generate.voice`:
+    admission is ``allow_intimate`` **and** ``within_ceiling``.
+
+    Args:
+        raw: The note's raw frontmatter, as loaded by the caller.
+        override: The admission ceiling. ``PrivacyTierOverride.ALL`` admits
+            everything, which is what "no ceiling declared" means for the
+            library's existing callers.
+
+    Returns:
+        ``True`` when the note may contribute to the artifact being written.
+    """
+    return tier_within_override(raw_privacy_tier(raw), override)
 
 
 def max_source_tier(tiers: Iterable[PrivacyTier]) -> PrivacyTier:

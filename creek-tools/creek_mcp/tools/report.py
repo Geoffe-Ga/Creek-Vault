@@ -11,20 +11,43 @@ deferred to the CLI because they need date arithmetic the MCP shape
 should not own. The wrapper writes one audit entry per invocation
 including ``created_path`` for the resulting report file(s).
 
-Read-side posture (#968): the ceiling is audited and echoed but never
-converted or threaded — ``to_privacy_override`` is never called here.
-Four of the six generators (``creek/generate/{tags,lexicon,decisions,
-wavelength}.py``) contain no tier filtering whatsoever;
-``creek/generate/voice.py`` is the only one with an ``allow_intimate``
-filter. Reproduced: ``report_type="tags"`` at ``ceiling=open`` wrote an
-``intimate`` fragment's tag verbatim into
-``00-Creek-Meta/Tag-Garden.md`` and
-``00-Creek-Meta/Processing-Log/tag-history.json``. The exposure is
-write-side, not read-side: this tool returns only ``report_paths``,
-never content, and no MCP tool reads an arbitrary vault file back — so
-a low-ceiling caller cannot read the leaked artifact *through MCP*.
-What it causes instead is above-ceiling content distilled into an
-unlabelled vault file.
+Tier ceiling (#968, closed). ``privacy_tier_ceiling`` is converted here by
+:func:`creek_mcp.tier_ceiling.to_privacy_override` and threaded into **all
+six** generators, each of which admits a note only when
+:func:`creek.classify.privacy_filter.within_ceiling` says its *raw*
+frontmatter clears :func:`~creek.classify.privacy_filter.tier_within_override`'s
+hard rank cutoff. A missing ``privacy_tier`` key fails closed to
+``intimate``: the model would default it to ``unclassified``, which ranks
+with ``personal`` and would be *admitted* at ``ceiling=personal``.
+
+What #968 closed was **write-side, not read-side**, and that framing is why
+the gap survived two earlier sweeps. This tool returns only
+``report_paths`` — never a tag, a title, or a body — so its response envelope
+was canary-free at ``ceiling=open`` for the whole life of the bug and no
+response-level test could ever have caught it. The evidence lives only in the
+bytes of the artifacts a call writes; the reproduction was an ``intimate``
+fragment's tag appearing verbatim in ``00-Creek-Meta/Tag-Garden.md`` *and* in
+the append-only ``00-Creek-Meta/Processing-Log/tag-history.json``. That is
+also why ``tag-history.json`` entries now record the ``tier_ceiling`` they
+were taken under: counts from two different ceilings survey two different
+corpora and are not comparable.
+
+One consequence must be printed on the tin: ``TagGardenGenerator`` scans five
+directories, and the four beyond ``01-Fragments`` (``02-Threads``,
+``03-Eddies``, ``04-Praxis``, ``08-Decisions``) hold note types with no
+``privacy_tier`` field at all, so the fail-closed read ranks them
+``intimate``. **A ceiling-filtered tag garden is fragment-derived only.**
+Those notes are derived from fragments and untierable by construction — a
+Decision note's ``title:`` is a source fragment's title verbatim — so reading
+them at ``ceiling=open`` would hand back what a ``ceiling=all`` run distilled
+there.
+
+Neither canonical read-gate primitive fits, and both were considered:
+``refuse_above_ceiling`` *refuses*, which would make the reports unreachable
+rather than tier-correct, and ``iter_admitted_fragments`` summarises
+``personal`` bodies rather than dropping them (a summary stub written into
+``### Sample Passages`` is a leak with extra steps) while reading the tier
+through the validated model, which fails open on a missing key.
 """
 
 from __future__ import annotations
@@ -37,7 +60,7 @@ from creek.generate.tags import TagGardenGenerator
 from creek.generate.voice import VoiceProfileGenerator
 from creek.generate.wavelength import ModeProfileGenerator
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling, refusal_response
+from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -65,6 +88,9 @@ def report_tool(
     Reports iterate vault content internally rather than operating on a
     caller-supplied fragment list, so ``affected_fragment_ids`` is the
     empty list and ``created_path`` carries the rendered file location.
+    The ceiling is converted once, below the ``report_type`` refusal, and
+    threaded into every branch — the refusal comes first so an unsupported
+    type is answered without touching the vault at all.
     """
     if report_type not in _VALID_TYPES:
         return refusal_response(
@@ -75,23 +101,34 @@ def report_tool(
                 f"available via MCP: {', '.join(_VALID_TYPES)}"
             ),
         )
+    override = to_privacy_override(privacy_tier_ceiling)
     if report_type == "tags":
         written_paths = [
-            TagGardenGenerator(vault_path=vault_path).generate_garden(),
+            TagGardenGenerator(
+                vault_path=vault_path,
+                override=override,
+            ).generate_garden(),
         ]
     elif report_type == "lexicon":
-        _lexicon, written_paths = generate_lexicon(vault_path)
+        _lexicon, written_paths = generate_lexicon(vault_path, override=override)
     elif report_type == "decisions":
-        written_paths = generate_decisions(vault_path)
+        written_paths = generate_decisions(vault_path, override=override)
     elif report_type == "rhetorical-patterns":
         written_paths = list(
-            VoiceProfileGenerator().generate_rhetorical_patterns(vault_path),
+            VoiceProfileGenerator(override=override).generate_rhetorical_patterns(
+                vault_path,
+            ),
         )
     elif report_type == "mode-profiles":
-        written_paths = list(ModeProfileGenerator().generate_mode_profiles(vault_path))
+        written_paths = list(
+            ModeProfileGenerator().generate_mode_profiles(
+                vault_path,
+                override=override,
+            ),
+        )
     else:
         written_paths = list(
-            VoiceProfileGenerator().generate_all_profiles(vault_path),
+            VoiceProfileGenerator(override=override).generate_all_profiles(vault_path),
         )
     relative_paths = [str(p.relative_to(vault_path)) for p in written_paths]
     MCPAuditLog(vault_path).append(

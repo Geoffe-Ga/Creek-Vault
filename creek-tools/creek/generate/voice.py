@@ -13,10 +13,17 @@ body texts to extract sentence structure, paragraph structure, transition
 patterns, metaphor families, rhetorical moves, vocabulary fingerprint, and
 punctuation habits.
 
-The collector is deliberately conservative about privacy: ``intimate``
-tier fragments are excluded by default and only included when the caller
-explicitly opts in. Saved exemplars include a per-register summary note
-recording the breakdown of confidence levels.
+The collector is deliberately conservative about privacy, and two
+independent gates say so. ``allow_intimate`` is a **consent** gate: the
+voice proxy is opt-in even at ``--include-tier intimate``
+(``creek/templates/skills/privacy-tier.SKILL.md:47``). ``override`` is a
+**ceiling** gate (#968): the caller's declared
+:class:`~creek.classify.privacy_filter.PrivacyTierOverride`, applied to each
+note's raw frontmatter via
+:func:`~creek.classify.privacy_filter.within_ceiling`. They are additive by
+design — admission is ``allow_intimate`` *and* ``within_ceiling`` — and must
+not be "simplified" into one. Saved exemplars include a per-register summary
+note recording the breakdown of confidence levels.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.config import VoiceAudienceWeightingConfig
 from creek.models import (
     Confidence,
@@ -302,14 +310,19 @@ def _iter_exemplars_from_jsonl(jsonl_path: Path) -> Iterator[Exemplar]:
 
 def _load_fragment_with_body(
     md_file: Path,
-) -> tuple[Fragment, str] | None:
-    """Parse *md_file* into a Fragment and return it with its body text.
+) -> tuple[Fragment, str, dict[str, object]] | None:
+    """Parse *md_file* into a Fragment and return it with body and raw frontmatter.
+
+    The raw frontmatter is returned alongside the validated model because the
+    ceiling gate (#968) must read the tier *before* Pydantic applies its
+    ``unclassified`` default: a missing key and an explicit ``unclassified``
+    are indistinguishable on the model, and they must rank differently.
 
     Args:
         md_file: Markdown file to read.
 
     Returns:
-        A ``(fragment, body)`` pair, or ``None`` when the file is not a
+        A ``(fragment, body, raw)`` triple, or ``None`` when the file is not a
         valid fragment record (unreadable, wrong type, or invalid
         frontmatter).
     """
@@ -326,7 +339,7 @@ def _load_fragment_with_body(
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
         return None
-    return fragment, post.content
+    return fragment, post.content, metadata
 
 
 class VoiceExemplarCollector:
@@ -345,7 +358,11 @@ class VoiceExemplarCollector:
         min_per_register: Minimum exemplars expected per register; below
             this threshold the collector emits a warning.
         allow_intimate: When ``True``, fragments tagged ``intimate``
-            participate in collection. Defaults to ``False``.
+            participate in collection. Defaults to ``False``. A *consent*
+            gate, not a ceiling one — see :attr:`override`.
+        override: The caller's tier ceiling (#968). Additive to
+            :attr:`allow_intimate`: a fragment is collected only when both
+            admit it.
     """
 
     def __init__(
@@ -354,6 +371,7 @@ class VoiceExemplarCollector:
         max_per_register: int = DEFAULT_MAX_PER_REGISTER,
         min_per_register: int = DEFAULT_MIN_PER_REGISTER,
         allow_intimate: bool = False,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
         audience_weighting: VoiceAudienceWeightingConfig | None = None,
     ) -> None:
         """Initialise the collector.
@@ -364,7 +382,20 @@ class VoiceExemplarCollector:
             min_per_register: Minimum exemplars per register before a
                 warning is emitted. Must be at least 1.
             allow_intimate: Whether to include ``intimate`` privacy tier
-                fragments. Defaults to ``False``.
+                fragments. Defaults to ``False``. This is the FEAT opt-in
+                for the voice proxy, which
+                ``creek/templates/skills/privacy-tier.SKILL.md:47`` requires
+                "even with ``--include-tier intimate``" — so it is *not*
+                superseded by *override* and the two must stay separate.
+            override: Tier ceiling for the corpus walk (#968). Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared", so adding it is a genuine
+                no-op for every caller that predates #968. The default is
+                safe because both production report surfaces state an
+                override explicitly, which
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``
+                enforces structurally.
             audience_weighting: Graduated audience-authority multipliers
                 applied during ranking. Defaults to the standard weighting,
                 which keeps a uniform-audience vault's relative ranking
@@ -391,6 +422,7 @@ class VoiceExemplarCollector:
         self.max_per_register = max_per_register
         self.min_per_register = min_per_register
         self.allow_intimate = allow_intimate
+        self.override = override
         self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._records: dict[str, _ExemplarRecord] = {}
 
@@ -402,8 +434,10 @@ class VoiceExemplarCollector:
         Fragments are kept when their ``voice.confidence`` is ``settled``
         or ``conviction`` and their ``voice.register`` is set. Intimate
         privacy tier fragments are filtered out unless
-        :attr:`allow_intimate` is ``True``. Each register key in the
-        returned dict is always present; empty registers map to ``[]``.
+        :attr:`allow_intimate` is ``True``, and every fragment must
+        additionally sit within :attr:`override` (#968). Each register key
+        in the returned dict is always present; empty registers map to
+        ``[]``.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
@@ -429,7 +463,12 @@ class VoiceExemplarCollector:
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
-            fragment, body = loaded
+            fragment, body, raw = loaded
+            # Ceiling gate (#968), above the consent gate: an above-ceiling
+            # fragment must not reach the corpus even when the operator has
+            # opted the voice proxy in to intimate content.
+            if not within_ceiling(raw, self.override):
+                continue
             register = self._eligible_register(fragment)
             if register is None:
                 continue
@@ -447,11 +486,12 @@ class VoiceExemplarCollector:
 
         Shares the eligibility gate with :meth:`collect_exemplars` (``settled``
         or ``conviction`` confidence, a set register, intimate filtered unless
-        :attr:`allow_intimate`, ``11-Other-Authors`` excluded) but returns a
-        flat :class:`Exemplar` list — fragment paired with its on-disk body —
-        rather than per-register ``Fragment`` buckets. Consumers that need the
-        whole voice corpus as one unit (e.g. the lexicon) use this so they share
-        a single source of truth for *which* fragments count as exemplars.
+        :attr:`allow_intimate`, within :attr:`override`, ``11-Other-Authors``
+        excluded) but returns a flat :class:`Exemplar` list — fragment paired
+        with its on-disk body — rather than per-register ``Fragment`` buckets.
+        Consumers that need the whole voice corpus as one unit (e.g. the
+        lexicon) use this so they share a single source of truth for *which*
+        fragments count as exemplars.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
@@ -469,14 +509,28 @@ class VoiceExemplarCollector:
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
-            fragment, body = loaded
+            fragment, body, raw = loaded
+            # Ceiling gate (#968) — see collect_exemplars for why it sits
+            # above the consent gate rather than folded into it.
+            if not within_ceiling(raw, self.override):
+                continue
             if self._eligible_register(fragment) is None:
                 continue
             exemplars.append(Exemplar(fragment=fragment, body=body))
         return exemplars
 
     def _eligible_register(self, fragment: Fragment) -> str | None:
-        """Return the fragment's register if it qualifies, else ``None``."""
+        """Return the fragment's register if it qualifies, else ``None``.
+
+        This answers the *consent* question only (``allow_intimate``, plus
+        confidence / voice-weight / register eligibility). The *ceiling*
+        question is asked separately by
+        :func:`~creek.classify.privacy_filter.within_ceiling` at each walk,
+        because it needs the raw frontmatter this method never sees. Do not
+        collapse the two: one is the operator's opt-in to voice-proxy
+        training, the other is the caller's declared ceiling, and a fragment
+        needs both.
+        """
         return _eligible_register(fragment, allow_intimate=self.allow_intimate)
 
     def _warn_below_minimum(self, buckets: dict[str, list[Fragment]]) -> None:
@@ -1686,6 +1740,7 @@ class VoiceProfileGenerator:
         min_exemplars: int = _DEFAULT_MIN_EXEMPLARS_PER_PROFILE,
         collector: VoiceExemplarCollector | None = None,
         extractor: VoicePatternExtractor | None = None,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
         audience_weighting: VoiceAudienceWeightingConfig | None = None,
     ) -> None:
         """Initialise the generator.
@@ -1697,10 +1752,29 @@ class VoiceProfileGenerator:
                 Must be at least 1 and no greater than ``max_exemplars``.
             collector: Optional :class:`VoiceExemplarCollector` used by
                 :meth:`generate_all_profiles`. Defaults to a collector
-                configured with the same exemplar bounds.
+                configured with the same exemplar bounds. **An injected
+                collector keeps its own** ``override``: it is a fully
+                configured object the caller built deliberately, and
+                silently overwriting one of its privacy settings from a
+                sibling argument would be the more surprising behaviour.
             extractor: Optional :class:`VoicePatternExtractor` used by
                 :meth:`generate_all_profiles`. Defaults to a plain
                 extractor.
+            override: Tier ceiling for the corpus walk (#968), forwarded
+                into the *default* collector only (see *collector*).
+                Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared", so it is a genuine no-op for
+                callers that predate #968. The default is safe because both
+                production report surfaces state an override explicitly,
+                which ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``
+                enforces structurally. The value is *not* stored on the
+                generator: :meth:`_stream_into` reads it back off
+                ``self._collector`` so there is exactly one storage location
+                and an injected collector cannot be contradicted.
+            audience_weighting: Graduated audience-authority multipliers
+                applied during ranking.
 
         Raises:
             ValueError: If either bound is less than 1, or if
@@ -1721,6 +1795,7 @@ class VoiceProfileGenerator:
         self._collector = collector or VoiceExemplarCollector(
             max_per_register=max_exemplars,
             min_per_register=min_exemplars,
+            override=override,
             audience_weighting=self._audience_weighting,
         )
         self._extractor = extractor or VoicePatternExtractor()
@@ -1977,7 +2052,12 @@ class VoiceProfileGenerator:
         register_paths: dict[str, Path],
         register_handles: dict[str, _JsonlWriter],
     ) -> None:
-        """Walk *fragments_dir* and append eligible exemplars to JSONL files."""
+        """Walk *fragments_dir* and append eligible exemplars to JSONL files.
+
+        Both privacy settings are read back off ``self._collector`` rather
+        than duplicated onto the generator, so an injected collector governs
+        this walk exactly as it governs the collector's own (#968).
+        """
         for md_file in sorted(fragments_dir.rglob("*.md")):
             # Defensive path gate (Issue #466): skip borrowed / AI-authored
             # content under ``11-Other-Authors`` so it never reaches the
@@ -1987,7 +2067,11 @@ class VoiceProfileGenerator:
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
-            fragment, body = loaded
+            fragment, body, raw = loaded
+            # Ceiling gate (#968), additive to the allow_intimate consent
+            # gate below — see ``VoiceExemplarCollector._eligible_register``.
+            if not within_ceiling(raw, self._collector.override):
+                continue
             register = _eligible_register(
                 fragment,
                 allow_intimate=self._collector.allow_intimate,
@@ -2008,7 +2092,7 @@ class VoiceProfileGenerator:
             )
             # Drop the local body reference before the next iteration
             # so the per-iteration peak is bounded by a single fragment.
-            del body, fragment, loaded
+            del body, fragment, raw, loaded
 
     def _rank_exemplars(self, exemplars: list[Exemplar]) -> list[Exemplar]:
         """Rank *exemplars* by the same quality heuristic as the collector.

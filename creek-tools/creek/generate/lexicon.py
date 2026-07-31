@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.classify.privacy_filter import PrivacyTierOverride
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
@@ -743,7 +745,11 @@ class LexiconGenerator:
         return "\n".join(lines)
 
 
-def generate_lexicon(vault_path: Path) -> tuple[Lexicon | None, list[Path]]:
+def generate_lexicon(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> tuple[Lexicon | None, list[Path]]:
     """Collect the voice corpus, build the lexicon, and persist it (#580).
 
     Reuses :meth:`creek.generate.voice.VoiceExemplarCollector.collect_all_exemplars`
@@ -758,6 +764,18 @@ def generate_lexicon(vault_path: Path) -> tuple[Lexicon | None, list[Path]]:
 
     Args:
         vault_path: Root of the Obsidian vault.
+        override: Tier ceiling for the corpus walk (#968), forwarded to the
+            collector. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared" — a genuine no-op for callers that
+            predate #968. The default is safe because both production surfaces
+            state an override explicitly, which
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_report_callers_always_state_an_override``
+            enforces structurally. This matters more here than elsewhere:
+            ``_build_borrowed_terms`` records the *whole surrounding sentence*
+            verbatim, so an admitted body lands in ``glossary.md`` byte for
+            byte.
 
     Returns:
         ``(lexicon, written_paths)``. When the vault has no qualifying
@@ -766,7 +784,9 @@ def generate_lexicon(vault_path: Path) -> tuple[Lexicon | None, list[Path]]:
     """
     from creek.generate.voice import VoiceExemplarCollector, VoicePatternExtractor
 
-    exemplars = VoiceExemplarCollector().collect_all_exemplars(vault_path)
+    exemplars = VoiceExemplarCollector(override=override).collect_all_exemplars(
+        vault_path,
+    )
     if not exemplars:
         return None, []
     patterns = VoicePatternExtractor().extract_patterns([e.body for e in exemplars])
