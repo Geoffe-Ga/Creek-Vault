@@ -40,7 +40,6 @@ import frontmatter
 import pytest
 from typer.testing import CliRunner
 
-from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.cli import app
 from creek.models import PrivacyTier
 from creek_mcp.tier_ceiling import TierCeiling
@@ -50,6 +49,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
     from types import ModuleType
+
+    from creek.classify.privacy_filter import PrivacyTierOverride
 
 runner = CliRunner()
 
@@ -517,9 +518,7 @@ def _changed_files(vault: Path, before: dict[Path, bytes]) -> list[Path]:
         Sorted list of new-or-modified files.
     """
     return sorted(
-        p
-        for p in vault.rglob("*")
-        if p.is_file() and before.get(p) != p.read_bytes()
+        p for p in vault.rglob("*") if p.is_file() and before.get(p) != p.read_bytes()
     )
 
 
@@ -731,6 +730,17 @@ def test_report_at_all_ceiling_admits_everything(
     empty artifact at every ceiling, so without this test "the ceiling is
     enforced" and "the report is broken" are indistinguishable.
 
+    ``rhetorical-patterns`` is exempt from the substring half, and it has to be:
+    its artifact is three integer counts, so *neither* sentinel is findable in
+    it by a sweep — in either direction. A ``ceiling=all`` assertion that the
+    above-ceiling canary is present would be false by construction rather than
+    by regression. Its permissive-direction evidence is the ``forbidden_glob``
+    assertion at the end of this test (the above-ceiling fragment's register
+    note must exist at ``ceiling=all``) plus
+    :func:`test_rhetorical_pattern_counts_are_identical_across_ceilings`.
+    ``below_canary is None`` is the flag for that case — it marks the artifact,
+    not the tier, which is why it gates both sentinels here.
+
     Args:
         case: The report type under test and its fixture.
         tmp_path: pytest's per-test temporary directory.
@@ -744,12 +754,12 @@ def test_report_at_all_ceiling_admits_everything(
     assert result["status"] == "ok"
 
     blob = _artifact_blob(vault, case.artifact_roots)
-    assert case.above_canary in blob, (
-        f"report_type={case.report_type!r} at ceiling=all dropped "
-        f"{case.above_canary!r}. ALL is the operator's explicit override; "
-        "filtering under it is a regression, not caution."
-    )
     if case.below_canary is not None:
+        assert case.above_canary in blob, (
+            f"report_type={case.report_type!r} at ceiling=all dropped "
+            f"{case.above_canary!r}. ALL is the operator's explicit override; "
+            "filtering under it is a regression, not caution."
+        )
         assert case.below_canary in blob
     assert list(vault.glob(case.positive_glob))
     if case.forbidden_glob is not None:
@@ -952,7 +962,7 @@ def test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate(
     garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
     assert _OPEN_CANARY in garden
     assert (_NOTIER_CANARY in garden) is admitted, (
-        f"a fragment with no privacy_tier key was "
+        "a fragment with no privacy_tier key was "
         f"{'excluded from' if admitted else 'admitted to'} the tag garden at "
         f"ceiling={ceiling.value!r}. A missing key must fail closed to "
         "intimate, not default to the model's 'unclassified'.\n\n" + garden
@@ -1079,7 +1089,7 @@ _GATE_CALL_SITES = [
     pytest.param("decisions", "creek.generate.decisions", id="decisions"),
     pytest.param("mode-profiles", "creek.generate.wavelength", id="wavelength"),
 ]
-"""``(report_type, module whose ``within_ceiling`` the walk actually calls)``.
+"""``report_type`` → the module whose ``within_ceiling`` the walk really calls.
 
 ``lexicon`` is the odd row and deliberately so: ``generate_lexicon`` owns no
 vault walk of its own — it delegates to
@@ -1149,7 +1159,7 @@ def test_report_generators_act_on_the_gate_verdict_not_just_call_it(
     if case.below_canary is not None:
         assert case.below_canary not in blob, (
             f"inverting {module}.within_ceiling left {case.below_canary!r} in "
-            f"the artifact, so the verdict is not what decides admission.\n\n"
+            "the artifact, so the verdict is not what decides admission.\n\n"
             f"{blob}"
         )
 

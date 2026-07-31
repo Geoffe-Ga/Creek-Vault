@@ -67,6 +67,22 @@ _INCLUDE_TIER_HELP = (
     "<vault>/00-Creek-Meta/audit/privacy.jsonl."
 )
 
+# ``report`` needs its own wording because the flag runs the other way here
+# (#968). Everywhere else ``--include-tier`` *widens* an already-restrictive
+# default; on ``report`` an absent flag means **unfiltered**, and the flag
+# narrows. That is the same reasoning already written at ``creek compile``
+# below: the CLI operator *is* the vault owner, so there is no caller
+# declaration to reconcile against and no ceiling to default to. Making an
+# absent flag mean ``open`` would silently delete most of an existing
+# operator's tag garden — a data-loss bug wearing a privacy fix's costume.
+_REPORT_INCLUDE_TIER_HELP = (
+    "Privacy-tier ceiling for the report's vault scan: open, personal, "
+    "intimate, or all. Omitting the flag leaves the scan unfiltered (the CLI "
+    "operator is the vault owner), so this flag NARROWS what the generated "
+    "artifact may contain. Elevated values are recorded in "
+    "<vault>/00-Creek-Meta/audit/privacy.jsonl."
+)
+
 
 def _parse_include_tier(value: str | None) -> PrivacyTierOverride | None:
     """Parse --include-tier and exit 2 with a clear error on bad values."""
@@ -1981,16 +1997,20 @@ def _build_fill_steps(
             vault_path=vault_path, config=config, method=method, rebuild=False
         )
 
+    # ``creek fill`` has no ``--include-tier`` of its own, and an absent flag
+    # means unfiltered on the report surface (#968), so every step states
+    # ``ALL`` rather than inheriting a default nobody typed.
+    unfiltered = PrivacyTierOverride.ALL
     steps: list[tuple[str, Callable[[], object]]] = [
         ("link/embeddings", _link("embeddings")),
         ("link/temporal", _link("temporal")),
         ("link/eddies", _link("eddies")),
         ("link/threads", _link("threads")),
-        ("report/decisions", lambda: _report_decisions(vault_path)),
-        ("report/unnamed", lambda: _report_unnamed(vault_path)),
-        ("report/paradox", lambda: _report_paradox(vault_path)),
-        ("report/synchronicity", lambda: _report_synchronicity(vault_path)),
-        ("report/mode-profiles", lambda: _report_mode_profiles(vault_path)),
+        ("report/decisions", lambda: _report_decisions(vault_path, unfiltered)),
+        ("report/unnamed", lambda: _report_unnamed(vault_path, unfiltered)),
+        ("report/paradox", lambda: _report_paradox(vault_path, unfiltered)),
+        ("report/synchronicity", lambda: _report_synchronicity(vault_path, unfiltered)),
+        ("report/mode-profiles", lambda: _report_mode_profiles(vault_path, unfiltered)),
         ("report/wavelength", lambda: _report_wavelength(vault_path, "weekly")),
         ("index", lambda: IndexGenerator(vault_path=vault_path).generate_all()),
     ]
@@ -2511,16 +2531,35 @@ def compile_(
     )
 
 
-def _report_tags(vault_path: Path) -> None:
-    """Generate the tag-garden report."""
+def _report_tags(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Generate the tag-garden report.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the scan (#968). Note the garden is
+            fragment-derived only below ``intimate``: the four non-fragment
+            scan directories hold note types with no ``privacy_tier``.
+    """
     from creek.generate.tags import TagGardenGenerator
 
-    path = TagGardenGenerator(vault_path=vault_path).generate_garden()
+    path = TagGardenGenerator(
+        vault_path=vault_path,
+        override=override,
+    ).generate_garden()
     console.print(f"[bold green]Tag Garden generated: {path}[/bold green]")
 
 
-def _report_unnamed(vault_path: Path) -> None:
-    """Generate the weekly unnamed-fragment digest."""
+def _report_unnamed(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Generate the weekly unnamed-fragment digest.
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``unnamed`` is not exposed over MCP and is outside
+            #968's scope; the parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
+    """
+    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+
     from datetime import date as _date
     from datetime import timedelta as _timedelta
 
@@ -2538,11 +2577,20 @@ def _report_unnamed(vault_path: Path) -> None:
     )
 
 
-def _report_voice(vault_path: Path) -> None:
-    """Generate per-register voice profiles, if exemplars exist."""
+def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Generate per-register voice profiles, if exemplars exist.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the exemplar walk (#968). Additive to the
+            collector's ``allow_intimate`` consent gate, never a replacement
+            for it.
+    """
     from creek.generate.voice import VoiceProfileGenerator
 
-    profile_paths = VoiceProfileGenerator().generate_all_profiles(vault_path)
+    profile_paths = VoiceProfileGenerator(override=override).generate_all_profiles(
+        vault_path,
+    )
     if not profile_paths:
         console.print(
             "[yellow]No voice profiles generated: "
@@ -2556,17 +2604,22 @@ def _report_voice(vault_path: Path) -> None:
     )
 
 
-def _report_decisions(vault_path: Path) -> None:
+def _report_decisions(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Generate draft Decision notes from decision-signalling fragments (#581).
 
     Scans the vault's fragments for decision signals and writes a draft note per
     *new* candidate to ``08-Decisions/Active/``; re-running is idempotent (a
     fragment already captured by a note is skipped). Prints a friendly message
     when there are no new candidates.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the fragment walk (#968). A written note's
+            filename and ``title:`` are a source fragment's title verbatim.
     """
     from creek.generate.decisions import generate_decisions
 
-    written_paths = generate_decisions(vault_path)
+    written_paths = generate_decisions(vault_path, override=override)
     if not written_paths:
         console.print(
             "[yellow]No decision notes generated: "
@@ -2580,17 +2633,22 @@ def _report_decisions(vault_path: Path) -> None:
     )
 
 
-def _report_lexicon(vault_path: Path) -> None:
+def _report_lexicon(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Generate the voice lexicon glossary + metaphor index (#580).
 
     Collects the vault's voice exemplars (sharing the voice report's eligibility
     gate), builds a :class:`~creek.generate.lexicon.Lexicon`, and persists it to
     ``07-Voice/Lexicon/``. Mirrors ``_report_voice``'s friendly "no qualifying
     exemplars" message when the corpus is empty.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the exemplar walk (#968). Borrowed-term
+            entries record the whole surrounding sentence verbatim.
     """
     from creek.generate.lexicon import generate_lexicon
 
-    lexicon, written_paths = generate_lexicon(vault_path)
+    lexicon, written_paths = generate_lexicon(vault_path, override=override)
     if lexicon is None or not written_paths:
         console.print(
             "[yellow]No lexicon generated: no qualifying exemplars found.[/yellow]",
@@ -2604,17 +2662,28 @@ def _report_lexicon(vault_path: Path) -> None:
     )
 
 
-def _report_rhetorical_patterns(vault_path: Path) -> None:
+def _report_rhetorical_patterns(
+    vault_path: Path,
+    override: PrivacyTierOverride,
+) -> None:
     """Persist per-register rhetorical-pattern notes (#582).
 
     Writes the ontology's "### Rhetorical Moves" section per voice register to
     ``07-Voice/Rhetorical-Patterns/``, reusing the voice subsystem's existing
     move detection. Mirrors ``_report_voice``'s friendly "no qualifying
     exemplars" message when the corpus is empty.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the exemplar walk (#968). The notes hold
+            only integer counts, but *which* per-register files exist is
+            itself derived from who entered the corpus.
     """
     from creek.generate.voice import VoiceProfileGenerator
 
-    written_paths = VoiceProfileGenerator().generate_rhetorical_patterns(vault_path)
+    written_paths = VoiceProfileGenerator(
+        override=override,
+    ).generate_rhetorical_patterns(vault_path)
     if not written_paths:
         console.print(
             "[yellow]No rhetorical patterns written: "
@@ -2628,15 +2697,23 @@ def _report_rhetorical_patterns(vault_path: Path) -> None:
     )
 
 
-def _report_mode_profiles(vault_path: Path) -> None:
+def _report_mode_profiles(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Generate per-mode wavelength profiles to 05-Wavelength/Mode-Profiles/ (#583).
 
     Writes one note per engagement mode that has fragments; prints a friendly
     message when no fragment carries a classified mode.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the fragment walk (#968). A mode profile
+            lists sample fragment titles.
     """
     from creek.generate.wavelength import ModeProfileGenerator
 
-    written_paths = ModeProfileGenerator().generate_mode_profiles(vault_path)
+    written_paths = ModeProfileGenerator().generate_mode_profiles(
+        vault_path,
+        override=override,
+    )
     if not written_paths:
         console.print(
             "[yellow]No mode profiles written: "
@@ -2746,8 +2823,17 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
     )
 
 
-def _report_fingerprint(vault_path: Path) -> None:
-    """Build and persist the voice fingerprint (FEAT-040.2)."""
+def _report_fingerprint(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Build and persist the voice fingerprint (FEAT-040.2).
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``fingerprint`` is not exposed over MCP and is
+            outside #968's scope; the parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
+    """
+    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+
     from creek.config import load_config
     from creek.generate.ai_style.fingerprint import (
         build_fingerprint,
@@ -3019,13 +3105,21 @@ def voice_authenticity(
         console.print(report.summary_line(), markup=False)
 
 
-def _report_paradox(vault_path: Path) -> None:
+def _report_paradox(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Write Paradox notes for contradictory fragment pairs (#711).
 
     Wires the implemented ``ParadoxDetector`` to a runnable command: scans the
     vault for contradictory pairs and writes one neutral note per paradox into
     ``10-Liminal/Paradoxes/``. Idempotent; deterministic (no LLM).
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``paradox`` is not exposed over MCP and is outside
+            #968's scope; the parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
     """
+    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+
     from creek.generate.paradox import generate_paradoxes
 
     config = _load_config_for_vault(vault_path)
@@ -3042,14 +3136,22 @@ def _report_paradox(vault_path: Path) -> None:
     )
 
 
-def _report_synchronicity(vault_path: Path) -> None:
+def _report_synchronicity(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Write Synchronicity notes for surprising cross-source resonances (#711).
 
     Wires the implemented ``SynchronicityDetector`` to a runnable command: loads
     embeddings, computes resonances, filters for cross-source >0.9-similarity
     >30-day pairs, and writes one note per pair into
     ``10-Liminal/Synchronicities/``. Idempotent; deterministic (no LLM).
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``synchronicity`` is not exposed over MCP and is
+            outside #968's scope; the parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
     """
+    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+
     from creek.generate.synchronicity import generate_synchronicities
 
     config = _load_config_for_vault(vault_path)
@@ -3066,7 +3168,7 @@ def _report_synchronicity(vault_path: Path) -> None:
     )
 
 
-_REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
+_REPORT_DISPATCH: dict[str, Callable[[Path, PrivacyTierOverride], None]] = {
     "tags": _report_tags,
     "unnamed": _report_unnamed,
     "voice": _report_voice,
@@ -3088,7 +3190,7 @@ def report(
     include_tier: str | None = typer.Option(
         None,
         "--include-tier",
-        help=_INCLUDE_TIER_HELP,
+        help=_REPORT_INCLUDE_TIER_HELP,
     ),
 ) -> None:
     """Generate reports on vault state.
@@ -3115,7 +3217,10 @@ def report(
 
     handler = _REPORT_DISPATCH.get(type or "")
     if handler is not None:
-        handler(vault_path)
+        # An absent ``--include-tier`` means *unfiltered* here, not ``open``
+        # (#968) — see ``_REPORT_INCLUDE_TIER_HELP``. On ``report`` the flag
+        # narrows rather than widens.
+        handler(vault_path, override or PrivacyTierOverride.ALL)
         return
     if type == "wavelength":
         _report_wavelength(vault_path, period)

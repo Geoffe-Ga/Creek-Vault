@@ -63,7 +63,7 @@ real desk. Only the `research` medium is wired — any other `medium` returns
 | `creek.ingest`          | `source_type`, `input_path`                                 | Default ingest tier is `personal`; `ceiling=open` is refused.     |
 | `creek.classify`        | `method` (`rules`\|`llm`), `force`                          | Rewrites in place; no new tier produced — any ceiling permitted.  |
 | `creek.link`            | `method` (`embeddings`\|`temporal`\|`eddies`), `rebuild`    | Links existing artefacts in place — any ceiling permitted.        |
-| `creek.report`          | `report_type` (`tags`\|`voice`\|`decisions`\|`lexicon`\|`rhetorical-patterns`\|`mode-profiles`) | Ceiling is recorded but not enforced — known gap #968; see "Read-side posture (#932)" below. |
+| `creek.report`          | `report_type` (`tags`\|`voice`\|`decisions`\|`lexicon`\|`rhetorical-patterns`\|`mode-profiles`) | Ceiling is enforced on the *inputs* of all six generators (#968): a note enters the artifact only if its raw front matter is within `ceiling`, and a missing `privacy_tier` fails closed to `intimate`. Consequence for `tags`: the Tag Garden scans five directories, and the four beyond `01-Fragments` hold note types with no `privacy_tier` field at all, so **a ceiling-filtered tag garden is fragment-derived only**. `tag-history.json` entries record the `tier_ceiling` they were taken under, and growth is only ever compared between entries at the same ceiling. |
 | `creek.skills.refresh`  | none beyond `ceiling`                                       | Voice-skill tree regen; intimate exemplars excluded by a generator hardcode, not by the ceiling — `personal` bodies pass unsummarised at `ceiling=open` (known gap #971). |
 | `creek.compile`         | `fragment_ids`, `target_kind`, `target_id`, `target_title`  | Gates the *source* fragments' tier, not the compiled page's tier — a source above `ceiling` refuses the whole call (#848). Idempotent per FEAT-003; no-op re-runs do not log a duplicate. |
 | `creek.journal`         | `content`, `external_id`, `timestamp?`, `tier?`             | Stages an Adepthood entry then ledger-ingests it (#754); `external_id` is the idempotency key and `tier` defaults to `open`. The entry's tier is honored — a ceiling that would not admit it is refused. The tier of the fragment an existing `external_id` already maps to is **not** consulted before the update-in-place overwrites it (known gap #970). |
@@ -131,10 +131,19 @@ surface and, for `GATED` entries, against a real call site in the
 named module, and for the rest against a runtime canary probe.
 
 Most of what the sweep found is **write-side**: a tool *acts on* content
-above the caller's ceiling (#968, #970, #971) rather than handing it
+above the caller's ceiling (#970, #971) rather than handing it
 back. That is a shape the ceiling language elsewhere on this page does
 not describe — it is written entirely in read-back terms ("omitted",
 "returned as a title-only stub"), which is why those gaps survived.
+
+`creek.report` was the third of those and is now closed (#968): the ceiling
+is converted with `to_privacy_override` and threaded into all six
+generators, which filter their *inputs* through
+`creek.classify.privacy_filter.within_ceiling`. Keep the write-side framing
+in mind when reading that fix — `report_tool` returns only `report_paths`,
+so its response envelope was clean at `ceiling=open` for the whole life of
+the bug and no response-level test could have caught it. The evidence was
+always the bytes of the artifact the call wrote.
 
 One read-side leak was found, and it is worth stating how: the sweep
 first concluded there were none, having probed the tools that walk the

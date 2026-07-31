@@ -6,6 +6,19 @@ co-occurrence analysis, and provides maintenance recommendations.
 
 History is persisted to ``00-Creek-Meta/Processing-Log/tag-history.json``
 for temporal growth tracking across scans.
+
+Tier ceiling (#968): the scan admits a note only when
+:func:`creek.classify.privacy_filter.within_ceiling` says its *raw*
+frontmatter is within the caller's :class:`~creek.classify.privacy_filter.
+PrivacyTierOverride`. Four of the five :data:`_SCAN_DIRS` hold note types
+(``Thread``, ``Eddy``, ``Praxis``, ``Decision``) that carry no ``privacy_tier``
+field at all, so the fail-closed read ranks them ``intimate`` and a
+ceiling-filtered garden is **fragment-derived only**. That is the honest
+answer rather than a convenient one: those note types are derived from
+fragments and untierable by construction — ``generate_decisions`` writes
+``08-Decisions/Active/*.md`` whose ``title:`` *is* a source fragment's title
+verbatim — so scanning them at ``ceiling=open`` would read back content a
+``ceiling=all`` run had distilled there.
 """
 
 from __future__ import annotations
@@ -19,6 +32,8 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 import frontmatter
+
+from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -58,6 +73,9 @@ _BROAD_TAG_THRESHOLD: int = 100
 _SIMILAR_DISTANCE_MAX: float = 0.8
 """Minimum SequenceMatcher ratio to consider two tags similar (merge candidate)."""
 
+_TIER_CEILING_KEY: str = "tier_ceiling"
+"""History-entry key recording the ceiling a scan was taken under (#968)."""
+
 
 def _build_note(front: dict[str, str], body: str) -> str:
     """Build a markdown note with YAML frontmatter and body content.
@@ -73,6 +91,40 @@ def _build_note(front: dict[str, str], body: str) -> str:
     lines.extend(f"{key}: {value}" for key, value in front.items())
     lines.extend(("---", "", body))
     return "\n".join(lines)
+
+
+def _latest_counts_for(
+    history: list[dict[str, object]],
+    override: PrivacyTierOverride,
+) -> dict[str, int] | None:
+    """Return the newest history entry's counts taken at *override*'s ceiling.
+
+    Growth is only meaningful between two scans of the *same* corpus. Two runs
+    at different ceilings surveyed two different corpora, so comparing them
+    produces figures that are not merely imprecise but meaningless: every tag
+    the wider ceiling admits reads as brand new, and every tag the narrower one
+    dropped reads as a collapse.
+
+    Legacy entries written before #968 carry no :data:`_TIER_CEILING_KEY` and
+    are therefore *non-comparable* rather than assumed unfiltered — the ceiling
+    they were taken under is simply not recorded, and guessing it is the same
+    category error one level down.
+
+    Args:
+        history: Parsed ``tag-history.json`` entries, oldest first.
+        override: The ceiling the current scan is running under.
+
+    Returns:
+        The most recent matching entry's ``tag_counts``, or ``None`` when no
+        entry was taken at this ceiling.
+    """
+    for entry in reversed(history):
+        if entry.get(_TIER_CEILING_KEY) != override.value:
+            continue
+        counts = entry.get("tag_counts")
+        if isinstance(counts, dict):
+            return counts
+    return None
 
 
 @dataclass
@@ -97,15 +149,32 @@ class TagGardenGenerator:
     Attributes:
         vault_path: Path to the root of the Obsidian vault.
         history_path: Path to the tag history JSON file.
+        override: The tier ceiling the scan admits notes under (#968).
     """
 
-    def __init__(self, vault_path: Path) -> None:
+    def __init__(
+        self,
+        vault_path: Path,
+        *,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+    ) -> None:
         """Initialize the TagGardenGenerator with a vault path.
 
         Args:
             vault_path: Path to the root of the Obsidian vault directory.
+            override: Tier ceiling for the scan. Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared" — a genuine no-op for every
+                caller that predates #968, which is what keeps this a privacy
+                fix rather than a fixture migration. The default is safe
+                because both production surfaces (``creek_mcp.tools.report``
+                and ``creek.cli``) always pass an explicit value, a property
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``
+                enforces structurally.
         """
         self.vault_path = vault_path
+        self.override = override
         self.history_path = (
             vault_path / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
         )
@@ -114,7 +183,9 @@ class TagGardenGenerator:
         """Scan vault frontmatter and count all tag occurrences.
 
         Reads markdown files from fragment, thread, eddy, praxis, and
-        decision directories, extracting tags from YAML frontmatter.
+        decision directories, extracting tags from YAML frontmatter. Notes
+        above :attr:`override` contribute nothing — see the module docstring
+        for why that makes a filtered garden fragment-derived only.
 
         Returns:
             TagScanResult with tag counts and fragment-to-tag mappings.
@@ -127,7 +198,9 @@ class TagGardenGenerator:
             if not dir_path.is_dir():
                 continue
             for md_file in dir_path.rglob("*.md"):
-                ft = self._extract_tags(md_file)
+                ft = self._extract_tags(md_file, self.override)
+                if ft is None:
+                    continue
                 for tag in ft.tags:
                     tag_counts[tag] += 1
                     tag_fragments[tag].append(ft.fragment_id)
@@ -295,16 +368,29 @@ class TagGardenGenerator:
     # ---- Private helpers ----
 
     @staticmethod
-    def _extract_tags(md_file: Path) -> _FragmentTags:
+    def _extract_tags(
+        md_file: Path,
+        override: PrivacyTierOverride,
+    ) -> _FragmentTags | None:
         """Extract tags and ID from a markdown file's frontmatter.
+
+        The gate reads the *raw* frontmatter rather than a validated model:
+        four of the five :data:`_SCAN_DIRS` hold note types that have no
+        ``privacy_tier`` field to validate, and no ``Fragment`` is ever built
+        here at all.
 
         Args:
             md_file: Path to the markdown file.
+            override: The tier ceiling this scan admits under.
 
         Returns:
-            _FragmentTags with the file's ID and tag list.
+            _FragmentTags with the file's ID and tag list, or ``None`` when
+            the note's tier is above *override* — in which case not even its
+            id reaches the tally.
         """
         post = frontmatter.load(str(md_file))
+        if not within_ceiling(post.metadata, override):
+            return None
         raw_id = post.get("id", md_file.stem)
         frag_id: str = raw_id if isinstance(raw_id, str) else md_file.stem
         tags_raw = post.get("tags", [])
@@ -312,21 +398,30 @@ class TagGardenGenerator:
         return _FragmentTags(fragment_id=frag_id, tags=tags)
 
     def _load_previous_counts(self) -> dict[str, int] | None:
-        """Load the most recent tag counts from history.
+        """Load the most recent tag counts taken at this scan's ceiling.
 
         Returns:
-            Previous tag counts dict, or None if no history exists.
+            Previous tag counts dict, or ``None`` when no history entry was
+            recorded at :attr:`override`'s ceiling — see
+            :func:`_latest_counts_for` for why a mismatched entry is skipped
+            rather than reused.
         """
         if not self.history_path.exists():
             return None
-        history = json.loads(self.history_path.read_text(encoding="utf-8"))
+        history: list[dict[str, object]] = json.loads(
+            self.history_path.read_text(encoding="utf-8"),
+        )
         if not history:
             return None
-        latest: dict[str, int] = history[-1]["tag_counts"]
-        return latest
+        return _latest_counts_for(history, self.override)
 
     def _save_history(self, scan: TagScanResult) -> None:
         """Append current scan to the tag history file.
+
+        The entry records the ceiling it was taken under (#968). This file is
+        append-only, so an entry written at one ceiling is read back by every
+        later run: without the ceiling stated, a count is uninterpretable and
+        a later run would silently compare across corpora.
 
         Args:
             scan: The current tag scan result to persist.
@@ -340,6 +435,7 @@ class TagGardenGenerator:
         entry: dict[str, object] = {
             "timestamp": datetime.now(tz=UTC).isoformat(),
             "tag_counts": scan.tag_counts,
+            _TIER_CEILING_KEY: self.override.value,
         }
         history.append(entry)
 

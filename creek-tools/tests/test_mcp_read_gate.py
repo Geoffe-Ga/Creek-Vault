@@ -1587,7 +1587,7 @@ def test_report_probe_leaves_no_canary_in_the_artifact_it_writes(
 
     assert _RUNTIME_INTIMATE_CANARY not in garden, (
         "creek.report distilled an intimate fragment's tag into "
-        f"00-Creek-Meta/Tag-Garden.md at privacy_tier_ceiling=open. The "
+        "00-Creek-Meta/Tag-Garden.md at privacy_tier_ceiling=open. The "
         "response envelope was clean — it always is — so nothing above this "
         f"line could have caught it.\n\n{garden}"
     )

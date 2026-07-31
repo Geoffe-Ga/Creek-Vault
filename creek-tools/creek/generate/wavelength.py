@@ -23,6 +23,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.hierarchy import LevelPolicy, select_by_policy
 from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 from creek.time import effective_authored_date
@@ -191,12 +192,35 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
         return None
 
 
-def load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
+def load_fragments_from_vault(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> list[Fragment]:
     """Load every classified fragment from ``01-Fragments/`` under *vault_path*.
 
     Files that fail to parse or that lack the ``type: fragment`` marker
     are silently skipped. Returns an empty list when the folder is
     absent.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        override: Tier ceiling (#968), applied to each file's *raw*
+            frontmatter — which this loader already has in hand, and which
+            is the only place a missing ``privacy_tier`` is still
+            distinguishable from the model's ``unclassified`` default.
+            Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared", so the three non-report callers
+            in this module and ``creek report --type wavelength`` are
+            byte-identical to before. The default is safe because both
+            production report surfaces state an override explicitly, which
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_report_callers_always_state_an_override``
+            enforces structurally.
+
+    Returns:
+        Every admitted fragment, in sorted on-disk order.
     """
     root = vault_path / "01-Fragments"
     if not root.exists():
@@ -208,6 +232,8 @@ def load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
             continue
         metadata = dict(post.metadata)
         if metadata.get("type") != "fragment":
+            continue
+        if not within_ceiling(metadata, override):
             continue
         try:
             fragments.append(Fragment.model_validate(metadata))
@@ -1358,11 +1384,27 @@ class ModeProfileGenerator:
     an unclassified corpus produces no files at all (#583).
     """
 
-    def generate_mode_profiles(self, vault_path: Path) -> list[Path]:
+    def generate_mode_profiles(
+        self,
+        vault_path: Path,
+        *,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+    ) -> list[Path]:
         """Write one profile note per non-empty engagement mode.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
+            override: Tier ceiling (#968), forwarded to
+                :func:`load_fragments_from_vault`. Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared" — a genuine no-op for callers
+                that predate #968, and safe because both production report
+                surfaces state an override explicitly (pinned by
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``).
+                A mode profile lists sample fragment *titles*, so an
+                unfiltered walk publishes above-ceiling titles into
+                ``05-Wavelength/Mode-Profiles/``.
 
         Returns:
             Paths written, in canonical :class:`~creek.models.Mode` order; empty
@@ -1374,7 +1416,7 @@ class ModeProfileGenerator:
         # enum's ``.value``s below, so the comparison stays string-to-string
         # throughout rather than mixing enum identity with string lookups.
         by_mode: dict[str, list[Fragment]] = defaultdict(list)
-        for fragment in load_fragments_from_vault(vault_path):
+        for fragment in load_fragments_from_vault(vault_path, override=override):
             mode = str(fragment.wavelength.mode)
             if mode != Mode.UNCLASSIFIED.value:
                 by_mode[mode].append(fragment)
