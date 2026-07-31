@@ -25,6 +25,12 @@ from mcp.server.fastmcp import FastMCP
 from creek.care.guardrail import acute_distress_guard
 from creek.config import CONFIG_PATH_ENV_VAR, load_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
+from creek_mcp.policy import (
+    Admission,
+    CallerIdentity,
+    admitted_ceiling,
+    effective_consumer,
+)
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
@@ -73,22 +79,41 @@ if TYPE_CHECKING:
 
 SERVER_NAME = "creek-tools-mcp"
 
-# Tier ceilings a REMOTE (network-authed) consumer may request. INTIMATE and ALL
-# are excluded so intimate content can never be reached over the network — the
-# load-bearing boundary of #759. Local (stdio) callers are unaffected.
-_REMOTE_ADMITTED_CEILINGS: frozenset[TierCeiling] = frozenset(
-    {TierCeiling.OPEN, TierCeiling.PERSONAL}
-)
-
 
 def _current_access_token() -> AccessToken | None:
     """Return the current request's authenticated token, or ``None`` for stdio.
 
     A thin, monkeypatchable wrapper over the SDK's request-scoped
     ``get_access_token`` — non-``None`` exactly when the call arrived over the
-    authenticated network transport.
+    authenticated network transport. This is the single SDK seam on the
+    identity path: everything below reaches the request context through here
+    and nowhere else, which is what lets the tests drive both sides of the
+    boundary without standing up a transport.
     """
     return get_access_token()
+
+
+def _caller_identity() -> CallerIdentity:
+    """Answer :mod:`creek_mcp.policy`'s two questions with MCP's facts.
+
+    The MCP half of the #1073 split: policy decides, this states which side of
+    the network the call arrived from and whose credential it carried. An
+    authenticated network request has an access token whose ``client_id`` is
+    the consumer; a local stdio call has neither.
+
+    **Call this per call. Never hoist it.** ``get_access_token()`` is
+    request-scoped, while the ``consumer`` that :func:`build_server` resolves
+    from the environment is bound once at build time. Building the identity
+    beside it would pin every later call to whichever caller happened to be in
+    flight first — forging audit attribution, and, from a stdio-built identity,
+    uncapping every remote call thereafter. That is the highest-consequence
+    failure mode of this arrangement, and ``tests/test_mcp_remote.py`` pins it
+    by driving two bearers through one built server.
+    """
+    token = _current_access_token()
+    if token is None:
+        return CallerIdentity(consumer=None, is_remote=False)
+    return CallerIdentity(consumer=token.client_id, is_remote=True)
 
 
 def _effective_consumer(default: str) -> str:
@@ -96,20 +121,31 @@ def _effective_consumer(default: str) -> str:
 
     So a network call is audited under the consumer its bearer token identifies,
     while a local stdio call keeps the process-global ``CREEK_MCP_CONSUMER``.
+    The rule itself is :func:`creek_mcp.policy.effective_consumer`; all this
+    adds is MCP's answer to "who is calling", rebuilt for the request in flight.
+    Kept module-level under this exact name because the 23 tool closures below
+    call it on every request.
     """
-    token = _current_access_token()
-    return token.client_id if token is not None else default
+    return effective_consumer(_caller_identity(), default)
 
 
 class _BoundedFastMCP(FastMCP):
-    """``FastMCP`` that enforces the remote tier-ceiling cap at the one call chokepoint.
+    """The MCP adapter for :mod:`creek_mcp.policy`'s remote tier-ceiling cap.
 
-    Every tool call flows through :meth:`call_tool`. When the call is remote (an
-    authenticated network request — ``_current_access_token()`` is set), a
-    requested ceiling above the remote cap (i.e. ``INTIMATE`` or ``ALL``, or any
-    unrecognised value) is refused **before dispatch**, so intimate content is
-    never even read for a remote caller. Local stdio calls (no token) pass
-    through unchanged — the default per-tool ``OPEN`` ceiling still applies.
+    Every tool call flows through :meth:`call_tool`, the one MCP-side chokepoint
+    at which the requested ceiling is still a raw argument. The cap is not
+    decided here: since #1073 it is adapter-independent policy in
+    :func:`creek_mcp.policy.admitted_ceiling`, so the ``/v1`` HTTP surface
+    reaches the same verdict without an MCP request context to key off. What
+    this class owns is the two things only MCP can answer — *who is the caller*
+    and *is this remote*, via :func:`_caller_identity` — plus what a refusal
+    looks like on this transport: the
+    :func:`creek_mcp.tier_ceiling.refusal_response` payload, where ``/v1``
+    deliberately answers ``422 invalid_request`` instead.
+
+    A refused remote call is refused **before dispatch**, so intimate content is
+    never even read for it. Local stdio calls pass through unchanged — the
+    default per-tool ``OPEN`` ceiling still applies.
     """
 
     async def call_tool(
@@ -117,31 +153,37 @@ class _BoundedFastMCP(FastMCP):
     ) -> Sequence[ContentBlock] | dict[str, Any]:
         """Refuse over-ceiling remote calls, else dispatch normally.
 
+        The missing-key default is *adapter* vocabulary rather than policy's: a
+        tool that declares no ``privacy_tier_ceiling`` is read here as having
+        asked for ``OPEN``, exactly as ``/v1`` reads an absent
+        ``X-Creek-Tier-Ceiling`` header. Handing the absent key to policy as
+        ``None`` would also be safe — it fails closed — but it would refuse the
+        purge tools below rather than admitting them.
+
         Note: this ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
         they declare no ``privacy_tier_ceiling`` parameter, so ``arguments.get``
         below always falls back to ``OPEN`` (admitted) for them. That is
         intentional: purge is not tier-scoped and is instead gated, fail-closed,
         by ``CREEK_MCP_ELEVATED_TOKEN`` (see ``creek_mcp.auth.is_elevated`` and the
         purge tools), which a per-consumer bearer alone does not satisfy. Do not
-        rely on this gate for purge protection.
+        rely on this gate — or on :mod:`creek_mcp.policy` — for purge protection.
         """
-        if _current_access_token() is not None:
-            raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
-            try:
-                requested = TierCeiling(raw)
-            except ValueError:
-                requested = None
-            if requested not in _REMOTE_ADMITTED_CEILINGS:
-                return refusal_response(
-                    tool=name,
-                    ceiling=TierCeiling.OPEN,
-                    reason=(
-                        "remote consumers may not request a ceiling above "
-                        f"'{TierCeiling.PERSONAL.value}'; intimate content is not "
-                        "reachable over the network"
-                    ),
-                )
-        return await super().call_tool(name, arguments)
+        raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
+        verdict = admitted_ceiling(_caller_identity(), raw)
+        # Dispatch on the POSITIVE verdict, never on "not a refusal". If policy
+        # ever grows a third verdict, this falls to the refusal branch instead
+        # of silently uncapping the call — and because the branch below then
+        # narrows to a type that has no ``reason``, mypy fails the build rather
+        # than leaving the regression to be noticed at runtime.
+        if isinstance(verdict, Admission):
+            return await super().call_tool(name, arguments)
+        # ``ceiling=OPEN`` rather than the requested one: the refusal echoes
+        # the transport's own default, never the value that was refused.
+        return refusal_response(
+            tool=name,
+            ceiling=TierCeiling.OPEN,
+            reason=verdict.reason,
+        )
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:

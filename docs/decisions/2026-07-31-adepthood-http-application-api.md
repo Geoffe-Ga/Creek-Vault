@@ -355,8 +355,10 @@ exactly how an oracle returns through the back door.
 ## #1082 — the contract's answer
 
 `creek classify`'s privacy pass is escalate-only, and every remote consumer
-token is capped at `ceiling=personal` (`_REMOTE_ADMITTED_CEILINGS` in
-[`creek_mcp/server.py`](../../creek-tools/creek_mcp/server.py)). So once a
+token is capped at `ceiling=personal` (`REMOTE_ADMITTED_CEILINGS` in
+[`creek_mcp/policy.py`](../../creek-tools/creek_mcp/policy.py), moved out of
+`creek_mcp/server.py` by [#1073](https://github.com/Geoffe-Ga/Creek-Vault/issues/1073)
+so the cap is adapter-independent rather than bound to MCP middleware). So once a
 journal fragment's persisted tier reaches `intimate`, a remote consumer can
 **never send that `external_id` again — not even an unchanged, idempotent
 re-sync**.

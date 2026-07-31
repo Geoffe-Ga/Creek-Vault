@@ -2,7 +2,7 @@
 
 The ``/v1`` surface Adepthood consumes is *remote by construction*: every call
 arrives over the network transport, and that transport is already capped at
-``personal`` by ``creek_mcp.server._REMOTE_ADMITTED_CEILINGS``.
+``personal`` by ``creek_mcp.policy.REMOTE_ADMITTED_CEILINGS``.
 :mod:`creek_mcp.api.models` is the wire vocabulary for that surface -- a
 framework-free Pydantic layer that #1074 can mount behind whichever HTTP
 framework it picks without renegotiating a single field name.
@@ -18,7 +18,7 @@ pinning a property the cross-repo consumer is entitled to rely on:
 2.  every enum is *closed* -- membership is frozen, and the two enums that
     mirror a runtime constant (``NoteKind`` against
     ``reflect._ALLOWED_KINDS``, ``WireTierCeiling`` against
-    ``server._REMOTE_ADMITTED_CEILINGS``) are compared to that constant rather
+    ``policy.REMOTE_ADMITTED_CEILINGS``) are compared to that constant rather
     than to a copy of it;
 3.  the wheel declares ten separate required frequency fields, in canonical
     order, with bounded ``count`` / ``share``;
@@ -60,7 +60,7 @@ from pydantic import BaseModel, Field, ValidationError
 from creek.care.guardrail import CARE_SIGNAL
 from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
 from creek.models import PrivacyTier
-from creek_mcp import read_gate, server
+from creek_mcp import policy, read_gate
 from creek_mcp.api import models as api_models
 from creek_mcp.api.bundle import (
     BUNDLE_DIR_NAME,
@@ -444,7 +444,7 @@ def _admitted_ceiling_tier_pairs() -> tuple[tuple[TierCeiling, PrivacyTier], ...
     """Return every ``(remote ceiling, admitted tier)`` pair ``/v1`` can see."""
     return tuple(
         (ceiling, tier)
-        for ceiling in sorted(server._REMOTE_ADMITTED_CEILINGS)
+        for ceiling in sorted(policy.REMOTE_ADMITTED_CEILINGS)
         for tier in PrivacyTier
         if tier_allowed(tier, ceiling)
     )
@@ -558,7 +558,7 @@ def test_note_kind_mirrors_the_reflect_tool_allowed_kinds() -> None:
 
 def test_wire_tier_ceiling_matches_the_remote_admitted_ceilings() -> None:
     """``/v1`` is remote by construction, so its ceilings are the remote cap."""
-    remote = {ceiling.value for ceiling in server._REMOTE_ADMITTED_CEILINGS}
+    remote = {ceiling.value for ceiling in policy.REMOTE_ADMITTED_CEILINGS}
     assert {ceiling.value for ceiling in WireTierCeiling} == remote
 
 
@@ -1101,7 +1101,7 @@ def test_routed_tier_is_a_constant_function_of_the_declared_ceiling(
 def test_admitted_ceiling_tier_sweep_is_not_vacuous() -> None:
     """The non-oracle sweep covers both remote ceilings and several tiers."""
     pairs = _admitted_ceiling_tier_pairs()
-    assert {ceiling for ceiling, _ in pairs} == set(server._REMOTE_ADMITTED_CEILINGS)
+    assert {ceiling for ceiling, _ in pairs} == set(policy.REMOTE_ADMITTED_CEILINGS)
     assert len(pairs) >= 4
 
 
