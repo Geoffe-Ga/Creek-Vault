@@ -31,6 +31,7 @@ from crawdad.config import (
     router_model_for,
 )
 from crawdad.consent import PendingBatchStore
+from crawdad.discord_text import _truncate_for_discord
 from crawdad.dispatcher import WorkflowRunReport
 from crawdad.history import ConversationHistory
 from crawdad.intents import PrivacyTierCeiling, ToolInfo, cap_ceiling
@@ -51,18 +52,6 @@ if TYPE_CHECKING:
     from crawdad.state import SessionState
 
 _LOGGER = logging.getLogger("crawdad.cli")
-
-# Discord's regular message + slash-follow-up text body is capped at 2000
-# characters. Truncate well below the wire limit so the truncation marker
-# always fits and we leave headroom for accidental whitespace.
-_DISCORD_REPLY_LIMIT = 1900
-
-
-def _truncate_for_discord(text: str) -> str:
-    """Cap *text* at Discord's soft limit with an ellipsis marker if needed."""
-    if len(text) <= _DISCORD_REPLY_LIMIT:
-        return text
-    return text[: _DISCORD_REPLY_LIMIT - 3] + "..."
 
 
 def main(argv: Sequence[str] | None = None) -> None:
