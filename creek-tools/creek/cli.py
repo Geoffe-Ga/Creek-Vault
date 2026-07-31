@@ -3251,6 +3251,11 @@ def report(
 @app.command()
 def state(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=_REPORT_INCLUDE_TIER_HELP,
+    ),
 ) -> None:
     """Render ``00-Creek-Meta/State/<iso-week>.md`` audit report.
 
@@ -3258,15 +3263,40 @@ def state(
     re-runs classification, linking, or compile. It reads existing
     fragments, threads, eddies, praxis, synchronicities, and the most
     recent ``run-summary.jsonl`` line, and writes a single markdown
-    document organised in seven sections (vault summary, pre-LLM yield,
-    active eddies, active threads, surprising connections, hyperedges,
-    drift warnings). ``latest.md`` next to the ISO-week file always
-    points at the most recent report.
+    document organised in eleven sections (wavelength snapshot, vault
+    summary, pre-LLM yield, liminal watch, active eddies, active threads,
+    surprising connections, hyperedges, drift warnings, suggested
+    questions, lint summary). ``latest.md`` next to the ISO-week file
+    always points at the most recent report.
+
+    ``--include-tier`` runs the same way round as it does on ``report``
+    (#968): omitting it leaves the render **unfiltered**, because the CLI
+    operator is the vault owner, and supplying it NARROWS what the artifact may
+    contain. It is also half of the documented upgrade path for a pre-#969
+    ``latest.md``: ``creek state --include-tier open`` re-renders and
+    re-stamps so an ``open``-ceiling MCP reader stops being refused.
+
+    Privacy override audit: the entry is written only when the flag was
+    **explicitly supplied**. ``override_elevates`` answers ``True`` for
+    ``PrivacyTierOverride.ALL``, so auditing the resolved ceiling would write a
+    line on every bare ``creek state`` — the loudest possible record of the one
+    case where the operator asked for nothing.
     """
     from creek.generate.state import StateReportGenerator
 
+    override = _parse_include_tier(include_tier)
     vault_path = _resolve_vault(vault)
-    written = StateReportGenerator(vault_path=vault_path).write()
+    if include_tier is not None:
+        _audit_privacy_override_if_needed(
+            vault_path=vault_path,
+            command="state",
+            override=override,
+            fragment_ids=[],
+        )
+    written = StateReportGenerator(
+        vault_path=vault_path,
+        override=override or PrivacyTierOverride.ALL,
+    ).write()
     console.print(f"[bold green]State report written: {written}[/bold green]")
 
 

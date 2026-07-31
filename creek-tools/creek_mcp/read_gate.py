@@ -35,17 +35,30 @@ of the primitives below inherits it:
 5. Only *after* admission derive :func:`creek_mcp.tier_ceiling.routing_tier`
    to key a model call.
 
-**Why these primitives have no production caller yet.** That is a decision,
-not an oversight. ``creek.reflect`` and ``creek.compile`` are deliberately
-*not* retrofitted onto :func:`refuse_above_ceiling`: their refusal reasons and
-ordering comments are tool-specific and load-bearing. Reflect's "ACCEPTED
-RESIDUAL RISK" block documents exactly why its reason must stay distinct from
-``entry_ref not found`` — including the timing-equalisation caveat that would
-have to be handled if the two were ever unified — and folding it into a shared
-reason would delete that reasoning along with the behaviour. The primitives
-exist so a filed gap can be closed by *adoption* rather than by each tool
-re-deriving the policy, and so that a *new* tool finds an already-gated corpus
-walk on the path of least resistance.
+**Who calls these primitives, and why the rest still do not.**
+:func:`refuse_above_ceiling` has exactly one production caller:
+``creek_mcp.tools.state_read``, which adopted it in #969. That adoption is the
+shape the primitives were written for — the tool addresses a *single* cached
+artifact, so there is nothing to partially admit, and its refusal has no
+tool-specific story to tell. It gets the generic reason, the four-key payload
+and the no-tier-echo rule for free rather than re-deriving any of them.
+
+The other refusing tools are deliberately *not* retrofitted.
+``creek.reflect`` and ``creek.compile`` keep their own refusal reasons and
+ordering comments because those are tool-specific and load-bearing: reflect's
+"ACCEPTED RESIDUAL RISK" block documents exactly why its reason must stay
+distinct from ``entry_ref not found`` — including the timing-equalisation
+caveat that would have to be handled if the two were ever unified — and folding
+it into a shared reason would delete that reasoning along with the behaviour.
+
+:func:`iter_admitted_fragments` still has no production caller, and that too is
+a decision. Every gap closed so far needed the **hard rank cutoff**
+(``tier_within_override``) rather than this primitive's summarising filter: a
+report or a state artifact must *omit* above-ceiling content, because a
+``"[Personal-tier summary: <title>]"`` stub written into a voice profile or a
+mined prompt leaks the title it claims to be protecting. The primitive remains
+the right answer for a future tool that hands bodies to a model, and it is what
+stops such a tool re-deriving Ontology §13.2 for itself.
 
 **Adoption is not the only honest way to close a gap, and #968 is the worked
 example.** ``creek.report`` is now ``GATED`` without adopting either
@@ -62,6 +75,14 @@ corpus — and it reads the tier through the validated
 :func:`creek_mcp.tier_ceiling.to_privacy_override` without adopting either
 primitive. What the manifest checks is that the named gate exists and decides
 something, not which of two shapes it takes.
+
+#969 closed the two ``creek.state.*`` gaps and needed *both* shapes at once,
+which is the clearest statement of the rule. ``creek.state.render`` names no
+target — it is a corpus walk — so it excludes, on ``to_privacy_override``, like
+``report``. ``creek.state.read`` addresses one atomic cached artifact, so it
+refuses, on ``refuse_above_ceiling``. Read that as #1068's compile/reflect
+reasoning one level up: read's target is not caller-*named*, but it is
+caller-*addressed* and singular, which is the property that decides.
 
 :data:`TOOL_POSTURES` is verified by ``tests/test_mcp_read_gate.py``, which
 fails if an entry lies: the manifest must match ``server.list_tools()``
@@ -265,26 +286,55 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gate_symbol="to_privacy_override",
     ),
     "creek.state.read": ToolPosture(
-        posture=ReadPosture.UNGATED_KNOWN_GAP,
+        posture=ReadPosture.GATED,
         rationale=(
-            "Returns 00-Creek-Meta/State/latest.md verbatim at any ceiling. "
-            "The artifact records no ceiling of its own, so it may have been "
-            "rendered at ceiling=all and be read back at ceiling=open (#969)."
+            "Refuses, rather than excludes, on the artifact's own privacy_tier "
+            "stamp: its target is one atomic cached artifact, so there is "
+            "nothing to partially admit — you cannot exclude half a rendered "
+            "markdown document without re-rendering it, and re-rendering is "
+            "what creek.state.render is. refuse_above_ceiling supplies the "
+            "generic reason and the four-key payload, so the refusal never "
+            "names the stamped tier. Consequence to know: a pre-#969 "
+            "latest.md carries no stamp, fails closed to intimate and is "
+            "refused below ceiling=intimate — accurate rather than cautious, "
+            "since those bytes were rendered completely unfiltered. Recovery "
+            "is one re-render, and ceiling=all admits every stamp, so no "
+            "report is permanently unreachable. A *missing* report stays "
+            "status=empty: refusing there would be a vault-emptiness oracle "
+            "in the other direction."
         ),
-        gap_issue=969,
+        gate_module="creek_mcp.tools.state_read",
+        gate_symbol="refuse_above_ceiling",
     ),
     "creek.state.render": ToolPosture(
-        posture=ReadPosture.UNGATED_KNOWN_GAP,
+        posture=ReadPosture.GATED,
         rationale=(
-            "Walks the whole vault through StateReportGenerator, which "
-            "threads no override, and returns the rendered content. Its one "
-            "fragment-derived section is safe by default "
-            "(phase_filtered_seeds with override=None, which ranks as "
-            "ceiling=open); the eddy/thread/liminal title sections are "
-            "unfiltered and unfilterable — Eddy and Thread carry no "
-            "privacy_tier (#969)."
+            "Converts the ceiling with to_privacy_override and threads it "
+            "into StateReportGenerator, which admits ten of its eleven "
+            "sections against it and stamps the written artifact with the "
+            "highest tier it admitted. The exception is Pre-LLM yield, "
+            "ungated on purpose: it renders the last line of "
+            "run-summary.jsonl — a run id, a timestamp and four integers "
+            "describing one pipeline run — which names no fragment, so there "
+            "is nothing in it to filter by. Excludes rather than refuses: the tool "
+            "names no target, so refusing would make the audit report "
+            "unreachable — #968's explicit anti-goal. The gap was write-side, "
+            "which is why it survived a response-level sweep: the evidence is "
+            "the bytes under 00-Creek-Meta/State, where three leaks were "
+            "reproduced (an orphan path carrying an intimate fragment's "
+            "slugified title, a 10-Liminal/Unnamed file stem, and an eddy "
+            "title derived from an above-ceiling member). Consequences to "
+            "know: type: paradox notes carry no privacy_tier field at all and "
+            "fail closed out of the Liminal Watch below ceiling=intimate; the "
+            "lint summary is an untierable verbatim Processing-Log copy and is "
+            "admitted whole or not at all, i.e. intimate-only; suggested "
+            "questions are dropped below ceiling=personal because the miner's "
+            "filter summarises rather than drops a personal title; and "
+            "latest.md is a single slot, so a narrow render replaces a broader "
+            "one for every later reader."
         ),
-        gap_issue=969,
+        gate_module="creek_mcp.tools.state",
+        gate_symbol="to_privacy_override",
     ),
     "creek.skills.refresh": ToolPosture(
         posture=ReadPosture.UNGATED_KNOWN_GAP,
@@ -319,10 +369,16 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "tags check deliberately surveys the whole vault "
             "(creek/lint/checks/tags.py passes PrivacyTierOverride.ALL) so it "
             "cannot report 'no orphan tags' about a vault that has them. That "
-            "artifact is unreachable through MCP today, which is the same "
-            "argument #968 disproved for creek.report's Tag-Garden.md — it "
-            "holds here only while nothing serves Processing-Log/ back, so "
-            "read it against #969's state-artifact gap rather than alone."
+            "artifact IS served back through MCP — creek state appends it "
+            "verbatim as its ## Lint summary section — and #969 closed the "
+            "hole at that boundary rather than here: the section is now "
+            "rendered only at ceiling=intimate or broader, and its presence "
+            "escalates the state artifact's own tier stamp to intimate. The "
+            "copy is untierable row by row, so it is admitted whole or not at "
+            "all. What is left unresolved here is narrower than the caveat "
+            "this replaces: the file on disk is still written at ALL, so any "
+            "*future* surface that serves Processing-Log/ must make the same "
+            "whole-or-nothing decision creek state did."
         ),
     ),
     "creek.link": ToolPosture(

@@ -81,8 +81,19 @@ def vault(tmp_path: Path) -> Iterator[Path]:
 
 
 def test_state_read_returns_latest_md_content(vault: Path) -> None:
-    """``state.read`` reads ``00-Creek-Meta/State/latest.md`` verbatim."""
+    """``state.read`` reads ``00-Creek-Meta/State/latest.md`` verbatim.
+
+    The fixture carries the #969 ``privacy_tier: open`` stamp that
+    ``StateReportGenerator.write`` now writes. Before #969 an unstamped file
+    was served at every ceiling; now an *unstamped* report reads as
+    ``intimate`` (``raw_privacy_tier`` fails closed on a missing key), which is
+    an accurate statement about bytes rendered completely unfiltered. Stamping
+    the fixture keeps this test pinning what it always pinned — that admitted
+    content comes back verbatim — rather than accidentally becoming a second,
+    weaker copy of the refusal test below.
+    """
     (vault / "00-Creek-Meta" / "State" / "latest.md").write_text(
+        "---\ntype: state-report\nprivacy_tier: open\ntier_ceiling: open\n---\n\n"
         "# Audit report\n\nVault summary lives here.\n",
         encoding="utf-8",
     )
@@ -91,6 +102,28 @@ def test_state_read_returns_latest_md_content(vault: Path) -> None:
     assert result["tool"] == "creek.state.read"
     assert result["tier_ceiling"] == "open"
     assert "Audit report" in result["content"]
+
+
+def test_state_read_refuses_a_legacy_unstamped_report(vault: Path) -> None:
+    """An unstamped ``latest.md`` fails closed at the default ceiling (#969).
+
+    Added alongside — not instead of — the verbatim-read test above, because
+    the two halves have to be pinned together: "stamped ``open`` is served"
+    means nothing if "unstamped is also served".
+
+    Every ``latest.md`` written before #969 was rendered with no ceiling at
+    all, i.e. the equivalent of ``--include-tier all``. Refusing it states a
+    fact about those bytes rather than a precaution about them, and recovery is
+    one command: ``creek.state.render`` (or ``creek state --include-tier
+    open``) re-renders and re-stamps at the caller's ceiling.
+    """
+    (vault / "00-Creek-Meta" / "State" / "latest.md").write_text(
+        "# Audit report\n\nVault summary lives here.\n",
+        encoding="utf-8",
+    )
+    result = state_read_tool(vault_path=vault)
+    assert result["status"] == "refused"
+    assert "Vault summary lives here." not in json.dumps(result, default=str)
 
 
 def test_state_read_returns_empty_on_missing_report(vault: Path) -> None:
@@ -114,13 +147,64 @@ def test_state_read_writes_audit_entry(vault: Path) -> None:
     assert entry["tier_ceiling"] == "personal"
 
 
-def test_state_read_does_not_embed_fragment_bodies(vault: Path) -> None:
-    """Intimate fragment bodies must not appear in the audit report.
+def _write_liminal_unnamed(vault: Path, *, stem: str, privacy_tier: str) -> None:
+    """Write a ``10-Liminal/Unnamed`` note whose file *stem* is the sentinel.
 
-    The audit report aggregates titles + counts. A vault with an
-    ``intimate``-tier fragment must not see its body surface through
-    ``state.read`` even when the caller specifies ``ceiling=open``.
+    The Liminal Watch section renders ``path.stem`` and nothing else, so the
+    stem is the one place a sentinel can prove the rendered report reached
+    above-ceiling content. Used by the test below to get a canary into
+    ``latest.md`` through the production render path.
+
+    Args:
+        vault: Vault root.
+        stem: File stem, carrying the sentinel.
+        privacy_tier: The note's declared tier.
     """
+    target = vault / "10-Liminal" / "Unnamed" / f"{stem}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "type": "fragment",
+        "id": stem,
+        "title": stem,
+        "created": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "ingested": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "unclassified", "secondary": []},
+        "privacy_tier": privacy_tier,
+    }
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="unnamed body", **metadata)),
+        encoding="utf-8",
+    )
+
+
+def test_state_read_does_not_serve_above_ceiling_content_from_latest_md(
+    vault: Path,
+) -> None:
+    """``state.read`` refuses a report whose stamp is above the caller's ceiling.
+
+    **What this replaced, and why the old test could not fail.** The previous
+    ``test_state_read_does_not_embed_fragment_bodies`` wrote an intimate
+    fragment, then **hand-wrote** ``latest.md`` as the fixed string
+    ``"# Audit report\\n\\n- Fragments: 1\\n"``, then asserted
+    ``"secret journal body" not in result["content"]``. That was true by
+    construction: nothing in ``state_read_tool`` ever read the fragment, so the
+    ``_write_fragment`` call was decorative and the assertion held whether or
+    not a gate existed. It passed for the entire life of the #969 gap.
+
+    **Why this one can fail.** The artifact is produced through the production
+    path — ``state_render_tool(..., ceiling=ALL)`` — so the canary genuinely
+    reaches ``latest.md``, which is asserted first so the setup cannot rot into
+    the same vacuity. Delete the read gate and this test fails, because the
+    canary comes back. Delete the render gate and its companion in
+    ``tests/test_state_tier_ceiling.py`` fails, because the ``open`` render
+    would carry it.
+
+    The refusal, not merely the canary's absence, is what is asserted: a change
+    that stopped resolving ``latest.md`` would return ``status="empty"`` with
+    no canary in it and prove nothing about the ceiling.
+    """
+    canary = "CANARY-STATE-READ-INTIMATE-4d16"
     _write_fragment(
         vault,
         frag_id="frag-intimate-1",
@@ -128,12 +212,24 @@ def test_state_read_does_not_embed_fragment_bodies(vault: Path) -> None:
         privacy_tier="intimate",
         body="this is a secret journal body",
     )
-    (vault / "00-Creek-Meta" / "State" / "latest.md").write_text(
-        "# Audit report\n\n- Fragments: 1\n",
+    _write_liminal_unnamed(vault, stem=f"unnamed-{canary}", privacy_tier="intimate")
+
+    state_render_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.ALL)
+    latest = (vault / "00-Creek-Meta" / "State" / "latest.md").read_text(
         encoding="utf-8",
     )
-    result = state_read_tool(vault_path=vault)
-    assert "secret journal body" not in result["content"]
+    assert canary in latest, (
+        "the ceiling=all render did not put the canary into latest.md, so the "
+        "refusal assertion below would pass on an artifact with nothing in it "
+        "to refuse — exactly the vacuity this test replaced"
+    )
+
+    result = state_read_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.OPEN)
+    assert result["status"] == "refused"
+    assert canary not in json.dumps(result, default=str), (
+        "creek.state.read served above-ceiling content from latest.md at "
+        f"privacy_tier_ceiling=open:\n\n{result}"
+    )
 
 
 # ---------------------------------------------------------------------------

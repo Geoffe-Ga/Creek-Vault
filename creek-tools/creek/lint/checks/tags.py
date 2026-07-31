@@ -15,8 +15,13 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     del since
     # Stated explicitly rather than inherited (#968): an orphan-tag check must
     # survey the whole vault or it reports "no orphan tags" about a vault that
-    # has them. Safe to keep unfiltered because ``creek.lint``'s read posture is
-    # METADATA_ONLY — ``findings`` never leave the process over MCP.
+    # has them. What keeps the unfiltered survey safe is *not* that the
+    # findings stay in-process — ``creek state``'s ``## Lint summary`` appends
+    # this report verbatim (#969), so they do leave. It is that the section
+    # admits that copy whole or not at all, and only at ``ceiling=intimate``
+    # or broader: an untierable Processing-Log artefact has no row-level tier
+    # to filter on, so a partial copy would be a truncated report presented as
+    # a complete one.
     scan = TagGardenGenerator(
         vault_path=vault_path,
         override=PrivacyTierOverride.ALL,

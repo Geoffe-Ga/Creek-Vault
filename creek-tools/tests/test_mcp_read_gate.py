@@ -101,6 +101,8 @@ from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
+from creek_mcp.tools.state import state_render_tool
+from creek_mcp.tools.state_read import state_read_tool
 from creek_mcp.tools.wheel import wheel_tool
 
 if TYPE_CHECKING:
@@ -143,11 +145,24 @@ _PINNED_GATE_ROWS = [
     # check — which is exactly what the failure message on
     # ``test_pinned_gaps_keep_their_posture_and_issue`` asks for.
     ("creek.report", "creek_mcp.tools.report", "to_privacy_override"),
+    # #969 closed both state gaps, and they close in *different shapes* —
+    # which is why they are two rows rather than one. ``creek.state.render``
+    # names no target: it is a corpus walk like report/wheel/mine, so it
+    # EXCLUDES, converting the ceiling with ``to_privacy_override`` and
+    # threading it into StateReportGenerator's per-section gates. Refusing it
+    # would make the report unreachable, which is #968's explicit anti-goal.
+    # ``creek.state.read`` addresses one atomic cached artifact, so there is
+    # nothing to partially admit — you cannot exclude half a rendered markdown
+    # document without re-rendering it, and re-rendering is what ``render`` is
+    # — so it REFUSES on the artifact's own ``privacy_tier`` stamp via
+    # ``refuse_above_ceiling``. Same reasoning #1068 applied to compile and
+    # reflect, read one level up: read's target is not caller-*named* but it is
+    # caller-*addressed* and singular, which is the property that matters.
+    ("creek.state.read", "creek_mcp.tools.state_read", "refuse_above_ceiling"),
+    ("creek.state.render", "creek_mcp.tools.state", "to_privacy_override"),
 ]
 
 _PINNED_GAPS = {
-    "creek.state.read": 969,
-    "creek.state.render": 969,
     "creek.skills.refresh": 971,
     # Recorded as CALLER_NAMED_PATHS until the #932 Gate-2.5 review. The name
     # was accurate — the caller does name the path — but the confinement is to
@@ -546,10 +561,15 @@ def test_pinned_gate_claims_are_not_downgraded(
 def test_pinned_gaps_keep_their_posture_and_issue(tool: str, issue: int) -> None:
     """The known-ungated tools stay labelled as gaps against their own issues.
 
-    These four read vault content without honouring the caller's ceiling. The
+    These read vault content without honouring the caller's ceiling. The
     posture is the honest record of that, and the issue number is the promise
     that someone is on the hook for it. Relabelling either one — without the
     code changing — converts a tracked gap into an invisible one.
+
+    The table shrinks as gaps close: #968 took ``creek.report`` out of it and
+    #969 took the two ``creek.state.*`` entries, each *re-pointed* at the gate
+    that closed it in :data:`_PINNED_GATE_ROWS` rather than merely deleted, so
+    the claim stays checkable by layers (c) and (e) instead of disappearing.
     """
     entry = TOOL_POSTURES[tool]
     assert entry.posture is ReadPosture.UNGATED_KNOWN_GAP, (
@@ -1375,12 +1395,109 @@ def _probe_report(vault: Path) -> dict[str, Any]:
     )
 
 
+def _seed_state_carriers(vault: Path) -> None:
+    """Give the two ``creek.state.*`` probes a canary the state report can render.
+
+    ``canary_vault`` puts each sentinel in a fragment's ``title``, body and
+    ``tags``, which covers an index-shaped, a body-shaped and a tag-garden-shaped
+    response. The state report renders **none** of those three: it aggregates
+    counts, eddy/thread titles, synchronicity ids, orphan *paths* and liminal
+    file *stems*. A state probe run against the bare fixture would therefore
+    produce a canary-free report whether or not any ceiling was enforced —
+    vacuous in exactly the way ``_probe_state_read``'s docstring warns about,
+    and the reason this helper exists rather than the probe simply calling the
+    tool.
+
+    So the probe adds a carrier the report does render: a ``10-Liminal/Unnamed``
+    note whose file stem *is* the sentinel, one per tier. The ``open`` one is
+    the positive control — the render probe's own test asserts it is present in
+    the same bytes, so a gate broken in the drop-everything direction cannot
+    pass by writing an empty report.
+
+    ``00-Creek-Meta`` is created for the same reason ``_probe_report`` creates
+    it: ``canary_vault`` is a bare fragment vault and the MCP audit log writes
+    there.
+
+    Args:
+        vault: The seeded canary vault, mutated in place.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    unnamed = vault / "10-Liminal" / "Unnamed"
+    unnamed.mkdir(parents=True, exist_ok=True)
+    for canary, tier in (
+        (_RUNTIME_OPEN_CANARY, "open"),
+        (_RUNTIME_INTIMATE_CANARY, "intimate"),
+    ):
+        stem = f"unnamed-{canary}"
+        metadata: dict[str, Any] = {
+            "type": "fragment",
+            "id": stem,
+            "title": stem,
+            "created": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+            "ingested": datetime(2026, 5, 1, tzinfo=UTC).isoformat(),
+            "source": {"platform": "journal", "author": "self"},
+            "frequency": {"primary": "unclassified", "secondary": []},
+            "privacy_tier": tier,
+        }
+        (unnamed / f"{stem}.md").write_text(
+            frontmatter.dumps(frontmatter.Post(content="unnamed body", **metadata)),
+            encoding="utf-8",
+        )
+
+
+def _probe_state_render(vault: Path) -> dict[str, Any]:
+    """Call ``creek.state.render`` at the open ceiling over the canary vault.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    _seed_state_carriers(vault)
+    return state_render_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _probe_state_read(vault: Path) -> dict[str, Any]:
+    """Render at ``ceiling=all`` first, *then* read at the open ceiling.
+
+    The render is not setup convenience — it is what makes this probe mean
+    anything. ``canary_vault`` holds no ``00-Creek-Meta/State/latest.md``, so a
+    bare ``state_read_tool`` call would return ``status="empty"`` with an empty
+    ``content``, and the shared canary assertion would pass on a vault where
+    there was never anything to leak. Rendering at ``ceiling=all`` first puts
+    the intimate canary genuinely into the artifact the read then addresses, so
+    a missing gate produces a real leak rather than a vacuous pass.
+
+    :func:`_seed_state_carriers` is the other half of that: without it the
+    ``ceiling=all`` render would itself be canary-free, because the state
+    report renders none of the three places ``canary_vault`` hides a sentinel.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    _seed_state_carriers(vault)
+    state_render_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.ALL)
+    return state_read_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
 _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.wheel": _probe_wheel,
     "creek.mine": _probe_mine,
     "creek.reflect": _probe_reflect,
     "creek.compile": _probe_compile,
     "creek.report": _probe_report,
+    "creek.state.render": _probe_state_render,
+    "creek.state.read": _probe_state_read,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -1667,3 +1784,92 @@ def test_compile_probe_refuses_rather_than_merely_staying_quiet(
     assert response["status"] == "refused"
     assert response["reason"] == _ABOVE_CEILING_REASON
     assert response["tier_ceiling"] == TierCeiling.OPEN.value
+
+
+def test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes(
+    canary_vault: Path,
+) -> None:
+    """``creek.state.render``'s leak is the files it writes, not the dict it returns.
+
+    The shared assertion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling`` is
+    **not the evidence for this tool**. ``state_render_tool``'s envelope
+    happens to echo ``content`` today, so that assertion is not vacuous the way
+    ``creek.report``'s was — but it is contingent on a response shape, and a
+    change that dropped ``content`` (to keep the envelope small, say) would
+    silently turn it vacuous while the artifact on disk kept leaking. For a
+    write-side surface the durable evidence is the bytes on disk, and #969
+    reproduced three separate leaks in exactly those bytes.
+
+    Both artifacts are asserted, because they are two independent write paths:
+    the ISO-week file that ``write()`` renders, and ``latest.md`` — a symlink
+    where the filesystem allows one and an independent byte copy where it does
+    not, which is the file ``creek.state.read``, ``creek state-budget`` and
+    every documented session-start flow actually open.
+
+    The ``open`` canary is asserted *present* in the same bytes as the positive
+    control, so the tool cannot pass by writing an empty report — which a gate
+    broken in the drop-everything direction would do: leak-free, and useless.
+    """
+    response = _probe_state_render(canary_vault)
+    assert response["status"] == "ok"
+
+    state_dir = canary_vault / "00-Creek-Meta" / "State"
+    week_files = [p for p in sorted(state_dir.glob("*.md")) if p.name != "latest.md"]
+    assert len(week_files) == 1, (
+        f"expected exactly one ISO-week report under {state_dir}, found "
+        f"{[p.name for p in week_files]}"
+    )
+    week = week_files[0].read_text(encoding="utf-8")
+    latest = (state_dir / "latest.md").read_text(encoding="utf-8")
+
+    assert _RUNTIME_INTIMATE_CANARY not in week, (
+        "creek.state.render wrote an intimate fragment's canary into "
+        f"{week_files[0].name} at privacy_tier_ceiling=open. This is the "
+        "artifact every later reader of the vault serves, and the response "
+        f"envelope is not evidence for a write-side surface.\n\n{week}"
+    )
+    assert _RUNTIME_INTIMATE_CANARY not in latest, (
+        "creek.state.render wrote an intimate fragment's canary into "
+        "00-Creek-Meta/State/latest.md at privacy_tier_ceiling=open. This is "
+        "the documented session-start context: CrawDad, /creek and "
+        f"creek.state.read all read this file.\n\n{latest}"
+    )
+    assert _RUNTIME_OPEN_CANARY in week, (
+        "creek.state.render wrote a report with no admitted content in it, so "
+        f"the exclusion assertions above are vacuous.\n\n{week}"
+    )
+
+
+def test_state_read_probe_refuses_rather_than_merely_staying_quiet(
+    canary_vault: Path,
+) -> None:
+    """``creek.state.read`` *refuses* an above-ceiling artifact (#969).
+
+    Absence of the canary is necessary but not sufficient, the same argument
+    reflect's and compile's probes make. ``state_read_tool`` has a second
+    quiet answer — ``status="empty"`` for a vault with no rendered report — and
+    a change that stopped resolving ``latest.md`` at all would satisfy a bare
+    canary sweep while proving nothing about the ceiling. So the refusal is
+    what is asserted, and the reason is pinned to
+    :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON` rather than to
+    ``status`` alone.
+
+    The reason is deliberately the *generic* one, shared with every other
+    above-ceiling refusal on the surface, and it names no tier. A distinguishable
+    "this report predates the stamp" reason would itself be an oracle for
+    whether the vault holds above-ceiling content.
+    """
+    response = _probe_state_read(canary_vault)
+    assert response["status"] == "refused"
+    assert response["reason"] == GENERIC_ABOVE_CEILING_REASON
+    assert response["tier_ceiling"] == TierCeiling.OPEN.value
+    assert response == refusal_response(
+        tool="creek.state.read",
+        ceiling=TierCeiling.OPEN,
+        reason=GENERIC_ABOVE_CEILING_REASON,
+    ), (
+        "creek.state.read's refusal carries keys beyond the canonical four. "
+        "Every extra key on a refusal is derived from content the caller was "
+        f"not admitted to.\n\n{response}"
+    )

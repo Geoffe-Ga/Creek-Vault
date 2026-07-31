@@ -1635,6 +1635,7 @@ def phase_filtered_seeds(
     *,
     n: int = DEFAULT_PHASE_FILTERED_SEEDS,
     miner: IdeaMiner | None = None,
+    snapshot: MiningSnapshot | None = None,
 ) -> list[IdeaSeed]:
     """Return up to *n* :class:`IdeaSeed` objects filtered for *phase*.
 
@@ -1653,6 +1654,22 @@ def phase_filtered_seeds(
             zero.
         miner: Optional pre-configured :class:`IdeaMiner`. Defaults to
             a fresh instance with library defaults.
+        snapshot: Optional pre-loaded :class:`MiningSnapshot`, forwarded
+            verbatim to :meth:`IdeaMiner.mine_all`, which already accepts
+            one. ``None`` (the default) leaves the miner to load its own, so
+            no existing caller's behaviour changes.
+
+            ``creek state`` supplies a snapshot it has narrowed to the
+            threads and eddies its tier ceiling admitted (#969). That
+            narrowing cannot be made here, or in
+            :func:`_load_mining_snapshot`: :class:`~creek.models.Thread` and
+            :class:`~creek.models.Eddy` carry no ``privacy_tier`` field, so a
+            raw-frontmatter gate on ``02-Threads`` / ``03-Eddies`` would have
+            no evidence to read and would fail closed on *every* thread and
+            eddy — silently deleting the thread-terminus and liminal-cross-
+            eddy strategies for every ``creek mine`` caller below
+            ``ceiling=intimate``. A caller that can derive those tiers
+            passes the result in; this module keeps its own behaviour.
 
     Returns:
         Up to *n* seeds ordered by descending score, then strategy, then
@@ -1666,7 +1683,11 @@ def phase_filtered_seeds(
     except ValueError:
         current_phase = Phase.UNCLASSIFIED
     active_miner = miner if miner is not None else IdeaMiner()
-    all_seeds = active_miner.mine_all(vault_path, current_phase=current_phase)
+    all_seeds = active_miner.mine_all(
+        vault_path,
+        current_phase=current_phase,
+        snapshot=snapshot,
+    )
     allowed = _PHASE_AWARE_STRATEGIES.get(phase_value)
     filtered = (
         all_seeds

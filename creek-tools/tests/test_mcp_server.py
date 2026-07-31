@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -287,8 +288,19 @@ def test_purge_tools_require_auth_token_parameter(vault: Path) -> None:
 
 
 def test_call_tool_state_read_through_mcp(vault: Path) -> None:
-    """End-to-end: ``call_tool("creek.state.read")`` returns the report bytes."""
+    """End-to-end: ``call_tool("creek.state.read")`` returns the report bytes.
+
+    The fixture carries the ``privacy_tier: open`` stamp that
+    ``StateReportGenerator.write`` writes since #969. Only the *fixture*
+    changed: every assertion below is the one this test has always made. An
+    unstamped report now reads as ``intimate`` — ``raw_privacy_tier`` fails
+    closed on a missing key, which is an accurate statement about bytes that
+    were rendered with no ceiling at all — so leaving the fixture unstamped
+    would have quietly turned this end-to-end read-path test into a second copy
+    of the refusal test below.
+    """
     (vault / "00-Creek-Meta" / "State" / "latest.md").write_text(
+        "---\ntype: state-report\nprivacy_tier: open\ntier_ceiling: open\n---\n\n"
         "# Audit\n\nhello\n",
         encoding="utf-8",
     )
@@ -303,6 +315,32 @@ def test_call_tool_state_read_through_mcp(vault: Path) -> None:
     assert structured["status"] == "ok"
     assert structured["tool"] == "creek.state.read"
     assert "Audit" in structured["content"]  # type: ignore[operator]
+
+
+def test_call_tool_state_read_refuses_a_legacy_report_through_mcp(vault: Path) -> None:
+    """The #969 fail-closed path is reachable end to end, not just in-process.
+
+    Added alongside the test above rather than replacing its coverage: the
+    stamped-``open`` fixture there only means something if an *unstamped* report
+    is not also served. Pinning both halves on the real ``call_tool`` boundary
+    is what proves the refusal survives MCP's response serialisation — a
+    refusal that only exists inside ``state_read_tool`` would be no gate at all
+    if the transport layer re-shaped it.
+    """
+    (vault / "00-Creek-Meta" / "State" / "latest.md").write_text(
+        "# Audit\n\nhello\n",
+        encoding="utf-8",
+    )
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool("creek.state.read", {"privacy_tier_ceiling": "open"}),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "refused"
+    assert "hello" not in json.dumps(structured, default=str)
 
 
 def test_call_tool_state_render_through_mcp(vault: Path) -> None:
