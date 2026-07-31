@@ -3208,6 +3208,16 @@ def report(
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     override = _parse_include_tier(include_tier)
+    # NB (#968): this audits the *flag*, not the effective ceiling, so a bare
+    # ``creek report`` — which now scans unfiltered — writes no privacy-override
+    # entry while a typed ``--include-tier open``, the narrowest scan there is,
+    # writes one. ``report``'s inverted polarity is what makes the shared
+    # ``override_elevates`` helper read backwards here. Deliberately left alone
+    # in this change and tracked separately: auditing the resolved ceiling here
+    # fires before ``--type`` is validated, turning the #716 unknown-type exit-2
+    # into an OSError on an unwritable vault path
+    # (``tests/test_cli.py::test_report_command``), so the fix is a reordering
+    # plus an audit-volume decision, not a one-line swap.
     _audit_privacy_override_if_needed(
         vault_path=vault_path,
         command=f"report.{type}" if type else "report",

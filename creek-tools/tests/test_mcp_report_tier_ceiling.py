@@ -1322,6 +1322,27 @@ def test_raw_and_model_tier_readers_agree_on_every_fragment(
             PrivacyTier.INTIMATE,
             id="unrecognised",
         ),
+        # YAML front matter is operator-editable, so the value need not be a
+        # string at all. These rows exist because the implementation reaches
+        # the enum through ``PrivacyTier(str(value))``: dropping that ``str()``
+        # wrap would still raise for a list and a dict, but the row that really
+        # bites is ``["open"]`` — a one-character YAML slip (``privacy_tier:``
+        # followed by an indented ``- open``) which must fail closed rather
+        # than be talked into ``open`` by some future normalisation.
+        pytest.param({"privacy_tier": ["open"]}, PrivacyTier.INTIMATE, id="list"),
+        pytest.param(
+            {"privacy_tier": {"tier": "open"}},
+            PrivacyTier.INTIMATE,
+            id="mapping",
+        ),
+        pytest.param({"privacy_tier": 0}, PrivacyTier.INTIMATE, id="int"),
+        pytest.param({"privacy_tier": False}, PrivacyTier.INTIMATE, id="bool"),
+        # Casing and whitespace are not silently repaired. ``creek classify``
+        # writes the canonical lowercase value; anything else is a note nobody
+        # can vouch for, and guessing what an operator meant is how a gate
+        # becomes negotiable.
+        pytest.param({"privacy_tier": "OPEN"}, PrivacyTier.INTIMATE, id="uppercase"),
+        pytest.param({"privacy_tier": " open"}, PrivacyTier.INTIMATE, id="padded"),
         pytest.param({"privacy_tier": "open"}, PrivacyTier.OPEN, id="open"),
         pytest.param(
             {"privacy_tier": "personal"},

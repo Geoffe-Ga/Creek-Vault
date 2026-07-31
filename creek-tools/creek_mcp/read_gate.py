@@ -312,7 +312,17 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "The checks read fragment frontmatter (paradox, unnamed and "
             "orphan-compiled scan 01-Fragments), never bodies; the MCP "
             "response returns only check names, count-shaped summaries and "
-            "len(findings). Titles live in findings, which is never returned."
+            "len(findings). Titles live in findings, which is never returned. "
+            "The posture is about the *response* only: the lint run also "
+            "writes a markdown report under 00-Creek-Meta/Processing-Log/ "
+            "that does embed above-ceiling titles and tag names, and the "
+            "tags check deliberately surveys the whole vault "
+            "(creek/lint/checks/tags.py passes PrivacyTierOverride.ALL) so it "
+            "cannot report 'no orphan tags' about a vault that has them. That "
+            "artifact is unreachable through MCP today, which is the same "
+            "argument #968 disproved for creek.report's Tag-Garden.md — it "
+            "holds here only while nothing serves Processing-Log/ back, so "
+            "read it against #969's state-artifact gap rather than alone."
         ),
     ),
     "creek.link": ToolPosture(
