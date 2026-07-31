@@ -86,6 +86,7 @@ from typing import TYPE_CHECKING, Any, cast
 import frontmatter
 import pytest
 
+from creek.config import CreekConfig
 from creek.models import PrivacyTier
 from creek_mcp.read_gate import (
     CANONICAL_GATE_PRIMITIVES,
@@ -100,6 +101,7 @@ from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.journal import journal_ingest_tool
 from creek_mcp.tools.mine import mine_tool
+from creek_mcp.tools.redact import _OUT_OF_SCOPE_REASON, redact_scan_tool
 from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
 from creek_mcp.tools.state import state_render_tool
@@ -176,17 +178,32 @@ _PINNED_GATE_ROWS = [
     # the behaviour from drifting apart — the property the deleted
     # ``test_journal_is_pinned_as_no_unsupplied_read`` used to hold.
     ("creek.journal", "creek_mcp.tools.journal", "refuse_above_ceiling"),
+    # #972 closed the redact gap, and this row is a re-point of the same kind
+    # #968/#969/#970 made. The gap entry it replaces was recorded as
+    # CALLER_NAMED_PATHS until the #932 review: the caller *does* name the
+    # path, which was true and insufficient, because ``resolve_within_vault``
+    # confines that path to the whole vault and a finding names the file it
+    # came from — and Creek fragment filenames are slugified titles, so an
+    # open-ceiling caller aimed at 01-Fragments read intimate titles off the
+    # response.
+    #
+    # It closed by **scope** plus an as-scanned path renderer, not by adopting
+    # either canonical primitive, so layer (e) has nothing to say about it and
+    # layers (c)/(f) carry the weight. ``_refuse_outside_scan_scope`` admits
+    # the FEAT-027 staging subtree at every ceiling and ranks every other
+    # in-vault target as intimate, because the scan is a regex pass over bytes
+    # that reads no per-file tiers and therefore has nothing to rank a
+    # fragment *with*. ``refuse_above_ceiling`` was deliberately NOT adopted
+    # for exactly that reason: it would carry GENERIC_ABOVE_CEILING_REASON —
+    # "resolved content exceeds the declared tier ceiling" — which claims the
+    # tool ranked content it never opened, and tells a CrawDad operator
+    # nothing about the one thing they can act on, which is where they pointed
+    # the scan. Same call #968 made for creek.report, one step further out.
+    ("creek.redact.scan", "creek_mcp.tools.redact", "_refuse_outside_scan_scope"),
 ]
 
 _PINNED_GAPS = {
     "creek.skills.refresh": 971,
-    # Recorded as CALLER_NAMED_PATHS until the #932 Gate-2.5 review. The name
-    # was accurate — the caller does name the path — but the confinement is to
-    # the whole vault, not the FEAT-027 staging subtree, so an open-ceiling
-    # caller aimed at 01-Fragments gets back intimate fragments' filenames,
-    # which are slugified titles. Pinned so the posture cannot drift back to a
-    # reassuring label while the behaviour is unchanged.
-    "creek.redact.scan": 972,
 }
 
 _PINNED_AUTH_TOKEN_TOOLS = [
@@ -384,18 +401,29 @@ def _write_fragment(
     body: str,
     privacy_tier: str,
     tags: list[str] | None = None,
+    file_stem: str | None = None,
 ) -> Path:
     """Write one classified fragment under ``01-Fragments/Notes``.
 
     Args:
         vault: Vault root.
-        frag_id: Fragment id, also used as the file stem.
+        frag_id: Fragment id, and by default the file stem too.
         title: Fragment title — what a personal-tier summary is built from.
         body: Markdown body (a canary string in these tests).
         privacy_tier: The fragment's ``privacy_tier`` front-matter value.
         tags: Optional Obsidian tags. ``None`` — the default — omits the key
             entirely rather than writing an empty list, so front matter written
             by the callers that predate layer (f) is byte-identical to before.
+        file_stem: Filename stem, when it must differ from *frag_id*. Added for
+            :func:`_seed_redact_canaries`, whose whole point is a sentinel that
+            lives in the **filename** — Creek fragment filenames are slugified
+            titles, and ``creek.redact.scan`` reports the file a finding came
+            from. Defaults to *frag_id*, so every caller that predates it
+            writes byte-identical front matter to the same path as before. The
+            two are kept separable rather than folded together because a
+            canary in an *id* would be echoed back legitimately by
+            ``creek.reflect`` and ``creek.compile``, which are handed the id by
+            the caller — see :data:`_RUNTIME_INTIMATE_ID`.
 
     Returns:
         The path the fragment was written to.
@@ -413,7 +441,7 @@ def _write_fragment(
     }
     if tags is not None:
         metadata["tags"] = tags
-    target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
+    target = vault / "01-Fragments" / "Notes" / f"{file_stem or frag_id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
         frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
@@ -1593,6 +1621,99 @@ def _probe_journal(vault: Path) -> dict[str, Any]:
     return _journal_overwrite_at_open(vault)
 
 
+_REDACT_PII_LINE = "Reach me at someone@example.com any time."
+"""One real ``email`` match, so a redact scan of the file yields findings.
+
+``creek.redact.scan`` reports nothing about a file it finds nothing in, so a
+carrier with no PII in it would never appear in the response at all and the
+canary assertions below would hold over an empty findings list.
+"""
+
+_REDACT_SCAN_TARGET = "01-Fragments"
+"""The out-of-scope subtree ``_probe_redact_scan`` aims at."""
+
+_REDACT_STAGING_TARGET = "00-Creek-Meta/Inbound"
+"""The FEAT-027 staging subtree, admitted at every ceiling."""
+
+
+def _seed_redact_canaries(vault: Path) -> None:
+    """Give the redact probe carriers whose sentinels live in **filenames**.
+
+    ``canary_vault`` is structurally blind to this leak class, in exactly the
+    way :func:`_seed_state_carriers`' docstring warns about. Two independent
+    reasons, and either one alone would make the probe vacuous:
+
+    * The fixture's file stems come from ``frag_id``
+      (``frag-runtime-intimate``), and the sentinels live in the ``title``,
+      the body and the ``tags``. ``creek.redact.scan`` returns none of those
+      three — it returns the *path* of each file a pattern matched in, plus a
+      line number and a salted hash — so no canary is anywhere it could
+      surface.
+    * The fixture's fragments carry no PII, so the scanner matches nothing in
+      them and reports them not at all.
+
+    Run the probe over the bare fixture and it comes back canary-free whether
+    or not any gate exists, which is a green layer (f) that proves nothing.
+
+    So this seeds two carriers of the shape the tool actually reports. (a) An
+    ``intimate`` fragment whose **file stem** carries
+    :data:`_RUNTIME_INTIMATE_CANARY` and whose body carries a real email
+    match — the thing an ``open``-ceiling caller must not be able to name,
+    and a faithful model of the real leak, since Creek fragment filenames are
+    slugified titles. (b) A staged file under ``00-Creek-Meta/Inbound/`` whose
+    file stem carries :data:`_RUNTIME_OPEN_CANARY` and whose body carries the
+    same match — the positive control, asserted *present* by the probe's own
+    test so a gate broken in the refuse-everything direction cannot pass by
+    returning nothing.
+
+    Both bodies are deliberately canary-free: the scan never returns matched
+    text, so a sentinel in a body could not surface even through a completely
+    ungated tool, and its absence from the response would be evidence about
+    nothing.
+
+    Args:
+        vault: The seeded canary vault, mutated in place.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-redact-intimate",
+        title="Intimate redact carrier",
+        body=_REDACT_PII_LINE,
+        privacy_tier="intimate",
+        file_stem=f"redact-carrier-{_RUNTIME_INTIMATE_CANARY}",
+    )
+    staged = vault / "00-Creek-Meta" / "Inbound" / "ch1"
+    staged.mkdir(parents=True, exist_ok=True)
+    (staged / f"attachment-{_RUNTIME_OPEN_CANARY}.md").write_text(
+        f"{_REDACT_PII_LINE}\n",
+        encoding="utf-8",
+    )
+
+
+def _probe_redact_scan(vault: Path) -> dict[str, Any]:
+    """Aim ``creek.redact.scan`` at ``01-Fragments`` from the open ceiling.
+
+    The scope gate answers above ``load_config()`` — and above the existence
+    check, so the refusal cannot be used as an existence oracle over slugified
+    filenames — which is what keeps layer (f) a unit test: no config file, no
+    provider, no skills tree. The audit log is appended before the gate, by
+    design, and creates its own parent directory, so the bare fixture needs no
+    ``00-Creek-Meta`` of its own.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    _seed_redact_canaries(vault)
+    return redact_scan_tool(
+        vault_path=vault,
+        input_path=_REDACT_SCAN_TARGET,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
 def _fragment_bytes(vault: Path) -> dict[Path, bytes]:
     """Return every fragment file under ``01-Fragments`` mapped to its bytes.
 
@@ -1619,6 +1740,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.state.render": _probe_state_render,
     "creek.state.read": _probe_state_read,
     "creek.journal": _probe_journal,
+    "creek.redact.scan": _probe_redact_scan,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -2070,3 +2192,104 @@ def test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched(
         "extra key is derived from a fragment the caller was not admitted to — "
         f"including the id it resolved.\n\n{response}"
     )
+
+
+def test_redact_scan_probe_refuses_and_is_not_vacuous(
+    canary_vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek.redact.scan``'s leak *is* its response, unlike its neighbours (#972).
+
+    Worth stating plainly, because the three tests above it all exist to say
+    the opposite. ``creek.report``'s and ``creek.state.render``'s evidence is
+    the artifact they write, and ``creek.journal``'s is the fragment bytes it
+    overwrites; for all three, the shared assertion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling``
+    passes vacuously or contingently. Here the artifact and the envelope are
+    the same object: the tool's entire output is a list of the files it
+    matched in, and CrawDad posts ``report_markdown`` straight into a Discord
+    channel. So the shared layer-(f) assertion is genuinely load-bearing for
+    this tool — **provided** the seeded carrier puts a sentinel somewhere the
+    response can reach, which is why :func:`_seed_redact_canaries` puts it in
+    a filename rather than in a title, a tag or a body.
+
+    Four things are pinned, and the middle two are the ones that make the
+    first mean anything:
+
+    (a) The open-ceiling probe refuses, with the reason pinned to the module's
+        own ``_OUT_OF_SCOPE_REASON``. A bare ``status == "refused"`` would
+        also pass if the tool merely stopped resolving paths — it has a
+        "not found" refusal too, and at ``ceiling=intimate``/``all`` an
+        "outside the vault" one as well, and neither would say anything about
+        scope. Below that ceiling those two collapse into this same fixed
+        string on purpose (the Gate-2.5 review's M1: a distinguishable
+        off-vault message is an oracle for "there is an outward symlink at
+        exactly this path"), which is what makes the reason pin here a
+        statement about scope rather than about resolution.
+    (b) The *same* ``01-Fragments`` scan at ``ceiling=all`` returns
+        ``status="ok"`` and its serialised response contains the intimate
+        canary. This is the sharpest anti-vacuity control available anywhere
+        in layer (f): it proves the sentinel was genuinely reachable through
+        this exact call, so the open refusal is what withheld it rather than a
+        fixture that never carried it.
+    (c) A scan of ``00-Creek-Meta/Inbound`` at ``ceiling=open`` still returns
+        findings naming the staged canary. FEAT-027 is the reason this tool
+        exists; CrawDad calls it at the channel's configured ceiling —
+        ``personal`` by default, ``open`` where a channel is mapped to it —
+        so admission has to hold at the lowest of them, and a scope gate that
+        refused everything would satisfy (a) perfectly while breaking the only
+        production caller.
+    (d) The vault root appears in none of the three responses — the second
+        half of #972, where ``report_markdown`` rendered absolute paths and
+        leaked the operator's home directory alongside the filename.
+
+    ``load_config`` is stubbed for the admitted calls; the refused one returns
+    above it.
+    """
+    monkeypatch.setattr(
+        "creek_mcp.tools.redact.load_config",
+        lambda: CreekConfig(),
+    )
+    vault_root = str(canary_vault.resolve())
+
+    refused = _probe_redact_scan(canary_vault)
+    assert refused["status"] == "refused"
+    assert refused["reason"] == _OUT_OF_SCOPE_REASON, (
+        "creek.redact.scan refused for some reason other than scope, so this "
+        "probe is evidence that the tool stopped working rather than that it "
+        f"started enforcing anything.\n\n{refused}"
+    )
+    assert refused["tier_ceiling"] == TierCeiling.OPEN.value
+
+    admitted = redact_scan_tool(
+        vault_path=canary_vault,
+        input_path=_REDACT_SCAN_TARGET,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert admitted["status"] == "ok"
+    assert _RUNTIME_INTIMATE_CANARY in json.dumps(admitted, default=str), (
+        "the same 01-Fragments scan at ceiling=all did not surface the "
+        "intimate carrier's filename, so the open-ceiling refusal above "
+        "withheld nothing and every canary assertion in layer (f) is vacuous "
+        f"for this tool.\n\n{admitted}"
+    )
+
+    staged = redact_scan_tool(
+        vault_path=canary_vault,
+        input_path=_REDACT_STAGING_TARGET,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+    assert staged["status"] == "ok"
+    assert _RUNTIME_OPEN_CANARY in json.dumps(staged, default=str), (
+        "the FEAT-027 staging subtree is no longer scannable at ceiling=open. "
+        "That is the one call CrawDad makes, and a scope gate that refuses it "
+        f"has replaced a disclosure with an outage.\n\n{staged}"
+    )
+
+    for response in (refused, admitted, staged):
+        assert vault_root not in json.dumps(response, default=str), (
+            "a creek.redact.scan response embeds the vault root, leaking the "
+            "operator's home directory into whatever CrawDad posts next.\n\n"
+            f"{response}"
+        )

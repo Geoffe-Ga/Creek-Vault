@@ -4,6 +4,8 @@
 
 > Redaction is one defensive layer; it does not encrypt the vault and it cannot detect every secret format. Read the [threat model](security/threat-model.md) for the full picture of what Creek does and does not protect against.
 
+This page covers the `creek redact` CLI. For the read-only MCP tool version of the scan (`creek.redact.scan`, the one CrawDad's Discord safety pass calls), see [mcp.md](mcp.md).
+
 ## The three modes
 
 `creek redact` is dispatched by exactly one of `--scan`, `--apply`, or `--review`. Mixing them is an error.
