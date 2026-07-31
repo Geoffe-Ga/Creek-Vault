@@ -148,6 +148,17 @@ check "optout wakes" "WATCH 103 optout" "$out"
 out="$(TOKENS="ready-unreviewed" run_watch 104)"
 check "ready-unreviewed wakes" "WATCH 104 ready-unreviewed" "$out"
 
+# changes-requested — a fresh non-LGTM verdict, i.e. Gate 4 FAILED (issue
+# #1097) — is deliberately NOT in IN_FLIGHT_TOKENS, so it falls out of the
+# in-flight set and becomes a prompt wake with no watcher change at all. This
+# pins the case observed live on PR #1095, where the old classifier called a
+# fresh COMMENTS verdict `awaiting-review` and the watcher slept its full
+# timeout past it.
+out="$(TOKENS="awaiting-review,changes-requested" run_watch 114)"
+check "changes-requested wakes promptly (outside the in-flight set)" \
+  "WATCH 114 changes-requested" "$out"
+check "changes-requested case polled exactly twice" "2" "$(polls 114)"
+
 # --- gone: a merged/closed PR ends the watch --------------------------------
 rc=0
 out="$(TOKENS="pending" STATES="OPEN,MERGED" run_watch 105)" || rc=$?

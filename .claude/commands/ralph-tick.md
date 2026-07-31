@@ -113,7 +113,7 @@ code** (`0`=green, `8`=pending, else=failed) and only honours an LGTM verdict
 posted **after** the PR's HEAD commit (stale-verdict guard):
 ```bash
 STATUS=$(scripts/ralph/pr-ready.sh "$PR_NUM") && RC=0 || RC=$?
-# ready | ready-unreviewed | behind | pending | ci-failed | awaiting-review | optout
+# ready | ready-unreviewed | behind | pending | ci-failed | changes-requested | awaiting-review | optout
 ```
 The exit code is captured explicitly (`RC`) — the helper now exits non-zero
 when it cannot classify a lane at all, and an unchecked `$STATUS` would just
@@ -199,8 +199,12 @@ Then act on `$STATUS`:
   deliberate: releasing it would discard work a human paused. The label
   already exists in this repo and `pick-next.sh` already excludes it at
   issue-pick time; this is the PR-side half.
-- **`pending`** / **`awaiting-review`** — CI is still running or no fresh LGTM
-  verdict exists yet. Leave the lane; its Step 5 wake (webhook subscription on
+- **`pending`** / **`awaiting-review`** — CI is still running (`pending`), or
+  no verdict for the current HEAD exists yet: none was ever posted, or the
+  latest one is stale — it predates the HEAD commit, LGTM or not
+  (`awaiting-review`). A **fresh non-LGTM** verdict is NOT this state — it
+  reads `changes-requested` (below) and is acted on, not waited on. Leave the
+  lane; its Step 5 wake (webhook subscription on
   remote, `watch-pr.sh` background watcher on local) fires when CI or the
   verdict changes. **Exception — missing review usually means a merge
   conflict:** if the verdict never arrives and the `claude-review` check is
@@ -212,6 +216,15 @@ Then act on `$STATUS`:
   conflict (`fleet.sh sync` → conflict-fix worker → push); the post-resolution
   push triggers the PR's real CI + review.
 - **`ci-failed`** — a check failed. Advance it via Step 2 (`ci-debugging`).
+- **`changes-requested`** — CI is green and a **fresh** verdict (posted after
+  the PR's HEAD commit) exists and is not `LGTM` — i.e. `CHANGES_REQUESTED` or
+  `COMMENTS`. This is **Gate 4 failed**, an actionable state, not a wait:
+  advance it via Step 2's `address-feedback` path **now**. (Precedence: the
+  verdict is only consulted once CI is green, so `pending`/`ci-failed` classify
+  exactly as before even when a verdict has already landed; a stale non-LGTM
+  still reads `awaiting-review` because the re-review is owed on the new HEAD;
+  and an unreadable verdict lookup fails closed — a tooling error or
+  `awaiting-review`, never this token.)
 - **`RC` non-zero (`$STATUS` empty)** — the helper hit a tooling error (which
   includes an UNDETERMINABLE `optout` label/body lookup — the helper fails
   closed rather than reading that as "no hold") and could not classify this
@@ -233,7 +246,8 @@ into that PR's worktree only if it needs a fix (re-attach a worktree with
 `scripts/ralph/fleet.sh assign "$N" "<slug>"` if reconcile removed it — `assign`
 reuses the existing branch):
 
-- **Gate 4 failed** (`CHANGES_REQUESTED`/`COMMENTS`): worker runs the
+- **Gate 4 failed** — `pr-ready.sh` printed **`changes-requested`** (a fresh
+  `CHANGES_REQUESTED`/`COMMENTS` verdict): worker runs the
   **`address-feedback`** flow in the worktree — triage, TDD fix loop dispatching
   the specialist that owns each comment, re-clear Gate 2 + Gate 2.5, push, reply,
   resolve threads.
