@@ -100,6 +100,7 @@ from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.reflect import reflect_tool
+from creek_mcp.tools.report import report_tool
 from creek_mcp.tools.wheel import wheel_tool
 
 if TYPE_CHECKING:
@@ -135,10 +136,16 @@ _PINNED_GATE_ROWS = [
     ("creek.mine", "creek_mcp.tools.mine", "to_privacy_override"),
     ("creek.draft", "creek_mcp.tools.draft", "to_privacy_override"),
     ("creek.author", "creek_mcp.tools.author", "to_privacy_override"),
+    # #968 closed the report gap. The entry is *re-pointed* at the gate that
+    # closed it rather than relabelled: report_tool now converts the ceiling
+    # with ``to_privacy_override`` and threads the result into all six
+    # generators, so the honest record is a GATED claim layers (c) and (e) can
+    # check — which is exactly what the failure message on
+    # ``test_pinned_gaps_keep_their_posture_and_issue`` asks for.
+    ("creek.report", "creek_mcp.tools.report", "to_privacy_override"),
 ]
 
 _PINNED_GAPS = {
-    "creek.report": 968,
     "creek.state.read": 969,
     "creek.state.render": 969,
     "creek.skills.refresh": 971,
@@ -1345,11 +1352,35 @@ def _probe_compile(vault: Path) -> dict[str, Any]:
     )
 
 
+def _probe_report(vault: Path) -> dict[str, Any]:
+    """Call ``creek.report`` (``tags``) at the open ceiling over the canary vault.
+
+    ``tags`` is the report type the #968 reproduction used and the only one that
+    reaches all five of ``TagGardenGenerator``'s scan directories.
+    ``generate_garden`` writes ``00-Creek-Meta/Tag-Garden.md`` without creating
+    its parent, and ``canary_vault`` is a bare fragment vault, so the probe
+    creates the meta folder first.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    return report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
 _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.wheel": _probe_wheel,
     "creek.mine": _probe_mine,
     "creek.reflect": _probe_reflect,
     "creek.compile": _probe_compile,
+    "creek.report": _probe_report,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -1518,6 +1549,58 @@ def test_wheel_probe_still_counts_the_fragment_it_is_admitted_to(
     assert response["status"] == "ok"
     assert response["total_classified"] == 1
     assert response["wheel"]["F1"]["count"] == 1
+
+
+def test_report_probe_leaves_no_canary_in_the_artifact_it_writes(
+    canary_vault: Path,
+) -> None:
+    """``creek.report``'s leak is the file it writes, not the dict it returns.
+
+    The shared assertion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling`` is
+    **structurally vacuous for this tool**. ``report_tool`` returns
+    ``report_paths`` and nothing else — never a tag, a title, or a body — so its
+    envelope is canary-free at ``ceiling=open`` whether or not the ceiling is
+    enforced, and it was canary-free for the whole life of #968. The envelope
+    check still earns its place as a tripwire against a future response shape
+    that *does* carry content, but it is not evidence about this gap.
+
+    The only evidence that means anything lives in the bytes of the artifacts
+    the call writes, and #968 reproduced against **two** of them, so both are
+    asserted: the regenerated ``Tag-Garden.md`` and the append-only
+    ``tag-history.json``, where a wrongly-admitted tag would persist across
+    every later run.
+
+    The ``open`` canary is asserted *present* as the positive control, so the
+    tool cannot pass by writing an empty garden — which a gate broken in the
+    drop-everything direction would do: leak-free, and useless.
+    """
+    response = _probe_report(canary_vault)
+    assert response["status"] == "ok"
+
+    garden_path = canary_vault / "00-Creek-Meta" / "Tag-Garden.md"
+    history_path = (
+        canary_vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
+    )
+    garden = garden_path.read_text(encoding="utf-8")
+    history = history_path.read_text(encoding="utf-8")
+
+    assert _RUNTIME_INTIMATE_CANARY not in garden, (
+        "creek.report distilled an intimate fragment's tag into "
+        f"00-Creek-Meta/Tag-Garden.md at privacy_tier_ceiling=open. The "
+        "response envelope was clean — it always is — so nothing above this "
+        f"line could have caught it.\n\n{garden}"
+    )
+    assert _RUNTIME_INTIMATE_CANARY not in history, (
+        "creek.report recorded an intimate fragment's tag in "
+        "00-Creek-Meta/Processing-Log/tag-history.json at "
+        "privacy_tier_ceiling=open. This file is append-only: an entry written "
+        f"at the wrong ceiling stays in the vault.\n\n{history}"
+    )
+    assert _RUNTIME_OPEN_CANARY in garden, (
+        "creek.report wrote a tag garden with no admitted tag in it, so the "
+        f"exclusion assertions above are vacuous.\n\n{garden}"
+    )
 
 
 def test_mine_probe_still_reaches_the_admitted_corpus(canary_vault: Path) -> None:
