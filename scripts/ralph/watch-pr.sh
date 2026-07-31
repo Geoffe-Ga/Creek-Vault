@@ -14,8 +14,9 @@
 # It polls `scripts/ralph/pr-ready.sh <PR>` (the single authoritative
 # classifier — never a rollup grep) every INTERVAL seconds and exits the moment
 # the token leaves the IN-FLIGHT set {pending, awaiting-review}; every other
-# token (ready, ready-unreviewed, behind, ci-failed, optout) is a state the
-# orchestrator acts on, so it is worth a wake. Output is exactly one line:
+# token (ready, ready-unreviewed, behind, ci-failed, changes-requested, optout)
+# is a state the orchestrator acts on, so it is worth a wake. Output is exactly
+# one line:
 #
 #   WATCH <PR> already-watching     another live watcher owns this PR (pidfile)
 #   WATCH <PR> <token>              the lane settled; <token> is pr-ready.sh's

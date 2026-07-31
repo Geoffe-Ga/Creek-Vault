@@ -8,8 +8,13 @@
 # verdict only counts when it is fresher than the PR's HEAD commit (stale-verdict
 # guard). We put a fake, arg-aware `gh` on PATH and assert every classification.
 #
-# Beyond that baseline, these tests pin five more dimensions:
+# Beyond that baseline, these tests pin six more dimensions:
 #
+#   verdict split  the four verdict states are distinct outcomes (issue #1097):
+#                  missing → awaiting-review, stale (LGTM or not) →
+#                  awaiting-review, fresh LGTM → ready, fresh non-LGTM →
+#                  changes-requested — with a malformed verdict answer failing
+#                  closed to awaiting-review, never to the dispatch token.
 #   opt-out        a `do-not-auto-merge` label on the PR — or on the LAST issue
 #                  its body links — parks the lane (`optout`), checked BEFORE CI
 #                  so a human hold is honoured even mid-run. An UNDETERMINABLE
@@ -219,9 +224,25 @@ check "green + CLEAN + STALE LGTM → awaiting-review" "awaiting-review" \
 check "green + CLEAN + no verdict → awaiting-review" "awaiting-review" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" run 100)"
 
-# --- fresh but non-LGTM verdict (e.g. changes requested) → awaiting-review --
-check "green + CLEAN + fresh non-LGTM → awaiting-review" "awaiting-review" \
+# --- the four verdict states are FOUR tokens, not two (issue #1097) ---------
+# `awaiting-review` used to swallow missing, stale AND fresh-non-LGTM verdicts,
+# so watch-pr.sh (whose in-flight set contains `awaiting-review`) could never
+# wake on the one Gate 4 outcome that needs the orchestrator soonest: a fresh
+# CHANGES_REQUESTED/COMMENTS. A fresh non-LGTM verdict is ACTIONABLE (Step 2,
+# address-feedback) and gets its own token; missing and stale stay "wait".
+check "green + CLEAN + fresh non-LGTM → changes-requested" "changes-requested" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" run 100)"
+
+# A STALE non-LGTM reviewed code that is no longer HEAD — the re-review is still
+# owed, so this is a wait, never a dispatch.
+check "green + CLEAN + STALE non-LGTM → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|false" run 100)"
+
+# Fail CLOSED on a malformed verdict answer: the second field must be exactly
+# jq's `true`/`false`. Garbage there must degrade to `awaiting-review` (wait),
+# never to `changes-requested` (dispatch a fix worker on an unreadable answer).
+check "malformed verdict flag → awaiting-review, never changes-requested" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|garbage" run 100)"
 
 # --- REAL jq: exercise the production verdict regex against real bodies ----
 # The verdict `claude-code-review.yml` posts is `## Verdict: <X>` at the END of a
@@ -238,10 +259,19 @@ if command -v jq >/dev/null 2>&1; then
        run 100)"
 
   # `**Verdict:** CHANGES_REQUESTED` whose prose mentions "LGTM" must NOT count as
-  # LGTM — the exact false-positive a whole-body match would cause.
-  check "real CHANGES_REQUESTED w/ 'LGTM' in prose → awaiting-review" "awaiting-review" \
+  # LGTM — the exact false-positive a whole-body match would cause. It is a real,
+  # fresh, non-LGTM verdict, so it classifies as actionable `changes-requested`.
+  check "real CHANGES_REQUESTED w/ 'LGTM' in prose → changes-requested" "changes-requested" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
        COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"Not ready for LGTM yet.\n\n**Verdict:** CHANGES_REQUESTED\n"}')" \
+       run 100)"
+
+  # The other non-LGTM verdict the reviewer posts. Observed live on PR #1095:
+  # a fresh `## Verdict: COMMENTS` + fully green CI sat unnoticed for the
+  # watcher's whole timeout because it classified as in-flight `awaiting-review`.
+  check "real ## Verdict: COMMENTS (fresh) → changes-requested" "changes-requested" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\nnits\n\n## Verdict: COMMENTS\n"}')" \
        run 100)"
 
   # No verdict-bearing comment at all → awaiting-review.
@@ -445,6 +475,12 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" \
 check "lazy compare: stale-verdict lane token" "awaiting-review" "$tok"
 probed "lazy compare: stale-verdict lane does not probe" "no" "$S_STALE"
 
+S_CR="$WORK/probe-changes-requested"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" \
+       BEHIND_BY=22 COMPARE_SENTINEL="$S_CR" run 100)" || tok="exit-$?"
+check "lazy compare: changes-requested lane token" "changes-requested" "$tok"
+probed "lazy compare: changes-requested lane does not probe" "no" "$S_CR"
+
 S_READY="$WORK/probe-ready"
 tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
        BEHIND_BY=0 COMPARE_SENTINEL="$S_READY" run 100)" || tok="exit-$?"
@@ -645,6 +681,16 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_B
        REVIEW_SENTINEL="$R_OPTOUT" run 100)" || tok="exit-$?"
 check "lazy review-gate: opt-out token" "optout" "$tok"
 probed "lazy review-gate: opt-out does not probe" "no" "$R_OPTOUT"
+
+# A fresh non-LGTM verdict on a bot PR: the verdict IS the review gate speaking,
+# so it outranks the ready-unreviewed shortcut — `changes-requested` without ever
+# paying for the rollup probe.
+R_CR="$WORK/review-changes-requested"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" BEHIND_BY=0 \
+       PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+       REVIEW_CONCLUSIONS="$SKIPPED" REVIEW_SENTINEL="$R_CR" run 100)" || tok="exit-$?"
+check "lazy review-gate: fresh non-LGTM token" "changes-requested" "$tok"
+probed "lazy review-gate: fresh non-LGTM does not probe" "no" "$R_CR"
 
 R_NOVERDICT="$WORK/review-noverdict"
 tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=0 \
