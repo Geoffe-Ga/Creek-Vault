@@ -34,17 +34,13 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
+from crawdad.discord_text import _MCP_UNAVAILABLE_REPLY
 from crawdad.mcp_client import MCPUnavailableError
 
 if TYPE_CHECKING:
     from crawdad.config import CrawDadConfig
 
 _LOGGER = logging.getLogger("crawdad.slash_commands")
-
-# The documented soft-error shown when the desk / creek-tools MCP surface is
-# unreachable. Mirrors ``crawdad.loop._MCP_UNAVAILABLE_REPLY``
-# so the author routes degrade with the same wording as the agent loop.
-_MCP_UNAVAILABLE_REPLY = "creek-tools is unreachable; try again in a moment."
 
 # A callable that drives one turn of the FEAT-015 loop and returns the
 # user-facing reply string. The CLI builds one by closing over the

@@ -37,6 +37,10 @@ from crawdad.consent import (
     classify_followup_message,
     format_type_question,
 )
+from crawdad.discord_text import (
+    _MCP_UNAVAILABLE_REPLY,
+    _truncate_for_discord,
+)
 from crawdad.history import ConversationHistory
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPUnavailableError
@@ -61,9 +65,6 @@ _LOGGER = logging.getLogger("crawdad.bot")
 _STATE_UNAVAILABLE_REPLY = (
     "no audit report yet — run `creek state` in the vault and try again."
 )
-_MCP_UNAVAILABLE_REPLY = "creek-tools is unreachable; try again in a moment."
-_DISCORD_REPLY_LIMIT = 1900
-
 # FEAT-027: name of the MCP tool the bot invokes for the safety pass on
 # Discord attachments. Sourced from
 # ``creek_mcp.tools.redact.TOOL_NAME``; duplicated here so the bot has
@@ -729,13 +730,6 @@ def _resolve_skills(
     if registry is not None:
         return registry.stack
     return fallback or _empty_skills()
-
-
-def _truncate_for_discord(text: str) -> str:
-    """Cap reply at Discord's soft limit so very long composer outputs land."""
-    if len(text) <= _DISCORD_REPLY_LIMIT:
-        return text
-    return text[: _DISCORD_REPLY_LIMIT - 3] + "..."
 
 
 def render_state_unavailable_reply(error: StateUnavailableError) -> str:

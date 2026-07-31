@@ -9,6 +9,7 @@ import pytest
 
 from crawdad import cli
 from crawdad.config import CrawDadConfig
+from crawdad.discord_text import _DISCORD_REPLY_LIMIT
 
 
 @pytest.fixture
@@ -352,7 +353,7 @@ async def test_loop_runner_truncates_long_replies(
     assert runner is not None
     reply = await runner("anything")
     assert len(reply) < len(long_reply)
-    assert len(reply) <= cli._DISCORD_REPLY_LIMIT
+    assert len(reply) <= _DISCORD_REPLY_LIMIT
     assert reply.endswith("...")
 
 
@@ -716,7 +717,7 @@ async def test_build_workflow_runner_returns_composed_reply(
     registry = WorkflowRegistry(vault_path=tmp_path)
 
     async def _ok(**_kwargs: Any) -> str:
-        return "x" * (cli._DISCORD_REPLY_LIMIT + 50)
+        return "x" * (_DISCORD_REPLY_LIMIT + 50)
 
     monkeypatch.setattr(cli, "run_workflow_and_compose", _ok)
 
@@ -730,4 +731,4 @@ async def test_build_workflow_runner_returns_composed_reply(
     assert runner is not None
     reply = await runner("wavelength-checkin", {})
     assert reply.endswith("...")
-    assert len(reply) <= cli._DISCORD_REPLY_LIMIT
+    assert len(reply) <= _DISCORD_REPLY_LIMIT

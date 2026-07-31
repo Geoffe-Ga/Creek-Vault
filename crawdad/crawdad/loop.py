@@ -63,6 +63,7 @@ from pydantic import BaseModel, ConfigDict
 
 from crawdad.composer import ComposerFailureError, mentions_paradox
 from crawdad.config import MAX_LOOP_ROUNDS
+from crawdad.discord_text import _MCP_UNAVAILABLE_REPLY
 from crawdad.dispatcher import (
     IntentDispatcher,
     ToolResult,
@@ -93,7 +94,6 @@ _UNKNOWN_INTENT_REPLY = (
     "I tried to use a tool I don't have. Try a different question, or check "
     "`creek-tools` for the available tool surface."
 )
-_MCP_UNAVAILABLE_REPLY = "creek-tools is unreachable; try again in a moment."
 _COMPOSER_FAILURE_REPLY = (
     "I'm having trouble composing right now — try again in a moment."
 )
