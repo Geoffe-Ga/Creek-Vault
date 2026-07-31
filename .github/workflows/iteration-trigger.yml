@@ -84,8 +84,11 @@ jobs:
           BODY=$(jq -r '.body' <<<"$CLAUDE")
 
           # Parse the verdict from that line only — grepping the whole body is
-          # unsafe (a COMMENTS rationale may itself mention "LGTM").
-          VLINE=$(grep -m1 -E '^## Verdict:' <<<"$BODY" || true)
+          # unsafe (a COMMENTS rationale may itself mention "LGTM"). When the
+          # body carries several verdict lines (the reviewer re-verdicted in
+          # one comment), the LAST is the final word — same contract as
+          # stats.py's normalize_verdict.
+          VLINE=$(grep -E '^## Verdict:' <<<"$BODY" | tail -n 1 || true)
           case "$VLINE" in
             *CHANGES_REQUESTED*) VERDICT='CHANGES REQUESTED' ;;
             *LGTM*)              VERDICT='LGTM' ;;
