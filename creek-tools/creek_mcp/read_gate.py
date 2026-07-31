@@ -36,12 +36,20 @@ of the primitives below inherits it:
    to key a model call.
 
 **Who calls these primitives, and why the rest still do not.**
-:func:`refuse_above_ceiling` has exactly one production caller:
-``creek_mcp.tools.state_read``, which adopted it in #969. That adoption is the
+:func:`refuse_above_ceiling` has two production callers.
+``creek_mcp.tools.state_read`` adopted it in #969, and that adoption is the
 shape the primitives were written for — the tool addresses a *single* cached
 artifact, so there is nothing to partially admit, and its refusal has no
 tool-specific story to tell. It gets the generic reason, the four-key payload
 and the no-tier-echo rule for free rather than re-deriving any of them.
+``creek_mcp.tools.journal`` adopted it in #970 on the same property one step
+further out: it is a *write* gate asking a read question. Its idempotent
+update-in-place would overwrite the one fragment an ``external_id`` resolves
+to, and the rule is that you may only overwrite what you could have read — so
+admission is decided by ``tier_allowed`` through this primitive, not by
+``write_tier_allowed``, which ranks the incoming entry and knows nothing about
+the fragment on disk. Caller-addressed and singular again: you cannot
+overwrite half a body, so there is nothing to partially admit.
 
 The other refusing tools are deliberately *not* retrofitted.
 ``creek.reflect`` and ``creek.compile`` keep their own refusal reasons and
@@ -159,8 +167,9 @@ class ToolPosture:
         gate_symbol: Name of the gate callable within *gate_module*. Set on
             ``GATED`` entries only.
         gap_issue: Issue tracking an unenforced ceiling — required on every
-            ``UNGATED_KNOWN_GAP`` entry, and also carried by ``creek.journal``
-            whose gap is on its update-in-place path rather than a read.
+            ``UNGATED_KNOWN_GAP`` entry, and set on nothing else. It was also
+            carried by ``creek.journal`` until #970 gated its update-in-place
+            path; that entry is now ``GATED`` and names its gate instead.
     """
 
     posture: ReadPosture
@@ -347,14 +356,44 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gap_issue=971,
     ),
     "creek.journal": ToolPosture(
-        posture=ReadPosture.NO_UNSUPPLIED_READ,
+        posture=ReadPosture.GATED,
         rationale=(
-            "The entry body is the caller's own, and write_tier_allowed gates "
-            "the tier it creates; but the idempotent update-in-place "
-            "overwrites the fragment an external_id already maps to without "
-            "consulting that fragment's tier (#970)."
+            "The entry body is the caller's own and write_tier_allowed gates "
+            "the tier it creates, but the idempotent update-in-place destroys "
+            "the fragment an external_id already maps to — so it refuses on "
+            "THAT fragment's current vault tier: you may only overwrite what "
+            "you could have read (#970). A write gate asking a read question, "
+            "hence refuse_above_ceiling (tier_allowed) rather than "
+            "write_tier_allowed; the target is caller-addressed and singular, "
+            "and you cannot overwrite half a body. Ordering is load-bearing: "
+            "the gate sits ABOVE _stage_entry, because the staged copy under "
+            "00-Creek-Meta/adepthood/journal/ has no escalate-only ratchet, so "
+            "a gate placed below staging would return a correct refusal over "
+            "an already-destroyed staged entry whose privacy_tier had been "
+            "rewritten downward. Two fail-closed rules, not one: no ledger "
+            "record at all passes content_tier=None and CREATES (creation must "
+            "keep working at every ceiling), while a ledger record whose "
+            "fragment does not resolve reduces max_source_tier([]) to intimate "
+            "and is refused — so any divergence from the writer's own id index "
+            "fails safe. Consequence to know: PurgeEngine leaves a dangling "
+            "ledger record (#1080), so a purged id is refused below "
+            "ceiling=intimate until it is re-sent by an admitted caller — a "
+            "LOCAL stdio caller only, since a remote consumer token is capped "
+            "at ceiling=personal and can never send ceiling=intimate/all "
+            "(#1082 tracks a possible content-hash carve-out for the "
+            "unchanged-resend case). Accepted residual: the refusal is an "
+            "existence-AND-rank oracle, matching reflect's own honesty "
+            "standard for its analogous oracle. No stronger than the "
+            "pre-existing action: created|updated bit on the existence "
+            "question those two share; the rank bit — 'above your ceiling' — "
+            "is new, and is the price of refusing at all. It is deliberately "
+            "blurred, not a clean tier read: every fail-closed unresolvable "
+            "case (purged, orphaned, schema-invalid, deleted out of band) "
+            "collapses into the identical refusal as a genuine above-ceiling "
+            "fragment, so refused means 'above your ceiling OR unresolvable'."
         ),
-        gap_issue=970,
+        gate_module="creek_mcp.tools.journal",
+        gate_symbol="refuse_above_ceiling",
     ),
     "creek.lint": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
