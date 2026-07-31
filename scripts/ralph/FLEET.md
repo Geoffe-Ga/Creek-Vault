@@ -176,13 +176,16 @@ rather than reading as "no hold."
 | `behind` | `LGTM` + green, but stale — `mergeStateStatus BEHIND`, or `CLEAN` with `behind_by > 0`. Sync (`fleet.sh sync`) and re-green. |
 | `pending` | CI still running, or no checks registered yet. Wait. |
 | `ci-failed` | A check failed or errored. Advance via `ci-debugging`. |
-| `awaiting-review` | CI green but no fresh `LGTM` verdict yet (missing, stale, or non-LGTM). Wait, or check for a hidden merge conflict masquerading as a missing review (see `ralph-tick.md` Step 1). |
+| `changes-requested` | CI green + a **fresh** verdict (posted after the HEAD commit) that is not `LGTM` — `CHANGES_REQUESTED` or `COMMENTS`. Gate 4 failed: advance via `address-feedback` (`ralph-tick.md` Step 2) now. A stale non-LGTM stays `awaiting-review`, and an unreadable verdict lookup fails closed (tooling error / `awaiting-review`) — never this token. |
+| `awaiting-review` | CI green but no verdict for the current HEAD yet — none posted, or only a stale one (it predates HEAD, LGTM or not). Wait, or check for a hidden merge conflict masquerading as a missing review (see `ralph-tick.md` Step 1). |
 | `optout` | `do-not-auto-merge` on the PR's own labels, or on the labels of the last issue it closes. Leave the lane **entirely** alone — no merge, no sync, no dispatch; a lane it already occupies stays occupied. |
 
 ## Tests
 
-Four offline suites cover the fleet, all run in CI by
-`.github/workflows/ralph-fleet-tests.yml` on any `scripts/ralph/**` change —
+Five offline suites cover the fleet, all run in CI by
+`.github/workflows/ralph-recap-tests.yml` ("Ralph Tooling Tests" — one
+workflow for everything under `scripts/ralph/`, shell and Python alike) on any
+`scripts/ralph/**` change —
 which also runs `shellcheck --severity=warning scripts/ralph/*.sh` first.
 (`creek-tools/scripts/lint-extended.sh` only shellchecks `scripts/*.sh`
 relative to `creek-tools/`, so before that step these files were linted by the
@@ -221,15 +224,23 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   next to a copy of the script under test) and `gh`, and exercises the local
   per-lane hot watcher: pidfile idempotence (`already-watching` on a live pid,
   takeover of a stale/garbage one, removal on exit), settling on the first
-  token outside `pending`/`awaiting-review`, `gone` on a merged/closed PR,
-  `timeout <last-token>` at the deadline, and that transient `pr-ready.sh` /
+  token outside `pending`/`awaiting-review` (including that `changes-requested`
+  falls out of the in-flight set and wakes promptly), `gone` on a merged/closed
+  PR, `timeout <last-token>` at the deadline, and that transient `pr-ready.sh` /
   `gh` failures never kill the watcher — every wait outcome exits 0.
+- `scripts/ralph/test_exec_bits.sh` asserts every `scripts/ralph/*.sh` is
+  committed mode `100755` per `git ls-files -s` — the INDEX mode, so a local
+  unstaged `chmod` can't fake it. These scripts are invoked by path
+  (`scripts/ralph/watch-pr.sh <PR>`, ralph-tick.md Step 5), and CI runs the
+  suites via `bash <file>`, so nothing else catches a script shipped `100644`
+  exiting 126 on every fresh clone (issue #1096).
 
 ```bash
 bash scripts/ralph/test_fleet.sh
 bash scripts/ralph/test_pick_next.sh
 bash scripts/ralph/test_pr_ready.sh
 bash scripts/ralph/test_watch_pr.sh
+bash scripts/ralph/test_exec_bits.sh
 ```
 
 ## Failure modes and how they're handled
