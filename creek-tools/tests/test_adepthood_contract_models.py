@@ -10,8 +10,11 @@ framework it picks without renegotiating a single field name.
 These tests *are* the contract, not a description of one. Twelve groups, each
 pinning a property the cross-repo consumer is entitled to rely on:
 
-1.  every model in :data:`~creek_mcp.api.models.CONTRACT_MODELS` accepts a
-    canonical happy payload and forbids unknown keys;
+1.  :data:`~creek_mcp.api.models.CONTRACT_MODELS` is total over the module's
+    live ``_WireModel`` subclasses -- checked by reflection, since every
+    fixture below is keyed off the registry and so cannot check it -- and
+    every model in it accepts a canonical happy payload and forbids unknown
+    keys;
 2.  every enum is *closed* -- membership is frozen, and the two enums that
     mirror a runtime constant (``NoteKind`` against
     ``reflect._ALLOWED_KINDS``, ``WireTierCeiling`` against
@@ -52,12 +55,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from creek.care.guardrail import CARE_SIGNAL
 from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
 from creek.models import PrivacyTier
 from creek_mcp import read_gate, server
+from creek_mcp.api import models as api_models
 from creek_mcp.api.bundle import (
     BUNDLE_DIR_NAME,
     CAPABILITIES,
@@ -414,6 +418,28 @@ def _api_sources() -> list[Path]:
     return sorted(API_PACKAGE.rglob("*.py"))
 
 
+def _wire_model_subclasses(
+    namespace: Mapping[str, object],
+) -> dict[str, type[BaseModel]]:
+    """Return every published wire model in *namespace*, keyed by class name.
+
+    Discovery walks the live objects in the namespace rather than
+    :data:`CONTRACT_MODELS`, which is the whole point: every other fixture in
+    this module (``HAPPY_PAYLOADS``, ``MODEL_NAMES``) is keyed off the registry,
+    so the registry cannot be checked for completeness against itself.
+
+    The base class is excluded by identity, not by a name convention, and no
+    module filter is applied -- a wire model defined elsewhere and merely
+    imported into :mod:`creek_mcp.api.models` still has to be registered.
+    """
+    base = api_models._WireModel
+    return {
+        obj.__name__: obj
+        for obj in namespace.values()
+        if isinstance(obj, type) and issubclass(obj, base) and obj is not base
+    }
+
+
 def _admitted_ceiling_tier_pairs() -> tuple[tuple[TierCeiling, PrivacyTier], ...]:
     """Return every ``(remote ceiling, admitted tier)`` pair ``/v1`` can see."""
     return tuple(
@@ -427,6 +453,45 @@ def _admitted_ceiling_tier_pairs() -> tuple[tuple[TierCeiling, PrivacyTier], ...
 # ---------------------------------------------------------------------------
 # Group 1 -- happy path
 # ---------------------------------------------------------------------------
+
+
+def test_every_wire_model_subclass_is_registered_in_contract_models() -> None:
+    """``CONTRACT_MODELS`` is total over the module's live ``_WireModel`` tree.
+
+    A model defined in :mod:`creek_mcp.api.models` but forgotten in the registry
+    would be invisible to every other test here -- they key their fixtures off
+    ``CONTRACT_MODELS`` itself -- and, because :mod:`creek_mcp.api.bundle` walks
+    the same mapping to emit ``schemas/<name>.schema.json``, it would also be
+    absent from the published bundle without a single check going red. This is
+    the one assertion that reads the module's class list instead of the
+    registry, and it is an equality so it catches the reverse too: a registry
+    entry whose class no longer lives in the module.
+    """
+    assert _wire_model_subclasses(vars(api_models)) == CONTRACT_MODELS
+
+
+def test_wire_model_registry_check_catches_an_unregistered_subclass() -> None:
+    """The completeness check above is not vacuous.
+
+    Reflection-based guards fail open when the discovery predicate stops
+    matching -- the sweep finds nothing, the equality holds, and the test stays
+    green while the invariant rots. So this pins the negative case: a
+    ``_WireModel`` subclass that nobody added to ``CONTRACT_MODELS`` is
+    discovered, and the equality that
+    ``test_every_wire_model_subclass_is_registered_in_contract_models`` asserts
+    is exactly what breaks.
+    """
+
+    class ForgottenModel(api_models._WireModel):
+        """A wire model whose author forgot the ``CONTRACT_MODELS`` entry."""
+
+        value: str = Field(description="Filler field; the omission is the point.")
+
+    namespace = {**vars(api_models), ForgottenModel.__name__: ForgottenModel}
+    discovered = _wire_model_subclasses(namespace)
+
+    assert discovered == {**CONTRACT_MODELS, ForgottenModel.__name__: ForgottenModel}
+    assert discovered != CONTRACT_MODELS
 
 
 def test_happy_payloads_cover_every_contract_model() -> None:

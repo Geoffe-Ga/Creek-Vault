@@ -310,7 +310,12 @@ nothing, and a symlink resolving off the vault must all be byte-identical
 below the admitting ceiling. A `404` that a caller could distinguish from a
 `403` over a vault object would hand back precisely the existence-and-rank
 oracle those issues removed. This is a deliberate narrowing of the taxonomy
-issue #1072's Problem section originally sketched.
+issue #1072's Problem section originally sketched. Until
+[#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074) mounts the
+handlers there is nothing to enforce this against; the structural guard that
+keeps it from regressing once they exist — an AST sweep over every `NOT_FOUND`
+construction site, checked against a pinned routing-layer allowlist — is
+tracked in [#1098](https://github.com/Geoffe-Ga/Creek-Vault/issues/1098).
 
 **`creek.reflect`'s two refusal reasons collapse at the `/v1` boundary.** At
 the MCP layer `reflect_tool` keeps `"entry_ref not found"` distinct from

@@ -39,6 +39,12 @@ one id at a time without ever reading a byte of it. Every vault-object
 non-answer — above the ceiling, purged, orphaned, schema-invalid, or deleted
 out of band — collapses to :attr:`ErrorCode.PRIVACY_REFUSED` carrying
 :data:`creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`.
+
+Today that rule is enforced by this vocabulary alone: there is no handler to
+break it, since ``/v1`` has no routes until #1074 mounts them. The structural
+guard that keeps it from regressing once handlers exist — an AST sweep over
+every ``NOT_FOUND`` construction site in :mod:`creek_mcp`, checked against a
+pinned routing-layer allowlist — is tracked in #1098.
 """
 
 from __future__ import annotations
