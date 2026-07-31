@@ -90,3 +90,19 @@ Follow the 4-gate process:
 2. **Local**: `./scripts/check-all.sh` passes (exit 0)
 3. **CI**: All GitHub Actions jobs green
 4. **Review**: LGTM before merge
+
+## Knowledge Graph (graphify) — query first
+
+This repo publishes its code graph (~23k nodes) as assets on the rolling
+`knowledge-graph` GitHub Release (never committed; part of the adepthood
+federation). For ANY question about this codebase — structure, relationships,
+impact — query the graph BEFORE grep/read sweeps:
+
+- Restore once per session:
+  `gh release download knowledge-graph --pattern graph.json --dir graphify-out`
+  (or rebuild keyless: `pip install graphifyy && graphify extract . --code-only`).
+- `graphify query "<question>"` · `graphify path "A" "B"` ·
+  `graphify explain "X"` · `graphify affected "X"` (before changing X).
+- Quote each cited node's `source_location`; verify before trusting.
+- Fail-soft: if the CLI or graph is unavailable, proceed with normal file
+  tools — never stall.
