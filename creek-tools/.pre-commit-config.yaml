@@ -58,6 +58,9 @@ repos:
     - pytest>=7.4.0
     - hypothesis>=6.92.0
     - pydantic>=2.0.0
+    # anthropic ships py.typed; scripts/ralph/recap.py imports it (guarded),
+    # so mypy needs the real package to resolve the module.
+    - anthropic>=0.40.0
     args:
     - --strict
 - repo: https://github.com/PyCQA/bandit
