@@ -67,10 +67,11 @@ Two fail-closed rules, deliberately distinct — collapsing them breaks one:
 
 Consequence to know: that recovery does not exist for a remote consumer.
 ``_BoundedFastMCP.call_tool`` caps every remote request at
-``ceiling=personal`` (``docs/mcp.md`` §"INTIMATE is never reachable
-remotely"), so a remote caller can never even *request*
-``ceiling=intimate``/``all``. Because ``creek classify``'s privacy pass is
-escalate-only, once a journal fragment reaches ``intimate`` a remote
+``ceiling=personal`` — on :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS`,
+which has owned that rule for every transport since #1073 (``docs/mcp.md``
+§"INTIMATE is never reachable remotely") — so a remote caller can never even
+*request* ``ceiling=intimate``/``all``. Because ``creek classify``'s privacy
+pass is escalate-only, once a journal fragment reaches ``intimate`` a remote
 consumer — and Adepthood, the primary journal producer, IS a remote
 consumer — can never send that ``external_id`` again: not to edit it, and
 not even as an unchanged idempotent re-sync, because this gate sits above
