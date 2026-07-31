@@ -13,7 +13,12 @@
 #   behind           LGTM (fresh) + CI green but the branch is not current → sync first
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
 #   ci-failed        CI has a failing/errored check → Step 2 (ci-debugging)
-#   awaiting-review  no fresh LGTM verdict (missing, stale, or non-LGTM) → wait / Step 2
+#   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
+#                    not LGTM (CHANGES_REQUESTED / COMMENTS) → Step 2
+#                    (address-feedback). This is Gate 4 FAILED — an actionable
+#                    state, distinct from waiting (issue #1097).
+#   awaiting-review  no verdict posted yet, or only a STALE one (it predates the
+#                    HEAD commit, LGTM or not) → wait for (re-)review
 #   optout           `do-not-auto-merge` on the PR or on the issue it closes → the
 #                    loop does not act on this PR AT ALL; a human owns it. Checked
 #                    first, and an unreadable label answer exits 2 rather than
@@ -72,6 +77,21 @@
 # Stale-verdict guard: a review verdict only counts when it was posted AFTER the
 # PR's HEAD commit. An LGTM from before the latest push is stale (it reviewed
 # older code) and must not gate a merge.
+#
+# TOKEN PRECEDENCE (deliberate, pinned by test_pr_ready.sh): `optout` is checked
+# before everything else; then CI state (`pending` / `ci-failed`), exactly as it
+# always was; the verdict is only consulted once CI is green. So
+# `changes-requested` never outranks `pending`/`ci-failed` — a lane whose CI is
+# still running classifies `pending` even if the verdict already landed, and the
+# wake arrives when CI resolves (green → `changes-requested`, red → `ci-failed`;
+# both orchestrator-actionable, so nothing is lost — only ordered). On the green
+# path the fresh-non-LGTM check sits exactly where `awaiting-review` used to be
+# emitted, and it wins over the `ready-unreviewed` shortcut: a posted verdict
+# proves a review gate exists, so the verdict — not the shortcut — decides.
+# FAIL-CLOSED: an unreadable verdict lookup still dies (exit 2, nothing on
+# stdout — the tooling-error contract above), and a malformed verdict answer
+# degrades to `awaiting-review` (wait), NEVER to `changes-requested` — the one
+# token that dispatches a fix worker must not fire on garbage.
 #
 # Freshness guard: `mergeStateStatus` is NOT a freshness signal. GitHub computes
 # BEHIND only when the base branch enforces strict/up-to-date status checks,
@@ -359,11 +379,20 @@ branch_is_current() {
 # Fresh LGTM ⇔ latest verdict is LGTM AND its createdAt is strictly newer than
 # the HEAD commit. RFC3339 UTC timestamps are fixed-width, so a lexical string
 # compare is a correct chronological compare (portable — no date arithmetic).
-# Absent that the lane waits for review, unless there is provably no review to
-# wait for — and the review-gate probe is LAZY for the same rate-limit reason as
-# the compare probe: only a lane already lacking a fresh verdict ever pays for it.
+# Absent that: a FRESH non-LGTM verdict is Gate 4 failed → `changes-requested`
+# (checked FIRST — the verdict is the review gate speaking, so it outranks the
+# no-gate shortcut); otherwise the lane waits for review, unless there is
+# provably no review to wait for — and the review-gate probe is LAZY for the
+# same rate-limit reason as the compare probe: only a lane already lacking a
+# fresh verdict ever pays for it.
 ready_token="ready"
 if [[ "$verdict_lgtm" != "true" || -z "$verdict_date" ]] || ! [[ "$verdict_date" > "$head_date" ]]; then
+  # Exactly `false` (jq's tostring), never `!= true`: anything else in that
+  # field is a malformed answer, and the dispatch-a-worker token must fail
+  # closed to the wait token below rather than fire on garbage.
+  if [[ "$verdict_lgtm" == "false" && -n "$verdict_date" ]] && [[ "$verdict_date" > "$head_date" ]]; then
+    echo "changes-requested"; exit 0
+  fi
   review_gate_absent || { echo "awaiting-review"; exit 0; }
   ready_token="ready-unreviewed"
 fi

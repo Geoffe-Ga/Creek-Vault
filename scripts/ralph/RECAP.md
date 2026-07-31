@@ -25,7 +25,7 @@ scripts/ralph/
 └── RECAP.md             # this file
 .github/workflows/
 ├── ralph-recap.yml        # fires on every merged PR → posts the recap
-└── ralph-recap-tests.yml  # runs the unit tests on changes under scripts/ralph/
+└── ralph-recap-tests.yml  # "Ralph Tooling Tests": all shell + Python suites on scripts/ralph/ changes
 ```
 
 ## What you need
@@ -157,8 +157,10 @@ If the reviewer ever phrases verdicts differently from the `Verdict:` line that
 python -m pytest scripts/ralph -q
 ```
 
-CI runs the same suite via `.github/workflows/ralph-recap-tests.yml` on any
-change under `scripts/ralph/`.
+CI runs the same suite via `.github/workflows/ralph-recap-tests.yml` ("Ralph
+Tooling Tests" — the one workflow for everything under `scripts/ralph/`; it
+also shellchecks and runs the fleet shell suites) on any change under
+`scripts/ralph/`.
 
 ## Troubleshooting
 

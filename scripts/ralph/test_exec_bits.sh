@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# scripts/ralph/test_exec_bits.sh
+#
+# Regression test for the RECORDED git file mode of every directly-invoked
+# shell script under scripts/ralph/. The mode matters because the orchestrator
+# and its docs invoke these scripts by PATH (`scripts/ralph/watch-pr.sh <PR>`,
+# ralph-tick.md Step 5) — a script committed 100644 exits 126 ("permission
+# denied") on every fresh clone, exactly the platform the local hot watch was
+# written for. CI runs the suites via `bash <file>`, which never consults the
+# mode — so nothing else in CI can catch a dropped bit, and #1092 shipped both
+# watch-pr.sh and test_watch_pr.sh as 100644 (issue #1096).
+#
+# The check reads `git ls-files -s` — the INDEX mode git will write on the next
+# clone — never the working tree's stat(2) bits, so it cannot be fooled by a
+# local `chmod +x` that was never staged.
+#
+# Run:  bash scripts/ralph/test_exec_bits.sh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PASS=0
+FAIL=0
+
+ok()  { PASS=$((PASS + 1)); printf '  ok  - %s\n' "$1"; }
+bad() { FAIL=$((FAIL + 1)); printf 'FAIL  - %s\n' "$1"; }
+check() { # check <desc> <expected> <actual>
+  if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi
+}
+
+readonly EXEC_MODE=100755
+
+# Every *.sh under scripts/ralph/ is directly invoked — the entry points
+# (fleet.sh, pick-next.sh, pr-ready.sh, watch-pr.sh) by the orchestrator, the
+# test_*.sh suites by CI and by hand — so the rule is the whole glob, not a
+# hand-kept list that a new script would silently dodge.
+listing="$(git -C "$ROOT" ls-files -s -- 'scripts/ralph/*.sh')"
+
+# Guard the guard: an empty listing (a moved directory, a bad pathspec) must
+# FAIL loudly, or every assertion below would pass vacuously.
+if [[ -n "$listing" ]]; then
+  ok "git ls-files sees shell scripts under scripts/ralph/"
+else
+  bad "git ls-files returned no scripts/ralph/*.sh entries — pathspec broken?"
+fi
+
+# And pin the four known entry points by name, so a rename cannot quietly drop
+# one out of the glob's jurisdiction.
+for name in fleet.sh pick-next.sh pr-ready.sh watch-pr.sh; do
+  if grep -q "scripts/ralph/$name\$" <<<"$listing"; then
+    ok "listing includes $name"
+  else
+    bad "listing is missing scripts/ralph/$name"
+  fi
+done
+
+while read -r mode _oid _stage path; do
+  [[ -n "$mode" ]] || continue
+  check "$path is committed executable ($EXEC_MODE)" "$EXEC_MODE" "$mode"
+done <<<"$listing"
+
+# --- summary ---------------------------------------------------------------
+echo
+echo "exec-bit tests: $PASS passed, $FAIL failed"
+[[ "$FAIL" -eq 0 ]]
