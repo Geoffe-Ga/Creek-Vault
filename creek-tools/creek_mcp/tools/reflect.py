@@ -3,9 +3,12 @@
 Takes one journal entry (raw ``content`` or an ``entry_ref`` fragment id) plus a
 privacy-tier ceiling and returns ``{notes: [{quote, kind, note}], essay?}`` —
 warm, second-person, anti-guru reflections that mirror the user's own wisdom,
-grounded in retrieval over their corpus. Distinct from the essay-shaped
-``draft``/``author``/``mine`` surface; this is the reflection surface Adepthood's
-journal needs.
+grounded in the *titles* of the ceiling-admitted corpus fragments nearest the
+entry (titles only, never body text). That grounding has been live only since
+#964: before it, the default grounder raised into a silent ``except`` and every
+reflection was ungrounded. Distinct from the essay-shaped
+``draft``/``author``/``mine`` surface; this is the reflection surface
+Adepthood's journal needs.
 
 Four guarantees this module enforces:
 
@@ -46,8 +49,10 @@ structured dict rather than raising: a malformed or unreadable file under
 malformed model turn degrades to no notes. No parse error crosses the MCP
 boundary.
 
-The LLM and retrieval are injected so the tool is unit-testable with no live
-calls; ``build_server`` supplies the production factory + retrieval.
+The LLM and retrieval are both injectable seams so the tool is unit-testable
+with no live calls. ``build_server`` supplies the production LLM factory and
+leaves ``retrieve`` unset, so production grounding is :func:`_default_retrieve`
+— the ceiling-bounded title retrieval described above.
 """
 
 from __future__ import annotations
@@ -358,8 +363,12 @@ def reflect_tool(
             *content* wins when both are given.
         entry_ref: A fragment id whose body is the entry, when *content* is
             absent.
-        retrieve: ``(query, vault, override) -> snippets`` grounding source;
-            defaults to the corpus retrieval specialist.
+        retrieve: ``(query, vault, override) -> grounding lines`` source. The
+            default (:func:`_default_retrieve`) returns ceiling-bounded corpus
+            fragment **titles**, never body text. An injected callable
+            *replaces* the default outright — the two are never merged — so a
+            deployment wanting richer grounding owns its own admission
+            filtering.
         care_guard: ``(entry) -> reason | None``; a non-``None`` reason escalates
             to a human and skips the model entirely (#753 seam).
         privacy_tier_ceiling: The ceiling; gates admission of the *entry itself*
@@ -485,25 +494,91 @@ def reflect_tool(
 def _default_retrieve(
     query: str, vault_path: Path, override: PrivacyTierOverride
 ) -> list[str]:
-    """Production grounding: top corpus fragments related to *query*.
+    """Production grounding: the *titles* of the corpus fragments nearest *query*.
 
-    Lazily imports the author retrieval specialist so the server still boots
-    when its (heavier) deps are unavailable; any retrieval failure degrades to
-    no grounding rather than failing the reflection.
+    Returns the titles of the top ``author.retrieval_top_k`` (default 5) corpus
+    fragments semantically nearest *query*, drawn from ``01-Fragments``,
+    ``09-Reference`` and ``11-Other-Authors``. The author retrieval specialist
+    is imported lazily so the server still boots when its (heavier) deps are
+    unavailable.
+
+    **Titles, not bodies — and that is the decision, not an accident.** Three
+    reasons, recorded because "grounding" reads like it ought to mean body text:
+
+    - :func:`_build_prompt` validates every returned ``notes[].quote`` as a
+      verbatim span of the *entry*, never of a source, so grounding supplies
+      thematic context and is structurally unquotable — titles serve that role.
+    - Bodies would mean changing ``creek.author.agents._fragment_claim``, whose
+      "one assertion, one short sentence" contract is shared by
+      ``GraphSpecialist`` and the Writing Desk's citation and leak-gate
+      machinery.
+    - :func:`reflect_tool`'s ``retrieve=`` is an injectable seam, so the
+      *default* is deliberately the conservative one; a deployment wanting
+      richer grounding supplies its own callable.
+
+    **The ceiling invariant.** ``creek.author.agents._load_corpus`` applies
+    ``tier_within_override`` — a **hard rank cutoff** — so an above-ceiling
+    fragment contributes *nothing*: no title, no body, no id. This is
+    explicitly NOT ``filter_fragments_by_tier``'s summarise-the-body path,
+    which is the shape #931/#1032 found leaking titles for fragments whose
+    bodies policy had already dropped. Verified admitted sets: ``open`` admits
+    ``open`` only; ``personal`` admits ``open`` + ``personal`` +
+    ``unclassified``; ``intimate`` and ``all`` admit all four.
+
+    **The routing consequence.** The most sensitive tier that can reach the
+    prompt is therefore bounded by the ceiling, and :func:`reflect_tool` keys
+    the model with :func:`creek_mcp.tier_ceiling.routing_tier`, whose
+    ceiling-derived floor is the most sensitive tier that ceiling admits. So
+    the routing tier always dominates every retrieved fragment's tier, and
+    intimate titles can only be retrieved under a ceiling that already forces
+    INTIMATE (local-only) routing. Pinned by
+    ``test_routing_tier_dominates_every_retrieved_fragment_tier``.
+
+    **The cost, honestly.** Each call constructs a fresh
+    ``RetrievalSpecialist``, so it parses the corpus and loads the embeddings
+    parquet per call, and live-embeds any fragment whose cached
+    ``content_hash`` is stale or missing — on a cold cache, that is the whole
+    admitted corpus. Tracked by #1034; the ``except Exception`` below does not
+    bound it, because slowness is not an exception.
+
+    A known asymmetry: a fragment with **no** ``privacy_tier`` key at all is
+    admitted here from ``ceiling=personal`` (the ``Fragment`` model default is
+    ``unclassified``), while :func:`_fragment_tier` fails that same file closed
+    to INTIMATE as an *entry*. Tracked by #1033.
+
+    Args:
+        query: The entry text to retrieve against.
+        vault_path: Vault root whose corpus subtrees are searched.
+        override: The ceiling-derived admission override, applied as a hard
+            cutoff inside the corpus walk.
+
+    Returns:
+        Fragment titles, most relevant first — ``[]`` when retrieval fails.
     """
     try:
         from creek.author.agents import RetrievalSpecialist
 
         bundle = RetrievalSpecialist().gather(query, vault_path, override=override)
-        # ``EvidenceClaim`` carries ``claim``, not ``text``, so this access has
-        # always raised and been swallowed below: production grounding has
-        # never actually run. Renaming the attribute switches it on, and what
-        # it would then feed the prompt is corpus fragment *titles*
-        # (``_fragment_claim`` sets ``claim=fragment.title``) — grounding on
-        # titles rather than bodies is an undecided design question that needs
-        # its own privacy tests. Suppressed rather than "fixed" so bringing
-        # this package under mypy does not quietly turn that egress on; #964
-        # owns the decision.
-        return [claim.text for claim in bundle.claims]  # type: ignore[attr-defined]  # Issue #964
-    except Exception:
+        return [claim.claim for claim in bundle.claims]
+    except Exception as exc:
+        # This log line is the #964 remedy. The attribute this comprehension
+        # reads was wrong for the entire life of the feature, so grounding
+        # raised on every production call and every reflection was ungrounded —
+        # undetected precisely because this swallow was silent. The log is what
+        # makes the next such failure findable.
+        #
+        # The catch stays broad on purpose: ``RetrievalSpecialist.gather``
+        # reaches ``load_config``, a full corpus parse and the
+        # sentence-transformer model load, so its failure surface is open-ended
+        # (ImportError, OSError, yaml errors, pydantic ``ValidationError``,
+        # model-load failures) and none of it may cross the MCP boundary.
+        #
+        # Log the exception's *type name only* — never ``str(exc)``,
+        # ``exc_info``, or ``logger.exception``, for the reason given at
+        # ``_resolve_entry`` above: these are the same user-managed corpus
+        # files, and ``yaml.MarkedYAMLError`` stringifies with the offending
+        # source snippet, so the message text would write tier-unknown vault
+        # content into a log that carries no tier and is not covered by the
+        # ceiling.
+        logger.debug("Grounding degraded to none (%s)", type(exc).__name__)
         return []
