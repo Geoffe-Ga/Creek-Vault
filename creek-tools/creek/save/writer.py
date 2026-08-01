@@ -13,19 +13,21 @@ path for fragments and rolled-up primitives; save needs to land notes
 at additional vault locations (``10-Liminal/Paradoxes/``,
 ``10-Liminal/Unnamed/``, ``07-Voice/Drafts/``) that VaultWriter does
 not own. Sharing the same atomic-create pattern keeps the on-disk
-behaviour consistent.
+behaviour consistent: the raw-descriptor create itself is
+:func:`creek._fsio.create_exclusive`, shared verbatim with
+:mod:`creek.vault.writer`.
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
 
+from creek._fsio import create_exclusive
 from creek.classify.privacy_filter import pre_save_filter
 from creek.models import (
     Authorship,
@@ -236,20 +238,32 @@ def _compose_base_name(title: str) -> str:
 
 
 def _atomic_create(target_dir: Path, base_name: str, content: str) -> Path:
-    """Create ``target_dir/{base_name}.md`` atomically; retry on collision."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    """Create ``target_dir/{base_name}.md`` atomically; retry on collision.
+
+    Args:
+        target_dir: Directory the note will land in.
+        base_name: Filename stem (without ``.md``).
+        content: Full note contents to write.
+
+    Returns:
+        The path of the created note.
+
+    Raises:
+        RuntimeError: If a unique filename cannot be obtained within
+            :data:`_MAX_COLLISION_RETRIES` attempts.
+        OSError: If the note was created but its contents could not be
+            written in full. The partial file is unlinked, so a
+            truncated answer is never filed under the operator's title
+            (#987).
+    """
     encoded = content.encode("utf-8")
     for counter in range(_MAX_COLLISION_RETRIES):
         suffix = "" if counter == 0 else f"-{counter}"
         candidate = target_dir / f"{base_name}{suffix}.md"
         try:
-            fd = os.open(candidate, flags, 0o644)
+            create_exclusive(candidate, encoded)
         except FileExistsError:
             continue
-        try:
-            os.write(fd, encoded)
-        finally:
-            os.close(fd)
         return candidate
     msg = (
         f"Could not allocate a unique filename for '{base_name}.md' in "

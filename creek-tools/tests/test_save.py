@@ -7,6 +7,8 @@ and the ``creek save`` CLI command itself.
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,6 +30,8 @@ from creek.save import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from conftest import ShortWriteController
 
 
 @pytest.fixture
@@ -770,12 +774,55 @@ def test_atomic_create_raises_when_collision_retries_exhausted(
     def always_exists(*_args: object, **_kwargs: object) -> int:
         raise FileExistsError
 
-    monkeypatch.setattr(writer_module.os, "open", always_exists)
+    monkeypatch.setattr(os, "open", always_exists)
     with pytest.raises(RuntimeError) as excinfo:
         writer_module._atomic_create(vault, "stuck", "content")
     message = str(excinfo.value)
     assert "stuck.md" in message
     assert str(writer_module._MAX_COLLISION_RETRIES) in message
+
+
+def test_save_writes_full_body_under_short_writes(
+    vault: Path,
+    short_write: ShortWriteController,
+) -> None:
+    """A short ``os.write`` must not truncate a saved note's body (#987).
+
+    ``_atomic_create`` writes directly to the final path, so a discarded
+    byte count silently files half an answer under the operator's title —
+    the most dangerous shape of this bug, because the note looks saved.
+    """
+    short_write.halve()
+    body = "x" * 400 + "TAIL"
+
+    path = save_to_vault(
+        _make_request(SaveTarget.THREAD, body=body),
+        vault_path=vault,
+    )
+
+    # Assert on the raw bytes first: a truncated note may lose its closing
+    # frontmatter delimiter, and a parser error would obscure the real
+    # failure (the missing tail).
+    assert path.read_text(encoding="utf-8").rstrip("\n").endswith("TAIL")
+    post = frontmatter.load(str(path))
+    assert post.content.strip() == body
+
+
+def test_save_atomic_create_leaves_no_file_when_write_makes_no_progress(
+    vault: Path,
+    short_write: ShortWriteController,
+) -> None:
+    """A stalled descriptor raises instead of filing an empty note."""
+    short_write.stall()
+
+    with pytest.raises(OSError) as excinfo:
+        save_to_vault(
+            _make_request(SaveTarget.THREAD, body="x" * 400 + "TAIL"),
+            vault_path=vault,
+        )
+
+    assert excinfo.value.errno == errno.EIO
+    assert not list(target_directory(vault, SaveTarget.THREAD).glob("*.md"))
 
 
 # ---- Shared slugify helper ----
