@@ -104,6 +104,23 @@ _ALL_METHODS: Final[tuple[str, ...]] = (
     "OPTIONS",
 )
 
+_UNROUTED: Final[tuple[str, ...]] = (
+    "/v1/nonsense",
+    "/",
+    "/v1/journal-entries",
+    "/v2/capabilities",
+)
+"""Paths this server mounts nothing at, chosen to be four *different* misses.
+
+``/v1/nonsense`` is an invented sibling of the real routes; ``/`` is the one
+path a prober always tries first; ``/v1/journal-entries`` is the journal route
+with its ``{external_id}`` segment removed, which is the miss a client produces
+by accident rather than by probing; and ``/v2/capabilities`` is a *future*
+major version, the miss a client produces by upgrading ahead of the server.
+Each must answer ``404 not_found`` under every verb — including the ones that
+would make Starlette's router raise ``405`` if the path existed.
+"""
+
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Iterator[Path]:
@@ -420,10 +437,61 @@ def test_no_reachable_request_produces_a_status_outside_the_set(
     assert observed <= ALLOWED_HTTP_STATUSES
 
 
+def test_no_unrouted_request_produces_a_status_outside_the_set(vault: Path) -> None:
+    """Sweep every *unrouted* path against every method: all ``404``, no ``405``.
+
+    The sweep above covers *mounted* paths, where the router matches the path
+    and then rejects the verb — Starlette raises ``HTTPException(405)`` with an
+    ``Allow`` header. This is the other half of the same router: nothing matches
+    at all, and it raises ``HTTPException(404)``. Both land in ``_routing_miss``,
+    whose entire purpose is that a caller cannot tell the two apart, so both
+    halves have to be swept before that claim is checked rather than assumed.
+
+    The targeted ``404`` test above reaches unrouted paths under ``GET`` alone,
+    which left five of the six verbs unchecked on every miss. Twenty-four
+    requests close that, and the ``Allow`` assertion pins that no refusal here
+    grows the one header the mounted half's ``405`` would have carried.
+
+    Args:
+        vault: A seeded vault.
+    """
+    observed: set[int] = set()
+    codes: set[str] = set()
+    with client(vault_path=vault) as test_client:
+        for path in _UNROUTED:
+            for probe in _ALL_METHODS:
+                kwargs: dict[str, Any] = {"headers": headers(ceiling="open")}
+                payload = _BODIES.get(probe)
+                if payload is not None:
+                    kwargs["json"] = payload
+                response = test_client.request(probe, path, **kwargs)
+                observed.add(response.status_code)
+                codes.add(str(envelope(response)["code"]))
+                assert "allow" not in {name.lower() for name in response.headers}
+    assert observed == {_NOT_FOUND_STATUS}
+    assert codes == {ErrorCode.NOT_FOUND.value}
+    assert _METHOD_NOT_ALLOWED not in observed
+    assert observed <= ALLOWED_HTTP_STATUSES
+
+
 def test_the_method_sweep_is_not_vacuous() -> None:
     """The sweep above really does try every verb on every route."""
     assert len(MOUNTED) * len(_ALL_METHODS) == 30
     assert "PATCH" in _ALL_METHODS
+
+
+def test_the_unrouted_sweep_is_not_vacuous() -> None:
+    """The unrouted sweep really does try every verb on four genuine misses.
+
+    Three ways this guard could quietly stop guarding, each pinned: the tuple
+    shrinking (the arithmetic), a path being listed twice (the deduplication),
+    and — the one that would actually make it vacuous — a "miss" that is in
+    fact a mounted route, which would turn the ``404`` assertions into a claim
+    about a real endpoint.
+    """
+    assert len(_UNROUTED) * len(_ALL_METHODS) == 24
+    assert len(set(_UNROUTED)) == len(_UNROUTED)
+    assert not set(_UNROUTED) & {path for _method, path in MOUNTED}
 
 
 # --------------------------------------------------------------------------- #

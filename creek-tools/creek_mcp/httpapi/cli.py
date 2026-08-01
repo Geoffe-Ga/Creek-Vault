@@ -169,25 +169,65 @@ def _verifier_or_exit(parser: argparse.ArgumentParser) -> ConsumerTokenVerifier:
     return verifier
 
 
-def serve(app: Starlette, args: argparse.Namespace) -> None:  # pragma: no cover
-    """Run *app* under uvicorn until the process is stopped.
+def build_uvicorn_config(app: Starlette, args: argparse.Namespace) -> uvicorn.Config:
+    """Build the uvicorn configuration this CLI serves *app* under.
 
-    The one seam that binds a socket, and therefore the one thing the CLI tests
-    replace: a guard bug then fails as ``DID NOT RAISE`` rather than hanging the
-    suite on a real port.
+    Extracted from :func:`serve` so the one decision in it that is a security
+    promise — ``access_log=False`` — is reachable by a test without binding a
+    socket.
+
+    **Why uvicorn's own access log is switched off.** uvicorn ships an access
+    logger that is on by default and writes one line per request in the form
+    ``client_addr - "METHOD /concrete/path?query HTTP/1.1" status``. It does not
+    replace :class:`~creek_mcp.httpapi.logging.AccessLogMiddleware`; it runs
+    alongside it. Two fields in that line are exactly what the middleware exists
+    to keep out of a log: the **client address**, and the **concrete path with
+    its query string** — which for ``/v1/journal-entries/{external_id}`` is a
+    consumer-chosen identifier, republished on every sync. ``docs/api.md``
+    publishes to consumers the unqualified promise that request logging names
+    the route template and never the concrete path; left on, uvicorn's logger
+    keeps that promise in one log and breaks it in the other, and the operator's
+    shipper collects both.
+
+    **Suppression, not filtering.** A ``log_config`` override or a
+    :class:`logging.Filter` would leave a *second* redaction rule in the process,
+    free to drift from the middleware's — the failure mode
+    :mod:`creek_mcp.httpapi.logging`'s "re-export, never redefine" docstring
+    argues against. Total suppression has no rule to drift: there is one access
+    log, and it is the audited one.
 
     Args:
         app: The built application.
         args: The parsed arguments, carrying host, port and TLS material.
+
+    Returns:
+        The configuration, carrying the bind address, the TLS material when the
+        operator supplied it, and no access log of uvicorn's own.
     """
-    config = uvicorn.Config(
+    return uvicorn.Config(
         app,
         host=args.host,
         port=args.port,
         ssl_certfile=None if args.tls_cert is None else str(args.tls_cert),
         ssl_keyfile=None if args.tls_key is None else str(args.tls_key),
+        access_log=False,
     )
-    uvicorn.Server(config).run()
+
+
+def serve(app: Starlette, args: argparse.Namespace) -> None:  # pragma: no cover
+    """Run *app* under uvicorn until the process is stopped.
+
+    The one seam that binds a socket, and therefore the one thing the CLI tests
+    replace: a guard bug then fails as ``DID NOT RAISE`` rather than hanging the
+    suite on a real port. Everything decidable without a socket lives in
+    :func:`build_uvicorn_config`, so that the uncovered surface here is the bind
+    itself and nothing else.
+
+    Args:
+        app: The built application.
+        args: The parsed arguments, carrying host, port and TLS material.
+    """
+    uvicorn.Server(build_uvicorn_config(app, args)).run()
 
 
 def main(argv: list[str] | None = None) -> None:

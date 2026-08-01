@@ -566,6 +566,49 @@ exactly the kind of undeclared-dependency drift this epic exists to stop.
 `model_json_schema()` and `model_validate` are pure Pydantic, already a
 direct dependency of `creek-tools`.
 
+## Serving: uvicorn's own logging and the readiness probe
+
+Two decisions from the #1117 review, both about how `creek-tools-api`'s own
+uvicorn process behaves rather than about the wire contract above.
+
+**uvicorn's access log is suppressed, not filtered.**
+[`build_uvicorn_config`](../../creek-tools/creek_mcp/httpapi/cli.py) passes
+`access_log=False` rather than reaching for a `log_config` override or a
+`logging.Filter` that trims the client address and concrete path back out of
+uvicorn's own logger. That logger is on by default and
+runs *alongside*
+[`AccessLogMiddleware`](../../creek-tools/creek_mcp/httpapi/logging.py), not
+instead of it, so a filter would be a *second* redaction rule loose in the
+process — free to drift from the middleware's the next time either one is
+touched without the other. Total suppression has no rule to drift: there is
+exactly one access log left in the process, and it is the audited one
+described in [`creek-tools/docs/api.md`](../../creek-tools/docs/api.md)'s
+"Request logging" section.
+
+**The `GET /v1/capabilities` readiness probe is hoisted off the event loop
+as a whole, not seam-by-seam.**
+[`_vault_is_usable`](../../creek-tools/creek_mcp/httpapi/capabilities.py) is
+the single synchronous seam under `handle_capabilities`: every blocking
+filesystem call the handshake makes — the config read and YAML parse, the
+marker stat, and an audit append that takes a thread lock and an `fcntl`
+exclusive lock across a full `fsync` — is reachable from that one function
+and nowhere else. `handle_capabilities` therefore wraps `_vault_is_usable`
+whole in `starlette.concurrency.run_in_threadpool` rather than hoisting each
+syscall beneath it individually; a narrower hoist would still leave some of
+those calls on the loop for no benefit and buy an extra context switch for
+the privilege. Inline, this probe blocked the event loop entirely — stalling
+every other in-flight request, including `GET /v1/health` and
+`RequestTimeoutMiddleware`'s own cancel scope, on the one endpoint every
+client calls first.
+
+**Not fixed here.** `creek_mcp/server.py`'s `_serve_network` builds its own
+`uvicorn.Config` for the MCP network transport and passes it no
+`access_log=False` — the identical omission this ADR's uvicorn decision
+above corrects for `creek-tools-api`, so uvicorn's default access logger is
+live there too, writing the client address and request line for every
+network MCP call. It is out of scope for #1117 and is tracked as follow-up
+[#1125](https://github.com/Geoffe-Ga/Creek-Vault/issues/1125).
+
 ## The published fixture bundle
 
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
@@ -655,3 +698,4 @@ restating the other.
 |---|---|---|
 | `0.2.0` | 2026-07-31 | This ADR: publishes `/v1`, the Adepthood HTTP application API, alongside the existing MCP agent adapter. No wire-shape change to the existing contract version — `creek_mcp.api.models` and the fixture bundle under `docs/contracts/adepthood-v1/` are the first publication of a new surface, not a revision of the MCP one (#1072, epic #1071). |
 | `0.2.0` | 2026-07-31 | #1074 mounts the routes: the tracer serves a real `GET /v1/capabilities` and answers `501 unsupported_capability` on journal, reflection and wheel. No wire shape changes, so no version moves. Two clarifications recorded above rather than left implicit: the advertised capability list tracks what is actually implemented during the epic's build-out, and the issue's provisional `not_implemented` spelling is superseded by `unsupported_capability` — the `ErrorCode` member this ADR already publishes for exactly that meaning at exactly that status. |
+| `0.2.0` | 2026-08-01 | #1117 review fixes: `creek-tools-api` now starts uvicorn with `access_log=False` (its own access logger was republishing the caller's address and the concrete request path alongside the audited middleware), and `GET /v1/capabilities`'s readiness probe now runs in a worker thread rather than on the event loop. Neither changes a wire shape, so no version moves. See [Serving: uvicorn's own logging and the readiness probe](#serving-uvicorns-own-logging-and-the-readiness-probe). |

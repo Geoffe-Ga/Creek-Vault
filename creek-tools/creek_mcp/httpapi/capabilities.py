@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
+from starlette.concurrency import run_in_threadpool
 from yaml import YAMLError
 
 from creek.config import load_config
@@ -151,6 +152,18 @@ def _negotiate(vault: Path, context: RequestContext) -> bool:
 
 def _vault_is_usable(request: Request, context: RequestContext) -> bool:
     """Return whether a scaffolded, readable vault stands behind this server.
+
+    Synchronous on purpose, and *the* sync seam of this module: every blocking
+    syscall the handshake makes is reachable from here and nowhere else, so
+    :func:`handle_capabilities` can hoist the lot off the event loop with a
+    single :func:`~starlette.concurrency.run_in_threadpool` call. The three
+    seams underneath are all filesystem I/O — :func:`_configured_vault` reads
+    and parses ``creek_config.yaml``, ``vault_available`` stats the marker, and
+    :func:`_negotiate` reaches :meth:`creek_mcp.audit.MCPAuditLog.append`,
+    which takes a thread lock and an ``fcntl`` exclusive lock across a full
+    re-read, a write and an ``fsync``. Hoisting a narrower seam would leave
+    some of those on the loop for no benefit and buy an extra context switch
+    for the privilege.
 
     Args:
         request: The request in flight.
@@ -270,6 +283,30 @@ async def handle_capabilities(request: Request) -> Response:
     ``200``, and ``invalid_request`` is a distinct code it can tell apart from
     every server-side state.
 
+    **The readiness probe runs in a worker thread.** :func:`_vault_is_usable` is
+    entirely blocking filesystem I/O — config read and YAML parse, a stat, and
+    an audit append that holds a thread lock and an ``fcntl`` exclusive lock
+    across an ``fsync``. Called inline it would stop the event loop, so one
+    consumer's slow audit log would stall every other connection this process is
+    serving, on the endpoint every client calls *first*. Exception behaviour is
+    unchanged: the ``_UNREADABLE_CONFIG`` catches sit inside that function and
+    anything they do not catch propagates back out through the ``await``.
+
+    It is also what lets
+    :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware` fire
+    at all: ``fail_after`` is a cancel scope evaluated *on the loop*, so with the
+    loop blocked the deadline could never be reached, let alone enforced. Be
+    clear about what that buys and what it does not — anyio cannot cancel a
+    worker thread, so on timeout the request is abandoned while the append runs
+    to completion in the background. That is strictly better than a deadline
+    that cannot fire, not a cancellation.
+
+    :func:`starlette.concurrency.run_in_threadpool` rather than
+    :func:`anyio.to_thread.run_sync`: ``starlette`` is a declared dependency of
+    this package and ``anyio`` reaches it only as a transitive, so importing
+    anyio directly here would deepen an undeclared-dependency defect that is
+    tracked separately.
+
     Args:
         request: The request in flight.
 
@@ -277,5 +314,5 @@ async def handle_capabilities(request: Request) -> Response:
         The handshake response.
     """
     context = context_of(request.scope)
-    available = _vault_is_usable(request, context)
+    available = await run_in_threadpool(_vault_is_usable, request, context)
     return _render(_status_for(request, available=available), available=available)

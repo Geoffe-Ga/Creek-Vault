@@ -292,12 +292,46 @@ The concurrency limit is process-global, not per-consumer, so one consumer can
 in principle starve the others; per-consumer rate limiting is a tracked
 follow-up.
 
+**The per-request timeout is a cancel scope evaluated on the event loop**,
+so it can only fire while the loop is free to run it. That is why
+`GET /v1/capabilities`'s readiness probe is dispatched to a worker thread
+rather than awaited inline — otherwise a blocked loop would mean the
+deadline could never be reached, let alone enforced, on the one endpoint
+every client calls first. Be precise about what that buys: anyio cannot
+cancel a worker thread, so on timeout the request is abandoned at the HTTP
+layer while the filesystem work it kicked off keeps running to completion in
+the background. That is strictly better than a deadline that cannot fire at
+all — but it is not cancellation, and no code here should be read as
+promising that it is.
+
 ### Request logging
 
 One structured line per request carrying method, **route template**, consumer,
 status and duration. It never records a request body, a token, or a fragment id
 — and it logs the route *template* (`/v1/journal-entries/{external_id}`), never
-the concrete path, so an identifier can never reach the log through the URL.
+the concrete path, so an identifier does not reach this log through the URL.
+That sentence is about *this* log line; the two paragraphs below say what it
+takes for the process as a whole to keep the promise, and where the promise
+stops. Read all three, because the first on its own was once true of Creek's
+own middleware while the process still published identifiers elsewhere.
+
+**That guarantee is about the whole process, not just Creek's own
+middleware.** `creek-tools-api` starts uvicorn with `access_log=False`,
+because uvicorn ships its own access logger — on by default — that runs
+*alongside* the middleware above, not instead of it, and writes the client
+address and the concrete path with its query string on every request:
+`INFO: 127.0.0.1:59272 - "PUT /v1/journal-entries/zz-sentinel-external-id-9x7q-zz HTTP/1.1" 501 Not Implemented`.
+Left on, that second logger would republish the caller's IP and a
+consumer-chosen identifier on every sync — making the promise above false
+without a single line of Creek's own code being wrong.
+
+**Scope: this is a promise about `creek-tools-api` itself, not about
+whatever sits in front of it.** A reverse proxy, load balancer, or TLS
+terminator placed in front of this server logs the full request line by
+default, and that log lives outside this process — nothing here can redact
+it. An operator who fronts `creek-tools-api` with one must suppress or
+template the path at that layer too; the guarantee above does not, and
+cannot, reach past the process boundary.
 
 This is ordinary stdlib logging, deliberately **not** the vault audit log. An
 audit entry per request would put a hash-chained write on an unauthenticated

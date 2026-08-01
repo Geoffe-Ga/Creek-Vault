@@ -14,7 +14,17 @@ each:
   temporarily_unavailable``, and the concurrency semaphore is *released* on the
   exception and timeout paths. A semaphore that leaks on the failure path
   converts one bad request into a permanently dead server, which is the
-  failure the limit was installed to prevent.
+  failure the limit was installed to prevent. And no handler may do its
+  blocking work **on the event loop thread**: ``GET /v1/capabilities`` reaches
+  :meth:`creek_mcp.audit.MCPAuditLog.append`, which takes a thread lock and an
+  ``fcntl`` exclusive lock across an ``fsync`` — and builds a fresh log object,
+  so it re-reads the whole file — per request. Run inline, that stalls *every*
+  other in-flight request for the duration, and it is the first endpoint any
+  client calls, which makes it the worst place in the surface to serialise the
+  server. It is pinned two ways, because "the endpoint returned ``200``" is
+  equally true of the blocking implementation: the handshake must run
+  off-loop, and the loop must demonstrably answer a second request while the
+  handshake is still blocked.
 * **Faults.** An unhandled exception is ``500 internal_error`` with the
   published envelope and nothing else. No traceback, no exception class name,
   no file path — those are the three things a default framework error page
@@ -35,8 +45,10 @@ middleware fault is logged and enveloped.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -45,6 +57,7 @@ from anyio.to_thread import run_sync
 from starlette.responses import JSONResponse
 
 from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
+from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi.auth import BearerAuthMiddleware
 from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME
@@ -58,6 +71,7 @@ from creek_mcp.httpapi.middleware.limits import (
 )
 from tests.v1_api_support import (
     ANONYMOUS_CONSUMER,
+    CAPABILITIES_PATH,
     CONSUMER,
     HEALTH_PATH,
     JOURNAL_TEMPLATE,
@@ -79,6 +93,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+_OK_STATUS: Final[int] = 200
 _INVALID_REQUEST_STATUS: Final[int] = 422
 _UNAVAILABLE_STATUS: Final[int] = 503
 _INTERNAL_ERROR_STATUS: Final[int] = 500
@@ -87,6 +102,14 @@ _UNAUTHENTICATED_STATUS: Final[int] = 401
 
 _SMALL_LIMIT: Final[int] = 64
 """A tiny body cap, so the size tests stay in-memory and instant."""
+
+_CHUNK_BYTES: Final[int] = 16
+"""How many bytes each streamed chunk carries.
+
+Smaller than :data:`_SMALL_LIMIT`, so the cap is crossed *between* chunks and
+the streaming path is genuinely exercised rather than short-circuited by a
+single oversized read.
+"""
 
 _TINY_TIMEOUT: Final[float] = 0.01
 """Short enough that the timeout test costs milliseconds, not seconds."""
@@ -118,6 +141,43 @@ def _body_of_exactly(size: int) -> bytes:
     padding = size - len(prefix) - len(suffix)
     assert padding > 0, "size must leave room for the JSON scaffolding"
     return prefix + b"x" * padding + suffix
+
+
+def _oversize_body_carrying_the_sentinel() -> bytes:
+    """Return a body far over the cap whose *first* content bytes are sensitive.
+
+    The sentinel leads the payload deliberately. Whatever the limit reads
+    before refusing — the declared length, one chunk, or the lot — it has
+    demonstrably held this string in memory, which is what makes "it never
+    reached the log" a claim about the log rather than about how little was
+    read.
+
+    Returns:
+        A JSON object several times :data:`_SMALL_LIMIT` in length.
+    """
+    return (
+        b'{"content":"'
+        + _SENTINEL_BODY.encode()
+        + b"x" * (_SMALL_LIMIT * 4)
+        + b'","max_notes":3}'
+    )
+
+
+def _streamed(payload: bytes) -> Iterator[bytes]:
+    """Yield *payload* in :data:`_CHUNK_BYTES` pieces, forcing chunked encoding.
+
+    ``httpx`` sets ``Content-Length`` for a ``bytes`` body and
+    ``Transfer-Encoding: chunked`` for an iterable one, so driving the body
+    from a generator is what selects the *undeclared-length* code path.
+
+    Args:
+        payload: The full body to stream.
+
+    Yields:
+        Successive chunks of *payload*.
+    """
+    for offset in range(0, len(payload), _CHUNK_BYTES):
+        yield payload[offset : offset + _CHUNK_BYTES]
 
 
 # --------------------------------------------------------------------------- #
@@ -193,16 +253,10 @@ def test_an_undeclared_chunked_oversize_body_is_refused(vault: Path) -> None:
         vault: A seeded vault.
     """
 
-    def _chunks() -> Iterator[bytes]:
-        """Yield the oversize body in pieces, forcing chunked encoding."""
-        payload = _body_of_exactly(_SMALL_LIMIT * 4)
-        for offset in range(0, len(payload), 16):
-            yield payload[offset : offset + 16]
-
     with client(vault_path=vault, max_body_bytes=_SMALL_LIMIT) as test_client:
         response = test_client.post(
             REFLECTIONS_PATH,
-            content=_chunks(),
+            content=_streamed(_body_of_exactly(_SMALL_LIMIT * 4)),
             headers={**headers(ceiling="open"), "Content-Type": "application/json"},
         )
     assert "content-length" not in {k.lower() for k in response.request.headers}
@@ -239,19 +293,48 @@ def test_an_oversize_body_writes_no_log_line_carrying_its_content(
         caplog: Captures the access log.
     """
     caplog.set_level(logging.INFO, logger=ACCESS_LOGGER_NAME)
-    payload = (
-        b'{"content":"'
-        + _SENTINEL_BODY.encode()
-        + b"x" * (_SMALL_LIMIT * 4)
-        + b'","max_notes":3}'
-    )
     with client(vault_path=vault, max_body_bytes=_SMALL_LIMIT) as test_client:
         test_client.post(
             REFLECTIONS_PATH,
-            content=payload,
+            content=_oversize_body_carrying_the_sentinel(),
             headers={**headers(ceiling="open"), "Content-Type": "application/json"},
         )
     assert _SENTINEL_BODY not in caplog.text
+
+
+def test_an_oversize_streamed_body_writes_no_log_line_carrying_its_content(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same promise on the *undeclared-length* path, which is a different one.
+
+    The test above sends ``bytes``, so ``httpx`` declares a ``Content-Length``
+    and the limit refuses on the header alone — the body is never buffered, and
+    "the content did not reach the log" is nearly free. A streamed body has no
+    length header at all, so the middleware has to accumulate chunks in
+    ``_buffer_within`` until the cap is crossed. That is the path on which the
+    server genuinely holds the caller's content, and therefore the path on
+    which a well-meant "log what we refused" would actually leak something.
+
+    The structured fields are swept as well as the rendered message: a leak
+    into ``extra=`` payload never appears in ``caplog.text``.
+
+    Args:
+        vault: A seeded vault.
+        caplog: Captures the access log.
+    """
+    caplog.set_level(logging.DEBUG, logger=ACCESS_LOGGER_NAME)
+    with client(vault_path=vault, max_body_bytes=_SMALL_LIMIT) as test_client:
+        response = test_client.post(
+            REFLECTIONS_PATH,
+            content=_streamed(_oversize_body_carrying_the_sentinel()),
+            headers={**headers(ceiling="open"), "Content-Type": "application/json"},
+        )
+    assert "content-length" not in {k.lower() for k in response.request.headers}
+    assert response.status_code == _INVALID_REQUEST_STATUS
+    assert _SENTINEL_BODY not in caplog.text
+    assert all(
+        _SENTINEL_BODY not in str(record.__dict__) for record in _access_records(caplog)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -421,6 +504,238 @@ def test_the_semaphore_is_released_after_a_timeout(
         after = test_client.get(HEALTH_PATH, headers=headers())
     assert timed_out.status_code == _UNAVAILABLE_STATUS
     assert after.status_code == _UNAVAILABLE_STATUS
+
+
+def _a_running_loop_is_visible() -> bool:
+    """Return whether the calling thread is currently running an event loop.
+
+    Stdlib only, deliberately. ``sniffio`` would answer the same question more
+    prettily, but it reaches this environment as an undeclared transitive of
+    ``anyio``; a test that depended on it would break on a dependency change
+    that has nothing to do with the invariant.
+
+    Returns:
+        ``True`` when :func:`asyncio.get_running_loop` succeeds — i.e. the
+        caller is executing *on* the loop thread rather than in a worker.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+class _HandshakeProbe:
+    """A synchronous stand-in for ``handshake_tool`` that reports where it ran.
+
+    The real tool is slow for structural reasons rather than incidental ones:
+    :meth:`creek_mcp.audit.MCPAuditLog.append` takes a thread lock and an
+    ``fcntl`` exclusive lock across an ``fsync``, and a fresh log object is
+    built per request so the whole file is re-read. So the question is never
+    "is it fast enough" — it is "is it on the event loop", and that is a fact
+    about the calling thread which :func:`_a_running_loop_is_visible` answers
+    exactly.
+
+    Attributes:
+        entered: Set the moment the stand-in is called, so a test knows the
+            handshake is genuinely in flight before it does anything else.
+        release: Waited on when the probe blocks, so the scenario ends when the
+            test says so rather than after a sleep.
+        ran_on_the_event_loop: ``None`` until called, then whether a running
+            event loop was visible from the thread that called it.
+    """
+
+    def __init__(self, *, blocks: bool) -> None:
+        """Create the stand-in.
+
+        Args:
+            blocks: Whether to hold until :attr:`release` is set. The
+                off-loop question does not need blocking to answer; the
+                ordering proof does.
+        """
+        self._blocks = blocks
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.ran_on_the_event_loop: bool | None = None
+
+    def __call__(self, **_kwargs: object) -> dict[str, object]:
+        """Record the calling context, optionally block, then report available.
+
+        Args:
+            **_kwargs: The tool's keyword arguments — vault path, capabilities,
+                server name, ceiling, consumer — none of which this stands in
+                for.
+
+        Returns:
+            A mapping carrying ``available``, which is the one key
+            ``_negotiate`` reads out of the tool's result.
+        """
+        self.ran_on_the_event_loop = _a_running_loop_is_visible()
+        self.entered.set()
+        if self._blocks:
+            self.release.wait(_JOIN_TIMEOUT)
+        return {"available": True}
+
+
+def test_the_capabilities_handshake_never_runs_on_the_event_loop_thread(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /v1/capabilities`` must do its blocking work in a worker thread.
+
+    ``handle_capabilities`` is a coroutine, but the work underneath it is
+    synchronous and takes two locks across an ``fsync``. Called inline, it does
+    not merely make *this* request slow — it stops the loop, so every other
+    connection the process is serving waits for a file lock on somebody's audit
+    log. And this is the endpoint every client calls first.
+
+    Asserting the status alone would not see any of that: the blocking
+    implementation returns exactly the same ``200``. What distinguishes them is
+    *where the call happened*, so that is what is asserted, from the stdlib.
+
+    The body assertion is the non-vacuity half: it proves the stand-in was
+    actually reached through the production path and its verdict consumed,
+    rather than the request having taken some route that never negotiated.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the handshake tool for the probe.
+    """
+    probe = _HandshakeProbe(blocks=False)
+    monkeypatch.setattr(capabilities_module, "handshake_tool", probe)
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _OK_STATUS
+    assert envelope(response)["vault"] == {"available": True}
+    assert probe.ran_on_the_event_loop is False
+
+
+class _SeamProbe:
+    """A stand-in for one blocking seam that reports where it was called.
+
+    Deliberately dumber than :class:`_HandshakeProbe`: it never blocks, because
+    the question it answers — which thread ran it — is settled the instant it is
+    entered.
+
+    Attributes:
+        ran_on_the_event_loop: ``None`` until called, then whether a running
+            event loop was visible from the calling thread.
+    """
+
+    def __init__(self, result: object) -> None:
+        """Create the stand-in.
+
+        Args:
+            result: What to return, standing in for the real seam's value.
+        """
+        self._result = result
+        self.ran_on_the_event_loop: bool | None = None
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        """Record the calling context and return the canned result.
+
+        Args:
+            *_args: The real seam's positional arguments, unused.
+            **_kwargs: The real seam's keyword arguments, unused.
+
+        Returns:
+            The canned result this probe was built with.
+        """
+        self.ran_on_the_event_loop = _a_running_loop_is_visible()
+        return self._result
+
+
+def test_every_blocking_seam_of_the_readiness_probe_runs_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All three blocking seams, not just the audited one.
+
+    ``_vault_is_usable`` reaches filesystem I/O three separate ways: it reads
+    and parses ``creek_config.yaml`` (``load_config``), stats the vault marker
+    (``vault_available``), and appends to the audit log under two locks and an
+    ``fsync`` (``handshake_tool``). The test above pins only the last of them,
+    so an implementation that hoisted ``_negotiate`` alone — the narrowest
+    reading of the defect — would satisfy it while still reading and parsing a
+    YAML file on the event loop of every request.
+
+    This pins the *scope* of the hoist rather than its existence, which is the
+    property that would otherwise rot silently: nothing about a narrowed hoist
+    looks wrong at the call site, and no other test in the suite can tell.
+
+    ``vault_path=None`` is what routes the request through ``load_config`` at
+    all; with a vault configured on the app, ``_configured_vault`` returns early
+    and that seam is never reached.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps all three seams for probes.
+    """
+    probes = {
+        "load_config": _SeamProbe(SimpleNamespace(vault_path=vault)),
+        "vault_available": _SeamProbe(True),
+        "handshake_tool": _SeamProbe({"available": True}),
+    }
+    for name, probe in probes.items():
+        monkeypatch.setattr(capabilities_module, name, probe)
+
+    with client(vault_path=None) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+
+    assert response.status_code == _OK_STATUS
+    assert envelope(response)["vault"] == {"available": True}
+    assert {name: probe.ran_on_the_event_loop for name, probe in probes.items()} == {
+        "load_config": False,
+        "vault_available": False,
+        "handshake_tool": False,
+    }
+
+
+def test_the_event_loop_serves_another_request_while_the_handshake_blocks(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The consequence, proved by ordering rather than by a clock.
+
+    A holder thread issues ``GET /v1/capabilities`` and the handshake stops
+    dead inside it. The main thread then issues ``GET /v1/health`` — an
+    unrelated route that touches nothing — and only afterwards releases the
+    gate. If the handshake is off-loop, health is answered while capabilities
+    is still blocked and the completion order is ``health`` then
+    ``capabilities``. If the handshake is on-loop, health cannot be answered at
+    all until the gate self-releases, and the order inverts.
+
+    Deliberately **not** a duration assertion. "Health answered in under N
+    milliseconds" is the same claim with a threshold bolted on, and a threshold
+    is a flake on a loaded CI runner. The ordering is the claim itself, and it
+    has no timing constant in it: the probe's own timeout exists only so a
+    regression fails the run instead of hanging it.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the handshake tool for the blocking probe.
+    """
+    probe = _HandshakeProbe(blocks=True)
+    monkeypatch.setattr(capabilities_module, "handshake_tool", probe)
+    order: list[str] = []
+
+    with client(vault_path=vault) as test_client:
+
+        def _hold() -> None:
+            """Run the capabilities request whose handshake blocks."""
+            test_client.get(CAPABILITIES_PATH, headers=headers())
+            order.append("capabilities")
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        try:
+            assert probe.entered.wait(_JOIN_TIMEOUT), "the handshake never started"
+            health = test_client.get(HEALTH_PATH, headers=headers())
+            order.append("health")
+        finally:
+            probe.release.set()
+            holder.join(_JOIN_TIMEOUT)
+
+    assert not holder.is_alive()
+    assert health.status_code == _OK_STATUS
+    assert order == ["health", "capabilities"]
 
 
 # --------------------------------------------------------------------------- #
