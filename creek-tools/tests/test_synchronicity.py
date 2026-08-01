@@ -8,8 +8,9 @@ and create_synchronicity_note (writing reflection notes to
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
+from zoneinfo import ZoneInfo
 
 import frontmatter
 import pytest
@@ -575,6 +576,82 @@ class TestEffectiveAuthoredAtPrecedence:
         assert "2025-01-05" in body
         assert "2025-04-20" in body
         assert ingest_moment.date().isoformat() not in body
+
+
+# ---- Issue #976: mixed naive / aware vaults ----
+
+
+class TestMixedNaiveAndAwareTimestamps:
+    """A vault mixing offsetless and offset-carrying timestamps still detects.
+
+    This is the consumer-side regression for issue #976. The fixtures
+    above feed naive datetimes on *both* sides of every pair, so they
+    never compare a naive value against an aware one and the suite stayed
+    green while the defect was live. A real vault is not so tidy: journal
+    frontmatter written as ``ingested: 2024-01-01 09:00:00`` (naive, per
+    PyYAML) sits next to a Substack fragment whose ``authored_at`` was
+    extracted with a real offset. Detection then walked into
+    ``TypeError: can't compare offset-naive and offset-aware datetimes``
+    in :meth:`SynchronicityDetector._chronological_pair`, killing the
+    whole ``creek report --type synchronicity`` run rather than one pair.
+
+    ``detect_synchronicities`` is the cheapest public entry point that
+    reproduces it: it accepts the legacy ``(id_a, id_b, similarity)``
+    tuple, so two fragments and one tuple exercise the crash with no
+    embeddings, no LLM, and no I/O.
+    """
+
+    def test_mixed_naive_and_aware_vault_yields_synchronicity(
+        self,
+        detector: SynchronicityDetector,
+    ) -> None:
+        """A naive-``ingested`` fragment pairs with an aware-``authored_at`` one.
+
+        Asserts the *result*, not merely that nothing raised: a
+        "does not raise" test would be exactly the vacuousness issue
+        #976 is about. The expected gap is computed from the coerced
+        instants — 2024-01-01 09:00 anchored to LA (17:00Z) against
+        2024-06-01 09:00 in Sydney (2024-05-31 23:00Z) — which is 151
+        days and 6 hours, so ``time_gap_days`` is 151.
+
+        The gap alone does *not* separate the correct
+        ``replace(tzinfo=LA_TZ)`` coercion from an ``astimezone``-based
+        one: the ``astimezone`` variant only shifts this gap to 152 on
+        hosts at UTC+12 or further east (Pacific/Auckland,
+        Pacific/Kiritimati), so it survives here on every realistic dev
+        or CI host. That variant is killed instead by
+        ``test_naive_coercion_preserves_the_wall_clock`` in
+        ``tests/test_time.py``, which pins the wall-clock fields rather
+        than an elapsed gap.
+        """
+        sydney = ZoneInfo("Australia/Sydney")
+        naive_journal = _make_fragment(
+            frag_id="frag-naive-ingested",
+            title="the kettle boils in an empty kitchen",
+            platform=SourcePlatform.JOURNAL,
+            created=datetime(2024, 1, 1, 9, 0, 0),
+        )
+        aware_substack = _authored_fragment(
+            frag_id="frag-aware-authored",
+            title="a bell rung twice at the edge of sleep",
+            platform=SourcePlatform.SUBSTACK,
+            ingest_moment=datetime(2024, 6, 2, 12, 0, 0, tzinfo=UTC),
+            authored_at=datetime(2024, 6, 1, 9, 0, 0, tzinfo=sydney),
+        )
+        fragments = {
+            naive_journal.id: naive_journal,
+            aware_substack.id: aware_substack,
+        }
+        resonances = [("frag-naive-ingested", "frag-aware-authored", 0.95)]
+
+        result = detector.detect_synchronicities(resonances, fragments)
+
+        assert len(result) == 1
+        # The naive-timestamped fragment is the earlier of the two once
+        # both sides are comparable, so it lands in ``fragment_a_id``.
+        assert result[0].fragment_a_id == "frag-naive-ingested"
+        assert result[0].fragment_b_id == "frag-aware-authored"
+        assert result[0].time_gap_days == 151
 
 
 # ---- FEAT-024 cross-level ranking ----

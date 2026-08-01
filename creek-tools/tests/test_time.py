@@ -1,6 +1,6 @@
 """Regression tests for ``creek.time`` and the BUG-002 timezone sweep.
 
-These tests pin two facts that earlier code regressed on:
+These tests pin the facts that earlier code regressed on:
 
 1. The :func:`creek.time.now_la` helper returns a tz-aware datetime
    anchored to America/Los_Angeles.
@@ -11,6 +11,10 @@ These tests pin two facts that earlier code regressed on:
 4. :func:`creek.time.effective_authored_at` codifies the FEAT-031
    precedence (``authored_at`` → ``ingested``) that every time-bucket
    surface routes through.
+5. :class:`creek.models.Fragment` anchors a naive ``created`` /
+   ``ingested`` / ``authored_at`` to America/Los_Angeles at validation
+   time (issue #976), so offsetless YAML frontmatter cannot smuggle a
+   naive datetime into a vault that also holds tz-aware ones.
 """
 
 from __future__ import annotations
@@ -108,14 +112,24 @@ class TestFragmentDefaultTimestamps:
         assert frag.ingested.tzinfo is not None
 
     def test_fragment_default_timestamps_are_la(self) -> None:
-        """Fragment defaults agree with the LA timezone."""
+        """Fragment defaults agree with the LA timezone.
+
+        Post-#976 this is the only test pinning the default path:
+        ``default_factory=now_la`` values never reach
+        ``Fragment._normalise_timestamp`` because Pydantic does not run
+        field validators over defaults. The defaults therefore have to
+        be LA-aware on their own, and a future change that moved the LA
+        anchoring *into* the validator would leave them naive with
+        nothing else to catch it.
+        """
         frag = Fragment(
             id="frag-test1234",
             title="t",
             source=FragmentSource(platform=SourcePlatform.OTHER),
         )
-        la_offset = ZoneInfo("America/Los_Angeles").utcoffset(frag.created)
-        assert frag.created.utcoffset() == la_offset
+        la = ZoneInfo("America/Los_Angeles")
+        assert frag.created.utcoffset() == la.utcoffset(frag.created)
+        assert frag.ingested.utcoffset() == la.utcoffset(frag.ingested)
 
 
 class TestThreadEddyDecisionDefaults:
@@ -223,18 +237,28 @@ class TestEffectiveAuthoredAt:
     def test_result_is_always_tz_aware(self) -> None:
         """Neither branch produces a naive datetime — invariant for downstream.
 
-        Fragment validates that ``ingested`` and ``authored_at`` (when
-        present) are tz-aware via Pydantic's datetime parsing for both
-        defaults and round-tripped YAML values, so this helper inherits
-        the invariant. Pin it here so a future change to the model can't
-        silently break temporal-linker comparisons.
+        The enforcer is :class:`~creek.models.Fragment`'s field
+        validator over ``created`` / ``ingested`` / ``authored_at``
+        (issue #976), **not** Pydantic's datetime parsing: Pydantic
+        happily accepts an offsetless value and stores it naive, which
+        is exactly what PyYAML hands back for a frontmatter line like
+        ``ingested: 2024-01-01 12:00:00``. So both branches are fed
+        *naive* inputs here — the shape that actually reaches the model
+        off disk — and both must come back anchored to LA. Asserting
+        only ``tzinfo is not None`` off an already-aware input would be
+        vacuous; the offset assertion pins where it lands.
         """
-        authored = datetime(2024, 3, 15, tzinfo=UTC)
-        ingested = datetime(2026, 5, 24, tzinfo=UTC)
+        authored = datetime(2024, 3, 15)
+        ingested = datetime(2026, 5, 24)
         with_authored = self._frag(authored_at=authored, ingested=ingested)
         without_authored = self._frag(authored_at=None, ingested=ingested)
-        assert effective_authored_at(with_authored).tzinfo is not None
-        assert effective_authored_at(without_authored).tzinfo is not None
+        from_authored = effective_authored_at(with_authored)
+        from_ingested = effective_authored_at(without_authored)
+        la = ZoneInfo("America/Los_Angeles")
+        assert from_authored.tzinfo is not None
+        assert from_ingested.tzinfo is not None
+        assert from_authored.utcoffset() == la.utcoffset(from_authored)
+        assert from_ingested.utcoffset() == la.utcoffset(from_ingested)
 
 
 class TestEffectiveAuthoredDate:
@@ -337,6 +361,202 @@ class TestEnsureAware:
         assert future >= reference
         assert reference >= past
         assert reference < future
+
+
+class TestFragmentTimestampNormalisation:
+    """``Fragment`` anchors naive timestamps to LA at validation (issue #976).
+
+    Vault frontmatter routinely carries offsetless timestamps
+    (``ingested: 2024-01-01 12:00:00``), which PyYAML parses into a
+    *naive* :class:`~datetime.datetime`. Before #976 the model stored
+    that verbatim, so a vault mixing offsetless and offset-carrying
+    timestamps raised ``TypeError: can't compare offset-naive and
+    offset-aware datetimes`` at whichever consumer compared them first
+    (:class:`~creek.generate.synchronicity.SynchronicityDetector` is the
+    reproducer). :func:`creek.time.ensure_aware` was the repair valve
+    but had no caller on the load path; the model is now the chokepoint,
+    so no downstream surface has to remember to repair anything.
+
+    The contract inherits ``ensure_aware``'s asymmetry: naive in →
+    *attach* LA (wall clock preserved); aware in → untouched, zone and
+    microseconds intact; ``None`` in → still ``None``.
+    """
+
+    def test_naive_ingested_is_anchored_to_la(self) -> None:
+        """A naive ``ingested`` comes back anchored to America/Los_Angeles."""
+        frag = Fragment(
+            id="frag-tznorm0001",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            ingested=datetime(2025, 4, 20, 10, 0, 0),
+        )
+        la = ZoneInfo("America/Los_Angeles")
+        assert frag.ingested.tzinfo is not None
+        assert frag.ingested.utcoffset() == la.utcoffset(frag.ingested)
+
+    def test_naive_created_is_anchored_to_la(self) -> None:
+        """A naive ``created`` comes back anchored to America/Los_Angeles."""
+        frag = Fragment(
+            id="frag-tznorm0002",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            created=datetime(2025, 4, 20, 10, 0, 0),
+        )
+        la = ZoneInfo("America/Los_Angeles")
+        assert frag.created.tzinfo is not None
+        assert frag.created.utcoffset() == la.utcoffset(frag.created)
+
+    def test_naive_authored_at_is_anchored_to_la(self) -> None:
+        """A naive ``authored_at`` comes back anchored to America/Los_Angeles.
+
+        ``authored_at`` needs its own case because it is the only one of
+        the three that is ``datetime | None`` — a validator written for
+        the two non-optional fields could easily be left off it, and it
+        is the field :func:`effective_authored_at` prefers.
+        """
+        frag = Fragment(
+            id="frag-tznorm0003",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=datetime(2025, 4, 20, 10, 0, 0),
+        )
+        la = ZoneInfo("America/Los_Angeles")
+        assert frag.authored_at is not None
+        assert frag.authored_at.tzinfo is not None
+        assert frag.authored_at.utcoffset() == la.utcoffset(frag.authored_at)
+
+    def test_naive_coercion_preserves_the_wall_clock(self) -> None:
+        """The zone is *attached*, never converted — 23:00 stays 23:00.
+
+        This is the assertion that catches an ``astimezone()``
+        implementation. ``astimezone`` on a naive value interprets it in
+        the host timezone and then shifts the clock, so 23:00 on the
+        28th becomes 16:00 on the 28th (or 06:00 on the 29th, depending
+        on the host) — silently moving fragments across a day boundary
+        and corrupting every date-bucketed surface. Only the
+        wall-clock-preserving ``replace(tzinfo=...)`` behaviour of
+        :func:`creek.time.ensure_aware` satisfies both halves of this
+        test.
+        """
+        frag = Fragment(
+            id="frag-tznorm0004",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            ingested=datetime(2026, 7, 28, 23, 0, 0, 123456),
+        )
+        ingested = frag.ingested
+        la = ZoneInfo("America/Los_Angeles")
+        assert ingested.utcoffset() == la.utcoffset(ingested)
+        assert (ingested.year, ingested.month, ingested.day) == (2026, 7, 28)
+        assert (ingested.hour, ingested.minute, ingested.second) == (23, 0, 0)
+        assert ingested.microsecond == 123456
+
+    def test_iso_string_without_offset_is_anchored_to_la(self) -> None:
+        """An offsetless ISO-8601 *string* is anchored too — after, not before.
+
+        Load-bearing: this is the only case that distinguishes a
+        ``mode="after"`` validator from a ``mode="before"`` one. A
+        before-validator runs on the raw ``str`` and never sees a
+        :class:`~datetime.datetime` at all, so it would hand the string
+        to Pydantic untouched and the parsed result would stay naive.
+        Frontmatter quoted as ``ingested: "2025-04-20T10:00:00"`` (or
+        any JSON round-trip of a fragment) arrives in exactly this shape.
+        """
+        frag = Fragment.model_validate(
+            {
+                "type": "fragment",
+                "id": "frag-tznorm0005",
+                "title": "t",
+                "source": {"platform": "other"},
+                "ingested": "2025-04-20T10:00:00",
+            },
+        )
+        la = ZoneInfo("America/Los_Angeles")
+        assert frag.ingested.tzinfo is not None
+        assert frag.ingested.utcoffset() == la.utcoffset(frag.ingested)
+
+    def test_naive_datetime_from_yaml_mapping_is_anchored_to_la(self) -> None:
+        """A naive ``datetime`` inside a validated mapping is anchored.
+
+        The PyYAML shape: ``creek.vault.reader.try_load_fragment`` calls
+        ``Fragment.model_validate`` on the parsed frontmatter mapping,
+        in which an unquoted ``ingested: 2025-04-20 10:00:00`` has
+        already become a naive ``datetime`` object. Pinned separately
+        from the keyword-constructor cases so a validator that somehow
+        only fires on one entry point cannot pass.
+        """
+        frag = Fragment.model_validate(
+            {
+                "type": "fragment",
+                "id": "frag-tznorm0006",
+                "title": "t",
+                "source": {"platform": "other"},
+                "ingested": datetime(2025, 4, 20, 10, 0, 0),
+            },
+        )
+        la = ZoneInfo("America/Los_Angeles")
+        assert frag.ingested.tzinfo is not None
+        assert frag.ingested.utcoffset() == la.utcoffset(frag.ingested)
+
+    def test_aware_sydney_authored_at_is_untouched(self) -> None:
+        """An already-aware ``authored_at`` keeps its own zone, not LA.
+
+        The other half of the asymmetric contract: coercion must not
+        become normalisation. A Substack post authored in Sydney keeps
+        its Sydney rendering, matching the promise
+        :func:`effective_authored_at` already makes to callers that
+        display source-local time.
+        """
+        sydney = ZoneInfo("Australia/Sydney")
+        authored = datetime(2024, 3, 15, 8, 30, 45, 123456, tzinfo=sydney)
+        frag = Fragment(
+            id="frag-tznorm0007",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=authored,
+        )
+        assert frag.authored_at is not None
+        assert frag.authored_at == authored
+        assert frag.authored_at.tzinfo == sydney
+        assert frag.authored_at.hour == 8
+        assert frag.authored_at.microsecond == 123456
+
+    def test_aware_utc_ingested_is_untouched(self) -> None:
+        """An already-aware ``ingested`` passes straight through in UTC.
+
+        Covers the aware branch on a non-optional field (the Sydney case
+        covers it on the optional one), so both sides of the validator's
+        branch are exercised rather than only the naive path.
+        """
+        moment = datetime(2026, 5, 24, 6, 0, 0, 654321, tzinfo=UTC)
+        frag = Fragment(
+            id="frag-tznorm0008",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            ingested=moment,
+        )
+        assert frag.ingested == moment
+        assert frag.ingested.tzinfo == UTC
+        assert frag.ingested.hour == 6
+        assert frag.ingested.microsecond == 654321
+
+    def test_authored_at_none_is_preserved(self) -> None:
+        """``authored_at=None`` stays ``None`` — the validator never invents one.
+
+        ``None`` is the honest answer when no source date is
+        extractable. A validator that reached for ``now_la()`` on the
+        ``None`` branch would fabricate an authored date for every
+        fragment whose source has none, which
+        :func:`effective_authored_at` would then prefer over the real
+        ``ingested`` value — silently re-dating the whole vault.
+        """
+        frag = Fragment(
+            id="frag-tznorm0009",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=None,
+        )
+        assert frag.authored_at is None
 
 
 @pytest.mark.parametrize("tz_env", ["UTC", "Asia/Tokyo", "America/New_York"])
