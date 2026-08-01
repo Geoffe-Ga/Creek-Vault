@@ -10,6 +10,20 @@ on:
     #   - "src/**/*.js"
     #   - "src/**/*.jsx"
 
+# One review per ref. This workflow only ever runs on `pull_request`, so an
+# unconditional cancel is correct here — but it is written the same way as
+# ci.yml's on purpose, so neither file grows a rule the other lacks if a
+# non-PR trigger is ever added.
+#
+# Why it matters: every push to a lane invalidates the previous LGTM under
+# pr-ready.sh's stale-verdict guard, so a superseded review is not merely
+# wasted Claude time — its verdict can never gate anything. Letting it run to
+# completion also posts a verdict comment against an already-dead HEAD, which
+# is noise on the very PR thread a human reads to see what happened (#1140).
+concurrency:
+  group: claude-review-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   claude-review:
     # Skip runs Dependabot itself TRIGGERED — keyed on the actor, not the PR's

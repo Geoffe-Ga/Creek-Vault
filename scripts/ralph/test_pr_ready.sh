@@ -131,9 +131,25 @@ cat > "$BIN/gh" <<'STUB'
 args="$*"
 case "$args" in
   "api "*"compare"*)
-    [[ -n "${COMPARE_SENTINEL:-}" ]] && : > "$COMPARE_SENTINEL"
-    printf '%s\n' "${BEHIND_BY-0}"
-    exit "${COMPARE_EC:-0}" ;;
+    # Three compare calls now, told apart by the --jq the caller passes and by
+    # the range. The behind_by/merge-base probe is the only one a lane that is
+    # already current ever makes; the two file listings are paid only by a lane
+    # that is genuinely behind.
+    if [[ "$args" == *"behind_by"* ]]; then
+      [[ -n "${COMPARE_SENTINEL:-}" ]] && : > "$COMPARE_SENTINEL"
+      printf '%s|%s\n' "${BEHIND_BY-0}" "${MERGE_BASE-abc1234}"
+      exit "${COMPARE_EC:-0}"
+    fi
+    [[ -n "${FILES_SENTINEL:-}" ]] && : > "$FILES_SENTINEL"
+    # `<merge base>...<base>` is what MAIN landed; anything else is `<base>...<head>`,
+    # what THIS BRANCH changed. Both are comma-separated in the fixture and split
+    # to lines here, because a filename cannot contain a comma in these tests.
+    if [[ "$args" == *"compare/${MERGE_BASE-abc1234}..."* ]]; then
+      [[ -n "${THEIR_FILES-}" ]] && printf '%s' "${THEIR_FILES-}" | tr ',' '\n'
+      exit "${THEIR_FILES_EC:-0}"
+    fi
+    [[ -n "${OUR_FILES-}" ]] && printf '%s' "${OUR_FILES-}" | tr ',' '\n'
+    exit "${OUR_FILES_EC:-0}" ;;
   *"pr checks"*)
     if [[ "${CHECKS_NO_CHECKS:-0}" == "1" ]]; then
       echo "no checks reported on the 'feature-x' branch" >&2
@@ -399,15 +415,99 @@ check "changelog noise: hold on an upstream #456 is not ours → ready" "ready" 
 # main: GitHub only says BEHIND when the base branch requires strict up-to-date
 # merging. So `ready` must ask the compare API for `behind_by` directly, or the
 # loop merges branches that never ran against current main.
-check "green + CLEAN + fresh LGTM but 22 behind → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 run 100)"
+check "green + CLEAN + fresh LGTM but 22 behind, overlapping file → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/vault/writer.py" OUR_FILES="creek/vault/writer.py" run 100)"
 
 check "behind_by 0 → ready" "ready" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 run 100)"
 
-# One commit is enough: "nearly current" is still not current.
-check "behind_by 1 → behind" "behind" \
-  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=1 run 100)"
+# --- behind ≠ stale: the #1137 regression ----------------------------------
+# Requiring `behind_by == 0` outright made every merge to `main` invalidate every
+# OTHER open lane: each paid a sync, a ~14-minute CI round and a full re-review,
+# and because that window is as long as the gap between merges, lanes went stale
+# again WHILE re-proving themselves. Two bug fixes in different modules cannot
+# turn each other red, so being behind is stale only for a REASON.
+check "behind but disjoint, inert files → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py,tests/test_privacy.py" \
+     OUR_FILES="creek/vault/writer.py,tests/test_writer.py" run 100)"
+
+# One shared file IS a semantic interaction, even buried in a longer list.
+check "behind + one overlapping file among many → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=3 \
+     THEIR_FILES="creek/a.py,creek/shared.py,creek/b.py" \
+     OUR_FILES="creek/c.py,creek/d.py,creek/shared.py" run 100)"
+
+# A prefix match would read `creek/vault.py` as overlapping `creek/vault_index.py`
+# and re-impose the very serialization this change removes.
+check "behind + merely prefix-similar paths → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=2 \
+     THEIR_FILES="creek/vault.py" OUR_FILES="creek/vault_index.py" run 100)"
+
+# --- the risk surface: what #1022 was actually right about ------------------
+# PR #943 was a `ruff` bump 22 commits behind, and a bump 17 behind carrying a
+# ruff major produced 144 lint errors against the then-current tree. A change to
+# how the tree is built/linted/typed/tested invalidates EVERY branch's green,
+# overlap or not — so each of these must still force a sync.
+for risky in "creek-tools/uv.lock" "creek-tools/pyproject.toml" \
+             "crawdad/requirements-dev.txt" ".pre-commit-config.yaml" \
+             "creek-tools/tests/conftest.py" ".github/workflows/ci.yml" \
+             "creek-tools/scripts/check-all.sh"; do
+  check "risk surface on main ($risky) → behind" "behind" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=4 \
+       THEIR_FILES="creek/unrelated.py,$risky" OUR_FILES="creek/mine.py" run 100)"
+done
+
+# OUR side of the risk surface counts too, and the reason is sharper: a branch
+# that changes the tooling has proved it only against the tree at its merge base,
+# so everything main landed after that is code the new tooling never ran over.
+check "risk surface on OUR side, inert main → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=4 \
+     THEIR_FILES="creek/unrelated.py" OUR_FILES="creek/mine.py,creek-tools/uv.lock" run 100)"
+
+# The twin: a path that merely LOOKS like the risk surface is not it. Without
+# this, `docs/pyproject.toml.md` or `creek/scripts/helper.py` would silently
+# re-serialize the fleet.
+check "risk-surface look-alikes are inert → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=4 \
+     THEIR_FILES="docs/pyproject.toml.md,creek/scripts/helper.py,docs/workflows/ci.yml" \
+     OUR_FILES="creek/mine.py" run 100)"
+
+# --- fail closed on every unusable answer ----------------------------------
+# The file listings decide whether to SKIP a sync, so an answer we cannot trust
+# has to read as "sync anyway" — the remedy is always safe, a false `ready` is not.
+check "main-side file listing errors → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=5 \
+     THEIR_FILES="creek/a.py" THEIR_FILES_EC=1 OUR_FILES="creek/b.py" run 100)"
+
+check "branch-side file listing errors → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=5 \
+     THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" OUR_FILES_EC=1 run 100)"
+
+# GitHub caps `.files` at 300. AT the cap the list is truncated, so "disjoint" is
+# an answer the data cannot support.
+TRUNCATED="$(seq 1 300 | sed 's|^|creek/f|; s|$|.py|' | paste -sd, -)"
+check "300-file (capped) main listing → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=6 \
+     THEIR_FILES="$TRUNCATED" OUR_FILES="creek/mine.py" run 100)"
+
+# 299 is under the cap and therefore a complete, usable list — the non-vacuity
+# twin proving the check above is about truncation, not about list length.
+UNDER_CAP="$(seq 1 299 | sed 's|^|creek/f|; s|$|.py|' | paste -sd, -)"
+check "299-file (uncapped) main listing → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=6 \
+     THEIR_FILES="$UNDER_CAP" OUR_FILES="creek/mine.py" run 100)"
+
+# The merge base comes from the same call as behind_by and builds the main-side
+# compare range; a malformed one would compare against a garbage ref.
+check "malformed merge base → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=7 \
+     MERGE_BASE="not-a-sha" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" run 100)"
+
+check "empty merge base → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=7 \
+     MERGE_BASE="" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" run 100)"
 
 # Fail CLOSED. A compare call that errors (rate limit, 404 on a force-pushed OID)
 # must not inherit the happy answer that happens to be on stdout.
@@ -487,6 +587,30 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
 check "lazy compare: would-be-ready lane token" "ready" "$tok"
 probed "lazy compare: would-be-ready lane DOES probe" "yes" "$S_READY"
 
+# The file listings are lazy INSIDE the compare probe as well: `behind_by == 0`
+# is the overwhelmingly common answer and must still cost exactly ONE request,
+# or the fix for #1137 would tax every already-current lane on every wake.
+S_F_CURRENT="$WORK/probe-files-current"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=0 FILES_SENTINEL="$S_F_CURRENT" run 100)" || tok="exit-$?"
+check "lazy files: current lane token" "ready" "$tok"
+probed "lazy files: current lane does not list files" "no" "$S_F_CURRENT"
+
+S_F_BEHIND="$WORK/probe-files-behind"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=9 \
+       THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" \
+       FILES_SENTINEL="$S_F_BEHIND" run 100)" || tok="exit-$?"
+check "lazy files: behind lane token" "ready" "$tok"
+probed "lazy files: behind lane DOES list files" "yes" "$S_F_BEHIND"
+
+# And a lane behind a RISK-SURFACE change never pays for the branch-side listing:
+# the main-side answer already decided it.
+S_F_RISK="$WORK/probe-files-risk"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=9 \
+       THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/b.py" OUR_FILES_EC=1 \
+       FILES_SENTINEL="$S_F_RISK" run 100)" || tok="exit-$?"
+check "lazy files: risk-surface lane short-circuits" "behind" "$tok"
+
 S_OPTOUT="$WORK/probe-optout"
 tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
        BEHIND_BY=22 PR_LABELS="$OPTOUT" COMPARE_SENTINEL="$S_OPTOUT" run 100)" || tok="exit-$?"
@@ -524,9 +648,23 @@ check "reviewless setup WITH a fresh LGTM → ready" "ready" \
      PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
      REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
 
-# Skipping review does NOT skip freshness or mergeability.
-check "reviewless but 22 behind → behind" "behind" \
+# Skipping review does NOT skip freshness or mergeability. A bump changes the
+# risk surface BY DEFINITION — its lockfile is the thing that decides how the
+# whole tree lints and builds — so it re-proves itself every time `main` moves,
+# no matter how unrelated main's commits look. This is PR #943's case: a `ruff`
+# bump 22 behind, whose own green said nothing about the 22 commits after it.
+check "reviewless bump 22 behind (its own lockfile) → behind" "behind" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=22 \
+     THEIR_FILES="creek/unrelated.py" OUR_FILES="creek-tools/uv.lock,creek-tools/pyproject.toml" \
+     PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
+     REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
+
+# The twin, so the check above is provably about the risk surface and not about
+# `ready-unreviewed` losing its freshness gate: the same reviewless lane, equally
+# far behind, touching only ordinary source, still clears.
+check "reviewless bump 22 behind, inert both sides → ready-unreviewed" "ready-unreviewed" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_BY=22 \
+     THEIR_FILES="creek/unrelated.py" OUR_FILES="creek/other.py" \
      PR_AUTHOR="$DEPENDABOT" HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
      REVIEW_CONCLUSIONS="$SKIPPED" run 100)"
 
