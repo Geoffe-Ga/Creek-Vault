@@ -7,6 +7,22 @@ on:
     branches: [ main, develop ]
   workflow_dispatch:
 
+# One in-flight run per ref. A Ralph lane pushes repeatedly to the same PR — a
+# sync merge, a review fix, a CI fix — and without this the superseded run keeps
+# burning a full ~15-minute 3-version matrix on a commit nobody will merge, while
+# the lane that needs a runner waits behind it (#1140). It also removes a real
+# ambiguity: `scripts/ralph/pr-ready.sh` keys CI state off `gh pr checks`, and a
+# stale in-flight run leaves the rollup reporting `pending` for a commit whose
+# answer no longer matters.
+#
+# `cancel-in-progress` is keyed off the EVENT, never a blanket `true`: cancelling
+# a `push` run on `main` would leave a merged commit unvalidated, and that run is
+# the backstop the relaxed pre-merge freshness gate depends on (#1138). Grouping
+# by `github.ref` keeps sibling lanes from cancelling each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   PYTHON_DEFAULT_VERSION: '3.12'
   COVERAGE_THRESHOLD: 90
