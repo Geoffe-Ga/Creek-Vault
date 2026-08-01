@@ -110,11 +110,59 @@ message, so the Sonnet composer wraps the tool results in your voice.
 | `/crawdad surface` | Surface paradoxes / liminal content via `creek.lint`. |
 | `/crawdad draft <topic>` | Mine + draft on the supplied topic (`creek.mine` → `creek.draft`). |
 | `/crawdad save <content>` | File the supplied content back to the vault (`creek.save`). |
-| `/crawdad workflow [list]` | v1.0 stub — full workflow DSL ships in v1.1. |
+| `/crawdad workflow [list\|run <name>]` | List registered workflows, or walk one. See [Workflow files](#workflow-files). |
 
 Full grammar reference (including the developer-side `/creek` surface
 for Claude Code) is in
 [`creek-tools/docs/slash-commands.md`](../creek-tools/docs/slash-commands.md).
+
+### Workflow files
+
+`/crawdad workflow run <name>` executes a `*.workflow.yaml` file: a
+deterministic, router-free walk over an ordered list of MCP tool
+calls (DSL reference — interpolation syntax, per-step error handling —
+is the module docstring in `crawdad/crawdad/workflows.py`). Files are
+discovered from two sources, in order, a user `name` beating a
+built-in of the same name: `crawdad/crawdad/builtin_workflows/`
+(shipped, version-controlled) and `<vault>/00-Creek-Meta/Workflows/`
+(your own, outside version control — see
+`crawdad/docs/adr/2026-05-24_workflow-file-location.md`).
+
+| Key | Required | Default | Notes |
+|---|---|---|---|
+| `name` | yes | — | Unique id; the argument to `workflow run <name>`. |
+| `description` | yes | — | Shown by `/crawdad workflow list`. |
+| `trigger` | no | — | Documentation only; not read by the walker. |
+| `phase_aware` | no | `false` | If `true`, refuses to run with no session phase. |
+| `allowed_phases` | no | any | Non-empty list narrows `phase_aware` to specific phases. |
+| `privacy_tier_ceiling` | no | `open` | See below. |
+| `inputs` | no | — | Names the caller must supply, or the run is refused. |
+| `steps` | yes | — | Ordered `{id, tool, args}` list; one MCP tool call each. |
+
+**The ceiling, ordered least-to-most permissive:** `open` <
+`personal` < `intimate` < `all` — despite its name, `open` is the
+*most restrictive* tier, not "no restriction"; that inversion is what
+the old key name got backwards. Only `open`/`personal` may be
+declared: a workflow requesting `intimate` or `all` still parses and
+still shows up in `/crawdad workflow list`, but `run` refuses it in
+Discord at run time, because every tool result is relayed to a cloud
+LLM composer and posted straight into a Discord message.
+
+**Renamed from `privacy_tier_floor`**, which was inverted (raising the
+"floor" widened access). The old key still works, value-preserving,
+with a `WARNING` naming the workflow (removal tracked in
+[#1151](https://github.com/Geoffe-Ga/Creek-Vault/issues/1151)); both
+keys in one file is a parse error. For an existing file:
+`open`/`personal` values run unchanged —
+rename at your leisure; `intimate`/`all` values now get refused at
+`run` (intended — that value was granting intimate reads, never
+requiring intimate protection); both keys present fails to parse and
+the workflow drops out of the listing.
+
+**No per-step ceilings** — a step's `args:` may not set its own
+`privacy_tier_ceiling` (or the deprecated `privacy_tier_floor`); the
+workflow-level value applies to every step, and a step that tries is
+refused at run time, naming the step.
 
 ## Development
 
