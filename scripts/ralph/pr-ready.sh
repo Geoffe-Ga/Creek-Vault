@@ -10,7 +10,12 @@
 #                    current with main, but this PR HAS no review gate: Dependabot
 #                    authored it AND pushed its HEAD commit, and `claude-review`
 #                    reported SKIPPED → the orchestrator decides (see ralph-tick.md)
-#   behind           LGTM (fresh) + CI green but the branch is not current → sync first
+#   behind           LGTM (fresh) + CI green, but `main` has landed something
+#                    since the merge base that can invalidate this branch's
+#                    green — a cross-cutting change (lockfile / tool pin /
+#                    workflow / check script / root conftest) or an edit to a
+#                    file this branch also touches → sync first. Merely being
+#                    behind is NOT enough; see the freshness guard below.
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
 #   ci-failed        CI has a failing/errored check → Step 2 (ci-debugging)
 #   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
@@ -54,7 +59,7 @@
 # `ready` path, so this token covers only the residual case of a bump already
 # green and already current, where nothing of ours is ever pushed. It is a
 # SEPARATE token rather than a looser `ready` on purpose: `ready` keeps its full
-# four-part meaning (fresh LGTM + green CI + CLEAN + `behind_by == 0`), so the
+# four-part meaning (fresh LGTM + green CI + CLEAN + verified current), so the
 # decision about what to do with a PR no reviewer ever saw is made visibly in
 # `ralph-tick.md` and never silently here — and in THIS repo ralph-tick.md's
 # Step 1 routing does not merge on this token, it hands the lane to a human.
@@ -101,11 +106,31 @@
 # `behind_by: 22`, and #863 says 44. #943 is a `ruff` bump, and the identical
 # situation upstream (a bump 17 behind carrying a ruff major) produced 144 lint
 # errors against the then-current tree — merging its stale green would have
-# turned `main` red. Freshness therefore comes from the compare API's
-# `behind_by`, and CLEAN is KEPT alongside it because DIRTY / CONFLICTING /
-# BLOCKED / DRAFT / UNKNOWN are invisible to `behind_by`. The probe is LAZY by
-# design — only a lane that would otherwise print `ready` pays for it, so the
-# orchestrator never burns a request per lane per wake on already-decided lanes.
+# turned `main` red. Freshness therefore comes from the compare API, and CLEAN
+# is KEPT alongside it because DIRTY / CONFLICTING / BLOCKED / DRAFT / UNKNOWN
+# are invisible to it. The probe is LAZY by design — only a lane that would
+# otherwise print `ready` pays for it, so the orchestrator never burns a request
+# per lane per wake on already-decided lanes.
+#
+# WHY IT IS `behind_by > 0` PLUS A REASON, NOT `behind_by > 0` ALONE (#1137):
+# requiring `behind_by == 0` outright is a self-imposed strict-up-to-date rule,
+# and it is quadratic in lane count — merging ONE lane pushes every OTHER open
+# lane behind, and each of them then pays a sync, a ~14-minute CI round, and
+# (because the new HEAD commit invalidates its LGTM under the stale-verdict
+# guard above) a full re-review. Because that window is comparable to the
+# interval between merges, lanes routinely went stale again WHILE re-proving
+# themselves. Measured across #1022 landing: CI runs per PR went 1.00 → 1.61
+# (max 5) and p90 PR latency went 15 → 104 minutes, with two of PR #1117's five
+# CI+review rounds spent on `Merge origin/main` commits that changed no code.
+#
+# So a branch that is behind is stale only for a REASON: `main` landed something
+# on the cross-cutting RISK_SURFACE_RE below (a lockfile, a tool pin, a workflow,
+# a check script, a root conftest — the class #943 actually belonged to), or it
+# touched a file this branch also touches, which is a genuine semantic
+# interaction. Otherwise the branch's green still describes the tree it would
+# merge into, and it merges. What backstops the residual risk is the full CI run
+# on `push: main` — every squash-merge re-proves the merged result, so a stale
+# green that slips through is caught on `main` rather than assumed away.
 #
 # Usage:  pr-ready.sh <PR_NUMBER> [--repo <owner/repo>]
 set -euo pipefail
@@ -144,6 +169,26 @@ readonly CURRENT_REPO_SLUG='{owner}/{repo}'
 # checks.
 readonly DEPENDABOT_AUTHOR="app/dependabot"
 readonly DEPENDABOT_COMMIT_AUTHOR="dependabot[bot]"
+
+# Paths on `main` that can turn ANY branch's green red no matter what that branch
+# touched, because they change how the whole tree is built, linted, typed or
+# tested. This is the list that keeps #1022's actual finding alive: PR #943 was a
+# `ruff` bump sitting 22 commits behind, and the identical situation upstream (a
+# bump 17 behind carrying a ruff major) produced 144 lint errors against the
+# then-current tree. A lockfile, a tool pin, a workflow, a check script or a root
+# `conftest.py` landing on `main` therefore still forces a full re-prove.
+#
+# Everything NOT on this list is inert with respect to a branch that does not
+# touch it: two bug fixes in different modules cannot invalidate each other's
+# CI run, and before this list existed each of them forced the other to re-run
+# ~14 minutes of CI and a full re-review (#1137).
+readonly RISK_SURFACE_RE='(^|/)(pyproject\.toml|uv\.lock|poetry\.lock|conftest\.py|\.pre-commit-config\.yaml|(requirements|constraints)[^/]*\.txt)$|^\.github/workflows/|^creek-tools/scripts/'
+
+# GitHub's compare API returns at most 300 entries in `.files`. AT the cap the
+# list is truncated, so "these two changesets are disjoint" is an answer we
+# cannot support — and the whole point of the disjointness test is to skip a
+# sync. Fail closed at the cap: a big merge re-proves itself the old way.
+readonly COMPARE_FILE_CAP=300
 
 # The `code-review.yml` job name as it appears in the status rollup (the job KEY;
 # that job declares no `name:` override, so the check name matches it), and the
@@ -347,12 +392,67 @@ review_gate_absent() {
   all_conclusions_skipped "$conclusions"
 }
 
-# True only when the compare API proves the head is 0 commits behind its base.
-# Fails CLOSED: an API error, an empty answer, or a non-integer all read as "not
-# current", because `behind`'s remedy (fleet.sh sync) is always safe and a false
-# `ready` is not.
+# The filenames a compare endpoint reports, one per line, or non-zero on any
+# failure — including the 300-entry cap, where GitHub has truncated the list and
+# a disjointness answer would be unsupportable. `grep -c` is guarded because it
+# exits 1 on an empty input, which is a legitimate answer (a range whose commits
+# changed no files) and not an error.
+compare_files() { # compare_files <slug> <range>
+  local out count
+  out="$(gh api "repos/$1/compare/$2?per_page=1" \
+    --jq '(.files // [])[].filename' 2>/dev/null)" || return 1
+  count="$(grep -c . <<<"$out" || true)"
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  [[ "$count" -lt "$COMPARE_FILE_CAP" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# True when everything `main` has landed since the merge base is inert with
+# respect to THIS branch: it touched no cross-cutting risk surface, and it
+# touched no file this branch also touches. Either of those is a real reason to
+# re-prove green; neither being present means the branch's existing green still
+# describes the tree it would merge into.
+#
+# Fails CLOSED on every failure path, exactly like the caller: an errored or
+# truncated compare reads as "not inert", whose remedy (a sync) is always safe.
+main_changes_are_inert() { # main_changes_are_inert <slug> <base> <head_oid> <merge_base>
+  local theirs ours f
+  # THEIRS first: it decides the risk-surface case on its own, so a lane that is
+  # behind a lockfile bump never pays for the second call.
+  theirs="$(compare_files "$1" "$4...$2")" || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ "$f" =~ $RISK_SURFACE_RE ]]; then return 1; fi
+  done <<<"$theirs"
+  ours="$(compare_files "$1" "$2...$3")" || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    # OUR side of the risk surface counts too, and for the sharper reason. A
+    # branch that changes how the tree is linted/built/typed/tested has proved
+    # that only against the tree AT ITS MERGE BASE; everything `main` has landed
+    # since is code the new tooling has never been run over. That is PR #943
+    # exactly — the ruff bump whose own green said nothing about the 22 commits
+    # that arrived after it — so a bump re-proves itself whenever `main` moves,
+    # which is the case #1022 was right about and this keeps.
+    if [[ "$f" =~ $RISK_SURFACE_RE ]]; then return 1; fi
+    # -x -F: whole line, literal. A path is not a pattern, and a prefix match
+    # would read `creek/vault.py` as overlapping `creek/vault_index.py`.
+    if grep -qxF "$f" <<<"$theirs"; then return 1; fi
+  done <<<"$ours"
+  return 0
+}
+
+# True when `main` has landed nothing since the merge base that could invalidate
+# this branch's green. `behind_by == 0` is the fast path and still short-circuits
+# on ONE call, so a lane that is already current costs exactly what it always
+# did; only a lane that is genuinely behind pays for the file comparison, and it
+# was otherwise about to pay for a sync plus a full CI round.
+#
+# Fails CLOSED: an API error, an empty answer, a non-integer, a malformed merge
+# base, or a truncated file list all read as "not current", because `behind`'s
+# remedy (fleet.sh sync) is always safe and a false `ready` is not.
 branch_is_current() {
-  local ref_line base head_oid slug behind
+  local ref_line base head_oid slug cmp behind merge_base cmp_rest
   ref_line="$(gh pr view "${gh_args[@]}" --json baseRefName,headRefOid \
     --jq '(.baseRefName // "") + "|" + (.headRefOid // "")' 2>/dev/null)" || return 1
   # Demand the separator before splitting on it. Without this, a separator-free
@@ -370,10 +470,22 @@ branch_is_current() {
   [[ "$head_oid" =~ ^[0-9a-f]{7,40}$ ]] || return 1
   slug="$CURRENT_REPO_SLUG"
   [[ -z "$repo_slug" ]] || slug="$repo_slug"
-  behind="$(gh api "repos/$slug/compare/$base...$head_oid?per_page=1" \
-    --jq '.behind_by' 2>/dev/null)" || return 1
+  # One call yields "<behind_by>|<merge base sha>". The merge base rides along
+  # because the "what did main land?" range is `<merge base>...<base>` and
+  # fetching it separately would be a second round trip for a value this
+  # response already carries.
+  cmp="$(gh api "repos/$slug/compare/$base...$head_oid?per_page=1" \
+    --jq '((.behind_by // "") | tostring) + "|" + (.merge_base_commit.sha // "")' \
+    2>/dev/null)" || return 1
+  # Split by FIELD COUNT for the same reason every other answer in this file is:
+  # neither an integer nor a SHA can contain `|`, so a surplus field means the
+  # answer is malformed and must fail closed rather than be seeked into.
+  IFS='|' read -r behind merge_base cmp_rest <<<"$cmp"
+  [[ -z "$cmp_rest" ]] || return 1
   [[ "$behind" =~ ^[0-9]+$ ]] || return 1
-  [[ "$behind" -eq 0 ]]
+  if [[ "$behind" -eq 0 ]]; then return 0; fi
+  [[ "$merge_base" =~ ^[0-9a-f]{7,40}$ ]] || return 1
+  main_changes_are_inert "$slug" "$base" "$head_oid" "$merge_base"
 }
 
 # Fresh LGTM ⇔ latest verdict is LGTM AND its createdAt is strictly newer than

@@ -175,14 +175,25 @@ Then act on `$STATUS`:
   ever covers a bump that was already current with `main` and already
   green — one nobody touched.
 - **`behind`** (`LGTM` + green but `mergeStateStatus` is `BEHIND`, **or** the
-  far more common case: `mergeStateStatus CLEAN` yet the compare API reports
-  `behind_by > 0`). `CLEAN` means only "no merge conflict" — GitHub computes
-  `BEHIND` solely when the base branch enforces strict/up-to-date status
-  checks, which this repo does not, so `CLEAN` routinely reports on a PR that
-  is dozens of commits stale (measured live: PR #943 reported
-  `MERGEABLE`/`UNSTABLE` while the compare API said `behind_by: 22`; PR #863
-  said `44`). **Do not merge stale — a branch's own green CI says nothing
-  about today's `main`.** Same remedy either way:
+  branch is behind `main` *for a reason that can invalidate its green*).
+  `CLEAN` means only "no merge conflict" — GitHub computes `BEHIND` solely when
+  the base branch enforces strict/up-to-date status checks, which this repo does
+  not, so `CLEAN` routinely reports on a PR that is dozens of commits stale
+  (measured live: PR #943 reported `MERGEABLE`/`UNSTABLE` while the compare API
+  said `behind_by: 22`; PR #863 said `44`). **Do not merge a branch whose green
+  says nothing about today's `main`.**
+
+  But **being behind is not by itself stale** (#1137). Requiring `behind_by == 0`
+  outright is quadratic in lane count — merging one lane pushes every *other*
+  lane behind, and each then pays a sync, a full CI round and a fresh review;
+  because that window is as long as the gap between merges, lanes went stale
+  again while re-proving themselves. Measured across that gate landing: CI runs
+  per PR 1.00 → 1.61 (max 5), p90 PR latency 15 → 104 min. `pr-ready.sh` now
+  prints `behind` only when the two changesets can actually interact: `main`
+  landed a cross-cutting change (lockfile, tool pin, workflow, check script,
+  root `conftest.py`), **or** this branch did, **or** the two touched a file in
+  common. Two fixes in unrelated modules no longer serialize. Same remedy when
+  it does fire:
   ```bash
   scripts/ralph/fleet.sh sync "$ISSUE_N" || echo "SYNC-CONFLICT $ISSUE_N"
   ```
