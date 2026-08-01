@@ -775,3 +775,637 @@ def test_default_stdio_transport_unaffected(
     stub = _stub_build_server(monkeypatch)
     main([])
     assert stub.run_calls == ["stdio"]
+
+
+# --------------------------------------------------------------------------- #
+# CHARACTERIZATION PINS for the issue #1073 extraction
+#
+# Everything below this banner pins the *current* behaviour of the remote
+# tier-ceiling cap (``_BoundedFastMCP.call_tool``) and of per-call consumer
+# identity (``_effective_consumer``), exactly as they behave today, before any
+# of that logic is extracted out of ``creek_mcp/server.py``.
+#
+# These tests PASS against the unmodified code. They are pins, not RED tests.
+# Their whole job is to fail loudly if the extraction changes behaviour, so:
+#
+# * a diff to any test below across the extraction commit is itself a red flag
+#   — the pins are meant to be byte-identical before and after the move;
+# * every pin goes through the public boundary (``build_server`` +
+#   ``server.call_tool``, or the module-level ``_effective_consumer``), never
+#   through an internal the extraction is expected to relocate;
+# * the refusal ``reason`` is asserted against a hard-coded literal rather than
+#   an imported constant, so a refactor cannot silently reword the one sentence
+#   a remote consumer is told when intimate content is withheld.
+# --------------------------------------------------------------------------- #
+
+# The exact text ``_BoundedFastMCP.call_tool`` refuses with today. Spelled out
+# rather than imported on purpose: importing the constant would let a reword
+# sail through unnoticed.
+_CAP_REFUSAL_REASON = (
+    "remote consumers may not request a ceiling above 'personal'; "
+    "intimate content is not reachable over the network"
+)
+
+# The literal ``creek_mcp.tools.purge`` refuses with when the elevated gate
+# denies. Also spelled out, for the same reason.
+_PURGE_ELEVATED_REFUSAL_REASON = (
+    "elevated authorization required: set CREEK_MCP_ELEVATED_TOKEN on the "
+    "server and pass a matching auth_token"
+)
+
+_PURGE_VAULT_CONFIRM_REFUSAL_REASON = (
+    "creek.purge.vault requires confirm_vault_path matching the "
+    "target vault's absolute path"
+)
+
+_ELEVATED_TOKEN_ENV = "CREEK_MCP_ELEVATED_TOKEN"
+_CONSUMER_ENV = "CREEK_MCP_CONSUMER"
+
+_PURGE_TOOL_NAMES = (
+    "creek.purge.fragment",
+    "creek.purge.source",
+    "creek.purge.classifications",
+    "creek.purge.daterange",
+    "creek.purge.vault",
+)
+
+# Every ``privacy_tier_ceiling`` value the cap refuses for a REMOTE caller.
+# Only the exact strings ``open`` and ``personal`` (and an absent key, which
+# defaults to ``open``) clear it: no case folding, no whitespace tolerance, no
+# coercion of non-strings.
+_REMOTE_REFUSED_CEILINGS: list[object] = [
+    "intimate",
+    "all",
+    None,
+    "",
+    "OPEN",
+    "Personal",
+    " open",
+    "open ",
+    "bogus-tier",
+    "unclassified",
+    0,
+    1,
+    True,
+    False,
+    3.5,
+    [],
+    {},
+]
+
+_REMOTE_REFUSED_IDS = [
+    "intimate",
+    "all",
+    "none",
+    "empty-string",
+    "upper-open",
+    "title-personal",
+    "leading-space",
+    "trailing-space",
+    "bogus-tier",
+    "unclassified",
+    "int-zero",
+    "int-one",
+    "bool-true",
+    "bool-false",
+    "float",
+    "empty-list",
+    "empty-dict",
+]
+
+# Every argument set that dispatches locally, including the absent key.
+_VALID_CEILING_ARGUMENTS: list[dict[str, object]] = [
+    {},
+    {"privacy_tier_ceiling": "open"},
+    {"privacy_tier_ceiling": "personal"},
+    {"privacy_tier_ceiling": "intimate"},
+    {"privacy_tier_ceiling": "all"},
+]
+
+_VALID_CEILING_IDS = ["absent", "open", "personal", "intimate", "all"]
+
+
+def _pin_server(vault: Path) -> FastMCP:
+    """Build the server every characterization pin drives through ``call_tool``.
+
+    Args:
+        vault: The seeded vault root the tools read and audit under.
+
+    Returns:
+        A ``build_server`` instance with a stub draft LLM, so no pin needs a
+        provider configured.
+    """
+    return build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+
+
+def _remote(monkeypatch: pytest.MonkeyPatch, consumer: str = "adepthood") -> None:
+    """Make every subsequent call look like an authenticated remote request.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        consumer: The ``client_id`` the fake bearer identifies.
+    """
+    monkeypatch.setattr(
+        server_mod, "_current_access_token", lambda: _fake_token(consumer)
+    )
+
+
+def _local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every subsequent call look like a local stdio request (no token).
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+    """
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: None)
+
+
+def _call(
+    server: FastMCP, tool: str, arguments: dict[str, object]
+) -> dict[str, object] | None:
+    """Invoke *tool* through the public boundary; return its structured payload.
+
+    Args:
+        server: The built server under test.
+        tool: Dot-namespaced tool name.
+        arguments: The raw argument mapping, deliberately untyped so a pin can
+            hand the boundary a value FastMCP would never construct.
+
+    Returns:
+        The structured payload, or ``None`` when the call raised before
+        producing one. ``None`` is what FastMCP's own pydantic argument
+        coercion yields for a value that is not a ``TierCeiling``; that
+        coercion is not the ceiling cap's business, so the local-path pins ask
+        only whether the *cap's* refusal was produced.
+    """
+    try:
+        return _structured(asyncio.run(server.call_tool(tool, arguments)))
+    except Exception:
+        return None
+
+
+def _audit_entries(vault: Path) -> list[dict[str, object]]:
+    """Return every parsed MCP audit entry under *vault*, in write order.
+
+    Args:
+        vault: The vault root.
+
+    Returns:
+        The decoded entries, or an empty list when the log does not exist.
+    """
+    log_path = vault / MCP_AUDIT_RELPATH
+    if not log_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in log_path.read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _entries_for(vault: Path, tool: str) -> list[dict[str, object]]:
+    """Return the audit entries written for *tool*, in write order.
+
+    Args:
+        vault: The vault root.
+        tool: Dot-namespaced tool name to filter on.
+
+    Returns:
+        The matching entries.
+    """
+    return [entry for entry in _audit_entries(vault) if entry["tool"] == tool]
+
+
+def _consumers_for(vault: Path, tool: str) -> list[object]:
+    """Return the ``consumer`` of every audit entry for *tool*, in write order.
+
+    Args:
+        vault: The vault root.
+        tool: Dot-namespaced tool name to filter on.
+
+    Returns:
+        The consumer identifiers, one per matching entry.
+    """
+    return [entry["consumer"] for entry in _entries_for(vault, tool)]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: the remote admission table, refused half
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("ceiling", _REMOTE_REFUSED_CEILINGS, ids=_REMOTE_REFUSED_IDS)
+def test_remote_cap_refuses_every_non_admitted_ceiling(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, ceiling: object
+) -> None:
+    """Pin the whole refused half of the remote admission table.
+
+    The cap admits the exact strings ``open`` and ``personal`` and nothing
+    else. Everything here — the two over-ceiling tiers, wrong case, leading or
+    trailing whitespace, ``None``, the empty string, unknown tier names, and
+    every non-string scalar or container — is refused *before dispatch* with
+    the one hard-coded reason, and leaves no audit entry behind.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to present an authenticated remote bearer.
+        ceiling: The ``privacy_tier_ceiling`` value under test.
+    """
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": ceiling})
+    assert result is not None
+    assert result["status"] == "refused"
+    assert result["tool"] == "creek.wheel"
+    assert result["reason"] == _CAP_REFUSAL_REASON
+    # Refused before dispatch => the tool never ran, so nothing was audited.
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+
+@pytest.mark.parametrize("ceiling", ["intimate", "all", "bogus-tier"])
+def test_remote_refusal_payload_is_exact_and_does_not_echo_the_request(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, ceiling: str
+) -> None:
+    """Pin the refusal payload key-for-key, including the ceiling it reports.
+
+    ``tier_ceiling`` is always ``"open"`` — the cap's own floor — never the
+    ceiling the caller asked for, so a client cannot read its own rejected
+    request back out of the response. The dict equality also pins that the
+    payload carries no key beyond ``status``/``tool``/``tier_ceiling``/
+    ``reason``.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to present an authenticated remote bearer.
+        ceiling: An over-ceiling or unrecognised request value.
+    """
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": ceiling})
+    assert result == {
+        "status": "refused",
+        "tool": "creek.wheel",
+        "tier_ceiling": "open",
+        "reason": _CAP_REFUSAL_REASON,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Pin: the remote admission table, admitted half
+# --------------------------------------------------------------------------- #
+
+
+def test_remote_call_without_the_ceiling_key_dispatches_and_audits(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absent ``privacy_tier_ceiling`` defaults to ``open`` and is admitted.
+
+    The cap reads ``arguments.get(...)`` with an ``open`` fallback, so omitting
+    the key entirely is admitted rather than refused — and the call dispatches
+    far enough to write its audit entry under the bearer's consumer.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to present an authenticated remote bearer.
+    """
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {})
+    assert result is not None
+    assert result["tool"] == "creek.wheel"
+    assert result.get("status") != "refused"
+    assert _consumers_for(vault, "creek.wheel") == ["adepthood"]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: stdio is outside the cap entirely
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("ceiling", _REMOTE_REFUSED_CEILINGS, ids=_REMOTE_REFUSED_IDS)
+def test_local_call_never_produces_the_cap_refusal(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, ceiling: object
+) -> None:
+    """No local (stdio) call is refused *by the cap*, whatever the value is.
+
+    The garbage values still fail FastMCP's own pydantic coercion locally,
+    which raises instead of returning a payload. That is not this gate's
+    business, so the pin is deliberately narrow: whatever else happens, the
+    cap's refusal is never what comes back.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to make the call look local (no token).
+        ceiling: The ``privacy_tier_ceiling`` value under test.
+    """
+    _local(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": ceiling})
+    assert result is None or result.get("reason") != _CAP_REFUSAL_REASON
+
+
+@pytest.mark.parametrize("arguments", _VALID_CEILING_ARGUMENTS, ids=_VALID_CEILING_IDS)
+def test_local_call_dispatches_at_every_valid_ceiling(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, arguments: dict[str, object]
+) -> None:
+    """All four ceilings — plus an absent key — dispatch for a local caller.
+
+    ``intimate`` and ``all`` are exactly the two the remote cap refuses, so
+    this is the pin that stops the extraction from widening the cap onto the
+    stdio path.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to make the call look local (no token).
+        arguments: The argument mapping under test.
+    """
+    _local(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", arguments)
+    assert result is not None
+    assert result["tool"] == "creek.wheel"
+    assert result.get("status") != "refused"
+
+
+def test_local_call_is_audited_under_the_env_consumer(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stdio half of the identity rule: no token means ``CREEK_MCP_CONSUMER``.
+
+    The remote half is pinned by
+    ``test_remote_call_is_audited_under_token_consumer``; this is its
+    counterpart, so the extraction cannot make the env default win for a
+    bearer-identified caller (or vice versa) without turning one of the two
+    red.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process-default consumer and clears the token.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    _local(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": "open"})
+    assert result is not None
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: caller identity and remoteness are resolved PER CALL, never cached
+#
+# The single highest-consequence failure mode of the #1073 extraction is a
+# caller identity built once at ``build_server`` time. Every call after the
+# first would then be audited under the first caller's name — forging
+# attribution — and the cap would be pinned to the first caller's remoteness,
+# so one local call could unlock intimate content for every later remote one.
+# --------------------------------------------------------------------------- #
+
+
+def test_consumer_identity_is_resolved_per_call_not_once_per_server(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two calls on ONE server under two bearers audit under two consumers.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process default and swaps the live bearer between
+            the two calls.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    bearer: list[AccessToken | None] = [_fake_token("adepthood")]
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: bearer[0])
+    server = _pin_server(vault)
+
+    assert _call(server, "creek.wheel", {"privacy_tier_ceiling": "open"}) is not None
+    bearer[0] = _fake_token("crawdad")
+    assert _call(server, "creek.wheel", {"privacy_tier_ceiling": "open"}) is not None
+
+    assert _consumers_for(vault, "creek.wheel") == ["adepthood", "crawdad"]
+
+
+def test_cap_re_evaluates_remoteness_remote_then_local(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One server, remote then local: the cap engages on the first call only.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process default and drops the bearer between the
+            two calls.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    bearer: list[AccessToken | None] = [_fake_token("adepthood")]
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: bearer[0])
+    server = _pin_server(vault)
+
+    refused = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert refused is not None
+    assert refused["reason"] == _CAP_REFUSAL_REASON
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+    bearer[0] = None
+    admitted = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert admitted is not None
+    assert admitted.get("status") != "refused"
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+
+def test_cap_re_evaluates_remoteness_local_then_remote(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One server, local then remote: an earlier local call does not unlock the cap.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process default and installs the bearer between
+            the two calls.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    bearer: list[AccessToken | None] = [None]
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: bearer[0])
+    server = _pin_server(vault)
+
+    admitted = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert admitted is not None
+    assert admitted.get("status") != "refused"
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+    bearer[0] = _fake_token("adepthood")
+    refused = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert refused is not None
+    assert refused["reason"] == _CAP_REFUSAL_REASON
+    # Refused before dispatch => no second entry joined the first.
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: the deliberate creek.purge.* carve-out (server.py:120-131)
+#
+# Purge tools declare no ``privacy_tier_ceiling``, so the remote cap always
+# falls back to ``open`` for them and is a documented no-op. Their real gate is
+# ``CREEK_MCP_ELEVATED_TOKEN`` via ``creek_mcp.auth.is_elevated``. These pins
+# stop the extraction from either (a) accidentally routing purge through the
+# ceiling cap, or (b) treating the cap as purge's protection and weakening the
+# elevated gate.
+# --------------------------------------------------------------------------- #
+
+
+def test_purge_tools_declare_no_tier_ceiling_parameter(vault: Path) -> None:
+    """The carve-out's premise: purge tools expose no ceiling to cap.
+
+    ``creek.wheel`` declares ``privacy_tier_ceiling``; none of the five
+    ``creek.purge.*`` tools do.
+
+    Args:
+        vault: Seeded vault root.
+    """
+    server = _pin_server(vault)
+    listed = asyncio.run(server.list_tools())
+    schemas = {tool.name: tool.inputSchema for tool in listed}
+    assert "privacy_tier_ceiling" in schemas["creek.wheel"]["properties"]
+    for name in _PURGE_TOOL_NAMES:
+        assert "privacy_tier_ceiling" not in schemas[name]["properties"]
+
+
+def test_remote_purge_is_refused_by_the_elevated_gate_not_the_cap(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote purge call is refused by the ELEVATED gate, never by the ceiling cap.
+
+    The distinguishing evidence is the reason string plus the payload shape:
+    the purge refusal carries no ``tier_ceiling`` key at all, which the cap's
+    refusal always does.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Clears the elevated token and presents a remote bearer.
+    """
+    monkeypatch.delenv(_ELEVATED_TOKEN_ENV, raising=False)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.purge.fragment", {"fragment_id": "frag-missing"})
+    assert result == {
+        "status": "refused",
+        "tool": "creek.purge.fragment",
+        "reason": _PURGE_ELEVATED_REFUSAL_REASON,
+    }
+
+
+def test_remote_purge_refusal_is_audited_under_the_bearer_consumer(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The elevated gate audits its denial, attributed to the bearer's consumer.
+
+    Also pins that the audit entry records ``tier_ceiling: "open"`` for a
+    purge, and that the caller's ``auth_token`` never enters ``args_summary``.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets a process default, clears the elevated token, and
+            presents a remote bearer.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    monkeypatch.delenv(_ELEVATED_TOKEN_ENV, raising=False)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    _call(server, "creek.purge.fragment", {"fragment_id": "frag-missing"})
+
+    entries = _entries_for(vault, "creek.purge.fragment")
+    assert len(entries) == 1
+    assert entries[0]["consumer"] == "adepthood"
+    assert entries[0]["tier_ceiling"] == "open"
+    assert entries[0]["args_summary"] == {
+        "fragment_id": "frag-missing",
+        "dry_run": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "supplied"),
+    [
+        (None, None),
+        (None, _STRONG_TOKEN),
+        (_STRONG_TOKEN, None),
+        (_STRONG_TOKEN, "wrong-token-value"),
+    ],
+    ids=[
+        "unset-and-absent",
+        "unset-but-supplied",
+        "set-but-absent",
+        "set-and-mismatched",
+    ],
+)
+def test_elevated_gate_remains_the_real_purge_gate(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    supplied: str | None,
+) -> None:
+    """A remote bearer alone never satisfies the elevated gate, and denials audit.
+
+    Four ways to fail closed: no server token and no client token, no server
+    token with a client token, a server token with no client token, and a
+    server token with a mismatched client token. All four refuse with the
+    elevated reason and all four leave exactly one audit entry.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Configures (or clears) the elevated token and presents a
+            remote bearer.
+        configured: The server-side ``CREEK_MCP_ELEVATED_TOKEN``, or ``None``
+            to leave it unset.
+        supplied: The client-side ``auth_token``, or ``None`` to omit it.
+    """
+    if configured is None:
+        monkeypatch.delenv(_ELEVATED_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_ELEVATED_TOKEN_ENV, configured)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+
+    arguments: dict[str, object] = {"fragment_id": "frag-missing"}
+    if supplied is not None:
+        arguments["auth_token"] = supplied
+    result = _call(server, "creek.purge.fragment", arguments)
+
+    assert result is not None
+    assert result["status"] == "refused"
+    assert result["reason"] == _PURGE_ELEVATED_REFUSAL_REASON
+    assert len(_entries_for(vault, "creek.purge.fragment")) == 1
+
+
+def test_remote_purge_with_valid_elevated_token_clears_both_gates(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the elevated token, a remote purge gets past the cap AND the gate.
+
+    ``creek.purge.vault`` then stops on its own second factor — the missing
+    ``confirm_vault_path`` — which is the proof that neither the ceiling cap
+    nor the elevated gate refused it. Nothing is destroyed: the refusal lands
+    before ``PurgeEngine`` is ever constructed.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Configures a floor-clearing elevated token and presents a
+            remote bearer.
+    """
+    monkeypatch.setenv(_ELEVATED_TOKEN_ENV, _STRONG_TOKEN)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.purge.vault", {"auth_token": _STRONG_TOKEN})
+
+    assert result == {
+        "status": "refused",
+        "tool": "creek.purge.vault",
+        "reason": _PURGE_VAULT_CONFIRM_REFUSAL_REASON,
+    }
+    entries = _entries_for(vault, "creek.purge.vault")
+    assert len(entries) == 1
+    assert entries[0]["consumer"] == "adepthood"
+    # The elevated token never reaches the audit log.
+    assert entries[0]["args_summary"] == {
+        "confirm_vault_path": False,
+        "dry_run": False,
+    }

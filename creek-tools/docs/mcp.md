@@ -543,12 +543,35 @@ routable by design and requires TLS.
   fragment above the caller's ceiling (#970), and remote callers are capped at
   `personal`, so a remote consumer can no longer destroy an `intimate` journal
   fragment.
-- **INTIMATE is never reachable remotely.** The boundary caps a remote
-  caller at `personal`: a request for a `privacy_tier_ceiling` above it
-  (`intimate` / `all`, or any unrecognised value) is **refused before
-  dispatch**, so intimate content is never even read for a network consumer.
-  Stdio calls are unaffected — the per-tool `open` default still applies
-  locally, and `intimate` remains reachable for the local owner.
+- **INTIMATE is never reachable remotely.** The cap is
+  **adapter-independent policy**, in `creek_mcp/policy.py::admitted_ceiling`
+  — not a property of the MCP transport wrapper. "Remote" is a fact each
+  adapter asserts about its own transport (`CallerIdentity.is_remote`),
+  never something policy infers from the presence of MCP-specific state.
+  That distinction is the whole point of the split: before it, "remote"
+  meant "this call carries an MCP access token", so an adapter that stands
+  up no MCP request context at all — the Adepthood `/v1` HTTP API (see
+  [`docs/decisions/2026-07-31-adepthood-http-application-api.md`](../../docs/decisions/2026-07-31-adepthood-http-application-api.md))
+  — would have read as local under the old definition and left the cap
+  silently unenforced. The behaviour this page describes is unchanged: a
+  remote caller is capped at `personal`, a request for a
+  `privacy_tier_ceiling` above it (`intimate` / `all`, or any unrecognised
+  value) is **refused before dispatch**, so intimate content is never even
+  read for a network consumer, and stdio calls are unaffected — the
+  per-tool `open` default still applies locally, and `intimate` remains
+  reachable for the local owner. `_BoundedFastMCP.call_tool` is still the
+  MCP-side chokepoint that enforces this; it now renders a verdict
+  `creek_mcp/policy.py` decides rather than deciding it itself. The `/v1`
+  surface of epic #1071 is specified to reach the same verdict through the
+  same module, answering `422 invalid_request` where MCP returns its own
+  refusal reason — the two adapters are to agree on the boundary, not on the
+  wording. No `/v1` handler is mounted yet (#1074), so today
+  `_BoundedFastMCP.call_tool` is the only caller. The audited consumer
+  identity moved the same way, for the same reason:
+  `creek_mcp/policy.py::effective_consumer` decides whose name lands in the
+  audit log from the same `CallerIdentity`, and `_effective_consumer` in
+  `creek_mcp/server.py` is now MCP's thin adapter over it, unchanged in
+  behaviour.
 
 The transport is a thin wrapper around the MCP SDK's `TokenVerifier` /
 streamable-http app; the tool registry, tier-ceiling rules, and hash-chained

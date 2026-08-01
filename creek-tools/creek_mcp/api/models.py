@@ -6,8 +6,10 @@ reads the JSON Schemas generated from these classes (see
 refactor.
 
 **Remote by construction.** ``/v1`` is only ever reached over the network, and
-:meth:`creek_mcp.server._BoundedFastMCP.call_tool` already caps every remote
-caller at :data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` — ``open`` and
+:func:`creek_mcp.policy.admitted_ceiling` — the transport-neutral owner of the
+rule since #1073, applied on the MCP side by
+:meth:`creek_mcp.server._BoundedFastMCP.call_tool` — already caps every remote
+caller at :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` — ``open`` and
 ``personal``. :class:`WireTierCeiling` therefore has exactly two members. That
 is deliberate: ``intimate`` is made unreachable *in the type*, in every wire
 position (request tier, response tier, routed tier), rather than by a runtime
@@ -101,11 +103,15 @@ class WireTierCeiling(StrEnum):
     """The only two tier ceilings expressible on ``/v1``.
 
     ``/v1`` is remote by construction, and
-    :meth:`creek_mcp.server._BoundedFastMCP.call_tool` refuses any remote call
-    declaring a ceiling outside
-    :data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS` *before dispatch*. This
-    enum mirrors that frozenset, so ``intimate`` and ``all`` are not merely
-    refused at runtime — they cannot be constructed at all.
+    :func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring
+    a ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before
+    dispatch*. Since #1073 that decision is transport-neutral, so every adapter
+    is meant to reach it the same way; the MCP surface does so today through
+    :meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the
+    ``/v1`` handlers that will. This enum mirrors that frozenset, so
+    ``intimate`` and ``all`` are not merely refused at runtime — they cannot be
+    constructed at all, which is the half of the guarantee that does not depend
+    on a handler remembering to ask.
 
     The same two values double as the wire's *tier* vocabulary (see
     :class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and
@@ -350,7 +356,7 @@ RETRY_POLICY: Final[dict[ErrorCode, RetryDisposition]] = {
 **Why ``PRIVACY_REFUSED`` is ``TERMINAL``.** ``creek classify`` is
 escalate-only: a fragment's tier can rise to ``intimate`` but never fall back.
 A remote consumer is capped at ``ceiling=personal`` by
-:data:`creek_mcp.server._REMOTE_ADMITTED_CEILINGS`. So once the fragment behind
+:data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS`. So once the fragment behind
 an ``external_id`` has reached ``intimate``, no remote consumer can ever send
 that id again — not even an unchanged, idempotent re-sync, because the ceiling
 gate sits *above* the content-hash compare in ``write_fragment_idempotent`` and
