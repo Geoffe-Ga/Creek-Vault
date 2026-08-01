@@ -1875,6 +1875,426 @@ def test_tier_only_write_failure_lands_on_errors_without_aborting(
     assert _tier_map(vault)["frag-tierio-ok001"] == "personal"
 
 
+# ---- Post-classification reassess on an already-tiered vault (issue #1105) --
+#
+# ``_prepare_fragment`` gated the post-classification reassess on ``owns_tier``
+# (``needs_tier(raw) or force``), which is ``False`` for every fragment that
+# already carries a concrete tier. A mature vault is *entirely* such fragments,
+# so on a non-``--force`` LLM run the second look never ran: a fragment stamped
+# ``personal`` whose LLM verdict came back ``confessional`` + ``conviction``
+# stayed ``personal`` and — because ``voice_proxy_eligible`` is derived from the
+# tier — stayed a legitimate input to voice-proxy generation.
+#
+# The replacement predicate is "did THIS run's classification make the privacy
+# heuristic **strictly more restrictive** than it was on the fragment as
+# loaded?". Strictly, not merely-differently: a weakened verdict must not raise
+# an operator's tier either. The tests below pin both halves plus the two
+# guarantees the old proxy was standing in for (an operator tier survives a
+# signal-free run; a preserved fragment is not re-tiered at all).
+
+
+def _field_map(vault: Path, key: str) -> dict[str, object]:
+    """Return ``{fragment_id: frontmatter[key]}`` read back off disk.
+
+    The sibling of :func:`_tier_map` for the other frontmatter keys these
+    tests assert on (``voice_proxy_eligible``, ``classification_method``),
+    kept separate so ``_tier_map``'s ``dict[str, str]`` contract — which
+    several existing tests compare against string literals — is untouched.
+    Reads EVERY markdown file under ``01-Fragments`` and keys the result by
+    fragment id, never by ``rglob`` position.
+
+    Args:
+        vault: Vault root to read back.
+        key: Frontmatter key to project.
+
+    Returns:
+        Mapping of fragment id to that key's value, ``"<absent>"`` when the
+        key is missing.
+    """
+    out: dict[str, object] = {}
+    for path in (vault / "01-Fragments").rglob("*.md"):
+        meta = frontmatter.load(str(path)).metadata
+        if meta.get("type") != "fragment":
+            continue
+        out[str(meta["id"])] = meta.get(key, "<absent>")
+    return out
+
+
+def test_a_confessional_verdict_escalates_an_already_tiered_fragment(
+    tmp_path: Path,
+) -> None:
+    """An LLM verdict hardens the tier of a fragment that already had one.
+
+    The #1105 reproduction. Both fragments are pre-stamped
+    ``privacy_tier: personal`` — the shape of every fragment in a vault
+    that has been classified once — and neither carries a
+    ``classification_method``, so the OPS-001 preserved short-circuit does
+    not fire and both really do reach the model on this non-``--force``
+    run. One comes back ``confessional`` + ``conviction``, which is
+    ``PrivacyClassifier.classify_tier``'s third INTIMATE trigger; before
+    #1105 the reassess was gated on "does this run own the tier?", which
+    is false here, so that verdict was silently discarded and the fragment
+    stayed ``personal`` / ``voice_proxy_eligible: true``.
+
+    ``voice_proxy_eligible`` is asserted alongside the tier because it is
+    the actual cost: it is what admits a confessional fragment into
+    voice-proxy generation, where private material can be echoed back out
+    in generated prose.
+
+    The second fragment — same starting tier, an ``analytical`` /
+    ``musing`` verdict — must stay ``personal``, so an implementation that
+    escalates every already-tiered fragment fails here rather than passing
+    the reproduction by accident.
+    """
+    from creek.models import (
+        Authorship,
+        Confidence,
+        PrivacyTier,
+        VoiceClassification,
+        VoiceRegister,
+    )
+
+    vault = tmp_path / "vault"
+    for frag_id in ("frag-owned-conf01", "frag-owned-calm01"):
+        _write_fragment(
+            vault=vault,
+            fragment=Fragment(
+                id=frag_id,
+                title="A hard thing",
+                source=FragmentSource(
+                    platform=SourcePlatform.MARKDOWN,
+                    author=Authorship.SELF,
+                ),
+                privacy_tier=PrivacyTier.PERSONAL,
+            ),
+            body=_TIER_NEUTRAL_BODY,
+        )
+    # Precondition: the tier really is on record before the run, so this is
+    # the already-tiered path and not a first classification.
+    assert _tier_map(vault) == {
+        "frag-owned-conf01": "personal",
+        "frag-owned-calm01": "personal",
+    }
+
+    verdicts = {
+        "frag-owned-conf01": VoiceClassification(
+            voice_register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.CONVICTION,
+        ),
+        "frag-owned-calm01": VoiceClassification(
+            voice_register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.MUSING,
+        ),
+    }
+
+    def _verdict(fragment: Fragment, content: str = "") -> LLMClassificationResult:
+        """Return this test's scripted voice verdict for *fragment*."""
+        _ = content
+        return LLMClassificationResult(
+            fragment=fragment.model_copy(update={"voice": verdicts[fragment.id]}),
+            reasoning="",
+        )
+
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_verdict,
+    ):
+        run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    assert _tier_map(vault) == {
+        "frag-owned-conf01": "intimate",  # the LLM's verdict hardened the tier
+        "frag-owned-calm01": "personal",  # a light verdict moves nothing
+    }
+    assert _field_map(vault, "voice_proxy_eligible") == {
+        "frag-owned-conf01": False,
+        "frag-owned-calm01": True,
+    }
+    # The verdicts really landed, so the tiers above cannot be passing for
+    # want of an LLM call.
+    assert _field_map(vault, "classification_method") == {
+        "frag-owned-conf01": "llm",
+        "frag-owned-calm01": "llm",
+    }
+
+
+def test_an_operator_tier_survives_when_the_run_produces_no_new_signal(
+    tmp_path: Path,
+) -> None:
+    """A deliberate tier is not raised by a signal that was already on disk.
+
+    The guarantee the deleted ``owns_tier`` gate was standing in for, and
+    the reason #1105 is not fixed by reassessing unconditionally. This
+    journal fragment already reads INTIMATE to the heuristic *as loaded*
+    (self-authored journal, and confessional + conviction already in its
+    frontmatter), and the operator nonetheless set ``privacy_tier: open``.
+    The model returns exactly the verdict already on disk, so this run
+    hardened nothing — and a tier the operator chose may only be relaxed
+    or tightened by the operator, never by a re-run over unchanged
+    evidence.
+
+    The contrast fragment is an untiered journal entry: it must acquire
+    ``intimate`` on the same run, so a "never touch any tier" regression
+    cannot pass this test.
+    """
+    from creek.models import (
+        Authorship,
+        Confidence,
+        PrivacyTier,
+        VoiceClassification,
+        VoiceRegister,
+    )
+
+    confessional = VoiceClassification(
+        voice_register=VoiceRegister.CONFESSIONAL,
+        confidence=Confidence.CONVICTION,
+    )
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-opertr-open1",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+            privacy_tier=PrivacyTier.OPEN,
+            voice=confessional,
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-opertr-fresh",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+    def _echo(fragment: Fragment, content: str = "") -> LLMClassificationResult:
+        """Return the fragment with the confessional verdict it already had."""
+        _ = content
+        return LLMClassificationResult(
+            fragment=fragment.model_copy(update={"voice": confessional}),
+            reasoning="",
+        )
+
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_echo,
+    ):
+        run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    assert _tier_map(vault) == {
+        "frag-opertr-open1": "open",  # the operator's call, kept
+        "frag-opertr-fresh": "intimate",  # a fresh fragment still gets tiered
+    }
+    # Both fragments really went through the model, so "open" above is a
+    # decision the pass made, not a fragment it never looked at.
+    assert _field_map(vault, "classification_method") == {
+        "frag-opertr-open1": "llm",
+        "frag-opertr-fresh": "llm",
+    }
+
+
+def test_a_weakened_verdict_does_not_raise_an_operator_tier(tmp_path: Path) -> None:
+    """A verdict that softens the signal may not raise a tier either.
+
+    The engine-level companion to
+    ``TestReassess.test_declines_when_the_candidate_weakened_from_the_baseline``:
+    it separates the decided "strictly more restrictive" predicate from a
+    naive "merely different" one. This markdown fragment is loaded looking
+    INTIMATE to the heuristic (confessional + conviction in its
+    frontmatter) with an operator tier of ``open``; the model then answers
+    ``analytical`` / ``musing``, so the post-classification candidate is
+    ``personal`` — different from the baseline, but different downwards.
+    Acting on that difference would raise the operator's ``open`` to
+    ``personal`` on evidence that pointed the other way, and a
+    flip-flopping model would ratchet a vault tighter every run.
+
+    The contrast fragment (untiered markdown, same weakened verdict) must
+    still land ``personal``, so this cannot pass by never tiering anything.
+    """
+    from creek.models import (
+        Authorship,
+        Confidence,
+        PrivacyTier,
+        VoiceClassification,
+        VoiceRegister,
+    )
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-weaken-open1",
+            title="A hard thing",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+            privacy_tier=PrivacyTier.OPEN,
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.CONFESSIONAL,
+                confidence=Confidence.CONVICTION,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-weaken-fresh",
+            title="A hard thing",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+    analytical = VoiceClassification(
+        voice_register=VoiceRegister.ANALYTICAL,
+        confidence=Confidence.MUSING,
+    )
+
+    def _soften(fragment: Fragment, content: str = "") -> LLMClassificationResult:
+        """Return a verdict weaker than the one already on the fragment."""
+        _ = content
+        return LLMClassificationResult(
+            fragment=fragment.model_copy(update={"voice": analytical}),
+            reasoning="",
+        )
+
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_soften,
+    ):
+        run_classify(vault_path=vault, config=config, method="llm", force=False)
+
+    assert _tier_map(vault) == {
+        "frag-weaken-open1": "open",  # weakened evidence raises nothing
+        "frag-weaken-fresh": "personal",
+    }
+    # The weakened verdict really was written, so the tier above is the
+    # pass's decision about it and not a fragment the model never saw.
+    assert _field_map(vault, "voice") == {
+        "frag-weaken-open1": {
+            "voice_register": "analytical",
+            "confidence": "musing",
+        },
+        "frag-weaken-fresh": {
+            "voice_register": "analytical",
+            "confidence": "musing",
+        },
+    }
+
+
+def test_a_preserved_fragment_is_not_retiered(tmp_path: Path) -> None:
+    """The OPS-001 short-circuit still means "this run did not look".
+
+    A fragment carrying ``classification_method: llm`` from a prior paid
+    run is skipped before any classifier sees it, so this run produces no
+    new signal about it at all — even though the confessional voice
+    already in its frontmatter means the heuristic *would* answer
+    ``intimate`` if asked. #1105 widens when the reassess runs, and the
+    risk is that it widens into this path and starts silently re-tiering
+    the whole of a mature vault off evidence no run of this command
+    produced. The preserved counter is asserted alongside the tier so the
+    test cannot pass by the fragment being skipped for the wrong reason.
+
+    The contrast fragment is an untiered journal entry that does classify
+    normally on the same run.
+    """
+    from creek.models import (
+        Authorship,
+        Confidence,
+        PrivacyTier,
+        VoiceClassification,
+        VoiceRegister,
+    )
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-presrv-conf1",
+            title="A hard thing",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+            privacy_tier=PrivacyTier.PERSONAL,
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.CONFESSIONAL,
+                confidence=Confidence.CONVICTION,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+        method="llm",
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-presrv-fresh",
+            title="Morning pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+
+    seen: list[str] = []
+
+    def _record(fragment: Fragment, content: str = "") -> LLMClassificationResult:
+        """Record which fragments reached the model; echo them back unchanged."""
+        _ = content
+        seen.append(fragment.id)
+        return LLMClassificationResult(fragment=fragment, reasoning="")
+
+    config = CreekConfig()
+    config.classification.confidence_threshold = 1.0  # force the LLM path
+
+    with patch(
+        "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+        side_effect=_record,
+    ):
+        summary = run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+    assert summary.preserved_llm == 1
+    assert seen == ["frag-presrv-fresh"]  # the preserved fragment never ran
+    assert _tier_map(vault) == {
+        "frag-presrv-conf1": "personal",  # untouched: this run never looked
+        "frag-presrv-fresh": "intimate",
+    }
+    assert _field_map(vault, "voice_proxy_eligible") == {
+        "frag-presrv-conf1": True,
+        "frag-presrv-fresh": False,
+    }
+
+
 # ---- Praxis-potential pass (issue #877) ------------------------------------
 #
 # Same discipline as the #876 tier block above: seed fragments with known
