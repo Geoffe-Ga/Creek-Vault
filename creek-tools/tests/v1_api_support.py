@@ -329,16 +329,24 @@ def blank_request_id(body: dict[str, Any]) -> dict[str, Any]:
     return {**body, "request_id": "<blanked>"}
 
 
-def header_names(response: httpx.Response) -> frozenset[str]:
-    """Return *response*'s header names, lowercased.
+def header_items(response: httpx.Response) -> frozenset[tuple[str, str]]:
+    """Return *response*'s headers as lowercased-name/verbatim-value pairs.
+
+    Names *and* values, deliberately. An earlier version of this helper
+    returned names alone, which made "every refusal is identical" a claim
+    about the shape of the header block rather than about its contents — and
+    a ``WWW-Authenticate`` that named the vault, or a ``Content-Length`` that
+    varied with which route was probed, would have passed it. Values are
+    compared byte-for-byte with no normalisation, because a difference this
+    helper smoothed over is a difference a caller could still measure.
 
     Args:
         response: The response under test.
 
     Returns:
-        The set of header names.
+        The set of ``(name, value)`` pairs.
     """
-    return frozenset(name.lower() for name in response.headers)
+    return frozenset((name.lower(), value) for name, value in response.headers.items())
 
 
 _PATH_LIKE: Final[re.Pattern[str]] = re.compile(r"(?:/[A-Za-z0-9._~{}-]+){2,}")

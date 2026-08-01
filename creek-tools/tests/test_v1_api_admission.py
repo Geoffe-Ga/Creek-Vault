@@ -43,6 +43,7 @@ import pytest
 from creek_mcp import policy
 from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
 from creek_mcp.httpapi import capabilities as capabilities_module
+from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.tier_ceiling import TierCeiling
 from tests.v1_api_support import (
     CEILING_HEADER,
@@ -70,12 +71,15 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import httpx
+    from starlette.requests import Request
+    from starlette.responses import Response
     from starlette.testclient import TestClient
 
 _INVALID_REQUEST_STATUS: Final[int] = 422
 _UNAUTHENTICATED_STATUS: Final[int] = 401
 _NOT_FOUND_STATUS: Final[int] = 404
 _INCOMPATIBLE_VERSION_STATUS: Final[int] = 409
+_INTERNAL_ERROR_STATUS: Final[int] = 500
 
 # Every ceiling a remote caller may not have. ``INTIMATE`` (wrong case),
 # ``" personal"`` and ``"open "`` are here because ``_parse_ceiling`` matches
@@ -205,6 +209,91 @@ def test_inadmissible_ceiling_never_reaches_the_handshake_tool(
             test_client, "GET", "/v1/capabilities", headers=headers(ceiling=ceiling)
         )
     assert response.status_code == _INVALID_REQUEST_STATUS
+
+
+async def _explode_handler(_request: Request) -> Response:
+    """Stand in for a route handler, and fail loudly if it is ever entered.
+
+    Args:
+        _request: Ignored.
+
+    Returns:
+        Never.
+
+    Raises:
+        AssertionError: Always. Dispatch *is* the failure — the error boundary
+            turns it into a ``500``, which is a status the gate can be told
+            apart from.
+    """
+    msg = "handler dispatched"
+    raise AssertionError(msg)
+
+
+def _explode_every_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace every mounted handler with :func:`_explode_handler`.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+    """
+    for operation_id in list(handlers_module.HANDLERS):
+        monkeypatch.setitem(handlers_module.HANDLERS, operation_id, _explode_handler)
+
+
+@pytest.mark.parametrize(("method", "path"), MOUNTED, ids=MOUNTED_IDS)
+@pytest.mark.parametrize("ceiling", _INADMISSIBLE_CEILINGS, ids=_INADMISSIBLE_IDS)
+def test_inadmissible_ceiling_never_reaches_any_handler(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    path: str,
+    ceiling: str,
+) -> None:
+    """No route's handler runs for an over-ceiling request — all five of them.
+
+    The ``handshake_tool`` substitution above is the same proof for one route,
+    and only one route could ever carry it: the other four answer ``501``
+    without reaching a tool, so there is no tool call to intercept there. This
+    one moves the probe up a layer, to the handler the router would dispatch
+    to, which every route has. Thirty cells — five routes times six
+    inadmissible ceilings — and none of them may reach a handler.
+
+    That completes the pair. The filesystem snapshot covers all five routes
+    and would miss a handler that read nothing; this covers all five routes
+    and would miss nothing that ran.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Replaces every handler with :func:`_explode_handler`.
+        method: HTTP method under test.
+        path: Request path under test.
+        ceiling: The inadmissible ceiling declared.
+    """
+    _explode_every_handler(monkeypatch)
+    with client(vault_path=vault) as test_client:
+        response = _call(test_client, method, path, headers=headers(ceiling=ceiling))
+    assert response.status_code == _INVALID_REQUEST_STATUS
+
+
+@pytest.mark.parametrize(("method", "path"), MOUNTED, ids=MOUNTED_IDS)
+def test_the_handler_probe_is_live_on_every_route(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    """The non-vacuity twin: an *admissible* request does reach the probe.
+
+    Without this, the sweep above would be equally green against a substitution
+    that silently failed to take — five routes' worth of "no handler ran"
+    proving only that no handler was ever installed.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Replaces every handler with :func:`_explode_handler`.
+        method: HTTP method under test.
+        path: Request path under test.
+    """
+    _explode_every_handler(monkeypatch)
+    with client(vault_path=vault) as test_client:
+        response = _call(test_client, method, path, headers=headers())
+    assert response.status_code == _INTERNAL_ERROR_STATUS
 
 
 @pytest.mark.parametrize("ceiling", _INADMISSIBLE_CEILINGS, ids=_INADMISSIBLE_IDS)

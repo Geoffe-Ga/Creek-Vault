@@ -48,7 +48,7 @@ from tests.v1_api_support import (
     client,
     contains_a_path,
     envelope,
-    header_names,
+    header_items,
     headers,
     seed_vault,
     spy_admitted_ceiling,
@@ -136,8 +136,15 @@ def test_every_unauthenticated_refusal_is_byte_identical(vault: Path) -> None:
     Fifty-six probes: seven paths (five real routes, one unrouted ``/v1``
     path, and ``/``) times four methods times two credential states (absent,
     and a well-formed-but-unknown bearer). If any two of them differ in the
-    body or in the header *names*, an unauthenticated caller has a
+    body, or in a header **name or value**, an unauthenticated caller has a
     distinguishing oracle over the route table.
+
+    Header *values* are in the comparison, not only names (#1117 review). The
+    header block of a ``401`` carries the bearer challenge, the standing
+    ``Vary``, the content type and the content length — and the last of those
+    is a byte count over the body, so a refusal that varied with the route
+    would show up there even if every name matched. Comparing names alone
+    would have called that identical.
 
     The sweep is one test rather than a parametrize on purpose: the property
     is cross-case identity, which no per-case assertion can express.
@@ -146,7 +153,7 @@ def test_every_unauthenticated_refusal_is_byte_identical(vault: Path) -> None:
         vault: A seeded vault, so nothing here fails for want of one.
     """
     bodies: set[str] = set()
-    names: set[frozenset[str]] = set()
+    header_sets: set[frozenset[tuple[str, str]]] = set()
     with client(vault_path=vault) as test_client:
         for path in _PROBE_PATHS:
             for method in _PROBE_METHODS:
@@ -158,9 +165,9 @@ def test_every_unauthenticated_refusal_is_byte_identical(vault: Path) -> None:
                         f"{method} {path} token={token!r}"
                     )
                     bodies.add(repr(blank_request_id(envelope(response))))
-                    names.add(header_names(response))
+                    header_sets.add(header_items(response))
     assert len(bodies) == 1
-    assert len(names) == 1
+    assert len(header_sets) == 1
 
 
 def test_the_unauthenticated_probe_matrix_is_not_vacuous() -> None:
@@ -280,7 +287,7 @@ def test_malformed_authorization_values_are_the_same_refusal(
         baseline = test_client.get("/v1/capabilities", headers=headers(token=None))
     assert refused.status_code == _UNAUTHENTICATED_STATUS
     assert blank_request_id(envelope(refused)) == blank_request_id(envelope(baseline))
-    assert header_names(refused) == header_names(baseline)
+    assert header_items(refused) == header_items(baseline)
 
 
 # --------------------------------------------------------------------------- #

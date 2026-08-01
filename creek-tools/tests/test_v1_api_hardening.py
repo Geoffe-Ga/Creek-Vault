@@ -52,11 +52,15 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
+from anyio import Event, create_task_group, sleep_forever
+from anyio import run as run_async
 from anyio import sleep as async_sleep
 from anyio.to_thread import run_sync
 from starlette.responses import JSONResponse
 
+from creek.audit import log as audit_log_module
 from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
+from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi.auth import BearerAuthMiddleware
@@ -90,6 +94,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from starlette.applications import Starlette
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -114,8 +119,29 @@ single oversized read.
 _TINY_TIMEOUT: Final[float] = 0.01
 """Short enough that the timeout test costs milliseconds, not seconds."""
 
+_SHED_TIMEOUT: Final[float] = 0.25
+"""The deadline used when a *second* request must beat it.
+
+Deliberately looser than :data:`_TINY_TIMEOUT`. A test that times one request
+out and then requires the next one to be answered ``200`` is asserting two
+things at once, and at a ten-millisecond deadline the second of them is a
+stopwatch race a loaded runner can lose. A quarter second is still a quarter
+second of test time, and it is twenty-five times the margin an in-process
+request through seven middlewares and a constant handler actually needs.
+"""
+
 _JOIN_TIMEOUT: Final[float] = 10.0
 """How long a helper thread may block before the test fails rather than hangs."""
+
+_REPEATED_CALLS: Final[int] = 5
+"""How many authenticated handshakes the audit-amplification test issues.
+
+More than two, so a per-request cost that grows with the log would show up as
+a count that tracks the loop rather than as an off-by-one.
+"""
+
+_LOOPBACK: Final[tuple[str, int]] = ("127.0.0.1", 51000)
+"""The peer and server address stamped into a hand-built ASGI scope."""
 
 _SENTINEL_ID: Final[str] = "zz-sentinel-external-id-zz"
 _SENTINEL_BODY: Final[str] = "zz-sentinel-journal-content-zz"
@@ -487,23 +513,269 @@ def test_the_semaphore_is_released_after_a_handler_fault(
     assert after.status_code == 200
 
 
+class _SlowOnce:
+    """A handler that overruns the deadline once, then answers instantly.
+
+    The point is the *second* call. A stand-in that is slow every time makes
+    the follow-up request ``503`` whether the first request gave its slot back
+    or not, and a test that cannot tell those apart is not evidence of either.
+
+    Attributes:
+        calls: How many times the handler has been entered.
+    """
+
+    def __init__(self) -> None:
+        """Start with no calls recorded."""
+        self.calls = 0
+
+    async def __call__(self, _request: Request) -> Response:
+        """Overrun on the first call, answer immediately on every later one.
+
+        Args:
+            _request: Ignored.
+
+        Returns:
+            A ``200`` — which the first call never gets to deliver, because
+            the deadline fires while it is still sleeping.
+        """
+        self.calls += 1
+        if self.calls == 1:
+            await async_sleep(_JOIN_TIMEOUT)
+        return JSONResponse({"status": "ok"})
+
+
 def test_the_semaphore_is_released_after_a_timeout(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The timeout path releases the slot too, not only the success path.
+    """The timeout path releases the slot too, and the *next* request shows it.
+
+    The obvious version of this test — time one request out, then assert the
+    next one is ``503`` as well — passes whatever the code does. A released
+    slot and a leaked slot both produce ``503`` on the second request, one
+    from the deadline and one from the concurrency limit, and the status line
+    does not say which. It was written that way and it proved nothing; this is
+    the rewrite.
+
+    So the second request goes through a **fast** path and must come back
+    ``200``. With the only slot leaked there is nothing left to answer it
+    with, and the assertion inverts — which is exactly what happens if the
+    ``finally`` in
+    :class:`~creek_mcp.httpapi.middleware.limits.ConcurrencyLimitMiddleware`
+    is removed.
 
     Args:
         vault: A seeded vault.
-        monkeypatch: Swaps the health handler for a sleeping one.
+        monkeypatch: Swaps the health handler for one that overruns once.
     """
-    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, _slow_health)
+    handler = _SlowOnce()
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, handler)
     with client(
-        vault_path=vault, max_concurrency=1, timeout_seconds=_TINY_TIMEOUT
+        vault_path=vault, max_concurrency=1, timeout_seconds=_SHED_TIMEOUT
     ) as test_client:
         timed_out = test_client.get(HEALTH_PATH, headers=headers())
         after = test_client.get(HEALTH_PATH, headers=headers())
     assert timed_out.status_code == _UNAVAILABLE_STATUS
-    assert after.status_code == _UNAVAILABLE_STATUS
+    assert envelope(timed_out)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert after.status_code == _OK_STATUS
+    assert handler.calls == 2, "the second request never reached the handler"
+
+
+class _BlockedOnce:
+    """A handler that hangs the first request forever, then answers instantly.
+
+    The counterpart to :class:`_SlowOnce` for the cancellation path: nothing
+    here watches a clock, because the first request is not meant to end on a
+    deadline — it is meant to be abandoned.
+
+    Attributes:
+        entered: Set the moment the first request reaches the handler, so the
+            test can cancel it while it is genuinely in flight rather than
+            after a sleep it guessed the length of.
+        calls: How many times the handler has been entered.
+    """
+
+    def __init__(self, entered: Event) -> None:
+        """Record the event to signal on entry.
+
+        Args:
+            entered: The event set when the first call arrives.
+        """
+        self.entered = entered
+        self.calls = 0
+
+    async def __call__(self, _request: Request) -> Response:
+        """Hang on the first call, answer immediately on every later one.
+
+        Args:
+            _request: Ignored.
+
+        Returns:
+            A ``200`` on the second and subsequent calls. The first call never
+            returns at all — it is cancelled where it waits.
+        """
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            await sleep_forever()
+        return JSONResponse({"status": "ok"})
+
+
+def _get_scope(path: str) -> dict[str, Any]:
+    """Return the ASGI scope a server would build for ``GET`` *path*.
+
+    Args:
+        path: The request path.
+
+    Returns:
+        A complete ``http`` scope carrying the suite's standard headers.
+    """
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (name.lower().encode(), value.encode()) for name, value in headers().items()
+        ],
+        "client": _LOOPBACK,
+        "server": _LOOPBACK,
+    }
+
+
+async def _drive(app: Starlette, path: str) -> int:
+    """Run one ``GET`` through *app* the way a server would, and report status.
+
+    The test client cannot express "the client went away": it is synchronous,
+    and a disconnect is a *cancellation of the server task*. So this drives the
+    raw ASGI callable, which is the only place that cancellation can be
+    applied from.
+
+    Args:
+        app: The application under test.
+        path: The request path.
+
+    Returns:
+        The status line the app emitted.
+    """
+    seen: list[int] = []
+
+    async def receive() -> dict[str, Any]:
+        """Deliver one empty body chunk and nothing further.
+
+        Returns:
+            The single ``http.request`` message.
+        """
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        """Record the status line and discard the rest.
+
+        Args:
+            message: The outgoing ASGI message.
+        """
+        if message["type"] == "http.response.start":
+            seen.append(int(message["status"]))
+
+    await app(_get_scope(path), receive, send)
+    return seen[0]
+
+
+def test_the_semaphore_is_released_when_the_client_disconnects(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that hangs up mid-request gives its slot back.
+
+    The likelier real-world path than a raised exception. A mobile client
+    loses its connection, the server cancels the task, and that surfaces
+    inside the stack as a **cancellation** — which
+    :class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware`
+    deliberately does not catch, because a cancellation is not a request-level
+    failure. Nothing turns it into a ``500``; the only thing that returns the
+    slot is the ``finally`` in the concurrency limiter. So this is the path
+    that leaks first, and it was the one path with no test.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one that hangs once.
+    """
+
+    async def scenario() -> int:
+        """Abandon one in-flight request, then measure the next one.
+
+        Returns:
+            The status of the request issued after the abandonment.
+        """
+        entered = Event()
+        handler = _BlockedOnce(entered)
+        monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, handler)
+        app = build_app(vault_path=vault, max_concurrency=1)
+        async with create_task_group() as abandoned:
+            abandoned.start_soon(_drive, app, HEALTH_PATH)
+            await entered.wait()
+            abandoned.cancel_scope.cancel()
+        return await _drive(app, HEALTH_PATH)
+
+    assert run_async(scenario) == _OK_STATUS
+
+
+# --------------------------------------------------------------------------- #
+# Audit-log amplification
+# --------------------------------------------------------------------------- #
+
+
+def test_repeated_handshakes_do_not_re_read_the_whole_audit_log(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One authenticated handshake must not cost one full log scan.
+
+    Every authenticated ``GET /v1/capabilities`` appends an audit entry, and
+    the chain hash that append stamps in is the hash of the log's *last line*.
+    :class:`creek.audit.AuditLog` caches that hash for exactly this reason —
+    but a fresh log object per request finds the cache cold every time, so the
+    append re-reads the entire file, and it does so while holding the
+    process-global write lock. Per-request cost then grows with the length of
+    the log: the same amplification
+    :mod:`creek_mcp.httpapi.middleware.access_log` refuses to introduce on the
+    unauthenticated path, reintroduced one layer in.
+
+    Counted rather than timed. The claim is a number of full scans — one, the
+    cold read before the first append — and it must not track the request
+    count.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Counts full-file rescans at their single seam.
+    """
+    scans: list[Path] = []
+    real_scan = audit_log_module._last_line
+
+    def _counted(path: Path) -> str | None:
+        """Record one full-file rescan, then perform it.
+
+        Args:
+            path: The log being scanned.
+
+        Returns:
+            Whatever the real scan returned.
+        """
+        scans.append(path)
+        return real_scan(path)
+
+    monkeypatch.setattr(audit_log_module, "_last_line", _counted)
+    with client(vault_path=vault) as test_client:
+        for _ in range(_REPEATED_CALLS):
+            response = test_client.get(CAPABILITIES_PATH, headers=headers())
+            assert response.status_code == _OK_STATUS
+
+    written = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()
+    assert len(written) == _REPEATED_CALLS, "the requests did not reach the audit log"
+    verify_mcp_audit_chain(vault)
+    assert len(scans) == 1, f"one cold scan expected, saw {len(scans)}"
 
 
 def _a_running_loop_is_visible() -> bool:
