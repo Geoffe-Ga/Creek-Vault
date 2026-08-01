@@ -30,11 +30,11 @@ import json
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
+
+from creek_mcp import server as server_mod
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import cli as cli_mod
 from creek_mcp.httpapi.cli import DEFAULT_API_PORT, main
-
-from creek_mcp import server as server_mod
 from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
 from creek_mcp.server import DEFAULT_MCP_NETWORK_PORT
 from creek_mcp.token_policy import MIN_TOKEN_LEN

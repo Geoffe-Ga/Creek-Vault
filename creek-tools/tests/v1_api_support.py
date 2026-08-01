@@ -25,13 +25,13 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Final
 
-from creek_mcp.httpapi.app import create_app
-from creek_mcp.httpapi.middleware import ceiling as ceiling_middleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from creek_mcp import policy
 from creek_mcp.api.models import CONTRACT_MINOR
+from creek_mcp.httpapi.app import create_app
+from creek_mcp.httpapi.middleware import ceiling as ceiling_middleware
 from creek_mcp.remote_auth import ConsumerTokenVerifier
 
 if TYPE_CHECKING:
