@@ -42,7 +42,12 @@ from creek.classify.classify_engine import build_tier_classifiers
 from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
-from creek.classify.privacy_pass import PRIVACY_TIER_KEY, apply_tier
+from creek.classify.privacy_pass import (
+    PRIVACY_TIER_KEY,
+    apply_tier,
+    needs_tier,
+    reassess,
+)
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
@@ -552,6 +557,34 @@ class Pipeline:
         it. The pass is escalate-only, so running it after the optional
         LLM dispatch cannot undo a ``latent`` verdict the model produced.
 
+        Every fragment then gets one more privacy look, and that look is
+        the last mutation before the write (#974). The pre-pass above has
+        to precede the LLM for the router's sake, so it cannot see
+        ``voice_register`` / ``confidence``, and self-authored +
+        confessional + conviction is ``classify_tier``'s third INTIMATE
+        trigger (``creek/classify/privacy.py:141``). Without this second
+        look ``creek process`` stamped ``personal`` +
+        ``voice_proxy_eligible: true`` on content ``creek classify``
+        stamps ``intimate`` + ``false`` — so which command the user
+        happened to run decided whether intimate content stayed
+        voice-proxy eligible. Running it last is safe because it is
+        escalate-only (:func:`~creek.classify.privacy_pass.escalate`): it
+        can never lower a tier, so it can never regress the tier→router
+        ordering above. It is guarded on ``owns_tier`` to mirror
+        ``_prepare_fragment`` (``creek/classify/classify_engine.py:765``
+        and ``:919-920``), so the two entry points stay ordered and gated
+        identically — which is the whole point of an issue about those
+        two disagreeing. ``force`` is always ``False`` on this path, so
+        the engine's ``needs_tier(raw) or force`` reduces here to
+        ``needs_tier(raw)``; the guard earns its place because
+        ``apply_tier`` itself already declines to overwrite a tier that
+        is on record when ``force`` is ``False``
+        (``creek/classify/privacy_pass.py:153-155``), and an unguarded
+        reassess would therefore have the pipeline honour a pre-set tier
+        before the model runs and override it after. No production
+        ingester sets ``privacy_tier`` today, so in practice
+        ``owns_tier`` is always ``True`` here.
+
         Classification operates on the inner :class:`Fragment`; the body
         is preserved unchanged on the returned :class:`IngestedFragment`.
 
@@ -576,10 +609,15 @@ class Pipeline:
             # very run meant to classify it (Intimate-never-cloud, ADR-0003).
             # There is no frontmatter on disk yet, so the fragment's own tier
             # is the "raw" state a manual override would have to come through.
+            raw: dict[str, object] = {PRIVACY_TIER_KEY: frag.privacy_tier}
+            # Read the ownership question BEFORE ``apply_tier`` answers it by
+            # stamping a tier, mirroring the engine's ``_prepare_fragment``
+            # (``force`` is always False here, so its ``or force`` drops out).
+            owns_tier = needs_tier(raw)
             frag = apply_tier(
                 frag,
                 item.body,
-                raw={PRIVACY_TIER_KEY: frag.privacy_tier},
+                raw=raw,
                 force=False,
                 classifier=self.privacy_classifier,
             )
@@ -597,9 +635,18 @@ class Pipeline:
             # placement mirrors the engine's (classify -> audience -> praxis)
             # so the two entry points agree fragment for fragment.
             frag = self.audience_classifier.classify_and_enforce(frag, item.body)
-            # Issue #877: score the praxis axis last, so the escalate-only
-            # merge sees whatever the optional LLM dispatch above produced.
+            # Issue #877: score the praxis axis after the optional LLM dispatch
+            # above, so the escalate-only merge sees whatever the model
+            # produced, and before the reassess below, so the #876 privacy
+            # pass stays the last mutation before the write (mirrors the
+            # engine's ordering).
             frag = apply_praxis(frag, item.body)
+            # Issue #974: the tier pass above had to run before the LLM, so it
+            # never saw the voice axes Pass 3 just filled in. Look once more,
+            # last and escalate-only, exactly where the engine looks — only
+            # when this run owns the tier, so a pre-set one is never raised.
+            if owns_tier:
+                frag = reassess(frag, item.body, classifier=self.privacy_classifier)
             classified.append(IngestedFragment(fragment=frag, body=item.body))
 
         self.review_generator.generate_queue(

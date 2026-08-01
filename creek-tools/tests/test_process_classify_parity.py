@@ -39,6 +39,20 @@ comparison meaningless anyway. The true, stronger, testable contract is:
    resulting delta would be correct behaviour rather than a wiring hole.
 3. Compare *parsed metadata*, not bytes — see above.
 
+**Known limitation (#974).** The claim above that this module "fails
+automatically on a fourth instance" is true only of the deterministic
+path: precondition 1 scopes every assertion here to ``no_llm=True`` /
+``--method rules``, and the fourth instance — ``creek process`` never
+calling :func:`creek.classify.privacy_pass.reassess`, so an LLM verdict
+of ``confessional`` + ``conviction`` never escalates the tier the way
+``creek classify`` does — structurally cannot manifest with no LLM in
+the run, so it went uncaught here. Extending the detector past that
+scope needs a deterministic stubbed model driving *both* orchestrators
+(tracked in #1107); until then, an axis wired into only one of them
+**behind an LLM verdict** is outside this module's reach, and
+``tests/test_pipeline.py::TestPipelinePrivacyReassess`` is what pins
+that particular hole.
+
 The comparison is over the whole parsed frontmatter dict minus a small
 documented exclusion set, never a hand-enumerated list of axes. That is
 what makes the next unwired axis fail here on its own.

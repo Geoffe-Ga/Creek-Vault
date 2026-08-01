@@ -1188,6 +1188,453 @@ class TestPipelineTierRouting:
         }
 
 
+class TestPipelinePrivacyReassess:
+    """``creek process`` re-checks the tier after the LLM answers (#974).
+
+    The #876 privacy pre-pass has to run *before* ``for_tier`` picks a
+    provider, so it can only read the axes already on a freshly-ingested
+    fragment — and a fresh fragment has no voice. When Pass 3 then comes
+    back ``confessional`` + ``conviction`` on self-authored content, that
+    is
+    :meth:`~creek.classify.privacy.PrivacyClassifier.classify_tier`'s
+    third INTIMATE trigger, and it arrives too late for the pre-pass to
+    see it. :func:`~creek.classify.privacy_pass.reassess` exists for
+    exactly this second look, and
+    :func:`~creek.classify.classify_engine._process_file` calls it — but
+    :meth:`~creek.pipeline.Pipeline._run_classification` never did.
+
+    The consequence is a real divergence, not a cosmetic one: the same
+    fragment lands ``privacy_tier: personal`` / ``voice_proxy_eligible:
+    true`` through ``creek process`` and ``intimate`` / ``false`` through
+    ``creek classify``. The ``true`` is the damage — it admits a
+    confessional fragment into voice-proxy generation, so private
+    material can be echoed back out in generated prose.
+
+    This is the same wired-into-one-caller defect class as #876 / #877 /
+    #937, and it slipped past
+    :mod:`tests.test_process_classify_parity` because that detector is
+    scoped to ``no_llm=True`` (see the note in its module docstring). So
+    every test here that pins the gap drives the **LLM** path with a
+    stubbed verdict; on the rules path the bug cannot manifest, because
+    ``_run_classification`` runs the rule classifier *before*
+    ``apply_tier`` and a rules-derived confessional register is therefore
+    already visible to the pre-pass.
+    """
+
+    # Deliberately free of RECOVERY_KEYWORDS (``creek/classify/privacy.py``)
+    # and of the CONFESSIONAL / CONVICTION rules keywords, so the tier a
+    # test observes comes from the stubbed verdict (or, in the no-LLM
+    # test, from the source platform) and never from the body text.
+    NEUTRAL_BODY = "a plain note about the walk to the shops and the weather"
+
+    @staticmethod
+    def _ingested(
+        frag_id: str,
+        platform: str,
+        channel: str | None = None,
+        tier: PrivacyTier | None = None,
+    ):
+        """A self-authored IngestedFragment carrying the neutral body.
+
+        Args:
+            frag_id: Fragment id — the assertion key.
+            platform: :class:`~creek.models.SourcePlatform` value.
+            channel: Optional source channel; the Discord tier hint.
+            tier: Optional pre-set :class:`~creek.models.PrivacyTier`.
+                ``None`` leaves the model default ``unclassified``, which
+                is the freshly-ingested shape every production ingester
+                produces.
+
+        Returns:
+            The assembled :class:`~creek.ingest.base.IngestedFragment`.
+        """
+        from creek.ingest.base import IngestedFragment
+        from creek.models import (
+            Authorship,
+            Fragment,
+            FragmentSource,
+            PrivacyTier,
+            SourcePlatform,
+        )
+
+        fragment = Fragment(
+            id=frag_id,
+            title="A note",
+            source=FragmentSource(
+                platform=SourcePlatform(platform),
+                author=Authorship.SELF,
+                channel=channel,
+            ),
+            privacy_tier=PrivacyTier.UNCLASSIFIED if tier is None else tier,
+        )
+        return IngestedFragment(
+            fragment=fragment,
+            body=TestPipelinePrivacyReassess.NEUTRAL_BODY,
+        )
+
+    @staticmethod
+    def _stub_llm_voice(pipeline, monkeypatch, verdicts) -> None:
+        """Make Pass 3 return a chosen voice verdict per fragment id.
+
+        Both tier classifiers are stubbed with the same function so the
+        assertions never depend on which provider ``for_tier`` picks, and
+        an unexpected fragment reaching the LLM raises ``KeyError``
+        rather than silently taking a default.
+
+        Args:
+            pipeline: The :class:`~creek.pipeline.Pipeline` to stub.
+            monkeypatch: pytest's monkeypatch fixture.
+            verdicts: Map of fragment id → ``(voice_register, confidence)``
+                the stubbed model returns for that fragment. Either
+                element may be ``None`` (an unset axis).
+        """
+        from creek.models import VoiceClassification
+
+        def _classify(fragment, content=""):
+            """Return *fragment* carrying this test's scripted verdict."""
+            register, confidence = verdicts[fragment.id]
+            return fragment.model_copy(
+                update={
+                    "voice": VoiceClassification(
+                        voice_register=register,
+                        confidence=confidence,
+                    ),
+                },
+            )
+
+        for classifier in (
+            pipeline.tier_classifiers.intimate,
+            pipeline.tier_classifiers.non_intimate,
+        ):
+            monkeypatch.setattr(classifier, "classify", _classify)
+
+    @staticmethod
+    def _tiers(classified) -> dict[str, str]:
+        """Map fragment id → ``privacy_tier`` value for a classified batch.
+
+        Args:
+            classified: The list ``_run_classification`` returned.
+
+        Returns:
+            Dict keyed by fragment id, never by list position.
+        """
+        from creek.models import PrivacyTier
+
+        return {
+            item.fragment.id: PrivacyTier(item.fragment.privacy_tier).value
+            for item in classified
+        }
+
+    @staticmethod
+    def _eligibility(classified) -> dict[str, bool]:
+        """Map fragment id → ``voice_proxy_eligible`` for a batch.
+
+        Args:
+            classified: The list ``_run_classification`` returned.
+
+        Returns:
+            Dict keyed by fragment id, never by list position.
+        """
+        return {
+            item.fragment.id: item.fragment.voice_proxy_eligible for item in classified
+        }
+
+    def test_a_confessional_llm_verdict_raises_the_tier_before_the_write(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A confessional verdict reaches the vault as ``intimate``.
+
+        The pre-pass sees an untiered self-authored markdown note with no
+        voice and correctly answers ``personal``. Pass 3 then answers
+        ``confessional`` + ``conviction`` — the third INTIMATE trigger in
+        :meth:`~creek.classify.privacy.PrivacyClassifier.classify_tier` —
+        and nothing looks again, so the harder signal is discarded.
+
+        Asserted on the **file**, not the in-memory fragment, because
+        ``voice_proxy_eligible`` is the whole cost of the bug: it is a
+        :func:`~pydantic.computed_field` derived from ``privacy_tier`` +
+        ``source.author``, so a fragment written at ``personal`` is
+        serialised ``voice_proxy_eligible: true`` and is thereafter a
+        legitimate input to voice-proxy generation. The voice assertion
+        below proves the stubbed verdict actually landed, so the tier
+        assertion cannot be passing because the LLM was never consulted.
+        """
+        import frontmatter
+
+        from creek.models import Confidence, PrivacyTier, VoiceRegister
+
+        pipeline = Pipeline(config=CreekConfig())
+        # Rules leaving the frequency unclassified is what routes the
+        # fragment to Pass 3 at all.
+        monkeypatch.setattr(
+            pipeline.rule_classifier, "classify", lambda f, content="": f
+        )
+        self._stub_llm_voice(
+            pipeline,
+            monkeypatch,
+            {
+                "frag-reassess001": (
+                    VoiceRegister.CONFESSIONAL,
+                    Confidence.CONVICTION,
+                ),
+            },
+        )
+        result = PipelineResult()
+
+        classified = pipeline._run_classification(
+            [self._ingested("frag-reassess001", "markdown")],
+            vault_path,
+            result,
+        )
+        pipeline._write_to_vault(classified, vault_path, result)
+
+        on_disk = {
+            post["id"]: post
+            for post in (
+                frontmatter.load(str(path))
+                for path in (vault_path / "01-Fragments").rglob("*.md")
+            )
+        }
+
+        assert result.errors == []
+        assert on_disk["frag-reassess001"]["voice"]["voice_register"] == (
+            VoiceRegister.CONFESSIONAL.value
+        )
+        assert on_disk["frag-reassess001"]["privacy_tier"] == PrivacyTier.INTIMATE.value
+        assert on_disk["frag-reassess001"]["voice_proxy_eligible"] is False
+
+    def test_reassess_never_lowers_a_tier(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A weaker post-classification verdict cannot demote ``intimate``.
+
+        The second look is a one-way ratchet
+        (:func:`~creek.classify.privacy_pass.escalate`): lowering a tier
+        is the only direction that leaks content, so an operator — not a
+        heuristic — relaxes one. Both fragments here are self-authored
+        journal entries, which the pre-pass tiers ``intimate`` on the
+        source alone, and both come back from the stubbed model with a
+        verdict that would derive something *lighter* if it were allowed
+        to overwrite: one explicitly ``analytical`` + ``musing``, one
+        with both voice axes unset, which is the shape a partial or
+        malformed model answer produces.
+
+        ``human_review_sources`` is emptied because ``journal`` is in it
+        by default, which would skip Pass 3 entirely and make the test
+        vacuous.
+        """
+        from creek.models import Confidence, PrivacyTier, VoiceRegister
+
+        config = CreekConfig()
+        config.classification.human_review_sources = []
+        pipeline = Pipeline(config=config)
+        monkeypatch.setattr(
+            pipeline.rule_classifier, "classify", lambda f, content="": f
+        )
+        self._stub_llm_voice(
+            pipeline,
+            monkeypatch,
+            {
+                "frag-reassess002": (VoiceRegister.ANALYTICAL, Confidence.MUSING),
+                "frag-reassess003": (None, None),
+            },
+        )
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested("frag-reassess002", "journal"),
+                self._ingested("frag-reassess003", "journal"),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert self._tiers(classified) == {
+            "frag-reassess002": PrivacyTier.INTIMATE.value,
+            "frag-reassess003": PrivacyTier.INTIMATE.value,
+        }
+        assert self._eligibility(classified) == {
+            "frag-reassess002": False,
+            "frag-reassess003": False,
+        }
+
+    def test_a_non_confessional_verdict_leaves_the_tier_untouched(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The second look escalates on the signal, not on principle.
+
+        A pass that answered ``intimate`` for everything would satisfy
+        the RED test above while burying ordinary content — every
+        processed fragment would leave voice-proxy generation with
+        nothing to learn from. Three self-authored fragments run
+        together with three **distinct** expected tiers, so no
+        blanket verdict can pass:
+
+        * ``markdown`` + ``confessional`` but only ``exploring`` — the
+          register alone is not the trigger; ``classify_tier`` requires
+          ``conviction`` too, so this stays ``personal`` and voice-proxy
+          eligible.
+        * ``essay`` + ``confessional`` + ``conviction`` — this one *does*
+          become ``intimate``. The self-authored INTIMATE checks sit
+          **above** the ESSAY branch in ``classify_tier``
+          (``creek/classify/privacy.py:136-144``), so the trigger fires
+          before the source can answer ``open``. It is here to prove the
+          escalation is content-driven: the same platform that stays
+          ``open`` under a light verdict rises under a heavy one.
+        * ``discord`` on a named (non-DM) channel + ``analytical`` —
+          stays ``open``, the tier the second look must be most careful
+          never to raise.
+        """
+        from creek.models import Confidence, PrivacyTier, VoiceRegister
+
+        pipeline = Pipeline(config=CreekConfig())
+        monkeypatch.setattr(
+            pipeline.rule_classifier, "classify", lambda f, content="": f
+        )
+        self._stub_llm_voice(
+            pipeline,
+            monkeypatch,
+            {
+                "frag-reassess004": (
+                    VoiceRegister.CONFESSIONAL,
+                    Confidence.EXPLORING,
+                ),
+                "frag-reassess005": (
+                    VoiceRegister.CONFESSIONAL,
+                    Confidence.CONVICTION,
+                ),
+                "frag-reassess006": (VoiceRegister.ANALYTICAL, Confidence.MUSING),
+            },
+        )
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested("frag-reassess004", "markdown"),
+                self._ingested("frag-reassess005", "essay"),
+                self._ingested("frag-reassess006", "discord", channel="general"),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert self._tiers(classified) == {
+            "frag-reassess004": PrivacyTier.PERSONAL.value,
+            "frag-reassess005": PrivacyTier.INTIMATE.value,
+            "frag-reassess006": PrivacyTier.OPEN.value,
+        }
+        assert self._eligibility(classified) == {
+            "frag-reassess004": True,
+            "frag-reassess005": False,
+            "frag-reassess006": True,
+        }
+
+    def test_a_preset_ingester_tier_is_not_silently_raised(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A tier already on record survives a heavier LLM verdict.
+
+        :func:`~creek.classify.privacy_pass.apply_tier`
+        (``creek/classify/privacy_pass.py:153-155``) declines to overwrite
+        a tier that is already on record when ``force=False`` — the
+        operator's call outranks the heuristic. The second look has to
+        decline for the same reason, keyed on the same "did this
+        frontmatter still owe us a tier?" question
+        (:func:`~creek.classify.privacy_pass.needs_tier`), or the
+        pipeline would half-honour a pre-set tier: respected before the
+        model runs, overridden after.
+
+        This is a **seam contract**, not a live content path: no
+        production ingester sets ``privacy_tier`` today, so the fragment
+        below is constructed by hand. Note the resulting test polarity —
+        it passes both before and after the #974 fix, and fails only if
+        the fix drops the ``owns_tier`` guard and reassesses
+        unconditionally (which reads ``intimate`` here). Deleting it
+        because "it was never red" removes the only thing pinning that
+        guard.
+        """
+        from creek.models import Confidence, PrivacyTier, VoiceRegister
+
+        pipeline = Pipeline(config=CreekConfig())
+        monkeypatch.setattr(
+            pipeline.rule_classifier, "classify", lambda f, content="": f
+        )
+        self._stub_llm_voice(
+            pipeline,
+            monkeypatch,
+            {
+                "frag-reassess007": (
+                    VoiceRegister.CONFESSIONAL,
+                    Confidence.CONVICTION,
+                ),
+            },
+        )
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested(
+                    "frag-reassess007",
+                    "markdown",
+                    tier=PrivacyTier.OPEN,
+                ),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert self._tiers(classified) == {
+            "frag-reassess007": PrivacyTier.OPEN.value,
+        }
+        # The verdict that *would* have escalated an untiered fragment did
+        # land, so the assertion above is not passing for want of an LLM call.
+        assert classified[0].fragment.voice.voice_register == (
+            VoiceRegister.CONFESSIONAL.value
+        )
+
+    def test_a_no_llm_run_changes_no_tier(self, vault_path: Path) -> None:
+        """With no LLM in the run, the second look is a strict no-op.
+
+        The real rule classifier runs here (not a stub) over neutral
+        bodies that carry no voice signal, so nothing hardens between the
+        pre-pass and the write and every tier must come out exactly as
+        the source platform dictates. That is the claim
+        :mod:`tests.test_process_classify_parity` depends on: its whole
+        invariant is scoped to ``no_llm=True`` / ``--method rules``, so if
+        the #974 fix moved any tier on the deterministic path it would
+        break process/classify parity on every axis at once.
+
+        Four fragments, three distinct expected tiers, keyed by id.
+        """
+        from creek.models import PrivacyTier
+
+        pipeline = Pipeline(config=CreekConfig(), no_llm=True)
+
+        classified = pipeline._run_classification(
+            [
+                self._ingested("frag-reassess008", "journal"),
+                self._ingested("frag-reassess009", "essay"),
+                self._ingested("frag-reassess010", "markdown"),
+                self._ingested("frag-reassess011", "discord", channel="dm"),
+            ],
+            vault_path,
+            PipelineResult(),
+        )
+
+        assert self._tiers(classified) == {
+            "frag-reassess008": PrivacyTier.INTIMATE.value,
+            "frag-reassess009": PrivacyTier.OPEN.value,
+            "frag-reassess010": PrivacyTier.PERSONAL.value,
+            "frag-reassess011": PrivacyTier.PERSONAL.value,
+        }
+
+
 class TestPipelinePraxisPass:
     """``creek process`` stamps ``praxis_potential`` too (issue #877).
 

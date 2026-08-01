@@ -12,7 +12,8 @@ close that hole:
 * :func:`escalate` — merge two candidate tiers, never lowering.
 * :func:`apply_tier` — stamp a tier, honouring a manual override.
 * :func:`reassess` — re-run the check after classification hardened the
-  fragment's voice signals; escalate-only.
+  fragment's voice signals; escalate-only. Both entry points call it,
+  each as its last mutation before the write (#974).
 
 Two rules hold across every function here:
 
