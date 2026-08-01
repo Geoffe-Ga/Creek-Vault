@@ -9,6 +9,7 @@ via write_any.
 
 from __future__ import annotations
 
+import errno
 import json
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,8 @@ from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from conftest import ShortWriteController
 
 
 # ---- Fixtures ----
@@ -1525,6 +1528,202 @@ class TestAtomicWriteHardening:
                 "2025-01-15-collide",
                 "irrelevant",
             )
+
+    def test_atomic_create_writes_full_body_under_short_writes(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A short ``os.write`` must not truncate the created note (#987).
+
+        ``_atomic_create`` writes straight to the final path — there is no
+        tempfile + rename — so a discarded byte count lands a half-written
+        note at the real filename with no exception raised.
+        """
+        short_write.halve()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        content = "x" * 400 + "TAIL"
+
+        path = VaultWriter._atomic_create(target_dir, "demo", content)
+
+        assert path.read_text(encoding="utf-8") == content
+
+    def test_atomic_create_leaves_no_file_when_write_makes_no_progress(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A stalled descriptor raises instead of returning an empty note.
+
+        Today the zero-byte return is ignored: the caller receives a path
+        to a 0-byte file and indexes it as a real fragment.
+        """
+        short_write.stall()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+
+        with pytest.raises(OSError) as excinfo:
+            VaultWriter._atomic_create(target_dir, "demo", "x" * 400 + "TAIL")
+
+        assert excinfo.value.errno == errno.EIO
+        assert not list(target_dir.glob("demo*.md"))
+
+    def test_append_index_entry_writes_complete_line_under_short_writes(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A short append writes the whole JSON line, not half of one.
+
+        Half a line is not valid JSON, so ``_load_index_file`` skips it and
+        the id-to-filename mapping is silently dropped — the fragment
+        becomes invisible to duplicate detection and to ``update_fragment``.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        short_write.halve()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        model_id = "frag-short-write"
+        filename = "2025-01-15-demo.md"
+
+        VaultWriter._append_index_entry(target_dir, model_id, filename)
+
+        index_path = target_dir / INDEX_FILENAME
+        expected = (
+            json.dumps({"id": model_id, "filename": filename}, sort_keys=True) + "\n"
+        )
+        assert index_path.read_text(encoding="utf-8") == expected
+        assert VaultWriter._load_index_file(index_path) == {model_id: filename}
+
+    def test_append_index_entry_raises_when_write_makes_no_progress(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A stalled index append fails loudly rather than dropping the entry."""
+        from creek.vault.writer import INDEX_FILENAME
+
+        short_write.stall()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+
+        with pytest.raises(OSError) as excinfo:
+            VaultWriter._append_index_entry(
+                target_dir,
+                "frag-stalled",
+                "2025-01-15-demo.md",
+            )
+
+        assert excinfo.value.errno == errno.EIO
+        assert VaultWriter._load_index_file(target_dir / INDEX_FILENAME) == {}
+
+    def test_failed_index_append_also_swallows_the_next_entry(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A half-written index line takes the *next* entry down with it.
+
+        KNOWN DEFECT, tracked as issue #1120. This is a characterization
+        test: it pins the behaviour the code has **today**, not the
+        behaviour anybody wants. ``_append_index_entry`` opens with
+        ``O_APPEND``, so every line lands at EOF with no separator of its
+        own — the trailing newline is part of the payload. When a drain
+        fails part-way (``ENOSPC`` here, after half the bytes are on
+        disk) the remnant survives *without* that newline, and the next
+        successful append is concatenated straight onto it. The merged
+        line is not valid JSON, so ``_load_index_file`` skips it wholesale
+        at ``json.JSONDecodeError`` and **both** the failed entry and the
+        innocent next one drop out of the index.
+
+        ``ftruncate``-back is not a safe repair under concurrent
+        ``O_APPEND`` writers, so a real fix needs a rewrite-under-lock or
+        a framing change — out of scope for #987. When #1120 lands, this
+        test must be **inverted** (``frag-next`` at minimum, ideally both
+        entries, must survive), never deleted.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        index_path = target_dir / INDEX_FILENAME
+        next_line = json.dumps(
+            {"id": "frag-next", "filename": "2025-01-16-next.md"},
+            sort_keys=True,
+        )
+
+        # First append: half the encoded line reaches disk (the payload
+        # is ~60 bytes, so the cut lands deep inside the JSON, far short
+        # of the terminating newline), then the drain hits ENOSPC.
+        short_write.fail_after_half(errno.ENOSPC)
+        with pytest.raises(OSError) as excinfo:
+            VaultWriter._append_index_entry(
+                target_dir,
+                "frag-partial",
+                "2025-01-15-partial.md",
+            )
+        assert excinfo.value.errno == errno.ENOSPC
+
+        # Second append: an entirely healthy, complete write.
+        short_write.passthrough()
+        VaultWriter._append_index_entry(
+            target_dir,
+            "frag-next",
+            "2025-01-16-next.md",
+        )
+
+        raw = index_path.read_text(encoding="utf-8")
+        # Both halves of the scenario are genuinely on disk, so neither
+        # write can have silently become a no-op: the file is non-empty,
+        # the second entry landed complete at the tail, and something
+        # (the remnant) precedes it.
+        assert raw
+        assert raw.endswith(next_line + "\n")
+        assert len(raw) > len(next_line) + 1
+        # ...and the remnant carried no newline of its own, so the two
+        # collided into a single, unparseable line.
+        assert len(raw.splitlines()) == 1
+
+        index = VaultWriter._load_index_file(index_path)
+        # State both absences explicitly: the failed entry is gone (bad
+        # but expected) and so is the *successful* one (the defect).
+        assert "frag-partial" not in index
+        assert "frag-next" not in index
+        assert index == {}
+
+    def test_write_fragment_survives_short_writes_end_to_end(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """The public write path keeps both the body and the index intact.
+
+        Exercises the full blast radius of #987 in one pass: the note body
+        goes through ``_atomic_create`` and the id mapping goes through
+        ``_append_index_entry``, and a short write corrupts both.
+        """
+        import frontmatter as fm_mod
+
+        from creek.vault.writer import INDEX_FILENAME
+
+        fragment = Fragment(
+            id="frag-short-e2e",
+            title="Short write end to end",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 0, 0),
+        )
+        body = "x" * 400 + "TAIL"
+        short_write.halve()
+
+        path = writer.write_fragment(fragment, body=body)
+
+        # Raw bytes first: a truncated note can lose its closing ``---``
+        # delimiter, and a parser error would obscure the real failure.
+        assert path.read_text(encoding="utf-8").rstrip("\n").endswith("TAIL")
+        post = fm_mod.load(str(path))
+        assert post.content.strip() == body
+        assert post["id"] == "frag-short-e2e"
+        index_path = vault_path / "01-Fragments" / "Conversations" / INDEX_FILENAME
+        index = VaultWriter._load_index_file(index_path)
+        assert index == {"frag-short-e2e": path.name}
 
 
 @pytest.mark.slow

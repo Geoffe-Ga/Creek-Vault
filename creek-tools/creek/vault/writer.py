@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import yaml
 
+from creek._fsio import create_exclusive, write_all
 from creek.audit import AuditLog
 from creek.models import (
     Authorship,
@@ -1233,6 +1234,39 @@ class VaultWriter:
         before the write to make a regression (e.g. an unusually long
         fragment ID or filename) fail loudly rather than risk silent
         interleaving.
+
+        The line is drained through :func:`creek._fsio.write_all`, so an
+        ordinary short ``write(2)`` no longer leaves half a JSON line at
+        the tail (#987). If the line is genuinely un-drainable the
+        ``OSError`` propagates and a partial line survives at the tail.
+        That residual is worse than a single lost entry: ``O_APPEND``
+        writes always land at EOF with no separator of their own — the
+        trailing newline is part of the payload — so a remnant left
+        *without* its trailing newline is silently concatenated onto the
+        next successful append. The merged line is not valid JSON, so
+        :meth:`_load_index_file` skips it wholesale at
+        ``json.JSONDecodeError`` and **both** the failed entry and the
+        next legitimate one drop out of the index.
+
+        ``ftruncate``-back is not a safe alternative: under concurrent
+        ``O_APPEND`` writers the write offset is chosen atomically inside
+        the syscall, so we never reliably learn our own start offset, and
+        another appender may already have landed a complete line past
+        ours that the truncation would destroy. Tracked as issue #1120 —
+        a real fix needs a rewrite-under-lock or a framing change, both
+        out of scope for #987.
+
+        Args:
+            target_dir: Directory holding the index file.
+            model_id: ID of the model being recorded.
+            filename: Name of the markdown file that holds it.
+
+        Raises:
+            ValueError: If the encoded line exceeds :data:`_PIPE_BUF_BYTES`,
+                which would void the ``O_APPEND`` atomicity guarantee.
+            OSError: If the line cannot be written in full. A
+                newline-less partial line may survive at the tail, taking
+                the next appended entry down with it (#1120, above).
         """
         target_dir.mkdir(parents=True, exist_ok=True)
         index_path = target_dir / INDEX_FILENAME
@@ -1249,7 +1283,7 @@ class VaultWriter:
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         fd = os.open(str(index_path), flags, 0o644)
         try:
-            os.write(fd, encoded)
+            write_all(fd, encoded)
         finally:
             os.close(fd)
 
@@ -1272,6 +1306,10 @@ class VaultWriter:
         contention pattern surfaces as a loud ``RuntimeError`` rather
         than spinning forever.
 
+        The create-and-drain step is :func:`creek._fsio.create_exclusive`,
+        which writes the whole body even when ``write(2)`` goes short
+        and unlinks the file if it cannot (#987).
+
         Args:
             target_dir: Directory the file will live in.
             base_name: Filename stem (without ``.md``).
@@ -1283,20 +1321,18 @@ class VaultWriter:
         Raises:
             RuntimeError: If a unique filename cannot be obtained within
                 :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
+            OSError: If the file was created but its contents could not
+                be written in full. The partial file is unlinked, so a
+                truncated note is never promoted to the real path.
         """
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         encoded = content.encode("utf-8")
         for counter in range(_MAX_FILENAME_COLLISION_RETRIES):
             suffix = "" if counter == 0 else f"-{counter}"
             candidate = target_dir / f"{base_name}{suffix}.md"
             try:
-                fd = os.open(str(candidate), flags, 0o644)
+                create_exclusive(candidate, encoded)
             except FileExistsError:
                 continue
-            try:
-                os.write(fd, encoded)
-            finally:
-                os.close(fd)
             return candidate
         msg = (
             f"Could not allocate a unique filename for '{base_name}.md' in "
