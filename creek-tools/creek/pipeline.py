@@ -42,12 +42,7 @@ from creek.classify.classify_engine import build_tier_classifiers
 from creek.classify.praxis_pass import apply_praxis
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_filter import tier_of
-from creek.classify.privacy_pass import (
-    PRIVACY_TIER_KEY,
-    apply_tier,
-    needs_tier,
-    reassess,
-)
+from creek.classify.privacy_pass import PRIVACY_TIER_KEY, apply_tier, reassess
 from creek.classify.review import ReviewQueueGenerator
 from creek.classify.rules import RuleClassifier
 from creek.config import CreekConfig
@@ -570,20 +565,32 @@ class Pipeline:
         voice-proxy eligible. Running it last is safe because it is
         escalate-only (:func:`~creek.classify.privacy_pass.escalate`): it
         can never lower a tier, so it can never regress the tier→router
-        ordering above. It is guarded on ``owns_tier`` to mirror
-        ``_prepare_fragment`` (``creek/classify/classify_engine.py:765``
-        and ``:919-920``), so the two entry points stay ordered and gated
-        identically — which is the whole point of an issue about those
-        two disagreeing. ``force`` is always ``False`` on this path, so
-        the engine's ``needs_tier(raw) or force`` reduces here to
-        ``needs_tier(raw)``; the guard earns its place because
-        ``apply_tier`` itself already declines to overwrite a tier that
-        is on record when ``force`` is ``False``
-        (``creek/classify/privacy_pass.py:153-155``), and an unguarded
-        reassess would therefore have the pipeline honour a pre-set tier
-        before the model runs and override it after. No production
-        ingester sets ``privacy_tier`` today, so in practice
-        ``owns_tier`` is always ``True`` here.
+        ordering above.
+
+        That second look is unconditional, because ``reassess`` carries
+        its own gate (#1105): it acts only when *this run's*
+        classification made the privacy heuristic **strictly more
+        restrictive** than it was on the fragment as ingested. So a tier
+        already on record — which ``apply_tier`` correctly declines to
+        overwrite when ``force`` is ``False`` — is disturbed only by
+        evidence that did not exist when it was set, never by a re-run
+        over the same input. The predicate replaces an ``owns_tier``
+        guard that asked "did this frontmatter still owe us a tier?";
+        that proxy answered ``False`` for every already-tiered fragment,
+        so it discarded exactly the confessional verdicts the second look
+        exists to catch.
+
+        The ``baseline`` handed to ``reassess`` is computed on
+        ``item.fragment`` *before* the rule classifier runs, mirroring the
+        engine, which computes it on the fragment as loaded from disk
+        before any of its own classification
+        (``creek.classify.classify_engine._prepare_fragment``). Both
+        therefore mean "the heuristic's verdict on untouched input", and
+        the two entry points stay gated identically — which is the whole
+        point of an issue about them disagreeing. Taking it *after* the
+        rules pass here would make a rules-derived confessional register
+        count as new evidence on this path but not on the engine's, and
+        re-open the divergence in a subtler place.
 
         Classification operates on the inner :class:`Fragment`; the body
         is preserved unchanged on the returned :class:`IngestedFragment`.
@@ -603,6 +610,15 @@ class Pipeline:
 
         classified: list[IngestedFragment] = []
         for item in ingested:
+            # Issue #1105: the heuristic's verdict on the fragment as ingested,
+            # taken before ANY of this run's classification touches the axes it
+            # reads. The reassess below compares against it to tell new evidence
+            # from an echo of what was already there. Mirrors the point at which
+            # the classify engine takes its own baseline.
+            baseline = self.privacy_classifier.classify_tier(
+                item.fragment,
+                content=item.body,
+            )
             frag = self.rule_classifier.classify(item.fragment, content=item.body)
             # Issue #876: assign a real privacy tier BEFORE ``for_tier`` picks
             # a provider, or an Intimate fragment routes to the cloud on the
@@ -610,10 +626,6 @@ class Pipeline:
             # There is no frontmatter on disk yet, so the fragment's own tier
             # is the "raw" state a manual override would have to come through.
             raw: dict[str, object] = {PRIVACY_TIER_KEY: frag.privacy_tier}
-            # Read the ownership question BEFORE ``apply_tier`` answers it by
-            # stamping a tier, mirroring the engine's ``_prepare_fragment``
-            # (``force`` is always False here, so its ``or force`` drops out).
-            owns_tier = needs_tier(raw)
             frag = apply_tier(
                 frag,
                 item.body,
@@ -643,10 +655,16 @@ class Pipeline:
             frag = apply_praxis(frag, item.body)
             # Issue #974: the tier pass above had to run before the LLM, so it
             # never saw the voice axes Pass 3 just filled in. Look once more,
-            # last and escalate-only, exactly where the engine looks — only
-            # when this run owns the tier, so a pre-set one is never raised.
-            if owns_tier:
-                frag = reassess(frag, item.body, classifier=self.privacy_classifier)
+            # last and escalate-only, exactly where the engine looks. Issue
+            # #1105: unconditional — ``reassess`` compares against ``baseline``
+            # itself and declines unless this run made the heuristic stricter,
+            # so a tier already on record moves only on new evidence.
+            frag = reassess(
+                frag,
+                item.body,
+                baseline=baseline,
+                classifier=self.privacy_classifier,
+            )
             classified.append(IngestedFragment(fragment=frag, body=item.body))
 
         self.review_generator.generate_queue(

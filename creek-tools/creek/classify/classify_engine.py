@@ -53,9 +53,19 @@ call it:
 * **Escalate-only, never auto-downgrade.** ``--force`` may raise a tier
   that is too light, and the post-classification reassess may raise one
   the classifier just hardened, but neither ever lowers a tier —
-  lowering is the one direction that leaks content. An explicit
-  non-``unclassified`` tier on disk also survives any non-``--force``
-  run untouched: the operator's decision outranks the heuristic.
+  lowering is the one direction that leaks content.
+* **A settled tier moves only on new evidence** (#1105). A concrete
+  non-``unclassified`` tier on disk survives a non-``--force`` run
+  *assignment* untouched — :func:`~creek.classify.privacy_pass.apply_tier`
+  will not overwrite it. The post-classification reassess can still raise
+  it, but only when *this run's* classification made the privacy
+  heuristic strictly more restrictive than it was on the fragment as
+  loaded (:attr:`_PreparedFragment.tier_baseline`). So a re-run over
+  unchanged evidence never disturbs a tier the operator chose, while a
+  freshly-revealed INTIMATE signal is no longer discarded just because
+  some tier was already on record. A fragment the resume short-circuit
+  preserves is not reassessed at all: this run produced no evidence
+  about it.
 
 Praxis pass (issue #877)
 ------------------------
@@ -708,18 +718,19 @@ class _PreparedFragment:
             keys are preserved through the rewrite).
         llm: The classifier the fragment's tier resolved to, or ``None``
             on the rules path.
-        owns_tier: Whether *this* run owns the fragment's tier — true
-            when the frontmatter carried none (or ``unclassified``), or
-            when ``--force`` was passed. Gates the post-classification
-            reassess so a hand-set tier is never silently escalated
-            either.
+        tier_baseline: The privacy heuristic's verdict on the fragment
+            **as loaded**, taken before this run classified anything.
+            :func:`~creek.classify.privacy_pass.reassess` compares its
+            own verdict against this to answer the only question that
+            licenses touching a settled tier: did *this run* make the
+            heuristic stricter? (#1105)
     """
 
     fragment: Fragment
     body: str
     raw: dict[str, object]
     llm: LLMClassifier | None
-    owns_tier: bool
+    tier_baseline: PrivacyTier
 
 
 def _prepare_fragment(
@@ -741,6 +752,15 @@ def _prepare_fragment(
     ``llm``/``manual``-stamped fragments that make up a mature vault can
     acquire a tier without ``--force`` re-paying for their classification.
 
+    One more ordering is load-bearing (issue #1105):
+    :attr:`_PreparedFragment.tier_baseline` is captured *first of all*, on
+    the fragment exactly as loaded. It is the reference point
+    :func:`~creek.classify.privacy_pass.reassess` needs to judge whether
+    this run learned anything new about the fragment's privacy, so any
+    mutation taken before it — the tier stamp here, the classifier's voice
+    verdict later — would fold this run's own output back into the
+    baseline and blind the gate to it.
+
     Args:
         md_file: The file to consider.
         force: Whether to re-derive settled classifications and tiers.
@@ -760,8 +780,22 @@ def _prepare_fragment(
         return None
     fragment, body, raw = record
 
+    # #1105: record the heuristic's verdict on the fragment as loaded, BEFORE
+    # ``apply_tier`` (and the classifier below) change anything it reads. The
+    # post-classification reassess needs this to tell "the model just revealed
+    # something new" from "the model echoed what was already on disk"; only the
+    # former licenses raising a tier that is already on record.
+    tier_baseline = privacy.classify_tier(fragment, content=body)
+
     # #876: stamp a real tier before anything else looks at one. ``force``
     # merges escalate-only, so an existing ``intimate`` is never lowered.
+    #
+    # Since #1105 this answers only "did this run *assign* the tier?", and its
+    # two remaining consumers are the ``privacy_tiers_assigned`` counter just
+    # below and the preserved-path :func:`_persist_tier_only` write. It no
+    # longer gates the post-classification reassess — ``tier_baseline`` does
+    # that — because "a tier is already on record" turned out to say nothing
+    # about whether a *person* put it there.
     owns_tier = needs_tier(raw) or force
     fragment = apply_tier(fragment, body, raw=raw, force=force, classifier=privacy)
     if owns_tier:
@@ -797,7 +831,7 @@ def _prepare_fragment(
         body=body,
         raw=raw,
         llm=llm,
-        owns_tier=owns_tier,
+        tier_baseline=tier_baseline,
     )
 
 
@@ -914,10 +948,21 @@ def _process_file(
     # #876: classification may have hardened the fragment's voice signals
     # (confessional + conviction is one of the INTIMATE triggers), which the
     # pre-pass could not see. Take the stricter of the two verdicts —
-    # escalate-only, and only when this run owns the tier, so a deliberate
-    # operator tier is never silently raised either.
-    if prepared.owns_tier:
-        new_fragment = reassess(new_fragment, body, classifier=privacy)
+    # escalate-only, so nothing here can lower a tier.
+    #
+    # #1105: unconditional, because ``reassess`` now carries its own gate.
+    # Its ``baseline`` is the heuristic's verdict on the fragment as loaded,
+    # so it fires only where this run's classification made the heuristic
+    # strictly stricter — new evidence, which no tier on disk predates. The
+    # gate this replaces asked "does this run own the tier?", which is False
+    # for every already-tiered fragment, i.e. for the whole of a mature
+    # vault; that answer discarded exactly the verdicts it was here to catch.
+    new_fragment = reassess(
+        new_fragment,
+        body,
+        baseline=prepared.tier_baseline,
+        classifier=privacy,
+    )
 
     with lock:
         _record_praxis(praxis_before, new_fragment, counts)

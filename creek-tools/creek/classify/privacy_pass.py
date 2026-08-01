@@ -12,15 +12,26 @@ close that hole:
 * :func:`escalate` — merge two candidate tiers, never lowering.
 * :func:`apply_tier` — stamp a tier, honouring a manual override.
 * :func:`reassess` — re-run the check after classification hardened the
-  fragment's voice signals; escalate-only. Both entry points call it,
-  each as its last mutation before the write (#974).
+  fragment's voice signals; escalate-only, and only on new evidence.
+  Both entry points call it, each as its last mutation before the write
+  (#974).
 
-Two rules hold across every function here:
+Three rules hold across every function here:
 
 **Never auto-downgrade.** Lowering a tier is the only direction that
 leaks content, so both the ``--force`` merge and the post-classification
 reassess take the *more* restrictive of the two candidates. An operator
 who wants a tier relaxed edits the frontmatter by hand.
+
+**Act only on new evidence** (#1105). A tier already on record is
+re-litigated only when *this run's* classification made the heuristic
+strictly more restrictive than it was on the fragment as loaded —
+:func:`reassess` compares its own verdict against the caller's
+``baseline`` and returns the fragment untouched when nothing hardened.
+That is why the pass needs no notion of *who* wrote the tier (the
+frontmatter carries no such provenance): it acts only on evidence that
+did not exist when the tier was written, so a settled decision cannot be
+overturned by a re-run over unchanged input.
 
 **Never yield ``unclassified``.**
 :meth:`~creek.classify.privacy.PrivacyClassifier.classify_tier` always
@@ -163,9 +174,10 @@ def reassess(
     fragment: Fragment,
     body: str,
     *,
+    baseline: PrivacyTier,
     classifier: PrivacyClassifier,
 ) -> Fragment:
-    """Re-derive the tier after classification and keep the stricter one.
+    """Re-derive the tier after classification, on new evidence only.
 
     The pre-pass runs *before* the classifier so the per-tier router sees
     a real tier, which means it can only read the axes already on the
@@ -176,20 +188,49 @@ def reassess(
     third INTIMATE trigger — this second look promotes the tier before
     the write, so the harder signal is not thrown away.
 
-    Escalate-only: a lighter post-classification verdict can never demote
-    the tier the pre-pass chose.
+    Two independent guards, in this order (#1105):
+
+    1. **The gate.** Compare the heuristic's verdict *now* against
+       *baseline*, its verdict on the fragment as loaded. Act only when
+       the verdict got **strictly more restrictive**; otherwise this run
+       learned nothing new about the fragment's privacy and has no
+       standing to disturb a tier already on record.
+    2. **The merge.** Escalate-only against ``tier_of(fragment)``, so
+       passing the gate is never licence to *lower* what is stored.
+
+    The gate is deliberately "strictly more restrictive" and not "merely
+    different". A different verdict includes a *weaker* one, and acting
+    on a weakening verdict would let a flip-flopping model raise a tier
+    off evidence that pointed the other way — ratcheting a vault tighter
+    every run.
+
+    Known limitation, stated plainly. A run that escalates also persists
+    the voice axes that justified it, so an operator who then lowers the
+    tier by hand keeps it: the next run reads that same voice off disk,
+    the baseline moves up with it, and nothing hardens. But if the
+    model's verdict is *unstable* — the axes are rewritten weaker on one
+    run and confessional again on the next — that later re-hardening is
+    genuine new evidence and will raise the tier again. Each flip
+    terminates in one step, and the alternative (trusting a tier's
+    provenance the frontmatter does not record) is the bug this replaced.
 
     Args:
         fragment: The classified fragment. Never mutated.
         body: The fragment's markdown body.
+        baseline: The heuristic's tier for this fragment *before* this
+            run classified anything. Callers compute it on the fragment
+            as loaded, so "hardened" means "hardened by this run".
         classifier: The shared :class:`PrivacyClassifier`.
 
     Returns:
-        The fragment at the merged tier — the same object when nothing
-        escalated.
+        The fragment at the merged tier — the same object when this run
+        hardened nothing, or when the merge changed nothing.
     """
+    candidate = classifier.classify_tier(fragment, content=body)
+    if escalate(baseline, candidate) is baseline:
+        return fragment
     current = tier_of(fragment)
-    merged = escalate(current, classifier.classify_tier(fragment, content=body))
+    merged = escalate(current, candidate)
     if merged is current:
         return fragment
     return classifier.enforce_tier(fragment, merged)

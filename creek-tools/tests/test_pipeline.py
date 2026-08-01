@@ -1534,31 +1534,34 @@ class TestPipelinePrivacyReassess:
             "frag-reassess006": True,
         }
 
-    def test_a_preset_ingester_tier_is_not_silently_raised(
+    def test_a_preset_tier_is_raised_only_when_the_verdict_hardens_it(
         self,
         vault_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A tier already on record survives a heavier LLM verdict.
+        """A tier on record yields to a verdict that hardens the signal.
 
-        :func:`~creek.classify.privacy_pass.apply_tier`
-        (``creek/classify/privacy_pass.py:153-155``) declines to overwrite
-        a tier that is already on record when ``force=False`` — the
-        operator's call outranks the heuristic. The second look has to
-        decline for the same reason, keyed on the same "did this
-        frontmatter still owe us a tier?" question
-        (:func:`~creek.classify.privacy_pass.needs_tier`), or the
-        pipeline would half-honour a pre-set tier: respected before the
-        model runs, overridden after.
+        **Supersedes the ``owns_tier`` seam contract, by decision of
+        issue #1105.** This test previously asserted the opposite — that
+        a pre-set tier is never raised, because the second look was gated
+        on :func:`~creek.classify.privacy_pass.needs_tier` ("did this
+        frontmatter still owe us a tier?"). That proxy answered ``False``
+        for every fragment carrying a concrete tier, i.e. for the whole of
+        a vault that has been classified once, so a confessional verdict
+        on an already-tiered fragment was silently discarded and the
+        fragment stayed voice-proxy eligible. #1105 replaces the proxy
+        with the predicate it was standing in for: escalate when *this
+        run's* classification made the privacy heuristic **strictly more
+        restrictive** than it was on the fragment as loaded.
 
-        This is a **seam contract**, not a live content path: no
-        production ingester sets ``privacy_tier`` today, so the fragment
-        below is constructed by hand. Note the resulting test polarity —
-        it passes both before and after the #974 fix, and fails only if
-        the fix drops the ``owns_tier`` guard and reassesses
-        unconditionally (which reads ``intimate`` here). Deleting it
-        because "it was never red" removes the only thing pinning that
-        guard.
+        The original observation still holds and still matters: this is a
+        **seam contract**, not a live content path — no production
+        ingester sets ``privacy_tier`` today, so both fragments below are
+        constructed by hand. What it pins now is the discrimination, not a
+        blanket refusal. Both start at ``open``; the confessional +
+        conviction verdict raises one to ``intimate`` while the analytical
+        verdict leaves the other at ``open``, so neither "never raise a
+        pre-set tier" nor "always reassess" can pass.
         """
         from creek.models import Confidence, PrivacyTier, VoiceRegister
 
@@ -1574,6 +1577,7 @@ class TestPipelinePrivacyReassess:
                     VoiceRegister.CONFESSIONAL,
                     Confidence.CONVICTION,
                 ),
+                "frag-reassess012": (VoiceRegister.ANALYTICAL, Confidence.MUSING),
             },
         )
 
@@ -1584,19 +1588,33 @@ class TestPipelinePrivacyReassess:
                     "markdown",
                     tier=PrivacyTier.OPEN,
                 ),
+                self._ingested(
+                    "frag-reassess012",
+                    "markdown",
+                    tier=PrivacyTier.OPEN,
+                ),
             ],
             vault_path,
             PipelineResult(),
         )
 
         assert self._tiers(classified) == {
-            "frag-reassess007": PrivacyTier.OPEN.value,
+            "frag-reassess007": PrivacyTier.INTIMATE.value,
+            "frag-reassess012": PrivacyTier.OPEN.value,
         }
-        # The verdict that *would* have escalated an untiered fragment did
-        # land, so the assertion above is not passing for want of an LLM call.
-        assert classified[0].fragment.voice.voice_register == (
-            VoiceRegister.CONFESSIONAL.value
-        )
+        assert self._eligibility(classified) == {
+            "frag-reassess007": False,
+            "frag-reassess012": True,
+        }
+        # The verdicts did land, so the tiers above are not passing for want
+        # of an LLM call. Keyed by id, never by list position.
+        landed = {
+            item.fragment.id: item.fragment.voice.voice_register for item in classified
+        }
+        assert landed == {
+            "frag-reassess007": VoiceRegister.CONFESSIONAL.value,
+            "frag-reassess012": VoiceRegister.ANALYTICAL.value,
+        }
 
     def test_a_no_llm_run_changes_no_tier(self, vault_path: Path) -> None:
         """With no LLM in the run, the second look is a strict no-op.
