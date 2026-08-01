@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -132,6 +133,56 @@ def test_try_load_fragment_without_hierarchy_keys_defaults_to_root(
     # files and explode the audit diff on the next pass).
     assert "parent_id" not in raw
     assert "level" not in raw
+
+
+def test_fragment_with_offsetless_frontmatter_timestamp_loads_tz_aware(
+    tmp_path: Path,
+) -> None:
+    """An offsetless ``ingested:`` loads coerced to LA — and is not dropped.
+
+    PyYAML parses the unquoted frontmatter line
+    ``ingested: 2024-01-01 12:00:00`` into a *naive* datetime, which
+    before issue #976 flowed straight through
+    :meth:`Fragment.model_validate` and detonated later, at whichever
+    consumer first compared it against a tz-aware timestamp from a
+    neighbouring fragment. This is the on-disk round trip: the frontmatter
+    is hand-written rather than dumped from a :class:`Fragment`, because a
+    dumped model would already carry an offset and prove nothing.
+
+    Assertion (a) — ``record is not None`` — is deliberate, not padding.
+    :func:`try_load_fragment` swallows ``ValidationError`` and returns
+    ``None`` at DEBUG level, so "hardening" the model to *reject* naive
+    timestamps rather than coerce them would silently delete every
+    offsetless fragment from every vault scan with no error surfaced
+    anywhere. This test pins coerce-over-reject.
+    """
+    fragment_file = tmp_path / "offsetless.md"
+    fragment_file.write_text(
+        "---\n"
+        "type: fragment\n"
+        "id: frag-offsetless01\n"
+        "title: Offsetless timestamp\n"
+        "source:\n"
+        "  platform: journal\n"
+        "ingested: 2024-01-01 12:00:00\n"
+        "---\n"
+        "Body of the offsetless fragment.\n",
+        encoding="utf-8",
+    )
+
+    record = try_load_fragment(fragment_file)
+
+    # (a) The fragment survives the load — naive timestamps are repaired,
+    # never grounds for silently discarding vault content.
+    assert record is not None
+    fragment, _body, _raw = record
+    # (b) …and it is repaired to LA, not merely stamped with some offset.
+    la = ZoneInfo("America/Los_Angeles")
+    assert fragment.ingested.tzinfo is not None
+    assert fragment.ingested.utcoffset() == la.utcoffset(fragment.ingested)
+    # Attached, not converted: the wall clock the file recorded survives.
+    assert fragment.ingested.hour == 12
+    assert fragment.ingested.date().isoformat() == "2024-01-01"
 
 
 def test_try_load_fragment_round_trips_hierarchy_fields(tmp_path: Path) -> None:

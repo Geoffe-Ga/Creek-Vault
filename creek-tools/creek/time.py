@@ -9,9 +9,12 @@ produce naive datetimes that fail to compare against tz-aware ones with
 values that arrive from outside that discipline — persisted frontmatter,
 legacy callers — making them safe to compare without moving the clock.
 
-The constant :data:`LA_TZ` is re-exported from
-:mod:`creek.ingest.base` to preserve the historical import path while
-giving callers a dependency-free home for the helper.
+The constant :data:`LA_TZ` is defined here as a dependency-free home
+for the timezone helpers; :mod:`creek.ingest.base` independently
+defines its own equal constant of the same name to preserve the
+historical import path some callers still use. Neither re-exports the
+other — each module owns its own definition, and the two simply agree
+on the same ``ZoneInfo("America/Los_Angeles")`` value.
 """
 
 from __future__ import annotations
@@ -45,6 +48,15 @@ def ensure_aware(value: datetime) -> datetime:
     failure mode this module exists to prevent. Callers that mix a
     pipeline-generated clock with timestamps read back off disk route
     through this helper first.
+
+    The primary production caller is
+    :class:`~creek.models.Fragment`'s field validator over ``created`` /
+    ``ingested`` / ``authored_at`` (#976), which makes every fragment
+    load through the constructor or ``model_validate`` — the paths
+    ingest and vault reads use — the enforcement point for the "never
+    naive" invariant. See
+    :meth:`~creek.models.Fragment._normalise_timestamp` for the
+    construction paths that bypass it.
 
     The contract is deliberately asymmetric:
 
@@ -93,7 +105,14 @@ def effective_authored_at(fragment: Fragment) -> datetime:
        source-side timestamp (a Substack post's ``post_date``, a
        Discord message's ``timestamp``, an EXIF ``DateTimeOriginal``).
     2. :attr:`Fragment.ingested` — the wall-clock moment the vault
-       wrote the fragment. Always present, never naive.
+       wrote the fragment. Never naive when the fragment was built
+       through the normal constructor or ``model_validate`` path:
+       :class:`~creek.models.Fragment` normalises ``created`` /
+       ``ingested`` / ``authored_at`` through :func:`ensure_aware` at
+       validation time (#976), so a frontmatter timestamp serialised
+       without an offset is anchored to LA before it ever reaches this
+       helper. (See :meth:`~creek.models.Fragment._normalise_timestamp`
+       for which construction paths this covers.)
 
     :attr:`Fragment.created` is deliberately not in the chain:
     historically it conflated "source authored date" and "filesystem
