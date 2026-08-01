@@ -64,12 +64,17 @@ the version string an Adepthood client reads off this document is the
 version string the running server actually speaks. The bump is owed the
 first time any of #1073–#1077 changes a wire shape.
 
-**Wire mechanism.** Every `/v1` endpoint **except** `GET /v1/capabilities`
-requires an `X-Creek-Contract-Version: <major.minor>` request header; a
-missing or mismatched value is refused `409 incompatible_version` before any
-vault read. `GET /v1/capabilities` requires nothing on this axis,
-deliberately — the negotiation endpoint must never itself be able to fail to
-negotiate.
+**Wire mechanism.** Every `/v1` **capability** endpoint requires an
+`X-Creek-Contract-Version: <major.minor>` request header; a missing or
+mismatched value is refused `409 incompatible_version` before any vault read.
+`GET /v1/capabilities` requires nothing on this axis, deliberately — the
+negotiation endpoint must never itself be able to fail to negotiate.
+
+`GET /v1/health`, added by #1074, is exempt for a different reason: it is not
+part of this published contract at all, so there is no contract version for it
+to negotiate. Gating liveness on the header would leave a client on the wrong
+version unable to tell "the server is down" from "the server is up and we
+disagree about versions" — the two facts a probe exists to separate.
 
 **An Adepthood client pinned to `0.1.0-draft` is a hard break, not a
 negotiation.** It receives `409` on every journal/reflection/wheel call and a
@@ -88,9 +93,54 @@ migration artifact. There is no grace period to promise, so none is implied.
 
 ## Capabilities — the states a handshake can report
 
-`GET /v1/capabilities` is always HTTP `200` when the server is reachable and
-the caller is authenticated; the readiness state lives entirely in the
-`status` field of `CapabilitiesResponse`, never in the HTTP status line.
+`GET /v1/capabilities` is always HTTP `200` when the server is reachable, the
+caller is authenticated, and the request itself is well formed; the **readiness
+state** lives entirely in the `status` field of `CapabilitiesResponse`, never in
+the HTTP status line. No condition of the *server* — no vault, an unreadable
+config, a contract minor this server cannot speak — can move it off `200`.
+
+**The promise is about the server's state, not about accepting a malformed
+request.** A caller that declares an inadmissible `X-Creek-Tier-Ceiling` gets
+`422 invalid_request` here exactly as it does on every other route, because the
+ceiling gate is one edge check above the router with **no per-route exemption**
+(see [INTIMATE](#intimate)). That is deliberate, and it does not weaken
+negotiation:
+
+- The ceiling is the caller's own free, per-request choice, not something it is
+  pinned to the way a compiled-in contract version is. Omitting the header
+  always works and fails closed to `open`, so the caller is one trivially
+  discoverable step from a `200` — which is precisely the situation the version
+  exemption exists to rescue a client *from*, and why that axis needs an
+  exemption and this one does not.
+- The refusal is `invalid_request`, a distinct machine-readable code that a
+  conforming client (which branches on `code`, never on prose) can tell apart
+  from every server-side condition. It does not collapse into "vault
+  unavailable" — the failure this epic exists to stop.
+- `intimate` is not a constructible member of `WireTierCeiling`, so a client
+  generated from the published bundle cannot send it. Reaching this refusal
+  means leaving the published contract.
+- Most importantly, **any** exemption makes the ceiling gate route-aware, and
+  that is the property being protected. Its whole value is that it is one edge
+  check with no per-path branch: what it does is a function of the declared
+  header alone, so reviewing it does not require enumerating the route table,
+  and #1075–#1077 cannot get it wrong by omission. The version gate can afford
+  a per-route flag because it is not the thing standing between a network
+  caller and intimate content; this gate is.
+
+  Two exemption shapes were considered and both are refused. *Skip the check for
+  this route* is the obviously dangerous one — copy-pasted onto a handler that
+  really reads the vault, it reads it uncapped. *Degrade an inadmissible value
+  to `open` for this route* is genuinely not dangerous in itself (`open` is the
+  strictest ceiling, and is already what an absent header yields), so it is
+  worth saying plainly that it is refused on different grounds: it would break
+  the standing rule that an absent ceiling fails closed while a **bad** one is
+  refused and never repaired. Coercion is how a typo'd or hostile value ends up
+  admitted at *some* ceiling rather than at none, and a rule that holds
+  everywhere except on one route is a rule a reader has to check rather than
+  know.
+
+The published OpenAPI document therefore lists `422` among `getCapabilities`'
+responses, and that is correct rather than a generator artefact.
 
 | State | `status` | `vault.available` | `capabilities` | Both version strings present? |
 |---|---|---|---|---|
@@ -107,6 +157,24 @@ closed set the contract publishes — `{200, 401, 403, 404, 409, 422, 500,
 distinct local state and MUST NOT synthesize a capabilities body, and MUST
 NOT fold it into "uninitialized" — those are different facts an operator
 needs to act on differently.
+
+**"All four" describes the completed epic, not every commit of it.** While
+#1071 is being built out, `capabilities` advertises only the capabilities the
+running server actually implements: [#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074)
+ships `capabilities` alone, and #1075–#1077 each add one. A route that is
+mounted but unbuilt answers `501 unsupported_capability`, and advertising it in
+the handshake would be exactly the "the contract says yes, the call says no"
+divergence this epic exists to remove — a client would negotiate a capability
+and then discover, one round trip later, that it does not exist. The server's
+list is therefore driven by a single constant, `IMPLEMENTED_CAPABILITIES` in
+`creek_mcp/api/routes.py`, which also decides which routes answer `501`; the
+two can never disagree. `examples/capabilities/success.json` in the fixture
+bundle continues to document the completed steady state — all four — because
+re-publishing and re-hashing a consumer-pinned artifact four times inside one
+epic would train that consumer to re-pin without reading, which is the opposite
+of what a pinned bundle is for. The divergence between the fixture and the
+running server during the build-out is deliberate and is itself pinned by a
+test.
 
 **A fifth state the issue's Problem section did not name.** Post-#961,
 `unclassified` ranks with `personal`, not `open`, on the MCP ceiling (see
@@ -586,3 +654,4 @@ restating the other.
 | Contract version | Date | Change |
 |---|---|---|
 | `0.2.0` | 2026-07-31 | This ADR: publishes `/v1`, the Adepthood HTTP application API, alongside the existing MCP agent adapter. No wire-shape change to the existing contract version — `creek_mcp.api.models` and the fixture bundle under `docs/contracts/adepthood-v1/` are the first publication of a new surface, not a revision of the MCP one (#1072, epic #1071). |
+| `0.2.0` | 2026-07-31 | #1074 mounts the routes: the tracer serves a real `GET /v1/capabilities` and answers `501 unsupported_capability` on journal, reflection and wheel. No wire shape changes, so no version moves. Two clarifications recorded above rather than left implicit: the advertised capability list tracks what is actually implemented during the epic's build-out, and the issue's provisional `not_implemented` spelling is superseded by `unsupported_capability` — the `ErrorCode` member this ADR already publishes for exactly that meaning at exactly that status. |

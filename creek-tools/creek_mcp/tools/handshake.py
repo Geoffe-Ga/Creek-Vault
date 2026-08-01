@@ -23,8 +23,39 @@ from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.tier_ceiling import TierCeiling
 
 TOOL_NAME = "creek.handshake"
-_CREEK_MARKER = Path("00-Creek-Meta")
+
+CREEK_MARKER = Path("00-Creek-Meta")
+"""The directory whose presence means "a vault has been scaffolded here"."""
+
+# Retained under the original private name: it predates #1074 and is referenced
+# by existing tests. The public name exists because the ``/v1`` capabilities
+# handler needs the same probe, and a second copy of the literal is a second
+# definition of "initialised" free to drift from this one.
+_CREEK_MARKER = CREEK_MARKER
+
 TRANSPORT = "stdio"
+
+
+def vault_available(vault_path: Path) -> bool:
+    """Return whether a scaffolded vault is readable at *vault_path*.
+
+    The whole readiness probe, in one predicate with no side effect. That
+    matters more than it looks: :func:`handshake_tool` also appends to the
+    audit log, and :meth:`creek_mcp.audit.MCPAuditLog.append` reaches a
+    ``mkdir(parents=True, exist_ok=True)`` — so calling the *tool* against an
+    absent vault **creates** ``00-Creek-Meta/audit/`` and makes the next probe
+    answer ``True`` for a vault nobody ever initialised. Callers that only need
+    the answer (notably ``GET /v1/capabilities``, which must keep the ADR's
+    "present" and "uninitialised" states distinct across repeated calls) must
+    use this and not reach for the tool.
+
+    Args:
+        vault_path: Vault root to probe.
+
+    Returns:
+        ``True`` when :data:`CREEK_MARKER` is a directory under *vault_path*.
+    """
+    return (vault_path / CREEK_MARKER).is_dir()
 
 
 def _content_tiers() -> list[str]:
@@ -71,7 +102,7 @@ def handshake_tool(
         ``ontology_version``, ``tiers``, and ``capabilities``, plus the
         ``tier_model``, ``transport``, and ``server`` name for the client.
     """
-    available = (vault_path / _CREEK_MARKER).is_dir()
+    available = vault_available(vault_path)
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args={},
