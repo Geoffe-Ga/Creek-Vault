@@ -256,7 +256,19 @@ class TestApplyTier:
 
 
 class TestReassess:
-    """``reassess`` re-runs the check post-classification and only escalates."""
+    """``reassess`` re-runs the check post-classification and only escalates.
+
+    Since issue #1105 the pass is gated on a required ``baseline`` —
+    the heuristic's verdict on the fragment as it was loaded, *before*
+    this run classified anything. The pass acts only when this run's
+    classification made the heuristic **strictly more restrictive** than
+    that baseline, and returns the very same fragment object otherwise.
+
+    The predicate is deliberately ``>`` and not ``!=``: a merely
+    *different* verdict includes a **weaker** one, and acting on a
+    weakening verdict would let a flip-flopping model raise an
+    operator's deliberate tier off evidence that pointed the other way.
+    """
 
     def test_escalates_when_classification_hardens_the_signal(self) -> None:
         """Confessional + conviction from the classifier lifts personal → intimate."""
@@ -269,7 +281,14 @@ class TestReassess:
             ),
         )
 
-        result = reassess(fragment, _NEUTRAL_BODY, classifier=PrivacyClassifier())
+        # baseline: pre-classification this fragment carried no voice, so the
+        # heuristic answered PERSONAL — the verdict below genuinely hardens it.
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.PERSONAL,
+            classifier=PrivacyClassifier(),
+        )
 
         assert PrivacyTier(result.privacy_tier) is PrivacyTier.INTIMATE
 
@@ -280,7 +299,15 @@ class TestReassess:
             tier=PrivacyTier.INTIMATE,
         )
 
-        result = reassess(fragment, _NEUTRAL_BODY, classifier=PrivacyClassifier())
+        # baseline: no prior heuristic verdict, so the essay's OPEN candidate
+        # counts as hardening and the escalate-only merge really runs — which
+        # is what keeps this test's "never lowers" claim under test.
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.UNCLASSIFIED,
+            classifier=PrivacyClassifier(),
+        )
 
         assert PrivacyTier(result.privacy_tier) is PrivacyTier.INTIMATE
 
@@ -291,7 +318,14 @@ class TestReassess:
             tier=PrivacyTier.PERSONAL,
         )
 
-        result = reassess(fragment, _NEUTRAL_BODY, classifier=PrivacyClassifier())
+        # baseline: as above — UNCLASSIFIED lets the OPEN candidate through the
+        # gate so the merge, not the gate, is what refuses to lower the tier.
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.UNCLASSIFIED,
+            classifier=PrivacyClassifier(),
+        )
 
         assert PrivacyTier(result.privacy_tier) is PrivacyTier.PERSONAL
 
@@ -302,6 +336,151 @@ class TestReassess:
             tier=PrivacyTier.OPEN,
         )
 
-        result = reassess(fragment, _NEUTRAL_BODY, classifier=PrivacyClassifier())
+        # baseline: the heuristic said OPEN before classification and says OPEN
+        # after, so nothing hardened and the pass has nothing to do.
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.OPEN,
+            classifier=PrivacyClassifier(),
+        )
 
         assert result.model_dump(mode="json") == fragment.model_dump(mode="json")
+
+    def test_hardened_signal_also_flips_voice_proxy_eligibility(self) -> None:
+        """The escalation carries the derived eligibility flag with it (#1105).
+
+        ``voice_proxy_eligible`` is a computed field over ``privacy_tier``
+        + ``source.author``, and it is the actual damage of the bug: a
+        confessional fragment left at ``personal`` advertises itself as a
+        legitimate input to voice-proxy generation, so private material
+        can be echoed back out in generated prose. Pinning the flag as
+        well as the tier means an implementation that escalates without
+        going through ``enforce_tier`` cannot pass.
+        """
+        fragment = _fragment(
+            platform=SourcePlatform.MARKDOWN,
+            tier=PrivacyTier.PERSONAL,
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.CONFESSIONAL,
+                confidence=Confidence.CONVICTION,
+            ),
+        )
+        assert fragment.voice_proxy_eligible is True
+
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.PERSONAL,
+            classifier=PrivacyClassifier(),
+        )
+
+        assert result is not fragment
+        assert PrivacyTier(result.privacy_tier) is PrivacyTier.INTIMATE
+        assert result.voice_proxy_eligible is False
+        # The input is never mutated: the caller's copy still reads personal.
+        assert PrivacyTier(fragment.privacy_tier) is PrivacyTier.PERSONAL
+
+    def test_declines_when_the_candidate_matches_the_baseline(self) -> None:
+        """An unchanged signal leaves an operator's lighter tier alone (#1105).
+
+        This journal fragment reads INTIMATE to the heuristic both before
+        and after classification — the run produced no *new* privacy
+        signal — while the tier on record is the operator's deliberate
+        ``personal``. Without the baseline gate the escalate-only merge
+        would raise it, which is how the previous ``owns_tier`` proxy
+        earned its place; the gate has to keep that guarantee while
+        dropping the proxy. Identity (``is``) is asserted rather than
+        equality because the contract is "the same object back", which no
+        accidental re-stamp can satisfy.
+        """
+        fragment = _fragment(
+            platform=SourcePlatform.JOURNAL,
+            tier=PrivacyTier.PERSONAL,
+        )
+
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.INTIMATE,
+            classifier=PrivacyClassifier(),
+        )
+
+        assert result is fragment
+        assert PrivacyTier(result.privacy_tier) is PrivacyTier.PERSONAL
+
+    def test_declines_when_the_candidate_weakened_from_the_baseline(self) -> None:
+        """A *weaker* verdict may not raise a tier either (#1105).
+
+        This is the case that separates the decided ``>`` predicate from
+        a naive ``!=`` one. The fragment was loaded looking INTIMATE to
+        the heuristic (self-authored, confessional + conviction on disk);
+        this run's classification came back merely analytical, so the
+        candidate is PERSONAL — *different* from the baseline, but
+        different in the weakening direction. Under ``!=`` the pass would
+        fire and the escalate-only merge would raise the operator's
+        ``open`` to ``personal`` on evidence that pointed the other way.
+        Under ``>`` it declines, and the operator's tier survives.
+        """
+        fragment = _fragment(
+            platform=SourcePlatform.MARKDOWN,
+            tier=PrivacyTier.OPEN,
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.MUSING,
+            ),
+        )
+        # Precondition: this fixture's candidate really is PERSONAL — markdown
+        # is neither the ESSAY nor the DISCORD branch, and an analytical /
+        # musing voice misses the third INTIMATE trigger, so ``classify_tier``
+        # falls through to its PERSONAL default.
+        assert (
+            PrivacyClassifier().classify_tier(fragment, content=_NEUTRAL_BODY)
+            is PrivacyTier.PERSONAL
+        )
+
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.INTIMATE,
+            classifier=PrivacyClassifier(),
+        )
+
+        assert result is fragment
+        assert PrivacyTier(result.privacy_tier) is PrivacyTier.OPEN
+
+    def test_a_hardened_signal_still_never_lowers_the_stored_tier(self) -> None:
+        """Passing the gate is not licence to lower what is on disk (#1105).
+
+        The gate compares the *heuristic's* two verdicts; the merge that
+        follows compares against the tier actually on the fragment. Those
+        are different quantities, and this fragment holds them apart: the
+        candidate (PERSONAL) hardens relative to the baseline (OPEN), so
+        the pass runs — but the stored tier is INTIMATE, so the merge
+        must keep INTIMATE. An implementation that assigned the candidate
+        outright once the gate opened would silently downgrade intimate
+        content, the one direction that leaks it.
+
+        The platform is ``markdown``, not the ``essay`` an earlier sketch
+        of this case used: a self-authored essay derives OPEN, which does
+        not harden past an OPEN baseline, so that shape would never have
+        opened the gate at all and the test would have been vacuous.
+        """
+        fragment = _fragment(
+            platform=SourcePlatform.MARKDOWN,
+            tier=PrivacyTier.INTIMATE,
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.MUSING,
+            ),
+        )
+
+        result = reassess(
+            fragment,
+            _NEUTRAL_BODY,
+            baseline=PrivacyTier.OPEN,
+            classifier=PrivacyClassifier(),
+        )
+
+        assert PrivacyTier(result.privacy_tier) is PrivacyTier.INTIMATE
+        assert result.voice_proxy_eligible is False
