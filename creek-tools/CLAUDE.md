@@ -405,6 +405,14 @@ All code must meet these standards before merging to main:
 
 #### Linting and Formatting
 - **Ruff**: lint + format, configured in `pyproject.toml` (no `|| true`).
+- **Ruff cache**: `--no-cache` on every invocation — lint and format,
+  check and fix — in `scripts/lint.sh`, `scripts/format.sh`, and both
+  `astral-sh/ruff-pre-commit` hooks. Ruff's per-file cache key is
+  mtime-only, so a local gate must never trust a cache CI doesn't
+  have. Costs ~0.05s on this tree (477 files); don't drop it for
+  speed. Issue #1119; enforced by `tests/test_ruff_cache_poisoning.py`
+  and `tests/test_ruff_gate_parity.py`. Same hazard is open for mypy's
+  cache (#1186) and `__pycache__` (#1187).
 - **Pylint**: ≥9.0 (`pylint creek/ creek_mcp/ --fail-under=9.0`, in CI
   and `lint-extended.sh`; CI-002).
 - **Bandit**: zero medium-or-above findings
