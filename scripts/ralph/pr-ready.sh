@@ -7,7 +7,8 @@
 #
 #   ready            LGTM (fresh) + CI green + verified current with main → merge now
 #   ready-unreviewed CI green (with real checks that actually passed) + verified
-#                    current with main, but this PR HAS no review gate: Dependabot
+#                    current with main, but this PR HAS no review gate: NO
+#                    verdict-bearing comment was ever posted on it, Dependabot
 #                    authored it AND pushed its HEAD commit, and `claude-review`
 #                    reported SKIPPED → the orchestrator decides (see ralph-tick.md)
 #   behind           LGTM (fresh) + CI green, but `main` has landed something
@@ -85,9 +86,16 @@
 # `ralph-tick.md` and never silently here — and in THIS repo ralph-tick.md's
 # Step 1 routing does not merge on this token, it hands the lane to a human.
 #
-# Two conditions beyond "Dependabot authored it" make that safe, because the
+# Three conditions beyond "Dependabot authored it" make that safe, because the
 # token's whole justification is "green CI against current main replaces the
 # review":
+#   * NO verdict-bearing comment may exist on the PR — the `verdict_comment_seen`
+#     latch, checked first inside `review_gate_absent` and argued at its own
+#     block further down (#1181). A comment carrying a verdict LINE (whatever
+#     `VERDICT_RE` accepts) is proof that SOMETHING reviewed this PR, so the
+#     shortcut's premise — "there is no review gate to wait for" — is already
+#     false, whatever became of that verdict afterwards: refused for provenance,
+#     stale, or unreadable.
 #   * At least one NON-review check must have actually SUCCEEDED. `gh pr checks`
 #     exits 0 when every check merely skipped, and the test workflows here are
 #     `paths:`-filtered to their own sources — so a `github-actions` ecosystem
@@ -102,7 +110,165 @@
 #
 # Stale-verdict guard: a review verdict only counts when it was posted AFTER the
 # PR's HEAD commit. An LGTM from before the latest push is stale (it reviewed
-# older code) and must not gate a merge.
+# older code) and must not gate a merge. The `createdAt` it compares is the
+# SELECTED comment's, so the selector's exclusion of iteration-trigger.yml's
+# summary (ITER_SUMMARY_RE) belongs to THIS guard as much as to the provenance
+# one: before that exclusion, a stale review followed by a fresh summary handed
+# this comparison the SUMMARY's stamp and read as fresh. That hole predates
+# #1181, which masked it (the summary was refused for want of a marker before
+# freshness was ever consulted) rather than closing it. It is closed and pinned
+# now.
+#
+# ---------------------------------------------------------------------------
+# PROVENANCE GUARD: A VERDICT MUST NAME THE PR IT REVIEWED (#1181)
+# ---------------------------------------------------------------------------
+# A verdict also only counts when the comment carrying it carries the marker
+# `.github/workflows/code-review.yml` prepends to every review it posts —
+# `<!-- creek-review pr=N -->` — and N is THIS PR. The marker is read from the
+# SAME comment `VERDICT_RE` already selected (one `--jq`, one `$v` binding), and
+# a marker that is absent, malformed, or names another PR makes the verdict NO
+# VERDICT AT ALL: it gates neither `ready` nor `changes-requested`, so the lane
+# falls through to `awaiting-review` — and never FORWARD into `ready-unreviewed`,
+# which is what the verdict-EXISTED latch at the parse site enforces.
+#
+# WHICH COMMENT "THE VERDICT" IS, HOWEVER, IS ITS OWN QUESTION, AND GETTING IT
+# WRONG DEFEATS EVERYTHING BELOW. The selector takes the LAST comment matching
+# VERDICT_RE, and in this repo that was routinely NOT a review at all:
+# `.github/workflows/iteration-trigger.yml`'s executive summary matches
+# VERDICT_RE too and posts last on every lane, so between #1181 landing and this
+# fix the guard was refusing a comment that had never been a verdict and holding
+# the entire fleet on it. ITER_SUMMARY_RE excludes that comment inside the same
+# `--jq`; the measurement, the decision to anchor it, and the residual it accepts
+# are argued at that constant, and the correction to this file's own
+# fleet-wide-risk argument is in the third-polarity block below.
+#
+# IT IS A PROVENANCE ATTESTATION, NOT A WRONG-DIFF DETECTOR. The workflow
+# computes `pr=` from `github.event.pull_request.number` — the same value it
+# posts the comment to — so in normal operation `pr=` CANNOT disagree with the
+# PR the comment lives on, and this parser therefore cannot, on its own, catch a
+# reviewer that read the wrong diff. Its whole force is negative: it refuses any
+# verdict that did not come from a pipeline version which runs the
+# WORKFLOW-SIDE `reviewed_pr_number` cross-check, where the agent self-reports
+# the number it actually passed to `gh pr diff`, the workflow compares it with
+# `$PR_NUMBER`, and any mismatch fails the check with no comment posted. THAT
+# cross-check is the detector; this marker is the proof it was in force. It is
+# spelled out because the tempting "simplification" is to delete the cross-check
+# believing the marker covers it — after which every marker in the fleet would
+# attest to nothing at all.
+#
+# THE INCIDENT (2026-08-07, PR #1117). The `prompt:` never stated the PR number,
+# and `actions/checkout` leaves the runner in DETACHED HEAD on
+# `refs/pull/<N>/merge`, so the agent's first command — `gh pr view --json
+# number,…` — died with "could not determine current branch: failed to run git:
+# not on any branch". It then GUESSED: `gh pr list --state all --limit 20 --json
+# number,title,headRefName,mergeCommit,commits`, read `git log`'s `Merge a332aec
+# into 46182a6f`, matched that BASE parent against PR #1179's `mergeCommit.oid`,
+# and reviewed #1179's `cryptography`-floor bump (`gh pr diff 1179`, `gh pr view
+# 1179`, `gh pr checks 1179`). The workflow posted the resulting LGTM onto #1117
+# (`PR_NUMBER: 1117`), and `pr-ready.sh 1117` printed `ready` — a 38-file
+# authenticated HTTP surface one orchestrator tick from merging on a review of a
+# dependency bump. FOR THE NEXT READER: the issue's `HEAD^1..HEAD` diff-range
+# hypothesis is REFUTED, by the owner himself. There is no diff range anywhere
+# in that workflow; the defect was PR-number RESOLUTION, and a range-selection
+# "fix" would have changed nothing.
+#
+# NO GRANDFATHER CLAUSE FOR UNMARKED LEGACY VERDICTS — and a time-based one
+# would be incorrect rather than merely lenient. `pull_request` runs execute the
+# workflow file from the PR's OWN merge ref, not from `main`, so a branch cut
+# before this change keeps emitting unmarked verdicts AFTER it lands. There is
+# no cutoff T that ever expires, which makes a grandfather clause here
+# indistinguishable from leaving the feature switched off.
+# What failing closed actually cost was measured, not assumed: at the time of
+# writing there were 7 open PRs — 5 Dependabot lanes (which take the
+# `ready-unreviewed` path and consult no verdict at all), #1117 (held under
+# `do-not-auto-merge`), and #1070, #943, #863, none of which carried ANY verdict
+# comment. Zero re-reviews. Structurally the bill was already owed too: this
+# change touches `.github/workflows/`, which is on RISK_SURFACE_RE below, so
+# every open lane already faced a sync → HEAD advance → stale-verdict
+# invalidation → re-review. What changes is routing, not quota.
+#
+# THE ROUTING COST, NAMED HONESTLY — IT HAS TWO PARTS.
+#
+# (1) THE WEDGE. The verdict is consulted BEFORE `branch_is_current`, so a
+# refused verdict prints `awaiting-review` and never reaches the `behind` branch
+# that would have dispatched the sync — and `awaiting-review` is in watch-pr.sh's
+# IN_FLIGHT_TOKENS, so the watcher sleeps on it. That is a wedge, and the un-wedge
+# is one push by anybody. It is the accepted price of never merging an unattested
+# verdict.
+# "ONE PUSH BY ANYBODY" IS TRUE ONLY BECAUSE THE SELECTOR NOW EXCLUDES
+# iteration-trigger.yml's SUMMARY. While it did not, a push produced a fresh
+# review comment and then, 15 seconds later, a fresh unmarked summary that the
+# selector preferred — so the wedge survived every push, on every lane, with no
+# self-heal at all. See ITER_SUMMARY_RE: the sentence is a claim about which
+# comment gets selected, not just about pushing.
+#
+# (2) THE LATCH'S OWN, NARROWER ROUTING CHANGE, on a lane the wedge above does
+# not describe: a Dependabot bump whose only verdict is STALE BUT PERFECTLY
+# ATTESTED. Before the `verdict_comment_seen` latch that lane fell past the
+# stale-verdict guard into `review_gate_absent`, cleared it, and printed
+# `ready-unreviewed`. It now prints `awaiting-review`. That is CORRECT — a stale
+# verdict is not a missing review gate, it is an out-of-date one, and the
+# shortcut's precondition is absence — and the un-wedge is the same single push,
+# which (being ours, not the bot's) makes `claude-review` runnable again and
+# lands the lane back on the normal `ready` path. It is written down because an
+# unnamed behaviour change is how the next reader concludes the latch is a bug.
+#
+# WHAT THIS IS NOT: IT IS NOT AN AUTHORSHIP CONTROL, AND A FORGED VERDICT STILL
+# CLEARS THE GATE. The marker is a public, hard-coded literal, and the parser
+# below checks WHAT the comment says and never WHO said it: the verdict `--jq`
+# selects `createdAt`, the verdict test and the marker, and no author field
+# enters the decision at any point. So anybody who can comment on the
+# PR can write `<!-- creek-review pr=<N> -->` above a `## Verdict: LGTM`, the
+# selector will pick that comment (latest verdict-bearing comment wins), the
+# marker will match, and the lane will print `ready` — exactly as a hand-posted
+# verdict did before #1181. Nothing about forgery got harder here, and a reader
+# who takes the guard for an anti-forgery measure will under-protect the next
+# thing they build on it.
+#
+# What DID change is what an HONEST verdict attests to: the marker proves the
+# comment was produced by a PIPELINE VERSION that runs the workflow-side
+# `reviewed_pr_number` cross-check described above — the control that actually
+# catches #1117's class — so drift, replay and legacy accidents are refused
+# where before they merged. That is a provenance claim about the emitter, not an
+# identity claim about the author.
+#
+# Authenticating the verdict's AUTHOR is tracked as #1199 and deliberately NOT
+# done here. It is not the one-liner it looks like: `--json comments` already
+# carries `.author.login` at zero extra API cost, but this repo's emitter posts
+# as `GEOFFE_GA_PAT`'s account when that secret exists and as
+# `github-actions[bot]` when it does not (see the `GH_TOKEN:` fallback in
+# `.github/workflows/code-review.yml`), so the allowlist has two legitimate
+# members whose presence depends on secret availability — and an allowlist that
+# guesses wrong unmarks every verdict in the fleet at once, which is the one
+# failure mode the polarity block below says this guard cannot afford.
+#
+# TWO ALTERNATIVES CONSIDERED AND REJECTED (recorded here, not as issues, for
+# the same reason the #1160 block below records its own):
+#   * an AGENT-REPORTED diff fingerprint (`reviewed_paths_sha256`) instead of a
+#     number, which would attest to the DIFF rather than to the PR. Coherent —
+#     but an agent hashing a sorted path list is fragile (renames, whitespace,
+#     locale, its own truncation), and each false positive turns a good review
+#     red for no gain over the number the workflow already knows for certain.
+#   * a distinct `verdict-unverifiable` token outside IN_FLIGHT_TOKENS, making
+#     the wedge above an actionable state instead of a wait. It adds routing
+#     surface to watch-pr.sh, ralph-tick.md Step 1 and test_watch_pr.sh at once,
+#     and a token the orchestrator has no route for is worse than a wait.
+#     Revisit it if the wedge is ever actually observed FOR THE SHAPE IT DESCRIBES
+#     — a genuine review whose marker this parser cannot admit. It has NOT been.
+#     What WAS observed live, fleet-wide, was the selector preferring
+#     iteration-trigger.yml's summary over the review (see ITER_SUMMARY_RE), which
+#     is a wrong-comment bug and not an unverifiable verdict; a new token would
+#     have dressed it up as a routing state instead of fixing it. Keeping the two
+#     apart is the point of this note.
+#
+# AND IT IS NOT A SIBLING SCRIPT. `main-health.sh` and `review-quota.sh` are
+# separate helpers because each asks a question this file has no other way to
+# answer. This is a pure function of a string already fetched, computed in the
+# same `--jq`, at zero extra API cost. Extracting it would force a second
+# `--json comments` call, or an argv/`MAX_ARG_STRLEN` dance to hand a whole
+# comment thread to a child process, or a duplicated `VERDICT_RE` selector in
+# two files — and that last one destroys the same-comment invariant that is the
+# only thing making the check mean anything.
 #
 # TOKEN PRECEDENCE (deliberate, pinned by test_pr_ready.sh): `optout` is checked
 # before everything else; then CI state (`pending` / `ci-failed`), exactly as it
@@ -114,6 +280,13 @@
 # path the fresh-non-LGTM check sits exactly where `awaiting-review` used to be
 # emitted, and it wins over the `ready-unreviewed` shortcut: a posted verdict
 # proves a review gate exists, so the verdict — not the shortcut — decides.
+# THAT SENTENCE IS ENFORCED IN TWO PLACES, and it needs both to stay true: the
+# `verdict_lgtm == "false"` branch covers a FRESH NON-LGTM verdict, and the
+# verdict-EXISTED latch covers every verdict the provenance guard REFUSES —
+# whose fields that guard has already blanked, so the first branch can no longer
+# see them. Without the latch, "this verdict is inadmissible" would arrive at
+# `review_gate_absent` as "this PR has no review gate", which is the shortcut's
+# precondition and not what an unreadable marker means (#1181).
 # FAIL-CLOSED: an unreadable verdict lookup still dies (exit 2, nothing on
 # stdout — the tooling-error contract above), and a malformed verdict answer
 # degrades to `awaiting-review` (wait), NEVER to `changes-requested` — the one
@@ -253,7 +426,12 @@
 #     `available`, `unknown`, an empty answer, a non-zero exit, a garbage word, a
 #     MISSING helper and a NON-EXECUTABLE helper all fall through to today's
 #     `behind` → sync.
-# Both are fail-closed in the IDENTICAL sense — prefer the recoverable error —
+#   provenance (#1181): anything that is not a well-formed marker naming THIS PR
+#     REFUSES the verdict — main-health.sh's polarity, not review-quota.sh's.
+# THE THREE POLARITIES ARE DELIBERATELY NOT UNIFORM; the first two are argued
+# here and the third in the block that follows. Read both before making any of
+# them agree.
+# The first two are fail-closed in the IDENTICAL sense — prefer the recoverable error —
 # and therefore take OPPOSITE actions, because the recoverable error differs.
 # There, merging a stale green onto a broken tree buries the culprit and waiting
 # one wake costs nothing. Here, holding a lane on an unproven claim wedges a
@@ -266,6 +444,65 @@
 # consistent" either re-introduces #1160 or wedges the fleet; test_pr_ready.sh's
 # inverted sweep and test_review_quota.sh's `never_exhausted()` pin both
 # directions.
+#
+# ---------------------------------------------------------------------------
+# THE THIRD POLARITY, AND WHY IT SIDES WITH `main-health.sh` (#1181)
+# ---------------------------------------------------------------------------
+# The provenance guard holds on doubt: an absent, malformed or mismatched marker
+# refuses the verdict. That is main-health.sh's polarity, and the reason is not
+# "two out of three win".
+#   * It is a different KIND of object. Both siblings above are preconditions on
+#     a REMEDY — they decide whether the sync a lane is about to be told to run
+#     is safe. This is a property of the MERGE GATE itself, and a merge gate's
+#     doubt-polarity is settled by the oldest rule in this file: never weaken a
+#     gate. An unattributable review is not a review.
+#   * Against `main-health.sh` the shape is identical. The unrecoverable error
+#     is merging an unreviewed 38-file authenticated surface on somebody else's
+#     LGTM; the recoverable one is one wait plus one push.
+#   * Against `review-quota.sh` the inversion rests on two legs. Leg (1) — a
+#     false hold wedges a lane for DAYS with no self-heal — is normally false
+#     here: the remedy is a self-service push and lands in one tick. Leg (2) —
+#     the false-positive trigger is CORRELATED FLEET-WIDE — DOES apply, and it is
+#     the strongest argument against this polarity: a broken emitter unmarks
+#     every verdict at once, so every lane holds at once.
+#     WHAT NEUTRALISES LEG (2) IS THE CROSS-FILE COUPLING TEST. test_pr_ready.sh
+#     greps the emitter's own `printf` format out of
+#     `.github/workflows/code-review.yml`, renders it, and round-trips it
+#     through THIS parser — and `ralph-recap-tests.yml` runs that suite on
+#     changes to that workflow. Emitter and parser therefore cannot drift
+#     without CI going red ON THE VERY PR THAT CAUSES THE DRIFT, before any lane
+#     can hold. Those two facts are load-bearing TOGETHER: delete the round-trip
+#     case, or the `paths:` entry that makes it run, and this polarity loses its
+#     justification. Do not remove either believing the other covers it.
+#
+#     AND THAT ARGUMENT WAS INCOMPLETE WHEN IT WAS FIRST WRITTEN — SAY IT PLAINLY,
+#     BECAUSE IT IS THE NEAR-MISS THE NEXT READER NEEDS. "A broken emitter" said
+#     THE emitter, and there are TWO emitters of a VERDICT_RE-matching comment in
+#     this repo. The second is `.github/workflows/iteration-trigger.yml`'s
+#     executive summary, whose `**VERDICT**: <X>` line satisfies VERDICT_RE and
+#     VERDICT_LGTM_RE, which cannot carry a `creek-review` marker, and which posts
+#     LAST on every lane — so the selector picked it, the guard refused it, and
+#     the correlated fleet-wide hold this block claims to have neutralised was
+#     happening on EVERY lane, from the moment #1181 landed. Leg (1) fell with it:
+#     the self-service push does NOT un-wedge that shape, because a push produces
+#     a fresh review comment and then, 15 seconds later, a fresh unmarked summary.
+#     Before the fix, the string `iteration-trigger.yml` appeared in this file
+#     ZERO times, and no fixture ANYWHERE in test_pr_ready.sh carried an
+#     iteration-trigger summary — so nothing anywhere went red. (The suite did
+#     have multi-comment fixtures; what it did not have was the second emitter's
+#     comment. A test bench that models one producer cannot fail on a second one
+#     it has never heard of.) It was found by reading four
+#     merged PRs' live comment threads (#906, #905, #904, #902 — 4 of 4) at
+#     Gate 2.5 round 3.
+#     The same coupling discipline now covers the second emitter: ITER_SUMMARY_RE
+#     below excludes it, its bytes are read out of that workflow's own `MARKER:`
+#     and asserted against this constant, and the behavioural cases are built from
+#     those bytes rather than from the suite's own. What that costs, and the
+#     residual it accepts, is argued at the constant. THE GENERAL LESSON IS NOT
+#     "add one more coupling test": it is that a polarity argument of the form
+#     "only a broken EMITTER can do this, and the coupling test catches the
+#     emitter" is only as good as the enumeration of emitters behind it. Before
+#     adding a third consumer of VERDICT_RE, enumerate again.
 #
 # Usage:  pr-ready.sh <PR_NUMBER> [--repo <owner/repo>]
 set -euo pipefail
@@ -410,6 +647,163 @@ done
 readonly VERDICT_RE='(?im)^\\s*(?:#{1,6}\\s+|\\*\\*)?verdict[:*\\s]'
 readonly VERDICT_LGTM_RE="${VERDICT_RE}+lgtm"
 
+# The provenance marker `.github/workflows/code-review.yml` PREPENDS to every
+# review comment it posts, with N interpolated by the WORKFLOW from
+# `github.event.pull_request.number` — never from anything the review agent
+# says. Read from the SAME comment `VERDICT_RE` selects; see the provenance
+# block in the header for why a second scan of the thread would prove nothing.
+#
+# Written with literal spaces, `[0-9]` and a POSIX class only: not one backslash
+# appears here, so the doubled-escape hazard documented three lines up (this text
+# is spliced into a jq string literal, where `\s` is invalid and must arrive as
+# `\\s`) cannot arise by construction.
+#
+# `(?m)` IS LOAD-BEARING AND IS WRITTEN INLINE ON PURPOSE, exactly as it is in
+# VERDICT_RE. Under the PRODUCTION engine (Go's `regexp`; see the note below) the
+# `m` flag is documented as off unless asked for, so without it `^`/`$` would
+# mean `\A`/`\Z` and this pattern would only match a marker that IS the entire
+# comment. Spelling the flag out is also what makes the pattern independent of
+# the OTHER engine's default, which is a question this file deliberately does not
+# answer — see the two-engine note below for how their agreement is established
+# instead. With `(?m)` in force, `^` is what stops review prose that merely
+# quotes a marker — a review of this very change quotes one — from attesting, and
+# the tail anchor is what refuses `pr=100 7` on PR 100, where a lax
+# `pr=([0-9]+)` would capture `100` and merge.
+#
+# AND TWO DIFFERENT REGEX ENGINES HAVE TO AGREE ABOUT ALL OF THAT. This pattern
+# is never run by the `jq` binary in production: it is spliced into a `--jq`
+# expression that `gh` evaluates in its OWN process with gojq
+# (`github.com/itchyny/gojq`), whose `test`/`scan` are Go's `regexp` — RE2.
+# `scripts/ralph/test_pr_ready.sh` pipes its fixtures through the SYSTEM `jq`
+# instead, which is Oniguruma. That the two agree about THIS pattern is asserted
+# from OBSERVED BEHAVIOUR, not from any claim about what either engine's flags
+# default to. That claim was in this comment once, stated confidently for both
+# engines; a reviewer read Oniguruma's default the other way, and nobody had
+# measured either reading. Behaviour settles it and a documentation reading does
+# not, so behaviour is what is recorded:
+#   * Under the system `jq` (Oniguruma), this exact pattern was MEASURED to do
+#     the three things the guard needs: a marker quoted mid-line does NOT match,
+#     a marker on its own line DOES, and a CRLF-terminated marker line DOES.
+#     Those are not anecdotes — they are three named cases in
+#     `scripts/ralph/test_pr_ready.sh` ("marker embedded mid-line", "marker
+#     present and MATCHING", "CRLF comment body still attests"), so the
+#     observation re-runs on every CI pass rather than aging into a claim.
+#   * Under gojq (RE2), the same property has been carrying production for
+#     months: VERDICT_RE sets the same inline `m` flag (as `(?im)`) and depends
+#     on the same line-anchored `^` to find `## Verdict:` at the END of a
+#     multi-line `## Summary …` body, and it has been selecting verdict comments
+#     correctly the whole time.
+# Both engines also accept `[[:space:]]` and `[0-9]+`. They agree on every byte
+# written here because this pattern is DELIBERATELY RESTRICTED to the constructs
+# common to both, not because the suite and production share an engine. They do
+# not.
+#
+# SO THE COUPLING TEST VALIDATES THIS PARSER AGAINST AN ENGINE PRODUCTION DOES
+# NOT USE, which is as far as an offline suite can go — and the failure it cannot
+# see is one-directional: an Oniguruma-only construct (a lookahead, a
+# backreference, `\K`) passes the local suite GREEN and then fails LIVE, where
+# RE2 refuses to compile it, the whole `--jq` errors out, `gh` exits non-zero and
+# this script dies mid-classification on every lane at once. Keeping to the
+# common subset is what makes the local green transferable. VERDICT_RE rests on
+# the identical property, and this is the one place it is written down.
+#
+# The trailing `[[:space:]]*` tolerates a carriage return (and stray trailing
+# blanks) on the marker's own line. It loosens nothing that matters — the line
+# must still be the marker and then whitespace to its end — and it is the one
+# cheap hedge against the correlated failure this whole guard's polarity depends
+# on not happening: a comment body that came back CRLF-delimited would otherwise
+# unmark every verdict in the fleet at once.
+readonly MARKER_RE='(?m)^<!-- creek-review pr=([0-9]+) -->[[:space:]]*$'
+
+# The loose probe that tells "no marker at all" (every verdict posted before
+# #1181 landed) apart from "a marker this emitter cannot have produced" (the
+# emitter and this parser have drifted). It picks WHICH diagnostic is printed
+# and nothing else — both shapes refuse the verdict — so its one false-positive
+# shape, a review whose prose mentions the word, costs a slightly wrong message.
+readonly MARKER_ANY_RE='creek-review'
+
+# What the `--jq` puts in the marker field when MARKER_ANY_RE matched and
+# MARKER_RE did not. Safe as a sentinel because `$pr` is `^[0-9]+$`-validated
+# above, so no real PR number can ever collide with it.
+readonly MARKER_MALFORMED='malformed'
+
+# ---------------------------------------------------------------------------
+# THE SECOND EMITTER OF A VERDICT_RE MATCH, AND WHY IT IS EXCLUDED (#1181)
+# ---------------------------------------------------------------------------
+# Everything above assumes the only thing on a PR that matches VERDICT_RE is a
+# review comment. IN THIS REPO THAT IS FALSE, and the comment that falsifies it
+# posts LAST on every lane. `.github/workflows/iteration-trigger.yml` posts a
+# four-line executive summary whenever CI completes and a review verdict exists:
+#
+#     <!-- iteration-trigger -->
+#     **CI**: 10/10 Green
+#     **VERDICT**: LGTM
+#     **Action**: You are cleared to squash merge, ...
+#
+# Line 3 SATISFIES VERDICT_RE, through the `(?:#{1,6}\s+|\*\*)?` alternative that
+# pattern deliberately tolerates: the leading `**` matches it, `VERDICT` matches
+# `verdict` case-insensitively, the second `*` matches `[:*\s]`, and `**: LGTM`
+# then satisfies VERDICT_LGTM_RE as well. Measured through these very patterns
+# with jq: VERDICT_RE true, VERDICT_LGTM_RE true, `creek-review` marker NONE.
+#
+# IT IS NOT A VERDICT, IT IS A REPORT OF ONE. That workflow SELECTS the review
+# comment (`[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last`) and
+# copies the verdict line out of it. It cannot carry `<!-- creek-review pr=N -->`
+# and must not: that marker attests the CODE-REVIEW pipeline produced the
+# comment, and this one is posted by a workflow that never read a diff.
+#
+# WITHOUT THIS EXCLUSION IT WEDGES THE WHOLE FLEET, because the selector takes
+# the LAST match and the summary is always it. Merged PR #906's comment tail:
+#   06:53:17Z  `## Summary\nPR #906 fixes false-positive "broke...` <- the review
+#   06:53:32Z  `<!-- iteration-trigger -->\n**CI**: 4/7 Green...`   <- 15 s later
+#   07:03:05Z  `<!-- iteration-trigger -->\n**CI**: 10/10 Green...` <- LAST
+# Same shape on #905, #904 and #902 — 4 of 4 merged PRs. The provenance guard
+# then refuses that summary on EVERY lane at once; `awaiting-review` is in
+# watch-pr.sh's IN_FLIGHT_TOKENS so the watcher sleeps on it; and the un-wedge
+# the routing-cost block promises ("one push by anybody") does NOT clear it — a
+# push yields a fresh review comment and, 15 seconds later, a fresh unmarked
+# summary. That is precisely the correlated fleet-wide hold the third-polarity
+# block says this guard cannot afford.
+#
+# THE EXCLUSION IS LINE-ANCHORED, AND THAT IS A DECISION. Both directions fail
+# closed — skipping a comment can only ever LOSE a verdict, never invent one — so
+# what is being chosen is how much verdict is lost, not whether it is safe:
+#   * a BARE SUBSTRING `test("<!-- iteration-trigger -->")` also skips any review
+#     whose PROSE quotes the marker. Not hypothetical: a review of THIS VERY
+#     CHANGE quotes it, and the identical shape is already written down for the
+#     OTHER marker — at MARKER_RE above ("a review of this very change quotes
+#     one"), in iteration-trigger.yml's own extraction, and in two named cases of
+#     test_pr_ready.sh. The cost is not one lost verdict either — it is a lane
+#     wedged at `awaiting-review`, i.e. the failure this exclusion exists to
+#     remove, re-entering through a narrower door.
+#   * anchoring costs nothing against every REAL summary: that workflow builds
+#     the body with `printf '%s\n%s\n%s\n%s\n'` and `$MARKER` FIRST, so the marker
+#     sits on line 1 at column 0 — exactly where code-review.yml puts
+#     `creek-review`. The two markers' parse rules are then symmetric, and this is
+#     the very pattern iteration-trigger.yml itself uses to read the creek-review
+#     marker (`grep -oE '^<!-- creek-review pr=[0-9]+ -->[[:space:]]*$'`).
+# THE RESIDUAL IS ACCEPTED AND NAMED: a review that quotes the marker on a line
+# of its OWN (inside a fenced block) is still skipped. That is one verdict lost
+# on one PR, recoverable by one re-review — never a fleet-wide hold.
+#
+# `(?m)` IS SPELLED OUT rather than relied upon, and the pattern is restricted to
+# the constructs gojq/RE2 (production) and Oniguruma (the suite) share. Not one
+# backslash appears in it, so the jq-string-literal hazard documented at
+# VERDICT_RE (`\s` is invalid there and must arrive as `\\s`) cannot arise by
+# construction. Those are MARKER_RE's rules for MARKER_RE's reasons — read its
+# engine note above before changing a byte here. The tighter `^` alone, anchoring
+# to the START OF THE BODY where the emitter always puts it, is rejected for the
+# reason recorded there: it would rest on a flag DEFAULT, and a confident claim
+# about those defaults was written down once, read the other way by a reviewer,
+# and never measured by anybody.
+#
+# AND THE BYTES ARE COUPLED TO THE EMITTER, exactly as the marker round trip
+# couples this file to code-review.yml: test_pr_ready.sh reads `MARKER:` out of
+# iteration-trigger.yml and asserts THIS constant carries it, so renaming the
+# marker there without teaching this parser turns CI red on the renaming PR
+# instead of silently re-opening the wedge.
+readonly ITER_SUMMARY_RE='(?m)^<!-- iteration-trigger -->[[:space:]]*$'
+
 # `${arr[@]+"${arr[@]}"}` expands to nothing when the array is empty instead of
 # tripping `set -u` on bash 3.2 (stock /bin/bash on macOS).
 gh_args=("$pr" ${repo_args[@]+"${repo_args[@]}"})
@@ -485,8 +879,12 @@ fi
 
 # --- CI is green: check mergeability + a FRESH LGTM verdict -----------------
 # One call yields "<mergeStateStatus>|<HEAD committedDate>|<HEAD author login>",
-# another the latest top-level verdict as "<createdAt>|<isLGTM>". gh applies --jq
-# server-side. The HEAD author rides along here rather than in its own call: it is
+# another the latest top-level verdict as "<createdAt>|<isLGTM>|<marker pr= value>"
+# — one call for both halves of the verdict question, see below. `gh` applies the
+# `--jq` itself, with gojq rather than the `jq` binary (see MARKER_RE's engine
+# note), so the whole answer arrives already reduced to one scalar per call and
+# no comment thread is ever piped through this shell. The HEAD author rides along
+# here rather than in its own call: it is
 # only needed by `review_gate_absent`, and `gh` already hands us the commit.
 # (`gh` caps `commits` at 100. That is already how `head_date` is derived, and it
 # fails CLOSED for the author too: on an adopted lane the bot's bump is commit 1
@@ -501,12 +899,184 @@ merge_line="$(gh pr view "${gh_args[@]}" \
 IFS='|' read -r merge_state head_date head_author merge_rest <<<"$merge_line"
 [[ -z "$merge_rest" ]] || { merge_state=""; head_date=""; head_author=""; }
 
+# THREE fields now: "<createdAt>|<isLGTM>|<marker pr= value>". The marker is
+# captured from `$v` — the SAME comment the VERDICT_RE selector above already
+# picked — because a whole-thread question ("does this PR have a matching marker
+# anywhere?") answers yes for every PR that was ever reviewed once, and would
+# vouch for a verdict comment that carries no marker of its own (#1181).
+# `[scan(...)] | flatten | first` rather than `capture`: `capture` THROWS on no
+# match, which would turn "this verdict is unattested" — the single most common
+# case while legacy verdicts are still on the fleet — into a failed `gh` call
+# and a lane the orchestrator refuses to classify at all.
+#
+# THE ITER_SUMMARY_RE EXCLUSION IS PART OF THE SELECTOR, INSIDE THIS ONE `--jq`,
+# and it has to be. Every field below — `createdAt`, the LGTM test, the marker —
+# is read off the single `$v` binding, and that SAME-COMMENT INVARIANT is the
+# only thing that makes any of them mean anything: a second selector for the
+# freshness stamp, or a marker lookup rebound to the comment that was skipped,
+# resurrects #1181's own failure with one extra step. test_pr_ready.sh's W3, W3b
+# and W5 cases are what kill those three mutants; the "AND IT IS NOT A SIBLING
+# SCRIPT" block in the header is the same argument against splitting the answer
+# across files.
+#
+# IT ALSO CLOSES A PRE-EXISTING FRESHNESS HOLE, as a side effect worth naming:
+# before this, a STALE review followed by a FRESH summary handed the stale-verdict
+# guard the SUMMARY's `createdAt`, so the guard compared the wrong comment's time
+# against HEAD and a review of code that is no longer there passed as fresh. The
+# provenance guard has been masking that since #1181 landed (it refused the
+# summary before freshness was ever consulted) rather than closing it. It is
+# closed now, and pinned.
 verdict_line="$(gh pr view "${gh_args[@]}" \
   --json comments \
-  --jq "([.comments[] | select(.body != null and (.body | test(\"$VERDICT_RE\")))] | last) as \$v
-        | ((\$v.createdAt // \"\") + \"|\" + ((\$v.body // \"\" | test(\"$VERDICT_LGTM_RE\")) | tostring))")"
-verdict_date="${verdict_line%%|*}"
-verdict_lgtm="${verdict_line#*|}"
+  --jq "([.comments[] | select(.body != null
+                               and ((.body | test(\"$ITER_SUMMARY_RE\")) | not)
+                               and (.body | test(\"$VERDICT_RE\")))] | last) as \$v
+        | (\$v.body // \"\") as \$b
+        | ((\$b | [scan(\"$MARKER_RE\")] | flatten | first)
+           // (if (\$b | test(\"$MARKER_ANY_RE\")) then \"$MARKER_MALFORMED\" else \"\" end)) as \$mk
+        | ((\$v.createdAt // \"\") + \"|\" + ((\$b | test(\"$VERDICT_LGTM_RE\")) | tostring) + \"|\" + \$mk)")"
+# Split by FIELD COUNT, exactly like the mergeState answer above and the rollup
+# answer below: an RFC3339 stamp, a jq boolean and a PR number can none of them
+# contain `|`, so a fourth field means the answer is not the shape we asked for
+# and every branch below must fail closed on it. The two-expansion split this
+# replaces (`%%|*` / `#*|`) read `true|100` into the LGTM flag the moment the
+# answer grew its third field — the `|`-seeking class this file has already
+# proven exploitable once.
+IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_rest <<<"$verdict_line"
+[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; }
+
+# --- the verdict-EXISTED latch, recorded BEFORE the guard blanks (#1181) ----
+# The provenance guard immediately below is about to erase `verdict_date` and
+# `verdict_lgtm`, and those two fields are the only trace a verdict comment
+# leaves in this process. What must survive that erasure is NOT the verdict —
+# refusing it is the whole point — but the bare FACT that one was posted, because
+# `review_gate_absent` further down asks a different question and would otherwise
+# answer it from evidence that no longer exists.
+#
+# THE TWO QUESTIONS ARE NOT THE SAME, AND CONFLATING THEM MOVES A LANE TOWARDS
+# MERGING. `ready-unreviewed`'s precondition is "this PR HAS NO REVIEW GATE to
+# wait for" — nobody has reviewed it and nobody ever will. An inadmissible marker
+# says the verdict is UNUSABLE; it does not say the gate is ABSENT. A comment
+# carrying a `## Verdict:` line means SOMETHING reviewed this PR and spoke: the
+# `claude-review` job posted it, or (as the authorship note in the header
+# concedes) a human did. Either way the shortcut's premise is already false, and
+# an unreadable marker is a reason to distrust WHAT was said, never evidence that
+# nothing was.
+#
+# Without this latch, the one lane where the difference is visible went the wrong
+# way: a Dependabot bump whose every `claude-review` rollup entry really is
+# SKIPPED, carrying an UNMARKED verdict. The guard blanks the fields, so
+# `verdict_lgtm` is `""` and not `"false"` and the `changes-requested` branch can
+# no longer fire; `review_gate_absent` consults only the author and the rollup,
+# knows nothing of the verdict it never saw, and clears — and the lane prints
+# `ready-unreviewed`, which is merge-adjacent. Refusing a verdict would then have
+# pushed the lane FORWARD, leaving a PR that HAS a posted verdict further along
+# than one that has none. That is the regression this latch closes, and it is
+# what keeps the header's precedence sentence ("a posted verdict proves a review
+# gate exists, so the verdict — not the shortcut — decides") true on the one path
+# where the provenance guard, not the verdict, is doing the deciding.
+#
+# THE DISCRIMINATOR IS `$verdict_date`, DELIBERATELY — the same field the guard
+# below uses to mean "a verdict actually exists", so the two can never disagree
+# about whether there was one. NOT the marker field, which is EMPTY for precisely
+# the case this latch exists to catch (a legacy verdict with no marker at all)
+# and would therefore latch nothing exactly when it is needed.
+#
+# AND THE DISCRIMINATOR IS NOT "the rollup looks dirty". With no verdict-bearing
+# comment at all, `$v` is null and every field of this answer comes back empty —
+# that lane latches nothing and MUST still reach the shortcut. It is the control
+# against the lazy fix: "stop `ready-unreviewed` firing after a refused verdict"
+# must not degenerate into "delete `ready-unreviewed`", which re-wedges every
+# Dependabot bump at `awaiting-review` forever, waiting on a review the workflow
+# provably never runs (see the WHY `ready-unreviewed` EXISTS block in the header).
+#
+# THE SUMMARY EXCLUSION NARROWS WHAT FEEDS THIS LATCH, AND THAT WAS CHECKED
+# RATHER THAN ASSUMED. `$verdict_date` now comes from a selector that skips
+# iteration-trigger.yml's executive summary, so a summary is no longer evidence
+# that a review gate exists. Exactly one lane could care: Dependabot author, every
+# `claude-review` rollup entry SKIPPED, a summary on the thread, and NO review
+# comment at all — `awaiting-review` before the exclusion, `ready-unreviewed`
+# (merge-adjacent) after it.
+#
+# THAT LANE CANNOT OCCUR, and the proof is in the emitter, not in this file:
+# iteration-trigger.yml EXITS EARLY ("No Claude review yet - skipping") unless
+# `[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last` finds a comment. So
+# a summary exists only where a `## Verdict:` comment already does — and every
+# such comment matches VERDICT_RE (`##` takes the `#{1,6}\s+` alternative, then
+# `verdict`, then `:`), carries no `<!-- iteration-trigger -->` line of its own,
+# and therefore still latches. The latch is left feeding off the SAME corrected
+# selector as everything else; it is deliberately NOT given a looser selector of
+# its own, which would break the same-comment invariant for the sake of a lane
+# that does not exist.
+#
+# IF THAT EARLY EXIT EVER LEAVES iteration-trigger.yml, this reasoning leaves with
+# it, and the safe move is to fail CLOSED — latch on the summary as well — never
+# to leave the latch reading a selector that can no longer see one.
+#
+# AND IT SITS AFTER THE FIELD-COUNT BLANK, one line up, not before it: a
+# surplus-field answer is not evidence that a verdict exists, it is evidence that
+# the answer is unreadable, and reading a latch out of fields we just refused to
+# trust would be the same mistake in the other direction. The residual — a
+# malformed answer letting a Dependabot lane keep the shortcut — is unreachable
+# by construction, because an RFC3339 stamp, a jq boolean and a `[0-9]+` marker
+# (or the `malformed` sentinel) can none of them contain a `|`.
+verdict_comment_seen=""
+[[ -z "$verdict_date" ]] || verdict_comment_seen="yes"
+
+# --- provenance: does this verdict attest to THIS PR? (#1181) ---------------
+# STRING equality on purpose, and NOT for the reason it is tempting to give. A
+# numeric `[[ "$verdict_pr" -eq "$pr" ]]` would not admit an absent marker:
+# `[[ "" -eq 100 ]]`, `[[ "abc" -eq 100 ]]` and `[[ "malformed" -eq 100 ]]` are
+# all FALSE on both shells this repo runs on, so the empty and lettered fields
+# are precisely the ones `-eq` gets right.
+#
+# The hazard is a single value, and it is worse than a wrong answer — it is a
+# DISAGREEMENT BETWEEN INTERPRETERS. `pr=0100` is the one point in the whole
+# space where `-eq` and a string `!=` differ at all, and the two shells this file
+# actually runs under differ from EACH OTHER about it. Measured, not assumed:
+#
+#   bash 5.3.15 (aarch64-apple-darwin24.6)  [[ "0100" -eq 100 ]] → TRUE,  -eq 64 → FALSE
+#   /bin/bash 3.2 (stock macOS)             [[ "0100" -eq 100 ]] → FALSE, -eq 64 → TRUE
+#
+# (bash 5 reads the leading zero as decimal inside `[[ ]]`'s arithmetic context;
+# bash 3.2 reads it as octal.) A numeric compare would therefore make the MERGE
+# GATE SHELL-VERSION-DEPENDENT: the same marker clears on one interpreter and is
+# refused on the other, with nothing in the output to say which one ran. String
+# equality is exact and version-independent, and it is what the emitter produces:
+# the workflow interpolates `github.event.pull_request.number` verbatim through a
+# `%s`, so anything but the verbatim bytes is a marker it did not emit.
+# test_pr_ready.sh pins this with a `pr=0100` case carrying the same measurements.
+#
+# Guarded on `$verdict_date` so the diagnostic describes a verdict that actually
+# exists: with no verdict-bearing comment at all the marker field is empty too,
+# and that is the ordinary `awaiting-review` lane, not a provenance failure.
+if [[ -n "$verdict_date" && "$verdict_pr" != "$pr" ]]; then
+  case "$verdict_pr" in
+    "")
+      marker_what='carries NO provenance marker'
+      marker_tail='Expected for any verdict posted before #1181 landed: that pipeline never named the PR it reviewed.'
+      ;;
+    "$MARKER_MALFORMED")
+      marker_what='carries a provenance marker this workflow cannot emit'
+      marker_tail="The emitter and this parser have drifted; test_pr_ready.sh's coupling case should have caught it — fix the emitter, do not loosen the parser."
+      ;;
+    *)
+      marker_what="names PR #$verdict_pr, not #$pr"
+      marker_tail='A verdict produced for another PR, a forged comment, or an emitter bug. Do NOT merge. Unreachable in normal operation; file an issue against .github/workflows/code-review.yml.'
+      ;;
+  esac
+  # One printf per LINE, and each fact whole within its own line: the operator
+  # reads this in a log, and test_pr_ready.sh greps it line by line.
+  {
+    printf 'pr-ready: the latest verdict on PR #%s %s.\n' "$pr" "$marker_what"
+    printf 'pr-ready:   %s\n' "$marker_tail"
+    printf 'pr-ready:   It is treated as no verdict at all — it gates neither `ready` nor `changes-requested`, so this lane falls through to `awaiting-review` (#1181).\n'
+    printf 'pr-ready:   Remedy: scripts/ralph/fleet.sh sync (or push any commit). That advances HEAD — which invalidated the old verdict anyway — and brings the marker-emitting workflow onto the branch, so the re-review is attested.\n'
+    printf 'pr-ready:   Re-running the old review workflow run will NOT help: a re-run replays the workflow file from the commit that run was launched from, which is the one without the fix.\n'
+  } >&2
+  verdict_date=""
+  verdict_lgtm=""
+fi
 
 # Without a HEAD commit time we cannot prove the verdict is fresh — fail closed.
 if [[ -z "$head_date" ]]; then
@@ -527,9 +1097,10 @@ all_conclusions_skipped() {
   done
 }
 
-# True only when this PR has no review gate to wait for: Dependabot authored it,
-# Dependabot also pushed its HEAD commit (so nothing of ours rides the branch —
-# see the force-push note in the header), at least one non-review check actually
+# True only when this PR has no review gate to wait for: no verdict-bearing
+# comment was ever posted (the latch above), Dependabot authored it, Dependabot
+# also pushed its HEAD commit (so nothing of ours rides the branch — see the
+# force-push note in the header), at least one non-review check actually
 # SUCCEEDED (so "green" is not "nothing ran"), and every `claude-review` entry in
 # its rollup reported SKIPPED (the rollup carries one entry per triggering event,
 # so a single non-SKIPPED entry means the job did run and a verdict is genuinely
@@ -538,6 +1109,26 @@ all_conclusions_skipped() {
 # as "the gate exists", so an unreadable answer can only ever hold the lane.
 review_gate_absent() {
   local line author conclusions passes rest
+  # THE LATCH, CHECKED FIRST (#1181). A verdict comment exists on this PR, so the
+  # review gate EXISTS and this function's question is already answered NO — no
+  # amount of author or rollup evidence can unsay a comment that is sitting on
+  # the thread. The caller reaches here only because that verdict was REFUSED by
+  # the provenance guard, is STALE, or came back MALFORMED — unusable, out of
+  # date, unreadable. Not one of those is "there is no gate", and all three are
+  # waits.
+  #
+  # THE ROLLUP IS NOT A SUBSTITUTE FOR THIS. `statusCheckRollup` is per-HEAD-
+  # commit, so all-SKIPPED means the job did not run FOR THIS HEAD — the verdict
+  # may have been posted against an earlier one, by a re-run, or by a pipeline
+  # version this parser refuses. Every one of those makes the verdict unusable
+  # and none of them makes the gate absent.
+  #
+  # Checked ahead of the `gh` call rather than after it because the answer cannot
+  # change, and it spares the lane one API request per wake — the same laziness
+  # argument every other probe in this file makes. (The `probed` sentinels in
+  # test_pr_ready.sh pin the one path that MUST still pay for it: the lane with
+  # no verdict comment at all.)
+  [[ -z "$verdict_comment_seen" ]] || return 1
   line="$(gh pr view "${gh_args[@]}" --json author,statusCheckRollup \
     --jq "(.author.login // \"\") + \"|\" + ([.statusCheckRollup[]? | select((.name // \"\") == \"$REVIEW_CHECK_NAME\") | (.conclusion // \"\")] | join(\",\")) + \"|\" + ([.statusCheckRollup[]? | select((.name // \"\") != \"$REVIEW_CHECK_NAME\" and (.conclusion // \"\") == \"$SUCCESS_CONCLUSION\")] | length | tostring)" \
     2>/dev/null)" || return 1
@@ -703,12 +1294,22 @@ branch_is_current() {
 # Fresh LGTM ⇔ latest verdict is LGTM AND its createdAt is strictly newer than
 # the HEAD commit. RFC3339 UTC timestamps are fixed-width, so a lexical string
 # compare is a correct chronological compare (portable — no date arithmetic).
+# The guards COMPOSE rather than substitute: an inadmissible marker has already
+# blanked both fields above (#1181), so a verdict must be attested AND fresh AND
+# LGTM to reach `ready` — and an attested LGTM that predates HEAD is still stale.
 # Absent that: a FRESH non-LGTM verdict is Gate 4 failed → `changes-requested`
 # (checked FIRST — the verdict is the review gate speaking, so it outranks the
 # no-gate shortcut); otherwise the lane waits for review, unless there is
 # provably no review to wait for — and the review-gate probe is LAZY for the
 # same rate-limit reason as the compare probe: only a lane already lacking a
 # fresh verdict ever pays for it.
+#
+# The `changes-requested` test below is only HALF of "the verdict outranks the
+# shortcut": it reads `verdict_lgtm`, which the provenance guard blanks, so it
+# cannot speak for a REFUSED verdict. The other half is the latch inside
+# `review_gate_absent`, which refuses the shortcut on the mere existence of a
+# verdict comment. Both are needed, and a change that drops either one lets a
+# refused verdict end at a token the loop merges on (#1181).
 ready_token="ready"
 if [[ "$verdict_lgtm" != "true" || -z "$verdict_date" ]] || ! [[ "$verdict_date" > "$head_date" ]]; then
   # Exactly `false` (jq's tostring), never `!= true`: anything else in that
