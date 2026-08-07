@@ -195,8 +195,8 @@ code** (`0`=green, `8`=pending, else=failed) and only honours an LGTM verdict
 posted **after** the PR's HEAD commit (stale-verdict guard):
 ```bash
 STATUS=$(scripts/ralph/pr-ready.sh "$PR_NUM") && RC=0 || RC=$?
-# ready | ready-unreviewed | behind | main-not-green | pending | ci-failed |
-# changes-requested | awaiting-review | optout
+# ready | ready-unreviewed | behind | main-not-green | review-quota-exhausted |
+# pending | ci-failed | changes-requested | awaiting-review | optout
 ```
 The exit code is captured explicitly (`RC`) — the helper now exits non-zero
 when it cannot classify a lane at all, and an unchecked `$STATUS` would just
@@ -275,8 +275,11 @@ Then act on `$STATUS`:
   prints `behind` only when the two changesets can actually interact: `main`
   landed a cross-cutting change (lockfile, tool pin, workflow, check script,
   root `conftest.py`), **or** this branch did, **or** the two touched a file in
-  common. Two fixes in unrelated modules no longer serialize. Same remedy when
-  it does fire:
+  common. Two fixes in unrelated modules no longer serialize. The sync below is
+  now itself conditional (#1160): a lane that also carries a fresh LGTM reads
+  `review-quota-exhausted` instead of `behind` when the reviewer is provably out
+  of quota, because the sync's own re-review couldn't happen — see that token
+  below. Same remedy when it does fire as plain `behind`:
   ```bash
   scripts/ralph/fleet.sh sync "$ISSUE_N" || echo "SYNC-CONFLICT $ISSUE_N"
   ```
@@ -296,6 +299,34 @@ Then act on `$STATUS`:
   polling instead of busy-waking the fleet. **The one exception is the lane
   fixing `main`** (Step 0b) — that worker syncs on purpose, because its fix
   must sit on top of the commit it is fixing.
+- **`review-quota-exhausted`** (issue #1160) — this lane is behind `main` for a
+  real reason and holds a fresh LGTM plus green CI, so it would otherwise print
+  `behind` — but `scripts/ralph/review-quota.sh` has positively proven the
+  `claude-review` reviewer is out of quota. `behind`'s remedy is
+  `fleet.sh sync`, which pushes a merge commit and, under `pr-ready.sh`'s own
+  stale-verdict guard, invalidates the LGTM the moment it lands — normally that
+  just costs one re-review, but with the reviewer out of quota the re-review
+  cannot happen, so the sync would destroy the only verdict this lane will ever
+  get. **Leave the lane; specifically do NOT sync it, and do NOT
+  `fleet.sh release` it** (see the Hard rule below). Its Step 5 wake retries
+  like `main-not-green`'s: `review-quota-exhausted` is in `watch-pr.sh`'s
+  in-flight set, so the watcher keeps polling rather than busy-waking the fleet.
+
+  **This does not hold forever.** Two triggers are each independently
+  sufficient to un-wedge it: (a) the `resetsAt` the probe recorded passes, so
+  the identical log now reads `available`; or (b) any newer conclusive
+  `code-review.yml` run — on any lane — concludes `success`, proving the
+  reviewer is back. Either way the token reverts to plain `behind` on the next
+  wake, the watcher exits on it (it is no longer in the in-flight set), Step 1
+  syncs, CI and a fresh review run, and the lane merges normally. The LGTM
+  *is* still destroyed at that sync — deliberately, because that is now the one
+  moment a replacement verdict is obtainable.
+
+  **Precedence with `main-not-green`:** that token still wins when both would
+  apply, because it is decided earlier, inside `branch_is_current`, before
+  `review-quota.sh` is ever consulted. Both remedies are "wait", so the
+  observable outcome is identical either way — a lane already held by
+  `main-not-green` simply never pays for the quota probe.
 - **`optout`** — `do-not-auto-merge` is on the PR's own labels, or on the
   labels of the LAST issue its body links via `Closes|Fixes|Resolves #N`.
   **Leave the PR entirely alone**: do not merge, do not sync, do not dispatch
@@ -540,6 +571,13 @@ still worktree-isolated, same gates, same drop-backs.
   A sync imports the breakage, wastes a CI round, and re-reports as that lane's
   own `ci-failed`. `pr-ready.sh` says so mechanically by printing
   `main-not-green` instead of `behind` (#1159).
+- **Never `fleet.sh release` a `review-quota-exhausted` lane** (#1160).
+  `cmd_release` deletes the local branch, and a later `assign` recreates it
+  from `origin/main`, orphaning the PR's already-pushed commits (issue #1180).
+  `review-quota-exhausted` is the first token that can park a lane with an open
+  PR for **days** — exactly the slot pressure that tempts a release. Leave it
+  occupied; it un-wedges on its own (see the `review-quota-exhausted` bullet in
+  Step 1).
 - **Never make a fast lane wait on a slow one.** No per-tick barrier, no
   all-lanes Monitor. Act on whichever lane a wake is about; refill freed slots
   immediately.

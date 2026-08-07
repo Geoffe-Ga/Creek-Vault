@@ -42,6 +42,17 @@
 #                  the relaxation must first prove the backstop is alive —
 #                  `main-not-green` (issue #1159). A lane with `behind_by == 0`
 #                  never uses the relaxation and therefore never asks.
+#   review quota   `behind`'s remedy is a sync, and a sync advances HEAD, which
+#                  invalidates a fresh LGTM under the stale-verdict guard above.
+#                  That normally costs one re-review. When the `claude-review`
+#                  quota is EXHAUSTED it costs the verdict outright, for days —
+#                  so such a lane reports `review-quota-exhausted` and waits
+#                  (issue #1160). The polarity of THAT probe is INVERTED with
+#                  respect to main health: only a positively-proven `exhausted`
+#                  holds the lane; `available`, `unknown`, an empty answer, a
+#                  non-zero exit, a garbage word, a missing helper and a
+#                  non-executable helper all fall through to today's `behind`,
+#                  because merging (or holding) stale is the worse error.
 #
 # Plus one cross-file coupling check: pr-ready.sh matches the review check by the
 # literal name `claude-review`, so `.github/workflows/code-review.yml` must keep
@@ -148,12 +159,66 @@ mkdir -p "$BIN"
 #                   laziness assertions use it: this gate costs an extra API
 #                   call, so only a lane about to USE the #1157 relaxation may
 #                   pay for it.
+#   REVIEW_QUOTA  — scalar shortcut for the OTHER `gh run list` arm, the one
+#                   review-quota.sh (pr-ready.sh's second sibling, issue #1160)
+#                   calls with `--workflow code-review.yml`: `available` emits a
+#                   completed/success review run, `exhausted` emits a
+#                   completed/failure one (whose log the stub then serves as a
+#                   real rate-limit rejection), `unknown` emits nothing at all.
+#                   It DEFAULTS TO `available` so every pre-existing case in this
+#                   file keeps asserting exactly what it asserted before #1160 —
+#                   in particular every lane that must still print `behind`.
+#   REVIEW_RUNS   — raw run-list answer for that arm, one run per line, NEWEST
+#                   FIRST, four `|`-separated fields
+#                   (status|conclusion|databaseId|url). Honoured even when empty,
+#                   so a case can reproduce an empty window.
+#   REVIEW_RUNS_EC — exit code of that call; 1 plays a failed lookup, which must
+#                   fall THROUGH to `behind` rather than hold the lane.
+#   REVIEW_LOG    — what `gh run view <id> --log` prints for the review run.
+#                   Honoured even when empty. Unset ⇒ the stub serves
+#                   $REVIEW_REJECTION_LOG, the verbatim payload from PR #1158.
+#   REVIEW_LOG_EC — exit code of that log fetch.
+#   REVIEW_QUOTA_SENTINEL — file the code-review.yml run-list arm touches when it
+#                   is called. Same laziness argument as MAIN_HEALTH_SENTINEL,
+#                   and the same anti-masking role: with REVIEW_QUOTA defaulting
+#                   to `available`, only this sentinel can prove the probe is
+#                   made at all.
 # Real gh applies --jq, so — like test_fleet.sh — the stub emits the already
 # extracted scalar and branches on which --json field the caller asked for.
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  "run list"*"--workflow code-review.yml"*)
+    # review-quota.sh's list call (issue #1160). It MUST be told apart from
+    # main-health.sh's by the --workflow value: both siblings call `gh run
+    # list`, and one shared arm would feed main-health.sh's ci.yml fixture to
+    # the quota helper and the quota fixture to main-health.sh — flipping every
+    # #1159 assertion in this file while looking like it still tested them.
+    # One line per run, NEWEST FIRST, four `|`-separated fields:
+    # status|conclusion|databaseId|url (no headSha — a review run's blame range
+    # is not a thing).
+    [[ -n "${REVIEW_QUOTA_SENTINEL:-}" ]] && : > "$REVIEW_QUOTA_SENTINEL"
+    if [[ -n "${REVIEW_RUNS+set}" ]]; then
+      [[ -z "$REVIEW_RUNS" ]] || printf '%s\n' "$REVIEW_RUNS"
+      exit "${REVIEW_RUNS_EC:-0}"
+    fi
+    case "${REVIEW_QUOTA:-available}" in
+      available) printf 'completed|success|21|https://x/21\n' ;;
+      exhausted) printf 'completed|failure|22|https://x/22\n' ;;
+      *)         : ;;   # `unknown`: gh answered nothing at all
+    esac
+    exit "${REVIEW_RUNS_EC:-0}" ;;
+  "run view"*"--log"*)
+    # review-quota.sh's SECOND call, made only when the newest conclusive review
+    # run failed — i.e. only under REVIEW_QUOTA=exhausted, unless a case drives
+    # the run list directly.
+    if [[ -n "${REVIEW_LOG+set}" ]]; then
+      [[ -z "$REVIEW_LOG" ]] || printf '%s\n' "$REVIEW_LOG"
+      exit "${REVIEW_LOG_EC:-0}"
+    fi
+    printf '%s\n' "${REVIEW_REJECTION_LOG:-}"
+    exit "${REVIEW_LOG_EC:-0}" ;;
   "run list"*)
     # main-health.sh's single call. One line per run, NEWEST FIRST, five
     # `|`-separated fields: status|conclusion|headSha|databaseId|url.
@@ -241,6 +306,35 @@ STUB
 chmod +x "$BIN/gh"
 
 run() { PATH="$BIN:$PATH" "$READY" "$@" 2>/dev/null; }
+
+# The default `gh run view --log` payload for the review run (issue #1160): the
+# verbatim rate-limit rejection from PR #1158's re-review (run 30685776913,
+# conclusion `failure`, 24 seconds). `resetsAt` is COMPUTED rather than the
+# incident's literal 1785844800, because a hard-coded future epoch is a suite
+# that silently flips verdicts on some morning years from now. Exported because
+# the fake `gh` reads it from the environment, several processes down.
+REVIEW_RESET=$(( $(date +%s) + 2 * 86400 ))
+# Built with a here-doc rather than a quoted literal: the payload is full of
+# double quotes, and assigning it inline trips shellcheck SC2089/SC2090 (it
+# cannot tell a JSON blob from a command line being built up in a variable).
+REVIEW_REJECTION_LOG="$(cat <<JSON
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "rejected",
+    "resetsAt": $REVIEW_RESET,
+    "rateLimitType": "seven_day",
+    "overageStatus": "rejected",
+    "overageDisabledReason": "out_of_credits",
+    "isUsingOverage": false
+  },
+  "uuid": "f6e687d0-5cff-48a9-902e-3e47e73e42c0",
+  "session_id": "510eb0de-94f9-4382-b332-41d6278f5486"
+}
+{"error": "rate_limit"}
+JSON
+)"
+export REVIEW_REJECTION_LOG
 
 H="2026-07-01T10:00:00Z"          # HEAD commit time baseline
 FRESH="2026-07-01T11:00:00Z"      # a verdict posted AFTER HEAD (valid)
@@ -897,6 +991,316 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_B
        MAIN_HEALTH_SENTINEL="$M_BADBASE" run 100)" || tok="exit-$?"
 check "malformed merge base still short-circuits to behind" "behind" "$tok"
 probed "malformed merge base does not pay for main-health" "no" "$M_BADBASE"
+
+# --- review quota: when the remedy for `behind` DESTROYS the verdict (#1160) -
+# `behind`'s remedy is `fleet.sh sync`, which pushes a merge commit. That
+# advances HEAD, and the stale-verdict guard at the top of this file then
+# correctly stops counting the lane's LGTM — it reviewed older code. Normally
+# that costs exactly one re-review and the lane comes back. When the
+# `claude-review` quota is EXHAUSTED the re-review cannot happen at all, so the
+# sync destroys the only verdict the lane will ever get, and the lane is
+# unmergeable until the window resets.
+#
+# Observed on PR #1158: LGTM at 05:11:43Z, sync at 05:23:58Z, re-review rejected
+# in 24 seconds against a SEVEN-DAY window that would not reset for three days.
+# The loop did that to itself, with its own remedy, and then had nothing to
+# report but `behind` on every subsequent wake.
+#
+# ---------------------------------------------------------------------------
+# THE POLARITY IS INVERTED WITH RESPECT TO main-health.sh. DO NOT HARMONISE.
+# ---------------------------------------------------------------------------
+# main-health: anything that is not `green` HOLDS the lane.
+# review-quota: only a positively-proven `exhausted` HOLDS the lane.
+#
+# Both are fail-closed in the same sense — prefer the recoverable error — and
+# therefore take OPPOSITE actions, because the recoverable error is the opposite
+# one. A false `main-not-green` costs one wake. A false `review-quota-exhausted`
+# costs DAYS of a wedged lane with no un-wedge path, so every unreadable answer
+# here must fall through to today's behaviour: `behind`, sync, spend the verdict.
+# The issue says so outright: "Fails closed: if reviewability cannot be
+# determined, behave as today (sync), since merging stale is the worse error."
+#
+# The new token is printed in the terminal `else` (pr-ready.sh:651) ONLY when ALL
+# of these hold: the lane would otherwise print `behind`, `ready_token` is
+# `ready` (not `ready-unreviewed`), `merge_state` is `CLEAN`, and the helper
+# positively answered `exhausted`.
+
+# THE RED CASE. A lane with everything a merge needs except currency: green CI,
+# CLEAN, a FRESH LGTM — and a real risk-surface reason to be behind (`uv.lock`
+# landed on `main`), so #1157's relaxation genuinely does not apply and the lane
+# genuinely does need a sync. With the reviewer available that sync is right.
+# With the reviewer exhausted it is the one move that cannot be undone.
+check "behind (risk surface) + fresh LGTM + quota EXHAUSTED → review-quota-exhausted" \
+  "review-quota-exhausted" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted run 100)"
+
+# The same lane, behind an OVERLAPPING file rather than a risk surface — the
+# other way #1157 refuses to relax. Same verdict, so the new token is not an
+# accident of which disjointness rule fired.
+check "behind (overlapping file) + fresh LGTM + quota EXHAUSTED → review-quota-exhausted" \
+  "review-quota-exhausted" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="creek/shared.py" OUR_FILES="creek/shared.py" \
+     REVIEW_QUOTA=exhausted run 100)"
+
+# THE ANTI-MASKING PROOF, mirroring the three-part one at the head of the
+# main-health block above. Because the stub defaults REVIEW_QUOTA to
+# `available`, someone could delete the probe from pr-ready.sh entirely and every
+# other test in this file would still pass. Three assertions make that
+# impossible, and they only work TOGETHER:
+#   (1) REVIEW_QUOTA=available on the SAME lane → `behind` — the answer is
+#       genuinely consumed rather than the token being printed unconditionally;
+#   (2) the sentinel is PRESENT on the qualifying lane — the call is genuinely
+#       made rather than the token coming from somewhere else;
+#   (3) the sentinel is ABSENT on every non-qualifying lane — the laziness holds,
+#       so the probe is not simply unconditional.
+# Remove any one of the three and the other two pass vacuously. Do not.
+check "(1) same lane, quota AVAILABLE → behind (the answer is consumed)" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=available run 100)"
+
+Q_QUALIFY="$WORK/quota-qualifying"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_QUALIFY" run 100)" || tok="exit-$?"
+check "(2) qualifying lane token" "review-quota-exhausted" "$tok"
+probed "(2) the qualifying lane DOES probe the review quota" "yes" "$Q_QUALIFY"
+
+# --- THE INVERTED-POLARITY SWEEP --------------------------------------------
+# Everything that is not a proven `exhausted` must behave exactly as it did
+# before #1160. This is the assertion set a future "make it consistent with
+# main-health.sh" refactor would break, and breaking it wedges every behind lane
+# in the fleet for as long as the helper stays unreadable — which, unlike a red
+# `main`, nothing in the loop would ever repair.
+check "quota UNKNOWN → behind (fall through, do not hold)" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=unknown run 100)"
+
+# The helper's own lookup failing (rate limit, 5xx, expired token) is the most
+# likely unreadable answer of all — and it is likeliest precisely when the API
+# budget is under pressure, i.e. on the very lanes this feature exists for. It
+# still falls through.
+check "quota helper's gh lookup fails → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted REVIEW_RUNS_EC=1 run 100)"
+
+check "quota helper's log fetch fails → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted REVIEW_LOG_EC=1 run 100)"
+
+# The observed FALSE POSITIVE, end to end through pr-ready.sh. This log came
+# from a review run that concluded SUCCESS and posted a full LGTM (job
+# 92768878061, the Aug-7 re-run of #1158's job): `status` is `allowed`, and the
+# `rejected` / `out_of_credits` words describe the overage BUDGET. Any matcher
+# naive enough to fire on it would hold every behind lane in the fleet for days
+# on a reviewer that was working the whole time.
+check "a healthy 'allowed' log carrying the word rejected → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted \
+     REVIEW_LOG='{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":9999999999,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits"}}' \
+     run 100)"
+
+# --- the sibling seam, in the INVERTED direction ----------------------------
+# The same seam test_pr_ready.sh already exercises for main-health.sh at
+# :806-836 — a copy of pr-ready.sh in a directory whose siblings we control —
+# but with the opposite expectation. A main-health.sh that cannot be asked HOLDS
+# the lane; a review-quota.sh that cannot be asked must NOT.
+#
+# Each lane plants a main-health.sh that answers `green`, because otherwise the
+# lane never reaches the terminal branch where the quota question is asked at
+# all, and every assertion below would pass for the wrong reason.
+plant_lane() { # plant_lane <name> <review-quota body, or "" for no helper> [mode]
+  local dir="$WORK/plant-$1"
+  mkdir -p "$dir"
+  cp "$READY" "$dir/pr-ready.sh"
+  chmod +x "$dir/pr-ready.sh"
+  printf '#!/usr/bin/env bash\necho green\n' > "$dir/main-health.sh"
+  chmod +x "$dir/main-health.sh"
+  if [[ -n "$2" ]]; then
+    printf '%s' "$2" > "$dir/review-quota.sh"
+    chmod "${3:-755}" "$dir/review-quota.sh"
+  fi
+  printf '%s\n' "$dir/pr-ready.sh"
+}
+run_planted() { # run_planted <planted pr-ready.sh> <PR>
+  CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+    THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+    PATH="$BIN:$PATH" "$1" "$2" 2>/dev/null
+}
+
+# NON-VACUITY FIRST. The planted harness must be able to produce the POSITIVE
+# outcome, or every "…→ behind" assertion below would pass on a harness that
+# simply never reaches the probe. This one plants a helper that says `exhausted`
+# and nothing else.
+P_YES="$(plant_lane exhausted '#!/usr/bin/env bash
+echo exhausted
+')"
+tok="$(run_planted "$P_YES" 100)" || tok="exit-$?"
+check "planted harness non-vacuity: a helper saying exhausted holds the lane" \
+  "review-quota-exhausted" "$tok"
+
+P_AVAIL="$(plant_lane available '#!/usr/bin/env bash
+echo available
+')"
+tok="$(run_planted "$P_AVAIL" 100)" || tok="exit-$?"
+check "planted helper says available → behind" "behind" "$tok"
+
+P_EMPTY="$(plant_lane empty '#!/usr/bin/env bash
+exit 0
+')"
+tok="$(run_planted "$P_EMPTY" 100)" || tok="exit-$?"
+check "planted helper prints NOTHING → behind" "behind" "$tok"
+
+# A helper that exits non-zero WITH a happy answer already on stdout is the
+# dangerous shape (the output is there to be inherited). Under `set -e` an
+# unguarded call would also abort pr-ready.sh mid-classification, which the
+# orchestrator reads as a tooling error — dispatching nothing.
+P_EXIT2="$(plant_lane exit2 '#!/usr/bin/env bash
+echo exhausted
+exit 2
+')"
+rc=0
+tok="$(run_planted "$P_EXIT2" 100)" || rc=$?
+check "planted helper exits non-zero → behind" "behind" "$tok"
+check "planted helper exiting non-zero does not kill pr-ready.sh" "0" "$rc"
+
+# A word nobody recognises — a future token, a typo, a debug print. It is not
+# `exhausted`, so it is not a hold.
+P_GARBAGE="$(plant_lane garbage '#!/usr/bin/env bash
+echo dunno
+')"
+tok="$(run_planted "$P_GARBAGE" 100)" || tok="exit-$?"
+check "planted helper prints a garbage word → behind" "behind" "$tok"
+
+# A helper that is not there at all: a partial checkout, a packaging change, a
+# rename. Nothing about that says the reviewer is out of quota.
+P_MISSING="$(plant_lane missing "")"
+tok="$(run_planted "$P_MISSING" 100)" || tok="exit-$?"
+check "MISSING review-quota.sh sibling → behind" "behind" "$tok"
+
+# And a helper that exists but cannot be executed — the dropped exec bit #1092
+# actually shipped and test_exec_bits.sh guards. The planted file WOULD say
+# `exhausted` if it ran, so an implementation that `bash`es the helper instead of
+# checking `-x` fails here. Note this is the mirror of the main-health case at
+# :833-836: there a non-executable helper must never read as `green`; here it
+# must never read as `exhausted`.
+P_NOEXEC="$(plant_lane noexec '#!/usr/bin/env bash
+echo exhausted
+' 644)"
+tok="$(run_planted "$P_NOEXEC" 100)" || tok="exit-$?"
+check "NON-EXECUTABLE review-quota.sh sibling → behind" "behind" "$tok"
+
+# --- guard conditions: lanes with nothing to preserve, or nothing to gain ----
+# `ready-unreviewed` is a Dependabot lane that has PROVABLY no review gate — no
+# verdict was ever posted and none ever will be. There is no LGTM for a sync to
+# destroy, so holding the lane would buy nothing and cost a merge. It syncs.
+Q_UNREVIEWED="$WORK/quota-ready-unreviewed"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" BEHIND_BY=22 \
+       MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+       REVIEW_CONCLUSIONS="SKIPPED" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_UNREVIEWED" run 100)" || tok="exit-$?"
+check "ready-unreviewed + behind + quota exhausted → behind (no verdict to lose)" \
+  "behind" "$tok"
+probed "(3) a ready-unreviewed lane does not probe the review quota" "no" "$Q_UNREVIEWED"
+
+# A CONFLICTING lane's remedy IS the sync, and only the sync. The conflict never
+# self-resolves, and the lane's LGTM dies at Gate 1 regardless of quota — a
+# conflicted branch cannot merge at all. Holding it would therefore be a
+# PERMANENT wedge with no un-wedge path: the quota resets, the lane is still
+# conflicted, and nothing ever ran the one command that could fix it.
+Q_CONFLICT="$WORK/quota-conflicting"
+tok="$(CHECKS_EC=0 MERGE_STATE=CONFLICTING HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=22 MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_CONFLICT" run 100)" || tok="exit-$?"
+check "CONFLICTING + fresh LGTM + quota exhausted → behind (the sync IS the remedy)" \
+  "behind" "$tok"
+probed "(3) a conflicting lane does not probe the review quota" "no" "$Q_CONFLICT"
+
+Q_DIRTY="$WORK/quota-dirty"
+tok="$(CHECKS_EC=0 MERGE_STATE=DIRTY HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=22 MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_DIRTY" run 100)" || tok="exit-$?"
+check "DIRTY + fresh LGTM + quota exhausted → behind" "behind" "$tok"
+probed "(3) a dirty lane does not probe the review quota" "no" "$Q_DIRTY"
+
+# --- precedence: a lane already held does not pay for a second probe ---------
+# `main-not-green` outranks this token. Its remedy is also "wait", so nothing is
+# lost by reporting it — and the quota question is moot for a lane that is not
+# going to be synced either way.
+Q_MAINRED="$WORK/quota-main-red"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MAIN_HEALTH=red THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_MAINRED" run 100)" || tok="exit-$?"
+check "main RED + quota exhausted → main-not-green (main health outranks)" \
+  "main-not-green" "$tok"
+probed "(3) a main-not-green lane does not probe the review quota" "no" "$Q_MAINRED"
+
+# --- laziness: only a lane about to be TOLD TO SYNC may ask ------------------
+# Same rate-limit argument as every other probe in this file — and sharper here,
+# because the question being asked is literally "have we run out of API budget?"
+# Each lane gets its OWN sentinel path; a shared one would let an earlier lane's
+# probe satisfy a later lane's assertion.
+Q_OPTOUT="$WORK/quota-optout"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" PR_LABELS="$OPTOUT" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy quota: opt-out lane token" "optout" "$tok"
+probed "lazy quota: opt-out lane does not probe" "no" "$Q_OPTOUT"
+
+Q_PENDING="$WORK/quota-pending"
+tok="$(CHECKS_EC=8 BEHIND_BY=22 REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_PENDING" run 100)" || tok="exit-$?"
+check "lazy quota: pending lane token" "pending" "$tok"
+probed "lazy quota: pending lane does not probe" "no" "$Q_PENDING"
+
+Q_CIFAIL="$WORK/quota-cifail"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_CIFAIL" run 100)" || tok="exit-$?"
+check "lazy quota: ci-failed lane token" "ci-failed" "$tok"
+probed "lazy quota: ci-failed lane does not probe" "no" "$Q_CIFAIL"
+
+Q_CR="$WORK/quota-changes-requested"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" BEHIND_BY=22 \
+       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_CR" run 100)" || tok="exit-$?"
+check "lazy quota: changes-requested lane token" "changes-requested" "$tok"
+probed "lazy quota: changes-requested lane does not probe" "no" "$Q_CR"
+
+# A STALE verdict is the case that looks closest to the RED one and is not it:
+# the LGTM already does not count, so a sync cannot destroy it. Nothing to hold.
+Q_STALE="$WORK/quota-stale"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" BEHIND_BY=22 \
+       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_STALE" run 100)" || tok="exit-$?"
+check "lazy quota: stale-verdict lane token" "awaiting-review" "$tok"
+probed "lazy quota: stale-verdict lane does not probe" "no" "$Q_STALE"
+
+# A lane that is already CURRENT is about to merge. It is never told to sync, so
+# it never asks — on the overwhelmingly common path, this feature costs nothing.
+Q_CURRENT="$WORK/quota-current"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_CURRENT" run 100)" || tok="exit-$?"
+check "lazy quota: current lane token" "ready" "$tok"
+probed "lazy quota: current lane does not probe" "no" "$Q_CURRENT"
+
+# A lane that is behind but INERT merges under #1157 without a sync, so its LGTM
+# is in no danger either. Also the guard that #1157 has not been re-tightened:
+# if this ever flips to a hold, the serialization #1137 measured is back.
+Q_INERT="$WORK/quota-inert"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MAIN_HEALTH=green THEIR_FILES="creek/classify/privacy.py" \
+       OUR_FILES="creek/vault/writer.py" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_INERT" run 100)" || tok="exit-$?"
+check "lazy quota: behind-but-inert lane still merges" "ready" "$tok"
+probed "lazy quota: behind-but-inert lane does not probe" "no" "$Q_INERT"
 
 # --- ready-unreviewed: PROVABLY no review gate ------------------------------
 # `.github/workflows/code-review.yml` skips its `claude-review` job on Dependabot

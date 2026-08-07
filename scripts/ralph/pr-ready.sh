@@ -27,6 +27,16 @@
 #                    breakage into the lane. Fails closed — anything other than a
 #                    `green` answer from the `main-health.sh` sibling, including a
 #                    missing or non-executable helper, holds the lane (#1159).
+#   review-quota-exhausted
+#                    LGTM (fresh) + CI green + CLEAN, and this lane genuinely
+#                    needs a sync (it would print `behind`) — but the
+#                    `claude-review` quota is PROVEN exhausted, so the re-review
+#                    that sync makes necessary cannot happen. Syncing now would
+#                    destroy the only verdict the lane will ever get, so it
+#                    waits. Remedy: nothing to do — the rate-limit window resets
+#                    on its own, and the lane then reads `behind` and syncs
+#                    normally. Fails closed in the INVERTED direction — see the
+#                    polarity block below (#1160).
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
 #   ci-failed        CI has a failing/errored check → Step 2 (ci-debugging)
 #   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
@@ -201,6 +211,62 @@
 #     then classifies `ci-failed`, dispatching a fix worker onto a failure the
 #     lane never caused.
 #
+# ---------------------------------------------------------------------------
+# THE SECOND PRECONDITION: NEVER SPEND A VERDICT THAT CANNOT BE REPLACED (#1160)
+# ---------------------------------------------------------------------------
+# `behind`'s remedy is `fleet.sh sync`, which pushes a merge commit, advances
+# HEAD, and therefore invalidates the lane's LGTM under the stale-verdict guard
+# above. Normally that costs one re-review and nothing else. When the
+# `claude-review` quota is exhausted the re-review cannot happen at all, so the
+# sync permanently destroys the only verdict the lane will ever get. Observed on
+# PR #1158: LGTM at 05:11:43Z, sync at 05:23:58Z, re-review rejected in 24
+# seconds against a `seven_day` window that would not reset for three days. The
+# loop did that to itself, with its own remedy.
+#
+# THE RULE IS NOT "never destroy the LGTM on sync". It is "NEVER DESTROY IT AT A
+# MOMENT WHEN IT CANNOT BE REPLACED" — a precondition on the remedy, exactly the
+# shape the #1159 block above establishes. Not a new merge gate, not a
+# relaxation of an existing one, and never a forced sync.
+#
+# It is spent in the terminal `else` (the would-be-`behind` branch) and ONLY when
+# all four of these hold:
+#   * the lane would otherwise print `behind` — that is what the `else` means;
+#   * `ready_token` is `ready`, NOT `ready-unreviewed`. A Dependabot lane with no
+#     review gate has no verdict for a sync to destroy, so holding it would buy
+#     nothing and cost a merge. It keeps syncing exactly as today;
+#   * `merge_state` is `CLEAN`. A CONFLICTING/DIRTY lane's remedy IS the sync:
+#     the conflict never self-resolves and the lane's LGTM dies at Gate 1
+#     regardless of quota, so holding it would be a PERMANENT wedge with no
+#     un-wedge path — the quota resets, the lane is still conflicted, and nothing
+#     ever ran the one command that could fix it;
+#   * `review-quota.sh` positively answered `exhausted`.
+# Sitting in that `else` also gives `main-not-green` precedence for free
+# (`branch_is_current` sets `main_health_hold`, so the `elif` fires first) and
+# guarantees an already-held lane never pays for the probe — no explicit
+# precedence code is needed, and adding some would be a second place to keep in
+# sync with this one.
+#
+# THE FAIL-CLOSED POLARITY IS INVERTED WITH RESPECT TO `main-health.sh`.
+# DO NOT HARMONISE THEM.
+#   main-health.sh:  anything that is not `green` HOLDS the lane.
+#   review-quota.sh: only a positively-proven `exhausted` HOLDS the lane.
+#     `available`, `unknown`, an empty answer, a non-zero exit, a garbage word, a
+#     MISSING helper and a NON-EXECUTABLE helper all fall through to today's
+#     `behind` → sync.
+# Both are fail-closed in the IDENTICAL sense — prefer the recoverable error —
+# and therefore take OPPOSITE actions, because the recoverable error differs.
+# There, merging a stale green onto a broken tree buries the culprit and waiting
+# one wake costs nothing. Here, holding a lane on an unproven claim wedges a
+# fleet slot for up to seven days with no self-heal, and the trigger for a false
+# `exhausted` (a payload format change) would be correlated across every lane at
+# once — while a false `available` costs one wasted sync, which is exactly what
+# the loop does today. The issue's own acceptance criterion settles it: "Fails
+# closed: if reviewability cannot be determined, behave as today (sync), since
+# merging stale is the worse error." A future reader who "makes the two
+# consistent" either re-introduces #1160 or wedges the fleet; test_pr_ready.sh's
+# inverted sweep and test_review_quota.sh's `never_exhausted()` pin both
+# directions.
+#
 # Usage:  pr-ready.sh <PR_NUMBER> [--repo <owner/repo>]
 set -euo pipefail
 
@@ -278,6 +344,29 @@ readonly MAIN_HEALTHY_TOKEN="green"
 # repo considers uninstalled.
 MAIN_HEALTH_HELPER="$(cd "$(dirname "$0")" && pwd)/main-health.sh"
 readonly MAIN_HEALTH_HELPER
+
+# The ONE answer from `review-quota.sh` that holds a would-be-`behind` lane, and
+# the token that reports it. Note the INVERTED polarity against
+# `MAIN_HEALTHY_TOKEN` two blocks up: there, every answer except one holds the
+# lane; here, every answer except one lets it sync. Both are fail-closed — see
+# the "SECOND PRECONDITION" block in the header for why the safe action is the
+# opposite one in each. Do not harmonise them (#1160).
+readonly REVIEW_QUOTA_EXHAUSTED_TOKEN="exhausted"
+readonly REVIEW_QUOTA_HELD_TOKEN="review-quota-exhausted"
+
+# The second sibling, resolved by THIS script's own dirname for the same reason
+# as `MAIN_HEALTH_HELPER` above — a worktree, a copied tree or a checkout at any
+# path must find its own helper and never a stray one on PATH. Declared and
+# assigned on separate lines because `readonly x="$(…)"` masks the command
+# substitution's exit status (SC2155).
+#
+# Invoked DIRECTLY, never as `bash "$REVIEW_QUOTA_HELPER"`: a helper whose exec
+# bit was dropped in packaging (#1092's failure, guarded by test_exec_bits.sh)
+# must read as "we could not ask" — which HERE means "sync as usual", the
+# inverted polarity's safe answer. `bash` would run a file the repo considers
+# uninstalled and hand back a hold from it.
+REVIEW_QUOTA_HELPER="$(cd "$(dirname "$0")" && pwd)/review-quota.sh"
+readonly REVIEW_QUOTA_HELPER
 
 # The `code-review.yml` job name as it appears in the status rollup (the job KEY;
 # that job declares no `name:` override, so the check name matches it), and the
@@ -648,5 +737,37 @@ elif [[ -n "$main_health_hold" ]]; then
   # watcher does, rather than busy-waking the fleet (#1159).
   echo "main-not-green"
 else
-  echo "behind"
+  # THE SECOND PRECONDITION (#1160). Reaching this `else` means "behind": the
+  # remedy is `fleet.sh sync`, which advances HEAD and so spends this lane's
+  # LGTM. Ask whether that verdict can be earned back before spending it.
+  #
+  # The guards are the header's four conditions, and the two written here are the
+  # lanes with nothing to preserve or nothing to gain: `ready-unreviewed` has no
+  # verdict to lose, and a non-CLEAN lane's ONLY remedy is the sync (holding it
+  # would be a permanent wedge). They are also what keeps the probe LAZY — the
+  # same rate-limit argument as every other probe in this file, and sharper here
+  # because the question is literally "have we run out of API budget?".
+  # `main-not-green` needs no guard of its own: it is the `elif` above, so a lane
+  # already held never reaches this branch and never pays for the call.
+  #
+  # `|| quota=""` because the helper runs under `set -e`: an unguarded call that
+  # exited non-zero would abort mid-classification, and the orchestrator reads a
+  # non-zero exit with empty stdout as a TOOLING error, dispatching nothing. That
+  # empty string then falls through to `behind`, which is the correct answer for
+  # an unreadable one. `--repo` is forwarded so a `--repo`-scoped invocation does
+  # not read some other repo's reviewer. The helper's own stderr is deliberately
+  # NOT swallowed: it is the only place the operator learns which run proved the
+  # exhaustion and when the window lifts.
+  quota=""
+  if [[ "$ready_token" == "ready" && "$merge_state" == "CLEAN" && -x "$REVIEW_QUOTA_HELPER" ]]; then
+    quota="$("$REVIEW_QUOTA_HELPER" ${repo_args[@]+"${repo_args[@]}"})" || quota=""
+  fi
+  # Compared against the ONE token that holds. Everything else — `available`,
+  # `unknown`, empty, a future token, a debug print — is not proof, and an
+  # unproven hold costs days of a wedged lane (see the polarity block).
+  if [[ "$quota" == "$REVIEW_QUOTA_EXHAUSTED_TOKEN" ]]; then
+    echo "$REVIEW_QUOTA_HELD_TOKEN"
+  else
+    echo "behind"
+  fi
 fi

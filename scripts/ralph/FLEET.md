@@ -192,15 +192,44 @@ rather than reading as "no hold."
 | `ready-unreviewed` | CI green (with a real non-review `SUCCESS`, not just skipped checks) + `CLEAN` + `behind_by == 0`, but no review gate can ever exist — Dependabot authored the PR and pushed HEAD, so every review-rollup entry is `SKIPPED`. Report it; do not merge without the repo owner's OK — see `ralph-tick.md` Step 1 for the full reasoning and what would have to change first. |
 | `behind` | `LGTM` + green, but stale — `mergeStateStatus BEHIND`, or `CLEAN` with `behind_by > 0`. Sync (`fleet.sh sync`) and re-green. |
 | `main-not-green` | `LGTM` + green, the lane is behind, and the `push: main` CI run that justifies merging while behind (#1157) is **not** green — red, still running, or unreadable (`scripts/ralph/main-health.sh`). The relaxation is suspended for the duration: **wait, and do not sync** — a sync would import the breakage, burn a CI round, and re-report as this lane's own `ci-failed`. Fails closed: a missing or non-executable helper holds the lane too. A `behind_by == 0` lane never asks and still merges, so the PR that fixes `main` is never blocked (#1159). |
+| `review-quota-exhausted` | `LGTM` + green + `mergeStateStatus CLEAN`, the lane would otherwise print `behind`, and `scripts/ralph/review-quota.sh` has positively proven the `claude-review` reviewer is out of quota. `behind`'s remedy — `fleet.sh sync` — would push a merge commit that invalidates the LGTM under the stale-verdict guard, and with the reviewer out of quota that verdict cannot be re-earned. **Wait, and do not sync** (and never `fleet.sh release` this lane — see Failure modes below). Un-wedges on its own the moment either: the recorded `resetsAt` passes, or any newer `code-review.yml` run anywhere concludes `success`; either way the token reverts to `behind` and the lane proceeds normally. **Fails closed in the OPPOSITE direction from `main-not-green`** — see below; a missing, non-executable, or merely-uncertain `review-quota.sh` answer does **not** hold the lane, it falls through to today's `behind` → sync. `main-not-green` takes precedence when both would apply (decided earlier, inside `branch_is_current`), but the outcome is identical either way since both remedies are "wait." |
 | `pending` | CI still running, or no checks registered yet. Wait. |
 | `ci-failed` | A check failed or errored. Advance via `ci-debugging`. |
 | `changes-requested` | CI green + a **fresh** verdict (posted after the HEAD commit) that is not `LGTM` — `CHANGES_REQUESTED` or `COMMENTS`. Gate 4 failed: advance via `address-feedback` (`ralph-tick.md` Step 2) now. A stale non-LGTM stays `awaiting-review`, and an unreadable verdict lookup fails closed (tooling error / `awaiting-review`) — never this token. |
 | `awaiting-review` | CI green but no verdict for the current HEAD yet — none posted, or only a stale one (it predates HEAD, LGTM or not). Wait, or check for a hidden merge conflict masquerading as a missing review (see `ralph-tick.md` Step 1). |
 | `optout` | `do-not-auto-merge` on the PR's own labels, or on the labels of the last issue it closes. Leave the lane **entirely** alone — no merge, no sync, no dispatch; a lane it already occupies stays occupied. |
 
+### `main-not-green` vs. `review-quota-exhausted`: same fail-closed rule, opposite action — deliberately (#1160)
+
+Both tokens exist to make a precondition-on-the-remedy (`main-health.sh` for
+#1159, `review-quota.sh` for #1160) hold a lane rather than let it sync into
+harm. Reading the two rows above side by side, that looks inconsistent —
+`main-not-green` holds on *any* non-`green` answer, while `review-quota-exhausted`
+holds *only* on a positively-proven `exhausted` — and it is not; the two probes
+guard against opposite recoverable errors:
+
+- **`main-health.sh`**: anything that is not `green` HOLDS the lane. A false
+  `green` would merge a second, unvalidated change onto an already-broken tree
+  and bury the culprit — near-unrecoverable. Waiting one wake costs nothing, so
+  doubt ⇒ hold.
+- **`review-quota.sh`**: only a positively-proven `exhausted` HOLDS the lane.
+  `available`, `unknown`, an empty answer, a non-zero exit, a garbage word, a
+  missing helper, and a non-executable helper all fall through to today's
+  `behind` → sync. A false `exhausted` would wedge a fleet slot for up to seven
+  days with no self-heal, and the trigger for a false positive (a GitHub/
+  Anthropic payload format change) would be correlated across every lane at
+  once — while a false `available` costs only one wasted sync, exactly what the
+  loop already does today. So doubt ⇒ proceed.
+
+Both are fail-closed in the *identical* sense — prefer the recoverable error —
+and the recoverable error is simply the opposite one in each case. A future
+reader who "harmonises" the two polarities either re-introduces #1160's bug or
+wedges the fleet for days; `test_review_quota.sh`'s `never_exhausted()` sweep
+and `test_pr_ready.sh`'s inverted sweep both pin their own direction.
+
 ## Tests
 
-Six offline suites cover the fleet, all run in CI by
+Seven offline suites cover the fleet, all run in CI by
 `.github/workflows/ralph-recap-tests.yml` ("Ralph Tooling Tests" — one
 workflow for everything under `scripts/ralph/`, shell and Python alike) on any
 `scripts/ralph/**` change —
@@ -236,8 +265,15 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   `behind_by == 0` lane still merges while `main` is red — the deadlock pin
   for tree-borne breakage, with the time/environment-triggered residual
   accepted rather than closed — and a missing or non-executable
-  `main-health.sh` sibling is never mergeable),
-  and — via sentinel files — that all three probes
+  `main-health.sh` sibling is never mergeable), and the `review-quota-exhausted`
+  precondition (#1160) — a lane that would otherwise print `behind` holds only
+  when `ready_token` is `ready` (never `ready-unreviewed`, which has no verdict
+  to lose), `mergeStateStatus` is `CLEAN` (a conflicting/dirty lane's remedy IS
+  the sync), and `review-quota.sh` positively answers `exhausted`; the inverted
+  sweep pins that `available`, `unknown`, an empty answer, a non-zero exit, a
+  missing helper, and a non-executable helper all fall through to plain
+  `behind` instead, and that `main-not-green` still wins precedence when both
+  would apply. And — via sentinel files — that all three probes
   stay **lazy**, so a pending/red/unreviewed/held lane never pays for them.
   Two assertions are cross-file: they pin that
   `.github/workflows/code-review.yml` still declares the `claude-review` job key
@@ -248,13 +284,17 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   next to a copy of the script under test) and `gh`, and exercises the local
   per-lane hot watcher: pidfile idempotence (`already-watching` on a live pid,
   takeover of a stale/garbage one, removal on exit), settling on the first
-  token outside `pending`/`awaiting-review`/`main-not-green` (including that
-  `changes-requested` falls out of the in-flight set and wakes promptly, and
-  that `main-not-green` stays IN it — a watcher that exited on it would be
-  relaunched and exit again, busy-waking the whole fleet for as long as `main`
-  stayed red), `gone` on a merged/closed
-  PR, `timeout <last-token>` at the deadline, and that transient `pr-ready.sh` /
-  `gh` failures never kill the watcher — every wait outcome exits 0.
+  token outside `pending`/`awaiting-review`/`main-not-green`/
+  `review-quota-exhausted` (including that `changes-requested` falls out of the
+  in-flight set and wakes promptly, and that `main-not-green` stays IN it — a
+  watcher that exited on it would be relaunched and exit again, busy-waking the
+  whole fleet for as long as `main` stayed red), the same busy-wake pin for
+  `review-quota-exhausted` (staying in-flight through a poll and only exiting
+  once the token flips to `behind`, and timing out as a wait state — not a
+  settled token — when the quota window outlasts `TIMEOUT`), `gone` on a
+  merged/closed PR, `timeout <last-token>` at the deadline, and that transient
+  `pr-ready.sh` / `gh` failures never kill the watcher — every wait outcome
+  exits 0.
 - `scripts/ralph/test_main_health.sh` stubs `gh` and exercises the `main` CI
   circuit breaker: which conclusions count as evidence (`success` → `green`;
   `failure`/`timed_out`/`startup_failure` → `red`; cancelled / skipped /
@@ -270,6 +310,28 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   pin that `.github/workflows/ci.yml` keeps a `push:` trigger including `main`
   and never sets `cancel-in-progress: true` unconditionally — either edit
   deletes the very run this gate reads, silently.
+- `scripts/ralph/test_review_quota.sh` stubs `gh` and exercises the reviewer-
+  availability probe (#1160), `main-health.sh`'s sibling and deliberate polar
+  opposite: the three real payloads captured from live incidents (PR #1158's
+  actual rejection → `exhausted`; the #1117 log's TWO `rate_limit_event`
+  blocks with different `resetsAt` values, proving "last `resetsAt` in the log
+  wins" is wrong; and the Aug-7 re-run of that same #1158 job, which concluded
+  `success` with a full LGTM yet still carries `"overageStatus": "rejected"` and
+  `"out_of_credits"` in its log — the false-positive pin any bare `rejected` /
+  `overageStatus` / case-insensitive `status` grep would trip), the cheap-path
+  proof that a `success` run never opens its log at all (`GH_CALLS == 1`, so
+  that false positive is unreachable on the common path), the bounded reset
+  horizon (a `resetsAt` dated more than 8 days out reads `unknown`, not
+  `exhausted` — an unbounded horizon would let one forged line hold the fleet
+  for years), the bounded log scan (`LOG_TAIL_LINES`, needed for correctness —
+  a real rejection is always near the end — and for cost against bash 3.2's
+  quadratic array indexing), and the cardinal `never_exhausted()` sweep: every
+  malformed, missing, or merely-uncertain input answers `available` or
+  `unknown`, never `exhausted` — the mirror of `test_main_health.sh`'s
+  `not_green()` and the assertion this whole probe exists to protect. One
+  assertion is cross-file: it pins that `.github/workflows/code-review.yml`
+  keeps its `claude-review` job key and its `pull_request:` trigger — a rename
+  makes this helper answer `unknown` forever and #1160's bug silently returns.
 - `scripts/ralph/test_exec_bits.sh` asserts every `scripts/ralph/*.sh` is
   committed mode `100755` per `git ls-files -s` — the INDEX mode, so a local
   unstaged `chmod` can't fake it. These scripts are invoked by path
@@ -283,6 +345,7 @@ bash scripts/ralph/test_pick_next.sh
 bash scripts/ralph/test_pr_ready.sh
 bash scripts/ralph/test_watch_pr.sh
 bash scripts/ralph/test_main_health.sh
+bash scripts/ralph/test_review_quota.sh
 bash scripts/ralph/test_exec_bits.sh
 ```
 
@@ -293,6 +356,7 @@ bash scripts/ralph/test_exec_bits.sh
 | Two "independent" issues touch the same file | Whichever merges first wins; the other goes `BEHIND`, lazily syncs main in, re-greens, then merges. A sync conflict ⇒ drops to Gate 1. Never a broken merge. |
 | A slow lane would stall a fast one | It can't — lanes are independent; a ready lane merges immediately and its slot refills without waiting on any sibling. |
 | `main` itself goes red | The backstop that justifies merging while behind is dead, so behind lanes read `main-not-green` and **wait** (they do not sync — that would import the breakage). Refill stops (a new lane off a broken `origin/main` fails Gate 2 locally on somebody else's bug), and one `ci-debugging` lane is dispatched at the attributed commit, guarded by an open `main is red at <sha7>` issue so repeated wakes do not re-dispatch. A `behind_by == 0` + green lane — the shape of the fix PR — still merges, closing the deadlock by construction for tree-borne breakage; a stale-but-green such lane can still miss a time/environment-triggered break (a freshly published advisory, an expired pin — see `main-health.sh`'s header for the observed instance), an accepted residual rather than a gap in the proof (#1159). |
+| The `claude-review` reviewer runs out of quota while a lane is `behind` (#1160) | Syncing that lane would push a merge commit, invalidate its fresh LGTM under the stale-verdict guard, and then be unable to earn a replacement — observed on PR #1158: LGTM at 05:11:43Z, sync at 05:23:58Z, re-review rejected 24s later against a `seven_day` window three days from resetting. `pr-ready.sh` reads `review-quota-exhausted` instead of `behind` and the lane **waits** (no sync, and never `fleet.sh release` it — issue #1180). It un-wedges on its own the moment the recorded `resetsAt` passes or any newer `code-review.yml` run anywhere concludes `success`; either way the token reverts to `behind` and the lane proceeds normally on the next wake. This is fail-closed in the *opposite* direction from the `main`-red row above — see the "same fail-closed rule, opposite action" note under the token table — so a missing or merely-uncertain `review-quota.sh` answer does **not** hold the lane; only a positively-proven `exhausted` does. |
 | A worker crashes / abandons an issue | `reconcile` releases it once its PR closes; an un-PR'd stale worktree is re-detected and either resumed or released on the next wake. |
 | Fleet silts up with merged work | `reconcile` at the top of every wake GCs merged/closed worktrees. |
 | A genuinely serial issue | Label it `solo`; it runs alone and blocks fills until done. |
