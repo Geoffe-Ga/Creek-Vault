@@ -12,7 +12,7 @@ description: |
   drafts the top-ranked seed via ``creek.draft``.
 trigger: "/crawdad workflow run substack-draft-phase-transitions"
 phase_aware: true
-privacy_tier_floor: personal
+privacy_tier_ceiling: personal
 inputs: []
 steps:
   - id: read

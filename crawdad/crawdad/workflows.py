@@ -4,7 +4,29 @@ CrawDad composite commands compile down to a deterministic walk over
 authored YAML files. Each file declares a named workflow: a list of
 :class:`WorkflowStep` entries that map one-to-one to MCP tool calls,
 plus first-class constraint metadata (``phase_aware`` /
-``privacy_tier_floor``) the walker enforces before any tool fires.
+``privacy_tier_ceiling``).
+
+Pre-flight enforcement
+----------------------
+
+:meth:`WorkflowWalker._check_constraints` runs before the MCP session is
+opened, so a refusal costs zero tool calls. It enforces exactly five
+things, raising :class:`WorkflowConstraintError` on the first that
+fails — in this order, privacy first:
+
+1. ``privacy_tier_ceiling`` is inside :data:`WORKFLOW_ADMITTED_CEILINGS`;
+2. no step's ``args`` declares a ``privacy_tier_ceiling`` of its own —
+   per-step ceilings are not a supported feature;
+3. every name in ``inputs:`` was supplied by the caller;
+4. every step's ``tool:`` is advertised by the live MCP server;
+5. when ``phase_aware: true``, a session phase exists and (if
+   ``allowed_phases`` is non-empty) is one of the allowed ones.
+
+Note what is *not* enforced here: the admitted ceiling value itself is
+merely forwarded, verbatim, as a sibling argument on every tool call.
+The MCP server is what actually applies it when selecting content. The
+walker's only privacy job is to refuse the ceilings CrawDad must never
+request at all — see :data:`WORKFLOW_ADMITTED_CEILINGS`.
 
 File format
 -----------
@@ -17,7 +39,7 @@ looks like::
     trigger: "/crawdad workflow run substack-draft-phase-transitions"
     phase_aware: true
     allowed_phases: [rising, peak]
-    privacy_tier_floor: personal
+    privacy_tier_ceiling: personal
     inputs: [topic]
     steps:
       - id: read
@@ -75,10 +97,17 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from crawdad.dispatcher import ToolResult
 from crawdad.intents import PrivacyTierCeiling
@@ -102,6 +131,44 @@ BUILTIN_WORKFLOWS_DIR: Path = Path(__file__).resolve().parent / "builtin_workflo
 VAULT_WORKFLOWS_SUBPATH: Path = Path("00-Creek-Meta") / "Workflows"
 
 _WORKFLOW_FILE_SUFFIX = ".workflow.yaml"
+
+# The canonical privacy-ceiling key. The YAML key, the
+# :class:`WorkflowDefinition` field, and the sibling argument the MCP
+# server reads all share this one spelling by design, so the author
+# reads the same word in the file, the model, and the wire call.
+_CEILING_KEY = "privacy_tier_ceiling"
+
+# The pre-#1051 spelling of that key. Still accepted, value-preserving,
+# with a deprecation warning — see
+# :meth:`WorkflowDefinition._migrate_privacy_tier_floor`.
+_LEGACY_CEILING_KEY = "privacy_tier_floor"
+
+# The only privacy tier ceilings an authored workflow may request.
+#
+# CrawDad relays every :class:`~crawdad.dispatcher.ToolResult` body to a
+# cloud LLM composer and then posts the reply into a Discord message, so
+# ``intimate`` / ``all`` must never be requestable by a workflow file.
+# ``ALL`` subsumes ``intimate``, so the admitted set is the complement.
+#
+# The value coincides with ``creek_mcp.policy.REMOTE_ADMITTED_CEILINGS``
+# (``{OPEN, PERSONAL}`` — "intimate content is not reachable over the
+# network") but is NOT derived from it, and the two are not canonical
+# for each other: that cap draws the line at the network, this one at
+# the cloud composer. The reasoning above stands on its own if the
+# server-side set ever changes.
+#
+# This walker check is the ONLY gate on this path, not a redundant second
+# copy of the server's: CrawDad reaches the MCP server over **stdio**,
+# which ``creek_mcp/server.py::_caller_identity`` classifies as a LOCAL
+# caller (``is_remote=False``), so the server-side remote cap never fires
+# here. (Prose reference only — crawdad has no Python dependency on
+# creek-tools.)
+#
+# Membership (``in``), never a rank comparison: ``crawdad.loop`` owns the
+# single tier-ordering table and a second one must not exist.
+WORKFLOW_ADMITTED_CEILINGS: Final[frozenset[PrivacyTierCeiling]] = frozenset(
+    {PrivacyTierCeiling.OPEN, PrivacyTierCeiling.PERSONAL}
+)
 
 # ``\w`` matches the YAML-friendly subset we accept inside placeholder
 # tokens (alphanumerics, underscore). Dotted access is the only nesting
@@ -135,7 +202,15 @@ class WorkflowConstraintError(RuntimeError):
 
     Raised for any of: missing required input, missing session-state
     phase when ``phase_aware: true``, current phase not in
-    ``allowed_phases``, or a step referencing an unadvertised MCP tool.
+    ``allowed_phases``, a step referencing an unadvertised MCP tool, a
+    ``privacy_tier_ceiling`` outside :data:`WORKFLOW_ADMITTED_CEILINGS`,
+    or a step whose ``args`` tries to declare its own
+    ``privacy_tier_ceiling``.
+
+    Every one of these is checked pre-flight, before the MCP session is
+    opened. Keep this list in sync with
+    :meth:`WorkflowWalker._check_constraints` — stale prose here is how
+    the ceiling gap of #1051 hid in plain sight.
     """
 
 
@@ -220,10 +295,28 @@ class WorkflowStep(BaseModel):
 class WorkflowDefinition(BaseModel):
     """An authored workflow loaded from a ``*.workflow.yaml`` file.
 
-    ``phase_aware`` and ``privacy_tier_floor`` are the AC's first-class
-    constraint attributes. The walker treats them as soft-fail gates
-    rather than runtime errors so the slash-command surface can return
-    a clean user-facing message instead of a stack trace.
+    ``phase_aware`` and ``privacy_tier_ceiling`` are the AC's
+    first-class constraint attributes. Both are soft-fail gates: the
+    walker raises :class:`WorkflowConstraintError`, which the
+    slash-command surface turns into a clean user-facing message rather
+    than a stack trace. That mechanism is unchanged.
+
+    What they cover, precisely (#1051 — the previous wording implied the
+    ceiling was enforced when nothing read it at all):
+
+    * ``phase_aware`` / ``allowed_phases`` gate *when* the workflow may
+      run.
+    * ``privacy_tier_ceiling`` is capped at walk time to
+      :data:`WORKFLOW_ADMITTED_CEILINGS`; an admitted value is then
+      forwarded verbatim to the MCP server, which is what applies it.
+      A ceiling above the cap is refused loudly at run time and
+      deliberately NOT at parse time — see
+      :meth:`WorkflowWalker._check_privacy_ceiling`.
+
+    ``privacy_tier_floor`` is the deprecated spelling of
+    ``privacy_tier_ceiling``. It is still accepted, value-preserving,
+    with a WARNING; declaring both keys is an error. See
+    :meth:`_migrate_privacy_tier_floor`.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -233,9 +326,67 @@ class WorkflowDefinition(BaseModel):
     trigger: str | None = None
     phase_aware: bool = False
     allowed_phases: tuple[str, ...] = ()
-    privacy_tier_floor: PrivacyTierCeiling = PrivacyTierCeiling.OPEN
+    privacy_tier_ceiling: PrivacyTierCeiling = PrivacyTierCeiling.OPEN
     inputs: tuple[str, ...] = ()
     steps: tuple[WorkflowStep, ...]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_privacy_tier_floor(cls, data: Any) -> Any:
+        """Accept the deprecated ``privacy_tier_floor`` key, warning once.
+
+        The field was misnamed (#1051): ``open`` is the MOST restrictive
+        tier and ``all`` the broadest, so raising the so-called "floor"
+        *widened* what the MCP server returned. The key always was a
+        ceiling. The migration is therefore value-preserving — a file
+        declaring ``privacy_tier_floor: personal`` keeps requesting
+        exactly ``personal``, it just stops lying about the direction.
+
+        ``mode="before"`` so both entry points are covered:
+        :func:`load_workflow_from_yaml`'s ``model_validate(dict)`` and
+        direct ``WorkflowDefinition(privacy_tier_floor=...)`` kwargs
+        construction.
+
+        Declaring both spellings is ambiguous — silently picking a
+        winner could ship a different effective ceiling than the author
+        last read — so it raises :class:`ValueError`. That type is
+        deliberate: pydantic converts only ``ValueError`` /
+        ``AssertionError`` into a ``ValidationError``, which
+        :func:`load_workflow_from_yaml` already maps to
+        :class:`WorkflowParseError`.
+        """
+        # Pydantic hands non-dict payloads to "before" validators in
+        # some construction modes; nothing to migrate in those.
+        if not isinstance(data, dict):
+            return data
+        if _LEGACY_CEILING_KEY not in data:
+            return data
+        raw_name = data.get("name")
+        name = raw_name if isinstance(raw_name, str) else "<unnamed>"
+        if _CEILING_KEY in data:
+            msg = (
+                f"workflow {name!r} declares both {_LEGACY_CEILING_KEY!r} and "
+                f"{_CEILING_KEY!r}; the former is the deprecated spelling of "
+                f"the latter — keep only {_CEILING_KEY!r}"
+            )
+            raise ValueError(msg)
+        # Copy rather than mutate: the caller may still own this dict.
+        # The legacy key is popped, not merely shadowed, so no stale
+        # spelling survives into the model payload.
+        migrated = dict(data)
+        migrated[_CEILING_KEY] = migrated.pop(_LEGACY_CEILING_KEY)
+        _LOGGER.warning(
+            "workflow %r uses the deprecated key %r; rename it to %r. The "
+            "value is unchanged: the key always was a ceiling, not a floor "
+            "(%r is the most restrictive tier, %r the broadest). The alias "
+            "will be removed — see issue #1151.",
+            name,
+            _LEGACY_CEILING_KEY,
+            _CEILING_KEY,
+            PrivacyTierCeiling.OPEN.value,
+            PrivacyTierCeiling.ALL.value,
+        )
+        return migrated
 
     @field_validator("steps")
     @classmethod
@@ -590,7 +741,9 @@ class WorkflowWalker:
 
         Raises:
             WorkflowConstraintError: a declared constraint refused the
-                run — missing input, wrong phase, unknown tool, etc.
+                run — missing input, unknown tool, a privacy ceiling
+                above the cap, a step-level ceiling, or the wrong
+                phase. Always raised before the MCP session opens.
             WorkflowStepError: a step failed mid-walk — either its
                 ``args`` reference an unresolvable upstream step or
                 its MCP tool call raised. The error names the failing
@@ -609,7 +762,21 @@ class WorkflowWalker:
         state: SessionState | None,
         inputs: dict[str, str],
     ) -> None:
-        """Validate phase, inputs, and tool surface before any tool fires."""
+        """Validate privacy ceilings, inputs, tools, and phase pre-flight.
+
+        Every check here runs before :meth:`run` opens the MCP session,
+        so a refusal costs zero tool calls. Kept as a flat sequence of
+        guards — each non-trivial rule lives in its own ``_check_*``
+        helper so this stays readable as the rule set grows.
+
+        The privacy guards run FIRST, and that order is deliberate:
+        only the first failure is reported, so putting the missing-input
+        or unknown-tool checks ahead of them would walk an author with
+        several problems up to the privacy refusal one round trip at a
+        time. The privacy rule must never be the second thing said.
+        """
+        self._check_privacy_ceiling(workflow)
+        self._check_step_arg_ceilings(workflow)
         missing_inputs = [name for name in workflow.inputs if name not in inputs]
         if missing_inputs:
             msg = (
@@ -628,6 +795,84 @@ class WorkflowWalker:
             raise WorkflowConstraintError(msg)
         if workflow.phase_aware:
             self._check_phase(workflow, state)
+
+    def _check_privacy_ceiling(self, workflow: WorkflowDefinition) -> None:
+        """Refuse a workflow ceiling outside :data:`WORKFLOW_ADMITTED_CEILINGS`.
+
+        The cap is enforced HERE, at walk time, and deliberately not as
+        a pydantic validator. Two reasons, and the second is the one
+        that must stop a future editor from "improving" this into a
+        validator:
+
+        1. :func:`_absorb_dir` catches :class:`WorkflowParseError` and
+           does ``warning(); continue``, so a parse-time rejection would
+           make the workflow vanish from ``/crawdad workflow list`` with
+           no user-visible reason. Fail-invisible is worse than the bug
+           this closes.
+        2. A validator only guards *validated* construction.
+           ``model_construct`` and ``model_copy(update=...)`` sail
+           straight past one — both verified to produce an ``all``-tier
+           definition. This check sits on the only path to
+           ``session.call_tool``, so it holds for every construction
+           route, not just the parsed one.
+
+        The message lands verbatim in a Discord reply (see
+        :func:`crawdad.slash_commands._reply_workflow_run`), so it names
+        the workflow, the refused tier, the allowed set, and why. Every
+        token it interpolates is operator-*authored* — a workflow name,
+        a tier the author typed, a module constant. Keep it that way:
+        interpolating a tool result or any vault-derived value would
+        turn a refusal into an oracle over content the caller never had
+        (the #1090 hazard), which is exactly what this refusal is free
+        of today.
+        """
+        tier = workflow.privacy_tier_ceiling
+        if tier not in WORKFLOW_ADMITTED_CEILINGS:
+            allowed = ", ".join(sorted(t.value for t in WORKFLOW_ADMITTED_CEILINGS))
+            msg = (
+                f"workflow {workflow.name!r} declares {_CEILING_KEY} "
+                f"{tier.value!r}, which CrawDad refuses to request: every tool "
+                "result is relayed to a cloud LLM composer and then posted "
+                "into a Discord message, so material above the cap must never "
+                f"be asked for on this path. Allowed ceilings: {allowed}."
+            )
+            raise WorkflowConstraintError(msg)
+
+    def _check_step_arg_ceilings(self, workflow: WorkflowDefinition) -> None:
+        """Refuse any step whose ``args`` declares its own privacy ceiling.
+
+        ANY step-level declaration is refused, not just a widening one.
+        Deciding "is this wider?" would need a tier-ordering comparison
+        (``crawdad.loop`` owns the only such table), and admitting a
+        narrowing value would teach authors that per-step ceilings are a
+        supported feature when they are not.
+
+        Today such a key is silently overwritten by
+        :func:`_build_call_arguments`. That is safe, but it gives the
+        author neither the tier they asked for nor any signal their line
+        was discarded — the same false-assurance defect as the headline
+        bug of #1051, one level down.
+
+        Both spellings are refused. Scoping this to :data:`_CEILING_KEY`
+        alone would leave a step's ``privacy_tier_floor: all`` silently
+        accepted — that name is dead everywhere else, no MCP tool reads
+        it, and a line that does nothing while looking like a privacy
+        control is the very shape #1051 exists to close.
+        """
+        offenders = [
+            step.id
+            for step in workflow.steps
+            if _CEILING_KEY in step.args or _LEGACY_CEILING_KEY in step.args
+        ]
+        if offenders:
+            msg = (
+                f"workflow {workflow.name!r} sets {_CEILING_KEY!r} (or its "
+                f"deprecated spelling {_LEGACY_CEILING_KEY!r}) in the args of "
+                f"step(s) {offenders}: per-step privacy ceilings are not "
+                "supported — the workflow-level ceiling applies to every step. "
+                "Remove the key from those steps."
+            )
+            raise WorkflowConstraintError(msg)
 
     def _check_phase(
         self, workflow: WorkflowDefinition, state: SessionState | None
@@ -695,7 +940,7 @@ class WorkflowWalker:
                 step.args, state=state, inputs=inputs, step_results=step_results
             )
             arguments = _build_call_arguments(
-                resolved_args, workflow.privacy_tier_floor
+                resolved_args, workflow.privacy_tier_ceiling
             )
             body = await session.call_tool(step.tool, arguments)
         except (_StepRefError, WorkflowStepError) as exc:
@@ -705,7 +950,7 @@ class WorkflowWalker:
         return ToolResult(
             intent_type=step.tool,
             body=body,
-            privacy_tier_ceiling=workflow.privacy_tier_floor,
+            privacy_tier_ceiling=workflow.privacy_tier_ceiling,
         )
 
 
@@ -766,20 +1011,31 @@ def _wrap_step_failure(
 
 
 def _build_call_arguments(
-    resolved_args: Any, floor: PrivacyTierCeiling
+    resolved_args: Any, ceiling: PrivacyTierCeiling
 ) -> dict[str, Any]:
-    """Merge interpolated args with the privacy floor, matching dispatcher semantics.
+    """Merge interpolated args with the privacy ceiling, dispatcher-style.
 
     The MCP server reads ``privacy_tier_ceiling`` as a sibling argument
     on every tool call (see :mod:`crawdad.dispatcher._build_arguments`).
-    The workflow's declared floor is the contract; any colliding key
-    in the user-authored args is overwritten so a workflow author
-    cannot accidentally smuggle a looser tier in through the args dict.
+    The workflow's declared ceiling is the contract, so any colliding
+    key in the resolved args is overwritten rather than honoured.
+
+    :meth:`WorkflowWalker._check_step_arg_ceilings` now refuses that
+    collision up front, loudly, before the session opens. This
+    overwrite stays as defence in depth for a future programmatic
+    caller that reaches this helper without having gone through
+    :meth:`WorkflowWalker._check_constraints`. Never remove the belt
+    because braces were added.
+
+    It is NOT a guard against a ceiling appearing during interpolation:
+    :func:`interpolate` recurses over dict *values* only, so no new
+    top-level key can materialise. Saying otherwise would be exactly
+    the kind of overclaiming prose #1051 is a postmortem about.
     """
     payload: dict[str, Any] = (
         dict(resolved_args) if isinstance(resolved_args, dict) else {}
     )
-    payload["privacy_tier_ceiling"] = floor.value
+    payload[_CEILING_KEY] = ceiling.value
     return payload
 
 
@@ -820,9 +1076,10 @@ async def run_workflow_and_compose(
 
     Raises:
         WorkflowConstraintError: a declared constraint refused the run
-            (missing required input, wrong phase, unknown MCP tool).
-            Callers map these to a Discord soft error rather than
-            crashing the bot.
+            (missing required input, wrong phase, unknown MCP tool, a
+            privacy ceiling outside :data:`WORKFLOW_ADMITTED_CEILINGS`,
+            or a step declaring its own ceiling). Callers map these to
+            a Discord soft error rather than crashing the bot.
         WorkflowStepError: the walker aborted mid-walk because a step
             failed — either its interpolation references an
             unresolvable upstream step or its MCP tool call raised.
