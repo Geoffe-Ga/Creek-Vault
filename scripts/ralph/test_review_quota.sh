@@ -190,6 +190,11 @@ mkdir -p "$BIN"
 #               caught here — a scalar stub would mask all three.
 #   LOG       — what `gh run view <id> --log` prints. Defaulted with `-` so an
 #               EMPTY log is expressible.
+#   LOG_FILE  — the same thing, delivered as a FILE instead of an env string, and
+#               preferred over LOG when set. `run()` switches to it automatically
+#               for oversized fixtures; see the MAX_ENV_STRING note there for the
+#               execve limit that forces it. The bytes the probe reads are
+#               identical either way — only the transport differs.
 #   LOG_EC    — exit code of the log call; 1 plays a log we could not fetch.
 #   GH_CALLS  — file the stub appends one line to per invocation; the cost
 #               assertions read it. This helper runs per HELD lane per wake
@@ -214,23 +219,73 @@ case "$args" in
     [[ -z "${RUNS-}" ]] || printf '%s\n' "$RUNS"
     exit "${RUNS_EC:-0}" ;;
   "run view"*"--log"*)
-    [[ -z "${LOG-}" ]] || printf '%s\n' "$LOG"
+    # LOG_FILE wins when present: it is how oversized fixtures reach us at all.
+    if [[ -n "${LOG_FILE:-}" ]]; then
+      cat "$LOG_FILE"
+    else
+      [[ -z "${LOG-}" ]] || printf '%s\n' "$LOG"
+    fi
     exit "${LOG_EC:-0}" ;;
   *) echo '' ;;
 esac
 STUB
 chmod +x "$BIN/gh"
 
+# --- THE TRANSPORT LIMIT: why a log fixture may not travel in the environment -
+# Linux caps any SINGLE argv/envp string at MAX_ARG_STRLEN = 32 pages = 131,072
+# bytes; Darwin has no per-string cap at all, only the 1 MiB ARG_MAX total. So a
+# log fixture bigger than 128 KiB makes `execve` of review-quota.sh fail E2BIG on
+# the Ubuntu runner and succeed on a developer's Mac.
+#
+# This cost a CI red (PR #1198, job 92864640290): the two 3000-line cases below
+# are 262,889 bytes each, so on CI the probe NEVER RAN — exit 126, nothing on
+# stdout, and `Argument list too long` on the stderr this harness discards. The
+# assertions read `expected 'exhausted', got ''`, which looks exactly like a
+# fail-closed hole in the probe and is nothing of the kind. A MISCLASSIFICATION
+# prints some token; only a probe that never started prints none.
+#
+# The fix belongs HERE, in the harness, not in the fixture and not in the
+# assertion: shrinking either 3000-line case would un-pin the bounded scan those
+# cases exist to prove (LOG_TAIL_LINES is 2000 — a fixture under the bound
+# straddles nothing), and accepting '' would licence the very defect the suite
+# guards. So oversized fixtures travel by FILE. `env -u LOG` is load-bearing: the
+# stub preferring LOG_FILE is not enough while a 262 KB LOG is still in the
+# environment being handed to execve.
+#
+# The threshold is Linux's, applied on every platform on purpose — a limit that
+# only bites on the runner is a limit that gets rediscovered on the runner.
+readonly MAX_ENV_STRING=131072
+LOG_XFER="$WORK/log-xfer"
+
 # stdout only. `${1+"$@"}` (not a bare `"$@"`) because the normal invocation has
 # NO arguments at all, and an empty `"$@"` trips `set -u` on bash 3.2, the stock
 # /bin/bash on macOS — the same portability guard pr-ready.sh documents at its
 # `repo_args` expansion.
-run() { PATH="$BIN:$PATH" "$QUOTA" ${1+"$@"} 2>/dev/null; }
+run() { quota_exec /dev/null ${1+"$@"}; }
 # Same, but stderr is kept: the attribution assertions read it, and the
 # stdout-purity assertions need it out of the way to prove stdout is one token.
 run_capture() { # run_capture <stderr file> [args…]
-  local errfile="$1"
+  quota_exec "$@"
+}
+# The single exec chokepoint, so the transport rule cannot be forgotten at a call
+# site: every case in this file reaches the probe through here.
+quota_exec() { # quota_exec <stderr file> [args…]
+  local errfile="$1" log_len=0
   shift
+  # `${LOG-}` first: most cases set no LOG at all, and a bare `${#LOG}` on an
+  # unset name is an unbound-variable abort under `set -u`.
+  if [[ -n "${LOG-}" ]]; then log_len="${#LOG}"; fi
+  if [[ "$log_len" -ge "$MAX_ENV_STRING" ]]; then
+    printf '%s\n' "$LOG" > "$LOG_XFER"
+    # `export -n`, never `env -u LOG …`: `env` is itself an external command, so
+    # exec'ing it to strip the oversized variable hits the very E2BIG we are
+    # avoiding — the strip must happen INSIDE the shell, before any exec. Every
+    # call site runs inside a `$( … )` subshell, so this cannot leak to the next
+    # case; the value stays readable, it just stops being handed to execve.
+    export -n LOG
+    LOG_FILE="$LOG_XFER" PATH="$BIN:$PATH" "$QUOTA" ${1+"$@"} 2>"$errfile"
+    return
+  fi
   PATH="$BIN:$PATH" "$QUOTA" ${1+"$@"} 2>"$errfile"
 }
 calls() { # calls <counter file> — how many times the gh stub ran
@@ -1032,6 +1087,22 @@ LOG_LONG_THEN_REJECT="$(filler 3000)
 $(rejection_block "$RESET_REJ")
 $REJECTION_TAIL"
 check "3000 lines of review chatter THEN a rejection → exhausted" "exhausted" \
+  "$(RUNS="$FAILURE_RUN" LOG="$LOG_LONG_THEN_REJECT" run)"
+
+# NON-VACUITY FOR THE TRANSPORT RULE. The `run()` note above is only load-bearing
+# while these fixtures actually exceed the cap; a future edit that trims them
+# would silently retire the file transport AND un-pin the bounded scan, and both
+# would pass. So assert the premise, not just the consequence.
+if [[ "${#LOG_LONG_THEN_REJECT}" -gt "$MAX_ENV_STRING" ]]; then
+  ok "the long-log fixtures exceed the portable env-string cap (file transport is live)"
+else
+  bad "the long-log fixtures no longer exceed $MAX_ENV_STRING bytes — the bounded-scan cases stopped straddling LOG_TAIL_LINES"
+fi
+# And the consequence itself, named: an over-cap log yields a BARE TOKEN. `''` is
+# not a verdict this helper is allowed to produce, and `one_token` rejects it —
+# so a transport regression fails here saying what broke, instead of resurfacing
+# as two verdict assertions that look like a fail-closed hole in the probe.
+one_token "an over-cap log still yields one bare token (not an empty answer)" \
   "$(RUNS="$FAILURE_RUN" LOG="$LOG_LONG_THEN_REJECT" run)"
 
 # Buried far above the tail window, with the whole run continuing after it. Out
