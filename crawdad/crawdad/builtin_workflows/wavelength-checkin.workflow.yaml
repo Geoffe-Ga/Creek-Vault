@@ -11,7 +11,7 @@ description: |
   user's voice register.
 trigger: "/crawdad workflow run wavelength-checkin"
 phase_aware: false
-privacy_tier_floor: open
+privacy_tier_ceiling: open
 steps:
   - id: read
     tool: creek.state.read
