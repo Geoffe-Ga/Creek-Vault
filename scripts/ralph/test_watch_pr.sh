@@ -4,11 +4,11 @@
 # Offline tests for watch-pr.sh — the per-lane hot watch a LOCAL orchestrator
 # session launches as a background task per in-flight PR (ralph-tick.md Step 5).
 # The watcher polls pr-ready.sh and exits — which IS the wake — the moment the
-# token leaves the in-flight set {pending, awaiting-review}, the PR merges or
-# closes (`gone`), or TIMEOUT elapses. Like test_pr_ready.sh, everything runs
-# against stubs: a fake, sequence-driven `pr-ready.sh` placed NEXT TO a copy of
-# the script under test (watch-pr.sh resolves its sibling by dirname), and a
-# fake `gh` on PATH for the merged/closed probe.
+# token leaves the in-flight set {pending, awaiting-review, main-not-green}, the
+# PR merges or closes (`gone`), or TIMEOUT elapses. Like test_pr_ready.sh,
+# everything runs against stubs: a fake, sequence-driven `pr-ready.sh` placed
+# NEXT TO a copy of the script under test (watch-pr.sh resolves its sibling by
+# dirname), and a fake `gh` on PATH for the merged/closed probe.
 #
 # The dimensions pinned here:
 #
@@ -26,6 +26,14 @@
 #   error tolerance a pr-ready tooling failure (exit 2, empty stdout) or a
 #                   failed `gh` state lookup keeps the loop alive — transient
 #                   GitHub weather must not kill the watcher or fake a wake.
+#   in-flight set   FOUR tokens keep the watcher waiting, not two:
+#                   `main-not-green` (issue #1159) and
+#                   `review-quota-exhausted` (issue #1160) joined {pending,
+#                   awaiting-review}. Both are WAIT states — the lane is held
+#                   until `main`'s CI recovers, or until the reviewer's rate
+#                   limit window resets, and nothing the orchestrator can do
+#                   shortens either — so a watcher that exited on one would be
+#                   relaunched immediately and exit immediately again, forever.
 #
 # Run:  bash scripts/ralph/test_watch_pr.sh
 set -euo pipefail
@@ -158,6 +166,70 @@ out="$(TOKENS="awaiting-review,changes-requested" run_watch 114)"
 check "changes-requested wakes promptly (outside the in-flight set)" \
   "WATCH 114 changes-requested" "$out"
 check "changes-requested case polled exactly twice" "2" "$(polls 114)"
+
+# --- THE BUSY-WAKE REGRESSION TEST (issue #1159) ----------------------------
+# `main-not-green` means "this lane is held until `main`'s CI goes green again",
+# which is a WAIT — the orchestrator has nothing to do about it, and `main` CI
+# takes ~14 minutes per round. So it belongs in IN_FLIGHT_TOKENS, and this is
+# the case that proves it: the watcher must poll THROUGH it and wake only when
+# the lane finally settles.
+#
+# If it were left OUT of that set, the failure would be worse than the bug
+# #1159 fixes and much harder to see: the watcher would exit on its very first
+# poll, the orchestrator would relaunch it (the pidfile is gone, so the
+# idempotence guard does not catch it), it would exit immediately again, and
+# the whole fleet would busy-wake at wake speed for as long as `main` stayed
+# red — burning the API budget precisely when nobody can merge anything.
+rc=0
+out="$(TOKENS="main-not-green,main-not-green,ready" run_watch 115)" || rc=$?
+check "main-not-green is in-flight; ready wakes" "WATCH 115 ready" "$out"
+check "busy-wake pin exits 0" "0" "$rc"
+check "busy-wake pin polled exactly 3 times (never woke early)" "3" "$(polls 115)"
+
+# And a lane held for the whole window times out as a wait, exactly like a
+# `pending` one: the last classified token rides out with it, and it is still
+# exit 0 — a held lane is not an error.
+rc=0
+out="$(TOKENS="main-not-green" run_watch 116 0.2 1)" || rc=$?
+check "main-not-green alone times out as a wait state" "WATCH 116 timeout main-not-green" "$out"
+check "main-not-green timeout exits 0" "0" "$rc"
+
+# --- THE SAME BUSY-WAKE PIN, FOR `review-quota-exhausted` (issue #1160) ------
+# This token means "this lane holds a fresh LGTM and needs a sync, but the
+# `claude-review` quota is exhausted, so the sync would destroy the verdict with
+# no way to earn it back". Like `main-not-green` it is a WAIT: the orchestrator
+# has nothing to do about it, and the remedy arrives on its own when the rate
+# limit window resets.
+#
+# Leaving it OUT of IN_FLIGHT_TOKENS reproduces #1159's busy-wake storm — the
+# watcher exits on its first poll, the orchestrator relaunches it (the pidfile is
+# gone, so the idempotence guard does not catch it), it exits again — except that
+# here it would run for DAYS rather than the ~20 minutes a `main` CI round takes.
+# The observed window on PR #1158 was SEVEN days and had three days left to run.
+# So the fleet would spin at wake speed, burning the API budget, for days,
+# precisely when nobody can merge anything and the budget is the scarce thing.
+rc=0
+out="$(TOKENS="review-quota-exhausted,review-quota-exhausted,ready" run_watch 117)" || rc=$?
+check "review-quota-exhausted is in-flight; ready wakes" "WATCH 117 ready" "$out"
+check "review-quota busy-wake pin exits 0" "0" "$rc"
+check "review-quota busy-wake pin polled exactly 3 times (never woke early)" "3" \
+  "$(polls 117)"
+
+# The realistic settle: the window resets, the verdict is safe to spend again,
+# and pr-ready.sh goes back to reporting the lane's real state — `behind`, whose
+# remedy the orchestrator can finally run.
+out="$(TOKENS="review-quota-exhausted,behind" run_watch 118)"
+check "the quota window resetting wakes the lane to behind" "WATCH 118 behind" "$out"
+check "quota-reset case polled exactly twice" "2" "$(polls 118)"
+
+# And a lane held for the whole window times out as a wait, exactly like a
+# `pending` or `main-not-green` one: the last classified token rides out with it,
+# and it is still exit 0 — a held lane is not an error.
+rc=0
+out="$(TOKENS="review-quota-exhausted" run_watch 119 0.2 1)" || rc=$?
+check "review-quota-exhausted alone times out as a wait state" \
+  "WATCH 119 timeout review-quota-exhausted" "$out"
+check "review-quota-exhausted timeout exits 0" "0" "$rc"
 
 # --- gone: a merged/closed PR ends the watch --------------------------------
 rc=0

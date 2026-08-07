@@ -6,15 +6,38 @@
 # lane. CI state is keyed off the `gh pr checks` EXIT CODE (0=green, 8=pending,
 # else=failed), never a text grep of its TAB-delimited output, and an LGTM
 # verdict only counts when it is fresher than the PR's HEAD commit (stale-verdict
-# guard). We put a fake, arg-aware `gh` on PATH and assert every classification.
+# guard) AND carries the review workflow's provenance marker naming THIS PR
+# (issue #1181). We put a fake, arg-aware `gh` on PATH and assert every
+# classification.
 #
-# Beyond that baseline, these tests pin six more dimensions:
+# Beyond that baseline, these tests pin nine more dimensions:
 #
 #   verdict split  the four verdict states are distinct outcomes (issue #1097):
 #                  missing → awaiting-review, stale (LGTM or not) →
 #                  awaiting-review, fresh LGTM → ready, fresh non-LGTM →
 #                  changes-requested — with a malformed verdict answer failing
 #                  closed to awaiting-review, never to the dispatch token.
+#   verdict provenance
+#                  a verdict counts only when the comment carrying it also
+#                  carries the marker `.github/workflows/code-review.yml` emits
+#                  from `github.event.pull_request.number` —
+#                  `<!-- creek-review pr=N -->` — and N is THIS PR. That prompt
+#                  never states the PR number, and `actions/checkout` leaves the
+#                  runner in DETACHED HEAD on `refs/pull/<N>/merge`, so the
+#                  agent's `gh pr view --json number` fails and it GUESSES: on
+#                  PR #1117 it guessed #1179, reviewed that bump's diff, and the
+#                  workflow posted the resulting LGTM here — `pr-ready.sh 1117`
+#                  said `ready` (issue #1181). A marker that is absent,
+#                  malformed, or names a different PR is therefore NOT A
+#                  VERDICT: it gates neither `ready` NOR `changes-requested`, so
+#                  the lane reads `awaiting-review`. Legacy unmarked verdicts
+#                  are not grandfathered — every one of them was posted by the
+#                  pipeline that had the bug. Refusing a verdict must not push a
+#                  lane FORWARD either: a Dependabot lane whose every
+#                  `claude-review` entry is SKIPPED must not fall out of a
+#                  refused verdict into `ready-unreviewed`, because a posted
+#                  verdict proves the review gate exists even when the marker
+#                  makes it inadmissible.
 #   opt-out        a `do-not-auto-merge` label on the PR — or on the LAST issue
 #                  its body links — parks the lane (`optout`), checked BEFORE CI
 #                  so a human hold is honoured even mid-run. An UNDETERMINABLE
@@ -25,10 +48,15 @@
 #                  freshness signal — GitHub happily reports UNSTABLE/MERGEABLE
 #                  for a branch 22 commits behind main. Fails CLOSED (`behind`)
 #                  on an API error, an empty answer, or a non-integer.
-#   ready-unreviewed  a PR with PROVABLY no review gate (dependabot-authored PR
-#                  AND a dependabot-authored HEAD commit AND a real non-review
-#                  SUCCESS AND every `claude-review` entry exactly SKIPPED) may
-#                  merge without a verdict. Anything less ⇒ `awaiting-review`.
+#   ready-unreviewed  a PR with PROVABLY no review gate may merge without a
+#                  verdict. FIVE preconditions now, and #1181 added the first of
+#                  them: NO verdict-bearing comment was ever posted (the
+#                  `verdict_comment_seen` latch — a verdict the provenance guard
+#                  REFUSED still proves a review gate exists, so refusing it must
+#                  not push the lane FORWARD into this token), AND a
+#                  dependabot-authored PR, AND a dependabot-authored HEAD commit,
+#                  AND a real non-review SUCCESS, AND every `claude-review` entry
+#                  exactly SKIPPED. Anything less ⇒ `awaiting-review`.
 #   laziness       both new probes cost an extra API call per wake per lane, so
 #                  each must run ONLY on the path that would otherwise print
 #                  `ready`/`ready-unreviewed`. Sentinel files prove it.
@@ -36,10 +64,57 @@
 #                  `IFS='|' read -r a b c rest`; a non-empty `rest` (a `|` in a
 #                  branch name, a login, a date) must fail CLOSED, not silently
 #                  shift a field and merge on garbage.
+#   main health    the #1157 relaxation (a behind-but-inert lane merges anyway)
+#                  is justified by ONE backstop: the full CI run on `push: main`
+#                  re-proving every squash-merge. So a lane that is about to USE
+#                  the relaxation must first prove the backstop is alive —
+#                  `main-not-green` (issue #1159). A lane with `behind_by == 0`
+#                  never uses the relaxation and therefore never asks.
+#   review quota   `behind`'s remedy is a sync, and a sync advances HEAD, which
+#                  invalidates a fresh LGTM under the stale-verdict guard above.
+#                  That normally costs one re-review. When the `claude-review`
+#                  quota is EXHAUSTED it costs the verdict outright, for days —
+#                  so such a lane reports `review-quota-exhausted` and waits
+#                  (issue #1160). The polarity of THAT probe is INVERTED with
+#                  respect to main health: only a positively-proven `exhausted`
+#                  holds the lane; `available`, `unknown`, an empty answer, a
+#                  non-zero exit, a garbage word, a missing helper and a
+#                  non-executable helper all fall through to today's `behind`,
+#                  because merging (or holding) stale is the worse error.
 #
-# Plus one cross-file coupling check: pr-ready.sh matches the review check by the
-# literal name `claude-review`, so `.github/workflows/code-review.yml` must keep
-# that job key and must NOT add a `name:` override.
+# Plus the cross-file coupling checks at the end of this file. They are
+# LOAD-BEARING, not decoration: `.github/workflows/code-review.yml` is the
+# EMITTER and pr-ready.sh is the PARSER, and drift between them does not wedge
+# one lane, it wedges every lane at once.
+#   * pr-ready.sh matches the review check by the literal name `claude-review`,
+#     so code-review.yml must keep that job key and must NOT add a `name:`
+#     override.
+#   * the provenance marker ROUND-TRIPS: the WHOLE `printf` format argument is
+#     extracted from code-review.yml, rendered for this PR, and must be the
+#     exact bytes pr-ready.sh accepts — and rendered for another PR, the exact
+#     bytes it refuses (issue #1181). Rendered, not grepped: a `grep -oF` for a
+#     literal this file already holds can only ever print that literal back.
+#     The emitter's REDIRECTION (`>` for the marker, `>>` for the review body)
+#     is pinned alongside it, because "the marker is first" is a property of the
+#     redirection and no format string can see its own.
+#   * the workflow keeps the piece the marker ATTESTS TO: a `reviewed_pr_number`
+#     in the structured-output schema, which is what makes the workflow-side
+#     cross-check possible. Alongside it, and NOT of equal weight, the absence of
+#     `Bash(gh pr list:*)` from `--allowed-tools` — that is the instrument the
+#     #1117 run guessed with, so removing it is defence in depth. It is not a
+#     proof: `Bash(gh search:*)` is deliberately kept and `gh search prs` also
+#     enumerates PRs. See the block at that assertion.
+#   * the suite actually RUNS on emitter-only changes (ralph-recap-tests.yml's
+#     `paths:`), and the second merge-clearance path (iteration-trigger.yml)
+#     both EXTRACTS the marker with the same anchored pattern and REFUSES to
+#     clear a merge when it does not name this PR.
+#   * THAT SAME FILE IS ALSO A SECOND EMITTER OF A VERDICT_RE MATCH, and the one
+#     the provenance guard would otherwise select on every lane in this repo: its
+#     executive summary's `**VERDICT**: <X>` line satisfies VERDICT_RE, it can
+#     never carry a `creek-review` marker, and it posts LAST. So the marker it
+#     excludes itself by (`<!-- iteration-trigger -->`) is read out of that
+#     workflow and round-tripped through this parser, in the verdict block and
+#     again at the end of this file (#1181).
 #
 # Run:  bash scripts/ralph/test_pr_ready.sh
 set -euo pipefail
@@ -59,6 +134,45 @@ probed() { # probed <desc> <yes|no> <sentinel path> — did the probe run?
 no_merge_token() { # no_merge_token <desc> <token> — any token the loop won't merge on
   if [[ "$2" != "ready" && "$2" != "ready-unreviewed" ]]; then ok "$1"; else bad "$1 (got '$2')"; fi
 }
+says() { # says <desc> <ERE> <text> — the text must carry this phrasing
+  # Herestring, never `printf … | grep -q`: that pipeline is the pipefail/SIGPIPE
+  # inversion pr-ready.sh:634-637 documents at `has_optout_label` (grep -q exits
+  # at the first match, the writer dies 141, and the pipeline reports non-zero ON
+  # A MATCH). Cited by name as well as by line because pr-ready.sh moves.
+  if grep -Eqi -- "$2" <<<"$3"; then ok "$1"; else bad "$1 (no /$2/ in: $3)"; fi
+}
+
+# --- jq IS A HARD REQUIREMENT, DECIDED ONCE, HERE ---------------------------
+# This used to be FIVE separate `if command -v jq` guards, each of which printed
+# a `skip` line and carried on. Between them they covered the ENTIRE verdict-
+# provenance block (#1181), the emitter round trip, main-health.sh's production
+# run-list expression, the review-gate rollup expression and the
+# `reviewed_pr_number` schema coupling — so on a jq-less host this file printed
+# a GREEN summary while asserting nothing whatsoever about the gate it exists to
+# pin. A suite that reports success for a run in which it tested nothing is a
+# silent no-gate hole, and it is the same hole the #1181 polarity argument in
+# pr-ready.sh's header says it cannot afford: that argument's whole neutralising
+# leg is "the coupling test round-trips the emitter through this parser and CI
+# runs it", which is false the moment the round trip can silently not run.
+#
+# Failing LOUDLY costs nothing: `ubuntu-latest` ships jq, the ralph CI job that
+# runs this file uses it, and a developer host without jq is a broken
+# environment rather than a supported configuration — one `brew install jq` /
+# `apt-get install jq` away, and the message says so. Everything below therefore
+# assumes jq unconditionally: the stub's REAL-jq arms (COMMENTS_JSON,
+# ROLLUP_JSON, MAIN_RUNS_JSON), the marker round trip, and the schema check.
+#
+# EXIT 2, NOT 1, and on stderr rather than as a `bad`: the closing
+# `[[ "$FAIL" -eq 0 ]]` already owns exit 1 for "assertions failed", and "this
+# suite could not run" is a different fact from "this suite ran and found a
+# bug". Same split pr-ready.sh's own `die` makes, for the same reason — a caller
+# must never read one as the other.
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'pr-ready tests: FATAL — jq is not installed.\n' >&2
+  printf 'pr-ready tests:   Without it this suite cannot run the production `--jq` expressions (the verdict regex, the provenance-marker extraction, the emitter round trip, the rollup counts) and would report a green summary having tested none of them.\n' >&2
+  printf 'pr-ready tests:   Install jq (brew install jq / apt-get install jq) and re-run.\n' >&2
+  exit 2
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -120,16 +234,130 @@ mkdir -p "$BIN"
 #                   rollup expression that miscounts SKIPPED/null conclusions is
 #                   caught here (a scalar stub would mask it).
 #   VERDICT       — the "<createdAt>|<isLGTM>" scalar the verdict jq resolves to
+#   VERDICT_PR    — the THIRD field of that scalar (issue #1181): the PR number
+#                   the selected comment's `<!-- creek-review pr=N -->` marker
+#                   names, so the whole answer is
+#                   "<createdAt>|<isLGTM>|<markerPr>". Defaulted with `-` (not
+#                   `:-`) so `VERDICT_PR=''` reproduces a verdict comment with NO
+#                   marker at all, which must fail closed. The default is `100`
+#                   — the PR number every scalar case in this file passes to
+#                   `run` — so all ~109 pre-existing `VERDICT=` cases keep
+#                   asserting exactly what they asserted before #1181. Same
+#                   convention as MAIN_HEALTH (`green`) and REVIEW_QUOTA
+#                   (`available`), and for the same reason: a new gate must not
+#                   silently re-target the tests that were already here.
 #   COMMENTS_JSON — raw `--json comments` payload; when set, the stub runs the
 #                   REAL jq with pr-ready.sh's own `--jq` expression against it,
-#                   so the production verdict regex is genuinely exercised
-#                   (otherwise a scalar stub would mask a broken regex).
+#                   so the production verdict regex AND the production marker
+#                   extraction are genuinely exercised (otherwise a scalar stub
+#                   would mask a broken regex). WITH ONE CAVEAT, and pr-ready.sh
+#                   now concedes it in MARKER_RE's own block: the PATTERNS are
+#                   production's, the ENGINE is not. This stub runs the system
+#                   `jq` (Oniguruma); in production the `--jq` is evaluated by
+#                   `gh` in its own process with gojq, i.e. Go's `regexp` (RE2).
+#                   VERDICT_RE and MARKER_RE are deliberately restricted to the
+#                   constructs both engines share, so the two agree on every byte
+#                   written there — but "exercised" here means the pattern, not
+#                   the interpreter, and the failure this cannot see is
+#                   one-directional: an Oniguruma-only construct (a lookahead, a
+#                   backreference, `\K`) passes GREEN here and then fails LIVE,
+#                   where RE2 refuses to compile it and `gh` exits non-zero on
+#                   every lane at once.
+#   MAIN_HEALTH   — scalar shortcut for the `gh run list` arm that main-health.sh
+#                   (pr-ready.sh's sibling, issue #1159) calls: `green` / `red` /
+#                   `pending` emit one synthetic run line, `unknown` emits
+#                   nothing at all. It DEFAULTS TO `green` so the pre-existing
+#                   behind-but-inert cases keep testing #1157's disjointness
+#                   rather than accidentally testing this gate.
+#   MAIN_RUNS_JSON — raw `--json status,conclusion,headSha,databaseId,url`
+#                   payload; when set, the stub runs the REAL jq with
+#                   main-health.sh's own `--jq` expression against it (the
+#                   COMMENTS_JSON / ROLLUP_JSON pattern), so the production
+#                   run-list expression is genuinely exercised through
+#                   pr-ready.sh rather than mocked at the token.
+#   MAIN_HEALTH_EC — exit code of the run-list call; 1 proves a failed lookup
+#                   holds the lane (`main-not-green`) and still exits 0.
+#   MAIN_HEALTH_SENTINEL — file the run-list arm touches when it is called. The
+#                   laziness assertions use it: this gate costs an extra API
+#                   call, so only a lane about to USE the #1157 relaxation may
+#                   pay for it.
+#   REVIEW_QUOTA  — scalar shortcut for the OTHER `gh run list` arm, the one
+#                   review-quota.sh (pr-ready.sh's second sibling, issue #1160)
+#                   calls with `--workflow code-review.yml`: `available` emits a
+#                   completed/success review run, `exhausted` emits a
+#                   completed/failure one (whose log the stub then serves as a
+#                   real rate-limit rejection), `unknown` emits nothing at all.
+#                   It DEFAULTS TO `available` so every pre-existing case in this
+#                   file keeps asserting exactly what it asserted before #1160 —
+#                   in particular every lane that must still print `behind`.
+#   REVIEW_RUNS   — raw run-list answer for that arm, one run per line, NEWEST
+#                   FIRST, four `|`-separated fields
+#                   (status|conclusion|databaseId|url). Honoured even when empty,
+#                   so a case can reproduce an empty window.
+#   REVIEW_RUNS_EC — exit code of that call; 1 plays a failed lookup, which must
+#                   fall THROUGH to `behind` rather than hold the lane.
+#   REVIEW_LOG    — what `gh run view <id> --log` prints for the review run.
+#                   Honoured even when empty. Unset ⇒ the stub serves
+#                   $REVIEW_REJECTION_LOG, the verbatim payload from PR #1158.
+#   REVIEW_LOG_EC — exit code of that log fetch.
+#   REVIEW_QUOTA_SENTINEL — file the code-review.yml run-list arm touches when it
+#                   is called. Same laziness argument as MAIN_HEALTH_SENTINEL,
+#                   and the same anti-masking role: with REVIEW_QUOTA defaulting
+#                   to `available`, only this sentinel can prove the probe is
+#                   made at all.
 # Real gh applies --jq, so — like test_fleet.sh — the stub emits the already
 # extracted scalar and branches on which --json field the caller asked for.
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  "run list"*"--workflow code-review.yml"*)
+    # review-quota.sh's list call (issue #1160). It MUST be told apart from
+    # main-health.sh's by the --workflow value: both siblings call `gh run
+    # list`, and one shared arm would feed main-health.sh's ci.yml fixture to
+    # the quota helper and the quota fixture to main-health.sh — flipping every
+    # #1159 assertion in this file while looking like it still tested them.
+    # One line per run, NEWEST FIRST, four `|`-separated fields:
+    # status|conclusion|databaseId|url (no headSha — a review run's blame range
+    # is not a thing).
+    [[ -n "${REVIEW_QUOTA_SENTINEL:-}" ]] && : > "$REVIEW_QUOTA_SENTINEL"
+    if [[ -n "${REVIEW_RUNS+set}" ]]; then
+      [[ -z "$REVIEW_RUNS" ]] || printf '%s\n' "$REVIEW_RUNS"
+      exit "${REVIEW_RUNS_EC:-0}"
+    fi
+    case "${REVIEW_QUOTA:-available}" in
+      available) printf 'completed|success|21|https://x/21\n' ;;
+      exhausted) printf 'completed|failure|22|https://x/22\n' ;;
+      *)         : ;;   # `unknown`: gh answered nothing at all
+    esac
+    exit "${REVIEW_RUNS_EC:-0}" ;;
+  "run view"*"--log"*)
+    # review-quota.sh's SECOND call, made only when the newest conclusive review
+    # run failed — i.e. only under REVIEW_QUOTA=exhausted, unless a case drives
+    # the run list directly.
+    if [[ -n "${REVIEW_LOG+set}" ]]; then
+      [[ -z "$REVIEW_LOG" ]] || printf '%s\n' "$REVIEW_LOG"
+      exit "${REVIEW_LOG_EC:-0}"
+    fi
+    printf '%s\n' "${REVIEW_REJECTION_LOG:-}"
+    exit "${REVIEW_LOG_EC:-0}" ;;
+  "run list"*)
+    # main-health.sh's single call. One line per run, NEWEST FIRST, five
+    # `|`-separated fields: status|conclusion|headSha|databaseId|url.
+    [[ -n "${MAIN_HEALTH_SENTINEL:-}" ]] && : > "$MAIN_HEALTH_SENTINEL"
+    if [[ -n "${MAIN_RUNS_JSON:-}" ]]; then
+      expr="" prev=""
+      for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
+      printf '%s' "$MAIN_RUNS_JSON" | jq -r "$expr"
+      exit "${MAIN_HEALTH_EC:-0}"
+    fi
+    case "${MAIN_HEALTH:-green}" in
+      green)   printf 'completed|success|abc1234|11|https://x/11\n' ;;
+      red)     printf 'completed|failure|dead1234|12|https://x/12\n' ;;
+      pending) printf 'in_progress||feed1234|13|https://x/13\n' ;;
+      *)       : ;;   # `unknown`: gh answered nothing at all
+    esac
+    exit "${MAIN_HEALTH_EC:-0}" ;;
   "api "*"compare"*)
     # Three compare calls now, told apart by the --jq the caller passes and by
     # the range. The behind_by/merge-base probe is the only one a lane that is
@@ -192,7 +420,7 @@ case "$args" in
       for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
       printf '%s' "$COMMENTS_JSON" | jq -rc "$expr"
     else
-      printf '%s\n' "${VERDICT:-|false}"
+      printf '%s|%s\n' "${VERDICT:-|false}" "${VERDICT_PR-100}"
     fi ;;
   *)                        echo '' ;;
 esac
@@ -200,6 +428,54 @@ STUB
 chmod +x "$BIN/gh"
 
 run() { PATH="$BIN:$PATH" "$READY" "$@" 2>/dev/null; }
+
+# The sibling for the cases that assert ON the diagnostic rather than on the
+# token. `run()` swallows stderr so a token assertion is never polluted by one,
+# and changing that would re-write ~181 call sites to test one message. The
+# ORDER is load-bearing: stdout is dropped INSIDE the group and stderr is routed
+# into the capture OUTSIDE it, so only stderr is ever captured — capture both and
+# every assertion below would pass on the token instead of on the message. This
+# is shellcheck's own rewrite of the equivalent `2>&1 >/dev/null` (SC2069), which
+# is what pr-ready.sh:679-682 uses for `gh pr checks` (the `ci_err=` capture —
+# named as well as line-cited, because pr-ready.sh moves); the redirections there
+# are on a command rather than a group, where the order alone is unambiguous.
+run_err() { { PATH="$BIN:$PATH" "$READY" "$@" >/dev/null; } 2>&1; }
+
+# Wrap comment object(s) as a `--json comments` payload for COMMENTS_JSON. Kept
+# up here with the other harness helpers rather than inside the real-jq block
+# below, because the very first case in this file (the argv-validation collision)
+# already needs it — and because there is no longer a `command -v jq` block for
+# it to live inside.
+cj() { printf '{"comments":[%s]}' "$1"; }
+
+# The default `gh run view --log` payload for the review run (issue #1160): the
+# verbatim rate-limit rejection from PR #1158's re-review (run 30685776913,
+# conclusion `failure`, 24 seconds). `resetsAt` is COMPUTED rather than the
+# incident's literal 1785844800, because a hard-coded future epoch is a suite
+# that silently flips verdicts on some morning years from now. Exported because
+# the fake `gh` reads it from the environment, several processes down.
+REVIEW_RESET=$(( $(date +%s) + 2 * 86400 ))
+# Built with a here-doc rather than a quoted literal: the payload is full of
+# double quotes, and assigning it inline trips shellcheck SC2089/SC2090 (it
+# cannot tell a JSON blob from a command line being built up in a variable).
+REVIEW_REJECTION_LOG="$(cat <<JSON
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "rejected",
+    "resetsAt": $REVIEW_RESET,
+    "rateLimitType": "seven_day",
+    "overageStatus": "rejected",
+    "overageDisabledReason": "out_of_credits",
+    "isUsingOverage": false
+  },
+  "uuid": "f6e687d0-5cff-48a9-902e-3e47e73e42c0",
+  "session_id": "510eb0de-94f9-4382-b332-41d6278f5486"
+}
+{"error": "rate_limit"}
+JSON
+)"
+export REVIEW_REJECTION_LOG
 
 H="2026-07-01T10:00:00Z"          # HEAD commit time baseline
 FRESH="2026-07-01T11:00:00Z"      # a verdict posted AFTER HEAD (valid)
@@ -209,6 +485,37 @@ STALE="2026-07-01T09:00:00Z"      # a verdict posted BEFORE HEAD (stale)
 rc=0
 PATH="$BIN:$PATH" "$READY" >/dev/null 2>&1 || rc=$?
 check "missing PR number exits 2" "2" "$rc"
+
+# …and a NON-NUMERIC argument is the same class with a sharper reason, which is
+# why the sentinel word is the one that gets passed here. pr-ready.sh's
+# `^[0-9]+$` argument check is the ONLY thing keeping `$pr` out of collision with
+# `MARKER_MALFORMED` — the literal string the verdict `--jq` writes into the
+# marker field when a comment matched `creek-review` but not the whole-line
+# marker pattern.
+#
+# THE FIXTURE BUILDS THAT COLLISION FOR REAL, and it has to. An argv-only
+# invocation never reaches it: with no HEAD_DATE and no comment payload the stub
+# serves the `VERDICT_PR` default `100`, so the run exits at the `head_date`
+# guard with `awaiting-review` and the mutant dies on the EXIT CODE — a passing
+# assertion attached to a false explanation, which is worse than no explanation.
+# So HEAD_DATE is set and the selected comment carries
+# `<!-- creek-review pr=abc -->`, which the PRODUCTION `--jq` (real jq, via
+# COMMENTS_JSON) reduces to the literal `malformed` sentinel. Delete pr-ready.sh's
+# argv check and this exact invocation compares `verdict_pr` ("malformed")
+# against `$pr` ("malformed"), finds them EQUAL, skips the provenance guard
+# entirely, and prints `ready` — ATTESTING a verdict whose marker the parser
+# could not read (#1181). With the check in place the run never makes an API
+# call at all: exit 2 on argv.
+#
+# The empty stdout matters as much as the exit code: the orchestrator's contract
+# is that a non-zero exit carries no token, ever — silence is not a verdict —
+# and under that mutant this same invocation prints one the loop merges on.
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=abc -->\n\n## Verdict: LGTM\n"}')" \
+       PATH="$BIN:$PATH" "$READY" malformed 2>/dev/null)" || rc=$?
+check "non-numeric PR argument (the 'malformed' sentinel) exits 2" "2" "$rc"
+check "non-numeric PR argument prints nothing" "" "$out"
 
 # --- pending: gh pr checks exit 8 is NEVER ready (the core bug) -------------
 check "exit 8 → pending" "pending" \
@@ -265,13 +572,37 @@ check "malformed verdict flag → awaiting-review, never changes-requested" "awa
 # long `## Summary …` body. These cases feed raw comment JSON through pr-ready.sh's
 # own `--jq`, so a regex that fails to match `## Verdict:` — or that reads "LGTM"
 # from prose instead of the verdict line — is caught here (a scalar stub can't).
-if command -v jq >/dev/null 2>&1; then
-  cj() { printf '{"comments":[%s]}' "$1"; }   # wrap comment object(s) as a payload
-
+#
+# WHAT "REAL jq" DOES AND DOES NOT MEAN, precisely — pr-ready.sh now concedes
+# the same thing in MARKER_RE's own block, and the two files must not drift on
+# it. The PATTERNS below are production's, byte for byte. The ENGINE is not: this
+# harness runs the system `jq` (Oniguruma), while in production the `--jq` string
+# is evaluated by `gh` in its own process with gojq, whose `test`/`scan` are Go's
+# `regexp` — RE2. VERDICT_RE and MARKER_RE are deliberately confined to the
+# constructs both engines accept (`(?i)`/`(?m)`, `[0-9]`, `[[:space:]]`, plain
+# anchors), which is what makes a green run here transferable — not any shared
+# implementation. The gap is one-directional and therefore worth naming: an
+# Oniguruma-only construct passes HERE and fails LIVE, where RE2 refuses to
+# compile it, `gh` exits non-zero, and pr-ready.sh dies mid-classification on
+# every lane at once.
+#
+# This is an unconditional GROUP, not a `command -v jq` guard: jq is asserted
+# once at the top of this file (see the hard-requirement block there for why
+# skipping was a silent no-gate hole). The braces are kept so the block's shape
+# and indentation stay exactly what they were.
+{
   # Canonical `## Verdict: LGTM`, fresh + CLEAN → ready.
+  #
+  # Every body in THIS block whose verdict is meant to COUNT also carries the
+  # `<!-- creek-review pr=100 -->` provenance marker, because that is what
+  # code-review.yml prepends to a real review comment (#1181). These cases are
+  # about the verdict REGEX; leaving them unmarked would make them assert the
+  # provenance gate instead, and the marker cases below would then be the only
+  # thing testing the regex. The provenance gate has its own block after this
+  # one.
   check "real ## Verdict: LGTM (fresh) → ready" "ready" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
-       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
        run 100)"
 
   # `**Verdict:** CHANGES_REQUESTED` whose prose mentions "LGTM" must NOT count as
@@ -279,7 +610,7 @@ if command -v jq >/dev/null 2>&1; then
   # fresh, non-LGTM verdict, so it classifies as actionable `changes-requested`.
   check "real CHANGES_REQUESTED w/ 'LGTM' in prose → changes-requested" "changes-requested" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
-       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"Not ready for LGTM yet.\n\n**Verdict:** CHANGES_REQUESTED\n"}')" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\nNot ready for LGTM yet.\n\n**Verdict:** CHANGES_REQUESTED\n"}')" \
        run 100)"
 
   # The other non-LGTM verdict the reviewer posts. Observed live on PR #1095:
@@ -287,7 +618,7 @@ if command -v jq >/dev/null 2>&1; then
   # watcher's whole timeout because it classified as in-flight `awaiting-review`.
   check "real ## Verdict: COMMENTS (fresh) → changes-requested" "changes-requested" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
-       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\nnits\n\n## Verdict: COMMENTS\n"}')" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Summary\nnits\n\n## Verdict: COMMENTS\n"}')" \
        run 100)"
 
   # No verdict-bearing comment at all → awaiting-review.
@@ -299,17 +630,704 @@ if command -v jq >/dev/null 2>&1; then
   # Latest verdict wins: an LGTM posted after an earlier CHANGES_REQUESTED → ready.
   check "real latest-verdict-wins (LGTM after CR) → ready" "ready" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
-       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"## Verdict: CHANGES_REQUESTED\n"},{"createdAt":"'"$FRESH"'","body":"## Verdict: LGTM\n"}')" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"<!-- creek-review pr=100 -->\n\n## Verdict: CHANGES_REQUESTED\n"},{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Verdict: LGTM\n"}')" \
        run 100)"
 
-  # A real, fresh `## Verdict: LGTM` that predates HEAD is still stale → awaiting.
-  check "real ## Verdict: LGTM but stale → awaiting-review" "awaiting-review" \
+  # A real verdict that predates HEAD is still stale → awaiting. MARKED,
+  # deliberately: an unmarked body here would be refused for TWO reasons at once
+  # (stale AND unattested, after #1181), so deleting the freshness comparison
+  # outright would leave the case green — a confound, not a test. With the
+  # marker present the ONLY thing between this lane and `ready` is the
+  # stale-verdict guard. `**Verdict:**` rather than `## Verdict:` so it is not a
+  # restatement of the provenance block's own stale case either: this is the one
+  # place the alternate spelling is exercised on the LGTM-detecting side.
+  check "real **Verdict:** LGTM but stale → awaiting-review" "awaiting-review" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
-       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"## Verdict: LGTM\n"}')" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"<!-- creek-review pr=100 -->\n\n**Verdict:** LGTM\n"}')" \
        run 100)"
-else
-  echo "  skip - real-jq verdict-regex cases (jq not installed)"
-fi
+
+  # ==========================================================================
+  # VERDICT PROVENANCE: which PR did that verdict actually review? (issue #1181)
+  # ==========================================================================
+  # `.github/workflows/code-review.yml`'s `prompt:` never states the PR number,
+  # and `actions/checkout` puts the runner in DETACHED HEAD on
+  # `refs/pull/<N>/merge`. So the review agent's first command — `gh pr view
+  # --json number,…` — fails with "could not determine current branch: failed to
+  # run git: not on any branch", and it GUESSES.
+  #
+  # On PR #1117 (verdict posted 2026-08-07T05:27:24Z) it ran `gh pr list --state
+  # all --json number,title,headRefName,mergeCommit,commits`, matched the merge
+  # ref's base parent 46182a6f against PR #1179's `mergeCommit.oid`, and reviewed
+  # #1179's `cryptography`-bump diff — `gh pr diff 1179`, `gh pr view 1179`, `gh
+  # pr checks 1179`. The workflow then posted that LGTM onto #1117, and
+  # `pr-ready.sh 1117` printed `ready`. Gate 4 was bypassed on a 38-file
+  # authenticated HTTP surface by a verdict about a dependency bump.
+  #
+  # THE FIX, and what these cases pin. code-review.yml PREPENDS a machine-
+  # readable marker computed by the WORKFLOW from
+  # `${{ github.event.pull_request.number }}` — never from anything the agent
+  # says — in the shape of the `<!-- review-self-skip -->` marker that file
+  # already uses:  `<!-- creek-review pr=1117 -->`.  pr-ready.sh reads that
+  # marker FROM THE SAME COMMENT its VERDICT_RE selector already picked, and
+  # treats a verdict whose marker is absent, malformed, or names a DIFFERENT PR
+  # as no verdict at all: it gates neither `ready` NOR `changes-requested`, so
+  # the lane reads `awaiting-review`.
+  #
+  # It is a PROVENANCE ATTESTATION, not a wrong-diff detector. It cannot tell
+  # you the agent read the right diff; it proves the verdict was posted by a
+  # pipeline version that runs the workflow-side `reviewed_pr_number`
+  # cross-check. That is why exactly ONE key is defined (`pr=`) and why legacy
+  # unmarked verdicts are NOT grandfathered: the entire population of them was
+  # posted by the pipeline that had the bug, so "old but honest" is not a
+  # distinction the data supports.
+  #
+  # A second `createdAt` strictly newer than $FRESH, so a case can have TWO
+  # verdicts that are both fresh — the shape that makes "fall back to the newest
+  # CORRECTLY MARKED verdict" look attractive and be wrong.
+  LATER="2026-07-01T12:00:00Z"
+
+  # THE INCIDENT, replayed. PR #1117's own thread carrying the verdict that was
+  # actually posted to it: fresh, LGTM, and marked for #1179. Nothing else about
+  # this lane is wrong — CI green, CLEAN, current, verdict newer than HEAD — so
+  # the marker is the only thing between it and a merge, which is exactly the
+  # situation on 2026-08-07.
+  check "the #1117 incident: fresh LGTM marked for a DIFFERENT PR → awaiting-review" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=1179 -->\n\n## Summary\nPR #1179 raises the cryptography floor to clear PYSEC-2026-3552.\n\n## Verdict: LGTM\n"}')" \
+       run 1117)"
+
+  # A LEGACY verdict: posted by the pipeline that had the bug, so nothing about
+  # it says which PR the agent read. Not grandfathered — an absent marker is the
+  # single most common shape of the failure, and exempting it would exempt the
+  # bug.
+  check "unmarked fresh LGTM (legacy verdict) → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # It gates NEITHER direction. An unattested CHANGES_REQUESTED is not evidence
+  # that THIS PR needs changes — it may be a verdict about somebody else's diff
+  # — so it must not dispatch address-feedback either. `changes-requested` here
+  # would send a fix worker at a review nobody performed, and the worker would
+  # "address" feedback about another PR's code.
+  check "unmarked fresh CHANGES_REQUESTED → awaiting-review, not changes-requested" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\nnope\n\n## Verdict: CHANGES_REQUESTED\n"}')" \
+       run 100)"
+
+  # MALFORMED markers. `pr=` with no value and `pr=abc` are what a broken
+  # interpolation emits (an empty `github.event.pull_request.number`, a literal
+  # `${{ … }}` that never expanded). `pr=11 17` is the whitespace-mangled
+  # number. The last one is the mutation-resistant case: `pr=100 7` on PR 100
+  # SATISFIES a lax `pr=([0-9]+)` extractor, which would read 100 and merge —
+  # only a whole-marker match (`<!-- creek-review pr=<digits> -->` and nothing
+  # else) refuses it. None of these is a marker this workflow can emit, so none
+  # of them attests to anything.
+  for mm in '<!-- creek-review pr= -->' \
+            '<!-- creek-review pr=abc -->' \
+            '<!-- creek-review pr=11 17 -->' \
+            '<!-- creek-review pr=100 7 -->'; do
+    check "malformed marker '$mm' → awaiting-review" "awaiting-review" \
+      "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+         COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"'"$mm"'\n\n## Verdict: LGTM\n"}')" \
+         run 100)"
+  done
+
+  # THE CONTROL. Without it, an implementation that simply always printed
+  # `awaiting-review` from the verdict branch would pass every case above and
+  # wedge the entire fleet. Marker present, well-formed, naming THIS PR: merge.
+  check "marker present and MATCHING, fresh LGTM → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # STRING equality, not numeric — and `0100` is THE value to pin, because it is
+  # the one point in the whole space where `-eq` and `!=` disagree AND the two
+  # shells this repo actually runs on disagree with EACH OTHER. Measured, not
+  # assumed:
+  #
+  #   bash 5.3.15                        [[ "0100" -eq 100 ]] → TRUE   -eq 64 → FALSE
+  #   bash 3.2 (stock /bin/bash, macOS)  [[ "0100" -eq 100 ]] → FALSE  -eq 64 → TRUE
+  #
+  # (bash 5 reads the leading zero as decimal in `[[ ]]`'s arithmetic context;
+  # bash 3.2 reads it as octal 64. Both agree that `[[ "" -eq 100 ]]` and
+  # `[[ "abc" -eq 100 ]]` are FALSE, so an absent or lettered marker is not what
+  # a numeric compare would get wrong.) A numeric compare would therefore make
+  # the MERGE GATE shell-version-dependent: the same marker clears on CI's bash
+  # and refuses on the operator's, or the reverse, with nothing in the output to
+  # say which happened. String equality is exact and version-independent, and it
+  # is what the emitter produces: the workflow interpolates
+  # `github.event.pull_request.number` verbatim through `%s`, so anything but
+  # the verbatim bytes is a marker this pipeline did not emit.
+  check "leading-zero marker pr=0100 on PR 100 → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=0100 -->\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # THE SAME-COMMENT INVARIANT. The marker must be read from the comment
+  # VERDICT_RE already selected — the same `$v` binding in the same jq
+  # expression, never a second scan of the thread. Here an OLDER comment carries
+  # a perfectly valid marker for this very PR and no verdict at all, while the
+  # NEWER (selected) comment carries the verdict and no marker. Any whole-thread
+  # question ("does this PR have a matching marker anywhere?") answers yes and
+  # merges an unattested verdict — and every PR reviewed even once would have
+  # such a comment.
+  check "marker on an OLDER comment does not vouch for the selected verdict" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"<!-- creek-review pr=100 -->\n\nStarting the review now."},{"createdAt":"'"$FRESH"'","body":"## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # LATEST-VERDICT-WINS still decides WHICH comment is the verdict; provenance
+  # only decides whether that one counts. Both verdicts here are fresh, so an
+  # implementation that fell back to "the newest CORRECTLY MARKED verdict" would
+  # resurrect the older one and merge — reviving a verdict the reviewer itself
+  # superseded, which is the stale-verdict guard's failure mode one field over.
+  check "older MARKED LGTM + newer UNMARKED LGTM → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Verdict: LGTM\n"},{"createdAt":"'"$LATER"'","body":"## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # LINE-ANCHORED, exactly like the verdict line itself. The marker occupies its
+  # own line because the workflow's printf puts it there; a body-substring
+  # search would let review PROSE that merely quotes a marker attest to the
+  # verdict — and a review of THIS change would quote one.
+  check "marker embedded mid-line → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\nsome prose <!-- creek-review pr=100 --> more prose\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # THE TAIL ANCHOR, ISOLATED. Nothing above actually exercises it: the mid-line
+  # case is refused by the LEADING `^`, and `pr=100 7` is refused by the literal
+  # ` -->`. So `(?m)^<!-- creek-review pr=([0-9]+) -->` — MARKER_RE with its
+  # `[[:space:]]*$` tail deleted — survives every other provenance case in this
+  # file while admitting the body below, and the body below is the REALISTIC
+  # forgery: review prose that quotes a marker at the start of its own line.
+  # A review of THIS change quotes one. The marker must be the whole line, or a
+  # reviewer who writes it down attests on the author's behalf.
+  check "marker followed by prose on the SAME line → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 --> as quoted above\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # FIRST MARKER, NOT LAST. No other fixture in this file puts TWO markers in one
+  # body, so swapping `first` for `last` (or `.[-1]`) in the `[scan(…)] | flatten
+  # | first` extraction survives everything above. Under `last` this body
+  # ATTESTS: a genuine `pr=999` marker at the top — the #1117 shape, a verdict
+  # produced for another PR — plus a column-0 marker quoted in the review's own
+  # prose, which is all a chatty reviewer (or a forger) has to write to move the
+  # attestation onto this PR. The emitter PREPENDS exactly one marker, so only
+  # the first one can be the one it produced; everything after it is content.
+  check "quoted pr=100 marker BELOW a genuine pr=999 marker → awaiting-review" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=999 -->\n\n## Summary\nThe marker this change adds looks like:\n\n<!-- creek-review pr=100 -->\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # CRLF, the one LOOSENING that is load-bearing. MARKER_RE's trailing
+  # `[[:space:]]*` is described in pr-ready.sh as "the one cheap hedge against
+  # the correlated failure this whole guard's polarity depends on not
+  # happening": a comment body that came back CRLF-delimited would unmark every
+  # verdict in the fleet AT ONCE, and the #1181 polarity argument ("a false hold
+  # is one push away from repair") does not survive a fleet-wide false hold.
+  # Delete that `[[:space:]]*` and only this case goes red.
+  check "CRLF comment body still attests → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\r\n\r\n## Summary\ngood\r\n\r\n## Verdict: LGTM\r\n"}')" \
+       run 100)"
+
+  # THE GUARDS COMPOSE: provenance is ADDED to the freshness rule, not
+  # substituted for it. A correctly attested LGTM that predates HEAD reviewed
+  # code that is no longer there. (The unmarked twin above is held for two
+  # reasons after #1181; this one isolates the freshness half.)
+  check "marker MATCHING but verdict STALE → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"<!-- creek-review pr=100 -->\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # PROSE IS NOT PROVENANCE. Real reviews name other PRs constantly ("supersedes
+  # #1179", "same shape as PR 1179"), and the incident's own summary opened with
+  # `PR #1179`. Only the marker line attests. A naive `#[0-9]+` body grep — the
+  # obvious cheap "did it review the right PR?" heuristic — reads this
+  # correctly-attested verdict as a mismatch and wedges the lane at
+  # `awaiting-review` forever, with no verdict the reviewer could post to fix it.
+  check "prose naming other PRs does not override the marker → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Summary\nSupersedes #1179; same shape as PR 1179.\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # THE DEPENDABOT LANE. A mismatched verdict must not fall through into the one
+  # shortcut that merges WITHOUT a review. The rollup here carries a real
+  # non-SKIPPED entry because that is the only universe in which this comment
+  # exists — a posted verdict proves the `claude-review` job ran — so
+  # `review_gate_absent` is false and the hold holds for free. That free-ness is
+  # a property of the FIXTURE being realistic, which is exactly why it is
+  # pinned: a future change that stops consulting the rollup on this path turns
+  # a verdict about another PR into `ready-unreviewed`.
+  check "dependabot lane + mismatched marker → awaiting-review, never ready-unreviewed" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+       PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+       REVIEW_CONCLUSIONS="SKIPPED,SUCCESS" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=999 -->\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # THE ALL-SKIPPED SIBLING — the one place this guard can push a lane the WRONG
+  # WAY, and the case the fixture above hides. That lane's rollup carries a real
+  # non-SKIPPED entry, so `review_gate_absent` is false whatever the verdict
+  # does and the hold holds for free. Take that away — a Dependabot lane whose
+  # every `claude-review` entry really IS SKIPPED, plus a real non-review
+  # SUCCESS — and blanking the verdict does not merely withhold `ready`: it
+  # hands the lane to the shortcut that merges with NO review at all.
+  # `ready-unreviewed` is merge-adjacent (watch-pr.sh does not treat it as
+  # in-flight, and ralph-tick.md Step 1 routes on it), so a lane that HAS a
+  # posted verdict now comes out FURTHER ALONG than one that does not. Before
+  # #1181 this same fixture printed `changes-requested` (actionable) or
+  # `awaiting-review` (a wait); after it, `ready-unreviewed`.
+  #
+  # That contradicts pr-ready.sh's own precedence rule, stated in its header and
+  # again at the `review_gate_absent` call site: "a posted verdict proves a
+  # review gate exists, so the verdict — not the shortcut — decides." A comment
+  # carrying a `## Verdict:` line is proof the review job RAN. An unreadable
+  # marker makes that verdict INADMISSIBLE; it does not make the review gate
+  # NON-EXISTENT, and non-existence is the shortcut's whole precondition.
+  #
+  # Both verdict flavours, because they reach the shortcut by different routes:
+  # the LGTM falls through the freshness/LGTM test, the CHANGES_REQUESTED
+  # through the `verdict_lgtm == false` test — and neither may end at a token
+  # the loop will merge on. `awaiting-review` and not merely "not mergeable",
+  # because pr-ready.sh's own header fixes the destination: a refused verdict
+  # "gates neither `ready` nor `changes-requested`, so the lane falls through to
+  # `awaiting-review`". `changes-requested` here would dispatch a fix worker at
+  # a review nobody can attribute; `ready-unreviewed` would merge on it.
+  for vflav in LGTM CHANGES_REQUESTED; do
+    check "dependabot lane, all-SKIPPED review + UNMARKED $vflav → awaiting-review" \
+      "awaiting-review" \
+      "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+         PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+         REVIEW_CONCLUSIONS="SKIPPED" \
+         COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\nfine\n\n## Verdict: '"$vflav"'\n"}')" \
+         run 100)"
+  done
+
+  # THE CONTROL for the two above, and the guard against the lazy fix. The same
+  # lane with NO verdict-bearing comment at all — one chat comment — must STILL
+  # take the shortcut. Otherwise "stop `ready-unreviewed` firing after a
+  # verdict" degenerates into "delete `ready-unreviewed`", which re-wedges every
+  # Dependabot bump at `awaiting-review` forever waiting for a review the
+  # workflow provably never runs: the exact deadlock that token exists to break.
+  # The discriminator is "did a verdict comment EXIST", not "is the rollup
+  # clean".
+  check "dependabot lane, all-SKIPPED review + NO verdict comment → ready-unreviewed" \
+    "ready-unreviewed" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+       PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+       REVIEW_CONCLUSIONS="SKIPPED" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"just a chat comment"}')" \
+       run 100)"
+
+  # THE OTHER TWO REFUSAL SHAPES, on the same all-SKIPPED lane. The `$vflav`
+  # pair above is the ABSENT-marker flavour only, and absent is the arm whose
+  # marker field comes back EMPTY — so an implementation that latched on the
+  # MARKER field rather than on `$verdict_date` would fail there and pass here,
+  # while one that latched on the guard having FIRED would pass all three of
+  # these and fail only the stale case below. Malformed and mismatched reach
+  # `review_gate_absent` through the guard's blanking exactly as absent does,
+  # and neither may end at the merge-adjacent token either.
+  for mk in 'pr=abc:malformed' 'pr=999:mismatched'; do
+    check "dependabot lane, all-SKIPPED review + ${mk#*:} marker → awaiting-review" \
+      "awaiting-review" \
+      "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+         PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+         REVIEW_CONCLUSIONS="SKIPPED" \
+         COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review '"${mk%%:*}"' -->\n\n## Verdict: LGTM\n"}')" \
+         run 100)"
+  done
+
+  # THE LATCH WITH THE PROVENANCE GUARD ENTIRELY UNINVOLVED — the one route
+  # through `verdict_comment_seen` that nothing else in this file travels, and
+  # the one pr-ready.sh's own latch comment names when it lists "is STALE"
+  # alongside "was REFUSED" and "came back MALFORMED".
+  #
+  # Every other STALE fixture here omits PR_AUTHOR/HEAD_AUTHOR/REVIEW_CONCLUSIONS,
+  # so `review_gate_absent` fails on the author long before the latch could
+  # matter and the two are indistinguishable. This lane is a Dependabot bump that
+  # would genuinely earn `ready-unreviewed` on its own evidence — bot PR, bot
+  # HEAD commit, a real non-review SUCCESS, every `claude-review` entry SKIPPED,
+  # behind_by 0, CLEAN — carrying a verdict whose marker is PERFECT (`pr=100`, so
+  # the guard never fires and blanks nothing) and whose only defect is that it
+  # predates HEAD.
+  #
+  # Delete the latch and this prints `ready-unreviewed`: the stale-verdict guard
+  # withholds `ready`, the `verdict_lgtm == "false"` branch cannot fire (the
+  # verdict says true), and `review_gate_absent` — which sees only the author and
+  # the rollup — clears. A lane whose reviewer looked at it and said LGTM would
+  # then merge under the token reserved for lanes NO reviewer will ever look at,
+  # on the strength of a review of code that is no longer there. `awaiting-review`
+  # is the whole point: the re-review is owed and the workflow will run it,
+  # because a verdict comment on the thread is proof the job posts here.
+  check "dependabot lane, all-SKIPPED review + STALE but MARKED LGTM → awaiting-review" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+       PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+       REVIEW_CONCLUSIONS="SKIPPED" \
+       COMMENTS_JSON="$(cj '{"createdAt":"'"$STALE"'","body":"<!-- creek-review pr=100 -->\n\n## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
+       run 100)"
+
+  # THE DIAGNOSTIC. `awaiting-review` is an IN-FLIGHT token (it is in
+  # watch-pr.sh's IN_FLIGHT_TOKENS), so a lane held by this gate is
+  # indistinguishable from one whose review simply has not landed — and the
+  # operator's reflex, re-running the old review workflow run, replays the same
+  # agent from the same detached HEAD and posts another unattested verdict. The
+  # remedy is a sync onto a `main` that carries the fixed workflow, so the
+  # holder has to SAY so, on stderr, where `run()` deliberately does not look.
+  # Several assertions rather than one string match: the wording may improve, the
+  # facts may not go missing.
+  err="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+         COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"## Summary\ngood\n\n## Verdict: LGTM\n"}')" \
+         run_err 100)" || err="exit-$?"
+  says "unattested-verdict diagnostic names the remedy (fleet.sh sync)" \
+    'fleet\.sh sync' "$err"
+  says "unattested-verdict diagnostic names re-running the old run" 're-?run' "$err"
+  says "unattested-verdict diagnostic says that will NOT help" 'not help' "$err"
+  says "unattested-verdict diagnostic cites the issue (#1181)" '#1181' "$err"
+
+  # …AND TWO OF THEM MUST BE THE ABSENT ARM'S OWN WORDS. Every pattern above
+  # matches a line pr-ready.sh prints for ALL THREE `case` arms, and `$err` here
+  # comes from the ABSENT-marker fixture — so before these two, deleting the
+  # absent arm outright left the suite green while a legacy lane was told "A
+  # verdict produced for another PR … Do NOT merge", which is precisely the
+  # confusion the block below calls dangerous. Each arm must pin at least one
+  # string that only IT can produce; `marker_what` and `marker_tail` are the two
+  # strings the `case` actually chooses between.
+  says "absent-marker diagnostic says the marker is MISSING, not wrong" \
+    'carries NO provenance marker' "$err"
+  says "absent-marker diagnostic explains it as a pre-#1181 verdict" \
+    'before #1181 landed' "$err"
+
+  # …AND THE THREE VARIANTS MUST STAY THREE. Four of the six assertions above
+  # sit on lines pr-ready.sh prints for EVERY arm; the last two are the absent
+  # arm's own `marker_what` / `marker_tail`. This block supplies the same for the
+  # other two arms, so the rule holds across all three: each arm pins at least
+  # one string only IT can produce, and collapsing the whole `case` into one
+  # generic message now goes red three times over rather than passing silently.
+  # The generic message is precisely the one that leaves an operator unable to
+  # tell apart:
+  # "this predates #1181, push anything" / "the emitter is broken, do NOT touch
+  # the parser" / "somebody's verdict landed on the wrong PR, do not merge this
+  # at all". Those are three different remedies, and two of them are dangerous
+  # if confused with the first.
+  #
+  # MISMATCHED: the #1117 shape. It must name BOTH numbers (the operator's next
+  # move is to go look at the OTHER PR) and it must say do not merge, because
+  # unlike the other two arms this one can mean the review pipeline attested
+  # something false rather than merely nothing.
+  err_mismatch="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+         COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=1179 -->\n\n## Verdict: LGTM\n"}')" \
+         run_err 100)" || err_mismatch="exit-$?"
+  says "mismatched-marker diagnostic names BOTH PR numbers" \
+    'names PR #1179, not #100' "$err_mismatch"
+  says "mismatched-marker diagnostic says do NOT merge" 'do not merge' "$err_mismatch"
+
+  # MALFORMED: the emitter and this parser have drifted, which is the ONE arm
+  # whose remedy is a code change rather than a push — and the tempting code
+  # change is the wrong one. The message has to point at the emitter and
+  # explicitly forbid loosening the parser, or the fleet-wide hold this shape
+  # causes gets "fixed" by deleting the guard.
+  err_malformed="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+         COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=abc -->\n\n## Verdict: LGTM\n"}')" \
+         run_err 100)" || err_malformed="exit-$?"
+  says "malformed-marker diagnostic names the emitter/parser drift" \
+    'drift' "$err_malformed"
+  says "malformed-marker diagnostic forbids loosening the parser" \
+    'do not loosen the parser' "$err_malformed"
+
+  # ==========================================================================
+  # THE SECOND EMITTER: iteration-trigger.yml's executive summary (issue #1181)
+  # ==========================================================================
+  # Everything above assumes the only thing on a PR that matches VERDICT_RE is a
+  # review comment. In THIS repo that is false, and the comment that falsifies it
+  # posts LAST on every lane.
+  #
+  # `.github/workflows/iteration-trigger.yml` posts a four-line executive summary
+  # whenever CI completes green and a review verdict exists. Its emitted body is
+  # `printf '%s\n%s\n%s\n%s\n'` over `<!-- iteration-trigger -->`,
+  # `**CI**: G/T Green`, `**VERDICT**: V`, `**Action**: A` (that file's final
+  # step). The second line SATISFIES VERDICT_RE: the `(?:#{1,6}\s+|\*\*)?`
+  # alternative pr-ready.sh deliberately tolerates matches the leading `**`,
+  # `verdict` matches `VERDICT` case-insensitively, and `[:*\s]` matches the
+  # second `*` — after which `[:*\s]+lgtm` matches `**: LGTM` and
+  # VERDICT_LGTM_RE is satisfied too. Measured through these very patterns with
+  # jq: VERDICT_RE true, VERDICT_LGTM_RE true, `creek-review` marker NONE.
+  #
+  # IT IS NOT A VERDICT. It is a REPORT OF one: that workflow selects the review
+  # comment with `jq '[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last'`
+  # and copies the verdict out of it. It cannot carry `<!-- creek-review pr=N -->`
+  # and must not — the marker attests that the CODE-REVIEW pipeline produced the
+  # comment, and this one is posted by a workflow that never read the diff. So
+  # after #1181 the summary is refused on every lane, and because it posts LAST
+  # the `| last` selector picks it on every lane.
+  #
+  # MEASURED, NOT HYPOTHESISED. Merged PR #906's comment tail:
+  #   06:53:17Z  `## Summary\nPR #906 fixes false-positive "broke…`  ← the review
+  #   06:53:32Z  `<!-- iteration-trigger -->\n**CI**: 4/7 Green…`    ← 15 s later
+  #   07:03:05Z  `<!-- iteration-trigger -->\n**CI**: 10/10 Green…`  ← LAST
+  # Same shape on #905, #904 and #902 — 4 of 4. The result is the correlated
+  # FLEET-WIDE hold pr-ready.sh's own #1181 polarity block says this guard cannot
+  # afford: every lane reads `awaiting-review`, `awaiting-review` is in
+  # watch-pr.sh's IN_FLIGHT_TOKENS so the watcher sleeps on it, and the documented
+  # un-wedge ("one push by anybody") does NOT clear it — a push produces a fresh
+  # review comment and then, 15 s later, a fresh unmarked summary. The polarity
+  # block's neutralising leg is the emitter coupling test, and that test only ever
+  # knew about ONE emitter.
+  #
+  # THE FIX these cases pin: exclude the iteration-trigger summary from the
+  # verdict SELECTOR, inside the same single `--jq`. iteration-trigger.yml already
+  # does the mirror image for itself (it selects only comments matching
+  # `(^|\n)## Verdict:`, which no summary of its own carries), so the asymmetry is
+  # one-sided.
+  #
+  # WHY THE SUITE COULD NOT SEE THIS: no fixture anywhere in this file carried an
+  # iteration-trigger summary. Multi-comment fixtures existed (the
+  # latest-verdict-wins pair above is one), so "the suite only modelled single
+  # comments" is NOT the reason and stating it that way would send the next
+  # reader looking for the wrong gap. The reason is narrower and worse: the bench
+  # modelled ONE producer of verdict-shaped comments, and the repo has two.
+
+  # The summary's marker, READ OUT OF THE EMITTER rather than restated here, so
+  # the fixtures below carry the workflow's bytes and not the test's — the same
+  # round-trip discipline the code-review.yml coupling block at the end of this
+  # file applies to the FIRST emitter, applied now to the second. Rename `MARKER:`
+  # in iteration-trigger.yml without teaching pr-ready.sh the new name and W1/W2
+  # below go red on the rename itself.
+  ITER_TRIGGER_WORKFLOW="$(cd "$(dirname "$0")/../.." && pwd)/.github/workflows/iteration-trigger.yml"
+  ITER_MARKER_EXPECTED='<!-- iteration-trigger -->'
+  ITER_MARKER="$(sed -n "s/^[[:space:]]*MARKER: '\([^']*\)'[[:space:]]*\$/\1/p" \
+                 "$ITER_TRIGGER_WORKFLOW" | head -n 1 || true)"
+  # Kills the mutant that renames the emitter's marker and leaves the parser
+  # behind: this is the one coupling that cannot be inferred from either file
+  # alone, and drift in it re-opens the fleet wedge silently.
+  check "iteration-trigger.yml's MARKER: is the literal pr-ready.sh must exclude" \
+    "$ITER_MARKER_EXPECTED" "$ITER_MARKER"
+  # Fall back ONLY so the behavioural cases still assert something: with an empty
+  # marker every fixture body below would start with a blank line, and an empty
+  # exclusion pattern matches every comment — the cases would pass while testing
+  # nothing. The `check` above has already reported the drift.
+  [[ -n "$ITER_MARKER" ]] || ITER_MARKER="$ITER_MARKER_EXPECTED"
+
+  # A comment object whose body is escaped by `jq -Rs` rather than by hand, for
+  # the reason `marker_body` at the end of this file gives: a hand-written `\\n`
+  # can disagree with the bytes the fixture claims to carry, and these bodies are
+  # multi-line by nature.
+  rev_comment() { # rev_comment <createdAt> <body>
+    printf '{"createdAt":"%s","body":%s}' "$1" "$(printf '%s' "$2" | jq -Rs .)"
+  }
+
+  # The executive summary in its EMITTED shape. `**VERDICT**` and `**Action**` are
+  # reproduced verbatim rather than abbreviated because they are the two fields
+  # `.claude/skills/await-claude-review/SKILL.md` Step 4a actually reads.
+  iter_summary() { # iter_summary <createdAt> <CI field> <VERDICT field> <Action field>
+    rev_comment "$1" "${ITER_MARKER}
+**CI**: $2
+**VERDICT**: $3
+**Action**: $4
+"
+  }
+
+  # The two `**Action**:` strings iteration-trigger.yml can emit on a lane whose
+  # verdict is admissible: the cleared-to-merge instruction from its final `else`,
+  # and the iterate line from the outer `else` (a summary posted while CI was not
+  # yet fully green). Both are verbatim from that file.
+  ITER_ACTION_CLEARED='You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed.'
+  ITER_ACTION_ITERATE='pull comment 4242 to see in-depth feedback and continue iterating'
+
+  # A third stamp, strictly newer than $LATER: the live shape needs THREE comments
+  # in chronological order, all of them fresher than HEAD.
+  LATEST="2026-07-01T13:00:00Z"
+
+  # The review bodies, in code-review.yml's emitted shape: the marker printf
+  # (`<!-- creek-review pr=%s -->\n\n` > review.md), the review markdown, then
+  # `\n\n## Verdict: %s\n` appended.
+  MARKED_LGTM_BODY='<!-- creek-review pr=100 -->
+
+## Summary
+good
+
+## Verdict: LGTM
+'
+  MARKED_CR_BODY='<!-- creek-review pr=100 -->
+
+## Summary
+one blocking issue
+
+## Verdict: CHANGES_REQUESTED
+'
+  UNMARKED_LGTM_BODY='## Summary
+good
+
+## Verdict: LGTM
+'
+
+  # W1 — THE LIVE SHAPE, AND THE FLEET WEDGE. PR #906's tail exactly: a
+  # correctly-marked review LGTM, then the summary the trigger posted 15 s later,
+  # then the one it posted after the next CI round. The marked LGTM is the only
+  # verdict on this thread; the summaries quote it.
+  #
+  # FAILS TODAY with `awaiting-review` — the selector takes the LAST comment
+  # matching VERDICT_RE, which is a summary, and a summary can never carry a
+  # `creek-review` marker, so the provenance guard refuses it and the lane holds
+  # forever.
+  #
+  # TWO summaries rather than one, on purpose: that also kills "if the LAST
+  # comment is a summary, take the one before it", which is wrong on every lane
+  # whose CI ran more than once — i.e. on every lane that was ever synced.
+  w1_json="$(cj "$(rev_comment "$FRESH" "$MARKED_LGTM_BODY"),$(iter_summary "$LATER" '4/7 Green' 'LGTM' "$ITER_ACTION_ITERATE"),$(iter_summary "$LATEST" '10/10 Green' 'LGTM' "$ITER_ACTION_CLEARED")")"
+  check "W1 marked LGTM + TWO iteration-trigger summaries → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w1_json" run 100)"
+
+  # W2 — THE SAME WEDGE ON THE ACTIONABLE SIDE. A marked, fresh
+  # `## Verdict: CHANGES_REQUESTED` followed by its summary. The reviewer's
+  # verdict must still decide, and the summary must not be what is read.
+  #
+  # FAILS TODAY with `awaiting-review`: the summary is selected, carries no
+  # marker, and the provenance guard blanks the verdict fields before the
+  # `verdict_lgtm == "false"` branch can fire — so the lane that most needs a fix
+  # worker dispatched instead reads as in-flight and nobody is woken.
+  #
+  # `CHANGES REQUESTED` with a SPACE in the summary and an UNDERSCORE in the
+  # review comment is not a typo: iteration-trigger.yml's `case` sets
+  # `VERDICT='CHANGES REQUESTED'` (its own bytes), while code-review.yml appends
+  # `## Verdict: CHANGES_REQUESTED`. Both are reproduced as their emitters write
+  # them.
+  w2_json="$(cj "$(rev_comment "$FRESH" "$MARKED_CR_BODY"),$(iter_summary "$LATER" '10/10 Green' 'CHANGES REQUESTED' "$ITER_ACTION_ITERATE")")"
+  check "W2 marked CHANGES_REQUESTED + its summary → changes-requested" "changes-requested" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w2_json" run 100)"
+
+  # W3 — THE SUMMARY MUST NOT RESCUE AN UNATTESTED VERDICT EITHER. An unmarked
+  # (legacy) review verdict followed by a summary: skipping the summary must land
+  # on the real review comment and REFUSE it, not reach past it for something
+  # admissible.
+  #
+  # GREEN TODAY, and honestly so: today the summary is selected and refused for
+  # want of a marker, so this lands on the expected token by a different route.
+  # It is here for the FIX, and the mutant it kills is the same-comment invariant
+  # one — an exclusion implemented by re-binding `createdAt`/`isLGTM` to the
+  # comment BEFORE the summary while leaving the marker extraction bound to the
+  # comment it skipped (or dropping the marker check on that path because "we
+  # skipped a summary, so what is left must be a review comment"). Under that
+  # implementation this unmarked legacy LGTM comes out `ready`, which is #1181's
+  # own failure with one extra step.
+  w3_json="$(cj "$(rev_comment "$FRESH" "$UNMARKED_LGTM_BODY"),$(iter_summary "$LATER" '10/10 Green' 'LGTM' "$ITER_ACTION_CLEARED")")"
+  check "W3 UNMARKED verdict + summary → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w3_json" run 100)"
+
+  # W3b — THE REACH-BACK MUTANT, which W3 alone does not kill. Same shape plus an
+  # OLDER, correctly-marked, still-FRESH LGTM underneath. The rule pinned at
+  # "older MARKED LGTM + newer UNMARKED LGTM → awaiting-review" above is CORRECT
+  # and stays: latest verdict wins, and provenance only decides whether that one
+  # counts. Excluding the summary must not turn the selector into "the newest
+  # correctly MARKED verdict", which would resurrect a verdict the reviewer itself
+  # superseded and merge on it.
+  #
+  # GREEN TODAY (the summary is selected and refused). Under that mutant it prints
+  # `ready`.
+  w3b_json="$(cj "$(rev_comment "$FRESH" "$MARKED_LGTM_BODY"),$(rev_comment "$LATER" "$UNMARKED_LGTM_BODY"),$(iter_summary "$LATEST" '10/10 Green' 'LGTM' "$ITER_ACTION_CLEARED")")"
+  check "W3b older MARKED + newer UNMARKED + summary → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w3b_json" run 100)"
+
+  # W4 — THE SUMMARY ALONE. No review comment at all. Excluding it must leave
+  # "no verdict was posted", never "some verdict was posted".
+  #
+  # GREEN TODAY (selected, unmarked, refused) — AND IT IS THE ONLY CASE HERE THAT
+  # KILLS THE TEMPTING WRONG FIX. That fix is "the summary is posted by our own
+  # workflow, so accept `<!-- iteration-trigger -->` as a second provenance
+  # marker" instead of excluding it, and it passes W1 (summary says
+  # `**VERDICT**: LGTM` → ready) and W2 (summary says CHANGES REQUESTED →
+  # changes-requested) exactly as the real fix does. Here it prints `ready` for a
+  # PR on which no reviewer ever spoke. It is also strictly weaker than the
+  # marker it would join: `<!-- creek-review pr=N -->` names the PR, while these
+  # four lines name nothing at all, so anyone who can comment could write them.
+  # W1 and W2 are the wedge; this is the case that keeps its fix honest.
+  w4_json="$(cj "$(iter_summary "$FRESH" '10/10 Green' 'LGTM' "$ITER_ACTION_CLEARED")")"
+  check "W4 iteration-trigger summary ALONE → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w4_json" run 100)"
+
+  # W5 — FRESHNESS COMES FROM THE REVIEW COMMENT. A marked LGTM that predates HEAD
+  # (it reviewed code that is no longer there) followed by a FRESH summary. The
+  # stale-verdict guard must read the REVIEW comment's `createdAt`, not the
+  # summary's.
+  #
+  # GREEN TODAY, and the reason matters: today the marker guard refuses the
+  # summary before freshness is ever consulted, so the pre-#1181 hole this shape
+  # opened (a stale review + a fresh summary reading as a FRESH LGTM → `ready`) is
+  # currently masked rather than closed. The mutant it kills is the two-selector
+  # implementation: one binding for the marker (summary excluded) and another for
+  # `createdAt` (summary included) — which prints `ready` here, and which is
+  # exactly the same-comment invariant the provenance block above already had to
+  # defend once.
+  w5_json="$(cj "$(rev_comment "$STALE" "$MARKED_LGTM_BODY"),$(iter_summary "$FRESH" '10/10 Green' 'LGTM' "$ITER_ACTION_CLEARED")")"
+  check "W5 STALE marked LGTM + FRESH summary → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w5_json" run 100)"
+
+  # W6 — THE EXCLUSION IS LINE-ANCHORED, NOT A BODY SUBSTRING. A genuine review
+  # comment whose PROSE quotes the marker mid-sentence must still be selectable.
+  #
+  # THE DECISION, and it is a decision (both directions fail closed — skipping a
+  # comment can only ever LOSE a verdict, never invent one — so this is a choice
+  # about how much verdict is lost, not about safety):
+  #   * `test("<!-- iteration-trigger -->")` is a SUBSTRING match, so any review
+  #     that quotes the marker is skipped. That is not hypothetical here: a review
+  #     of THIS VERY CHANGE quotes it, and the identical shape is already written
+  #     down twice for the OTHER marker ("a review of THIS change quotes one", at
+  #     the mid-line and same-line marker cases above). The cost is not one lost
+  #     verdict either — it is a lane wedged at `awaiting-review`, which is
+  #     precisely the failure this whole block exists to remove, re-introduced
+  #     through a narrower door.
+  #   * `(?m)^<!-- iteration-trigger -->[[:space:]]*$` costs nothing to match every
+  #     REAL summary: the emitter's `printf '%s\n…'` puts the marker on line 1 at
+  #     column 0, exactly as code-review.yml does for `creek-review`. It makes the
+  #     two markers' parse rules symmetric, and it is the pattern
+  #     iteration-trigger.yml itself already uses to read the creek-review marker
+  #     (`grep -oE '^<!-- creek-review pr=[0-9]+ -->[[:space:]]*$'`).
+  #   * The residual is ACCEPTED and named: a review that quotes the marker on a
+  #     line of its OWN (inside a fenced block) is still skipped. That is one
+  #     verdict lost on one PR, recoverable by one re-review — not a fleet-wide
+  #     hold. The tighter alternative — a BARE `^`, i.e. anchoring to the start of
+  #     the body, which is where the emitter always puts it — is rejected not
+  #     because it is wrong but because it rests on a flag DEFAULT, and this suite
+  #     runs Oniguruma while production runs RE2. MARKER_RE's engine note in
+  #     pr-ready.sh records that a confident claim about those defaults was
+  #     written down once, read the other way by a reviewer, and never measured by
+  #     anybody. Spelling `(?m)` out is what makes the pattern independent of both
+  #     defaults, and it is why MARKER_RE spells it out too.
+  # So: anchored. This case goes red under the substring implementation and stays
+  # green under the anchored one. It is GREEN TODAY (no exclusion exists yet, so
+  # the comment is selected on its own merits).
+  w6_json="$(cj "$(rev_comment "$FRESH" "<!-- creek-review pr=100 -->
+
+## Summary
+The wedge is that a ${ITER_MARKER} summary matches VERDICT_RE, so the selector picks it.
+
+## Verdict: LGTM
+")")"
+  check "W6 review PROSE quoting the summary marker mid-line → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w6_json" run 100)"
+}
+
+# The verdict answer is now THREE fields — `<createdAt>|<isLGTM>|<markerPr>` —
+# and it is split by FIELD COUNT for the same reason the mergeState answer at
+# pr-ready.sh:720-721 (`merge_rest`) and the rollup answer at :917-918 (`rest`,
+# inside `review_gate_absent`) are — cited by variable name as well as by line,
+# because pr-ready.sh moves: an RFC3339 stamp, a
+# jq boolean and a PR number can none of them contain `|`, so a fourth field
+# means the answer is not the shape we asked for. Blank it and wait, rather than
+# seek one end of the string and merge on whatever lands in the flag — the
+# `|`-injection class this file has already proven exploitable once.
+check "surplus field in the verdict answer → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+     VERDICT="$FRESH|true|100" VERDICT_PR=extra run 100)"
 
 # --- opt-out: a human hold beats every other signal ------------------------
 # `do-not-auto-merge` is the kill switch a human reaches for when a lane is green
@@ -617,6 +1635,574 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
 check "lazy compare: opt-out lane token" "optout" "$tok"
 probed "lazy compare: opt-out lane does not probe" "no" "$S_OPTOUT"
 
+# --- main health: the #1157 relaxation's PRECONDITION (issue #1159) ---------
+# #1157 let a lane that is behind `main` merge anyway whenever the two
+# changesets provably cannot interact. Its whole justification is one sentence
+# in pr-ready.sh's header (lines 274-276, inside the "WHY IT IS `behind_by > 0`
+# PLUS A REASON" block — named as well as line-cited, because pr-ready.sh
+# moves): "What backstops the residual risk is the full CI run on `push: main`
+# — every squash-merge re-proves the merged
+# result." Nothing in the loop had ever read that run's conclusion, so the
+# backstop was an assumption. It is now a check, and it is deliberately a
+# precondition of the RELAXATION, not a new gate on merging: only a lane that is
+# about to skip a sync has to prove the backstop is alive.
+#
+# The probe sits inside `branch_is_current`, AFTER the `behind_by == 0` fast
+# path and AFTER the merge-base validation, and BEFORE `main_changes_are_inert`.
+# Anything other than `green` — including an empty answer or a missing helper —
+# holds the lane as `main-not-green`.
+#
+# THE ANTI-MASKING PROOF: because the stub defaults MAIN_HEALTH to `green`,
+# someone could delete the probe from pr-ready.sh entirely and every
+# pre-existing test in this file would still pass. Three assertions below make
+# that impossible, and they only work TOGETHER:
+#   (1) MAIN_HEALTH=red → `main-not-green`   — the answer is actually consumed;
+#   (2) the sentinel is PRESENT on that lane — the call is actually made;
+#   (3) the sentinel is ABSENT on a BEHIND_BY=0 lane — the laziness holds, and
+#       the deadlock exception below is real rather than an accident.
+# Delete the probe and (1) and (2) fail; make the probe unconditional and (3)
+# fails. Do not remove any one of the three believing the others cover it.
+
+# THE RED CASE. This is the #1137 behind-but-inert lane — the one #1157 taught
+# the loop to merge — with `main` itself broken. Merging it would stack a second
+# unvalidated change on top of a tree that is already red, and the loop would
+# then read the resulting CI failure as THIS lane's fault.
+check "behind + inert files but main CI RED → main-not-green" "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=red run 100)"
+
+# Non-vacuity, and the guard that #1157 was not quietly re-tightened: the SAME
+# lane with a healthy `main` still merges. If this ever flips to `behind` or
+# `main-not-green`, the serialization #1137 measured (CI runs per PR 1.00 →
+# 1.61, p90 latency 15 → 104 minutes) is back.
+check "behind + inert files, main CI green → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=green run 100)"
+
+# THE DEADLOCK PIN. A lane that is NOT behind merges even while `main` is red,
+# and this must stay true forever, so a future "tighten it" refactor cannot
+# freeze the whole loop the first time somebody breaks `main`.
+#
+# Why it is safe, precisely: `behind_by == 0` means `main`'s HEAD is already an
+# ancestor of this branch's head. `.github/workflows/ci.yml` carries NO `paths:`
+# filter and runs the IDENTICAL job matrix on `push` and `pull_request`, and its
+# `actions/checkout@v7` has no `ref:` override — so this PR's CI ran on
+# `refs/pull/N/merge`, a tree that already contains whatever broke `main`. Its
+# green is therefore positive proof that the breakage is either absent from the
+# merged result or fixed by this very branch.
+#
+# Why it matters: that is exactly the shape of the PR that FIXES `main`. Without
+# this exception the remedy for a red `main` would itself be blocked by the red
+# `main`, and the loop would need a bypass label — one more thing to get wrong,
+# and one more thing that can be left switched on. Here the loop cannot deadlock
+# by construction.
+check "behind_by 0 with main CI RED → ready (the deadlock pin)" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     MAIN_HEALTH=red run 100)"
+
+# Fail CLOSED on everything that is not a green answer. `pending` is the common
+# one — `main` CI lags each merge by ~14 minutes — and it is still not evidence
+# that the backstop caught anything, so a lane that wants to SKIP a sync waits
+# one wake rather than merging on a maybe.
+check "behind + inert but main CI PENDING → main-not-green" "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=pending run 100)"
+
+check "behind + inert but main health UNKNOWN → main-not-green" "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=unknown run 100)"
+
+# A gh failure inside the sibling must not kill pr-ready.sh: the call sits under
+# `set -e`, so an unguarded invocation would abort the script mid-classification
+# and the orchestrator would see an empty answer with a non-zero exit — which its
+# contract defines as a TOOLING error, dispatching nothing and logging nothing
+# useful. MAIN_HEALTH=green alongside EC=1 is the dangerous shape: the happy
+# answer is already on stdout when the call fails.
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_HEALTH=green MAIN_HEALTH_EC=1 run 100)" || rc=$?
+check "main-health lookup failure → main-not-green" "main-not-green" "$out"
+check "main-health lookup failure still exits 0" "0" "$rc"
+
+# ORDERING — never sync INTO the breakage. A lane behind a RISK-SURFACE change
+# would normally print `behind`, whose remedy is `fleet.sh sync`. With `main`
+# red that remedy is actively harmful: the sync pulls the breakage into the
+# lane, burns a ~14-minute CI round, and turns the lane's OWN CI red — which
+# pr-ready.sh then classifies `ci-failed`, dispatching a fix worker onto a
+# failure the lane never caused. So main-health is consulted BEFORE the file
+# comparison, and `main-not-green` (wait) outranks `behind` (act).
+check "behind a risk-surface change with main CI RED → main-not-green, not behind" \
+  "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" \
+     MAIN_HEALTH=red run 100)"
+
+# The twin: with `main` healthy the same lane is still `behind` — the ordering
+# change must not have swallowed #1157's risk-surface rule.
+check "behind a risk-surface change with main CI green → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" \
+     MAIN_HEALTH=green run 100)"
+
+# --- REAL jq: exercise main-health.sh's production run-list expression ------
+# The scalar arm above cannot catch a `--jq` that drops a field or trips over
+# the two type surprises in this payload: `databaseId` is a NUMBER and
+# `conclusion` is JSON null while a run is in flight. Feeding raw payloads
+# through the REAL sibling proves the two scripts agree end to end — including
+# on the token STRING, which a fake sibling would let drift.
+#
+# An unconditional GROUP, not a `command -v jq` guard: see the hard-requirement
+# block at the top of this file. Braces keep the indentation unchanged.
+{
+  MH_SUCCESS='{"status":"completed","conclusion":"success","headSha":"abc1234","databaseId":11,"url":"https://x/11"}'
+  MH_FAILURE='{"status":"completed","conclusion":"failure","headSha":"dead1234","databaseId":12,"url":"https://x/12"}'
+  MH_FLIGHT='{"status":"in_progress","conclusion":null,"headSha":"feed1234","databaseId":13,"url":"https://x/13"}'
+
+  check "real run-list payload, main failing → main-not-green" "main-not-green" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_RUNS_JSON="[$MH_FAILURE,$MH_SUCCESS]" run 100)"
+
+  # A run in flight over an older success is the STEADY STATE of a busy fleet
+  # (main CI lags every merge by ~14 minutes). It must read green, or this gate
+  # reintroduces the serialization #1138 removed.
+  #
+  # #1138 IS NOT A TYPO FOR #1137 here, and it has now been queried twice. The
+  # convention across `main-health.sh`, `test_main_health.sh` and this file is
+  # consistent: #1137 is the issue that MEASURED the serialization (this file
+  # says "the serialization #1137 measured" in two other places), #1138 is the
+  # change that REMOVED it ("the serialization #1138 removed", the same words in
+  # all three files). Checked against those files rather than assumed.
+  check "real run-list payload, in flight over a success → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_RUNS_JSON="[$MH_FLIGHT,$MH_SUCCESS]" run 100)"
+
+  check "real run-list payload, empty window → main-not-green" "main-not-green" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_RUNS_JSON='[]' run 100)"
+}
+
+# --- the sibling seam: a helper that is not there holds the lane ------------
+# pr-ready.sh resolves main-health.sh by its own `dirname`, exactly as
+# watch-pr.sh resolves pr-ready.sh (test_watch_pr.sh:59-62, where the stub is
+# planted next to a copy of watch-pr.sh for that reason). A copy of the script
+# in a directory with no sibling IS that seam. A partial checkout, a bad
+# packaging change, or a rename must never read as "main is fine".
+NOSIB="$WORK/nosibling"
+mkdir -p "$NOSIB"
+cp "$READY" "$NOSIB/pr-ready.sh"
+chmod +x "$NOSIB/pr-ready.sh"
+run_nosib() { PATH="$BIN:$PATH" "$NOSIB/pr-ready.sh" "$@" 2>/dev/null; }
+
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       run_nosib 100)" || tok="exit-$?"
+no_merge_token "missing main-health.sh sibling is never mergeable" "$tok"
+
+# And a helper that exists but cannot be executed (a dropped exec bit — the
+# exact failure test_exec_bits.sh guards, and the one #1092 actually shipped).
+# The planted file WOULD answer `green` if it ran, so an implementation that
+# `bash`es the helper instead of checking it is executable fails here.
+NOEXEC="$WORK/noexec"
+mkdir -p "$NOEXEC"
+cp "$READY" "$NOEXEC/pr-ready.sh"
+chmod +x "$NOEXEC/pr-ready.sh"
+printf '#!/usr/bin/env bash\necho green\n' > "$NOEXEC/main-health.sh"
+chmod 644 "$NOEXEC/main-health.sh"
+run_noexec() { PATH="$BIN:$PATH" "$NOEXEC/pr-ready.sh" "$@" 2>/dev/null; }
+
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       run_noexec 100)" || tok="exit-$?"
+no_merge_token "non-executable main-health.sh sibling is never mergeable" "$tok"
+
+# --- main-health probe is LAZY ---------------------------------------------
+# Same rate-limit argument as the compare and review-gate probes: this is one
+# more API request per lane per wake, and it can only change the outcome for a
+# lane that is about to USE the #1157 relaxation. Every lane below has already
+# decided. Each gets its OWN sentinel path — a shared one would let an earlier
+# lane's probe satisfy a later lane's assertion.
+M_OPTOUT="$WORK/main-health-optout"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       PR_LABELS="$OPTOUT" MAIN_HEALTH_SENTINEL="$M_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy main-health: opt-out lane token" "optout" "$tok"
+probed "lazy main-health: opt-out lane does not probe" "no" "$M_OPTOUT"
+
+M_PENDING="$WORK/main-health-pending"
+tok="$(CHECKS_EC=8 BEHIND_BY=22 MAIN_HEALTH_SENTINEL="$M_PENDING" run 100)" || tok="exit-$?"
+check "lazy main-health: pending lane token" "pending" "$tok"
+probed "lazy main-health: pending lane does not probe" "no" "$M_PENDING"
+
+M_CIFAIL="$WORK/main-health-cifail"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 MAIN_HEALTH_SENTINEL="$M_CIFAIL" run 100)" || tok="exit-$?"
+check "lazy main-health: ci-failed lane token" "ci-failed" "$tok"
+probed "lazy main-health: ci-failed lane does not probe" "no" "$M_CIFAIL"
+
+M_CR="$WORK/main-health-changes-requested"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" BEHIND_BY=22 \
+       MAIN_HEALTH_SENTINEL="$M_CR" run 100)" || tok="exit-$?"
+check "lazy main-health: changes-requested lane token" "changes-requested" "$tok"
+probed "lazy main-health: changes-requested lane does not probe" "no" "$M_CR"
+
+M_STALE="$WORK/main-health-stale"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" BEHIND_BY=22 \
+       MAIN_HEALTH_SENTINEL="$M_STALE" run 100)" || tok="exit-$?"
+check "lazy main-health: stale-verdict lane token" "awaiting-review" "$tok"
+probed "lazy main-health: stale-verdict lane does not probe" "no" "$M_STALE"
+
+# ASSERTION (3) OF THE ANTI-MASKING PROOF, and the deadlock exception made
+# mechanical: a lane that is already current never uses the relaxation, so it
+# never asks about `main` — not one request, on the overwhelmingly common path.
+M_CURRENT="$WORK/main-health-current"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       MAIN_HEALTH=red MAIN_HEALTH_SENTINEL="$M_CURRENT" run 100)" || tok="exit-$?"
+check "lazy main-health: current lane token" "ready" "$tok"
+probed "lazy main-health: current lane does not probe" "no" "$M_CURRENT"
+
+# ASSERTION (2): the behind lane really does make the call. Without this, a
+# probe deleted from pr-ready.sh would leave every green-default case passing.
+M_BEHIND="$WORK/main-health-behind"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_HEALTH_SENTINEL="$M_BEHIND" run 100)" || tok="exit-$?"
+check "lazy main-health: behind-past-merge-base lane token" "ready" "$tok"
+probed "lazy main-health: behind lane DOES probe" "yes" "$M_BEHIND"
+
+# PRECEDENCE: the merge-base validation runs FIRST, so a malformed merge base
+# still short-circuits to `behind` without paying for the main-health call. A
+# probe placed above that validation would spend a request to answer a question
+# the lane had already answered.
+M_BADBASE="$WORK/main-health-badbase"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MERGE_BASE="not-a-sha" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" \
+       MAIN_HEALTH_SENTINEL="$M_BADBASE" run 100)" || tok="exit-$?"
+check "malformed merge base still short-circuits to behind" "behind" "$tok"
+probed "malformed merge base does not pay for main-health" "no" "$M_BADBASE"
+
+# --- review quota: when the remedy for `behind` DESTROYS the verdict (#1160) -
+# `behind`'s remedy is `fleet.sh sync`, which pushes a merge commit. That
+# advances HEAD, and the stale-verdict guard at the top of this file then
+# correctly stops counting the lane's LGTM — it reviewed older code. Normally
+# that costs exactly one re-review and the lane comes back. When the
+# `claude-review` quota is EXHAUSTED the re-review cannot happen at all, so the
+# sync destroys the only verdict the lane will ever get, and the lane is
+# unmergeable until the window resets.
+#
+# Observed on PR #1158: LGTM at 05:11:43Z, sync at 05:23:58Z, re-review rejected
+# in 24 seconds against a SEVEN-DAY window that would not reset for three days.
+# The loop did that to itself, with its own remedy, and then had nothing to
+# report but `behind` on every subsequent wake.
+#
+# ---------------------------------------------------------------------------
+# THE POLARITY IS INVERTED WITH RESPECT TO main-health.sh. DO NOT HARMONISE.
+# ---------------------------------------------------------------------------
+# main-health: anything that is not `green` HOLDS the lane.
+# review-quota: only a positively-proven `exhausted` HOLDS the lane.
+#
+# Both are fail-closed in the same sense — prefer the recoverable error — and
+# therefore take OPPOSITE actions, because the recoverable error is the opposite
+# one. A false `main-not-green` costs one wake. A false `review-quota-exhausted`
+# costs DAYS of a wedged lane with no un-wedge path, so every unreadable answer
+# here must fall through to today's behaviour: `behind`, sync, spend the verdict.
+# The issue says so outright: "Fails closed: if reviewability cannot be
+# determined, behave as today (sync), since merging stale is the worse error."
+#
+# The new token is printed in the terminal `else` of pr-ready.sh's final
+# if/elif/else (pr-ready.sh:1118-1151, the branch that would otherwise `echo
+# behind`) ONLY when ALL
+# of these hold: the lane would otherwise print `behind`, `ready_token` is
+# `ready` (not `ready-unreviewed`), `merge_state` is `CLEAN`, and the helper
+# positively answered `exhausted`.
+
+# THE RED CASE. A lane with everything a merge needs except currency: green CI,
+# CLEAN, a FRESH LGTM — and a real risk-surface reason to be behind (`uv.lock`
+# landed on `main`), so #1157's relaxation genuinely does not apply and the lane
+# genuinely does need a sync. With the reviewer available that sync is right.
+# With the reviewer exhausted it is the one move that cannot be undone.
+check "behind (risk surface) + fresh LGTM + quota EXHAUSTED → review-quota-exhausted" \
+  "review-quota-exhausted" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted run 100)"
+
+# The same lane, behind an OVERLAPPING file rather than a risk surface — the
+# other way #1157 refuses to relax. Same verdict, so the new token is not an
+# accident of which disjointness rule fired.
+check "behind (overlapping file) + fresh LGTM + quota EXHAUSTED → review-quota-exhausted" \
+  "review-quota-exhausted" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="creek/shared.py" OUR_FILES="creek/shared.py" \
+     REVIEW_QUOTA=exhausted run 100)"
+
+# THE ANTI-MASKING PROOF, mirroring the three-part one at the head of the
+# main-health block above. Because the stub defaults REVIEW_QUOTA to
+# `available`, someone could delete the probe from pr-ready.sh entirely and every
+# other test in this file would still pass. Three assertions make that
+# impossible, and they only work TOGETHER:
+#   (1) REVIEW_QUOTA=available on the SAME lane → `behind` — the answer is
+#       genuinely consumed rather than the token being printed unconditionally;
+#   (2) the sentinel is PRESENT on the qualifying lane — the call is genuinely
+#       made rather than the token coming from somewhere else;
+#   (3) the sentinel is ABSENT on every non-qualifying lane — the laziness holds,
+#       so the probe is not simply unconditional.
+# Remove any one of the three and the other two pass vacuously. Do not.
+check "(1) same lane, quota AVAILABLE → behind (the answer is consumed)" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=available run 100)"
+
+Q_QUALIFY="$WORK/quota-qualifying"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_QUALIFY" run 100)" || tok="exit-$?"
+check "(2) qualifying lane token" "review-quota-exhausted" "$tok"
+probed "(2) the qualifying lane DOES probe the review quota" "yes" "$Q_QUALIFY"
+
+# --- THE INVERTED-POLARITY SWEEP --------------------------------------------
+# Everything that is not a proven `exhausted` must behave exactly as it did
+# before #1160. This is the assertion set a future "make it consistent with
+# main-health.sh" refactor would break, and breaking it wedges every behind lane
+# in the fleet for as long as the helper stays unreadable — which, unlike a red
+# `main`, nothing in the loop would ever repair.
+check "quota UNKNOWN → behind (fall through, do not hold)" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=unknown run 100)"
+
+# The helper's own lookup failing (rate limit, 5xx, expired token) is the most
+# likely unreadable answer of all — and it is likeliest precisely when the API
+# budget is under pressure, i.e. on the very lanes this feature exists for. It
+# still falls through.
+check "quota helper's gh lookup fails → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted REVIEW_RUNS_EC=1 run 100)"
+
+check "quota helper's log fetch fails → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted REVIEW_LOG_EC=1 run 100)"
+
+# The observed FALSE POSITIVE, end to end through pr-ready.sh. This log came
+# from a review run that concluded SUCCESS and posted a full LGTM (job
+# 92768878061, the Aug-7 re-run of #1158's job): `status` is `allowed`, and the
+# `rejected` / `out_of_credits` words describe the overage BUDGET. Any matcher
+# naive enough to fire on it would hold every behind lane in the fleet for days
+# on a reviewer that was working the whole time.
+check "a healthy 'allowed' log carrying the word rejected → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+     REVIEW_QUOTA=exhausted \
+     REVIEW_LOG='{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":9999999999,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits"}}' \
+     run 100)"
+
+# --- the sibling seam, in the INVERTED direction ----------------------------
+# The same seam this file already exercises for main-health.sh in the `$NOSIB` /
+# `$NOEXEC` block above — a copy of pr-ready.sh in a directory whose siblings we
+# control — but with the opposite expectation. Cited by the fixture's variable
+# names rather than by line number on purpose: the two intra-file line citations
+# that used to be here were made stale by this very diff's own growth, and will
+# be again by the next one, whereas `$NOSIB` and `$NOEXEC` are greppable and
+# move with the code. A main-health.sh that cannot be asked HOLDS
+# the lane; a review-quota.sh that cannot be asked must NOT.
+#
+# Each lane plants a main-health.sh that answers `green`, because otherwise the
+# lane never reaches the terminal branch where the quota question is asked at
+# all, and every assertion below would pass for the wrong reason.
+plant_lane() { # plant_lane <name> <review-quota body, or "" for no helper> [mode]
+  local dir="$WORK/plant-$1"
+  mkdir -p "$dir"
+  cp "$READY" "$dir/pr-ready.sh"
+  chmod +x "$dir/pr-ready.sh"
+  printf '#!/usr/bin/env bash\necho green\n' > "$dir/main-health.sh"
+  chmod +x "$dir/main-health.sh"
+  if [[ -n "$2" ]]; then
+    printf '%s' "$2" > "$dir/review-quota.sh"
+    chmod "${3:-755}" "$dir/review-quota.sh"
+  fi
+  printf '%s\n' "$dir/pr-ready.sh"
+}
+run_planted() { # run_planted <planted pr-ready.sh> <PR>
+  CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+    THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+    PATH="$BIN:$PATH" "$1" "$2" 2>/dev/null
+}
+
+# NON-VACUITY FIRST. The planted harness must be able to produce the POSITIVE
+# outcome, or every "…→ behind" assertion below would pass on a harness that
+# simply never reaches the probe. This one plants a helper that says `exhausted`
+# and nothing else.
+P_YES="$(plant_lane exhausted '#!/usr/bin/env bash
+echo exhausted
+')"
+tok="$(run_planted "$P_YES" 100)" || tok="exit-$?"
+check "planted harness non-vacuity: a helper saying exhausted holds the lane" \
+  "review-quota-exhausted" "$tok"
+
+P_AVAIL="$(plant_lane available '#!/usr/bin/env bash
+echo available
+')"
+tok="$(run_planted "$P_AVAIL" 100)" || tok="exit-$?"
+check "planted helper says available → behind" "behind" "$tok"
+
+P_EMPTY="$(plant_lane empty '#!/usr/bin/env bash
+exit 0
+')"
+tok="$(run_planted "$P_EMPTY" 100)" || tok="exit-$?"
+check "planted helper prints NOTHING → behind" "behind" "$tok"
+
+# A helper that exits non-zero WITH a happy answer already on stdout is the
+# dangerous shape (the output is there to be inherited). Under `set -e` an
+# unguarded call would also abort pr-ready.sh mid-classification, which the
+# orchestrator reads as a tooling error — dispatching nothing.
+P_EXIT2="$(plant_lane exit2 '#!/usr/bin/env bash
+echo exhausted
+exit 2
+')"
+rc=0
+tok="$(run_planted "$P_EXIT2" 100)" || rc=$?
+check "planted helper exits non-zero → behind" "behind" "$tok"
+check "planted helper exiting non-zero does not kill pr-ready.sh" "0" "$rc"
+
+# A word nobody recognises — a future token, a typo, a debug print. It is not
+# `exhausted`, so it is not a hold.
+P_GARBAGE="$(plant_lane garbage '#!/usr/bin/env bash
+echo dunno
+')"
+tok="$(run_planted "$P_GARBAGE" 100)" || tok="exit-$?"
+check "planted helper prints a garbage word → behind" "behind" "$tok"
+
+# A helper that is not there at all: a partial checkout, a packaging change, a
+# rename. Nothing about that says the reviewer is out of quota.
+P_MISSING="$(plant_lane missing "")"
+tok="$(run_planted "$P_MISSING" 100)" || tok="exit-$?"
+check "MISSING review-quota.sh sibling → behind" "behind" "$tok"
+
+# And a helper that exists but cannot be executed — the dropped exec bit #1092
+# actually shipped and test_exec_bits.sh guards. The planted file WOULD say
+# `exhausted` if it ran, so an implementation that `bash`es the helper instead of
+# checking `-x` fails here. Note this is the mirror of the main-health `$NOEXEC`
+# case above (named, not line-cited, for the reason given in the seam block):
+# there a non-executable helper must never read as `green`; here it must never
+# read as `exhausted`.
+P_NOEXEC="$(plant_lane noexec '#!/usr/bin/env bash
+echo exhausted
+' 644)"
+tok="$(run_planted "$P_NOEXEC" 100)" || tok="exit-$?"
+check "NON-EXECUTABLE review-quota.sh sibling → behind" "behind" "$tok"
+
+# --- guard conditions: lanes with nothing to preserve, or nothing to gain ----
+# `ready-unreviewed` is a Dependabot lane that has PROVABLY no review gate — no
+# verdict was ever posted and none ever will be. There is no LGTM for a sync to
+# destroy, so holding the lane would buy nothing and cost a merge. It syncs.
+Q_UNREVIEWED="$WORK/quota-ready-unreviewed"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="|false" BEHIND_BY=22 \
+       MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       PR_AUTHOR="app/dependabot" HEAD_AUTHOR="dependabot[bot]" \
+       REVIEW_CONCLUSIONS="SKIPPED" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_UNREVIEWED" run 100)" || tok="exit-$?"
+check "ready-unreviewed + behind + quota exhausted → behind (no verdict to lose)" \
+  "behind" "$tok"
+probed "(3) a ready-unreviewed lane does not probe the review quota" "no" "$Q_UNREVIEWED"
+
+# A CONFLICTING lane's remedy IS the sync, and only the sync. The conflict never
+# self-resolves, and the lane's LGTM dies at Gate 1 regardless of quota — a
+# conflicted branch cannot merge at all. Holding it would therefore be a
+# PERMANENT wedge with no un-wedge path: the quota resets, the lane is still
+# conflicted, and nothing ever ran the one command that could fix it.
+Q_CONFLICT="$WORK/quota-conflicting"
+tok="$(CHECKS_EC=0 MERGE_STATE=CONFLICTING HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=22 MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_CONFLICT" run 100)" || tok="exit-$?"
+check "CONFLICTING + fresh LGTM + quota exhausted → behind (the sync IS the remedy)" \
+  "behind" "$tok"
+probed "(3) a conflicting lane does not probe the review quota" "no" "$Q_CONFLICT"
+
+Q_DIRTY="$WORK/quota-dirty"
+tok="$(CHECKS_EC=0 MERGE_STATE=DIRTY HEAD_DATE=$H VERDICT="$FRESH|true" \
+       BEHIND_BY=22 MAIN_HEALTH=green THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_DIRTY" run 100)" || tok="exit-$?"
+check "DIRTY + fresh LGTM + quota exhausted → behind" "behind" "$tok"
+probed "(3) a dirty lane does not probe the review quota" "no" "$Q_DIRTY"
+
+# --- precedence: a lane already held does not pay for a second probe ---------
+# `main-not-green` outranks this token. Its remedy is also "wait", so nothing is
+# lost by reporting it — and the quota question is moot for a lane that is not
+# going to be synced either way.
+Q_MAINRED="$WORK/quota-main-red"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MAIN_HEALTH=red THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_MAINRED" run 100)" || tok="exit-$?"
+check "main RED + quota exhausted → main-not-green (main health outranks)" \
+  "main-not-green" "$tok"
+probed "(3) a main-not-green lane does not probe the review quota" "no" "$Q_MAINRED"
+
+# --- laziness: only a lane about to be TOLD TO SYNC may ask ------------------
+# Same rate-limit argument as every other probe in this file — and sharper here,
+# because the question being asked is literally "have we run out of API budget?"
+# Each lane gets its OWN sentinel path; a shared one would let an earlier lane's
+# probe satisfy a later lane's assertion.
+Q_OPTOUT="$WORK/quota-optout"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" PR_LABELS="$OPTOUT" \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy quota: opt-out lane token" "optout" "$tok"
+probed "lazy quota: opt-out lane does not probe" "no" "$Q_OPTOUT"
+
+Q_PENDING="$WORK/quota-pending"
+tok="$(CHECKS_EC=8 BEHIND_BY=22 REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_PENDING" run 100)" || tok="exit-$?"
+check "lazy quota: pending lane token" "pending" "$tok"
+probed "lazy quota: pending lane does not probe" "no" "$Q_PENDING"
+
+Q_CIFAIL="$WORK/quota-cifail"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_CIFAIL" run 100)" || tok="exit-$?"
+check "lazy quota: ci-failed lane token" "ci-failed" "$tok"
+probed "lazy quota: ci-failed lane does not probe" "no" "$Q_CIFAIL"
+
+Q_CR="$WORK/quota-changes-requested"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" BEHIND_BY=22 \
+       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_CR" run 100)" || tok="exit-$?"
+check "lazy quota: changes-requested lane token" "changes-requested" "$tok"
+probed "lazy quota: changes-requested lane does not probe" "no" "$Q_CR"
+
+# A STALE verdict is the case that looks closest to the RED one and is not it:
+# the LGTM already does not count, so a sync cannot destroy it. Nothing to hold.
+Q_STALE="$WORK/quota-stale"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" BEHIND_BY=22 \
+       THEIR_FILES="uv.lock" OUR_FILES="creek/mine.py" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_STALE" run 100)" || tok="exit-$?"
+check "lazy quota: stale-verdict lane token" "awaiting-review" "$tok"
+probed "lazy quota: stale-verdict lane does not probe" "no" "$Q_STALE"
+
+# A lane that is already CURRENT is about to merge. It is never told to sync, so
+# it never asks — on the overwhelmingly common path, this feature costs nothing.
+Q_CURRENT="$WORK/quota-current"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       REVIEW_QUOTA=exhausted REVIEW_QUOTA_SENTINEL="$Q_CURRENT" run 100)" || tok="exit-$?"
+check "lazy quota: current lane token" "ready" "$tok"
+probed "lazy quota: current lane does not probe" "no" "$Q_CURRENT"
+
+# A lane that is behind but INERT merges under #1157 without a sync, so its LGTM
+# is in no danger either. Also the guard that #1157 has not been re-tightened:
+# if this ever flips to a hold, the serialization #1137 measured is back.
+Q_INERT="$WORK/quota-inert"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MAIN_HEALTH=green THEIR_FILES="creek/classify/privacy.py" \
+       OUR_FILES="creek/vault/writer.py" REVIEW_QUOTA=exhausted \
+       REVIEW_QUOTA_SENTINEL="$Q_INERT" run 100)" || tok="exit-$?"
+check "lazy quota: behind-but-inert lane still merges" "ready" "$tok"
+probed "lazy quota: behind-but-inert lane does not probe" "no" "$Q_INERT"
+
 # --- ready-unreviewed: PROVABLY no review gate ------------------------------
 # `.github/workflows/code-review.yml` skips its `claude-review` job on Dependabot
 # PRs (Actions secrets are not exposed to dependabot runs), so those PRs can never
@@ -725,7 +2311,10 @@ check "one non-review SUCCESS → ready-unreviewed" "ready-unreviewed" \
 # `null`, not a string. These two feed a real payload through pr-ready.sh's own
 # expression, so a `select(.conclusion == "SUCCESS")` that accidentally counts
 # nulls or SKIPPEDs is caught here.
-if command -v jq >/dev/null 2>&1; then
+#
+# An unconditional GROUP, not a `command -v jq` guard: see the hard-requirement
+# block at the top of this file. Braces keep the indentation unchanged.
+{
   REVIEW_ENTRY='{"name":"claude-review","conclusion":"SKIPPED"}'
   rj() { # rj <extra rollup entries> — a real --json author,statusCheckRollup payload
     printf '{"author":{"login":"app/dependabot"},"statusCheckRollup":[%s,%s]}' \
@@ -745,9 +2334,7 @@ if command -v jq >/dev/null 2>&1; then
        HEAD_AUTHOR="$DEPENDABOT_COMMIT" \
        ROLLUP_JSON="$(rj '{"name":"ci","conclusion":"SUCCESS"},{"name":"lint","conclusion":null}')" \
        run 100)"
-else
-  echo "  skip - real-jq review-gate rollup cases (jq not installed)"
-fi
+}
 
 # The PR author is not enough: anyone can push a commit onto a Dependabot branch
 # (that is how we fix a bump's fallout), and that commit is unreviewed code
@@ -864,6 +2451,339 @@ if grep -qx "name" <<<"$job_keys"; then
   bad "claude-review declares a name: override — GitHub will report a different check name"
 else
   ok "claude-review declares no name: override (check name stays 'claude-review')"
+fi
+
+# --- cross-file coupling: the provenance marker (issue #1181) ---------------
+# code-review.yml is the EMITTER of the marker and pr-ready.sh is the PARSER.
+# Nothing else connects them: they are different languages in different
+# directories, and the only test that could catch drift is one that reads both.
+# Drift here does not wedge one lane, it wedges every lane at once — an emitter
+# that stops emitting turns the whole fleet to `awaiting-review` with no verdict
+# anyone can post to clear it.
+WF_DIR="$(dirname "$REVIEW_WORKFLOW")"
+RECAP_WORKFLOW="$WF_DIR/ralph-recap-tests.yml"
+ITER_WORKFLOW="$WF_DIR/iteration-trigger.yml"
+
+# The shared bytes, written out once. The prefix is what a READER of the marker
+# matches on; the full format is what the emitter's `printf` carries.
+MARKER_PREFIX='<!-- creek-review pr='
+MARKER_FMT_LITERAL="${MARKER_PREFIX}%s -->"
+
+# THE WHOLE printf FORMAT ARGUMENT — everything between the emitter's quotes,
+# not the substring this file already knows. What used to be here was
+# `grep -oF -- "$MARKER_FMT_LITERAL"`, and `grep -oF` can only ever print back
+# the pattern it was handed: the "extracted" value was either empty or
+# byte-identical to the literal three lines up, so the round trip below fed the
+# parser the TEST's bytes while claiming to feed it the EMITTER's. Three real
+# drifts survived that, each of which unmarks the whole fleet:
+#   * dropping the trailing `\n\n` — the marker then glues onto `## Summary` and
+#     MARKER_RE's tail `$` refuses it, but a fixture supplying its own blank
+#     line never notices;
+#   * any same-line prefix ahead of the marker inside the same format;
+#   * flipping `> review.md` to `>>` so the marker is no longer first (pinned
+#     separately, just below — a format string cannot see its own redirection).
+# `sed` takes the whole single-quoted argument instead, so the trailing escapes
+# are part of what gets rendered and compared.
+#
+# `%s`, not `%d`: the parser compares STRINGS (see the pr=0100 case above), and
+# `%d` would silently renormalise a number on the way out — the one place where
+# emitter and parser could disagree about bytes that both look correct. A `%d`
+# fails this extraction outright (the pattern is anchored on `pr=%s`) and is
+# reported LOUDLY rather than quietly rendered into something plausible.
+# Braces around the variable are required, not stylistic: `$MARKER_FMT_LITERAL[`
+# reads as an array subscript to shellcheck (SC1087, an ERROR), and the ralph CI
+# job shellchecks these scripts at --severity=warning.
+MARKER_FMT="$(sed -n "s/.*printf '\(${MARKER_FMT_LITERAL}[^']*\)'.*/\1/p" \
+              "$REVIEW_WORKFLOW" | head -n 1 || true)"
+if [[ -z "$MARKER_FMT" ]]; then
+  # BRACES ARE LOAD-BEARING HERE TOO, and for a sharper reason than SC1087
+  # above: the `…` that follows is multi-byte UTF-8, and bash swallowed its
+  # first byte into the parameter NAME — so this line died with
+  # `MARKER_FMT_LITERAL<byte>: unbound variable` under `set -u`. That crash sits
+  # on the ONE path this assertion exists to travel: it only runs when the
+  # emitter's format cannot be extracted, i.e. exactly when `code-review.yml`
+  # and this parser have drifted. The suite aborted mid-run instead of reporting
+  # the drift, which is how a coupling check silently stops being one. Caught by
+  # running this file against an unmodified `code-review.yml`.
+  bad "could not extract code-review.yml's \"printf '${MARKER_FMT_LITERAL}…'\" format — nothing attests to any verdict"
+else
+  ok "extracted code-review.yml's whole marker printf format"
+fi
+
+# THE MARKER IS FIRST, and that is a property of the REDIRECTION, not of the
+# format. The round trip below renders the format in isolation, so it cannot see
+# WHERE those bytes land in the file the comment body is built from: `>` on the
+# marker printf (truncate) and `>>` on everything after it is the only thing
+# putting the marker on line 1 at column 0. Flip the marker's `>` to `>>` and
+# the review markdown lands first — pr-ready.sh's `^` then anchors to a
+# `## Summary` line, every verdict in the fleet reads as unmarked, and the
+# format-level round trip stays green throughout.
+marker_printf_line="$(grep -F -- "$MARKER_FMT_LITERAL" "$REVIEW_WORKFLOW" | head -n 1 || true)"
+if [[ -z "$marker_printf_line" ]]; then
+  bad "no line of code-review.yml carries the marker printf format"
+elif grep -Eq -- '[^>]> *review\.md[[:space:]]*$' <<<"$marker_printf_line"; then
+  ok "the marker printf TRUNCATES review.md ('> review.md'), so the marker is first"
+else
+  bad "the marker printf does not redirect with a single '> review.md' — the marker may not be first in the comment body: $marker_printf_line"
+fi
+
+# The other half of the same property: the review markdown must be APPENDED. An
+# emitter that truncated here would overwrite the marker it just wrote.
+if grep -Eq -- '^[[:space:]]*jq .*review_markdown.*>> *review\.md[[:space:]]*$' "$REVIEW_WORKFLOW"; then
+  ok "the review markdown is APPENDED after the marker ('>> review.md')"
+else
+  bad "code-review.yml does not append the review markdown with '>> review.md' — it would overwrite the provenance marker"
+fi
+
+# THE ROUND TRIP, and the reason this check is not a shared-substring grep: the
+# bytes fed to the parser below are the EMITTER's own format argument, rendered
+# the way the workflow renders it and escaped by `jq` rather than by hand. A
+# grep for "both files mention creek-review" passes on two files that agree on a
+# word and disagree on a format; this passes only if the emitter's output is
+# accepted end to end — and only if the SAME bytes rendered for a different PR
+# are refused, which is the half that proves the acceptance was not vacuous.
+#
+# No `command -v jq` arm any more (it used to sit between these two): jq is a
+# hard requirement asserted at the top of this file, and THIS is the case that
+# made the skip intolerable — the #1181 polarity argument in pr-ready.sh's header
+# rests explicitly on "the round trip runs in CI", which a silent skip falsifies.
+if [[ -z "$MARKER_FMT" ]]; then
+  : # already reported above; rendering an empty format would assert nothing
+else
+  marker_body() { # marker_body <pr number> — a verdict comment carrying the RENDERED marker
+    local rendered body
+    # `%b` over the substituted format, rather than `printf "$MARKER_FMT" "$1"`:
+    # identical bytes for a format whose only directive is the `%s` asserted
+    # above, and it keeps this file clean under `shellcheck` without a
+    # `# shellcheck disable` (SC2059, a variable used as a printf format).
+    #
+    # The `X` sentinel is LOAD-BEARING: `$( … )` strips trailing newlines, and
+    # the format's trailing `\n\n` is exactly the byte sequence whose loss this
+    # case exists to catch. Without it the fixture would silently supply its own
+    # blank line and the drift would stay green — the original defect, one layer
+    # down.
+    rendered="$(printf '%b' "${MARKER_FMT//%s/$1}X")"
+    rendered="${rendered%X}"
+    body="${rendered}## Summary
+fine
+
+## Verdict: LGTM
+"
+    # `jq -Rs .` does the JSON escaping, so the fixture cannot disagree with the
+    # rendered bytes the way a hand-written `\\n\\n` did.
+    printf '{"createdAt":"%s","body":%s}' "$FRESH" "$(printf '%s' "$body" | jq -Rs .)"
+  }
+  check "round trip: emitter bytes rendered for THIS PR → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj "$(marker_body 100)")" run 100)"
+  check "round trip: the same bytes rendered for ANOTHER PR → awaiting-review" \
+    "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H \
+       COMMENTS_JSON="$(cj "$(marker_body 999)")" run 100)"
+fi
+
+# WHAT THE MARKER ATTESTS TO. The marker itself proves only "a pipeline version
+# that runs the cross-check posted this". If the cross-check leaves the
+# workflow, every marker in the world still says `pr=N` and means nothing — so
+# the schema field the agent must report BACK is pinned here, in both halves of
+# the schema (`required` without `properties` validates nothing; `properties`
+# without `required` is optional and an agent that cannot determine the number
+# will simply omit it — which is precisely the failure).
+#
+# An unconditional GROUP, not a `command -v jq` guard: see the hard-requirement
+# block at the top of this file. Braces keep the indentation unchanged.
+{
+  review_schema="$(sed -n "s/.*--json-schema '\({.*}\)'.*/\1/p" "$REVIEW_WORKFLOW" | head -n 1)"
+  if [[ -z "$review_schema" ]]; then
+    bad "could not extract code-review.yml's --json-schema"
+  elif jq -e '(.required | index("reviewed_pr_number") != null)
+              and (.properties | has("reviewed_pr_number"))' <<<"$review_schema" >/dev/null 2>&1; then
+    ok "--json-schema lists reviewed_pr_number in BOTH required and properties"
+  else
+    bad "--json-schema must list reviewed_pr_number in BOTH required and properties"
+  fi
+}
+
+# THE INSTRUMENT — DEFENCE IN DEPTH, NOT A PROOF, and this comment used to claim
+# otherwise. `gh pr list --state all --json number,title,headRefName,mergeCommit,commits`
+# is literally the command the #1117 run used to guess its way to the wrong PR,
+# and #1181 REMOVED `Bash(gh pr list:*)` from code-review.yml's
+# `--allowed-tools`. This assertion keeps it removed, which takes away the
+# specific instrument of that incident and raises the bar for the next accident.
+#
+# WHAT IT DOES NOT DO IS REMOVE THE CAPABILITY, and `code-review.yml` says so in
+# its own words right where the tool list is declared: `Bash(gh search:*)` is
+# deliberately KEPT, and `gh search prs --repo owner/repo --json number`
+# enumerates pull requests perfectly well. So "an agent that can neither ask
+# which PR it is on nor enumerate PRs has no way to guess" — the inference this
+# comment used to draw — is FALSE, and the workflow now disowns it in the same
+# diff. Two files in one change must not assert opposite things about the same
+# control; if this claim ever comes back, it has to come back on both sides.
+#
+# THE ACTUAL CONTROL IS THE WORKFLOW-SIDE `reviewed_pr_number` CROSS-CHECK,
+# pinned by the `--json-schema` assertion immediately above: the agent reports
+# the number it
+# actually passed to `gh pr diff`, the workflow compares it with `$PR_NUMBER`,
+# and a mismatch discards the review with no comment posted. That check does not
+# care HOW the agent arrived at a number, so it holds even against a route
+# nobody anticipated — which is exactly why it, and not this list, is the gate,
+# and why the marker pr-ready.sh parses attests to the cross-check being in
+# force rather than to the tool list being short.
+allowed_tools_line="$(grep -n -- '--allowed-tools' "$REVIEW_WORKFLOW" | head -n 1 || true)"
+if [[ -z "$allowed_tools_line" ]]; then
+  bad "code-review.yml declares no --allowed-tools line — nothing constrains what the agent may run"
+elif grep -q 'gh pr list' <<<"$allowed_tools_line"; then
+  bad "code-review.yml still allows Bash(gh pr list:*) — the instrument the #1117 run guessed with"
+else
+  ok "Bash(gh pr list:*) is not in code-review.yml's --allowed-tools"
+fi
+
+# SELF-SKIP INTEGRITY. claude-code-action self-skips (anti-tamper) on any PR
+# that edits code-review.yml — including the PR that ADDS the marker — so that
+# path posts a static comment and exits without a review. It must therefore
+# carry no marker and no verdict line: a marker there would attest to a review
+# that never happened, on exactly the PRs that rewrite the review pipeline. The
+# block is read out of the file rather than restated, so a future edit to those
+# literals is what this checks, not a copy of them.
+self_skip_lines="$(awk '/self_skip_body=\$\(printf/ {b = 1}
+                        b {print; if ($0 !~ /\\$/) exit}' "$REVIEW_WORKFLOW")"
+if [[ -z "$self_skip_lines" ]]; then
+  bad "could not find code-review.yml's static self-skip body literals"
+else
+  if grep -qF -- "creek-review" <<<"$self_skip_lines"; then
+    bad "the self-skip body carries the provenance marker — it would attest to a review that did not happen"
+  else
+    ok "the self-skip body carries no provenance marker"
+  fi
+  # VERDICT_RE's own shape, plus an optional leading `'` because these are shell
+  # literals in the workflow rather than the comment body a parser sees.
+  if grep -Eq "^[[:space:]]*'?(#{1,6}[[:space:]]+|\*\*)?[Vv]erdict[:*[:space:]]" <<<"$self_skip_lines"; then
+    bad "the self-skip body carries a verdict LINE — the merge-critical parsers would read it as a verdict"
+  else
+    ok "the self-skip body carries no verdict line"
+  fi
+fi
+
+# …and the marker printf must sit AFTER that path's `exit 0`, or the self-skip
+# comment grows provenance on its way out the door. Line numbers, because
+# "appears in the file" is not the property — ORDER is.
+marker_line="$(grep -nF -- "$MARKER_FMT_LITERAL" "$REVIEW_WORKFLOW" | head -n 1 | cut -d: -f1 || true)"
+self_skip_exit_line="$(awk '/review-self-skip/ {seen = 1}
+                            seen && /^[[:space:]]*exit 0$/ {print NR; exit}' "$REVIEW_WORKFLOW")"
+if [[ -z "$marker_line" || -z "$self_skip_exit_line" ]]; then
+  bad "cannot order the marker printf against the self-skip exit 0 (marker='$marker_line', exit='$self_skip_exit_line')"
+elif [[ "$marker_line" -gt "$self_skip_exit_line" ]]; then
+  ok "the marker printf sits AFTER the self-skip exit 0"
+else
+  bad "the marker printf sits BEFORE the self-skip exit 0 — the self-skip comment would carry provenance"
+fi
+
+# THE COUPLING CHECKS MUST ACTUALLY RUN. ralph-recap-tests.yml filters on
+# `scripts/ralph/**`, so a PR that edits ONLY code-review.yml — the one change
+# class every check above exists to guard — never runs this suite, and the
+# emitter can be rewritten with nothing red anywhere. Both triggers, because a
+# `push`-only filter still lets the drift land through a PR and a
+# `pull_request`-only filter misses a direct push to `main`.
+recap_trigger_block() { # recap_trigger_block <push|pull_request>
+  awk -v want="  $1:" '$0 == want {b = 1; next}
+                       b && /^[^[:space:]#]/ {exit}
+                       b && /^  [^[:space:]#]/ {exit}
+                       b {print}' "$RECAP_WORKFLOW"
+}
+for trig in push pull_request; do
+  trig_block="$(recap_trigger_block "$trig")"
+  if [[ -n "$trig_block" ]] && grep -q 'code-review\.yml' <<<"$trig_block"; then
+    ok "ralph-recap-tests.yml runs this suite on $trig changes to code-review.yml"
+  else
+    bad "ralph-recap-tests.yml's $trig paths: omit .github/workflows/code-review.yml — an emitter-only PR runs no coupling check"
+  fi
+done
+
+# THE SECOND MERGE-CLEARANCE PATH. iteration-trigger.yml posts "You are cleared
+# to squash merge" off its own verdict parse, and its header already commits it
+# to enforcing the SAME invariant as pr-ready.sh — otherwise it is a second code
+# path that falsifies the first. It cleared #1117 on the #1179 verdict too.
+#
+# NOT a bare `grep -F "$MARKER_PREFIX"`, which is what this used to be: that
+# string also appears in that file's COMMENTS, so the entire `MARKER_PR`
+# extraction and the `elif` consuming it could be deleted and the check would
+# stay green — the "shared-substring grep" this whole block exists to be better
+# than. Two literals instead, both lifted from the code that runs.
+ITER_MARKER_ERE='^'"$MARKER_PREFIX"'[0-9]+ -->[[:space:]]*$'
+# Written with `\$` inside double quotes rather than as a single-quoted literal:
+# the bytes are identical (`[ "$MARKER_PR" != "$PR" ]`) and it carries no
+# single-quoted `$…` for a linter to read as a lost expansion.
+ITER_CLEARANCE_GUARD="[ \"\$MARKER_PR\" != \"\$PR\" ]"
+
+if grep -qF -- "$ITER_MARKER_ERE" "$ITER_WORKFLOW"; then
+  ok "iteration-trigger.yml extracts the marker with the same anchored pattern"
+else
+  bad "iteration-trigger.yml no longer greps '$ITER_MARKER_ERE' — its extraction has drifted from pr-ready.sh's MARKER_RE"
+fi
+
+# Extracting the marker and never consulting it is the same bug with an extra
+# step. That `elif` is the ONLY thing between an unattested verdict and a
+# "cleared to squash merge" comment — and .claude/skills/await-claude-review
+# says this summary SHORT-CIRCUITS per-event classification, so when the two
+# paths disagree it is this one that wins over pr-ready.sh's `awaiting-review`.
+if grep -qF -- "$ITER_CLEARANCE_GUARD" "$ITER_WORKFLOW"; then
+  ok "iteration-trigger.yml refuses to clear a merge on a marker that is not this PR"
+else
+  bad "iteration-trigger.yml has lost its '$ITER_CLEARANCE_GUARD' clearance guard — it would clear a merge on a verdict pr-ready.sh refuses"
+fi
+
+# And rewriting `ACTION` is NOT what stops the merge — this is the assertion the
+# other two would otherwise let you delete with CI green. `.claude/skills/
+# await-claude-review/SKILL.md` Step 4a decides from `**VERDICT**:` plus
+# `**CI**:` ONLY; it never reads `**Action**:` (item 5 says in so many words: "Do
+# not infer a verdict from the `Action:` prose"). So a summary that still carries
+# `**VERDICT**: LGTM` merges no matter how emphatically `**Action**` refuses.
+# The `elif` therefore has to neutralise the VERDICT FIELD, and the value has to
+# be chosen for its BYTES: `NOT ATTESTED` contains no `LGTM` substring, so
+# neither a `*LGTM*` glob nor a `test("LGTM")` can match it.
+# (`HELD` and `BEHIND` still post `**VERDICT**: LGTM` and are defeated exactly
+# this way — pre-existing, filed as #1202, deliberately out of #1181's scope.)
+ITER_UNATTESTED_VERDICT="VERDICT='NOT ATTESTED'"
+
+if grep -qF -- "$ITER_UNATTESTED_VERDICT" "$ITER_WORKFLOW"; then
+  ok "iteration-trigger.yml also neutralises the VERDICT field, not just ACTION"
+else
+  bad "iteration-trigger.yml no longer sets $ITER_UNATTESTED_VERDICT — its summary would still say '**VERDICT**: LGTM' and await-claude-review Step 4a would merge on it (#1202)"
+fi
+
+# --- cross-file coupling: the SECOND emitter of a VERDICT_RE match (#1181) ---
+# Every coupling check above treats `.github/workflows/code-review.yml` as THE
+# emitter. It is not the only one. iteration-trigger.yml's executive summary
+# carries `**VERDICT**: <X>`, which satisfies VERDICT_RE and VERDICT_LGTM_RE (see
+# the block in the verdict section above for the measurement and for PR #906's
+# comment tail), and it posts LAST on every lane in this repo — so pr-ready.sh's
+# `| last` selector picks it, it can never carry a `creek-review` marker, and the
+# whole fleet holds at `awaiting-review` with no push able to clear it.
+#
+# pr-ready.sh must therefore EXCLUDE that comment from the verdict selector, and
+# the bytes it excludes must be the bytes that workflow emits. `$ITER_MARKER` is
+# the value read out of iteration-trigger.yml's own `MARKER:` env entry up in the
+# verdict block (and asserted there to be the expected literal), so this is a
+# comparison between two files and not between this file and itself — the same
+# distinction the `grep -oF` post-mortem at the marker round trip draws.
+#
+# The constant is matched by PREFIX (`ITER_SUMMARY_…`) rather than by one exact
+# name: the exclusion may reasonably be held as the bare marker or as the
+# line-anchored pattern built from it (see W6 above for why anchored), and both
+# spellings carry these bytes on the assignment line. What is NOT optional is that
+# the bytes come from the emitter.
+iter_exclude_line="$(grep -E "^readonly ITER_SUMMARY_[A-Z_]+=" "$READY" | head -n 1 || true)"
+if [[ -z "$iter_exclude_line" ]]; then
+  bad "pr-ready.sh defines no 'readonly ITER_SUMMARY_…' constant — nothing excludes iteration-trigger.yml's summary from the verdict selector, so the LAST verdict-bearing comment on every PR in this repo is one that can never carry a provenance marker (#1181)"
+elif grep -qF -- "$ITER_MARKER" <<<"$iter_exclude_line"; then
+  ok "pr-ready.sh's exclusion constant carries iteration-trigger.yml's own MARKER: bytes"
+else
+  # Braces on both expansions, not stylistic: each is followed by a `'`, and this
+  # file has already been bitten twice by an unbraced name running into what came
+  # after it (SC1087 at the marker round trip, and a multi-byte `…` swallowed into
+  # a parameter name under `set -u`) — on diagnostic paths that only execute when
+  # the coupling has ALREADY drifted, i.e. exactly when the message is needed.
+  bad "pr-ready.sh's '${iter_exclude_line}' does not carry iteration-trigger.yml's MARKER: value ('${ITER_MARKER}') — emitter and parser have drifted and every lane reads awaiting-review"
 fi
 
 # --- summary ---------------------------------------------------------------

@@ -7,11 +7,17 @@ name: Iteration Trigger
 # per PR to avoid runaway loops.
 #
 # The "cleared to squash merge" line this job emits is a merge instruction, so it
-# must enforce the SAME invariant as scripts/ralph/pr-ready.sh or it becomes a
-# second code path that falsifies it. It therefore also checks that the head is
-# current with its base (compare API `behind_by == 0`) and that no
-# `do-not-auto-merge` hold is set, and names the blocker instead of clearing when
-# either fails. Both fail closed on an unreadable answer.
+# must enforce the SAME invariants as scripts/ralph/pr-ready.sh or it becomes a
+# second code path that falsifies it. It therefore mirrors three of them, and
+# names the blocker instead of clearing when any fails:
+#   * no `do-not-auto-merge` hold on the PR;
+#   * the head is current with its base (compare API `behind_by == 0`);
+#   * the verdict carries the `<!-- creek-review pr=N -->` provenance marker for
+#     THIS PR (#1181) — the marker pr-ready.sh's MARKER_RE parses, read from the
+#     same comment the verdict came from.
+# All three fail closed on an unreadable answer. Note that only the provenance
+# branch also rewrites `VERDICT`; see the comment at that `elif` for why the
+# other two do not, and #1202 for the gap that leaves.
 #
 # Required secrets:
 #   GEOFFE_GA_PAT  - personal access token for the repo owner with `pull-requests: write`.
@@ -83,6 +89,27 @@ jobs:
           ID=$(jq -r '.id'   <<<"$CLAUDE")
           BODY=$(jq -r '.body' <<<"$CLAUDE")
 
+          # PROVENANCE (#1181), read from the SAME comment the verdict came from
+          # — the parity requirement in this file's header, and byte-for-byte the
+          # marker scripts/ralph/pr-ready.sh parses. code-review.yml prepends
+          # `<!-- creek-review pr=N -->` with N taken from
+          # `github.event.pull_request.number`, so a verdict without it came from
+          # the pipeline that reviewed PR #1179 and posted the LGTM onto #1117.
+          # Whole-LINE match: a marker quoted mid-sentence in review prose (a
+          # review of that change quotes one) attests to nothing. The trailing
+          # `[[:space:]]*` absorbs a carriage return, matching MARKER_RE in
+          # pr-ready.sh so the two clearance paths cannot disagree about bytes.
+          # `head -n 1` for the same reason: pr-ready.sh takes the FIRST marker in
+          # the body, so this must too.
+          #
+          # `|| true` on the whole pipeline because `set -euo pipefail` is on at
+          # the top of this step: grep exits 1 when there is no marker, which is
+          # the ordinary legacy case and not an error — and under `pipefail` that
+          # 1 would abort the step even though `tr` (the LAST command, whose
+          # status the pipeline would otherwise report) exits 0.
+          MARKER_PR=$(grep -oE '^<!-- creek-review pr=[0-9]+ -->[[:space:]]*$' <<<"$BODY" \
+                        | head -n 1 | tr -dc '0-9' || true)
+
           # Parse the verdict from that line only — grepping the whole body is
           # unsafe (a COMMENTS rationale may itself mention "LGTM"). When the
           # body carries several verdict lines (the reviewer re-verdicted in
@@ -129,6 +156,41 @@ jobs:
           if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
             if [ "$HELD" != "no" ]; then
               ACTION="NOT cleared to merge: the do-not-auto-merge hold is set on this PR (or its labels could not be read). A human owns this one - leave it alone."
+            elif [ "$MARKER_PR" != "$PR" ]; then
+              # Fails CLOSED: an absent or unparseable marker leaves MARKER_PR
+              # empty, which never equals a PR number, so it does not clear.
+              #
+              # REWRITING `VERDICT` IS WHAT ACTUALLY STOPS THE MERGE; `ACTION` IS
+              # NOT LOAD-BEARING. `.claude/skills/await-claude-review/SKILL.md`
+              # Step 4a parses `**VERDICT**:` and `**CI**: x/y Green` and nothing
+              # else — its item 3 returns LGTM to the caller on those two fields
+              # alone, and its item 5 says in as many words "Do not infer a
+              # verdict from the `Action:` prose". VERDICT is computed from the
+              # review comment ABOVE this clearance chain, and the chain only ever
+              # rewrote ACTION, so a marker-mismatched PR still posted
+              # `**VERDICT**: LGTM` + `**CI**: N/N Green` and a woken session
+              # merged on it — while Step 3 makes this summary SHORT-CIRCUIT
+              # per-event classification, so it is exactly the half that wins over
+              # pr-ready.sh's `awaiting-review`. A comment must not assert a
+              # merge-clearing verdict that the same comment then refuses.
+              #
+              # `NOT ATTESTED` is chosen for its BYTES: it contains no `LGTM`
+              # substring, so neither the `*LGTM*` glob above nor a downstream
+              # `test("LGTM")` can match it, and it is none of the three verdicts
+              # SKILL.md's recognition rule accepts — so Step 4a falls to item 5
+              # (marker present, verdict unparseable → surface to the user), which
+              # is the destination we want: a human looks, nobody merges.
+              # Assigning it here is safe because the enclosing
+              # `[ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]` has already
+              # been evaluated, and nothing reads VERDICT again before the BODY
+              # printf below.
+              #
+              # DELIBERATELY NOT DONE ON THE `HELD` AND `BEHIND` BRANCHES. They
+              # carry the identical pre-existing hole — a `do-not-auto-merge` hold
+              # is defeated the same way — and it is filed as #1202 (P1). The
+              # asymmetry is scoped to #1181 on purpose, not an oversight.
+              VERDICT='NOT ATTESTED'
+              ACTION="NOT cleared to merge: the latest verdict does not attest that the reviewer read THIS PR - its provenance marker names '${MARKER_PR}', not ${PR}. Run scripts/ralph/fleet.sh sync (or push any commit) so the marker-emitting review workflow runs on this branch and the re-review is attested; re-running the old review run will not help, it replays the workflow file from the commit that run was launched from. See #1181."
             elif [ "$BEHIND" != "0" ]; then
               ACTION="NOT cleared to merge: this head is not current with ${BASE:-its base} (behind_by='${BEHIND}'). Run scripts/ralph/fleet.sh sync and let CI re-run first."
             else

@@ -33,11 +33,16 @@ repos:
     - main
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.15.13
+  # --no-cache: ruff's cache key is mtime-only, and these hooks seed the very
+  # cache check-all.sh would otherwise trust; CI has none (issue #1119).
   hooks:
   - id: ruff
     args:
     - --fix
+    - --no-cache
   - id: ruff-format
+    args:
+    - --no-cache
 - repo: https://github.com/pre-commit/mirrors-mypy
   # Kept in sync with uv.lock (mypy 2.1.0) and pyproject.toml's
   # [project.optional-dependencies].dev pin so all three install paths

@@ -27,16 +27,20 @@ from __future__ import annotations
 import re
 import shlex
 import tomllib
-from pathlib import Path
 from typing import Any
 
 import yaml
 
-CREEK_TOOLS_DIR = Path(__file__).resolve().parent.parent
-REPO_ROOT = CREEK_TOOLS_DIR.parent
-SCRIPTS_DIR = CREEK_TOOLS_DIR / "scripts"
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-PRE_COMMIT_CONFIG = CREEK_TOOLS_DIR / ".pre-commit-config.yaml"
+from tests.shell_command_support import (
+    CI_WORKFLOW,
+    CREEK_TOOLS_DIR,
+    PRE_COMMIT_CONFIG,
+    SCRIPTS_DIR,
+)
+from tests.shell_command_support import ci_steps as _ci_steps
+from tests.shell_command_support import command_lines as _command_lines
+from tests.shell_command_support import non_comment_lines as _non_comment_lines
+
 PYPROJECT = CREEK_TOOLS_DIR / "pyproject.toml"
 
 # ``\bcreek\b`` deliberately does NOT match inside ``creek_mcp`` (``_`` is a
@@ -70,26 +74,6 @@ _MYPY_DISABLING_SETTINGS: dict[str, Any] = {
     "disallow_untyped_defs": False,
     "check_untyped_defs": False,
 }
-
-
-def _non_comment_lines(script: Path) -> list[str]:
-    """Return the lines of ``script`` that are not shell comments.
-
-    A line whose left-stripped form starts with ``#`` is a comment and is
-    dropped, so prose that quotes a command cannot satisfy an assertion
-    about the command that actually executes.
-    """
-    return [
-        line
-        for line in script.read_text(encoding="utf-8").splitlines()
-        if not line.lstrip().startswith("#")
-    ]
-
-
-def _command_lines(script: Path, pattern: str) -> list[str]:
-    """Return non-comment lines of ``script`` matching ``pattern``."""
-    regex = re.compile(pattern)
-    return [line.strip() for line in _non_comment_lines(script) if regex.search(line)]
 
 
 def _exclusion_values(command: str) -> list[str]:
@@ -141,15 +125,6 @@ def _as_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
     return [str(item) for item in value]
-
-
-def _ci_steps() -> list[dict[str, Any]]:
-    """Return every step of every job in the root CI workflow."""
-    workflow: dict[str, Any] = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
-    steps: list[dict[str, Any]] = []
-    for job in workflow["jobs"].values():
-        steps.extend(job.get("steps", []))
-    return steps
 
 
 def _ci_bandit_run_lines() -> list[str]:

@@ -2,22 +2,47 @@ name: Ralph Tooling Tests
 
 # The ONE workflow for everything under scripts/ralph/ — the Discord recap's
 # Python unit tests AND the shell suites for the fleet mechanics (fleet.sh,
-# pick-next.sh, pr-ready.sh, watch-pr.sh, plus the exec-bit regression test).
+# pick-next.sh, pr-ready.sh, watch-pr.sh, main-health.sh, review-quota.sh, plus
+# the exec-bit regression test).
 # These scripts live outside backend/ and tests/, so the backend-scoped
 # lint/coverage gates don't cover them. Consolidated from the former
 # ralph-fleet-tests.yml + ralph-recap-tests.yml pair: both triggered on the
 # same `scripts/ralph/**` paths, so the split was two workflows pretending to
 # be two concerns while covering one directory (#1096 fix 3).
 
+# code-review.yml is in BOTH path lists for the same reason every suite below is
+# listed explicitly: a suite that is written but never wired in here is not a
+# gate, it is a file. test_pr_ready.sh's coupling cases (issue #1181) read that
+# workflow — the EMITTER of the `<!-- creek-review pr=N -->` provenance marker —
+# and round-trip its printf format through pr-ready.sh's parser. Filtering on
+# `scripts/ralph/**` alone meant a PR that edits only the emitter ran no coupling
+# check at all: precisely the one change class those cases exist to guard. Both
+# triggers, because a `push`-only filter still lets the drift land through a PR
+# and a `pull_request`-only filter misses a direct push to `main`.
+#
+# iteration-trigger.yml is here for the identical reason: it is the SECOND
+# merge-clearance path. It posts "You are cleared to squash merge" off its own
+# verdict parse, so it must enforce the same invariant as pr-ready.sh or it
+# becomes a code path that falsifies the first — and it cleared PR #1117 on
+# #1179's verdict too. test_pr_ready.sh asserts two literals lifted out of it:
+# the anchored marker ERE its `MARKER_PR` extraction greps with, and the
+# `[ "$MARKER_PR" != "$PR" ]` clearance guard that consults it (extracting a
+# marker and never reading it is the same bug with an extra step). Both
+# assertions are as coupled to that file as the round trip is to the emitter, so
+# a PR that edits only iteration-trigger.yml must run this suite as well.
 on:
   push:
     paths:
       - "scripts/ralph/**"
       - ".github/workflows/ralph-recap-tests.yml"
+      - ".github/workflows/code-review.yml"
+      - ".github/workflows/iteration-trigger.yml"
   pull_request:
     paths:
       - "scripts/ralph/**"
       - ".github/workflows/ralph-recap-tests.yml"
+      - ".github/workflows/code-review.yml"
+      - ".github/workflows/iteration-trigger.yml"
 
 permissions:
   contents: read
@@ -38,6 +63,14 @@ jobs:
         run: shellcheck --severity=warning scripts/ralph/*.sh
 
       - name: Run fleet + picker + pr-ready + watch-pr + exec-bit shell tests
+        # Every suite is listed explicitly rather than globbed: a suite that is
+        # written but never wired in here is not a gate, it is a file. test_main_health.sh
+        # (issue #1159) guards the `main` CI circuit breaker the relaxed
+        # pre-merge freshness gate depends on. test_review_quota.sh (issue #1160)
+        # guards the reviewer-availability probe that stops a sync from spending
+        # an LGTM the quota cannot replace — and its polarity is INVERTED with
+        # respect to main-health.sh's, which is exactly the property an
+        # unwired suite would stop pinning.
         run: |
           git config --global user.email ci@example.com
           git config --global user.name ci
@@ -45,6 +78,8 @@ jobs:
           bash scripts/ralph/test_pick_next.sh
           bash scripts/ralph/test_pr_ready.sh
           bash scripts/ralph/test_watch_pr.sh
+          bash scripts/ralph/test_main_health.sh
+          bash scripts/ralph/test_review_quota.sh
           bash scripts/ralph/test_exec_bits.sh
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
