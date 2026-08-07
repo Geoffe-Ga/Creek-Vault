@@ -64,12 +64,17 @@ the version string an Adepthood client reads off this document is the
 version string the running server actually speaks. The bump is owed the
 first time any of #1073–#1077 changes a wire shape.
 
-**Wire mechanism.** Every `/v1` endpoint **except** `GET /v1/capabilities`
-requires an `X-Creek-Contract-Version: <major.minor>` request header; a
-missing or mismatched value is refused `409 incompatible_version` before any
-vault read. `GET /v1/capabilities` requires nothing on this axis,
-deliberately — the negotiation endpoint must never itself be able to fail to
-negotiate.
+**Wire mechanism.** Every `/v1` **capability** endpoint requires an
+`X-Creek-Contract-Version: <major.minor>` request header; a missing or
+mismatched value is refused `409 incompatible_version` before any vault read.
+`GET /v1/capabilities` requires nothing on this axis, deliberately — the
+negotiation endpoint must never itself be able to fail to negotiate.
+
+`GET /v1/health`, added by #1074, is exempt for a different reason: it is not
+part of this published contract at all, so there is no contract version for it
+to negotiate. Gating liveness on the header would leave a client on the wrong
+version unable to tell "the server is down" from "the server is up and we
+disagree about versions" — the two facts a probe exists to separate.
 
 **An Adepthood client pinned to `0.1.0-draft` is a hard break, not a
 negotiation.** It receives `409` on every journal/reflection/wheel call and a
@@ -88,15 +93,60 @@ migration artifact. There is no grace period to promise, so none is implied.
 
 ## Capabilities — the states a handshake can report
 
-`GET /v1/capabilities` is always HTTP `200` when the server is reachable and
-the caller is authenticated; the readiness state lives entirely in the
-`status` field of `CapabilitiesResponse`, never in the HTTP status line.
+`GET /v1/capabilities` is always HTTP `200` when the server is reachable, the
+caller is authenticated, and the request itself is well formed; the **readiness
+state** lives entirely in the `status` field of `CapabilitiesResponse`, never in
+the HTTP status line. No condition of the *server* — no vault, an unreadable
+config, a contract minor this server cannot speak — can move it off `200`.
+
+**The promise is about the server's state, not about accepting a malformed
+request.** A caller that declares an inadmissible `X-Creek-Tier-Ceiling` gets
+`422 invalid_request` here exactly as it does on every other route, because the
+ceiling gate is one edge check above the router with **no per-route exemption**
+(see [INTIMATE](#intimate)). That is deliberate, and it does not weaken
+negotiation:
+
+- The ceiling is the caller's own free, per-request choice, not something it is
+  pinned to the way a compiled-in contract version is. Omitting the header
+  always works and fails closed to `open`, so the caller is one trivially
+  discoverable step from a `200` — which is precisely the situation the version
+  exemption exists to rescue a client *from*, and why that axis needs an
+  exemption and this one does not.
+- The refusal is `invalid_request`, a distinct machine-readable code that a
+  conforming client (which branches on `code`, never on prose) can tell apart
+  from every server-side condition. It does not collapse into "vault
+  unavailable" — the failure this epic exists to stop.
+- `intimate` is not a constructible member of `WireTierCeiling`, so a client
+  generated from the published bundle cannot send it. Reaching this refusal
+  means leaving the published contract.
+- Most importantly, **any** exemption makes the ceiling gate route-aware, and
+  that is the property being protected. Its whole value is that it is one edge
+  check with no per-path branch: what it does is a function of the declared
+  header alone, so reviewing it does not require enumerating the route table,
+  and #1075–#1077 cannot get it wrong by omission. The version gate can afford
+  a per-route flag because it is not the thing standing between a network
+  caller and intimate content; this gate is.
+
+  Two exemption shapes were considered and both are refused. *Skip the check for
+  this route* is the obviously dangerous one — copy-pasted onto a handler that
+  really reads the vault, it reads it uncapped. *Degrade an inadmissible value
+  to `open` for this route* is genuinely not dangerous in itself (`open` is the
+  strictest ceiling, and is already what an absent header yields), so it is
+  worth saying plainly that it is refused on different grounds: it would break
+  the standing rule that an absent ceiling fails closed while a **bad** one is
+  refused and never repaired. Coercion is how a typo'd or hostile value ends up
+  admitted at *some* ceiling rather than at none, and a rule that holds
+  everywhere except on one route is a rule a reader has to check rather than
+  know.
+
+The published OpenAPI document therefore lists `422` among `getCapabilities`'
+responses, and that is correct rather than a generator artefact.
 
 | State | `status` | `vault.available` | `capabilities` | Both version strings present? |
 |---|---|---|---|---|
 | (a) present and usable | `ok` | `true` | all four | yes |
 | (b) reachable, uninitialized | `uninitialized` | `false` | `[]` | yes |
-| (c) reachable, contract-incompatible | `incompatible` | — | — | yes |
+| (c) reachable, contract-incompatible | `incompatible` | — | `[]` | yes |
 | (d) unreachable | — no body at all — | — | — | — |
 
 (d) is distinguished purely by transport outcome: connection refused, a
@@ -107,6 +157,24 @@ closed set the contract publishes — `{200, 401, 403, 404, 409, 422, 500,
 distinct local state and MUST NOT synthesize a capabilities body, and MUST
 NOT fold it into "uninitialized" — those are different facts an operator
 needs to act on differently.
+
+**"All four" describes the completed epic, not every commit of it.** While
+#1071 is being built out, `capabilities` advertises only the capabilities the
+running server actually implements: [#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074)
+ships `capabilities` alone, and #1075–#1077 each add one. A route that is
+mounted but unbuilt answers `501 unsupported_capability`, and advertising it in
+the handshake would be exactly the "the contract says yes, the call says no"
+divergence this epic exists to remove — a client would negotiate a capability
+and then discover, one round trip later, that it does not exist. The server's
+list is therefore driven by a single constant, `IMPLEMENTED_CAPABILITIES` in
+`creek_mcp/api/routes.py`, which also decides which routes answer `501`; the
+two can never disagree. `examples/capabilities/success.json` in the fixture
+bundle continues to document the completed steady state — all four — because
+re-publishing and re-hashing a consumer-pinned artifact four times inside one
+epic would train that consumer to re-pin without reading, which is the opposite
+of what a pinned bundle is for. The divergence between the fixture and the
+running server during the build-out is deliberate and is itself pinned by a
+test.
 
 **A fifth state the issue's Problem section did not name.** Post-#961,
 `unclassified` ranks with `personal`, not `open`, on the MCP ceiling (see
@@ -498,6 +566,49 @@ exactly the kind of undeclared-dependency drift this epic exists to stop.
 `model_json_schema()` and `model_validate` are pure Pydantic, already a
 direct dependency of `creek-tools`.
 
+## Serving: uvicorn's own logging and the readiness probe
+
+Two decisions from the #1117 review, both about how `creek-tools-api`'s own
+uvicorn process behaves rather than about the wire contract above.
+
+**uvicorn's access log is suppressed, not filtered.**
+[`build_uvicorn_config`](../../creek-tools/creek_mcp/httpapi/cli.py) passes
+`access_log=False` rather than reaching for a `log_config` override or a
+`logging.Filter` that trims the client address and concrete path back out of
+uvicorn's own logger. That logger is on by default and
+runs *alongside*
+[`AccessLogMiddleware`](../../creek-tools/creek_mcp/httpapi/logging.py), not
+instead of it, so a filter would be a *second* redaction rule loose in the
+process — free to drift from the middleware's the next time either one is
+touched without the other. Total suppression has no rule to drift: there is
+exactly one access log left in the process, and it is the audited one
+described in [`creek-tools/docs/api.md`](../../creek-tools/docs/api.md)'s
+"Request logging" section.
+
+**The `GET /v1/capabilities` readiness probe is hoisted off the event loop
+as a whole, not seam-by-seam.**
+[`_vault_is_usable`](../../creek-tools/creek_mcp/httpapi/capabilities.py) is
+the single synchronous seam under `handle_capabilities`: every blocking
+filesystem call the handshake makes — the config read and YAML parse, the
+marker stat, and an audit append that takes a thread lock and an `fcntl`
+exclusive lock across a full `fsync` — is reachable from that one function
+and nowhere else. `handle_capabilities` therefore wraps `_vault_is_usable`
+whole in `starlette.concurrency.run_in_threadpool` rather than hoisting each
+syscall beneath it individually; a narrower hoist would still leave some of
+those calls on the loop for no benefit and buy an extra context switch for
+the privilege. Inline, this probe blocked the event loop entirely — stalling
+every other in-flight request, including `GET /v1/health` and
+`RequestTimeoutMiddleware`'s own cancel scope, on the one endpoint every
+client calls first.
+
+**Not fixed here.** `creek_mcp/server.py`'s `_serve_network` builds its own
+`uvicorn.Config` for the MCP network transport and passes it no
+`access_log=False` — the identical omission this ADR's uvicorn decision
+above corrects for `creek-tools-api`, so uvicorn's default access logger is
+live there too, writing the client address and request line for every
+network MCP call. It is out of scope for #1117 and is tracked as follow-up
+[#1125](https://github.com/Geoffe-Ga/Creek-Vault/issues/1125).
+
 ## The published fixture bundle
 
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
@@ -586,3 +697,6 @@ restating the other.
 | Contract version | Date | Change |
 |---|---|---|
 | `0.2.0` | 2026-07-31 | This ADR: publishes `/v1`, the Adepthood HTTP application API, alongside the existing MCP agent adapter. No wire-shape change to the existing contract version — `creek_mcp.api.models` and the fixture bundle under `docs/contracts/adepthood-v1/` are the first publication of a new surface, not a revision of the MCP one (#1072, epic #1071). |
+| `0.2.0` | 2026-07-31 | #1074 mounts the routes: the tracer serves a real `GET /v1/capabilities` and answers `501 unsupported_capability` on journal, reflection and wheel. No wire shape changes, so no version moves. Two clarifications recorded above rather than left implicit: the advertised capability list tracks what is actually implemented during the epic's build-out, and the issue's provisional `not_implemented` spelling is superseded by `unsupported_capability` — the `ErrorCode` member this ADR already publishes for exactly that meaning at exactly that status. |
+| `0.2.0` | 2026-08-01 | #1117 review fixes: `creek-tools-api` now starts uvicorn with `access_log=False` (its own access logger was republishing the caller's address and the concrete request path alongside the audited middleware), and `GET /v1/capabilities`'s readiness probe now runs in a worker thread rather than on the event loop. Neither changes a wire shape, so no version moves. See [Serving: uvicorn's own logging and the readiness probe](#serving-uvicorns-own-logging-and-the-readiness-probe). |
+| `0.2.0` | 2026-08-01 | #1117 third review round: the audit append behind `GET /v1/capabilities` no longer re-reads the whole log per request — `creek_mcp.audit` now shares one `AuditLog` per path so the chain-hash cache it already maintains survives between requests, removing a per-request cost that grew with log length inside the exclusive write lock. Test-only alongside it: the semaphore-release-on-timeout test was rewritten (the original could not fail), a sibling case for release on client disconnect was added, the 401-uniformity sweep now compares header *values* and not only names, and the ceiling gate's handler-level probe was extended from one route to all five. Row (c) of the capabilities state table above is corrected from `—` to `[]` in the `capabilities` column, matching `docs/api.md` and the code. No wire shape changes, so no version moves. |

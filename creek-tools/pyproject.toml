@@ -28,6 +28,15 @@ dependencies = [
     # network transport (#837), so uvicorn is a direct dependency rather than
     # a transitive one via mcp. Floor matches the uv.lock resolution.
     "uvicorn>=0.47.0",
+    # creek_mcp.httpapi (the Adepthood /v1 HTTP application adapter, #1074)
+    # imports Starlette directly, so it is declared rather than left
+    # transitive via mcp — the undeclared-dependency drift the epic exists to
+    # stop. A floor, never a ceiling: the resolved version must stay
+    # compatible with the mcp SDK's own Starlette pin, because a conflict
+    # there would break the load-bearing MCP transport to serve the new one
+    # (see docs/decisions/2026-07-31-adepthood-http-application-api.md,
+    # "HTTP framework", reason 1). FastAPI is deliberately not adopted.
+    "starlette>=1.3.1",
     # At-rest volume key (creek.confidential): Argon2id / AES-GCM / HKDF are
     # imported unconditionally, so cryptography is a direct base dependency —
     # not left to transitive resolution via mcp -> pyjwt[crypto] (#758).
@@ -56,6 +65,10 @@ classifiers = [
 [project.scripts]
 creek = "creek.cli:app"
 creek-tools-mcp = "creek_mcp.server:main"
+# The Adepthood /v1 HTTP application adapter (#1074). Separate from
+# creek-tools-mcp on purpose: MCP stays the agent adapter, /v1 is the
+# application adapter, and both call one behavioural implementation.
+creek-tools-api = "creek_mcp.httpapi.cli:main"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]

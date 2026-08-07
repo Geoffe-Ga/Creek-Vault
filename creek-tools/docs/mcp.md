@@ -5,6 +5,13 @@ as MCP tools. Both the developer's Claude Code and the CrawDad Discord
 bot (FEAT-013+) consume the same surface, so privacy-tier enforcement
 and audit-log writes happen at one boundary.
 
+> **MCP is the *agent* adapter.** For the Adepthood-facing HTTP/JSON
+> *application* adapter — `creek-tools-api`, serving `/v1` — see
+> [`api.md`](api.md). Both adapters call the same `creek_mcp.tools.*`
+> functions and share one bearer-token registry, one tier-ceiling cap
+> (`creek_mcp.policy`) and one transport-confidentiality posture
+> (`creek_mcp.transport_posture`); they differ only in wire vocabulary.
+
 ## Installation
 
 ```bash

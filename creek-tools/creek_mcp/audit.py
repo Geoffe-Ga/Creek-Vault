@@ -29,6 +29,27 @@ FEAT-012 hardening details:
   individual ``entry_hash`` survives.
 * :func:`verify_mcp_audit_chain` walks both invariants and raises
   :class:`MCPAuditChainBrokenError` on any mismatch.
+
+**The underlying log object is shared per path, not built per call** (#1126).
+:class:`creek.audit.AuditLog` caches the chain hash of the line it
+last wrote so that repeated appends by one writer cost a ``stat`` rather than a
+full re-read of the file — the optimisation PR #193 added for the 10k-fragment
+ingest path. Every call site here spells the append as
+``MCPAuditLog(vault_path).append(...)``, which built a fresh
+:class:`~creek.audit.AuditLog` each time and so found that cache cold every
+time. Harmless at one append per interactive tool call; not harmless once
+``GET /v1/capabilities`` reaches the same append on every authenticated
+request, because the re-read happens *inside* the exclusive lock and its cost
+grows with the length of the log — an amplification a remote consumer controls
+by calling the endpoint. :func:`_shared_audit_log` gives one path one log
+object, so the cache survives between requests. Correctness does not depend on
+it: :meth:`~creek.audit.AuditLog._compute_prev_hash` compares the cached size
+against the file's own before trusting the cached hash, so an append by another
+instance, another thread or another process still forces the rescan it needs.
+The one thing that check cannot see is an out-of-band rewrite preserving the
+file's byte length — pre-existing, but the window is longer now that a cache
+lives for the process rather than for one call, so it is written down and
+tracked in #1149 rather than left to be rediscovered.
 """
 
 from __future__ import annotations
@@ -36,8 +57,9 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from creek.audit import AuditLog
 from creek.audit.log import GENESIS_PREV_HASH
@@ -50,6 +72,34 @@ MCP_AUDIT_RELPATH = Path("00-Creek-Meta/audit/mcp.jsonl")
 
 ENTRY_HASH_FIELD = "entry_hash"
 """Reserved field carrying ``sha256`` of the entry's content."""
+
+_SHARED_LOG_CACHE_SIZE: Final[int] = 32
+"""How many distinct log paths keep a warm chain-hash cache.
+
+Bounded rather than unbounded: a server serves one vault, so one entry does
+the whole job, and a cap means neither a long-lived process nor a test session
+that touches thousands of temporary vaults can accumulate log objects without
+limit. Evicting an entry costs the next append one rescan and nothing else.
+"""
+
+
+@lru_cache(maxsize=_SHARED_LOG_CACHE_SIZE)
+def _shared_audit_log(log_path: Path) -> AuditLog:
+    """Return the one :class:`~creek.audit.AuditLog` writing *log_path*.
+
+    Keyed on an already-resolved path so two spellings of the same file share
+    one object — the same normalisation
+    :func:`creek.audit.log._thread_lock_holder_for` applies to the write lock,
+    for the same reason: two objects for one file would each hold a cold cache
+    and neither would know the other had written.
+
+    Args:
+        log_path: The resolved path of the log file.
+
+    Returns:
+        The shared log object for that path.
+    """
+    return AuditLog(log_path)
 
 
 class MCPAuditChainBrokenError(Exception):
@@ -123,10 +173,16 @@ class MCPAuditLog:
     """
 
     def __init__(self, vault_path: Path) -> None:
-        """Resolve the canonical audit path under *vault_path*."""
+        """Resolve the canonical audit path under *vault_path*.
+
+        Cheap by construction — no I/O beyond the path resolution the shared
+        log is keyed on — so the ``MCPAuditLog(vault)`` spelling every tool
+        uses stays a per-call expression rather than something each call site
+        has to remember to hoist.
+        """
         self.vault_path = vault_path
         self.log_path = vault_path / MCP_AUDIT_RELPATH
-        self._audit = AuditLog(self.log_path)
+        self._audit = _shared_audit_log(self.log_path.resolve(strict=False))
 
     def append(
         self,
