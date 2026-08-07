@@ -16,6 +16,17 @@
 #                    workflow / check script / root conftest) or an edit to a
 #                    file this branch also touches → sync first. Merely being
 #                    behind is NOT enough; see the freshness guard below.
+#   main-not-green   LGTM (fresh) + CI green, and this lane IS behind `main` — so
+#                    it is about to invoke the #1157 relaxation below, whose
+#                    whole justification is the full CI run on `push: main`. That
+#                    run is not green (it failed, or nothing has concluded yet, or
+#                    the answer was unreadable), so the backstop is not there to
+#                    catch anything and the relaxation is SUSPENDED for the
+#                    duration — the lane waits. It deliberately does NOT print
+#                    `behind`: `behind`'s remedy is a sync, and syncing pulls the
+#                    breakage into the lane. Fails closed — anything other than a
+#                    `green` answer from the `main-health.sh` sibling, including a
+#                    missing or non-executable helper, holds the lane (#1159).
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
 #   ci-failed        CI has a failing/errored check → Step 2 (ci-debugging)
 #   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
@@ -130,7 +141,65 @@
 # interaction. Otherwise the branch's green still describes the tree it would
 # merge into, and it merges. What backstops the residual risk is the full CI run
 # on `push: main` — every squash-merge re-proves the merged result, so a stale
-# green that slips through is caught on `main` rather than assumed away.
+# green that slips through is caught on `main` rather than assumed away. That
+# backstop is now VERIFIED, not assumed: a lane about to spend it asks the
+# `main-health.sh` sibling whether the `push: main` run actually concluded green,
+# and holds (`main-not-green`) when it did not.
+#
+# WHY IT IS A PRECONDITION, NOT A GATE (#1159): the sentence above is a premise,
+# and until #1159 nothing in the loop had ever read the run it names. While
+# `main` is red that premise is simply false — the "it gets caught on `main`"
+# half of the argument is not happening — so the relaxation has no justification
+# left and is SUSPENDED: the gate falls back to pre-#1157 strictness for the
+# duration. Never weakened, never widened, and never converted into a forced
+# sync. Three consequences follow, and each one is load-bearing:
+#
+#   * It is asked ONLY by a lane that is behind. `behind_by == 0` means the
+#     relaxation is not being invoked at all, so there is no premise to check —
+#     and that lane merges even while `main` is red. That is not an oversight,
+#     it is proof — for the class of breakage that is a function of the merged
+#     tree — and it is airtight there: `behind_by == 0` means `main`'s HEAD is
+#     already an ancestor of this branch's head; `.github/workflows/ci.yml`
+#     carries no `paths:` filter, runs the IDENTICAL job matrix on `push` and
+#     `pull_request`, and its `actions/checkout@v7` has no `ref:` override — so
+#     this PR's CI ran on `refs/pull/N/merge`, a tree that already CONTAINS
+#     whatever broke `main`, and `gh pr checks` is per-HEAD-commit. Its green
+#     therefore says the commit-content breakage is either absent from the
+#     merged result or fixed by this very branch.
+#     The proof says nothing about breakage that is NOT a function of the
+#     git tree: a newly published advisory against an already-pinned
+#     dependency, an expired credential, a yanked upstream package. A
+#     `behind_by == 0` lane whose CI went green BEFORE such an event still
+#     carries the identical pinned dependency and still reads `ready` — its
+#     green is stale with respect to that class, and re-running its CI right
+#     now could be red. This is not hypothetical: `main-health.sh`'s own
+#     header records this gate's first live run catching `main` red on
+#     exactly that class (PYSEC-2026-3552 against `cryptography` 49.0.0,
+#     which turned `pip-audit` red on a tree nobody had touched — the two
+#     commits bounding the blame range were both innocent). That residual is
+#     a knowingly ACCEPTED risk, not a hole in the proof above — see the next
+#     bullet for why closing it costs more than it buys.
+#   * That is exactly the shape of the PR that FIXES `main` — current with
+#     `main`, green on the merge ref. So the remedy for a red `main` merges with
+#     no bypass label, no override, and no extra API call. Making this lane
+#     also consult `main-health.sh` was considered and rejected: the PR that
+#     FIXES `main` is itself `behind_by == 0` and green, so gating it on
+#     `main` being green would make the remedy unmergeable while `main` is
+#     red — precisely the deadlock this precondition exists to avoid, and
+#     escaping it would require the bypass label this design deliberately
+#     does not have. So for the commit-content class the deadlock is closed
+#     by construction; the time/environment-triggered class named above is an
+#     accepted residual, not a gap in that construction.
+#     (It is also flake-immune: if `main`'s red was a flake, current+green lanes
+#     keep merging and the loop keeps moving; if it was real, those lanes go red
+#     too under the identical matrix and are held by `ci-failed` anyway.)
+#   * The polarity is fail-CLOSED, and the probe sits BEFORE
+#     `main_changes_are_inert`, not after it. A lane behind a lockfile bump would
+#     otherwise print `behind`, whose remedy (`fleet.sh sync`) is actively
+#     harmful with `main` red: it pulls the breakage into the lane, burns a
+#     ~14-minute CI round, and turns the lane's own CI red — which this script
+#     then classifies `ci-failed`, dispatching a fix worker onto a failure the
+#     lane never caused.
 #
 # Usage:  pr-ready.sh <PR_NUMBER> [--repo <owner/repo>]
 set -euo pipefail
@@ -189,6 +258,26 @@ readonly RISK_SURFACE_RE='(^|/)(pyproject\.toml|uv\.lock|poetry\.lock|conftest\.
 # cannot support — and the whole point of the disjointness test is to skip a
 # sync. Fail closed at the cap: a big merge re-proves itself the old way.
 readonly COMPARE_FILE_CAP=300
+
+# The ONE answer from `main-health.sh` that clears the #1157 relaxation. Every
+# other token it can print — `red`, `pending`, `unknown` — plus an empty answer
+# and a helper that would not run at all, holds the lane. See the precondition
+# block in the header for why the polarity is this way round (#1159).
+readonly MAIN_HEALTHY_TOKEN="green"
+
+# The sibling that answers it, resolved by THIS script's own dirname exactly as
+# watch-pr.sh:65-66 resolves pr-ready.sh — so a copy of the tree, a worktree, or
+# a checkout at any path finds its own helper and never a stray one on PATH.
+# Declared and assigned on separate lines because `readonly x="$(…)"` masks the
+# command substitution's exit status (SC2155).
+#
+# It is invoked DIRECTLY, never as `bash "$MAIN_HEALTH_HELPER"`: a helper whose
+# exec bit was dropped in packaging (the exact failure #1092 shipped and
+# test_exec_bits.sh now guards) must read as "we could not ask", not as an
+# answer. `bash` would happily run it and hand back a verdict from a file the
+# repo considers uninstalled.
+MAIN_HEALTH_HELPER="$(cd "$(dirname "$0")" && pwd)/main-health.sh"
+readonly MAIN_HEALTH_HELPER
 
 # The `code-review.yml` job name as it appears in the status rollup (the job KEY;
 # that job declares no `name:` override, so the check name matches it), and the
@@ -442,6 +531,12 @@ main_changes_are_inert() { # main_changes_are_inert <slug> <base> <head_oid> <me
   return 0
 }
 
+# Set by `branch_is_current` when the lane is held because `main` itself is not
+# green — the ONE reason a not-current lane must NOT be told to sync. Module
+# scope because the function reports through the exit status the `&&` below
+# consumes, and "hold" and "sync first" are two different remedies (#1159).
+main_health_hold=""
+
 # True when `main` has landed nothing since the merge base that could invalidate
 # this branch's green. `behind_by == 0` is the fast path and still short-circuits
 # on ONE call, so a lane that is already current costs exactly what it always
@@ -452,7 +547,7 @@ main_changes_are_inert() { # main_changes_are_inert <slug> <base> <head_oid> <me
 # base, or a truncated file list all read as "not current", because `behind`'s
 # remedy (fleet.sh sync) is always safe and a false `ready` is not.
 branch_is_current() {
-  local ref_line base head_oid slug cmp behind merge_base cmp_rest
+  local ref_line base head_oid slug cmp behind merge_base cmp_rest health
   ref_line="$(gh pr view "${gh_args[@]}" --json baseRefName,headRefOid \
     --jq '(.baseRefName // "") + "|" + (.headRefOid // "")' 2>/dev/null)" || return 1
   # Demand the separator before splitting on it. Without this, a separator-free
@@ -485,6 +580,34 @@ branch_is_current() {
   [[ "$behind" =~ ^[0-9]+$ ]] || return 1
   if [[ "$behind" -eq 0 ]]; then return 0; fi
   [[ "$merge_base" =~ ^[0-9a-f]{7,40}$ ]] || return 1
+
+  # THE #1157 PRECONDITION (#1159). Everything below this line is the relaxation
+  # — the lane is behind, and `main_changes_are_inert` is about to decide it may
+  # merge anyway. That decision is only sound while the `push: main` backstop is
+  # alive, so ask before spending it. Placed HERE, and not one line lower, for
+  # the ordering reason in the header: after the file listing, a lane behind a
+  # lockfile bump would already have printed `behind` and been synced onto a
+  # broken `main`. Placed here and not one line HIGHER so the two cheap
+  # validations above still short-circuit without paying for the call — this is
+  # one more API request per behind lane per wake, and the fleet is what runs out
+  # of API budget first.
+  #
+  # `|| health=""` because the helper sits under `set -e`: an unguarded call that
+  # exited non-zero would abort this script mid-classification, and the
+  # orchestrator's contract reads a non-zero exit with empty stdout as a TOOLING
+  # error — dispatching nothing and logging nothing useful. `--repo` is forwarded
+  # or a `--repo`-scoped invocation would silently read some other repo's `main`.
+  # The helper's own stderr (its attribution and blame range) is deliberately NOT
+  # swallowed: it is the only place the operator learns WHICH commit is red.
+  health=""
+  if [[ -x "$MAIN_HEALTH_HELPER" ]]; then
+    health="$("$MAIN_HEALTH_HELPER" ${repo_args[@]+"${repo_args[@]}"})" || health=""
+  fi
+  if [[ "$health" != "$MAIN_HEALTHY_TOKEN" ]]; then
+    main_health_hold="${health:-unreadable}"
+    return 1
+  fi
+
   main_changes_are_inert "$slug" "$base" "$head_oid" "$merge_base"
 }
 
@@ -516,6 +639,14 @@ fi
 # way, so paying an API request to learn how far behind it is, is pure waste.
 if [[ "$merge_state" == "CLEAN" ]] && branch_is_current; then
   echo "$ready_token"
+elif [[ -n "$main_health_hold" ]]; then
+  # Not current, and the reason we cannot clear it is `main` itself. `behind`
+  # would be the wrong answer here even though the branch IS behind: its remedy
+  # is a sync, and a sync onto a red `main` imports the breakage, burns a CI
+  # round, and re-reports as this lane's own `ci-failed`. Wait instead — and
+  # `main-not-green` is in watch-pr.sh's IN_FLIGHT_TOKENS so waiting is what the
+  # watcher does, rather than busy-waking the fleet (#1159).
+  echo "main-not-green"
 else
   echo "behind"
 fi

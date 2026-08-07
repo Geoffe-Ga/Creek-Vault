@@ -30,9 +30,10 @@ check() { # check <desc> <expected> <actual>
 readonly EXEC_MODE=100755
 
 # Every *.sh under scripts/ralph/ is directly invoked — the entry points
-# (fleet.sh, pick-next.sh, pr-ready.sh, watch-pr.sh) by the orchestrator, the
-# test_*.sh suites by CI and by hand — so the rule is the whole glob, not a
-# hand-kept list that a new script would silently dodge.
+# (fleet.sh, pick-next.sh, pr-ready.sh, watch-pr.sh, main-health.sh) by the
+# orchestrator or by each other, the test_*.sh suites by CI and by hand — so the
+# rule is the whole glob, not a hand-kept list that a new script would silently
+# dodge.
 listing="$(git -C "$ROOT" ls-files -s -- 'scripts/ralph/*.sh')"
 
 # Guard the guard: an empty listing (a moved directory, a bad pathspec) must
@@ -43,9 +44,12 @@ else
   bad "git ls-files returned no scripts/ralph/*.sh entries — pathspec broken?"
 fi
 
-# And pin the four known entry points by name, so a rename cannot quietly drop
-# one out of the glob's jurisdiction.
-for name in fleet.sh pick-next.sh pr-ready.sh watch-pr.sh; do
+# And pin the known entry points by name, so a rename cannot quietly drop one
+# out of the glob's jurisdiction. main-health.sh (issue #1159) is one of them:
+# pr-ready.sh invokes it as a SIBLING, so a lost exec bit there does not fail
+# loudly — it degrades every behind lane to `main-not-green` and stalls the
+# fleet quietly, which is exactly the class of failure this suite exists for.
+for name in fleet.sh pick-next.sh pr-ready.sh watch-pr.sh main-health.sh; do
   if grep -q "scripts/ralph/$name\$" <<<"$listing"; then
     ok "listing includes $name"
   else

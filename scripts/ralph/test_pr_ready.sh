@@ -8,7 +8,7 @@
 # verdict only counts when it is fresher than the PR's HEAD commit (stale-verdict
 # guard). We put a fake, arg-aware `gh` on PATH and assert every classification.
 #
-# Beyond that baseline, these tests pin six more dimensions:
+# Beyond that baseline, these tests pin seven more dimensions:
 #
 #   verdict split  the four verdict states are distinct outcomes (issue #1097):
 #                  missing → awaiting-review, stale (LGTM or not) →
@@ -36,6 +36,12 @@
 #                  `IFS='|' read -r a b c rest`; a non-empty `rest` (a `|` in a
 #                  branch name, a login, a date) must fail CLOSED, not silently
 #                  shift a field and merge on garbage.
+#   main health    the #1157 relaxation (a behind-but-inert lane merges anyway)
+#                  is justified by ONE backstop: the full CI run on `push: main`
+#                  re-proving every squash-merge. So a lane that is about to USE
+#                  the relaxation must first prove the backstop is alive —
+#                  `main-not-green` (issue #1159). A lane with `behind_by == 0`
+#                  never uses the relaxation and therefore never asks.
 #
 # Plus one cross-file coupling check: pr-ready.sh matches the review check by the
 # literal name `claude-review`, so `.github/workflows/code-review.yml` must keep
@@ -124,12 +130,47 @@ mkdir -p "$BIN"
 #                   REAL jq with pr-ready.sh's own `--jq` expression against it,
 #                   so the production verdict regex is genuinely exercised
 #                   (otherwise a scalar stub would mask a broken regex).
+#   MAIN_HEALTH   — scalar shortcut for the `gh run list` arm that main-health.sh
+#                   (pr-ready.sh's sibling, issue #1159) calls: `green` / `red` /
+#                   `pending` emit one synthetic run line, `unknown` emits
+#                   nothing at all. It DEFAULTS TO `green` so the pre-existing
+#                   behind-but-inert cases keep testing #1157's disjointness
+#                   rather than accidentally testing this gate.
+#   MAIN_RUNS_JSON — raw `--json status,conclusion,headSha,databaseId,url`
+#                   payload; when set, the stub runs the REAL jq with
+#                   main-health.sh's own `--jq` expression against it (the
+#                   COMMENTS_JSON / ROLLUP_JSON pattern), so the production
+#                   run-list expression is genuinely exercised through
+#                   pr-ready.sh rather than mocked at the token.
+#   MAIN_HEALTH_EC — exit code of the run-list call; 1 proves a failed lookup
+#                   holds the lane (`main-not-green`) and still exits 0.
+#   MAIN_HEALTH_SENTINEL — file the run-list arm touches when it is called. The
+#                   laziness assertions use it: this gate costs an extra API
+#                   call, so only a lane about to USE the #1157 relaxation may
+#                   pay for it.
 # Real gh applies --jq, so — like test_fleet.sh — the stub emits the already
 # extracted scalar and branches on which --json field the caller asked for.
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  "run list"*)
+    # main-health.sh's single call. One line per run, NEWEST FIRST, five
+    # `|`-separated fields: status|conclusion|headSha|databaseId|url.
+    [[ -n "${MAIN_HEALTH_SENTINEL:-}" ]] && : > "$MAIN_HEALTH_SENTINEL"
+    if [[ -n "${MAIN_RUNS_JSON:-}" ]]; then
+      expr="" prev=""
+      for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
+      printf '%s' "$MAIN_RUNS_JSON" | jq -r "$expr"
+      exit "${MAIN_HEALTH_EC:-0}"
+    fi
+    case "${MAIN_HEALTH:-green}" in
+      green)   printf 'completed|success|abc1234|11|https://x/11\n' ;;
+      red)     printf 'completed|failure|dead1234|12|https://x/12\n' ;;
+      pending) printf 'in_progress||feed1234|13|https://x/13\n' ;;
+      *)       : ;;   # `unknown`: gh answered nothing at all
+    esac
+    exit "${MAIN_HEALTH_EC:-0}" ;;
   "api "*"compare"*)
     # Three compare calls now, told apart by the --jq the caller passes and by
     # the range. The behind_by/merge-base probe is the only one a lane that is
@@ -616,6 +657,246 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" \
        BEHIND_BY=22 PR_LABELS="$OPTOUT" COMPARE_SENTINEL="$S_OPTOUT" run 100)" || tok="exit-$?"
 check "lazy compare: opt-out lane token" "optout" "$tok"
 probed "lazy compare: opt-out lane does not probe" "no" "$S_OPTOUT"
+
+# --- main health: the #1157 relaxation's PRECONDITION (issue #1159) ---------
+# #1157 let a lane that is behind `main` merge anyway whenever the two
+# changesets provably cannot interact. Its whole justification is one sentence
+# in pr-ready.sh's header (lines 129-133): "What backstops the residual risk is
+# the full CI run on `push: main` — every squash-merge re-proves the merged
+# result." Nothing in the loop had ever read that run's conclusion, so the
+# backstop was an assumption. It is now a check, and it is deliberately a
+# precondition of the RELAXATION, not a new gate on merging: only a lane that is
+# about to skip a sync has to prove the backstop is alive.
+#
+# The probe sits inside `branch_is_current`, AFTER the `behind_by == 0` fast
+# path and AFTER the merge-base validation, and BEFORE `main_changes_are_inert`.
+# Anything other than `green` — including an empty answer or a missing helper —
+# holds the lane as `main-not-green`.
+#
+# THE ANTI-MASKING PROOF: because the stub defaults MAIN_HEALTH to `green`,
+# someone could delete the probe from pr-ready.sh entirely and every
+# pre-existing test in this file would still pass. Three assertions below make
+# that impossible, and they only work TOGETHER:
+#   (1) MAIN_HEALTH=red → `main-not-green`   — the answer is actually consumed;
+#   (2) the sentinel is PRESENT on that lane — the call is actually made;
+#   (3) the sentinel is ABSENT on a BEHIND_BY=0 lane — the laziness holds, and
+#       the deadlock exception below is real rather than an accident.
+# Delete the probe and (1) and (2) fail; make the probe unconditional and (3)
+# fails. Do not remove any one of the three believing the others cover it.
+
+# THE RED CASE. This is the #1137 behind-but-inert lane — the one #1157 taught
+# the loop to merge — with `main` itself broken. Merging it would stack a second
+# unvalidated change on top of a tree that is already red, and the loop would
+# then read the resulting CI failure as THIS lane's fault.
+check "behind + inert files but main CI RED → main-not-green" "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=red run 100)"
+
+# Non-vacuity, and the guard that #1157 was not quietly re-tightened: the SAME
+# lane with a healthy `main` still merges. If this ever flips to `behind` or
+# `main-not-green`, the serialization #1137 measured (CI runs per PR 1.00 →
+# 1.61, p90 latency 15 → 104 minutes) is back.
+check "behind + inert files, main CI green → ready" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=green run 100)"
+
+# THE DEADLOCK PIN. A lane that is NOT behind merges even while `main` is red,
+# and this must stay true forever, so a future "tighten it" refactor cannot
+# freeze the whole loop the first time somebody breaks `main`.
+#
+# Why it is safe, precisely: `behind_by == 0` means `main`'s HEAD is already an
+# ancestor of this branch's head. `.github/workflows/ci.yml` carries NO `paths:`
+# filter and runs the IDENTICAL job matrix on `push` and `pull_request`, and its
+# `actions/checkout@v7` has no `ref:` override — so this PR's CI ran on
+# `refs/pull/N/merge`, a tree that already contains whatever broke `main`. Its
+# green is therefore positive proof that the breakage is either absent from the
+# merged result or fixed by this very branch.
+#
+# Why it matters: that is exactly the shape of the PR that FIXES `main`. Without
+# this exception the remedy for a red `main` would itself be blocked by the red
+# `main`, and the loop would need a bypass label — one more thing to get wrong,
+# and one more thing that can be left switched on. Here the loop cannot deadlock
+# by construction.
+check "behind_by 0 with main CI RED → ready (the deadlock pin)" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+     MAIN_HEALTH=red run 100)"
+
+# Fail CLOSED on everything that is not a green answer. `pending` is the common
+# one — `main` CI lags each merge by ~14 minutes — and it is still not evidence
+# that the backstop caught anything, so a lane that wants to SKIP a sync waits
+# one wake rather than merging on a maybe.
+check "behind + inert but main CI PENDING → main-not-green" "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=pending run 100)"
+
+check "behind + inert but main health UNKNOWN → main-not-green" "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+     MAIN_HEALTH=unknown run 100)"
+
+# A gh failure inside the sibling must not kill pr-ready.sh: the call sits under
+# `set -e`, so an unguarded invocation would abort the script mid-classification
+# and the orchestrator would see an empty answer with a non-zero exit — which its
+# contract defines as a TOOLING error, dispatching nothing and logging nothing
+# useful. MAIN_HEALTH=green alongside EC=1 is the dangerous shape: the happy
+# answer is already on stdout when the call fails.
+rc=0
+out="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_HEALTH=green MAIN_HEALTH_EC=1 run 100)" || rc=$?
+check "main-health lookup failure → main-not-green" "main-not-green" "$out"
+check "main-health lookup failure still exits 0" "0" "$rc"
+
+# ORDERING — never sync INTO the breakage. A lane behind a RISK-SURFACE change
+# would normally print `behind`, whose remedy is `fleet.sh sync`. With `main`
+# red that remedy is actively harmful: the sync pulls the breakage into the
+# lane, burns a ~14-minute CI round, and turns the lane's OWN CI red — which
+# pr-ready.sh then classifies `ci-failed`, dispatching a fix worker onto a
+# failure the lane never caused. So main-health is consulted BEFORE the file
+# comparison, and `main-not-green` (wait) outranks `behind` (act).
+check "behind a risk-surface change with main CI RED → main-not-green, not behind" \
+  "main-not-green" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" \
+     MAIN_HEALTH=red run 100)"
+
+# The twin: with `main` healthy the same lane is still `behind` — the ordering
+# change must not have swallowed #1157's risk-surface rule.
+check "behind a risk-surface change with main CI green → behind" "behind" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+     THEIR_FILES="creek-tools/uv.lock" OUR_FILES="creek/mine.py" \
+     MAIN_HEALTH=green run 100)"
+
+# --- REAL jq: exercise main-health.sh's production run-list expression ------
+# The scalar arm above cannot catch a `--jq` that drops a field or trips over
+# the two type surprises in this payload: `databaseId` is a NUMBER and
+# `conclusion` is JSON null while a run is in flight. Feeding raw payloads
+# through the REAL sibling proves the two scripts agree end to end — including
+# on the token STRING, which a fake sibling would let drift.
+if command -v jq >/dev/null 2>&1; then
+  MH_SUCCESS='{"status":"completed","conclusion":"success","headSha":"abc1234","databaseId":11,"url":"https://x/11"}'
+  MH_FAILURE='{"status":"completed","conclusion":"failure","headSha":"dead1234","databaseId":12,"url":"https://x/12"}'
+  MH_FLIGHT='{"status":"in_progress","conclusion":null,"headSha":"feed1234","databaseId":13,"url":"https://x/13"}'
+
+  check "real run-list payload, main failing → main-not-green" "main-not-green" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_RUNS_JSON="[$MH_FAILURE,$MH_SUCCESS]" run 100)"
+
+  # A run in flight over an older success is the STEADY STATE of a busy fleet
+  # (main CI lags every merge by ~14 minutes). It must read green, or this gate
+  # reintroduces the serialization #1138 removed.
+  check "real run-list payload, in flight over a success → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_RUNS_JSON="[$MH_FLIGHT,$MH_SUCCESS]" run 100)"
+
+  check "real run-list payload, empty window → main-not-green" "main-not-green" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_RUNS_JSON='[]' run 100)"
+else
+  echo "  skip - real-jq main-health payload cases (jq not installed)"
+fi
+
+# --- the sibling seam: a helper that is not there holds the lane ------------
+# pr-ready.sh resolves main-health.sh by its own `dirname`, exactly as
+# watch-pr.sh resolves pr-ready.sh (test_watch_pr.sh:53). A copy of the script
+# in a directory with no sibling IS that seam. A partial checkout, a bad
+# packaging change, or a rename must never read as "main is fine".
+NOSIB="$WORK/nosibling"
+mkdir -p "$NOSIB"
+cp "$READY" "$NOSIB/pr-ready.sh"
+chmod +x "$NOSIB/pr-ready.sh"
+run_nosib() { PATH="$BIN:$PATH" "$NOSIB/pr-ready.sh" "$@" 2>/dev/null; }
+
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       run_nosib 100)" || tok="exit-$?"
+no_merge_token "missing main-health.sh sibling is never mergeable" "$tok"
+
+# And a helper that exists but cannot be executed (a dropped exec bit — the
+# exact failure test_exec_bits.sh guards, and the one #1092 actually shipped).
+# The planted file WOULD answer `green` if it ran, so an implementation that
+# `bash`es the helper instead of checking it is executable fails here.
+NOEXEC="$WORK/noexec"
+mkdir -p "$NOEXEC"
+cp "$READY" "$NOEXEC/pr-ready.sh"
+chmod +x "$NOEXEC/pr-ready.sh"
+printf '#!/usr/bin/env bash\necho green\n' > "$NOEXEC/main-health.sh"
+chmod 644 "$NOEXEC/main-health.sh"
+run_noexec() { PATH="$BIN:$PATH" "$NOEXEC/pr-ready.sh" "$@" 2>/dev/null; }
+
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       run_noexec 100)" || tok="exit-$?"
+no_merge_token "non-executable main-health.sh sibling is never mergeable" "$tok"
+
+# --- main-health probe is LAZY ---------------------------------------------
+# Same rate-limit argument as the compare and review-gate probes: this is one
+# more API request per lane per wake, and it can only change the outcome for a
+# lane that is about to USE the #1157 relaxation. Every lane below has already
+# decided. Each gets its OWN sentinel path — a shared one would let an earlier
+# lane's probe satisfy a later lane's assertion.
+M_OPTOUT="$WORK/main-health-optout"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       PR_LABELS="$OPTOUT" MAIN_HEALTH_SENTINEL="$M_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy main-health: opt-out lane token" "optout" "$tok"
+probed "lazy main-health: opt-out lane does not probe" "no" "$M_OPTOUT"
+
+M_PENDING="$WORK/main-health-pending"
+tok="$(CHECKS_EC=8 BEHIND_BY=22 MAIN_HEALTH_SENTINEL="$M_PENDING" run 100)" || tok="exit-$?"
+check "lazy main-health: pending lane token" "pending" "$tok"
+probed "lazy main-health: pending lane does not probe" "no" "$M_PENDING"
+
+M_CIFAIL="$WORK/main-health-cifail"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 MAIN_HEALTH_SENTINEL="$M_CIFAIL" run 100)" || tok="exit-$?"
+check "lazy main-health: ci-failed lane token" "ci-failed" "$tok"
+probed "lazy main-health: ci-failed lane does not probe" "no" "$M_CIFAIL"
+
+M_CR="$WORK/main-health-changes-requested"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|false" BEHIND_BY=22 \
+       MAIN_HEALTH_SENTINEL="$M_CR" run 100)" || tok="exit-$?"
+check "lazy main-health: changes-requested lane token" "changes-requested" "$tok"
+probed "lazy main-health: changes-requested lane does not probe" "no" "$M_CR"
+
+M_STALE="$WORK/main-health-stale"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$STALE|true" BEHIND_BY=22 \
+       MAIN_HEALTH_SENTINEL="$M_STALE" run 100)" || tok="exit-$?"
+check "lazy main-health: stale-verdict lane token" "awaiting-review" "$tok"
+probed "lazy main-health: stale-verdict lane does not probe" "no" "$M_STALE"
+
+# ASSERTION (3) OF THE ANTI-MASKING PROOF, and the deadlock exception made
+# mechanical: a lane that is already current never uses the relaxation, so it
+# never asks about `main` — not one request, on the overwhelmingly common path.
+M_CURRENT="$WORK/main-health-current"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       MAIN_HEALTH=red MAIN_HEALTH_SENTINEL="$M_CURRENT" run 100)" || tok="exit-$?"
+check "lazy main-health: current lane token" "ready" "$tok"
+probed "lazy main-health: current lane does not probe" "no" "$M_CURRENT"
+
+# ASSERTION (2): the behind lane really does make the call. Without this, a
+# probe deleted from pr-ready.sh would leave every green-default case passing.
+M_BEHIND="$WORK/main-health-behind"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       THEIR_FILES="creek/classify/privacy.py" OUR_FILES="creek/vault/writer.py" \
+       MAIN_HEALTH_SENTINEL="$M_BEHIND" run 100)" || tok="exit-$?"
+check "lazy main-health: behind-past-merge-base lane token" "ready" "$tok"
+probed "lazy main-health: behind lane DOES probe" "yes" "$M_BEHIND"
+
+# PRECEDENCE: the merge-base validation runs FIRST, so a malformed merge base
+# still short-circuits to `behind` without paying for the main-health call. A
+# probe placed above that validation would spend a request to answer a question
+# the lane had already answered.
+M_BADBASE="$WORK/main-health-badbase"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=22 \
+       MERGE_BASE="not-a-sha" THEIR_FILES="creek/a.py" OUR_FILES="creek/b.py" \
+       MAIN_HEALTH_SENTINEL="$M_BADBASE" run 100)" || tok="exit-$?"
+check "malformed merge base still short-circuits to behind" "behind" "$tok"
+probed "malformed merge base does not pay for main-health" "no" "$M_BADBASE"
 
 # --- ready-unreviewed: PROVABLY no review gate ------------------------------
 # `.github/workflows/code-review.yml` skips its `claude-review` job on Dependabot
