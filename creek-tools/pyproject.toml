@@ -31,7 +31,11 @@ dependencies = [
     # At-rest volume key (creek.confidential): Argon2id / AES-GCM / HKDF are
     # imported unconditionally, so cryptography is a direct base dependency —
     # not left to transitive resolution via mcp -> pyjwt[crypto] (#758).
-    "cryptography>=48.0.0",
+    # Security: floor raised above PYSEC-2026-3552 (CVE-2026-69247,
+    # GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption leaked a
+    # Bleichenbacher oracle through distinguishable errors and timing.
+    # Introduced in 44.0.0, fixed in 50.0.0 (#1167).
+    "cryptography>=50.0.0",
     # Security: pin urllib3 above CVE-2026-44431 / CVE-2026-44432
     # (transitive via requests/conan). Both are fixed in 2.7.0.
     "urllib3>=2.7.0",
@@ -153,7 +157,10 @@ build-backend = "setuptools.build_meta"
 # in the graph without adding it as a direct dependency, so a future
 # `uv lock` cannot silently regress onto a vulnerable build/dev version.
 constraint-dependencies = [
-    "cryptography>=48.0.0",
+    # Security: matches the base-dependency floor — above PYSEC-2026-3552
+    # (CVE-2026-69247), the PKCS#7 EnvelopedData Bleichenbacher oracle.
+    # Fixed in 50.0.0 (#1167).
+    "cryptography>=50.0.0",
     "pyjwt>=2.13.0",
     "pip>=26.1.2",
     # Security: pin setuptools above PYSEC-2026-3447 (CVE-2026-59890,

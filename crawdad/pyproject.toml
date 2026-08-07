@@ -80,13 +80,16 @@ constraint-dependencies = [
     # transitive via google-genai → google-auth → pyasn1-modules.
     # Both fixed in 0.6.4 (#867).
     "pyasn1>=0.6.4",
-    # Security: pin cryptography above GHSA-537c-gmf6-5ccf, carried by
-    # the previously-locked 48.0.0 — transitive via google-genai →
-    # google-auth → cryptography and via mcp → pyjwt → cryptography.
-    # Fixed in 48.0.1. Both consumers declare open floors
+    # Security: pin cryptography above PYSEC-2026-3552 (CVE-2026-69247,
+    # GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption exposed a
+    # Bleichenbacher oracle via distinguishable errors and timing;
+    # introduced in 44.0.0, fixed in 50.0.0 (#1167). Supersedes the
+    # earlier 48.0.1 floor for GHSA-537c-gmf6-5ccf (#979). Reached
+    # transitively via google-genai → google-auth → cryptography and via
+    # mcp → pyjwt → cryptography. Both consumers declare open floors
     # (google-auth: cryptography>=38.0.3, pyjwt: cryptography>=3.4.0),
-    # so nothing upstream blocks the raise (#979).
-    "cryptography>=48.0.1",
+    # so nothing upstream blocks the raise.
+    "cryptography>=50.0.0",
     # Security: pin pydantic-settings above GHSA-4xgf-cpjx-pc3j,
     # carried by the previously-locked 2.14.1 — transitive via mcp →
     # pydantic-settings. Fixed in 2.14.2; mcp 1.28.1 declares

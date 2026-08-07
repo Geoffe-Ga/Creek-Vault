@@ -36,6 +36,20 @@ transitive-only: it enters this graph via the ``embeddings`` extra →
 sentence-transformers and is never imported as a declared dependency,
 so its floor belongs in ``[tool.uv].constraint-dependencies``.
 
+``cryptography`` (issue #1167): cryptography 49.0.0 carries
+PYSEC-2026-3552 (CVE-2026-69247, GHSA-g6cj-pr64-35w5) — PKCS#7
+``EnvelopedData`` decryption exposed a Bleichenbacher oracle through
+distinguishable errors and timing. OSV records the flaw as introduced
+in 44.0.0 and fixed in 50.0.0, so the whole 44-49 band is vulnerable.
+cryptography is a *direct* dependency here — the at-rest volume key in
+``creek.confidential.keyvault`` imports Argon2id, AES-GCM, and HKDF
+unconditionally — so its floor lives in ``[project].dependencies``,
+not left to transitive resolution. The same floor is
+mirrored into ``[tool.uv].constraint-dependencies`` so the transitive
+edge (mcp → pyjwt[crypto]) cannot pull a lower build into the graph.
+Both surfaces are guarded independently below: dropping either one
+re-opens the regression.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
@@ -78,6 +92,11 @@ _SETUPTOOLS_PATCHED_VERSION = Version("83.0.0")
 #: First torch release containing the fix for PYSEC-2025-194
 #: (CVE-2025-3000 / GHSA-rrmf-rvhw-rf47).
 _TORCH_PATCHED_VERSION = Version("2.13.0")
+
+#: First cryptography release containing the fix for PYSEC-2026-3552
+#: (CVE-2026-69247 / GHSA-g6cj-pr64-35w5); the advisory range opens at
+#: 44.0.0, so every release from 44.0.0 up to 49.x is vulnerable.
+_CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -224,6 +243,75 @@ def _locked_torch_version() -> Version:
         if package["name"] == "torch":
             return Version(str(package["version"]))
     pytest.fail("torch has no [[package]] entry in uv.lock")
+
+
+def _cryptography_specifier() -> SpecifierSet:
+    """Return the ``cryptography`` specifier from ``[project].dependencies``.
+
+    cryptography is a direct dependency of this package —
+    ``creek.confidential.keyvault`` imports it unconditionally — so its
+    floor belongs alongside the other declared runtime dependencies
+    rather than in the uv constraint table.
+
+    Returns:
+        The specifier set attached to the ``cryptography`` entry in
+        ``[project].dependencies``. Fails the calling test if the entry
+        is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    dependencies: list[str] = pyproject["project"]["dependencies"]
+    for entry in dependencies:
+        requirement = Requirement(entry)
+        if requirement.name == "cryptography":
+            return requirement.specifier
+    pytest.fail(
+        "cryptography is not declared in [project].dependencies of pyproject.toml"
+    )
+
+
+def _cryptography_constraint_specifier() -> SpecifierSet:
+    """Return the ``cryptography`` specifier from uv constraint-dependencies.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``.
+    cryptography also arrives transitively (mcp → pyjwt[crypto]), so the
+    direct floor is mirrored here to keep resolution from pulling a
+    lower build into the graph (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``cryptography`` constraint
+        entry. Fails the calling test if the ``[tool.uv]`` table or the
+        ``cryptography`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "cryptography":
+            return requirement.specifier
+    pytest.fail(
+        "cryptography has no entry in [tool.uv].constraint-dependencies of "
+        "pyproject.toml"
+    )
+
+
+def _locked_cryptography_version() -> Version:
+    """Return the resolved ``cryptography`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``cryptography`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``cryptography`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "cryptography":
+            return Version(str(package["version"]))
+    pytest.fail("cryptography has no [[package]] entry in uv.lock")
 
 
 def test_mcp_floor_rejects_last_vulnerable_range() -> None:
@@ -411,4 +499,82 @@ def test_locked_torch_at_or_above_patched_release() -> None:
         f"{_TORCH_PATCHED_VERSION} (PYSEC-2025-194 / CVE-2025-3000); "
         "pip-audit inspects the lock, so relock after adding the "
         "constraint"
+    )
+
+
+def test_cryptography_floor_rejects_last_vulnerable_release() -> None:
+    """The dependency floor excludes 49.0.0, the previously-locked release.
+
+    cryptography 49.0.0 carries PYSEC-2026-3552 (CVE-2026-69247 — a
+    Bleichenbacher oracle in PKCS#7 ``EnvelopedData`` decryption). The
+    fix lands AT 50.0.0, so the probe assertion on 49.9999 pins the
+    floor at the patch itself: any weakened floor below ``>=50.0.0``
+    still admits vulnerable releases and fails here.
+    """
+    specifier = _cryptography_specifier()
+    assert "49.0.0" not in specifier, (
+        f"cryptography specifier {specifier!r} admits 49.0.0, the release "
+        "carrying PYSEC-2026-3552 / CVE-2026-69247; the floor must be "
+        ">=50.0.0"
+    )
+    assert "49.9999" not in specifier, (
+        f"cryptography specifier {specifier!r} admits 49.9999; the fix for "
+        "PYSEC-2026-3552 / CVE-2026-69247 lands at 50.0.0, so any floor "
+        "below >=50.0.0 still admits vulnerable releases"
+    )
+
+
+def test_cryptography_floor_accepts_patched_release() -> None:
+    """The dependency specifier accepts 50.0.0, the first patched release."""
+    specifier = _cryptography_specifier()
+    assert "50.0.0" in specifier, (
+        f"cryptography specifier {specifier!r} rejects 50.0.0; the patched "
+        "release itself must satisfy the pin"
+    )
+
+
+def test_cryptography_constraint_rejects_last_vulnerable_release() -> None:
+    """The uv constraint excludes 49.0.0, the previously-locked release.
+
+    The ``[project].dependencies`` floor alone does not bind the
+    transitive edge (mcp → pyjwt[crypto]) during resolution, so the
+    mirrored constraint has to reject the same band. The probe on
+    49.9999 pins it at 50.0.0 rather than anywhere in the vulnerable
+    44.0.0 through 49.x range.
+    """
+    specifier = _cryptography_constraint_specifier()
+    assert "49.0.0" not in specifier, (
+        f"cryptography constraint {specifier!r} admits 49.0.0, the release "
+        "carrying PYSEC-2026-3552 / CVE-2026-69247; the constraint must be "
+        ">=50.0.0"
+    )
+    assert "49.9999" not in specifier, (
+        f"cryptography constraint {specifier!r} admits 49.9999; the fix for "
+        "PYSEC-2026-3552 / CVE-2026-69247 lands at 50.0.0, so any floor "
+        "below >=50.0.0 still admits vulnerable releases"
+    )
+
+
+def test_cryptography_constraint_accepts_patched_release() -> None:
+    """The uv constraint accepts 50.0.0, the first patched release."""
+    specifier = _cryptography_constraint_specifier()
+    assert "50.0.0" in specifier, (
+        f"cryptography constraint {specifier!r} rejects 50.0.0; the patched "
+        "release itself must satisfy the constraint"
+    )
+
+
+def test_locked_cryptography_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves cryptography to >= 50.0.0.
+
+    The lockfile is what CI installs and what pip-audit inspects; a
+    correct pyproject floor with a stale lock still ships the vulnerable
+    49.0.0.
+    """
+    locked = _locked_cryptography_version()
+    assert locked >= _CRYPTOGRAPHY_PATCHED_VERSION, (
+        f"uv.lock pins cryptography {locked}, below the CVE-patched "
+        f"{_CRYPTOGRAPHY_PATCHED_VERSION} (PYSEC-2026-3552 / "
+        "CVE-2026-69247); pip-audit inspects the lock, so relock after "
+        "raising the floor"
     )
