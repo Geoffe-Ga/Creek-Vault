@@ -2,7 +2,8 @@ name: Ralph Tooling Tests
 
 # The ONE workflow for everything under scripts/ralph/ — the Discord recap's
 # Python unit tests AND the shell suites for the fleet mechanics (fleet.sh,
-# pick-next.sh, pr-ready.sh, watch-pr.sh, plus the exec-bit regression test).
+# pick-next.sh, pr-ready.sh, watch-pr.sh, main-health.sh, plus the exec-bit
+# regression test).
 # These scripts live outside backend/ and tests/, so the backend-scoped
 # lint/coverage gates don't cover them. Consolidated from the former
 # ralph-fleet-tests.yml + ralph-recap-tests.yml pair: both triggered on the
@@ -38,6 +39,10 @@ jobs:
         run: shellcheck --severity=warning scripts/ralph/*.sh
 
       - name: Run fleet + picker + pr-ready + watch-pr + exec-bit shell tests
+        # Every suite is listed explicitly rather than globbed: a suite that is
+        # written but never wired in here is not a gate, it is a file. test_main_health.sh
+        # (issue #1159) guards the `main` CI circuit breaker the relaxed
+        # pre-merge freshness gate depends on.
         run: |
           git config --global user.email ci@example.com
           git config --global user.name ci
@@ -45,6 +50,7 @@ jobs:
           bash scripts/ralph/test_pick_next.sh
           bash scripts/ralph/test_pr_ready.sh
           bash scripts/ralph/test_watch_pr.sh
+          bash scripts/ralph/test_main_health.sh
           bash scripts/ralph/test_exec_bits.sh
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
