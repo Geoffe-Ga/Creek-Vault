@@ -10,15 +10,39 @@ name: Ralph Tooling Tests
 # same `scripts/ralph/**` paths, so the split was two workflows pretending to
 # be two concerns while covering one directory (#1096 fix 3).
 
+# code-review.yml is in BOTH path lists for the same reason every suite below is
+# listed explicitly: a suite that is written but never wired in here is not a
+# gate, it is a file. test_pr_ready.sh's coupling cases (issue #1181) read that
+# workflow — the EMITTER of the `<!-- creek-review pr=N -->` provenance marker —
+# and round-trip its printf format through pr-ready.sh's parser. Filtering on
+# `scripts/ralph/**` alone meant a PR that edits only the emitter ran no coupling
+# check at all: precisely the one change class those cases exist to guard. Both
+# triggers, because a `push`-only filter still lets the drift land through a PR
+# and a `pull_request`-only filter misses a direct push to `main`.
+#
+# iteration-trigger.yml is here for the identical reason: it is the SECOND
+# merge-clearance path. It posts "You are cleared to squash merge" off its own
+# verdict parse, so it must enforce the same invariant as pr-ready.sh or it
+# becomes a code path that falsifies the first — and it cleared PR #1117 on
+# #1179's verdict too. test_pr_ready.sh asserts two literals lifted out of it:
+# the anchored marker ERE its `MARKER_PR` extraction greps with, and the
+# `[ "$MARKER_PR" != "$PR" ]` clearance guard that consults it (extracting a
+# marker and never reading it is the same bug with an extra step). Both
+# assertions are as coupled to that file as the round trip is to the emitter, so
+# a PR that edits only iteration-trigger.yml must run this suite as well.
 on:
   push:
     paths:
       - "scripts/ralph/**"
       - ".github/workflows/ralph-recap-tests.yml"
+      - ".github/workflows/code-review.yml"
+      - ".github/workflows/iteration-trigger.yml"
   pull_request:
     paths:
       - "scripts/ralph/**"
       - ".github/workflows/ralph-recap-tests.yml"
+      - ".github/workflows/code-review.yml"
+      - ".github/workflows/iteration-trigger.yml"
 
 permissions:
   contents: read

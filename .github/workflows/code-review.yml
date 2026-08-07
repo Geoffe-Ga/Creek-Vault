@@ -61,12 +61,51 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "dependabot[bot]"
           show_full_output: true
+          # THE PR NUMBER IS STATED HERE BECAUSE THE AGENT CANNOT DERIVE IT
+          # (#1181). `actions/checkout` above checks out `refs/pull/<N>/merge` in
+          # DETACHED HEAD, so `gh pr view --json number` — the agent's natural
+          # first move — fails with "could not determine current branch: failed
+          # to run git: not on any branch". On PR #1117 it then guessed via
+          # `gh pr list`, matched the merge ref's base parent to PR #1179's
+          # `mergeCommit.oid`, reviewed that bump's diff, and this workflow
+          # posted the resulting LGTM onto #1117. There is NO diff range anywhere
+          # in this file: the defect was PR-number RESOLUTION, not range
+          # selection, and a "fix" to a range would change nothing.
+          #
+          # INTERPOLATION SAFETY: `github.event.pull_request.number` is an
+          # integer and `github.repository` is `owner/repo` over GitHub's own
+          # name charset. Neither is attacker-controlled free text the way
+          # `title` / `body` / branch names are, so splicing them into the prompt
+          # adds no injection surface.
+          #
+          # AND THE USUAL `env:` + `$VAR` HARDENING DOES NOT APPLY HERE. `prompt`
+          # is an ACTION INPUT, not a shell script: nothing expands `$VAR` on the
+          # way in, so an `env:` indirection would ship the literal characters
+          # `$PR_NUMBER` to the model and silently restore the bug this whole
+          # change exists to fix. Do not "harden" it that way.
           prompt:  |
+            You are reviewing pull request #${{ github.event.pull_request.number }}
+            of the repository ${{ github.repository }}.
+
+            THAT NUMBER IS AUTHORITATIVE. It is the PR this review will be posted
+            to, and it is the only PR you may review. Do not try to work out
+            which PR you are on: the checkout is `refs/pull/${{ github.event.pull_request.number }}/merge`
+            in detached HEAD, so a bare `gh pr view` or `gh pr diff` WILL fail
+            with "could not determine current branch: failed to run git: not on
+            any branch". That failure is expected — it is not a reason to search.
+
+            NEVER infer the pull request from `git log`, from a merge commit's
+            parent OID, or by listing pull requests. Pass the number and the
+            repository explicitly on every `gh` call:
+
+              gh pr diff ${{ github.event.pull_request.number }} -R ${{ github.repository }}
+              gh pr view ${{ github.event.pull_request.number }} -R ${{ github.repository }}
+
             Review this pull request against the repository's CLAUDE.md. Read the
-            change with `gh pr diff` and `gh pr view` (and any files you need).
+            change with those commands (and any files you need).
 
             Do NOT post a comment yourself. Return ONLY the structured result with
-            three fields:
+            four fields:
 
             - "review_markdown": the full review as GitHub markdown, using this
               template (omit the verdict here — it is a separate field below):
@@ -109,16 +148,61 @@ jobs:
               blocking issue(s). For COMMENTS, name the substantive suggestion(s)
               that kept it from LGTM. For LGTM, state why it is ready to merge.
 
+            - "reviewed_pr_number": the integer you actually passed to
+              `gh pr diff` — copy it from your own command, not from the
+              instructions above. It is a report of what you DID, not an echo of
+              what you were told; the workflow compares it with the PR it is
+              about to comment on and discards the whole review if they differ.
+
           # The --json-schema flag makes the action return a validated
           # ``structured_output`` JSON string (verdict + rationale +
-          # review_markdown) instead of relying on the agent to remember to post a
-          # comment — the "Post review" step below then posts it deterministically
-          # (fixes flaky success-with-no-comment runs). gh pr comment is
-          # intentionally NOT in allowed-tools so the agent cannot post on its own.
+          # review_markdown + reviewed_pr_number) instead of relying on the agent
+          # to remember to post a comment — the "Post review" step below then
+          # posts it deterministically (fixes flaky success-with-no-comment
+          # runs). gh pr comment is intentionally NOT in allowed-tools so the
+          # agent cannot post on its own.
+          #
+          # `reviewed_pr_number` is in BOTH `required` and `properties`, with
+          # `additionalProperties:false` kept: `required` without `properties`
+          # validates nothing, and `properties` without `required` makes it
+          # optional — so an agent that cannot work out which PR it read would
+          # simply omit it, which is precisely the #1117 failure. It must be a
+          # hard schema violation instead.
+          #
+          # `Bash(gh pr list:*)` IS GONE, and its absence is worth keeping — but
+          # it is DEFENCE IN DEPTH, NOT A PROOF, and must never be cited as one.
+          # `gh pr list --state all --json number,title,headRefName,mergeCommit,commits`
+          # is literally the command the #1117 run used to guess its way to the
+          # wrong PR, so removing it takes away the specific instrument of that
+          # incident and raises the bar for the next accident. It does NOT remove
+          # the CAPABILITY: `gh search prs --repo owner/repo --json number`
+          # enumerates pull requests just as well. Anyone who reads this list as
+          # "the agent cannot enumerate, therefore it cannot guess" has the
+          # security story backwards.
+          #
+          # `Bash(gh search:*)` STAYS anyway, deliberately. Nothing in the prompt
+          # above asks the reviewer to search — but a reviewer that cannot look up
+          # a related issue or a prior PR writes worse reviews, and taking a
+          # capability away buys nothing here once the real control below is in
+          # place. A review-quality regression traded for a non-guarantee is a bad
+          # trade.
+          #
+          # THE ACTUAL CONTROL IS THE WORKFLOW-SIDE `reviewed_pr_number`
+          # CROSS-CHECK in the "Post review" step: the agent reports the number it
+          # actually passed to `gh pr diff`, this workflow compares it with
+          # `$PR_NUMBER`, and a mismatch discards the review, posts no comment and
+          # fails the check. That check does not care HOW the agent arrived at a
+          # number, so it holds even against one that enumerated by some route
+          # nobody anticipated — which is exactly why it, and not this list, is
+          # the gate. `scripts/ralph/pr-ready.sh` leans on the same asymmetry: its
+          # provenance marker attests only that a pipeline version running THIS
+          # cross-check posted the verdict, so weakening the cross-check silently
+          # empties every marker in the fleet while every test about the marker
+          # stays green.
           claude_args: >-
             --model sonnet
-            --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","verdict_rationale","review_markdown"],"properties":{"verdict":{"type":"string","enum":["CHANGES_REQUESTED","COMMENTS","LGTM"]},"verdict_rationale":{"type":"string"},"review_markdown":{"type":"string"}}}'
-            --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","verdict_rationale","review_markdown","reviewed_pr_number"],"properties":{"verdict":{"type":"string","enum":["CHANGES_REQUESTED","COMMENTS","LGTM"]},"verdict_rationale":{"type":"string"},"review_markdown":{"type":"string"},"reviewed_pr_number":{"type":"integer"}}}'
+            --allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       - name: Post review
         # Deterministic: this step always runs after a successful review and posts
@@ -183,9 +267,53 @@ jobs:
             echo "::error::Claude review produced no structured output — failing so it is re-run, never a silent no-review."
             exit 1
           fi
+          # --- THE CROSS-CHECK (#1181) --------------------------------------
+          # Everything from here down runs only on the REAL review path; the
+          # self-skip branch above returns at its own `exit 0` with no verdict
+          # and no marker, and must keep doing so — it is the path taken by any
+          # PR that edits this very file.
+          #
+          # The agent reports the number it actually passed to `gh pr diff`. If
+          # that is not this PR, the review describes somebody else's code: it is
+          # discarded, no comment is posted, and the check goes red.
+          #
+          # STRING comparison on purpose, and the `^[0-9]+$` guard is what makes
+          # the reason narrow: an empty or lettered report is already refused by
+          # the regex, so `0100` is the ONE surviving value where `-eq` and a
+          # string `!=` disagree at all — and the two shells this repo runs under
+          # disagree with EACH OTHER about it. Measured, not assumed:
+          #
+          #   bash 5.3.15                        [[ "0100" -eq 100 ]] → TRUE   -eq 64 → FALSE
+          #   bash 3.2 (stock /bin/bash, macOS)  [[ "0100" -eq 100 ]] → FALSE  -eq 64 → TRUE
+          #
+          # (bash 5 reads the leading zero as decimal in `[[ ]]`'s arithmetic
+          # context; bash 3.2 reads it as octal 64. The runner here is bash 5, so
+          # the octal reading does NOT happen on CI — which is what makes a
+          # numeric compare worse than merely wrong: it is shell-version-
+          # dependent, with nothing in the output to say which reading ran.)
+          # String equality is exact and version-independent, and it is the same
+          # choice `pr-ready.sh` makes on the parser side of this contract, with
+          # the same measurements recorded there and a `pr=0100` case pinning it
+          # in `scripts/ralph/test_pr_ready.sh`.
+          reviewed_pr=$(jq -r '.reviewed_pr_number // ""' <<<"$STRUCTURED")
+          if [[ ! "$reviewed_pr" =~ ^[0-9]+$ ]] || [[ "$reviewed_pr" != "$PR_NUMBER" ]]; then
+            echo "::error::The reviewer reports it read PR '${reviewed_pr}', not #${PR_NUMBER} — it reviewed the wrong pull request (or could not say which). This is NOT a defect in this PR's code and nothing here needs changing; the review itself is void and must be re-run. See #1181."
+            exit 1
+          fi
           verdict=$(jq -r '.verdict' <<<"$STRUCTURED")
           rationale=$(jq -r '.verdict_rationale // ""' <<<"$STRUCTURED")
-          jq -r '.review_markdown' <<<"$STRUCTURED" > review.md
+          # PROVENANCE MARKER, PREPENDED — `> review.md` here and `>>` below.
+          # Prepending (rather than appending) puts it at column 0 on the first
+          # line, exactly like the `<!-- review-self-skip -->` marker above, so
+          # no markdown indentation rule can ever swallow it. `%s`, not `%d`:
+          # `scripts/ralph/test_pr_ready.sh` greps THIS format string out of THIS
+          # file, renders it, and round-trips it through `pr-ready.sh`'s parser,
+          # which compares bytes — so the literal below is a CROSS-FILE CONTRACT
+          # with that parser and `.github/workflows/iteration-trigger.yml`, not a
+          # cosmetic detail. Change it in one place and CI goes red in the other.
+          # `$PR_NUMBER` is GitHub's own event field, never the agent's claim.
+          printf '<!-- creek-review pr=%s -->\n\n' "$PR_NUMBER" > review.md
+          jq -r '.review_markdown' <<<"$STRUCTURED" >> review.md
           # Keep the "## Verdict: <verdict>" line exactly — downstream skills
           # (address-feedback, await-claude-review) parse it. The rationale goes
           # on the following line so the verdict is never ambiguous.
