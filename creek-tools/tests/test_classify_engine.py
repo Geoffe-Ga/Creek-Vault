@@ -2603,3 +2603,210 @@ def test_praxis_pass_runs_after_the_router_reads_the_tier(
         "frag-order-journl": "explicit",
         "frag-order-essay1": "none",
     }
+
+
+# ---- Hashtag ``tags`` pass (issue #878) -------------------------------------
+#
+# Same discipline as the #876 tier and #877 praxis blocks above: seed
+# fragments with known ids, read the whole tree back off disk, and assert an
+# explicit ``{fragment_id: tags}`` mapping. ``rglob`` does not sort, so never
+# index into its output — before #878 every fragment in the 35,330-fragment
+# demo vault read ``tags: []``, so "the first file says []" was trivially true
+# for the *wrong* reason.
+
+_TAGS_SIGNAL_BODY = "notes from the week ahead\n\n#gardening"
+"""A body carrying exactly one extractable hashtag.
+
+``#gardening`` rather than ``#recovery`` on purpose: "recovery" is a
+#876 privacy-heuristic keyword, and a body that moved the tier as well
+as the tags would make a failure ambiguous. It is likewise free of
+frequency / phase / voice keywords and of praxis markers so no other
+axis moves.
+"""
+
+
+def _tags_map(vault: Path) -> dict[str, list[str]]:
+    """Return ``{fragment_id: tags}`` read back off disk.
+
+    Reads EVERY markdown file under ``01-Fragments`` (recursively) and
+    keys the result by fragment id, so the assertion is independent of
+    filesystem iteration order.
+    """
+    out: dict[str, list[str]] = {}
+    for path in (vault / "01-Fragments").rglob("*.md"):
+        meta = frontmatter.load(str(path)).metadata
+        if meta.get("type") != "fragment":
+            continue
+        out[str(meta["id"])] = list(meta.get("tags", []))
+    return out
+
+
+def test_run_classify_rules_extracts_tags(tmp_path: Path) -> None:
+    """A ``--method rules`` run writes body hashtags to ``tags`` (#878).
+
+    The classify pass is the *backfill* half of the fix — ingest is the
+    other — and it matters because the operator's vault was ingested long
+    before ``tags`` had any producer at all.
+
+    Three fragments covering three distinct outcomes — extracted, nothing
+    to extract, and already-recorded — so the mapping cannot pass by
+    stamping everything alike, and the counter cannot pass by counting
+    every visited file.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tags-signal1",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TAGS_SIGNAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tags-plain01",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TIER_NEUTRAL_BODY,
+    )
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tags-alread1",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+            tags=["gardening"],
+        ),
+        body=_TAGS_SIGNAL_BODY,
+    )
+    # Precondition: nothing is tagged by accident of the fixture writer.
+    assert _tags_map(vault)["frag-tags-signal1"] == []
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _tags_map(vault) == {
+        "frag-tags-signal1": ["gardening"],  # the hashtag was extracted
+        "frag-tags-plain01": [],  # a plain note gains nothing
+        "frag-tags-alread1": ["gardening"],  # already recorded, not duplicated
+    }
+    # Only the genuine addition is counted; re-deriving a tag the fragment
+    # already carries is not work the operator needs reported.
+    assert summary.tags_extracted == 1
+
+
+def test_second_run_extracts_no_tags_and_changes_none(tmp_path: Path) -> None:
+    """The tags pass is idempotent: run two reports zero extractions.
+
+    ``classified_at`` is legitimately re-stamped on the non-preserved
+    path, so a byte comparison would be meaningless; the durable contract
+    is that the id→tags mapping is identical and the counter reports zero
+    work the second time. A pass that re-appended (or reordered) would
+    churn every fragment's frontmatter on every classify run forever.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tags-idem001",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TAGS_SIGNAL_BODY,
+    )
+
+    first = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+    after_first = _tags_map(vault)
+
+    second = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert first.tags_extracted == 1
+    assert second.tags_extracted == 0
+    assert after_first == {"frag-tags-idem001": ["gardening"]}
+    assert _tags_map(vault) == after_first
+
+
+@pytest.mark.parametrize(
+    ("force", "expected_tags", "expected_extracted"),
+    [(False, [], 0), (True, ["gardening"], 1)],
+)
+def test_preserved_fragment_gets_tags_only_under_force(
+    tmp_path: Path,
+    force: bool,
+    expected_tags: list[str],
+    expected_extracted: int,
+) -> None:
+    """A preserved ``llm``-stamped fragment gains tags only with ``--force``.
+
+    The same deliberate asymmetry the #877 praxis pass carries.
+    ``_write_tier_only`` is the narrow writer used on the OPS-001 resume
+    short-circuit, and it is **not** widened to carry tags: the #876 tier
+    exception exists because an untiered fragment is a live cloud-egress
+    hole, whereas a missing tag is a missing feature. Widening that
+    writer would rewrite the ``tags`` axis of every already-curated
+    fragment in a mature vault without the operator asking — and unlike
+    praxis, ``tags`` is a field operators hand-edit in Obsidian.
+
+    ``creek fill`` surfaces the outstanding count instead (see
+    ``tests/test_cli_fill.py``).
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tags-presrv1",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TAGS_SIGNAL_BODY,
+        method="llm",
+    )
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=force,
+    )
+
+    assert _tags_map(vault) == {"frag-tags-presrv1": expected_tags}
+    assert summary.tags_extracted == expected_extracted
+    assert summary.preserved_llm == (0 if force else 1)

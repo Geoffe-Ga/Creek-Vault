@@ -1729,7 +1729,11 @@ def classify(
         f"{summary.privacy_tiers_assigned} privacy tier(s) assigned, "
         # Issue #877: same reasoning for the praxis axis — it is the only
         # visible evidence that the field has a producer at all.
-        f"{summary.praxis_marked} praxis marked"
+        f"{summary.praxis_marked} praxis marked, "
+        # Issue #878: and again for hashtag tags. Counts fragments gained,
+        # not tags written, so a second run over an unchanged vault reports
+        # zero rather than re-reporting the whole vault.
+        f"{summary.tags_extracted} tagged"
         ").[/bold green]",
     )
     if summary.errors:
@@ -2132,7 +2136,7 @@ def _detect_classify_upgrade(
 class _FillGapCounts:
     """What one walk of the vault found for ``creek fill``'s hints.
 
-    Both gap detectors need the same expensive thing — every fragment's
+    Every gap detector needs the same expensive thing — each fragment's
     frontmatter *and* body, parsed. Bundling their answers lets
     :func:`_scan_fill_gaps` pay for that walk once on a 35k-fragment
     vault instead of once per hint.
@@ -2142,14 +2146,17 @@ class _FillGapCounts:
         praxis_backfillable: Fragments the free praxis heuristic can
             prove are ``explicit`` while the disk still says ``none``
             (#877).
+        tags_backfillable: Fragments whose body carries a hashtag the
+            frontmatter does not record (#878).
     """
 
     untiered: int
     praxis_backfillable: int
+    tags_backfillable: int
 
 
 def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
-    """Walk the vault once and count both classes of fill-time gap.
+    """Walk the vault once and count every class of fill-time gap.
 
     The praxis detector deserves a note, because the two obvious choices
     are both wrong. It cannot be "the ``praxis_potential`` key is absent"
@@ -2161,6 +2168,14 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     evidence the fragment was classified before the field had a producer,
     it costs zero tokens to compute, and it goes quiet the moment the
     operator acts on it.
+
+    The tags detector (#878) is the same shape for the same reasons:
+    ``tags`` is always written, and "the list is empty" would nag forever
+    about the many fragments that genuinely have no hashtags. The
+    provable gap is "the free extractor finds a tag the disk does not
+    record". Computing it here rather than in its own function is what
+    keeps it free — it rides the walk the other two already pay for, and
+    must never become a second pass over 35k files.
 
     The imports are function-local (like the rest of this module's) so a
     bare ``creek --help`` never pays to import the classification stack.
@@ -2174,10 +2189,12 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     """
     from creek.classify.praxis_pass import detect
     from creek.classify.privacy_pass import needs_tier
+    from creek.classify.tags_pass import extract
     from creek.vault.reader import iter_vault_fragments
 
     untiered = 0
     backfillable = 0
+    untagged = 0
     for _path, fragment, body, raw in iter_vault_fragments(
         vault_path / "01-Fragments",
     ):
@@ -2186,7 +2203,13 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
         recorded_none = str(fragment.praxis_potential) == PraxisPotential.NONE.value
         if recorded_none and detect(fragment, body) is PraxisPotential.EXPLICIT:
             backfillable += 1
-    return _FillGapCounts(untiered=untiered, praxis_backfillable=backfillable)
+        if set(extract(body)) - set(fragment.tags):
+            untagged += 1
+    return _FillGapCounts(
+        untiered=untiered,
+        praxis_backfillable=backfillable,
+        tags_backfillable=untagged,
+    )
 
 
 def _scan_fill_gaps_quietly(vault_path: Path) -> _FillGapCounts | None:
@@ -2261,6 +2284,30 @@ def _count_praxis_backfillable_fragments(
     return scan.praxis_backfillable
 
 
+def _count_tags_backfillable_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments whose body carries a hashtag ``tags`` does not record.
+
+    See :func:`_scan_fill_gaps` for why "the extractor finds a tag the
+    disk is missing", and not "the list is empty", is the gap worth
+    reporting (issue #878).
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of backfillable fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.tags_backfillable
+
+
 def _hint_untiered_fragments(
     vault_path: Path,
     scan: _FillGapCounts | None = None,
@@ -2326,6 +2373,52 @@ def _hint_praxis_backfill(
     )
 
 
+def _hint_tags_backfill(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the backfill nudge when body hashtags are provably unrecorded.
+
+    Own guard, own warning: sharing the praxis hint's ``try`` would let
+    one failing scan silently suppress the other hint too. Silent at
+    zero, so a vault the operator has already backfilled never nags.
+
+    Reports a **count only** — never a fragment id, a body excerpt, or
+    the tags themselves. Any of those would turn an advisory line into an
+    unaudited disclosure of vault content through stdout (the
+    config-oracle rule, #846 / #848), and the tags are the most
+    disclosive of the three.
+
+    The named remedy is ``creek classify --method llm --force``, and its
+    token cost is stated. It is deliberately **not**
+    ``--method rules --force``, which would be free: on this path
+    :func:`creek.classify.classify_engine._classify_one` returns
+    :meth:`~creek.classify.rules.RuleClassifier.classify`'s answer, which
+    overwrites ``frequency`` / ``wavelength`` / ``voice`` wholesale and
+    re-stamps ``classification_method: rules``. On a vault already
+    classified by an LLM that trades every considered classification for
+    keyword output — a catastrophic price for a tag.
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        backfillable = _count_tags_backfillable_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping tags-backfill hint: %s", exc)
+        return
+    if backfillable == 0:
+        return
+    console.print(
+        f"[dim][fill] {backfillable} fragment(s) carry hashtags in their body "
+        "that `tags` does not record (ingested before the field had a "
+        "producer). Run `creek classify --method llm --force` to backfill — "
+        "that re-sends those fragments to the configured provider and costs "
+        "tokens.[/dim]",
+    )
+
+
 def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
     """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
 
@@ -2351,15 +2444,17 @@ def _maybe_upgrade_classification(
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
 
-    The #876 untiered-fragment hint and the #877 praxis-backfill hint fire
-    first, ahead of every early return: the vault that most needs them
-    (rules-classified, no LLM reachable, every fragment untiered) is exactly
-    the one where there is no upgrade to offer. Both read one shared vault
-    walk so ``creek fill`` parses every fragment once, not once per hint.
+    The #876 untiered-fragment hint, the #877 praxis-backfill hint and the
+    #878 tags-backfill hint all fire first, ahead of every early return: the
+    vault that most needs them (rules-classified, no LLM reachable, every
+    fragment untiered) is exactly the one where there is no upgrade to offer.
+    All three read one shared vault walk so ``creek fill`` parses every
+    fragment once, not once per hint.
     """
     gaps = _scan_fill_gaps_quietly(vault_path)
     _hint_untiered_fragments(vault_path, gaps)
     _hint_praxis_backfill(vault_path, gaps)
+    _hint_tags_backfill(vault_path, gaps)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:

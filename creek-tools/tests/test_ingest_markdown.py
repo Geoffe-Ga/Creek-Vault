@@ -15,7 +15,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from creek.ingest.base import IngestResult, ParsedFragment, RawDocument
+from creek.ingest.base import (
+    IngestResult,
+    ParsedFragment,
+    RawDocument,
+    assemble_ingested_fragment,
+)
 from creek.ingest.markdown import (
     MarkdownIngestor,
     _detect_document_type,
@@ -239,6 +244,34 @@ class TestMarkdownIngestorParse:
         fragments = md_ingestor.parse(fm_doc)
         existing_fm = fragments[0].metadata.get("existing_frontmatter", {})
         assert existing_fm.get("tags") == ["python", "testing"]
+
+    def test_obsidian_frontmatter_tags_reach_the_fragment_normalised(
+        self, md_ingestor: MarkdownIngestor, tmp_path: Path
+    ) -> None:
+        """An Obsidian ``tags:`` block survives the full ingest, lowercased.
+
+        Issue #878. ``parse`` already preserved the raw list (see
+        :meth:`test_parse_preserves_existing_tags` above) and
+        ``_merge_frontmatter`` already carried it through — but nothing
+        ever normalised it, so a vault whose notes say ``Recovery`` and
+        ``recovery`` would grow two Tag Garden entries for one tag. The
+        normalisation happens at the shared ingest chokepoint
+        (``assemble_ingested_fragment``), so this test drives the whole
+        four-stage pipeline rather than a single stage.
+
+        The source note carries **no** body hashtag on purpose: that
+        isolates the frontmatter path from the extraction path.
+        """
+        (tmp_path / "obsidian.md").write_text(
+            "---\ntags: [Recovery, Writing]\n---\n\n# Morning\n\nPlain prose.\n",
+            encoding="utf-8",
+        )
+
+        result = md_ingestor.ingest(tmp_path)
+
+        assert len(result.fragments) == 1
+        ingested = assemble_ingested_fragment(result.fragments[0])
+        assert ingested.fragment.tags == ["recovery", "writing"]
 
     def test_parse_without_frontmatter(
         self, md_ingestor: MarkdownIngestor, tmp_md_dir: Path

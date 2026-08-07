@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import frontmatter
 import pytest
 from typer.testing import CliRunner
 
@@ -163,6 +164,58 @@ def test_ingest_command_writes_fragments(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     written = list((vault / "01-Fragments").rglob("*.md"))
     assert len(written) >= 1
+
+
+def test_ingest_command_extracts_hashtags_into_frontmatter_tags(
+    tmp_path: Path,
+) -> None:
+    """``creek ingest`` writes body hashtags to ``tags`` (AC-1, issue #878).
+
+    The bug: ``Fragment.tags`` defaulted to ``[]`` and *no* pipeline
+    stage ever set it, so 2000/2000 sampled fragments of the operator's
+    35,330-fragment vault read ``tags: []`` and
+    ``00-Creek-Meta/Tag-Garden.md`` read ``*No tags found in vault.*``.
+    Three consumers — the Tag Garden (``creek/generate/tags.py``), the
+    orphan-tag lint (``creek/lint/checks/tags.py``) and the tag-driven
+    branches of ``creek/generate/compost.py`` — were structurally
+    unreachable.
+
+    This is the acceptance criterion end to end: a real ``creek ingest``
+    invocation over a real source note, asserted against the file that
+    lands in the vault rather than against any in-process object. The
+    expected value is an exact list, in body order, so the test cannot
+    false-green on "some tags exist".
+    """
+    vault = tmp_path / "vault"
+    for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
+        (vault / d).mkdir(parents=True)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text(
+        "# Hello\n\nFirst note about systems.\n\n#recovery #writing\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(written) == 1, written
+    post = frontmatter.load(str(written[0]))
+    assert post["tags"] == ["recovery", "writing"]
 
 
 def test_ingest_command_idempotent(tmp_path: Path) -> None:

@@ -469,6 +469,90 @@ class TestTemporalLinker:
         assert result[0].overlap_score == 0.4
         assert "emotional_texture" in result[0].shared_dimensions
 
+    def test_score_emotional_texture_bonus_scales_per_shared_tag(self) -> None:
+        """The texture term is exactly +0.1 per shared tag (issue #878).
+
+        Pinned at two distinct overlap sizes against the same 0.2
+        cross-source floor, so the *slope* is asserted and not just one
+        point on it: one shared tag scores 0.3, three score 0.5. A
+        flat-rate implementation ("+0.1 if any overlap") passes the
+        pre-existing two-tag test at 0.4 by coincidence and fails here.
+
+        This term was structurally dead before #878 —
+        ``emotional_texture`` had no producer, so 100% of the operator's
+        35,330-fragment vault carried ``[]`` and this branch never once
+        executed on real data.
+        """
+        now = datetime.now()
+        linker = TemporalLinker()
+
+        def _score(texture_a: list[str], texture_b: list[str]) -> float:
+            """Link one cross-source pair and return its overlap score."""
+            links = linker.find_temporal_links(
+                [
+                    _make_fragment(
+                        "A",
+                        platform=SourcePlatform.CLAUDE,
+                        created=now,
+                        emotional_texture=texture_a,
+                    ),
+                    _make_fragment(
+                        "B",
+                        platform=SourcePlatform.DISCORD,
+                        created=now,
+                        emotional_texture=texture_b,
+                    ),
+                ],
+                window_hours=168,
+            )
+            assert len(links) == 1
+            return links[0].overlap_score
+
+        # +0.1 (one shared texture) + 0.2 (different source)
+        assert _score(["grief"], ["grief", "resolve"]) == 0.3
+        # +0.3 (three shared textures) + 0.2 (different source)
+        three = _score(
+            ["grief", "resolve", "wonder"],
+            ["wonder", "grief", "resolve"],
+        )
+        assert three == 0.5
+
+    def test_score_without_shared_emotional_texture_has_no_delta(self) -> None:
+        """Disjoint textures add nothing and name no shared dimension.
+
+        The negative control for the test above: without it, an
+        implementation that added +0.1 unconditionally (or that compared
+        the lists for truthiness rather than intersection) would still
+        satisfy every positive assertion.
+
+        ``min_score=0`` because the point is the *score*, not the
+        filtering: at the default 0.3 threshold a cross-source-only pair
+        (0.2) is dropped entirely and there would be nothing to assert on.
+        """
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.0)
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                emotional_texture=["grief"],
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                emotional_texture=["resolve"],
+            ),
+        ]
+
+        result = linker.find_temporal_links(fragments, window_hours=168)
+
+        assert len(result) == 1
+        # Cross-source only: +0.2, with no texture contribution at all.
+        assert result[0].overlap_score == 0.2
+        assert "emotional_texture" not in result[0].shared_dimensions
+
     def test_score_different_source_bonus(self) -> None:
         """Different source platforms should add +0.2 to overlap_score."""
         now = datetime.now()

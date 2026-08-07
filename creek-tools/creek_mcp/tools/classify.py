@@ -99,5 +99,10 @@ def classify_tool(
         # — the field previously had no producer at all, and a silent
         # producer is how that bug survived.
         "praxis_marked": summary.praxis_marked,
+        # Issue #878: how many fragments this run gained a hashtag ``tags``
+        # entry on. Same reasoning again — the field had no producer at all
+        # until #878, and an invisible producer is how that bug survived
+        # 35,330 fragments and an empty Tag Garden.
+        "tags_extracted": summary.tags_extracted,
         "errors": list(summary.errors),
     }
