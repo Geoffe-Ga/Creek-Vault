@@ -13,10 +13,10 @@
 #
 # It polls `scripts/ralph/pr-ready.sh <PR>` (the single authoritative
 # classifier — never a rollup grep) every INTERVAL seconds and exits the moment
-# the token leaves the IN-FLIGHT set {pending, awaiting-review, main-not-green};
-# every other token (ready, ready-unreviewed, behind, ci-failed,
-# changes-requested, optout) is a state the orchestrator acts on, so it is worth
-# a wake. Output is exactly one line:
+# the token leaves the IN-FLIGHT set {pending, awaiting-review, main-not-green,
+# review-quota-exhausted}; every other token (ready, ready-unreviewed, behind,
+# ci-failed, changes-requested, optout) is a state the orchestrator acts on, so
+# it is worth a wake. Output is exactly one line:
 #
 #   WATCH <PR> already-watching     another live watcher owns this PR (pidfile)
 #   WATCH <PR> <token>              the lane settled; <token> is pr-ready.sh's
@@ -42,7 +42,7 @@ set -euo pipefail
 readonly DEFAULT_INTERVAL=30
 readonly DEFAULT_TIMEOUT=1800
 
-# pr-ready.sh's in-flight tokens — the ONLY three on which the lane is genuinely
+# pr-ready.sh's in-flight tokens — the ONLY four on which the lane is genuinely
 # "wait for GitHub". Everything else it prints calls for orchestrator action.
 #
 # `main-not-green` (issue #1159) is the third: the lane is held because `main`'s
@@ -55,7 +55,19 @@ readonly DEFAULT_TIMEOUT=1800
 # does not catch it), it would exit immediately again, and the whole fleet would
 # busy-wake at wake speed for as long as `main` stayed red — burning the API
 # budget precisely when nobody can merge anything.
-readonly -a IN_FLIGHT_TOKENS=(pending awaiting-review main-not-green)
+#
+# `review-quota-exhausted` (issue #1160) is the fourth, and it is the same wait
+# for the same reason: the lane holds a fresh LGTM and needs a sync, but the
+# `claude-review` quota is exhausted, so the sync would destroy that verdict with
+# no way to earn it back. The orchestrator can do nothing about it either — the
+# remedy arrives on its own when the rate-limit window resets, and the lane then
+# reads `behind`. Leaving it out reproduces #1159's busy-wake storm exactly
+# (first-poll exit, relaunch, exit, …) EXCEPT that it would last DAYS rather than
+# the ~20 minutes a `main` CI round takes: the observed window on PR #1158 was
+# seven days with three still to run. The fleet would spin at wake speed burning
+# the API budget for days, precisely when nobody can merge anything and that
+# budget is the scarce thing.
+readonly -a IN_FLIGHT_TOKENS=(pending awaiting-review main-not-green review-quota-exhausted)
 
 # `gh pr view --json state` values that mean the PR no longer exists to watch.
 readonly MERGED_STATE="MERGED"
