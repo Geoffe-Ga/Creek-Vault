@@ -41,8 +41,9 @@ discord.py changes, and the floor lives in
 ``cryptography``, ``pydantic-settings``, ``python-multipart``, and
 ``starlette`` (issue #979): the exported lock carried eight further
 advisories across these four transitive-only packages. cryptography
-48.0.0 carries GHSA-537c-gmf6-5ccf (fixed in 48.0.1), reached via
-google-auth and pyjwt. pydantic-settings 2.14.1 carries
+48.0.0 carried GHSA-537c-gmf6-5ccf (fixed in 48.0.1), reached via
+google-auth and pyjwt; that floor has since been superseded — see the
+#1167 paragraph below. pydantic-settings 2.14.1 carries
 GHSA-4xgf-cpjx-pc3j (fixed in 2.14.2), reached via mcp.
 python-multipart 0.0.29 carries PYSEC-2026-3036 and PYSEC-2026-3037
 (fixed in 0.0.30) plus PYSEC-2026-3040 (fixed only in 0.0.31), so
@@ -53,6 +54,21 @@ Every upstream specifier on these four is an open floor with no
 ceiling, so all four raise cleanly with zero suppressions and their
 floors live in ``[tool.uv].constraint-dependencies`` alongside pyasn1
 and aiohttp.
+
+``cryptography`` (issue #1167): cryptography 49.0.0 carries
+PYSEC-2026-3552 (CVE-2026-69247, GHSA-g6cj-pr64-35w5) — PKCS#7
+``EnvelopedData`` decryption exposed a Bleichenbacher oracle through
+distinguishable errors and timing, so an attacker able to submit
+chosen ciphertexts can recover plaintext. OSV records the flaw as
+introduced in 44.0.0 and fixed in 50.0.0, which makes the whole
+44.0.0 through 49.x band vulnerable and retires the 48.0.1 floor set
+in #979 — that floor now admits the oracle rather than excluding it,
+so the guards below were raised in place instead of being duplicated.
+cryptography remains transitive-only here, reached via google-genai →
+google-auth and via mcp → pyjwt; both declare open floors
+(``cryptography>=38.0.3`` and ``cryptography>=3.4.0``), so nothing
+upstream blocks the raise and the constraint moves to ``>=50.0.0``
+with zero suppressions.
 
 Two independent guards per package:
 
@@ -106,9 +122,11 @@ _PYASN1_PATCHED_VERSION = Version("0.6.4")
 #: fixed only PYSEC-2026-2104, PYSEC-2026-2105, and PYSEC-2026-2106.
 _AIOHTTP_PATCHED_VERSION = Version("3.14.1")
 
-#: First cryptography release containing the fix for
-#: GHSA-537c-gmf6-5ccf.
-_CRYPTOGRAPHY_PATCHED_VERSION = Version("48.0.1")
+#: First cryptography release containing the fix for PYSEC-2026-3552
+#: (CVE-2026-69247 / GHSA-g6cj-pr64-35w5). The advisory range opens at
+#: 44.0.0, so this supersedes the 48.0.1 floor that answered the older
+#: GHSA-537c-gmf6-5ccf: 48.0.1 sits inside the vulnerable band.
+_CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
 
 #: First pydantic-settings release containing the fix for
 #: GHSA-4xgf-cpjx-pc3j.
@@ -638,42 +656,51 @@ def test_locked_aiohttp_at_or_above_patched_release() -> None:
 
 
 def test_cryptography_floor_rejects_last_vulnerable_release() -> None:
-    """The constraint excludes 48.0.0, the last vulnerable release.
+    """The constraint excludes 49.0.0, the previously-locked release.
 
-    cryptography 48.0.0 carries GHSA-537c-gmf6-5ccf and reaches this
-    graph through google-auth and pyjwt. The constraint must genuinely
-    be ``>=48.0.1`` so a relock cannot resolve back onto it.
+    cryptography 49.0.0 carries PYSEC-2026-3552 (CVE-2026-69247 — the
+    PKCS#7 ``EnvelopedData`` Bleichenbacher oracle) and reaches this
+    graph through google-auth and pyjwt. The fix lands AT 50.0.0, so
+    the probe assertion on 49.9999 pins the floor at the patch itself:
+    the retired ``>=48.0.1`` floor, or any other below ``>=50.0.0``,
+    still admits vulnerable releases and fails here.
     """
     specifier = _cryptography_constraint_specifier()
-    assert "48.0.0" not in specifier, (
-        f"cryptography constraint {specifier!r} admits 48.0.0, the "
-        "release carrying GHSA-537c-gmf6-5ccf; the floor must be "
-        ">=48.0.1"
+    assert "49.0.0" not in specifier, (
+        f"cryptography constraint {specifier!r} admits 49.0.0, the "
+        "release carrying PYSEC-2026-3552 / CVE-2026-69247; the floor "
+        "must be >=50.0.0"
+    )
+    assert "49.9999" not in specifier, (
+        f"cryptography constraint {specifier!r} admits 49.9999; the fix "
+        "for PYSEC-2026-3552 / CVE-2026-69247 lands at 50.0.0, so any "
+        "floor below >=50.0.0 still admits vulnerable releases"
     )
 
 
 def test_cryptography_floor_accepts_patched_release() -> None:
-    """The constraint accepts 48.0.1, the first patched release."""
+    """The constraint accepts 50.0.0, the first patched release."""
     specifier = _cryptography_constraint_specifier()
-    assert "48.0.1" in specifier, (
-        f"cryptography constraint {specifier!r} rejects 48.0.1; the "
+    assert "50.0.0" in specifier, (
+        f"cryptography constraint {specifier!r} rejects 50.0.0; the "
         "patched release itself must satisfy the constraint"
     )
 
 
 def test_locked_cryptography_at_or_above_patched_release() -> None:
-    """``uv.lock`` resolves cryptography to >= 48.0.1.
+    """``uv.lock`` resolves cryptography to >= 50.0.0.
 
     The lockfile is what ``uv sync`` users install and the second
     surface ``scripts/security.sh`` audits via ``uv export --locked``;
     a correct constraint floor with a stale lock still ships the
-    vulnerable 48.0.0.
+    vulnerable 49.0.0.
     """
     locked = _locked_cryptography_version()
     assert locked >= _CRYPTOGRAPHY_PATCHED_VERSION, (
         f"uv.lock pins cryptography {locked}, below the patched "
-        f"{_CRYPTOGRAPHY_PATCHED_VERSION} (GHSA-537c-gmf6-5ccf); the "
-        "exported lock is audited, so relock after adding the constraint"
+        f"{_CRYPTOGRAPHY_PATCHED_VERSION} (PYSEC-2026-3552 / "
+        "CVE-2026-69247); the exported lock is audited, so relock after "
+        "raising the constraint"
     )
 
 
