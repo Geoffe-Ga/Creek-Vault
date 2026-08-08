@@ -2011,6 +2011,10 @@ def _build_fill_steps(
         ("report/paradox", lambda: _report_paradox(vault_path, unfiltered)),
         ("report/synchronicity", lambda: _report_synchronicity(vault_path, unfiltered)),
         ("report/mode-profiles", lambda: _report_mode_profiles(vault_path, unfiltered)),
+        # #879: ``fill`` is the "make my vault prod-ready" command, so the voice
+        # report belongs in it — otherwise the register samples are only ever
+        # written by an operator who knows to run ``report --type voice`` by hand.
+        ("report/voice", lambda: _report_voice(vault_path, unfiltered)),
         ("report/wavelength", lambda: _report_wavelength(vault_path, "weekly")),
         ("index", lambda: IndexGenerator(vault_path=vault_path).generate_all()),
     ]
@@ -2578,7 +2582,15 @@ def _report_unnamed(vault_path: Path, override: PrivacyTierOverride) -> None:
 
 
 def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
-    """Generate per-register voice profiles, if exemplars exist.
+    """Generate per-register voice profiles and register samples (#879).
+
+    Two halves of one report, over one corpus: the rendered profiles under
+    ``07-Voice/`` and the ranked exemplar copies under
+    ``07-Voice/Register-Samples/``.
+
+    The second half also **deletes** — a sample whose fragment has left the
+    corpus is removed — so this is a report that mutates the vault in both
+    directions, and prints both.
 
     Args:
         vault_path: Vault root.
@@ -2586,11 +2598,43 @@ def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
             collector's ``allow_intimate`` consent gate, never a replacement
             for it.
     """
-    from creek.generate.voice import VoiceProfileGenerator
+    from creek.generate.voice import VoiceProfileGenerator, generate_register_samples
 
     profile_paths = VoiceProfileGenerator(override=override).generate_all_profiles(
         vault_path,
     )
+    # Deliberately above the no-profiles early return: an emptied corpus has
+    # nothing left to profile, but the samples tree may still hold verbatim
+    # copies of the fragments that left it, and this is the call that prunes
+    # them (#879).
+    #
+    # This is a SECOND full walk of 01-Fragments, and knowingly so. It cannot
+    # share ``generate_all_profiles``' walk without a refactor: below,
+    # ``_persist_fragment`` copies a fragment's source file only while the
+    # collector's ``_records`` cache holds its entry, and only
+    # ``collect_exemplars`` fills that cache — so saving through a collector
+    # that never walked writes a full set of valid-looking samples with empty
+    # bodies. Measured on synthetic vaults (1k/5k fragments, linear scaling):
+    # the redundant walk takes ``_report_voice`` from 1.0x to 1.8x one corpus
+    # parse (~16s of ~39s projected at 35k). The trade is bounded because
+    # ``creek fill`` already makes ~12 full-corpus parse passes, so this is
+    # ~7% of its parse budget and less of its wall clock, which belongs to
+    # embedding inference and DBSCAN. ``save_exemplars`` itself is O(1) in
+    # vault size (<=7 registers x 20 copies). Sharing the walk is issue #1220.
+    pruned: list[Path] = []
+    summaries = generate_register_samples(
+        vault_path,
+        override=override,
+        on_prune=pruned.append,
+    )
+    # Announced before the early return, because the emptied corpus that
+    # takes that return is exactly the run with the most to delete. This
+    # command removes files from the vault, ``creek fill`` runs it
+    # unattended, and a silent deletion is one nobody can audit (#879).
+    if pruned:
+        console.print(
+            f"[yellow]Stale register samples pruned ({len(pruned)})[/yellow]",
+        )
     if not profile_paths:
         console.print(
             "[yellow]No voice profiles generated: "
@@ -2601,6 +2645,11 @@ def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
     console.print(
         f"[bold green]Voice profiles generated ({len(profile_paths)}): "
         f"{names}[/bold green]",
+    )
+    registers = ", ".join(sorted(summaries))
+    console.print(
+        f"[bold green]Register samples written ({len(summaries)}): "
+        f"{registers}[/bold green]",
     )
 
 
@@ -3208,14 +3257,17 @@ def report(
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     override = _parse_include_tier(include_tier)
-    # NB (#968): this audits the *flag*, not the effective ceiling, so a bare
-    # ``creek report`` — which now scans unfiltered — writes no privacy-override
-    # entry while a typed ``--include-tier open``, the narrowest scan there is,
-    # writes one. ``report``'s inverted polarity is what makes the shared
-    # ``override_elevates`` helper read backwards here. Deliberately left alone
-    # in this change and tracked separately: auditing the resolved ceiling here
-    # fires before ``--type`` is validated, turning the #716 unknown-type exit-2
-    # into an OSError on an unwritable vault path
+    # NB (#968): this audits the *flag*, not the effective ceiling, and the
+    # shared ``override_elevates`` helper reads backwards on this surface —
+    # it was built for ``mine``/``author``, where the flag WIDENS, whereas on
+    # ``report`` the flag NARROWS. It answers ``False`` for both ``None`` and
+    # ``OPEN``, so a bare ``creek report`` (unfiltered, the widest scan there
+    # is) and a typed ``--include-tier open`` (the narrowest) are alike
+    # unaudited and indistinguishable in the log. Pinned by
+    # ``tests/test_cli_privacy.py::test_report_voice_include_tier_open_writes_no_audit``
+    # and tracked as issue #1218 — not fixed in place because auditing the
+    # resolved ceiling here fires before ``--type`` is validated, turning the
+    # #716 unknown-type exit-2 into an OSError on an unwritable vault path
     # (``tests/test_cli.py::test_report_command``), so the fix is a reordering
     # plus an audit-volume decision, not a one-line swap.
     _audit_privacy_override_if_needed(

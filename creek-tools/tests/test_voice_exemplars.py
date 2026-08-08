@@ -21,6 +21,7 @@ from creek.generate.voice import (
     VOICE_REGISTERS,
     VoiceExemplarCollector,
     _is_other_authors_path,
+    _is_safe_sample_stem,
 )
 from creek.models import (
     Confidence,
@@ -977,3 +978,446 @@ class TestWarningBehavior:
             collector.collect_exemplars(vault)
         playful_warnings = [r for r in caplog.records if "playful" in r.message]
         assert len(playful_warnings) == 1
+
+
+# ---- Filename safety (Issue #879) ----
+
+
+class TestPersistFilenameSafety:
+    """``Fragment.id`` becomes a filename, so it is untrusted input.
+
+    ``_persist_fragment`` composes ``register_dir / f"{fragment.id}.md"``.
+    Nothing validates ``Fragment.id`` — the model declares a bare ``id:
+    str`` — so an id carrying path separators steers the write out of the
+    register folder entirely, and one equal to the summary's stem aims it
+    at a file the collector is about to write itself.
+    """
+
+    def test_traversing_id_writes_nothing_outside_the_register_folder(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """An id containing ``..`` must not place a file outside its register."""
+        frag = _build_fragment(
+            frag_id="../../escape",
+            title="Escaping fragment",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.SETTLED,
+        )
+
+        collector.save_exemplars({"analytical": [frag]}, vault)
+
+        assert not (vault / "07-Voice" / "escape.md").exists()
+        assert not (vault / "escape.md").exists()
+        register_dir = vault / "07-Voice" / "Register-Samples" / "analytical"
+        assert sorted(p.name for p in register_dir.glob("*.md")) == ["_Summary.md"]
+
+    def test_summary_named_id_leaves_the_summary_note_intact(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """A fragment id of ``_Summary`` must not become the summary note.
+
+        NOTE (regression pin, not a RED test): at the time of writing this
+        passes, because ``save_exemplars`` persists fragments *before*
+        ``_write_summary`` runs, so the summary overwrites the colliding
+        copy and the final file is correct by accident of ordering. The
+        invariant is worth stating anyway — it is the thing a filename
+        guard, a re-ordering, or the #879 prune pass must not break — but
+        it is honest about what it can and cannot catch: a guard confined
+        to ``_persist_fragment`` produces no observable change here at all.
+        """
+        frag = _build_fragment(
+            frag_id="_Summary",
+            title="Colliding sample",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, frag, body_words=400)
+
+        buckets = collector.collect_exemplars(vault)
+        collector.save_exemplars(buckets, vault)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "analytical"
+        post = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert post["type"] == "voice-register-summary"
+        assert post["voice_register"] == "analytical"
+
+    def test_rejects_an_id_whose_filename_exceeds_the_name_limit(self) -> None:
+        """An id too long to be a filename is rejected before the copy.
+
+        The guard bounds an id's *content* but not its *length*, so a
+        300-character id sails through and reaches ``shutil.copy2``,
+        which raises ``OSError``/``ENAMETOOLONG`` and takes the whole
+        command down with it. ``NAME_MAX`` is 255 **bytes** on every
+        filesystem creek runs on (APFS, ext4, XFS), and the name that has
+        to fit is ``f"{id}.md"`` — three bytes more than the id itself.
+
+        The accepted case is asserted alongside the rejected one and sits
+        exactly on the boundary: a guard that simply rejects long ids
+        somewhere short of the real limit would silently drop exemplars
+        the filesystem would have accepted.
+        """
+        assert _is_safe_sample_stem("a" * 252) is True
+        assert _is_safe_sample_stem("a" * 253) is False
+        assert _is_safe_sample_stem("a" * 300) is False
+
+    def test_measures_the_name_limit_in_bytes_not_characters(self) -> None:
+        """The length bound is a byte bound, because ``NAME_MAX`` is.
+
+        U+00E9 (LATIN SMALL LETTER E WITH ACUTE) encodes to two UTF-8
+        bytes, so 127 of them plus ``.md`` is 257 bytes in a name of only
+        130 characters. A ``len(filename) > 255`` check reads that as
+        comfortably short and lets it through — straight back into the
+        ``OSError`` the guard exists to prevent. Non-ASCII ids are not
+        hypothetical: ids are carried over verbatim from exports.
+
+        The 126-character case is the same boundary from below: 255
+        bytes exactly, which the filesystem accepts and so must this.
+        """
+        # Built from its codepoint rather than typed literally: the source
+        # stays ASCII, and the character under test cannot be mangled by an
+        # editor, a diff tool, or a normalising paste.
+        two_byte_char = chr(0xE9)  # LATIN SMALL LETTER E WITH ACUTE
+        # Stated, not assumed: the whole point of the test is the 2:1 ratio.
+        assert len(two_byte_char.encode("utf-8")) == 2
+        assert _is_safe_sample_stem(two_byte_char * 126) is True
+        assert _is_safe_sample_stem(two_byte_char * 127) is False
+
+    def test_rejects_the_summary_filename_as_a_sample_stem(self) -> None:
+        """An id of ``_Summary`` must not be usable as a sample stem.
+
+        ``_persist_fragment`` would write the fragment's verbatim body to
+        ``_Summary.md``; only the fact that ``_write_summary`` overwrites
+        it moments later makes the end state correct. Kill the process in
+        between — SIGKILL, OOM, a full disk — and ``_Summary.md`` holds a
+        fragment body instead, which the prune then exempts **by name**
+        and so never cleans up. Correct-by-ordering is not correct; the
+        collision belongs to the guard.
+
+        ``test_summary_named_id_leaves_the_summary_note_intact`` above
+        documents itself as a regression pin for the end state and must
+        keep passing once this guard lands: the summary is still written,
+        it is just no longer racing a body copy to the same path.
+        """
+        assert _is_safe_sample_stem("_Summary") is False
+
+
+# ---- generate_register_samples (Issue #879) ----
+
+
+class TestGenerateRegisterSamples:
+    """The module-level entry point the CLI report surface calls.
+
+    Mirrors ``creek.generate.lexicon.generate_lexicon``: build **one**
+    collector, ``collect_exemplars`` on it, then ``save_exemplars`` on
+    that same instance. The single-instance part is load-bearing rather
+    than stylistic — ``_persist_fragment`` copies the source file only
+    when ``self._records[fragment.id]`` is populated, and only
+    ``collect_exemplars`` populates it.
+    """
+
+    def test_returns_the_register_to_summary_path_mapping(
+        self,
+        vault: Path,
+    ) -> None:
+        """Every non-empty register maps to its written summary note."""
+        from creek.generate.voice import generate_register_samples
+
+        frag = _build_fragment(
+            frag_id="frag-grs-1",
+            title="Analytical sample",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, frag, body_words=400)
+
+        result = generate_register_samples(vault)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "analytical"
+        assert set(result) == {"analytical"}
+        assert result["analytical"] == register_dir / "_Summary.md"
+        assert result["analytical"].is_file()
+        assert (register_dir / "frag-grs-1.md").is_file()
+
+    def test_copies_the_source_file_verbatim(self, vault: Path) -> None:
+        """The persisted sample is the source file, byte for byte.
+
+        The single assertion that separates a correct implementation from
+        one that builds a second collector (or skips ``collect_exemplars``
+        on the instance it saves with): the fallback path serialises
+        ``frontmatter.Post(content="", **fragment.model_dump())``, which
+        is a *valid* fragment note with an **empty body**, and a voice
+        corpus of empty bodies is silently useless.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        frag = _build_fragment(
+            frag_id="frag-grs-body",
+            title="Body carrier",
+            register=VoiceRegister.PLAYFUL,
+            confidence=Confidence.CONVICTION,
+        )
+        source = _write_fragment(vault, frag, body_words=400)
+
+        generate_register_samples(vault)
+
+        copy = vault / "07-Voice" / "Register-Samples" / "playful" / "frag-grs-body.md"
+        assert copy.read_bytes() == source.read_bytes()
+        assert frontmatter.load(str(copy)).content.strip() != ""
+
+    def test_empty_vault_returns_an_empty_mapping_and_writes_nothing(
+        self,
+        vault: Path,
+    ) -> None:
+        """No qualifying exemplars means no mapping and no folders created."""
+        from creek.generate.voice import generate_register_samples
+
+        assert generate_register_samples(vault) == {}
+        assert list((vault / "07-Voice" / "Register-Samples").iterdir()) == []
+
+    def test_override_excludes_above_ceiling_fragments(self, vault: Path) -> None:
+        """The declared ceiling narrows the corpus the samples are drawn from.
+
+        Additive to — never a replacement for — the ``allow_intimate``
+        consent gate: this is the caller's ceiling, applied to the raw
+        frontmatter by ``within_ceiling``.
+        """
+        from creek.classify.privacy_filter import PrivacyTierOverride
+        from creek.generate.voice import generate_register_samples
+
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-grs-open",
+                title="Open sample",
+                register=VoiceRegister.RAW,
+                confidence=Confidence.CONVICTION,
+                privacy=PrivacyTier.OPEN,
+            ),
+            body_words=400,
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-grs-personal",
+                title="Personal sample",
+                register=VoiceRegister.RAW,
+                confidence=Confidence.CONVICTION,
+                privacy=PrivacyTier.PERSONAL,
+            ),
+            body_words=400,
+        )
+
+        generate_register_samples(vault, override=PrivacyTierOverride.OPEN)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "raw"
+        copied = sorted(
+            p.name for p in register_dir.glob("*.md") if p.name != "_Summary.md"
+        )
+        assert copied == ["frag-grs-open.md"]
+
+    def test_is_exported_from_the_module(self) -> None:
+        """The entry point is part of the module's public surface."""
+        from creek.generate import voice as voice_module
+
+        assert "generate_register_samples" in voice_module.__all__
+
+
+# ---- Manifest corruption is fail-safe (Issue #879) ----
+
+
+_MANIFEST_REGISTER_DIR = ("07-Voice", "Register-Samples", "analytical")
+"""Vault-relative samples folder the manifest-corruption tests operate in."""
+
+
+def _seed_pruneable_register(vault_path: Path) -> tuple[Path, Path]:
+    """Leave a register in the exact state its stale copy is prune-eligible in.
+
+    Runs one full save of two analytical exemplars — so both copies are on
+    disk **and** both are fingerprinted in ``_Summary.md``'s manifest —
+    then deletes one fragment's source file, dropping it out of the
+    corpus. A second ``generate_register_samples`` therefore *would*
+    delete ``frag-manifest-stale.md``, which is what makes "the copy
+    survived" an assertion about the manifest read rather than about a
+    prune that was never going to fire in this fixture anyway.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault``
+            fixture.
+
+    Returns:
+        The ``(register_dir, stale_copy)`` pair the callers assert on.
+    """
+    from creek.generate.voice import generate_register_samples
+
+    for frag_id in ("frag-manifest-keep", "frag-manifest-stale"):
+        _write_fragment(
+            vault_path,
+            _build_fragment(
+                frag_id=frag_id,
+                title=f"Manifest fixture {frag_id}",
+                register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.CONVICTION,
+            ),
+            body_words=400,
+        )
+
+    generate_register_samples(vault_path)
+
+    register_dir = vault_path.joinpath(*_MANIFEST_REGISTER_DIR)
+    stale_copy = register_dir / "frag-manifest-stale.md"
+    assert stale_copy.is_file(), "the seeding run wrote no copy to go stale"
+    (vault_path / "01-Fragments" / "Journal" / "frag-manifest-stale.md").unlink()
+    return register_dir, stale_copy
+
+
+def _rewrite_manifest(register_dir: Path, value: object) -> None:
+    """Replace the summary's recorded manifest with *value*, keeping the rest.
+
+    Rewriting through ``frontmatter`` rather than by hand keeps every
+    other key the prune and the operator rely on intact, so the only
+    variable in the test is the shape of the manifest itself.
+
+    Args:
+        register_dir: The register's samples folder.
+        value: The hand-edited value to store under ``exemplar_digests``.
+    """
+    summary_path = register_dir / "_Summary.md"
+    post = frontmatter.load(str(summary_path))
+    post.metadata["exemplar_digests"] = value
+    summary_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+class TestManifestCorruptionIsFailSafe:
+    """A manifest the prune cannot trust must disarm it, not crash or over-delete.
+
+    ``_read_sample_manifest`` answers the only question that entitles the
+    collector to ``unlink`` a file in a folder the operator also keeps
+    notes in: "did I write this?". Its two defensive branches — an
+    unreadable ``_Summary.md`` and a recorded value that is not a list —
+    both answer "I cannot tell", and the contract is that "I cannot tell"
+    means *delete nothing*. The cost is a stale copy; the cost of the
+    other direction is an operator's file.
+
+    Both branches were reachable only through fixtures nothing exercised,
+    which leaves two regressions invisible: a refactor that lets the read
+    raise takes down the whole command — and ``creek fill`` runs it
+    unattended — while one that drops the type check turns a hand-edited
+    manifest into a deletion list.
+
+    Every test here goes through the real save path, so what is pinned is
+    the prune's observable safety rather than a private helper's return
+    value.
+    """
+
+    def test_prunes_the_stale_copy_when_the_manifest_is_intact(
+        self,
+        vault: Path,
+    ) -> None:
+        """Baseline: an uncorrupted manifest DOES delete the stale copy.
+
+        Not a duplicate of the CLI-level prune tests but the control that
+        makes the three below non-vacuous: it establishes that in this
+        exact fixture the prune is armed and reaches this file. Without
+        it, "the copy survived" would be equally true of an implementation
+        that never prunes anything at all.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+
+        generate_register_samples(vault)
+
+        assert not stale_copy.exists()
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_unreadable_summary_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """Malformed summary YAML degrades to a no-op prune, not a traceback.
+
+        ``_Summary.md`` is an ordinary note inside the vault: an operator
+        edit, a half-written file from an interrupted run, or a merge
+        conflict marker all land here as YAML that ``frontmatter.load``
+        refuses. Uncaught, that exception escapes ``save_exemplars`` and
+        kills ``creek report --type voice`` and the unattended ``creek
+        fill`` step with it — over a file whose only job is to say which
+        copies are deletable.
+
+        The rewritten summary is the control: it proves the run carried on
+        past the unreadable manifest and completed the save, rather than
+        the copy surviving because nothing ran.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        (register_dir / "_Summary.md").write_text(
+            "---\nexemplar_digests: [\n---\n\nbroken\n",
+            encoding="utf-8",
+        )
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        rewritten = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert rewritten["exemplar_count"] == 1
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_a_scalar_manifest_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """A manifest that is a bare string prunes nothing.
+
+        The shape a hand-edit produces when someone strips the YAML list
+        dashes, or a note is authored by something that never read the
+        schema. Nothing about it is a record of authorship, so the prune
+        must treat it as no record at all — the file the collector cannot
+        prove it wrote is the file it must not delete.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        _rewrite_manifest(register_dir, "oops")
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        rewritten = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert rewritten["exemplar_count"] == 1
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_a_mapping_manifest_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """A manifest that is a mapping prunes nothing — the guard's live case.
+
+        The scalar case above cannot on its own prove the ``isinstance``
+        check earns its keep: iterating a string yields single characters,
+        which match no digest, so deleting the check would leave that test
+        green. A mapping is the shape where the check is load-bearing —
+        iterating it yields exactly the digest keys, so a prune that
+        skipped the type test would read this as a perfectly good manifest
+        and delete the copy. Keeping the real digests as the keys is the
+        whole point: a placeholder would prove nothing.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        seeded = frontmatter.load(str(register_dir / "_Summary.md"))
+        recorded = seeded["exemplar_digests"]
+        assert isinstance(recorded, list), "the seeding run recorded no manifest"
+        _rewrite_manifest(register_dir, dict.fromkeys(recorded, True))
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        assert (register_dir / "frag-manifest-keep.md").is_file()

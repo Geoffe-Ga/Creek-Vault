@@ -23,11 +23,14 @@ note's raw frontmatter via
 :func:`~creek.classify.privacy_filter.within_ceiling`. They are additive by
 design — admission is ``allow_intimate`` *and* ``within_ceiling`` — and must
 not be "simplified" into one. Saved exemplars include a per-register summary
-note recording the breakdown of confidence levels.
+note recording the breakdown of confidence levels and the manifest of the
+copies the run wrote (:func:`_sample_digest`), which is what entitles the
+next run to delete one.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -59,7 +62,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +114,30 @@ _CLASSIFICATION_BONUS: int = 1
 
 _SUMMARY_FILENAME: str = "_Summary.md"
 """Filename used for the per-register summary note."""
+
+_SUMMARY_STEM: str = Path(_SUMMARY_FILENAME).stem
+"""The summary's own stem, which no exemplar copy may claim.
+
+Derived rather than restated so the reserved name cannot drift away from
+the file it reserves.
+"""
+
+_MANIFEST_KEY: str = "exemplar_digests"
+"""Summary frontmatter key holding one fingerprint per copy the run wrote."""
+
+_ID_PATH_CHARS: frozenset[str] = frozenset({"/", "\\", "\x00"})
+"""Characters that make a ``Fragment.id`` a path rather than a filename."""
+
+_ID_DIRECTORY_NAMES: frozenset[str] = frozenset({"", ".", ".."})
+"""Whole-id values that name a directory (or nothing) rather than a file."""
+
+_NAME_MAX_BYTES: int = 255
+"""POSIX ``NAME_MAX``: the byte length limit on a single filename.
+
+255 on every filesystem creek runs on (APFS, ext4, XFS). The unit is bytes,
+not characters, because that is what the kernel counts: a non-ASCII id
+spends more of the budget than its length suggests.
+"""
 
 
 @dataclass(frozen=True)
@@ -206,6 +233,60 @@ def _is_other_authors_path(md_file: Path) -> bool:
         ``11-Other-Authors`` segment, otherwise ``False``.
     """
     return _OTHER_AUTHORS_SEGMENT in md_file.parts
+
+
+def _is_safe_sample_stem(fragment_id: str) -> bool:
+    """Return whether *fragment_id* may be used as a bare sample filename.
+
+    :meth:`VoiceExemplarCollector._persist_fragment` composes
+    ``<register_dir>/{fragment.id}.md``, and ``Fragment.id`` is an
+    unconstrained ``str`` carried over from an export
+    (``creek/models.py``), so an id has four separate hazards to clear
+    before it can name a file:
+
+    * **Traversal.** A separator or a ``..`` component steers the write
+      out of the register folder entirely — ``id="../../escape"`` lands
+      in ``07-Voice/``.
+    * **Emptiness.** An empty id writes ``.md``, whose ``Path.stem`` is
+      ``".md"`` rather than the id, so the prune pass could never
+      recognise the file as its own again.
+    * **Length.** The name that has to fit in a directory entry is
+      ``f"{id}.md"``, three bytes more than the id, and the limit is
+      :data:`_NAME_MAX_BYTES`. An over-long name reaches ``shutil.copy2``
+      and raises ``OSError`` (``ENAMETOOLONG``), which takes the whole
+      command down. The bound is measured on the **encoded** name because
+      the kernel's is: ids arrive verbatim from exports, and a non-ASCII
+      one costs more bytes than it shows characters.
+    * **Collision with the summary.** ``_Summary`` would send a verbatim
+      fragment body to the path :meth:`VoiceExemplarCollector._write_summary`
+      is about to write. Today the summary wins by writing last; a process
+      killed in between leaves a fragment body in ``_Summary.md`` instead
+      — a file the prune exempts *by name* and so never cleans up.
+
+    Same reasoning as the register guard in
+    :meth:`VoiceProfileGenerator.write_profile`; the response differs
+    because one unusable id is one unusable exemplar rather than a
+    malformed call, so the collector skips it and goes on saving the rest.
+
+    Windows device names (``CON``, ``NUL``), NTFS alternate data streams,
+    and Unicode-normalisation collisions are deliberately **not** handled
+    here — they are tracked in issue #1214, not overlooked.
+
+    Args:
+        fragment_id: The candidate id.
+
+    Returns:
+        ``True`` when ``f"{fragment_id}.md"`` is a plain filename that
+        resolves inside its own directory and fits in a directory entry.
+    """
+    if fragment_id in _ID_DIRECTORY_NAMES or fragment_id == _SUMMARY_STEM:
+        return False
+    if any(char in fragment_id for char in _ID_PATH_CHARS):
+        return False
+    filename = f"{fragment_id}.md"
+    if Path(filename).name != filename:
+        return False
+    return len(filename.encode("utf-8")) <= _NAME_MAX_BYTES
 
 
 def _eligible_register(
@@ -340,6 +421,72 @@ def _load_fragment_with_body(
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
         return None
     return fragment, post.content, metadata
+
+
+def _sample_digest(stem: str) -> str:
+    """Return the manifest fingerprint of a sample filename *stem*.
+
+    The manifest records fingerprints rather than the ids themselves
+    because of where it lives — the frontmatter of ``_Summary.md``, an
+    ordinary ``.md`` file inside the vault. ``creek purge`` rewrites
+    **every** ``.md`` in the vault in place, replacing a purged id with
+    ``[purged]`` (``creek/purge/engine.py``). A plaintext manifest is
+    therefore edited out from under the prune by the very command whose
+    leftovers the prune exists to remove, leaving the copy undeletable. A
+    digest survives that rewrite untouched, so the copy stays deletable.
+
+    **This is a stability property, not an erasure guarantee.** The digest
+    is unsalted SHA-256 over a low-entropy, enumerable value: fragment ids
+    come verbatim from exports, so anyone holding a candidate id list can
+    confirm membership by recomputing the digest, including after a purge.
+    The manifest is therefore best understood as a *confirmable* record of
+    which ids this folder once held, not as an anonymised one. It is
+    accepted because the alternative — a plaintext ledger somewhere purge
+    cannot reach — is strictly worse residue, and because the prune it
+    enables removes the fragment *bodies*, which are the sensitive part.
+    Domain-separating the digest (HMAC under a per-vault key) would close
+    the confirmation gap and is the obvious upgrade if that judgement ever
+    changes.
+
+    Args:
+        stem: The sample filename stem — equivalently the fragment id,
+            since :meth:`VoiceExemplarCollector._persist_fragment` writes
+            ``f"{fragment.id}.md"``.
+
+    Returns:
+        The hex digest recorded for *stem*.
+    """
+    return hashlib.sha256(stem.encode("utf-8")).hexdigest()
+
+
+def _read_sample_manifest(register_dir: Path) -> frozenset[str]:
+    """Return the digests the previous run recorded writing into *register_dir*.
+
+    A missing, unreadable, or manifest-less summary yields an empty set,
+    which makes the prune a no-op. That is the safe direction: the
+    collector deletes only what it can prove it wrote, so a lost record
+    costs a stale copy rather than an operator's file.
+
+    Args:
+        register_dir: The register's samples folder, which may not exist.
+
+    Returns:
+        Every entry recorded under :data:`_MANIFEST_KEY`, read as text —
+        the note is on disk and may have been hand-edited, and an entry
+        that is not a digest simply matches no file.
+    """
+    summary_path = register_dir / _SUMMARY_FILENAME
+    if not summary_path.is_file():
+        return frozenset()
+    try:
+        post = frontmatter.load(str(summary_path))
+    except (OSError, ValueError, yaml.YAMLError):
+        logger.debug("Unreadable register summary, pruning nothing: %s", summary_path)
+        return frozenset()
+    recorded = post.metadata.get(_MANIFEST_KEY)
+    if not isinstance(recorded, list):
+        return frozenset()
+    return frozenset(str(entry) for entry in recorded)
 
 
 class VoiceExemplarCollector:
@@ -605,13 +752,19 @@ class VoiceExemplarCollector:
         self,
         exemplars: dict[str, list[Fragment]],
         vault_path: Path,
+        *,
+        on_prune: Callable[[Path], None] | None = None,
     ) -> dict[str, Path]:
         """Copy ranked exemplars into ``07-Voice/Register-Samples/<register>/``.
 
-        For each non-empty register the collector creates the destination
-        folder, copies (or rewrites) up to :attr:`max_per_register` of
-        the top-ranked fragments, and writes a ``_Summary.md`` note
-        recording statistics about the cohort.
+        For every register named in *exemplars* the collector first prunes
+        the copies an earlier run recorded writing (#879), then — for the
+        non-empty ones — creates the destination folder, copies (or
+        rewrites) up to :attr:`max_per_register` of the top-ranked
+        fragments, and writes a ``_Summary.md`` note recording statistics
+        about the cohort. A register that has just emptied keeps neither:
+        its existing summary is rewritten to an honest zero rather than
+        left describing the cohort that has gone.
 
         Fragments in each register bucket are ranked internally via
         :meth:`rank_exemplars` before being persisted — callers do not
@@ -620,12 +773,22 @@ class VoiceExemplarCollector:
         Args:
             exemplars: Mapping of register → fragments, typically the
                 output of :meth:`collect_exemplars`. Non-canonical
-                register keys are skipped with a debug log entry.
+                register keys are skipped with a debug log entry, and are
+                not pruned either: an unrecognised key describes a folder
+                this collector never wrote.
             vault_path: Path to the root of the Obsidian vault.
+            on_prune: Invoked once per deleted copy, with its path.
+                Deletion is the half of this pass the return value cannot
+                describe, and ``creek fill`` runs it unattended, so the
+                CLI passes a collector here to report it (#879).
 
         Returns:
-            Mapping of register → path of the written summary note for
-            every non-empty register.
+            Mapping of register → path of the written summary note, one
+            entry per register that had exemplars to rank. A register that
+            has just lost its last exemplar gets its existing summary
+            rewritten to an honest zero, but is deliberately **absent**
+            from the mapping: callers count these entries as samples
+            written, and that register had none.
         """
         samples_root = vault_path.joinpath(*_SAMPLES_SUBPATH)
         summaries: dict[str, Path] = {}
@@ -633,18 +796,152 @@ class VoiceExemplarCollector:
             if register not in VOICE_REGISTERS:
                 logger.debug("Skipping unknown voice register %r", register)
                 continue
-            if not fragments:
-                continue
-            ranked = self.rank_exemplars(fragments)
-            register_dir = samples_root / register
-            register_dir.mkdir(parents=True, exist_ok=True)
-            for fragment in ranked:
-                self._persist_fragment(fragment, register_dir)
-            summaries[register] = self._write_summary(register, ranked, register_dir)
+            summary = self._save_register(
+                register,
+                fragments,
+                samples_root / register,
+                on_prune,
+            )
+            if summary is not None:
+                summaries[register] = summary
         return summaries
 
-    def _persist_fragment(self, fragment: Fragment, register_dir: Path) -> Path:
-        """Copy the source file for *fragment* (or serialise from memory)."""
+    def _save_register(
+        self,
+        register: str,
+        fragments: list[Fragment],
+        register_dir: Path,
+        on_prune: Callable[[Path], None] | None,
+    ) -> Path | None:
+        """Prune, persist, and summarise a single register.
+
+        Args:
+            register: The canonical register being saved.
+            fragments: Every candidate fragment collected for it.
+            register_dir: Its samples folder, which may not exist yet.
+            on_prune: Per-deletion callback, forwarded to
+                :meth:`_prune_stale_copies`.
+
+        Returns:
+            Path of the summary note describing this run's cohort, or
+            ``None`` when the register had nothing to rank.
+        """
+        ranked = self.rank_exemplars(fragments)
+        # Above the empty-bucket branch on purpose: a register that lost
+        # every exemplar is exactly the case with the most to clear.
+        self._prune_stale_copies(register_dir, {f.id for f in ranked}, on_prune)
+        if not ranked:
+            self._rewrite_emptied_summary(register, register_dir)
+            return None
+        register_dir.mkdir(parents=True, exist_ok=True)
+        # Only the fragments that actually reached disk are summarised: an
+        # id the filename guard rejected must not be counted, wikilinked,
+        # or recorded in the manifest, because a manifest entry for a file
+        # that was never written aims the next run's prune at a phantom.
+        persisted = [
+            fragment
+            for fragment in ranked
+            if self._persist_fragment(fragment, register_dir) is not None
+        ]
+        return self._write_summary(register, persisted, register_dir)
+
+    def _rewrite_emptied_summary(self, register: str, register_dir: Path) -> None:
+        """Rewrite the summary of a register that has just lost every exemplar.
+
+        The prune removes the copies, but the summary an earlier run wrote
+        outlives them and goes on naming the departed fragments by id
+        **and title**, and goes on reporting the ``tier_ceiling`` of a
+        corpus that no longer exists. That residue is introduced by the
+        prune pass itself, so it is the prune pass that has to clear it
+        (#879).
+
+        Nothing is created here. A register that never had a summary keeps
+        no folder and gains no note, which is what
+        ``tests/test_voice_exemplars.py::TestSaveExemplars::
+        test_skips_empty_registers`` holds.
+
+        Args:
+            register: The canonical register that emptied.
+            register_dir: Its samples folder, which may not exist.
+        """
+        if not (register_dir / _SUMMARY_FILENAME).is_file():
+            return
+        self._write_summary(register, [], register_dir)
+
+    @staticmethod
+    def _prune_stale_copies(
+        register_dir: Path,
+        keep_ids: set[str],
+        on_prune: Callable[[Path], None] | None,
+    ) -> None:
+        """Delete exemplar copies from an earlier run that no longer rank.
+
+        Persisting alone only ever adds, so without this pass a fragment
+        that drops out of the top :attr:`max_per_register`, is re-tiered
+        above the caller's ceiling, or is deleted from the vault outright
+        leaves a verbatim copy of its body in the samples tree forever
+        (#879).
+
+        A file is deleted only when the *previous* summary's manifest
+        records this collector writing it and this run is not about to
+        rewrite it. Authorship is a record, never a guess:
+        ``Register-Samples/<register>/`` is a folder an operator keeps
+        their own notes in, and a fragment they curated into it is — in
+        shape, byte for byte — indistinguishable from one this tool wrote.
+        Conversely the match is on the filename **stem**, so scrubbing a
+        copy's frontmatter, which ``creek purge`` does to every ``.md`` in
+        the vault, cannot make it unrecognisable and therefore immortal.
+
+        The scan is deliberately non-recursive, and never creates
+        *register_dir*, so a register with no exemplars stays folderless.
+
+        Args:
+            register_dir: The register's samples folder. Left untouched
+                when it does not exist.
+            keep_ids: Ids of the exemplars this run is about to write.
+            on_prune: Invoked with the path of each deleted copy, or
+                ``None`` when the caller does not need to know.
+        """
+        manifest = _read_sample_manifest(register_dir)
+        if not manifest:
+            return
+        for candidate in sorted(register_dir.glob("*.md")):
+            # The summary is exempted by name as well as by manifest: it
+            # is the one file in here the collector rewrites rather than
+            # replaces, and losing it would lose the manifest with it.
+            if candidate.name == _SUMMARY_FILENAME or candidate.stem in keep_ids:
+                continue
+            if _sample_digest(candidate.stem) not in manifest:
+                continue
+            candidate.unlink()
+            # Named, not just counted. The CLI reports a total, but a total
+            # scrolls past inside an unattended ``creek fill`` and cannot
+            # answer "which file did it take?". WARNING is the level rather
+            # than INFO because creek configures no logging handlers, so
+            # INFO is swallowed by ``logging.lastResort`` and a silent
+            # deletion is one nobody can audit (#879).
+            logger.warning("Pruned stale voice register sample: %s", candidate)
+            if on_prune is not None:
+                on_prune(candidate)
+
+    def _persist_fragment(self, fragment: Fragment, register_dir: Path) -> Path | None:
+        """Copy the source file for *fragment* (or serialise from memory).
+
+        Args:
+            fragment: The ranked exemplar to persist.
+            register_dir: The register's samples folder, already created.
+
+        Returns:
+            Path of the written copy, or ``None`` when ``fragment.id`` is
+            unusable as a filename (see :func:`_is_safe_sample_stem`) and
+            nothing was written.
+        """
+        if not _is_safe_sample_stem(fragment.id):
+            logger.warning(
+                "Skipping voice exemplar %r: its id is not usable as a filename.",
+                fragment.id,
+            )
+            return None
         target = register_dir / f"{fragment.id}.md"
         record = self._records.get(fragment.id)
         if record is not None and record.source_path.exists():
@@ -658,27 +955,56 @@ class VoiceExemplarCollector:
     def _write_summary(
         self,
         register: str,
-        ranked: list[Fragment],
+        persisted: list[Fragment],
         register_dir: Path,
     ) -> Path:
-        """Write the per-register summary note and return its path."""
+        """Write the per-register summary note and return its path.
+
+        Beyond its human-readable statistics the note carries two records.
+
+        The :attr:`override` the run was taken under, for the same reason
+        ``00-Creek-Meta/Processing-Log/tag-history.json`` does
+        (``creek_mcp/tools/report.py``): a narrow ceiling surveys a
+        smaller corpus *and* prunes samples a wider one produced, so two
+        summaries written at two ceilings describe two different corpora
+        and their counts are not comparable.
+
+        And the manifest under :data:`_MANIFEST_KEY`, which is the record
+        of which copies in this folder are the collector's own and the
+        only thing that entitles the next run to delete one. It
+        fingerprints the fragments that actually reached disk — see
+        :func:`_sample_digest` for why the ids themselves are not stored.
+
+        Args:
+            register: The canonical register this cohort belongs to.
+            persisted: The exemplars written alongside this note. Empty
+                when the register has just lost its last one.
+            register_dir: The register's samples folder.
+
+        Returns:
+            Path of the written summary note.
+        """
         conviction = sum(
-            1 for f in ranked if _confidence_value(f) == Confidence.CONVICTION.value
+            1 for f in persisted if _confidence_value(f) == Confidence.CONVICTION.value
         )
         settled = sum(
-            1 for f in ranked if _confidence_value(f) == Confidence.SETTLED.value
+            1 for f in persisted if _confidence_value(f) == Confidence.SETTLED.value
         )
-        body = self._render_summary_body(register, ranked, conviction, settled)
+        body = self._render_summary_body(register, persisted, conviction, settled)
         post = frontmatter.Post(
             content=body,
             type="voice-register-summary",
             voice_register=register,
-            exemplar_count=len(ranked),
+            exemplar_count=len(persisted),
             conviction_count=conviction,
             settled_count=settled,
+            tier_ceiling=self.override.value,
             generated_at=datetime.now(tz=UTC).isoformat(),
             tags=["voice", "voice-register", register],
         )
+        # Assigned rather than passed as a keyword so the key stays the
+        # single constant the prune's reader looks it up by.
+        post.metadata[_MANIFEST_KEY] = [_sample_digest(f.id) for f in persisted]
         summary_path = register_dir / _SUMMARY_FILENAME
         summary_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return summary_path
@@ -686,7 +1012,7 @@ class VoiceExemplarCollector:
     @staticmethod
     def _render_summary_body(
         register: str,
-        ranked: list[Fragment],
+        persisted: list[Fragment],
         conviction: int,
         settled: int,
     ) -> str:
@@ -696,15 +1022,15 @@ class VoiceExemplarCollector:
             "",
             "## Statistics",
             "",
-            f"- Exemplar count: {len(ranked)}",
+            f"- Exemplar count: {len(persisted)}",
             f"- Conviction confidence: {conviction}",
             f"- Settled confidence: {settled}",
             "",
             "## Exemplars",
             "",
         ]
-        if ranked:
-            for fragment in ranked:
+        if persisted:
+            for fragment in persisted:
                 lines.append(f"- [[{fragment.id}|{fragment.title}]]")
         else:
             lines.append("_No exemplars collected._")
@@ -2148,6 +2474,54 @@ class VoiceProfileGenerator:
         return "\n".join(lines)
 
 
+def generate_register_samples(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+    on_prune: Callable[[Path], None] | None = None,
+) -> dict[str, Path]:
+    """Collect the voice corpus and persist its register samples (#879).
+
+    Mirrors :func:`creek.generate.lexicon.generate_lexicon`: **one**
+    collector, built with the caller's ceiling, walks the vault and then
+    writes what that same walk found. The single instance is load-bearing
+    rather than stylistic — :meth:`VoiceExemplarCollector._persist_fragment`
+    copies a fragment's source file only while the collector's record cache
+    holds an entry for it, and only
+    :meth:`VoiceExemplarCollector.collect_exemplars` fills that cache.
+    Saving through a second collector still produces a full set of
+    valid-looking exemplar notes, every one of them with an **empty body**.
+
+    Only ``creek report --type voice`` calls this. The ``report_type="voice"``
+    MCP tool still writes profiles alone; that divergence is a recorded
+    decision tracked in issue #1204, not an oversight to tidy up by wiring
+    the MCP surface here.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        override: Tier ceiling for the corpus walk (#968), forwarded to the
+            collector. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared", so the default is a genuine no-op
+            for callers that predate #968. Additive to — never a replacement
+            for — the collector's ``allow_intimate`` consent gate, which
+            stays off here. The ceiling matters more on this path than on a
+            rendered report: a persisted sample is a source fragment's file
+            copied into the vault byte for byte.
+        on_prune: Invoked once per deleted stale copy, with its path. This
+            call both writes and *deletes* vault content, and the returned
+            mapping describes only the writing, so a caller that reports
+            what happened needs this to see the other half (#879).
+
+    Returns:
+        Mapping of register → path of the written ``_Summary.md``, one entry
+        per register that had exemplars. Empty when the corpus is.
+    """
+    collector = VoiceExemplarCollector(override=override)
+    buckets = collector.collect_exemplars(vault_path)
+    return collector.save_exemplars(buckets, vault_path, on_prune=on_prune)
+
+
 __all__ = [
     "DEFAULT_MAX_PER_REGISTER",
     "DEFAULT_MIN_PER_REGISTER",
@@ -2165,4 +2539,5 @@ __all__ = [
     "VoicePatterns",
     "VoiceProfile",
     "VoiceProfileGenerator",
+    "generate_register_samples",
 ]

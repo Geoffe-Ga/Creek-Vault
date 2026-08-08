@@ -21,6 +21,7 @@ The `generate` family of commands turns a classified, linked vault into the arte
 | `unnamed`        | `10-Liminal/Unnamed-Digest-<period>.md`    | `creek.generate.unnamed` |
 | `tags`           | `00-Creek-Meta/Tags/`                      | `creek.generate.tags` |
 | `lexicon`        | `09-Reference/Lexicon.md`                  | `creek.generate.lexicon` |
+| `voice`          | `07-Voice/<register>-profile.md` (profiles) + `07-Voice/Register-Samples/<register>/` (samples) | `creek.generate.voice` — see below |
 
 Periods are `--period weekly` or `--period monthly`. Wavelength reports contain phase-distribution histograms, dosage trends per frequency, and detected phase transitions.
 
@@ -36,6 +37,34 @@ creek report --type synchronicity --vault ~/Obsidian/Creek-Vault
 ```
 
 The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types collectively make up the **emergence infrastructure** described in Ontology §10. The exact criteria that decide whether content is surfaced (similarity thresholds, time-gap floors, project-name filters) live in [`emergence.md`](emergence.md).
+
+### Voice register samples (#879)
+
+`creek report --type voice` writes **two** artefacts (`creek.generate.voice`): the rendered profiles at `07-Voice/<register>-profile.md` (as before), and — new in #879 — ranked exemplar copies at `07-Voice/Register-Samples/<register>/<fragment-id>.md`, plus one `_Summary.md` per register. Before #879, `VoiceExemplarCollector.save_exemplars` had no production caller, so this folder was never populated.
+
+```bash
+creek report --type voice --vault ~/Obsidian/Creek-Vault
+```
+
+```
+Voice profiles generated (1): analytical-profile
+Register samples written (1): analytical
+```
+
+- **Samples are byte-for-byte copies** of the source fragment file (`shutil.copy2`), not excerpts — up to `DEFAULT_MAX_PER_REGISTER` (20) per register. (If the source file disappears mid-run — a concurrent `creek purge`, say — the collector falls back to serialising the fragment from memory, which yields a valid note with an empty body.)
+- **The folder is generated; treat it as read-only.** A `<fragment-id>.md` under `Register-Samples/` is overwritten (or deleted) on the next run. Edit the source fragment in `01-Fragments/`, never the copy.
+- **Stale copies are pruned automatically.** A fragment that drops out of the top 20, is re-tiered above the run's ceiling, or is deleted from the vault has its copy removed on the next run; the CLI reports `Stale register samples pruned (N)`. Each register's `_Summary.md` carries an `exemplar_digests` manifest of exactly what this tool wrote, and only a file matching that manifest is ever deleted — an operator's own notes in the folder, including a fragment they hand-curated into it, are left untouched.
+- **A narrower `--include-tier` prunes what a wider run wrote.** This is the only way to retract above-ceiling copies after a broad run, but it also means the folder always reflects the *last* ceiling a run used, not the union of every ceiling ever run. Each `_Summary.md` records `tier_ceiling` so you can tell which corpus you're looking at. `--include-tier` on this report type follows the [same convention as every other generation flow](#local-first-ergonomics): omitting it is unfiltered, and supplying it narrows.
+- **A retraction does not survive the next `creek fill`.** `creek fill` has no `--include-tier` of its own and runs `report/voice` unfiltered, so a narrowed run's retraction lasts only until the next fill, which re-copies every above-ceiling body it removed. `creek report --type voice --include-tier <tier>` is a way to *inspect* a narrower corpus, **not** a durable redaction. To remove content permanently, act on the source fragment — `creek purge` or a tier change in `01-Fragments/` — so the next unfiltered run has nothing to copy.
+- **`_Summary.md` is machine state as well as a note.** Its `exemplar_digests` frontmatter key is the prune's authorship record, so it renders as up to 20 64-character hex strings in Obsidian's properties panel. That noise is a deliberate trade: keeping the record *in the note* is what lets it survive `creek purge`'s rewrite of every `.md` in the vault, which is what keeps a purged fragment's copy deletable. Don't hand-edit it — a corrupted manifest disarms the prune (fail-safe: it declines to delete rather than guessing).
+- **"Same set" idempotence, not byte-identical files.** A re-run over an unchanged corpus produces the same *set* of files, but `_Summary.md` restamps `generated_at` every time, so it is rewritten even when nothing changed. Exemplar copies themselves are only rewritten from their source.
+- **Intimate-tier fragments are never copied**, at any ceiling. The voice proxy's `allow_intimate` consent gate is separate from the tier ceiling and is not exposed on the CLI.
+- **Existing vaults need no migration.** Collection reads only frontmatter `creek classify` already writes, so the next `creek report --type voice` or `creek fill` run populates the folder from what's already there.
+- **`creek fill` now runs this report** (`report/voice`, between `report/mode-profiles` and `report/wavelength` in its step sequence), so `creek fill` also writes voice profiles and samples — and, via the prune above, `report/voice` is the step in `creek fill` that deletes vault files.
+
+**Known gap** (issue #1211): `creek purge` does not synchronously remove a purged fragment's content from `07-Voice/` derived artefacts. This predates #879 — on an unmodified vault, `creek purge` already leaves a purged body sitting in `07-Voice/<register>-profile.md`. This report's own prune does clear an orphaned register-sample copy the next time it runs, which mitigates the gap for that one artefact; it does not fix it, and it does nothing for the profile.
+
+**MCP divergence** (issue #1204): the `report_type="voice"` MCP tool still writes profiles only, not register samples. That is a recorded decision, not an oversight.
 
 ## State (audit report)
 

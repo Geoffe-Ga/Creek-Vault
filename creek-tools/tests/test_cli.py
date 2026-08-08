@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import frontmatter
 import pytest
 from typer.testing import CliRunner
 
@@ -1580,6 +1581,670 @@ def test_report_voice_command(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Voice profile" in result.output or "voice profile" in result.output
     assert (vault / "07-Voice" / "confessional-profile.md").is_file()
+
+
+# ---- Issue #879: report --type voice must populate Register-Samples -------
+#
+# ``VoiceExemplarCollector.save_exemplars`` had no production caller, so
+# ``07-Voice/Register-Samples/`` was only ever written by tests: a real
+# vault got ``<register>-profile.md`` and an empty samples tree. These
+# tests pin the CLI wiring end to end — the copies exist, they carry the
+# source body rather than an empty one, both privacy gates still hold,
+# and a re-run neither duplicates nor orphans.
+
+_SAMPLES_SUBPATH = ("07-Voice", "Register-Samples")
+"""Vault-relative location of the persisted register samples."""
+
+
+def _voice_body(marker: str) -> str:
+    """Return a distinctive multi-sentence exemplar body carrying *marker*."""
+    return (
+        f"{marker} the creek of thought flows gently downstream. "
+        "It gathers what it passes and it carries the sediment on. "
+    ) * 20
+
+
+def _write_voice_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    tier: str | None = "personal",
+    register: str = "confessional",
+    confidence: str = "conviction",
+    body: str | None = None,
+    title: str | None = None,
+    file_stem: str | None = None,
+) -> Path:
+    """Write one exemplar-eligible fragment with hand-built frontmatter.
+
+    Built from a literal template rather than ``Fragment.model_dump``
+    (which always emits a ``privacy_tier``) so ``tier=None`` produces a
+    file with the key genuinely **absent** — the legacy / hand-edited
+    shape that ``raw_privacy_tier`` fails closed to ``intimate``, and the
+    only shape that can tell a raw-frontmatter ceiling read apart from a
+    model-defaulted one. Same reasoning as
+    ``tests/test_cli_fill.py::_seed_fragment``.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem, unless *file_stem* says
+            otherwise).
+        tier: ``privacy_tier`` value, or ``None`` to omit the key entirely.
+        register: ``voice.voice_register`` value.
+        confidence: ``voice.confidence`` value.
+        body: Markdown body; defaults to a marked exemplar body.
+        title: ``title`` value. Defaults to ``f"Fragment {frag_id}"``, which
+            *contains* the id — so a test asserting that a title has been
+            scrubbed must pass a title that shares no substring with the id,
+            or it proves nothing the id assertion did not already prove.
+        file_stem: Filename stem to write under, when it must differ from
+            *frag_id*. The two diverge only for ids that cannot themselves
+            be filenames (an over-long id would raise ``OSError`` here,
+            before the code under test ever saw it).
+
+    Returns:
+        Path of the written fragment file.
+    """
+    folder = vault / "01-Fragments" / "Journal"
+    folder.mkdir(parents=True, exist_ok=True)
+    tier_line = f"privacy_tier: {tier}\n" if tier is not None else ""
+    resolved_title = f"Fragment {frag_id}" if title is None else title
+    target = folder / f"{file_stem or frag_id}.md"
+    target.write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{resolved_title}"\n'
+        f"source:\n  platform: journal\n  author: self\n"
+        f"frequency:\n  primary: F5\n"
+        f"wavelength:\n  phase: rising\n  mode: express\n"
+        f"voice:\n  voice_register: {register}\n  confidence: {confidence}\n"
+        f"{tier_line}---\n{body if body is not None else _voice_body(frag_id)}\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+def _samples_root(vault: Path) -> Path:
+    """Return the ``07-Voice/Register-Samples`` root for *vault*."""
+    return vault.joinpath(*_SAMPLES_SUBPATH)
+
+
+def _sample_relpaths(vault: Path) -> list[str]:
+    """Return every file under ``Register-Samples`` as sorted relative paths."""
+    root = _samples_root(vault)
+    if not root.is_dir():
+        return []
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def _copied_names(vault: Path, register: str = "confessional") -> list[str]:
+    """Return the sorted exemplar filenames in *register*, minus the summary."""
+    register_dir = _samples_root(vault) / register
+    if not register_dir.is_dir():
+        return []
+    return sorted(p.name for p in register_dir.glob("*.md") if p.name != "_Summary.md")
+
+
+def _run_report_voice(vault: Path, *args: str) -> None:
+    """Invoke ``creek report --type voice`` on *vault* and assert it exits 0."""
+    result = runner.invoke(
+        app,
+        ["report", "--type", "voice", "--vault", str(vault), *args],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def _voice_vault(tmp_path: Path) -> Path:
+    """Return a scaffolded, empty vault root ready for voice fragments."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+    return vault
+
+
+def test_report_voice_writes_register_samples(tmp_path: Path) -> None:
+    """``report --type voice`` copies ranked exemplars into Register-Samples.
+
+    The headline defect of #879: the command wrote
+    ``07-Voice/confessional-profile.md`` and left
+    ``07-Voice/Register-Samples/`` completely empty, because
+    ``save_exemplars`` had no production caller at all.
+    """
+    vault = _voice_vault(tmp_path)
+    for index in range(6):
+        _write_voice_fragment(vault, f"frag-rs-{index}")
+
+    _run_report_voice(vault)
+
+    register_dir = _samples_root(vault) / "confessional"
+    assert (register_dir / "_Summary.md").is_file()
+    assert _copied_names(vault) == [f"frag-rs-{index}.md" for index in range(6)]
+
+
+def test_report_voice_register_samples_carry_the_source_body(
+    tmp_path: Path,
+) -> None:
+    """Each copied sample is the source file verbatim, never an empty body.
+
+    ``_persist_fragment`` only copies the source when
+    ``self._records[fragment.id]`` exists, and ``_records`` is populated
+    **only** by ``collect_exemplars``. An implementation that builds a
+    second collector for the save, or calls ``save_exemplars`` without a
+    prior ``collect_exemplars`` on the same instance, silently falls back
+    to ``frontmatter.Post(content="", ...)`` and writes body-less samples
+    that pass every other assertion in this module. Byte equality is the
+    assertion that catches it.
+    """
+    import frontmatter
+
+    vault = _voice_vault(tmp_path)
+    source = _write_voice_fragment(
+        vault,
+        "frag-body-1",
+        body=_voice_body("unmistakable-exemplar-marker"),
+    )
+
+    _run_report_voice(vault)
+
+    copy = _samples_root(vault) / "confessional" / "frag-body-1.md"
+    assert copy.is_file()
+    copied = frontmatter.load(str(copy))
+    assert copied.content == frontmatter.load(str(source)).content
+    assert copied.content.strip() != ""
+    assert "unmistakable-exemplar-marker" in copied.content
+    assert copy.read_bytes() == source.read_bytes()
+
+
+def test_report_voice_register_samples_exclude_intimate_by_default(
+    tmp_path: Path,
+) -> None:
+    """A bare run copies no intimate fragment, and names none in the summary.
+
+    ``allow_intimate`` is the voice proxy's own consent gate and is not
+    CLI-exposed, so ``intimate`` content must stay out of the samples tree
+    even on an otherwise unfiltered run. The ``open`` control fragment is
+    what stops this passing vacuously on an implementation that copies
+    nothing at all.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-open-ctl", tier="open")
+    _write_voice_fragment(vault, "frag-intimate", tier="intimate")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-open-ctl.md"]
+    written = "\n".join(
+        path.read_text(encoding="utf-8") for path in _samples_root(vault).rglob("*.md")
+    )
+    assert "frag-intimate" not in written
+
+
+def test_report_voice_register_samples_honour_the_tier_ceiling(
+    tmp_path: Path,
+) -> None:
+    """``--include-tier open`` admits only ``open`` fragments to the samples.
+
+    On ``report`` the flag NARROWS (an absent flag means unfiltered), so
+    the ``personal`` fragment sits one rank above the declared ceiling and
+    must not be copied — while the ``open`` control proves the run copied
+    anything at all.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-open", tier="open")
+    _write_voice_fragment(vault, "frag-personal", tier="personal")
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _copied_names(vault) == ["frag-open.md"]
+
+
+def test_report_voice_register_samples_fail_closed_on_an_absent_tier(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key at all is never copied.
+
+    The ceiling is asked of the **raw** frontmatter
+    (``privacy_filter.within_ceiling`` → ``raw_privacy_tier``), which
+    fails closed to ``intimate`` when the key is absent — a hand-edited or
+    legacy note carries less assurance than a pipeline-written one that
+    says ``unclassified`` out loud.
+
+    ``personal`` is the ceiling that makes this discriminating, and it is
+    the only one that does. A raw read ranks the untiered file with
+    ``intimate`` (rank 2) and excludes it; reading the tier through the
+    validated ``Fragment`` instead would apply the model's
+    ``unclassified`` default, which ranks with ``personal`` (rank 1,
+    #876) and would let it straight through. At ``--include-tier open``
+    both readings exclude it, so that ceiling proves nothing here. The
+    file is therefore written with the key genuinely stripped rather than
+    via ``model_dump``, which always emits one.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-personal-ctl", tier="personal")
+    _write_voice_fragment(vault, "frag-untiered", tier=None)
+
+    _run_report_voice(vault, "--include-tier", "personal")
+
+    assert _copied_names(vault) == ["frag-personal-ctl.md"]
+
+
+def test_report_voice_register_samples_are_idempotent(tmp_path: Path) -> None:
+    """A second run writes the same set of files, and no more of them."""
+    vault = _voice_vault(tmp_path)
+    for index in range(3):
+        _write_voice_fragment(vault, f"frag-idem-{index}")
+
+    _run_report_voice(vault)
+    first = _sample_relpaths(vault)
+    assert first, "the first run wrote nothing into Register-Samples"
+
+    _run_report_voice(vault)
+
+    assert _sample_relpaths(vault) == first
+
+
+def test_report_voice_prunes_samples_whose_fragment_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A sample whose source fragment left the corpus is removed on re-run.
+
+    ``save_exemplars`` only ever ``mkdir``s and writes, so a fragment that
+    drops out of the corpus leaves its copy behind forever — a deleted or
+    purged fragment keeps a full-bodied copy of itself in the voice
+    samples tree indefinitely.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-keep")
+    dropped = _write_voice_fragment(vault, "frag-drop")
+
+    _run_report_voice(vault)
+    assert _copied_names(vault) == ["frag-drop.md", "frag-keep.md"]
+
+    dropped.unlink()
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-keep.md"]
+
+
+def test_report_voice_prunes_a_sample_that_becomes_intimate(
+    tmp_path: Path,
+) -> None:
+    """Re-tiering a fragment to ``intimate`` removes its existing sample.
+
+    The privacy face of the same stale-copy bug: without pruning, a
+    fragment reclassified upward keeps a verbatim copy of its body in
+    ``Register-Samples`` that no gate will ever look at again.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-keep", tier="open")
+    _write_voice_fragment(vault, "frag-secret", tier="open")
+
+    _run_report_voice(vault)
+    assert _copied_names(vault) == ["frag-keep.md", "frag-secret.md"]
+
+    _write_voice_fragment(vault, "frag-secret", tier="intimate")
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-keep.md"]
+    written = "\n".join(
+        path.read_text(encoding="utf-8") for path in _samples_root(vault).rglob("*.md")
+    )
+    assert "frag-secret" not in written
+
+
+def test_report_voice_pruning_spares_operator_notes(tmp_path: Path) -> None:
+    """Pruning removes stale samples only — never the operator's own files.
+
+    ``Register-Samples/<register>/`` is a vault folder an operator can put
+    notes in. A prune that clears anything it did not write turns a
+    housekeeping pass into data loss, and one that clears ``_Summary.md``
+    deletes the note it is about to rewrite.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-a")
+    _write_voice_fragment(vault, "frag-b")
+
+    _run_report_voice(vault)
+    register_dir = _samples_root(vault) / "confessional"
+    notes = register_dir / "My-Notes.md"
+    notes.write_text("# My reading notes\n\nHand written.\n", encoding="utf-8")
+
+    _run_report_voice(vault)
+
+    assert notes.read_text(encoding="utf-8") == "# My reading notes\n\nHand written.\n"
+    assert (register_dir / "_Summary.md").is_file()
+    assert (register_dir / "frag-a.md").is_file()
+    assert (register_dir / "frag-b.md").is_file()
+
+
+# ---- Issue #879, second pass: security-review findings --------------------
+#
+# Five defects the first pass left behind. Three of them share a root
+# cause: ``_prune_stale_copies`` decides "is this file mine to delete?"
+# with ``_is_generated_sample`` — "parses as ``type: fragment`` and its
+# ``id`` equals its own stem" — which is a *shape* test, not a record of
+# authorship. It answers "no" for a file this tool wrote (once ``creek
+# purge`` scrubs the id) and "yes" for a file it did not (an operator's
+# curated fragment). The fix replaces the heuristic with a manifest kept
+# in ``_Summary.md``; these tests are written against the behaviour, not
+# the manifest's internals.
+
+
+def _samples_text(vault: Path) -> str:
+    """Return every byte of markdown currently under ``Register-Samples``.
+
+    The residue assertions need to search the *whole* samples tree, not
+    just the copies: the summary note is markdown too, and it is where
+    the ids and titles of departed fragments were found to survive.
+    """
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in _samples_root(vault).rglob("*.md")
+    )
+
+
+def _load_register_summary(
+    vault: Path,
+    register: str = "confessional",
+) -> frontmatter.Post:
+    """Load the ``_Summary.md`` note for *register*.
+
+    Args:
+        vault: Vault root.
+        register: Canonical voice register whose summary note to read.
+
+    Returns:
+        The parsed summary note.
+    """
+    return frontmatter.load(str(_samples_root(vault) / register / "_Summary.md"))
+
+
+def test_report_voice_rewrites_the_summary_of_an_emptied_register(
+    tmp_path: Path,
+) -> None:
+    """A register that loses every exemplar must stop naming them.
+
+    ``save_exemplars`` prunes and then ``continue``s on an empty bucket,
+    *before* ``_write_summary`` — so the summary an earlier run wrote
+    survives the emptying intact. It goes on claiming the old
+    ``exemplar_count`` and goes on wikilinking the departed fragment by
+    both id **and title**, which is the residue that matters: the body
+    copy is pruned correctly, and the title is the part of a fragment
+    most likely to be self-describing.
+
+    ``test_report_voice_prunes_a_sample_that_becomes_intimate`` cannot
+    catch this. Its register keeps another exemplar, so the summary is
+    rewritten as a side effect of the register still being non-empty.
+    Here the re-tiered fragment is the register's **sole** exemplar.
+
+    The fix is to rewrite the summary, not to invent a new rendering:
+    ``_render_summary_body`` already renders an empty cohort as
+    ``_No exemplars collected._`` (pinned by
+    ``tests/test_voice_exemplars.py::...::
+    test_summary_body_lists_zero_exemplars_when_empty``). Nor may the fix
+    start writing summaries for registers that never had one —
+    ``tests/test_voice_exemplars.py::TestSaveExemplars::
+    test_skips_empty_registers`` holds that line.
+    """
+    vault = _voice_vault(tmp_path)
+    # A second register keeps the run itself non-empty, so this test cannot
+    # pass by way of the command doing nothing at all.
+    _write_voice_fragment(vault, "frag-ctl", tier="open")
+    secret_title = "My affair with the neighbour"
+    _write_voice_fragment(
+        vault,
+        "frag-secret",
+        tier="open",
+        register="analytical",
+        title=secret_title,
+    )
+
+    _run_report_voice(vault)
+    assert _copied_names(vault, "analytical") == ["frag-secret.md"]
+    assert _load_register_summary(vault, "analytical")["exemplar_count"] == 1
+
+    _write_voice_fragment(
+        vault,
+        "frag-secret",
+        tier="intimate",
+        register="analytical",
+        title=secret_title,
+    )
+    _run_report_voice(vault)
+
+    assert _copied_names(vault, "analytical") == []
+    residue = _samples_text(vault)
+    assert "frag-secret" not in residue
+    assert secret_title not in residue
+    emptied = _load_register_summary(vault, "analytical")
+    assert emptied["exemplar_count"] == 0
+    assert emptied["conviction_count"] == 0
+    assert emptied["settled_count"] == 0
+    assert "_No exemplars collected._" in emptied.content
+    # The control register is untouched: the rewrite is scoped, not a wipe.
+    assert _copied_names(vault) == ["frag-ctl.md"]
+
+
+def test_report_voice_pruning_spares_a_curated_fragment_copy(
+    tmp_path: Path,
+) -> None:
+    """A fragment the operator curated into the folder must survive a re-run.
+
+    ``_is_generated_sample`` returns ``True`` for *any* fragment note whose
+    ``id`` equals its stem — which is exactly the shape of a fragment an
+    operator copies in to keep as a permanent stylistic exemplar. The
+    first ``creek report --type voice`` (or ``creek fill``) after that
+    deletes it, irrecoverably, with no prompt and no dry-run.
+
+    ``test_report_voice_pruning_spares_operator_notes`` covers only the
+    easy case: a note with no frontmatter at all, which no id-equals-stem
+    check could ever claim. This one is a *real fragment file*, byte for
+    byte, and the prune has no honest way to tell it from its own output
+    — unless it stops guessing and consults a record of what it actually
+    wrote.
+
+    ``exploring`` confidence keeps the curated fragment out of the corpus,
+    so it is never in ``keep_ids`` and the prune has to make a real
+    decision about it.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-a")
+    _write_voice_fragment(vault, "frag-b")
+
+    _run_report_voice(vault)
+    register_dir = _samples_root(vault) / "confessional"
+
+    curated_source = _write_voice_fragment(
+        vault,
+        "frag-curated",
+        confidence="exploring",
+    )
+    curated = register_dir / "frag-curated.md"
+    curated.write_bytes(curated_source.read_bytes())
+
+    _run_report_voice(vault)
+
+    assert curated.is_file(), "the prune deleted a fragment the operator curated"
+    assert curated.read_bytes() == curated_source.read_bytes()
+    assert _copied_names(vault) == ["frag-a.md", "frag-b.md", "frag-curated.md"]
+
+
+def test_report_voice_prunes_a_copy_whose_id_purge_has_scrubbed(
+    tmp_path: Path,
+) -> None:
+    """``creek purge``'s id-scrub must not make a stale copy immortal.
+
+    ``purge fragment`` deletes the source and then walks every ``.md`` in
+    the vault rewriting the fragment's id to ``[purged]``. That walk
+    reaches ``07-Voice/Register-Samples/<register>/<id>.md``, whose id is
+    now the YAML list ``["purged"]`` — so ``Fragment.model_validate``
+    rejects it, ``_is_generated_sample`` answers ``False``, and the prune
+    that exists precisely to remove this file refuses to touch it. The
+    verbatim body of a purged fragment then survives every subsequent
+    run, permanently.
+
+    Scope (do not widen): that ``purge`` does not itself reach
+    ``07-Voice/`` synchronously is a **pre-existing** gap, verified at
+    unmodified HEAD — ``purge`` already leaves a purged body in
+    ``07-Voice/<register>-profile.md`` — and is tracked as issue #1211.
+    This test pins only the part #879 owns: its own prune must not be
+    disarmed by the scrub.
+    """
+    vault = _voice_vault(tmp_path)
+    marker = "purge-residue-marker-9f2a"
+    _write_voice_fragment(vault, "frag-purge-keep", body=_voice_body("keeper"))
+    _write_voice_fragment(vault, "frag-purge-gone", body=_voice_body(marker))
+
+    _run_report_voice(vault)
+    assert _copied_names(vault) == ["frag-purge-gone.md", "frag-purge-keep.md"]
+
+    purged = runner.invoke(
+        app,
+        ["purge", "fragment", "frag-purge-gone", "--vault", str(vault), "--yes"],
+    )
+    assert purged.exit_code == 0, purged.output
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-purge-keep.md"]
+    assert marker not in _samples_text(vault)
+
+
+def test_report_voice_survives_an_unwritably_long_fragment_id(
+    tmp_path: Path,
+) -> None:
+    """One unusable id costs one exemplar, not the whole command.
+
+    ``_is_safe_sample_stem`` bounds an id's *content* but not its
+    *length*, so a 300-character id passes the guard and reaches
+    ``shutil.copy2``, which raises ``OSError`` (``[Errno 63] File name
+    too long``; ``ENAMETOOLONG`` on every filesystem with a 255-byte
+    ``NAME_MAX``). Nothing catches it, so ``creek report --type voice``
+    dies with a traceback — defeating the guard's own stated intent, that
+    "one unusable id is one unusable exemplar rather than a malformed
+    call, so the collector skips it and goes on saving the rest".
+
+    The long id sorts before ``frag-ok`` and is therefore persisted
+    first, so the surviving copy is a real assertion rather than an
+    artefact of ordering.
+
+    The id lives in the frontmatter of a *short-named* file: a source
+    file named after a 300-character id could not be written to disk at
+    all, and the defect is about ids, not paths.
+    """
+    vault = _voice_vault(tmp_path)
+    over_long_id = "a" * 300
+    _write_voice_fragment(vault, "frag-ok")
+    _write_voice_fragment(vault, over_long_id, file_stem="over-long-id")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-ok.md"]
+    assert (_samples_root(vault) / "confessional" / "_Summary.md").is_file()
+
+
+def test_report_voice_summary_stamps_an_unfiltered_tier_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A bare run records ``tier_ceiling: all`` in the summary.
+
+    Regression pin for existing-but-unasserted behaviour, not a RED test.
+    The stamp is the sole mitigation for a real caveat that
+    ``_write_summary`` documents: a narrower ``--include-tier`` run
+    surveys a smaller corpus *and* prunes samples a wider run produced,
+    so two summaries taken at two ceilings describe two different corpora
+    and their counts are not comparable. Without the stamp there is
+    nothing on disk that says which corpus a given count came from,
+    which makes it load-bearing rather than cosmetic.
+
+    ``report``'s ``--include-tier`` narrows rather than widens, so an
+    absent flag means unfiltered — ``PrivacyTierOverride.ALL``.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-ceiling-all", tier="personal")
+
+    _run_report_voice(vault)
+
+    assert _load_register_summary(vault)["tier_ceiling"] == "all"
+
+
+def test_report_voice_summary_stamps_a_narrowed_tier_ceiling(
+    tmp_path: Path,
+) -> None:
+    """``--include-tier open`` records ``tier_ceiling: open``.
+
+    The other half of the pin above: the stamp must track the declared
+    ceiling, not be a constant. Together the two tests kill the mutant
+    that hardcodes either value.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-ceiling-open", tier="open")
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _load_register_summary(vault)["tier_ceiling"] == "open"
+
+
+def test_report_voice_narrowed_rerun_retracts_a_wider_runs_sample(
+    tmp_path: Path,
+) -> None:
+    """A narrower ``--include-tier`` re-run deletes what a wider run wrote.
+
+    ``docs/generation.md`` states this as a privacy remedy, not a
+    convenience: "A narrower ``--include-tier`` prunes what a wider run
+    wrote. This is the only way to retract above-ceiling copies after a
+    broad run." Nothing else retracts a persisted sample — there is no
+    un-persist flag, and deleting the source fragment is precisely the
+    move that used to leave its verbatim body behind. If this does not
+    hold, the documented remedy for "I ran ``report --type voice``
+    unfiltered on a vault I meant to keep narrow" does not exist.
+
+    ``test_report_voice_register_samples_honour_the_tier_ceiling`` cannot
+    catch a regression here: it proves only that a narrow ceiling excludes
+    on **write**, starting from an empty folder. Retraction is a different
+    path. The copy is already on disk; this run never sees the fragment at
+    all, because the ceiling drops it during ``collect_exemplars`` and so
+    its id never reaches ``keep_ids``; and the only thing entitling the
+    prune to delete the file is the digest the *wider* run recorded in
+    ``_Summary.md``. Break that manifest round-trip — write it under
+    another key, record ids the next run cannot reproduce, skip it when
+    the ceiling changes — and the above-ceiling copy becomes permanent
+    while every write-side ceiling test stays green.
+
+    The ``open`` fragment is the control at both ends: it proves the wide
+    run wrote more than the sample under test, and that the narrow re-run
+    *retracted* rather than merely emptied the samples tree.
+    """
+    vault = _voice_vault(tmp_path)
+    # A title sharing no substring with the id, so the title assertion
+    # below proves something the id assertion does not: the summary
+    # wikilinks a departed exemplar by both, and the title is the half a
+    # deleted body copy does not take with it.
+    retracted_title = "Midnight at the cannery"
+    _write_voice_fragment(
+        vault,
+        "frag-wide-only",
+        tier="personal",
+        title=retracted_title,
+    )
+    _write_voice_fragment(vault, "frag-both-runs", tier="open")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-both-runs.md", "frag-wide-only.md"]
+    wide = _load_register_summary(vault)
+    assert wide["tier_ceiling"] == "all"
+    assert wide["exemplar_count"] == 2
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _copied_names(vault) == ["frag-both-runs.md"]
+    residue = _samples_text(vault)
+    assert "frag-wide-only" not in residue
+    assert retracted_title not in residue
+    # The control is still named in the tree it survived, so the
+    # retraction cannot have been a wipe of the samples folder.
+    assert "frag-both-runs" in residue
+    narrowed = _load_register_summary(vault)
+    assert narrowed["tier_ceiling"] == "open"
+    assert narrowed["exemplar_count"] == 1
 
 
 def _write_wavelength_fragment(vault: Path, frag_id: str) -> None:
