@@ -63,6 +63,7 @@ from creek_mcp.httpapi.middleware.limits import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from starlette.requests import Request
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from creek_mcp.api.routes import RouteSpec
     from creek_mcp.httpapi.handlers import Handler
     from creek_mcp.remote_auth import ConsumerTokenVerifier
+    from creek_mcp.tools.reflect import _LLMFactory
 
 
 def _speaks_a_served_minor(request: Request) -> bool:
@@ -198,6 +200,7 @@ def create_app(
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
 ) -> Starlette:
     """Build the ``/v1`` application.
 
@@ -212,6 +215,14 @@ def create_app(
         max_body_bytes: Inclusive request-body cap.
         timeout_seconds: Per-request deadline.
         max_concurrency: In-flight request limit, process-wide.
+        reflect_llm_factory: Thunk returning the tier-keyed LLM factory
+            ``POST /v1/reflections`` calls, or ``None`` to build the production
+            one lazily on first use. A thunk rather than a factory so a server
+            with no provider configured still boots — only a reflection call
+            then fails, and it fails as a structured refusal. Injectable so the
+            suite can run the whole vertical offline against a stub, which is
+            what keeps the care and ceiling gates testable by *observing that
+            the model was never reached*.
 
     Returns:
         The configured application.
@@ -234,4 +245,5 @@ def create_app(
         exception_handlers={HTTPException: _routing_miss},
     )
     app.state.vault_path = vault_path
+    app.state.reflect_llm_factory = reflect_llm_factory
     return app

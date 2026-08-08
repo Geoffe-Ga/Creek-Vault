@@ -1,21 +1,34 @@
 """What each ``/v1`` operation actually does, keyed by ``operation_id`` (#1074).
 
-Three of the five published routes are not built yet, and the dangerous shape
-for that is a route that returns a *plausible* success — an empty wheel, a
-fabricated ``fragment_id``, a ``{"status": "ok"}`` with nothing behind it —
-because a consumer integrating against it writes code that passes CI and
-silently does nothing in production. ``501 unsupported_capability`` is the
-honest answer, and the ADR puts it in the "safe to expose" column precisely
-because it is derived from the server's *static route table* and discloses
-nothing about the vault.
+Every published route is built as of #1077: the handshake and health from
+#1074, the journal upsert from #1075, the wheel from #1076 and the reflection
+from #1077. :data:`HANDLERS` is derived from the route table rather than listed,
+so a route added to :data:`~creek_mcp.api.routes.ROUTES` without a handler fails
+at *import* instead of being mounted to nothing.
 
-**One stub, three mountings.** :func:`unimplemented` is a factory, not three
-hand-written handlers, so the three unbuilt routes cannot drift into three
-different degrees of half-built. It stamps its product with
-``unimplemented_capability``, which makes "is this endpoint the stub?" a fact
-about the mounted route rather than a guess from its behaviour — and that is
-what lets ``tests/test_v1_api_capabilities.py`` hold advertised and implemented
-together in both directions.
+**The honesty stub stays, and stays exercised.** While a route was unbuilt it
+answered ``501 unsupported_capability`` rather than a *plausible* success — an
+empty wheel, a fabricated ``fragment_id``, a ``{"status": "ok"}`` with nothing
+behind it — because a consumer integrating against one of those writes code
+that passes CI and silently does nothing in production. The ADR puts ``501`` in
+the "safe to expose" column precisely because it is derived from the server's
+*static route table* and discloses nothing about the vault.
+
+Nothing in the table reaches :class:`UnimplementedHandler` today, and the
+temptation is to delete it. That would retire the guard along with the interim
+it covered: the *next* capability added to
+:class:`~creek_mcp.api.models.Capability` before its handler exists is the case
+the stub is for, and by then nobody would have run it in months. So it remains,
+and ``tests/test_v1_api_not_implemented.py`` drives it by substituting one entry
+of :data:`HANDLERS` — the same path a genuinely unbuilt capability takes.
+
+**One stub, however many mountings.** :func:`unimplemented` is a factory rather
+than hand-written handlers, so unbuilt routes cannot drift into different
+degrees of half-built. It stamps its product with ``unimplemented_capability``,
+which makes "is this endpoint the stub?" a fact about the mounted route rather
+than a guess from its behaviour — and that is what lets
+``tests/test_v1_api_capabilities.py`` hold advertised and implemented together
+in both directions.
 
 **The capability gate runs before body validation.** The stub reads nothing the
 caller sent. A stub that answered ``422`` for a malformed body and ``501`` for a
@@ -25,9 +38,7 @@ works too.
 
 :data:`HANDLERS` is read by :func:`creek_mcp.httpapi.app.create_app` at call
 time rather than captured at import, so a test can substitute one entry and
-build an app around it. #1075—#1077 each replace one factory product here with a
-real handler and add its capability to
-:data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`.
+build an app around it.
 """
 
 from __future__ import annotations
@@ -43,11 +54,17 @@ from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
     OP_CAPABILITIES,
     OP_HEALTH,
+    OP_JOURNAL_UPSERT,
+    OP_REFLECTIONS,
+    OP_WHEEL,
     ROUTES,
 )
 from creek_mcp.httpapi.capabilities import handle_capabilities
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.journal import handle_journal_upsert
+from creek_mcp.httpapi.reflect import handle_reflection
+from creek_mcp.httpapi.wheel import handle_wheel
 
 if TYPE_CHECKING:
     from creek_mcp.api.models import Capability
@@ -149,6 +166,9 @@ async def handle_health(_request: Request) -> Response:
 _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_CAPABILITIES: handle_capabilities,
     OP_HEALTH: handle_health,
+    OP_JOURNAL_UPSERT: handle_journal_upsert,
+    OP_REFLECTIONS: handle_reflection,
+    OP_WHEEL: handle_wheel,
 }
 """The operations that answer for real, keyed by ``operation_id``.
 

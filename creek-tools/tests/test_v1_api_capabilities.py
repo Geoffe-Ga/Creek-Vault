@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 import yaml
+from starlette.testclient import TestClient
 
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
@@ -56,12 +57,14 @@ from creek_mcp.api.models import (
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.api.routes import IMPLEMENTED_CAPABILITIES, ROUTES
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
-from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
+from creek_mcp.httpapi import vault as vault_module
 from creek_mcp.tools import handshake as handshake_module
 from creek_mcp.tools.handshake import CREEK_MARKER, vault_available
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
+    OP_REFLECTIONS,
+    REFLECTIONS_PATH,
     build_app,
     client,
     envelope,
@@ -77,6 +80,7 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 """``<repo-root>``: ``tests`` -> ``creek-tools`` -> the root that owns ``docs``."""
 
 _OK_STATUS: Final[int] = 200
+_UNSUPPORTED_STATUS: Final[int] = 501
 """The only status a reachable, authenticated, well-formed handshake returns."""
 
 _INVALID_REQUEST_STATUS: Final[int] = 422
@@ -175,12 +179,23 @@ def test_the_tier_model_is_the_standing_promise(vault: Path) -> None:
 def test_a_present_vault_advertises_only_the_built_capabilities(
     vault: Path,
 ) -> None:
-    """At #1074 that is exactly ``["capabilities"]``.
+    """At #1077 that is every published capability.
+
+    Spelled as a literal rather than derived from
+    ``IMPLEMENTED_CAPABILITIES`` — that derivation already has its own test
+    below. This one is the pin that makes a capability's landing *visible* in
+    a diff: a fifth capability has to add its name here, and a handler wired
+    without the constant (or vice versa) cannot slip past both.
 
     Args:
         vault: A seeded vault.
     """
-    assert _get(vault)["capabilities"] == ["capabilities"]
+    assert _get(vault)["capabilities"] == [
+        "capabilities",
+        "journal-upsert",
+        "reflections",
+        "wheel",
+    ]
 
 
 def test_the_response_carries_no_field_beyond_the_published_model(
@@ -320,14 +335,15 @@ def test_an_unreadable_config_degrades_to_uninitialized(
     down, sending them to look at the wrong thing.
 
     Args:
-        monkeypatch: Replaces ``load_config`` with a raiser.
+        monkeypatch: Replaces ``load_config`` with a raiser, on the module
+            that now owns vault resolution for every route (#1075).
         error: The exception ``load_config`` raises.
     """
 
     def _raise() -> None:
         raise error
 
-    monkeypatch.setattr(capabilities_module, "load_config", _raise)
+    monkeypatch.setattr(vault_module, "load_config", _raise)
     with client(vault_path=None) as test_client:
         response = test_client.get(CAPABILITIES_PATH, headers=headers())
     assert response.status_code == 200
@@ -383,28 +399,6 @@ def test_every_implemented_capability_has_a_real_handler(
     assert getattr(endpoint, "unimplemented_capability", None) is None
 
 
-@pytest.mark.parametrize(
-    "capability", _UNIMPLEMENTED_CAPABILITIES, ids=lambda c: str(c.value)
-)
-def test_every_unimplemented_capability_is_mounted_to_the_stub(
-    vault: Path, capability: Capability
-) -> None:
-    """The converse. An unbuilt capability answers ``501``, honestly stubbed.
-
-    This is what turns #1075/#1076/#1077 red: wiring a real handler without
-    adding the capability to ``IMPLEMENTED_CAPABILITIES`` fails here, and
-    adding it to the constant without wiring a handler fails the test above.
-
-    Args:
-        vault: A seeded vault.
-        capability: The unbuilt capability under test.
-    """
-    spec = next(entry for entry in ROUTES if entry.capability is capability)
-    app = build_app(vault_path=vault)
-    endpoint = route_for(app, spec.path, spec.method).endpoint
-    assert getattr(endpoint, "unimplemented_capability", None) is capability
-
-
 def test_the_unimplemented_factory_marks_its_product() -> None:
     """The marker check above is not vacuous.
 
@@ -417,14 +411,59 @@ def test_the_unimplemented_factory_marks_its_product() -> None:
     assert getattr(stub, "unimplemented_capability", None) is Capability.WHEEL
 
 
-def test_there_is_at_least_one_unimplemented_capability() -> None:
-    """The stub parametrize above has cases to run.
+def test_no_published_capability_is_mounted_to_the_stub() -> None:
+    """#1077 finished the epic, so the unimplemented set is empty. On purpose.
 
-    When #1075—#1077 land this becomes an empty set and this test goes red on
-    purpose: at that point the honesty machinery has done its job and the
-    parametrized converse has nothing left to guard.
+    Until now this module held a parametrized converse — one case per
+    published-but-unbuilt capability, asserting it was mounted to the honest
+    ``501`` — plus a guard asserting that set was non-empty so the parametrize
+    had rows. Both are gone, because both were about the *interim*: #1075,
+    #1076 and #1077 each built one handler, and there is no longer a capability
+    that is advertised and unbuilt.
+
+    Deleting them without replacement would have retired the machinery along
+    with the interim, which is the wrong trade — the machinery is what stops the
+    *next* capability being advertised before it works. So the guard is
+    restated as the invariant that actually matters now, and
+    :func:`test_the_stub_still_answers_501_for_an_unbuilt_capability` below
+    keeps the stub itself exercised against the day a fifth capability lands.
     """
-    assert _UNIMPLEMENTED_CAPABILITIES
+    assert _UNIMPLEMENTED_CAPABILITIES == ()
+
+
+def test_the_stub_still_answers_501_for_an_unbuilt_capability(vault: Path) -> None:
+    """The honesty stub is kept alive by exercising it, not by having a victim.
+
+    With every capability built, nothing in the *route table* reaches
+    :class:`~creek_mcp.httpapi.handlers.UnimplementedHandler` any more. That is
+    exactly when an unused guard rots: the next capability added to
+    ``Capability`` before its handler exists would be mounted to a stub nobody
+    had run in months.
+
+    So the machinery is driven directly — the route table's handler map is
+    substituted for one operation, the app is built around it, and the mounted
+    endpoint is asserted to be both *stamped* and *answering* the published
+    ``501``. That is the same path a genuinely unbuilt capability would take.
+
+    Args:
+        vault: A seeded vault.
+    """
+    stub = handlers_module.unimplemented(Capability.REFLECTIONS)
+    substituted = {**handlers_module.HANDLERS, OP_REFLECTIONS: stub}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(handlers_module, "HANDLERS", substituted)
+        app = build_app(vault_path=vault)
+        endpoint = route_for(app, REFLECTIONS_PATH, "POST").endpoint
+        with TestClient(app) as test_client:
+            response = test_client.post(
+                REFLECTIONS_PATH,
+                json={"content": "anything at all"},
+                headers=headers(ceiling="open"),
+            )
+
+    assert getattr(endpoint, "unimplemented_capability", None) is Capability.REFLECTIONS
+    assert response.status_code == _UNSUPPORTED_STATUS
+    assert envelope(response)["code"] == ErrorCode.UNSUPPORTED_CAPABILITY.value
 
 
 def test_capabilities_fixture_documents_the_completed_steady_state() -> None:

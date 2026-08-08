@@ -42,7 +42,8 @@ from tests.v1_api_support import (
     HEALTH_PATH,
     JOURNAL_PATH,
     MOUNTED,
-    REFLECTIONS_PATH,
+    STUB_METHOD,
+    STUB_PATH,
     VALID_JOURNAL_BODY,
     VALID_REFLECTION_BODY,
     VERSIONED,
@@ -54,12 +55,14 @@ from tests.v1_api_support import (
     headers,
     seed_vault,
     snapshot,
+    stubbed_client,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+_OK_STATUS: Final[int] = 200
 _UNSUPPORTED_STATUS: Final[int] = 501
 _INCOMPATIBLE_STATUS: Final[int] = 409
 _NOT_FOUND_STATUS: Final[int] = 404
@@ -69,9 +72,6 @@ ALLOWED_HTTP_STATUSES: Final[frozenset[int]] = frozenset(
     set(ERROR_STATUS.values()) | {200}
 )
 """The closed status set the contract publishes, derived not restated."""
-
-# A distinctive id, so "did the body echo the path?" is unmissable.
-_SENTINEL_ID: Final[str] = "zz-sentinel-external-id-zz"
 
 _BODIES: Final[dict[str, dict[str, Any]]] = {
     "PUT": VALID_JOURNAL_BODY,
@@ -128,6 +128,39 @@ def vault(tmp_path: Path) -> Iterator[Path]:
     yield seed_vault(tmp_path)
 
 
+def _send_stubbed(
+    vault_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    body: object = None,
+    **header_kwargs: str | None,
+) -> tuple[int, str, dict[str, Any]]:
+    """Issue one request to a *synthetically* unbuilt route.
+
+    #1077 built the last capability, so no route in the real table answers
+    ``501`` any more and a sweep over "the unbuilt routes" would have no rows —
+    a silently-skipped test, which is a guard that has stopped guarding. The
+    substitution reproduces the state a genuinely unbuilt capability would be
+    in, so these assertions keep applying to the *next* one.
+
+    Args:
+        vault_path: The vault the app is built over.
+        monkeypatch: The active monkeypatch fixture.
+        body: JSON body to send, or ``None`` for the route's canonical one.
+        **header_kwargs: Passed to :func:`tests.v1_api_support.headers`.
+
+    Returns:
+        The status code, the raw response text, and the decoded JSON body.
+    """
+    payload = _BODIES.get(STUB_METHOD) if body is None else body
+    kwargs: dict[str, Any] = {"headers": headers(**header_kwargs)}
+    if payload is not None:
+        kwargs["json"] = payload
+    with stubbed_client(vault_path, monkeypatch) as test_client:
+        response = test_client.request(STUB_METHOD, STUB_PATH, **kwargs)
+    return response.status_code, response.text, envelope(response)
+
+
 def _send(
     vault_path: Path,
     method: str,
@@ -162,105 +195,63 @@ def _send(
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(("method", "path"), VERSIONED, ids=VERSIONED_IDS)
-def test_unbuilt_routes_answer_501(vault: Path, method: str, path: str) -> None:
+def test_an_unbuilt_route_answers_501(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Exactly ``501``, the published code, the constant message.
 
     Args:
         vault: A seeded vault.
-        method: HTTP method under test.
-        path: Request path under test.
+        monkeypatch: Substitutes the stub for one route's handler.
     """
-    status, _text, body = _send(vault, method, path, ceiling="open")
+    status, _text, body = _send_stubbed(vault, monkeypatch, ceiling="open")
     assert status == _UNSUPPORTED_STATUS
     assert body["code"] == ErrorCode.UNSUPPORTED_CAPABILITY.value
     assert body["message"] == ERROR_MESSAGES[ErrorCode.UNSUPPORTED_CAPABILITY]
 
 
-@pytest.mark.parametrize(("method", "path"), VERSIONED, ids=VERSIONED_IDS)
 def test_the_501_body_is_exactly_the_envelope(
-    vault: Path, method: str, path: str
+    vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Three keys, never a fourth.
 
-    A stub that added ``"capability": "wheel"`` would be echoing the route
-    table into an error body the contract declares closed.
+    A stub that added ``"capability": "reflections"`` would be echoing the
+    route table into an error body the contract declares closed.
 
     Args:
         vault: A seeded vault.
-        method: HTTP method under test.
-        path: Request path under test.
+        monkeypatch: Substitutes the stub for one route's handler.
     """
-    _status, _text, body = _send(vault, method, path, ceiling="open")
+    _status, _text, body = _send_stubbed(vault, monkeypatch, ceiling="open")
     assert set(body) == {"code", "message", "request_id"}
 
 
-@pytest.mark.parametrize(("method", "path"), VERSIONED, ids=VERSIONED_IDS)
 @pytest.mark.parametrize("marker", _FAKE_SUCCESS_MARKERS)
 def test_the_501_body_contains_no_fake_success(
-    vault: Path, method: str, path: str, marker: str
+    vault: Path, monkeypatch: pytest.MonkeyPatch, marker: str
 ) -> None:
     """No word a fabricated success would carry appears anywhere in the body.
 
     Args:
         vault: A seeded vault.
-        method: HTTP method under test.
-        path: Request path under test.
+        monkeypatch: Substitutes the stub for one route's handler.
         marker: The forbidden substring.
     """
-    _status, text, _body = _send(vault, method, path, ceiling="open")
+    _status, text, _body = _send_stubbed(vault, monkeypatch, ceiling="open")
     assert marker not in text
 
 
-def test_the_501_body_never_echoes_the_path_identifier(vault: Path) -> None:
-    """A ``501`` for ``/v1/journal-entries/<id>`` does not name the ``<id>``.
-
-    Echoing the identifier would make an error body a function of caller
-    input — the first step towards a body that is a function of *vault*
-    input.
-
-    Args:
-        vault: A seeded vault.
-    """
-    path = f"/v1/journal-entries/{_SENTINEL_ID}"
-    _status, text, _body = _send(vault, "PUT", path, ceiling="open")
-    assert _SENTINEL_ID not in text
-    assert not contains_a_path(text)
-
-
-def test_the_501_body_never_echoes_the_request_body(vault: Path) -> None:
-    """Nothing the caller sent comes back.
-
-    Args:
-        vault: A seeded vault.
-    """
-    sent = {"content": "a private sentence about my week", "tier": "personal"}
-    _status, text, _body = _send(vault, "PUT", JOURNAL_PATH, body=sent, ceiling="open")
-    assert "private sentence" not in text
-    assert "personal" not in text
-
-
 @pytest.mark.parametrize(
-    ("method", "path", "body"),
+    "body",
     [
-        ("PUT", JOURNAL_PATH, VALID_JOURNAL_BODY),
-        ("PUT", JOURNAL_PATH, {"content": "   ", "tier": "intimate"}),
-        ("PUT", JOURNAL_PATH, {"nonsense": True}),
-        ("POST", REFLECTIONS_PATH, VALID_REFLECTION_BODY),
-        ("POST", REFLECTIONS_PATH, {"content": "x", "entry_ref": "y"}),
-        ("POST", REFLECTIONS_PATH, {}),
+        VALID_REFLECTION_BODY,
+        {"content": "x", "entry_ref": "y"},
+        {},
     ],
-    ids=[
-        "journal-valid",
-        "journal-intimate-tier",
-        "journal-garbage",
-        "reflection-valid",
-        "reflection-both-sources",
-        "reflection-neither-source",
-    ],
+    ids=["valid", "both-sources", "neither-source"],
 )
 def test_the_route_is_unbuilt_for_valid_and_invalid_bodies_alike(
-    vault: Path, method: str, path: str, body: dict[str, Any]
+    vault: Path, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
 ) -> None:
     """The capability gate runs before body validation, so ``501`` either way.
 
@@ -271,28 +262,27 @@ def test_the_route_is_unbuilt_for_valid_and_invalid_bodies_alike(
 
     Args:
         vault: A seeded vault.
-        method: HTTP method under test.
-        path: Request path under test.
+        monkeypatch: Substitutes the stub for one route's handler.
         body: The payload to send.
     """
-    status, _text, envelope_body = _send(vault, method, path, body=body, ceiling="open")
+    status, _text, envelope_body = _send_stubbed(
+        vault, monkeypatch, body=body, ceiling="open"
+    )
     assert status == _UNSUPPORTED_STATUS
     assert envelope_body["code"] == ErrorCode.UNSUPPORTED_CAPABILITY.value
 
 
-@pytest.mark.parametrize(("method", "path"), VERSIONED, ids=VERSIONED_IDS)
 def test_an_unbuilt_route_writes_nothing_to_the_vault(
-    vault: Path, method: str, path: str
+    vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ``501`` leaves no fragment, no ledger row and no audit line.
 
     Args:
         vault: A seeded vault.
-        method: HTTP method under test.
-        path: Request path under test.
+        monkeypatch: Substitutes the stub for one route's handler.
     """
     before = snapshot(vault)
-    _send(vault, method, path, ceiling="open")
+    _send_stubbed(vault, monkeypatch, ceiling="open")
     assert snapshot(vault) == before
 
 
@@ -332,8 +322,8 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
 @pytest.mark.parametrize(
     ("minor", "expected"),
     [
-        ("0.3", _UNSUPPORTED_STATUS),
-        ("0.2", _UNSUPPORTED_STATUS),
+        ("0.3", _OK_STATUS),
+        ("0.2", _OK_STATUS),
         ("0.2.0", _INCOMPATIBLE_STATUS),
         ("0.2.1", _INCOMPATIBLE_STATUS),
         ("0.20", _INCOMPATIBLE_STATUS),
@@ -356,6 +346,12 @@ def test_the_version_header_is_matched_strictly(
     vault: Path, minor: str, expected: int
 ) -> None:
     """``major.minor`` exactly — no liberal parsing, no whitespace repair.
+
+    Driven against ``GET /v1/wheel``, which #1076 built, so a served minor now
+    reaches a real handler and answers ``200`` where it used to answer the
+    honest ``501``. The distinction under test is unchanged and in fact
+    sharper: the gate either lets the request through to the route or refuses
+    it with ``409``.
 
     Both served minors reach the handler: ``0.3`` is the current one and
     ``0.2`` is retained by :data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS`

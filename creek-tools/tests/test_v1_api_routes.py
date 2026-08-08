@@ -280,19 +280,49 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_handshake() -> None:
-    """At #1074 only the handshake answers for real."""
-    assert frozenset({Capability.CAPABILITIES}) == IMPLEMENTED_CAPABILITIES
+def test_implemented_capabilities_is_exactly_the_published_four() -> None:
+    """At #1077 every published capability answers for real.
 
-
-def test_implemented_capabilities_is_a_strict_subset() -> None:
-    """Three capabilities are published-but-unbuilt, and the constant says so.
-
-    If this ever becomes an equality by *shrinking* ``Capability`` rather than
-    by #1075—#1077 building the handlers, the contract would have quietly
-    dropped three endpoints Adepthood already codes against.
+    An exhaustive literal, not a containment check, and still named one by
+    one: a fifth capability added to ``Capability`` has to change this line
+    before it can be advertised, which is what keeps a new endpoint's landing a
+    visible edit rather than a silent widening.
     """
-    assert set(Capability) > IMPLEMENTED_CAPABILITIES
+    assert (
+        frozenset(
+            {
+                Capability.CAPABILITIES,
+                Capability.JOURNAL_UPSERT,
+                Capability.REFLECTIONS,
+                Capability.WHEEL,
+            }
+        )
+        == IMPLEMENTED_CAPABILITIES
+    )
+
+
+def test_every_published_capability_is_implemented() -> None:
+    """The epic is finished, so the subset became an equality. Read this carefully.
+
+    Until #1077 this asserted ``set(Capability) > IMPLEMENTED_CAPABILITIES`` — a
+    *strict* superset — because three capabilities were published-but-unbuilt
+    and the constant had to say so out loud. Equality is now the correct claim,
+    and the reason it may be asserted is that it was reached the intended way:
+    #1075, #1076 and #1077 each built a handler and moved one name across. The
+    failure mode the old assertion guarded against was reaching equality by
+    *shrinking* ``Capability`` instead — quietly dropping endpoints Adepthood
+    already codes against — and that is now guarded by
+    :func:`test_implemented_capabilities_is_exactly_the_published_four` above,
+    which names all four and would go red on a removal.
+
+    **What must not happen is this assertion being relaxed in the other
+    direction.** ``>=`` here would let a capability be advertised with no
+    handler behind it, which is the dishonesty the whole constant exists to
+    prevent. If a fifth capability is published before its handler exists, this
+    test is supposed to go red, and the fix is to restore the strict-superset
+    form for the interim — not to weaken the operator.
+    """
+    assert set(Capability) == IMPLEMENTED_CAPABILITIES
 
 
 def test_implemented_capabilities_is_a_frozenset() -> None:

@@ -12,7 +12,7 @@ Where this page and that document disagree, the ADR wins. The wire vocabulary is
 `creek_mcp/api/models.py`; the published fixture bundle Adepthood vendors and
 hash-pins is [`docs/contracts/adepthood-v1/`](../../docs/contracts/adepthood-v1/).
 
-## What is implemented today (#1074)
+## What is implemented today (#1077)
 
 This is a **tracer**: the thinnest end-to-end path that is honest about what it
 does and does not yet do.
@@ -21,20 +21,27 @@ does and does not yet do.
 |---|---|
 | `GET /v1/capabilities` | **Implemented.** Real handshake — versions, vault readiness, tier model, capability list. |
 | `GET /v1/health` | **Implemented.** Readiness only. Not part of the published contract. |
-| `PUT /v1/journal-entries/{external_id}` | `501 unsupported_capability` (#1075). |
-| `POST /v1/reflections` | `501 unsupported_capability` (#1076). |
-| `GET /v1/wheel` | `501 unsupported_capability` (#1077). |
+| `PUT /v1/journal-entries/{external_id}` | **Implemented.** Idempotent journal write over the shared `creek.journal` tool — same tier gates, same audit records, same fragment identity as MCP (#1075). |
+| `POST /v1/reflections` | **Implemented.** Anchored margin notes over the shared `creek.reflect` tool. `ok` / `empty` / `escalate` / every refusal are distinguishable from a closed `status` or `code` enum — **no client needs to parse prose to branch**. `notes[].quote` is the only verbatim-guaranteed field: each is validated as a whitespace-normalised span of the submitted or referenced entry, and a span that is not is dropped rather than returned. `essay` is free model prose and is **never** grounding-checked, which is what `essay_grounded: false` (always present, always `false`) tells you — a client must not present it as the writer's own words. A care-flagged entry returns `status: "escalate"` at HTTP **200** with the full `care_signal`, and the model is never called; an escalation is not an error, because a person in acute distress must not land in a client's error path. An `entry_ref` that is above your ceiling and one that does not resolve are **deliberately indistinguishable** — both are `403 privacy_refused` with the same message, because a caller who could tell them apart could enumerate the corpus (#1077). |
+| `GET /v1/wheel` | **Implemented.** The **frequency distribution over the classified corpus** — how many ceiling-admitted fragments sit at each APTITUDE frequency F1–F10, and each frequency's share of the classified total. **This is not a curriculum-progress or fullness measure.** Adepthood's Map validates a ten-member `{aspects: [{stage_number, aspect, fullness}]}` shape from its own 36-week curriculum; that projection is Adepthood's and is owned there (Geoffe-Ga/adepthood#1937). Ten members on both sides is a coincidence of cardinality, not a shared meaning — reading one as the other renders confidently wrong numbers. An empty or missing corpus is `200` with all ten entries at `count: 0`, never `404` and never an error (#1076). |
 
-**The three unbuilt routes return an error, never a plausible empty success.**
-No fabricated `fragment_id`, no `action: "unchanged"`, no zeroed wheel that
-could be misread as an empty corpus. A stub that looks like success is worse
-than one that admits it is unbuilt: the whole reason epic #1071 exists is that
-every failure used to collapse into "vault unavailable", indistinguishable from
-"no vault configured", and two repositories shipped a contract neither
-implemented.
+**Every published route is now built, and none of them was ever allowed to
+fake it on the way here.** While a route was unbuilt it answered `501
+unsupported_capability` rather than a plausible empty success — no fabricated
+`fragment_id`, no `action: "unchanged"`, no zeroed wheel that could be misread
+as an empty corpus. A stub that looks like success is worse than one that
+admits it is unbuilt: the whole reason epic #1071 exists is that every failure
+used to collapse into "vault unavailable", indistinguishable from "no vault
+configured", and two repositories shipped a contract neither implemented.
+
+The machinery that enforced it is still in place and still tested. A fifth
+capability added to `Capability` before its handler exists is mounted to the
+same honest `501` and is left out of the advertised list, because both are
+driven by the one `IMPLEMENTED_CAPABILITIES` constant.
 
 `GET /v1/capabilities` advertises only the capabilities actually implemented —
-today, `["capabilities"]`. #1075–#1077 each add one. The advertised list and the
+today, all four: `["capabilities", "journal-upsert", "reflections", "wheel"]`.
+The advertised list and the
 set of routes that answer `501` are driven by a single constant,
 `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so they cannot
 disagree.
@@ -326,7 +333,7 @@ middleware.** `creek-tools-api` starts uvicorn with `access_log=False`,
 because uvicorn ships its own access logger — on by default — that runs
 *alongside* the middleware above, not instead of it, and writes the client
 address and the concrete path with its query string on every request:
-`INFO: 127.0.0.1:59272 - "PUT /v1/journal-entries/zz-sentinel-external-id-9x7q-zz HTTP/1.1" 501 Not Implemented`.
+`INFO: 127.0.0.1:59272 - "PUT /v1/journal-entries/zz-sentinel-external-id-9x7q-zz HTTP/1.1" 200 OK`.
 Left on, that second logger would republish the caller's IP and a
 consumer-chosen identifier on every sync — making the promise above false
 without a single line of Creek's own code being wrong.
