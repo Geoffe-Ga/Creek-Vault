@@ -162,6 +162,34 @@ class TestLinkingConfig:
         cfg = LinkingConfig(cross_source_aggregation=True)
         assert cfg.cross_source_aggregation is True
 
+    def test_cluster_ceiling_defaults(self) -> None:
+        """Issue #880: the five cluster-splitting knobs carry agreed defaults."""
+        cfg = LinkingConfig()
+        assert cfg.cluster_size_ceiling == 500
+        assert cfg.cluster_max_fraction == 0.10
+        assert cfg.cluster_split_max_depth == 3
+        assert cfg.eddy_split_eps_step == 0.05
+        assert cfg.thread_split_similarity_step == 0.1
+
+    def test_cluster_max_fraction_rejects_out_of_range(self) -> None:
+        """The corpus-fraction ceiling is a proportion, so it lives in [0, 1]."""
+        with pytest.raises(ValueError, match="cluster_max_fraction"):
+            LinkingConfig(cluster_max_fraction=1.5)
+        with pytest.raises(ValueError, match="cluster_max_fraction"):
+            LinkingConfig(cluster_max_fraction=-0.1)
+
+    def test_cluster_split_max_depth_rejects_negative(self) -> None:
+        """``0`` means "discard immediately"; negative depths are nonsense."""
+        with pytest.raises(ValueError, match="cluster_split_max_depth"):
+            LinkingConfig(cluster_split_max_depth=-1)
+
+    def test_split_steps_reject_zero(self) -> None:
+        """A zero tightening step would never terminate, so it is rejected."""
+        with pytest.raises(ValueError, match="eddy_split_eps_step"):
+            LinkingConfig(eddy_split_eps_step=0.0)
+        with pytest.raises(ValueError, match="thread_split_similarity_step"):
+            LinkingConfig(thread_split_similarity_step=0.0)
+
 
 class TestClassificationConfig:
     """Tests for ClassificationConfig model."""

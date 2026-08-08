@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
+from creek.link import eddies as eddies_module
+from creek.link.cluster_limits import SplitPolicy
 from creek.link.eddies import EddyDetector
+from creek.link.threads import ThreadDetector
 from creek.models import (
     Fragment,
     FragmentSource,
@@ -22,8 +26,15 @@ from creek.models import (
     WavelengthClassification,
 )
 
+if TYPE_CHECKING:
+    import pytest
+
 _EPS = 0.3
 _MIN_SAMPLES = 5
+_THREAD_MIN_FRAGMENTS = 3
+_SPLIT_CEILING = 50
+_SPLIT_MAX_FRACTION = 0.10
+_SPLIT_MAX_DEPTH = 3
 
 
 def _cos(a: list[float], b: list[float]) -> float:
@@ -169,3 +180,92 @@ def test_detect_eddies_scales_to_thousands() -> None:
     eddies = detector.detect_eddies(fragments, min_fragments=_MIN_SAMPLES)
     # 40 well-separated dense clusters of 60 → 40 eddies.
     assert len(eddies) == 40
+
+
+def _unsplittable_corpus(
+    size: int,
+) -> tuple[list[Fragment], dict[str, list[float]]]:
+    """Return *size* same-frequency fragments one day apart sharing one vector.
+
+    Identical embeddings mean no tightened threshold can ever separate the
+    cluster, so both detectors must exhaust their re-cluster budget — the
+    worst case for the issue #880 split path.
+    """
+    base = datetime(2024, 1, 1)
+    fragments: list[Fragment] = []
+    embeddings: dict[str, list[float]] = {}
+    for index in range(size):
+        fid = f"frag-uniform-{index:03d}"
+        created = base + timedelta(days=index)
+        fragments.append(
+            Fragment(
+                id=fid,
+                title=f"uniform stream note {index}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=created,
+                ingested=created,
+                frequency=FrequencyClassification(primary=Frequency.F5),
+                wavelength=WavelengthClassification(phase=Phase.UNCLASSIFIED),
+            ),
+        )
+        embeddings[fid] = [1.0, 0.0]
+    return fragments, embeddings
+
+
+def test_split_path_stays_within_neighbour_build_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #880 re-clustering costs at most ``max_depth + 1`` passes.
+
+    Asserted as call counts, never wall-clock: a timing assertion would flake
+    on a loaded CI runner while still passing for a runaway recursion on a
+    fast one. The eddy budget counts vectorised neighbour builds; the thread
+    budget is expressed relative to a single measured no-split pass.
+    """
+    policy = SplitPolicy(_SPLIT_CEILING, _SPLIT_MAX_FRACTION, _SPLIT_MAX_DEPTH)
+    fragments, embeddings = _unsplittable_corpus(60)
+
+    neighbour_calls = 0
+    real_neighbours = eddies_module.cosine_neighbours
+
+    def _counted_neighbours(*args: object, **kwargs: object) -> object:
+        """Count the neighbour build, then delegate to the real one."""
+        nonlocal neighbour_calls
+        neighbour_calls += 1
+        return real_neighbours(*args, **kwargs)
+
+    monkeypatch.setattr(eddies_module, "cosine_neighbours", _counted_neighbours)
+    EddyDetector(
+        embeddings=embeddings,
+        eps=_EPS,
+        min_samples=_MIN_SAMPLES,
+        split_policy=policy,
+    ).detect_eddies(fragments, min_fragments=_MIN_SAMPLES)
+    assert neighbour_calls <= _SPLIT_MAX_DEPTH + 1, neighbour_calls
+
+    consistency_calls = 0
+    real_consistent = ThreadDetector._topic_consistent
+
+    def _counted_consistent(self: object, *args: object, **kwargs: object) -> object:
+        """Count the topic-consistency probe, then delegate to the real one."""
+        nonlocal consistency_calls
+        consistency_calls += 1
+        return real_consistent(self, *args, **kwargs)
+
+    monkeypatch.setattr(ThreadDetector, "_topic_consistent", _counted_consistent)
+    ThreadDetector(embeddings=embeddings).detect_threads(
+        fragments,
+        min_fragments=_THREAD_MIN_FRAGMENTS,
+    )
+    single_pass = consistency_calls
+    assert single_pass > 0, "baseline pass must probe topic consistency"
+
+    consistency_calls = 0
+    ThreadDetector(embeddings=embeddings, split_policy=policy).detect_threads(
+        fragments,
+        min_fragments=_THREAD_MIN_FRAGMENTS,
+    )
+    assert consistency_calls <= (_SPLIT_MAX_DEPTH + 1) * single_pass, (
+        consistency_calls,
+        single_pass,
+    )
