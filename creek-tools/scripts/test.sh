@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/test.sh - Run tests with Pytest
-# Usage: ./scripts/test.sh [--unit|--integration|--e2e|--all] [--coverage]
+# Usage: ./scripts/test.sh [--unit|--integration|--e2e|--live|--all] [--coverage]
 #                          [-k EXPRESSION] [--verbose] [--help]
 
 set -euo pipefail
@@ -31,6 +31,10 @@ while [[ $# -gt 0 ]]; do
             TEST_TYPE="e2e"
             shift
             ;;
+        --live)
+            TEST_TYPE="live"
+            shift
+            ;;
         --all)
             TEST_TYPE="all"
             shift
@@ -58,14 +62,27 @@ Usage: $(basename "$0") [OPTIONS]
 Run tests using Pytest.
 
 OPTIONS:
-    --unit          Run unit tests only (default)
-    --integration   Run integration tests only (live smokes; coverage gate off)
-    --e2e           Run end-to-end tests only (coverage gate off)
-    --all           Run all test types
+    --unit          Run unit tests only (default) — everything unmarked.
+                    Carries the 90% coverage gate.
+    --integration   Run the hermetic cross-component lane. No network, no API
+                    keys, no real vault. BLOCKING in CI. Coverage gate off.
+    --e2e           Run the hermetic end-to-end lane: full journeys through the
+                    CLI against a synthetic vault. BLOCKING in CI. Coverage
+                    gate off.
+    --live          Run the live smokes: real provider APIs and local services.
+                    Needs credentials; NOT run in CI. Each test skips cleanly
+                    when its key or service is absent. Coverage gate off.
+    --all           Run every test type, live smokes included
     --coverage      Generate coverage report
     -k EXPRESSION   Only run tests matching the pytest keyword expression
     --verbose       Show detailed output
     --help          Display this help message
+
+WHICH LANE BLOCKS A MERGE:
+    --unit, --integration and --e2e all gate the Quality Gate in
+    .github/workflows/ci.yml. --live and the 'slow' benchmarks do not: CI holds
+    no provider credentials, and a gate that depends on a paid third-party API
+    or a local daemon is a flaky gate.
 
 EXIT CODES:
     0               All tests passed
@@ -76,6 +93,7 @@ EXAMPLES:
     $(basename "$0")                     # Run unit tests
     $(basename "$0") --all               # Run all tests
     $(basename "$0") --unit --coverage   # Unit tests with coverage
+    $(basename "$0") --live -k openai    # Smoke one provider's live API
 EOF
             exit 0
             ;;
@@ -103,21 +121,40 @@ PYTEST_ARGS=(-v)
 case "$TEST_TYPE" in
     unit)
         echo "=== Running Unit Tests ==="
-        PYTEST_ARGS+=(-m "not integration and not e2e and not slow")
+        # Every lane marker is excluded by name. `live` in particular: those
+        # tests skip themselves when a key is absent, so omitting it here would
+        # look fine in CI and quietly bill a real API on a developer's machine.
+        PYTEST_ARGS+=(-m "not integration and not e2e and not slow and not live")
         ;;
     integration)
-        echo "=== Running Integration Tests ==="
-        # A marker-only selection runs a handful of tests, so the project-wide
-        # --cov-fail-under from pyproject addopts would always fail; live
-        # smokes are about API round-trips, not coverage.
+        echo "=== Running Integration Tests (hermetic, blocking) ==="
+        # Hermetic cross-component tests: no network, no API keys, no real
+        # vault. --no-cov because a marker-only selection exercises a fraction
+        # of the package, so the project-wide --cov-fail-under from pyproject
+        # addopts would always fail. Coverage is the unit lane's job; this lane
+        # is about wiring between components.
         PYTEST_ARGS+=(-m "integration" --no-cov)
         ;;
     e2e)
-        echo "=== Running End-to-End Tests ==="
+        echo "=== Running End-to-End Tests (hermetic, blocking) ==="
+        # Full journeys through the CLI against a synthetic vault. --no-cov for
+        # the same reason as the integration lane above.
         PYTEST_ARGS+=(-m "e2e" --no-cov)
+        ;;
+    live)
+        echo "=== Running Live Smokes (needs credentials; not run in CI) ==="
+        # Real provider APIs and local services. Never wired into CI: it holds
+        # no provider credentials, and each test skips when its key or service
+        # is missing — a lane that skips everything is not a gate. --no-cov for
+        # the same reason as the lanes above.
+        PYTEST_ARGS+=(-m "live" --no-cov)
         ;;
     all)
         echo "=== Running All Tests ==="
+        # Deliberately no -m expression: "all" means every marker, live smokes
+        # and slow benchmarks included. Any new lane marker is picked up here
+        # for free, which is the point — do not turn this into a union of the
+        # lanes above, or a future marker silently stops being covered.
         ;;
 esac
 

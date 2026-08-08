@@ -491,9 +491,12 @@ describe.
 
 - **Development workflow**: [`../.claude/agents/shared/house-rules.md`](../.claude/agents/shared/house-rules.md)
   (the four gates, commit/PR conventions); [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
-- **Testing strategy**: [`scripts/test.sh`](scripts/test.sh); the
-  `[tool.pytest.ini_options]` table in [`pyproject.toml`](pyproject.toml)
-  for markers and testpaths.
+- **Testing strategy**: [`scripts/test.sh`](scripts/test.sh) — `--help` names
+  every lane and which ones block a merge; the `[tool.pytest.ini_options]`
+  table in [`pyproject.toml`](pyproject.toml) for the marker definitions and
+  testpaths; [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml) for
+  which lanes actually gate (jobs `quality` and `integration-e2e`, aggregated
+  by `quality-gate`) — that workflow, not this file, is the authority.
 - **Tool usage & code standards**: [`scripts/check-all.sh`](scripts/check-all.sh)
   for the gates, in order; the tool sections of [`pyproject.toml`](pyproject.toml).
 - **Common pitfalls & troubleshooting**: the Troubleshooting section of
