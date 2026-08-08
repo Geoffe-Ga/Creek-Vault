@@ -19,7 +19,7 @@ description: >-
   status polling (use `pull_request_read` directly).
 metadata:
   author: Geoff
-  version: 1.2.0
+  version: 1.3.0
 ---
 
 # Await Claude Review
@@ -77,13 +77,27 @@ This comment is not authored by `claude[bot]` — it's authored by the human use
 **Recognition.** A comment qualifies as an iteration-trigger summary when **all** of:
 
 1. The body contains the literal marker `<!-- iteration-trigger -->`.
-2. A line matches `^\*\*VERDICT\*\*:\s*(LGTM|CHANGES[_ ]REQUESTED|COMMENTS)`.
+2. A line matches `^\*\*VERDICT\*\*:\s*(\S.*)` — capture the value **verbatim**. Do not narrow this to the three review verdicts: the workflow also emits refusal values there (below), and a recogniser that cannot see them reports "malformed" for a comment that is perfectly well-formed and is explicitly refusing.
 3. A line matches `^\*\*CI\*\*:\s*(\d+)/(\d+)\s+Green` (use this to decide `merge` vs `iterate`).
+
+**Merge-critical fields: `VERDICT` and `CI`, and only those.** `**Action**:` is diagnostic prose and is never parsed for a decision (see Step 4a item 5). `iteration-trigger.yml`'s header states the same contract from the emitter's side, and both files must be updated together — a prose contract between two files is exactly what drifted in #1202.
+
+**The `VERDICT` vocabulary is therefore larger than the reviewer's.** Three values come from the review comment; the rest are the workflow **refusing to clear a merge**, and it sets them precisely so that no consumer reading `VERDICT` + `CI` can mistake the summary for permission:
+
+| `**VERDICT**` value | Meaning | Merge? |
+| ------------------- | ------- | ------ |
+| `LGTM`              | reviewer approved, and the workflow cleared every merge invariant | yes, subject to `CI: N/N` |
+| `CHANGES_REQUESTED` / `CHANGES REQUESTED` | reviewer wants changes | no — fix loop |
+| `COMMENTS`          | reviewer had non-blocking notes | no — caller decides |
+| `HELD`              | a human set `do-not-auto-merge` on the PR (or its labels were unreadable) | **never** — a human owns this PR |
+| `NOT ATTESTED`      | the verdict carries no `<!-- creek-review pr=N -->` marker for THIS PR (#1181) | **never** — surface to a human |
+| `NOT CURRENT`       | the head is behind its base, so its green describes a tree it would not merge into | **never** — sync first |
 
 **Routing.** When this comment wakes the session:
 
-- `VERDICT == LGTM` and `CI: N/N Green` (full match) → caller proceeds to merge gate. The `Action:` line will say "cleared to squash merge…".
+- `VERDICT` is exactly `LGTM` and `CI: N/N Green` (full match) → caller proceeds to merge gate. The `Action:` line will say "cleared to squash merge…".
 - `VERDICT == CHANGES_REQUESTED` or `VERDICT == COMMENTS` → caller enters fix loop. The `Action:` line will reference a comment ID to read for in-depth feedback. Pull that comment via `mcp__github__pull_request_read` `get_comments` and feed the body into `address-feedback`.
+- **Any other value** (`HELD`, `NOT ATTESTED`, `NOT CURRENT`, or one added later) → **do not merge and do not enter the fix loop.** Report the `Action:` line to the user and stop. The list above is not exhaustive by design: the rule is that only an exactly-`LGTM` verdict clears, so a value you do not recognise refuses.
 - `CI: x/y Green` where `x < y` → CI is not actually green; do not merge even on `LGTM`. Investigate the failing run before proceeding.
 
 **Currency check still applies.** The trigger fires on a `workflow_run` for a specific HEAD SHA, but the comment may arrive minutes after the push. Use the standard `created_at >= headPushedAt` guard before treating it as authoritative for the current HEAD.
@@ -149,10 +163,12 @@ Re-fetch the comments to read the full body (the webhook payload may be truncate
 When the wake event is the owner-authored iteration-trigger comment:
 
 1. **Currency check**: require `created_at >= headPushedAt`.
-2. Parse `**VERDICT**:` and `**CI**: x/y Green` from the body.
-3. If `VERDICT == LGTM` AND `x == y` (CI fully green): return `LGTM` to the caller. The follow-up `Action:` line typically reads "cleared to squash merge…". The caller proceeds to merge.
-4. Otherwise: extract the comment ID referenced in `Action: pull comment <id> …`, fetch that comment's body via `get_comments`, and pass the body to the caller (typically `address-feedback`) for triage. Treat the underlying verdict (`CHANGES_REQUESTED` or `COMMENTS`) as authoritative for the next loop.
-5. If the body is malformed (marker present but verdict line missing/unparseable): surface to user. Do not infer a verdict from the `Action:` prose.
+2. Parse `**VERDICT**:` and `**CI**: x/y Green` from the body. These two are the only merge-critical fields; `**Action**:` is prose.
+3. **Merge only on an exactly-`LGTM` verdict.** If the verdict is exactly `LGTM` AND `x == y` (CI fully green): return `LGTM` to the caller. The follow-up `Action:` line will read "cleared to squash merge…". The caller proceeds to merge. Every other value refuses — this is a whitelist, never a blacklist of known-bad verdicts, because the emitter's refusal vocabulary grows and this file learns about the additions late (#1202).
+4. If the verdict is `CHANGES_REQUESTED` or `COMMENTS`: extract the comment ID referenced in `Action: pull comment <id> …`, fetch that comment's body via `get_comments`, and pass the body to the caller (typically `address-feedback`) for triage. Treat that verdict as authoritative for the next loop.
+5. If the verdict is a **refusal** (`HELD`, `NOT ATTESTED`, `NOT CURRENT`, or any value not in items 3–4), or the body is malformed (marker present but verdict line missing/unparseable): surface the `Action:` line to the user and stop. Do not merge, do not dispatch a fix worker, and **do not infer a verdict from the `Action:` prose** — read it to the user, do not parse it for a decision.
+
+   `HELD` in particular means a human set `do-not-auto-merge`, which is the one control a human retains over an autonomous merge loop. Nothing in this skill may route around it. `scripts/ralph/pr-ready.sh` — the orchestrator's own clearance path — enforces the identical invariant independently: it prints `optout` before probing anything else, and it excludes this summary from its verdict selector entirely (`ITER_SUMMARY_RE`), so it can never read one as a verdict at all.
 
 ### Step 5: On CI Failure for Current HEAD
 

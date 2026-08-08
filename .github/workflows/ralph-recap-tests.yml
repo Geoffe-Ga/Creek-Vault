@@ -30,6 +30,15 @@ name: Ralph Tooling Tests
 # marker and never reading it is the same bug with an extra step). Both
 # assertions are as coupled to that file as the round trip is to the emitter, so
 # a PR that edits only iteration-trigger.yml must run this suite as well.
+#
+# .claude/skills/await-claude-review/SKILL.md is the third file here, and it is
+# the CONSUMER half of that same merge contract (#1202). Its Step 4a decides the
+# merge from `**VERDICT**` + `**CI**` alone, so iteration-trigger.yml's refusal
+# vocabulary — `HELD`, `NOT ATTESTED`, `NOT CURRENT` — only means anything if
+# Step 4a refuses those values; test_pr_ready.sh reads the emitter's branches and
+# asserts SKILL.md names every one. Emitter and consumer are two files agreeing
+# in prose, which is exactly what drifted to produce #1202, so a PR that edits
+# either one alone has to run the suite that compares them.
 on:
   push:
     paths:
@@ -37,12 +46,14 @@ on:
       - ".github/workflows/ralph-recap-tests.yml"
       - ".github/workflows/code-review.yml"
       - ".github/workflows/iteration-trigger.yml"
+      - ".claude/skills/await-claude-review/SKILL.md"
   pull_request:
     paths:
       - "scripts/ralph/**"
       - ".github/workflows/ralph-recap-tests.yml"
       - ".github/workflows/code-review.yml"
       - ".github/workflows/iteration-trigger.yml"
+      - ".claude/skills/await-claude-review/SKILL.md"
 
 permissions:
   contents: read
