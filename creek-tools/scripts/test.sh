@@ -78,6 +78,11 @@ OPTIONS:
     --verbose       Show detailed output
     --help          Display this help message
 
+ENVIRONMENT:
+    CREEK_TEST_WORKERS  pytest-xdist worker count for the unit lane.
+                        Default 'auto' (one per core). Set to 1 to run
+                        serially — needed for pdb, which xdist swallows.
+
 WHICH LANE BLOCKS A MERGE:
     --unit, --integration and --e2e all gate the Quality Gate in
     .github/workflows/ci.yml. --live and the 'slow' benchmarks do not: CI holds
@@ -125,6 +130,23 @@ case "$TEST_TYPE" in
         # tests skip themselves when a key is absent, so omitting it here would
         # look fine in CI and quietly bill a real API on a developer's machine.
         PYTEST_ARGS+=(-m "not integration and not e2e and not slow and not live")
+
+        # Distribute the unit lane across cores (pytest-xdist). This is the
+        # only lane that gets it: it is ~8,300 tests and was 213 of the CI
+        # job's seconds run serially on a 4-core runner with three cores idle
+        # (issue #1141). Measured 83s -> 40s locally at 4 workers.
+        #
+        # Coverage is NOT weakened by this. pytest-cov collects per worker and
+        # combines; the totals were verified byte-identical to the serial run
+        # (26344 stmts / 1249 miss / 6912 branch / 591 partial / 94.18%) at
+        # -n 4 and -n auto alike, so the 90% gate below means what it meant.
+        #
+        # CREEK_TEST_WORKERS=1 (or 0) forces serial for an interactive
+        # debugging session — xdist swallows pdb and interleaves output.
+        WORKERS="${CREEK_TEST_WORKERS:-auto}"
+        if [[ "$WORKERS" != "0" && "$WORKERS" != "1" ]]; then
+            PYTEST_ARGS+=(-n "$WORKERS")
+        fi
         ;;
     integration)
         echo "=== Running Integration Tests (hermetic, blocking) ==="

@@ -23,8 +23,47 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# ---------------------------------------------------------------------------
+# Job layout (issue #1141 — the CI critical path is a multiplier on #1137)
+#
+# Every merge to `main` forces revalidation of every in-flight lane, so the
+# cost of the backlog is roughly `merges x lanes x CI wall time`. Wall time is
+# therefore worth optimising in its own right — but ONLY by moving work off
+# the longest path, never by removing it.
+#
+# The old layout ran nine static-analysis stages in series AHEAD of the test
+# suite, inside the same job, duplicated across all three matrix legs. Pylint
+# alone was 334s of a 762s leg (44%), and half of that was a second, explicitly
+# non-gating analysis pass. Nothing about ruff/pylint/refurb/bandit/interrogate/
+# tryceratops depends on the interpreter that runs them, so paying for them
+# three times bought no signal at all.
+#
+# What runs where now, and why:
+#
+#   `static-analysis` + `pylint`  — interpreter-independent source analysis, run
+#       ONCE on PYTHON_DEFAULT_VERSION. Both tools' version-dependent checks are
+#       pinned to the `requires-python` FLOOR inside their scripts
+#       (`--py-version` / `--python-version`), which is stricter than the old
+#       behaviour of "whichever matrix leg happened to run this". Split into two
+#       jobs because pylint alone outweighs every other static stage combined;
+#       together they would become the new long pole.
+#   `tests`                       — genuinely version-sensitive work, and only
+#       that: mypy (per-version typeshed), pip-audit (per-version resolution),
+#       and the unit suite. Still the full 3.11/3.12/3.13 matrix.
+#
+# NOTHING was dropped. Every check that gated a merge before still gates one.
+# ---------------------------------------------------------------------------
+
 env:
   PYTHON_DEFAULT_VERSION: '3.12'
+  # Pin uv so a uv release cannot change resolution or CLI behaviour out from
+  # under CI. uv is installed into the runner Python and is therefore audited
+  # by the pip-audit step, so this pin must stay on a release with no open
+  # advisories (0.11.16 clears GHSA-w476-p2h3-79g9 / CVE-2025-13327 /
+  # GHSA-pjjw-68hj-v9mw); bump it deliberately when pip-audit flags a newer
+  # one. Hoisted to workflow scope in #1141 so the four jobs that install it
+  # cannot drift apart on a security-relevant version.
+  UV_PINNED_VERSION: '0.11.16'
   COVERAGE_THRESHOLD: 90
   DOCSTRING_COVERAGE_THRESHOLD: 95
   PYLINT_FAIL_UNDER: '9.0'
@@ -32,46 +71,40 @@ env:
   PER_FILE_COVERAGE_WAIVER_FLOOR: '65'
 
 jobs:
-  quality:
-    name: Code Quality & Testing
+  static-analysis:
+    name: Static Analysis
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: creek-tools
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.11', '3.12', '3.13']
+    # Deliberately NO `needs:` and NO matrix. See the layout note above: these
+    # tools read source and are configured with an explicit target version, so
+    # a second and third interpreter produce byte-identical verdicts.
+    #
+    # Step order is cheapest-first on purpose. Ruff is ~0s, so a badly
+    # formatted push now fails in well under a minute instead of after the
+    # ~4 minutes of pylint/refurb it used to sit behind.
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
       - name: Cache uv
         uses: actions/cache@v6
         with:
           path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('creek-tools/uv.lock') }}
+          key: ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-${{ hashFiles('creek-tools/uv.lock') }}
           restore-keys: |
-            ${{ runner.os }}-uv-${{ matrix.python-version }}-
+            ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-
             ${{ runner.os }}-uv-
 
       - name: Install uv
-        # Pin uv so a uv release cannot change resolution or CLI
-        # behaviour out from under CI. uv is installed into the runner
-        # Python and therefore audited by the pip-audit step below, so
-        # this pin must stay on a release with no open advisories
-        # (0.11.16 clears GHSA-w476-p2h3-79g9 / CVE-2025-13327 /
-        # GHSA-pjjw-68hj-v9mw); bump it deliberately when pip-audit flags
-        # a newer one.
-        run: python -m pip install 'uv==0.11.16'
+        run: python -m pip install "uv==${UV_PINNED_VERSION}"
 
       - name: Install dependencies (locked)
         # Install the fully-pinned uv.lock straight into the runner's
@@ -97,35 +130,15 @@ jobs:
       - name: Run Ruff format check
         run: ruff format --check .
 
-      - name: Run Pylint (CI-002)
-        # ./scripts/pylint.sh runs `python -m pylint creek/ creek_mcp/`
-        # with the configured --fail-under threshold and optionally writes
-        # a JSON snapshot. Same script the local check-all.sh runs, so a
-        # developer who passes locally cannot fail this gate (CI-004).
-        env:
-          PYLINT_FAIL_UNDER: ${{ env.PYLINT_FAIL_UNDER }}
-        run: ./scripts/pylint.sh --json reports/pylint-report.json
-
-      - name: Run MyPy type checking (CI-001)
-        # Project-wide strict mode is configured in pyproject.toml; the
-        # script runs `mypy creek/ creek_mcp/` so local and CI agree.
-        run: ./scripts/typecheck.sh
-
-      - name: Run Refurb (STYLE-001 modernisation gate)
-        # Backlog closed in STYLE-001 (148 → 0). Any new violation
-        # blocks CI; `# noqa: FURB…` is available for documented
-        # carve-outs (see creek-tools/CLAUDE.md §6.1).
-        run: ./scripts/lint-refurb.sh
+      - name: Check docstring coverage
+        run: |
+          interrogate -vv \
+            --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} creek/
 
       - name: Run Tryceratops (STYLE-001 exception-hygiene gate)
         # Backlog closed in STYLE-001 (21 → 0). Any new violation
         # blocks CI; `# noqa: TRY…` covers documented carve-outs.
         run: ./scripts/lint-tryceratops.sh
-
-      - name: Check docstring coverage
-        run: |
-          interrogate -vv \
-            --fail-under=${{ env.DOCSTRING_COVERAGE_THRESHOLD }} creek/
 
       - name: Run Bandit security scan
         # The first invocation only produces the JSON artifact and is
@@ -140,6 +153,148 @@ jobs:
         run: |
           bandit -r creek/ creek_mcp/ -f json -o reports/bandit-report.json || true
           bandit -r creek/ creek_mcp/ -ll
+
+      - name: Run Refurb (STYLE-001 modernisation gate)
+        # Backlog closed in STYLE-001 (148 → 0). Any new violation
+        # blocks CI; `# noqa: FURB…` is available for documented
+        # carve-outs (see creek-tools/CLAUDE.md §6.1).
+        #
+        # ./scripts/lint-refurb.sh pins `--python-version` to the
+        # requires-python floor, which is what makes this single run a
+        # strictly stronger gate than the old per-leg default.
+        run: ./scripts/lint-refurb.sh
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: security-reports
+          path: creek-tools/reports/bandit-report.json
+          retention-days: 30
+
+  pylint:
+    name: Pylint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: creek-tools
+    # Its own job rather than another step of `static-analysis`: pylint is a
+    # bigger single cost than every other static stage put together, so
+    # bundling it would make that job the critical path all by itself. As two
+    # siblings they finish at roughly the same time as the test matrix.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
+
+      - name: Cache uv
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-${{ hashFiles('creek-tools/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-
+            ${{ runner.os }}-uv-
+
+      - name: Install uv
+        run: python -m pip install "uv==${UV_PINNED_VERSION}"
+
+      - name: Install dependencies (locked)
+        run: |
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o /tmp/locked-requirements.txt
+          uv pip install --system -r /tmp/locked-requirements.txt
+          uv pip install --system --no-deps -e .
+
+      - name: Create necessary directories
+        run: |
+          mkdir -p reports
+
+      - name: Run Pylint (CI-002)
+        # ./scripts/pylint.sh runs `python -m pylint creek/ creek_mcp/`
+        # with the configured --fail-under threshold, pins --py-version to
+        # the requires-python floor, and emits the JSON report from the SAME
+        # analysis pass. Same script the local check-all.sh runs, so a
+        # developer who passes locally cannot fail this gate (CI-004).
+        env:
+          PYLINT_FAIL_UNDER: ${{ env.PYLINT_FAIL_UNDER }}
+        run: ./scripts/pylint.sh --json reports/pylint-report.json
+
+      - name: Upload pylint report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pylint-report
+          path: creek-tools/reports/pylint-report.json
+          retention-days: 30
+
+  tests:
+    name: Tests & Type Checking
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: creek-tools
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    # This job holds everything that is ACTUALLY version-sensitive, and is the
+    # reason the matrix exists at all:
+    #   - the unit suite, obviously;
+    #   - mypy, which resolves against a per-version typeshed, so a 3.12-only
+    #     API used on 3.11 is caught here and nowhere else;
+    #   - pip-audit, which audits the INSTALLED set, and uv.lock's environment
+    #     markers can resolve differently per interpreter.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache uv
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('creek-tools/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-${{ matrix.python-version }}-
+            ${{ runner.os }}-uv-
+
+      - name: Install uv
+        run: python -m pip install "uv==${UV_PINNED_VERSION}"
+
+      - name: Install dependencies (locked)
+        run: |
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o /tmp/locked-requirements.txt
+          uv pip install --system -r /tmp/locked-requirements.txt
+          uv pip install --system --no-deps -e .
+
+      - name: Create necessary directories
+        run: |
+          mkdir -p reports
+
+      - name: Run MyPy type checking (CI-001)
+        # Project-wide strict mode is configured in pyproject.toml; the
+        # script runs `mypy creek/ creek_mcp/` so local and CI agree.
+        #
+        # Runs with NO `.mypy_cache` restored from a previous run, and must
+        # keep doing so: mypy's incremental cache is the same false-clean
+        # hazard the ruff cache turned out to be (#1119), and it is still
+        # open as #1186. Caching it here would buy ~40s per leg and hand
+        # back a gate that can pass a tree CI would otherwise fail.
+        run: ./scripts/typecheck.sh
 
       - name: Run pip-audit dependency check
         # Documented CVE in build/install tooling. Excluded with a
@@ -168,13 +323,20 @@ jobs:
         # JSON artifact AND gates on findings (pip-audit exits non-zero
         # if any non-ignored vulnerability is reported, regardless of the
         # output flag). No `|| true`, no second invocation needed.
+        #
+        # Stays on the matrix rather than moving to `static-analysis`: it
+        # audits the INSTALLED packages, and uv.lock's environment markers
+        # can resolve a different set per interpreter.
         run: |
           pip-audit --format=json --output=reports/pip-audit-report.json \
             --ignore-vuln PYSEC-2022-42969
 
       - name: Run tests with coverage (CI-003 — mirrors local default)
         # ./scripts/test.sh excludes integration/e2e by default so local
-        # and CI run the same set of tests.
+        # and CI run the same set of tests, and distributes the unit lane
+        # across the runner's cores via pytest-xdist. Coverage totals were
+        # verified byte-identical between the serial and distributed runs
+        # before that landed (#1141) — the 90% gate below is unchanged.
         run: ./scripts/test.sh --unit --coverage
         env:
           COVERAGE_CORE: sysmon
@@ -219,14 +381,12 @@ jobs:
             creek-tools/htmlcov
           retention-days: 30
 
-      - name: Upload security reports
+      - name: Upload dependency audit reports
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: security-reports-${{ matrix.python-version }}
-          path: |
-            creek-tools/reports/bandit-report.json
-            creek-tools/reports/pip-audit-report.json
+          name: pip-audit-reports-${{ matrix.python-version }}
+          path: creek-tools/reports/pip-audit-report.json
           retention-days: 30
 
   integration-e2e:
@@ -235,13 +395,14 @@ jobs:
     defaults:
       run:
         working-directory: creek-tools
-    # Deliberately NO `needs:` — this lane is independent of `quality` and runs
-    # in parallel with it. A tree that fails lint should still report whether
-    # its cross-component wiring holds; serialising behind `quality` would hide
-    # that until the lint fix lands, costing a whole extra round trip. The lane
-    # is seconds of tests, so the parallel runner is nearly all setup cost.
+    # Deliberately NO `needs:` — this lane is independent of the test matrix
+    # and runs in parallel with it. A tree that fails lint should still report
+    # whether its cross-component wiring holds; serialising behind another job
+    # would hide that until the lint fix lands, costing a whole extra round
+    # trip. The lane is seconds of tests, so the parallel runner is nearly all
+    # setup cost.
     #
-    # Single Python version, unlike `quality`'s 3.11/3.12/3.13 matrix. These
+    # Single Python version, unlike the `tests` 3.11/3.12/3.13 matrix. These
     # tests exercise wiring between components, not version-sensitive syntax or
     # stdlib behaviour; a version-specific break surfaces in the unit matrix
     # first, and on the same commit. Fanning this lane across three versions
@@ -252,7 +413,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
@@ -266,8 +427,7 @@ jobs:
             ${{ runner.os }}-uv-
 
       - name: Install uv
-        # Same pin as the `quality` job — see the rationale there.
-        run: python -m pip install 'uv==0.11.16'
+        run: python -m pip install "uv==${UV_PINNED_VERSION}"
 
       - name: Install dependencies (locked)
         run: |
@@ -351,7 +511,10 @@ jobs:
     defaults:
       run:
         working-directory: creek-tools
-    needs: quality
+    # No `needs:` (was `needs: quality` until #1141). It has its own checkout
+    # and its own tool install, consumes nothing the test matrix produces, and
+    # took 22s — so gating it behind a 13-minute job only delayed its answer.
+    # `quality-gate` below still requires it to pass.
 
     steps:
       - name: Checkout code
@@ -395,7 +558,9 @@ jobs:
     defaults:
       run:
         working-directory: creek-tools
-    needs: quality
+    # No `needs:` — same reasoning as `complexity-analysis` above. It builds
+    # from a fresh checkout, so nothing about it depended on the test matrix
+    # having run first.
 
     steps:
       - name: Checkout code
@@ -427,20 +592,32 @@ jobs:
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
-    needs: [quality, integration-e2e, crawdad, complexity-analysis, build]
+    needs: [static-analysis, pylint, tests, integration-e2e, crawdad, complexity-analysis, build]
     # `if: always()` defeats GitHub's default skip-on-upstream-failure, so
     # `needs:` alone gates NOTHING here — it only makes `needs.<job>.result`
     # readable. Every job listed above MUST also have an explicit
     # `!= "success"` check below. A job added to `needs:` but not to the script
     # is the classic silent no-op: the gate waits for it, then passes whatever
     # it reported.
+    #
+    # `tests/test_ci_quality_gate.py` parses this file and fails if the two
+    # sets ever diverge, so the rule is enforced rather than merely written
+    # down (#1026, extended in #1141 when the static jobs were split out).
     if: always()
 
     steps:
       - name: Check quality job status
         run: |
-          if [ "${{ needs.quality.result }}" != "success" ]; then
-            echo "Quality checks failed"
+          if [ "${{ needs.static-analysis.result }}" != "success" ]; then
+            echo "Static analysis failed"
+            exit 1
+          fi
+          if [ "${{ needs.pylint.result }}" != "success" ]; then
+            echo "Pylint failed"
+            exit 1
+          fi
+          if [ "${{ needs.tests.result }}" != "success" ]; then
+            echo "Tests or type checking failed"
             exit 1
           fi
           if [ "${{ needs.integration-e2e.result }}" != "success" ]; then

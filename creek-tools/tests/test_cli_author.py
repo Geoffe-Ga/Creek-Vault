@@ -17,6 +17,11 @@ runner = CliRunner()
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+# The Unicode Box Drawing block — the ``│``/``─``/``╭`` glyphs Rich uses to
+# frame a panel. Matched as a range so a Rich style change to a different
+# border set cannot quietly reintroduce the wrapping brittleness above.
+_BOX_DRAWING_RE = re.compile("[─-╿]")
+
 
 def _strip_ansi(text: str) -> str:
     """Return *text* with ANSI SGR colour escape codes removed.
@@ -27,6 +32,29 @@ def _strip_ansi(text: str) -> str:
     agnostic.
     """
     return _ANSI_RE.sub("", text)
+
+
+def _flatten_panel(text: str) -> str:
+    """Return *text* with ANSI codes, Rich panel borders and wrapping removed.
+
+    Rich renders typer's errors inside a box and hard-wraps the body to the
+    terminal width, so a message that embeds a filesystem path can break
+    *mid-phrase*: ``'…/on-leverage.md' is a`` on one line and ``file.`` on the
+    next, with ``│`` borders and padding in between. Whether that happens is a
+    function of how long the path is, which makes any plain substring
+    assertion a coin flip on the length of ``tmp_path``.
+
+    That is not hypothetical. It is exactly what surfaced when the unit lane
+    moved to pytest-xdist (issue #1141): xdist inserts a ``popen-gwN/``
+    segment into ``tmp_path``, the path grew, and the wrap landed inside the
+    phrase under test. The assertion was brittle before the move — any change
+    to the temp-path layout would have tripped it — so the fix belongs here
+    rather than in the runner.
+
+    Dropping the box-drawing range and collapsing runs of whitespace rejoins
+    the sentence, leaving assertions about *wording* independent of *width*.
+    """
+    return " ".join(_BOX_DRAWING_RE.sub(" ", _strip_ansi(text)).split())
 
 
 def _vault(tmp_path: Path) -> Path:
@@ -225,7 +253,7 @@ def test_author_book_report_rejects_file_work(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2, result.output
-    plain = _strip_ansi(result.output)
+    plain = _flatten_panel(result.output)
     assert "--work" in plain
     assert "is a file" in plain
 

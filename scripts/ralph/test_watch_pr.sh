@@ -298,6 +298,34 @@ echo "not-a-pid" > "$(slug_pidfile 113)"
 out="$(TOKENS="ready" run_watch 113)"
 check "garbage pidfile is taken over" "WATCH 113 ready" "$out"
 
+# --- the watcher must not know any CI job name -----------------------------
+# Issue #1141 renamed and split the CI jobs (`Code Quality & Testing` became
+# `Tests & Type Checking`, plus new `Static Analysis` and `Pylint` jobs). The
+# watcher survived that only because it classifies purely by the token
+# pr-ready.sh prints and by `gh pr view --json state` — it never reads a job
+# name. That is a property, not an accident, and a property nobody asserts is
+# one a future edit can spend without noticing: a watcher that grepped for its
+# own job name would, after a rename, see no CI at all and either spin until
+# TIMEOUT or wake on a run it had not actually checked.
+JOB_NAME_RE='Code Quality & Testing|Tests & Type Checking|CrawDad Quality|Quality Gate|Build Distribution|Code Complexity Analysis|Integration & E2E|Static Analysis'
+hits="$(grep -vE '^\s*#' "$SRC" | grep -nE "$JOB_NAME_RE" || true)"
+if [[ -z "$hits" ]]; then
+  ok "watch-pr.sh hardcodes no CI job name"
+else
+  bad "watch-pr.sh hardcodes a CI job name: $hits"
+fi
+
+# And the same for the sibling it delegates every CI question to. pr-ready.sh
+# keys off `gh pr checks`'s EXIT CODE rather than its table text (see the
+# header there); a job-name literal creeping in would be the regression that
+# header exists to prevent.
+hits="$(grep -vE '^\s*#' "$(dirname "$SRC")/pr-ready.sh" | grep -nE "$JOB_NAME_RE" || true)"
+if [[ -z "$hits" ]]; then
+  ok "pr-ready.sh hardcodes no CI job name"
+else
+  bad "pr-ready.sh hardcodes a CI job name: $hits"
+fi
+
 # --- summary ---------------------------------------------------------------
 echo
 echo "watch-pr tests: $PASS passed, $FAIL failed"
