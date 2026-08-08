@@ -20,12 +20,13 @@
 # suite. Fix the fence and delete the line; do not add new entries here
 # to make a red gate go green.
 #
-# All three files below are broken by the same CommonMark trap: fences do
-# not nest, so a ```markdown block that demonstrates an inner ```json (or
-# ```bash) block ends early at the inner block's bare closer, and the
-# outer block's intended closer then opens a fence that is never closed.
-# Repairing them means re-fencing the outer block with a longer run of
-# backticks, which is documentation surgery rather than a test fix.
-.claude/skills/architectural-decisions/references/examples.md nested-fence trap: inner block's closer ends the outer example block; repair tracked by issue #1193
-.claude/skills/spec-decomposition/references/templates.md nested-fence trap: inner block's closer ends the outer template block; repair tracked by issue #1193
-creek-tools/.claude/skills/architectural-decisions.md nested-fence trap: inner block's closer ends the outer example block; repair tracked by issue #1193
+# The list is currently EMPTY, and that is the desired state.
+#
+# It once held three skill files broken by the same CommonMark trap:
+# fences do not nest, so a ```markdown block demonstrating an inner
+# ```json (or ```bash) block ended early at the inner block's bare
+# closer, and the outer block's intended closer then opened a fence that
+# was never closed. All three were deleted by the context prune, which
+# closes issue #1193 by removal rather than repair. With nothing
+# exempted, the fence check in tests/test_markdown_integrity.py now runs
+# over every tracked Markdown file without exception.
