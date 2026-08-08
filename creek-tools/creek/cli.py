@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, cast
 
 import typer
 from rich.console import Console
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from creek.config import CreekConfig
     from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
     from creek.generate.compost_embedding import CompostExemplar
+    from creek.generate.compost_scan import CompostScanResult
     from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import (
         DraftGenerator,
@@ -2523,8 +2524,9 @@ def fill(
     Each step is non-fatal: a failure is logged and the sequence continues, so
     one bad step cannot abort the rest. ``--dry-run`` prints the plan and runs
     nothing. ``--with-compost`` appends the deterministic compost overview
-    report (the only compost vault-write currently wired). Every underlying step
-    is idempotent, so a second ``creek fill`` is a clean no-op.
+    report, which surveys whatever notes ``creek compost scan`` has filed —
+    run that first, or the report has nothing to survey (#882). Every
+    underlying step is idempotent, so a second ``creek fill`` is a clean no-op.
     """
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
@@ -5877,3 +5879,226 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
         )
         return None
     return LLMCompostVerifier(provider=provider)
+
+
+def _build_compost_similarity_fn(
+    config: CreekConfig,
+    vault_path: Path,
+) -> Callable[[str], float]:
+    """Build the embedding-gate closure ``creek compost scan`` scores fragments with.
+
+    Split out of the command body so tests can substitute a deterministic
+    stub — the real closure loads a sentence-transformers model, which is far
+    too heavy for CLI wiring tests.
+
+    ``compost.exemplars_relpath`` is resolved against *vault_path*, matching
+    the field's own "vault-relative" contract and the handling its sibling
+    ``compost.review_queue_relpath`` already gets. Resolving it against the
+    process CWD instead would make the command depend on the operator's shell
+    location: a ``FileNotFoundError`` when run from elsewhere, or — worse,
+    silently — whatever same-named file happened to sit in that directory.
+
+    Args:
+        config: The loaded Creek config; supplies the embedding settings and,
+            when set, ``compost.exemplars_relpath``.
+        vault_path: Vault root that ``exemplars_relpath`` hangs off.
+
+    Returns:
+        A closure mapping fragment text to its maximum cosine similarity
+        against the compost exemplar set.
+    """
+    from creek.generate.compost_embedding import load_exemplars, make_similarity_fn
+    from creek.link.embeddings import EmbeddingLinker
+
+    relpath = config.compost.exemplars_relpath
+    exemplars_path = vault_path / relpath if relpath else None
+    try:
+        exemplars = load_exemplars(exemplars_path)
+    except (FileNotFoundError, ValueError) as exc:
+        # Same failure mode, same message as `compost_calibrate` — a config
+        # typo should read as a config typo, not as a Python traceback.
+        console.print(f"[red]Failed to load exemplars: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    return make_similarity_fn(exemplars, EmbeddingLinker(config=config.embeddings))
+
+
+def _refuse_scan_without_verifier(detail: str) -> NoReturn:
+    """Abort ``creek compost scan`` when the LLM verifier cannot be built.
+
+    ``creek compost calibrate`` degrades to embedding-only scoring in this
+    situation, which is harmless because it only prints a number. ``scan``
+    *writes to the vault*, so the same fallback would file unverified
+    embedding hits as canonical compost — asserting a finding the pipeline
+    never actually made. Refusing keeps the vault honest and leaves the
+    operator a deliberate opt-in.
+
+    Args:
+        detail: Why the verifier is unavailable, shown to the operator.
+
+    Raises:
+        typer.Exit: Always, with code 2 (matching the command's other
+            configuration failures).
+    """
+    console.print(f"[red]Cannot verify compost candidates: {detail}[/red]")
+    console.print(
+        "Set the provider credentials (API key + CREEK_CLOUD_CONSENT=1 for a "
+        "cloud provider, or start the local host), or re-run with "
+        "[bold]--no-llm[/bold] to file unverified candidates to the review "
+        "queue instead.",
+    )
+    raise typer.Exit(code=2)
+
+
+def _build_scan_verifier(config: CreekConfig) -> SupportsVerifyCompost:
+    """Construct the vault-scanning compost verifier, or refuse to scan.
+
+    This is the tier-aware builder the durable caveat on
+    :func:`_build_compost_verifier` asks for. That function feeds the verifier
+    YAML-fixture text and so needs no tier; **this** one feeds it real fragment
+    bodies, so the routing call must state a tier ceiling rather than pass
+    ``None``.
+
+    The ceiling is ``Personal``, and it is a derived fact rather than a guess:
+    :func:`creek.generate.compost_scan.run_compost_scan` forces
+    ``skip_intimate=True`` — not read from config, so no config edit or flag can
+    turn it off — which means an ``Intimate`` fragment is dropped before the
+    embedding gate, let alone the verifier. ``Personal`` is therefore the most
+    sensitive tier that can physically reach this provider. Should that forced
+    flag ever become configurable, this resolve call must be re-derived
+    per-fragment instead of hoisted here.
+
+    Unlike :func:`_build_compost_verifier`, an unavailable provider is fatal —
+    see :func:`_refuse_scan_without_verifier`.
+
+    Args:
+        config: The loaded Creek config, supplying the model router.
+
+    Returns:
+        A ready :class:`~creek.generate.compost_verifier.LLMCompostVerifier`.
+
+    Raises:
+        typer.Exit: When the provider cannot be built or reports its
+            prerequisites unmet.
+    """
+    from creek.classify.llm import build_provider
+    from creek.generate.compost_verifier import LLMCompostVerifier
+
+    llm_config = config.model_router.resolve("generation", PrivacyTier.PERSONAL)
+    try:
+        provider = build_provider(llm_config)
+    except RuntimeError as exc:
+        _refuse_scan_without_verifier(str(exc))
+    if not provider.available:
+        _refuse_scan_without_verifier(
+            "provider prerequisites unmet (missing API key, missing cloud "
+            "consent, or local host unreachable)",
+        )
+    return LLMCompostVerifier(provider=provider)
+
+
+def _render_compost_scan(result: CompostScanResult, *, dry_run: bool) -> None:
+    """Print the pre-flight estimate and, for a real run, what was written."""
+    plan = result.plan
+    console.print(
+        f"[bold]Candidates:[/bold] {plan.fragment_candidates} fragment, "
+        f"{plan.thread_candidates} thread, {plan.project_candidates} project "
+        f"({result.skipped_existing} already composted, skipped)",
+    )
+    console.print(f"[bold]LLM calls this run:[/bold] {plan.llm_calls}")
+    if dry_run:
+        console.print("[dim]Dry run — nothing written.[/dim]")
+        return
+    console.print(
+        f"[green]Composted:[/green] {len(result.composted)} note(s) → "
+        "10-Liminal/Compost/",
+    )
+    console.print(
+        f"[yellow]Queued for review:[/yellow] {len(result.review_queued)} note(s)",
+    )
+
+
+@compost_app.command("scan")
+def compost_scan(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    no_llm: bool = typer.Option(
+        False,
+        "--no-llm",
+        help=(
+            "Run the embedding gate only — no fragment content leaves the "
+            "device. Candidates are filed to the review queue unverified "
+            "rather than as canonical compost."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Print the candidate counts and the LLM-call estimate, then stop "
+            "without verifying or writing anything."
+        ),
+    ),
+    embedding_threshold: float | None = typer.Option(
+        None,
+        "--embedding-threshold",
+        help=(
+            "Override the embedding-gate cosine floor for this run (default: "
+            "`compost.embedding_threshold`, 0.6). Raise it after "
+            "`creek compost calibrate` shows the default over-recalls."
+        ),
+    ),
+) -> None:
+    """Scan the vault for composted ideas and write `10-Liminal/Compost/` notes.
+
+    The production counterpart to `creek compost calibrate`: where calibrate
+    scores the FEAT-018 detector against a labelled fixture, this points it at
+    a real vault. Dormant threads, silent tagged projects, and fragments whose
+    text reads as abandonment become compost notes preserving what each idea
+    was, why it faded, and what energy remains.
+
+    Fragments run the two-stage pipeline — embedding gate, then LLM verifier.
+    A `yes` verdict files canonically; `ambiguous` goes to the review queue
+    for you to triage; `no` is dropped. `--no-llm` runs the gate alone and
+    files every hit to the review queue, because an embedding match on its own
+    is a suspicion rather than a finding.
+
+    Intimate-tier fragments are excluded before the gate and never reach a
+    provider. Re-running is idempotent: sources already carrying a compost
+    note are skipped and reported, so a second scan spends no LLM calls on
+    them.
+
+    Setting `compost.llm_verification: false` in `creek_config.yaml` has the
+    same effect as passing `--no-llm` on every run.
+    """
+    from creek.generate.compost_scan import run_compost_scan
+
+    config = _load_config_for_vault(vault)
+    vault_path = _resolve_vault(vault)
+
+    compost_config = config.compost
+    if embedding_threshold is not None:
+        compost_config = compost_config.model_copy(
+            update={"embedding_threshold": embedding_threshold},
+        )
+
+    # `--no-llm` is the per-run form of `compost.llm_verification: false`;
+    # either one declares an offline pass, so honour whichever is set rather
+    # than building (and then refusing on) a provider the operator never
+    # asked for.
+    verify_with_llm = not no_llm and compost_config.llm_verification
+
+    # A dry run never calls the verifier, so it must not require one to exist.
+    # Demanding credentials to print a cost estimate would defeat the estimate:
+    # not-yet-configured is exactly when an operator wants to see the number.
+    # `will_verify` keeps the quoted count honest despite the skipped build.
+    verifier = _build_scan_verifier(config) if verify_with_llm and not dry_run else None
+    similarity_fn = _build_compost_similarity_fn(config, vault_path)
+
+    result = run_compost_scan(
+        vault_path,
+        similarity_fn=similarity_fn,
+        config=compost_config,
+        verifier=verifier,
+        dry_run=dry_run,
+        will_verify=verify_with_llm,
+    )
+    _render_compost_scan(result, dry_run=dry_run)
