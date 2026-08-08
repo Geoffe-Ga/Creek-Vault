@@ -18,6 +18,12 @@ classify`` engine — call to close that hole:
 * :func:`merge` — union two tag lists, never losing one.
 * :func:`apply_tags` — stamp the merged list onto a fragment.
 
+A fourth function, :func:`has_unrecorded_tags`, serves the reporting
+side (:func:`creek.cli._scan_fill_gaps`) rather than the writers: "would
+a classify run add anything here?" has to be answered in the same
+normalised space :func:`merge` works in, and that space is knowledge
+only this module has.
+
 Three rules hold across every function here.
 
 **Precision over recall.** The extractor is free and runs over every
@@ -36,7 +42,27 @@ does *not* re-apply the extractor's rejection filters to tags already on
 record. ``tags`` is a field operators hand-edit in Obsidian, and both
 writers run over the whole vault repeatedly; a merge that filtered its
 own inputs would silently delete author-written vault content the first
-time a re-ingest or a re-classify passed over it.
+time a re-ingest or a re-classify passed over it. The rule is stated
+formally, in two total halves. **Preservation:** :func:`_canonical`'s
+form of the recorded list is always a *prefix* of the merged result,
+however long that list is. **Bounded growth:** the merge admits at most
+``max(0, _MAX_TAGS - len(canonical))`` new tags on top of that prefix —
+exactly that many whenever the candidates offer enough.
+:data:`_MAX_TAGS` therefore ceilings what an automated pass may *add*,
+never what an operator may have written — a list can only *already* be
+past the ceiling, and then it gains nothing, so repeated passes are
+idempotent rather than a ratchet.
+
+Preservation is of the *tag*, not of the bytes: what comes back is
+:func:`_normalise`'s spelling of the recorded entry, so an entry differs
+from what the operator typed in exactly three ways, and none of them is
+a lost tag. It is **re-spelled** (``Recovery`` → ``recovery``,
+``Family_Business`` → ``family-business``) — the same tag under the one
+spelling the garden uses. It **folds into an earlier entry** that shares
+that spelling (``Recovery`` beside ``recovery`` yields a single
+``recovery``) — the duplicate is lost, the tag is not. Or it
+**normalises to the empty string** (``---``, ``_``, ``-``) and is
+dropped, having been a separator rather than a tag in the first place.
 
 **Never guess.** Normalisation is deliberately shallow — lowercase,
 ``_`` → ``-``, collapse repeated ``-``, strip the ends — and camelCase is
@@ -70,6 +96,12 @@ Known residuals
   the frontmatter; the operator removes it by hand. That is the price of
   the never-lose rule above, and it is the right side to err on — the
   alternative deletes hand-authored tags on every re-ingest.
+* **A list already over the ceiling is frozen.** A fragment carrying
+  more than :data:`_MAX_TAGS` recorded tags keeps every one of them and
+  gains none until the operator prunes it by hand. That is the
+  deliberate trade for never deleting hand-authored tags: nothing here
+  can tell which of the tags it did not write is the one worth evicting,
+  so it evicts nothing and admits nothing.
 * **FEAT-023 re-atomized children are tagged one pass late.** The
   splitter and the re-atomizer build :class:`~creek.ingest.base.IngestedFragment`
   directly (``creek/atomize/split.py:264``,
@@ -109,13 +141,22 @@ TAGS_KEY: Final[str] = "tags"
 
 
 _MAX_TAGS: Final[int] = 32
-"""Per-fragment ceiling on how many tags this pass will record.
+"""Per-fragment ceiling on the tags an *automated pass* may contribute.
 
-Stops one pathological body — a hand-written tag-index note, a scraped
-page whose navigation survived conversion — from writing hundreds of
-entries into a single fragment's YAML frontmatter. The truncation is
-first-seen order, never a set, so the same body always yields the same
-32 and a re-run does not churn the file.
+It plays two distinct roles, and only one of them is a truncation.
+
+In :func:`extract` it truncates the extractor's **own** freshly-derived
+output, stopping one pathological body — a hand-written tag-index note,
+a scraped page whose navigation survived conversion — from offering
+hundreds of entries for a single fragment's YAML frontmatter. That
+truncation is first-seen order, never a set, so the same body always
+yields the same 32 and a re-run does not churn the file.
+
+In :func:`merge` it is a **growth ceiling**: the most an automated pass
+may grow a recorded list *to*, i.e. at most
+``max(0, _MAX_TAGS - len(recorded))`` new tags are admitted. It is never
+a truncation of recorded data — a list already past it keeps every entry
+and gains none (see the module docstring's never-lose rule).
 """
 
 _MIN_ALPHA_CHARS: Final[int] = 2
@@ -146,6 +187,15 @@ _MIN_TAG_CHARS: Final[int] = 2
 
 A one-character tag carries no meaning in a garden of 35k fragments and
 is almost always the residue of a stray ``#`` next to an initial.
+
+The ``len(tag) < _MIN_TAG_CHARS`` half of :func:`_accept`'s bound is
+currently **unreachable** through :func:`extract`: :data:`_TAG_RE` forces
+a leading ``[A-Za-z]``, :func:`_has_enough_letters` then requires two
+alphabetic characters, and :func:`_normalise` never removes a letter, so
+every candidate that reaches the bound is already at least two
+characters long. It is kept as a defensive lower bound so that loosening
+either of those rules cannot silently start admitting one-character
+tags.
 """
 
 _MAX_TAG_CHARS: Final[int] = 64
@@ -352,6 +402,33 @@ def extract(body: str) -> list[str]:
     return found
 
 
+def _canonical(tags: list[str]) -> list[str]:
+    """Normalise *tags* and drop duplicates, preserving first-seen order.
+
+    The canonical form of a recorded tag list: every entry through
+    :func:`_normalise`, empties dropped, later spellings of an
+    already-seen tag dropped. This — not the raw list — is what the
+    never-lose guarantee in :func:`merge` is stated over.
+
+    Args:
+        tags: The tags as recorded, in whatever spelling was written.
+
+    Returns:
+        The canonical tags, in first-seen order. Never longer than
+        *tags*, and never capped: this is recorded data, and
+        :data:`_MAX_TAGS` bounds growth rather than length.
+    """
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for raw in tags:
+        tag = _normalise(raw)
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        canonical.append(tag)
+    return canonical
+
+
 def merge(current: list[str], candidate: list[str]) -> list[str]:
     """Union *current* and *candidate*, existing-first, never losing a tag.
 
@@ -363,31 +440,71 @@ def merge(current: list[str], candidate: list[str]) -> list[str]:
     and re-applying it here would delete recorded tags (see the
     module docstring's never-lose rule).
 
-    Existing-first ordering also decides who loses at the ceiling: a
-    fragment already holding :data:`_MAX_TAGS` tags keeps every one of
-    them and gains nothing, rather than evicting curated tags for
-    freshly-derived ones.
+    The contract has two halves and both are total.
+
+    **Preservation.** :func:`_canonical`'s form of *current* is always a
+    *prefix* of the result, however long *current* is. :data:`_MAX_TAGS`
+    bounds growth, not length, so no recorded list is ever trimmed to
+    fit under it.
+
+    **Bounded growth.** At most ``max(0, _MAX_TAGS - len(canonical))``
+    entries of *candidate* are admitted on top of that prefix, and
+    exactly that many when *candidate* offers enough distinct new tags. A
+    candidate already on record costs no room. An automated pass can
+    therefore never *grow* a list past the ceiling — a list can only
+    already be past it, and then it gains nothing — which makes repeated
+    passes idempotent rather than a ratchet.
 
     Args:
         current: The tags already recorded on the fragment.
         candidate: The tags just derived from the body.
 
     Returns:
-        The merged list, deduplicated after normalisation and capped at
-        :data:`_MAX_TAGS`. Tags that normalise to nothing at all are
-        dropped rather than recorded as ``""``.
+        The canonical form of *current*, in order, followed by the
+        admitted new tags. Entries come back in :func:`_normalise`'s
+        spelling rather than byte-for-byte, so an entry of *current* can
+        differ from what was written in exactly three ways, none of them
+        a lost tag: it is re-spelled (``"Recovery"`` → ``"recovery"``);
+        it folds into an earlier entry sharing that spelling
+        (``"Recovery"`` beside ``"recovery"`` yields one ``"recovery"``
+        — the duplicate goes, the tag stays); or it normalises to the
+        empty string (``"---"``, ``"_"``, ``"-"``) and is dropped as the
+        separator it always was rather than as a tag.
     """
-    merged: list[str] = []
-    seen: set[str] = set()
-    for raw in (*current, *candidate):
+    kept = _canonical(current)
+    seen = set(kept)
+    room = max(_MAX_TAGS - len(kept), 0)
+    for raw in candidate:
+        if room == 0:
+            break
         tag = _normalise(raw)
         if not tag or tag in seen:
             continue
         seen.add(tag)
-        merged.append(tag)
-        if len(merged) == _MAX_TAGS:
-            break
-    return merged
+        kept.append(tag)
+        room -= 1
+    return kept
+
+
+def has_unrecorded_tags(current: list[str], body: str) -> bool:
+    """Report whether *body* carries a hashtag *current* does not record.
+
+    Compares against ``_canonical(current)``, not the raw list, because
+    ``tags: [Recovery]`` beside a body reading ``#recovery`` records the
+    tag already — reporting that as a gap would bill the operator for a
+    paid ``creek classify --method llm --force`` run to fix a difference
+    in case that changes nothing.
+
+    Args:
+        current: The tags already recorded on the fragment.
+        body: The fragment's markdown body.
+
+    Returns:
+        ``True`` when :func:`extract` finds at least one tag the
+        canonical form of *current* does not already hold.
+    """
+    recorded = set(_canonical(current))
+    return any(tag not in recorded for tag in extract(body))
 
 
 def apply_tags(fragment: Fragment, body: str) -> Fragment:

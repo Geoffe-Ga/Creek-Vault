@@ -58,10 +58,24 @@ _MAX_TEXTURES: int = 5
 
 ``emotional_texture`` is a *handful* of tags naming how a fragment feels,
 not a taxonomy: five is generous for the axis and bounds what a
-pathological response can write into every fragment's on-disk YAML. It
-also protects the consumer — :func:`creek.link.temporal` adds ``+0.1``
-per *shared* texture tag, so an uncapped list would let one runaway
-response dominate the temporal score of every fragment it touches. See
+pathological response can write into every fragment's on-disk YAML.
+
+It bounds **LLM-derived** data only, and that is exactly the threat it
+protects the consumer from: :mod:`creek.link.temporal` adds ``+0.1`` per
+*shared* texture tag (``creek/link/temporal.py:106-112``) with no clamp
+anywhere in the module, so an uncapped *response* would let one runaway
+model answer dominate the temporal score of every fragment it touches.
+:func:`_parse_emotional_texture` hard-caps the response at five, and
+:func:`_merge_textures` admits at most
+``max(0, _MAX_TEXTURES - len(recorded))`` of those, so no classify run
+can raise that term.
+
+It is **not** a bound on what an operator hand-wrote, and never was:
+:class:`~creek.models.Fragment` imposes no cap on the field and the
+consumer clamps nothing, so a hand-authored twenty-tag list already
+contributes ``+2.0``. Trimming the recorded list here would not have
+fixed the unclamped consumer — it would only have deleted the
+operator's tags. Issue #1216 tracks clamping the consumer itself. See
 issue #878.
 """
 
@@ -492,9 +506,24 @@ def _merge_textures(current: list[str], candidate: list[str]) -> list[str]:
 
     Never a replacement: a model that saw only part of a long fragment
     must not be able to delete tags an earlier run — or the operator —
-    put on record. Existing-first also decides who loses at the ceiling,
-    so a fragment already holding :data:`_MAX_TEXTURES` tags keeps every
-    one of them and gains none.
+    put on record. Both halves of that are total.
+
+    **Preservation is verbatim.** *current*, minus its exact duplicates,
+    is always a *prefix* of the result — however long the list is and
+    however long any single entry is. No normalisation and no length
+    check is applied to the recorded side, so a hand-authored
+    200-character texture survives byte-for-byte. The only entry of
+    *current* that can be absent is an exact duplicate of an earlier
+    one.
+
+    **Growth is bounded.** At most ``max(0, _MAX_TEXTURES - len(prefix))``
+    entries of *candidate* are admitted on top of that prefix — exactly
+    that many when *candidate* offers enough distinct new tags — so
+    :data:`_MAX_TEXTURES` ceilings
+    what a classification may *add* rather than limiting the field's
+    length. A list already past the ceiling keeps every tag and gains
+    none, which makes repeated classifications idempotent rather than a
+    ratchet.
 
     Unlike :func:`creek.classify.tags_pass.merge`, the recorded side is
     **not** re-normalised. ``emotional_texture`` has exactly one producer
@@ -507,18 +536,20 @@ def _merge_textures(current: list[str], candidate: list[str]) -> list[str]:
         candidate: The sanitised tags from this response.
 
     Returns:
-        The merged list, deduplicated and capped at
-        :data:`_MAX_TEXTURES`.
+        *current* with its exact duplicates removed, in order, followed
+        by the admitted new tags.
     """
-    merged: list[str] = []
-    seen: set[str] = set()
-    for tag in (*current, *candidate):
+    merged = list(dict.fromkeys(current))
+    seen = set(merged)
+    room = max(_MAX_TEXTURES - len(merged), 0)
+    for tag in candidate:
+        if room == 0:
+            break
         if tag in seen:
             continue
         seen.add(tag)
         merged.append(tag)
-        if len(merged) == _MAX_TEXTURES:
-            break
+        room -= 1
     return merged
 
 

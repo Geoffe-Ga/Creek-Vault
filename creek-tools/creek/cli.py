@@ -2173,9 +2173,14 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     ``tags`` is always written, and "the list is empty" would nag forever
     about the many fragments that genuinely have no hashtags. The
     provable gap is "the free extractor finds a tag the disk does not
-    record". Computing it here rather than in its own function is what
-    keeps it free — it rides the walk the other two already pay for, and
-    must never become a second pass over 35k files.
+    record", which
+    :func:`~creek.classify.tags_pass.has_unrecorded_tags` answers in the
+    same normalised space the merge works in — comparing raw strings
+    would report ``tags: [Recovery]`` beside a body reading ``#recovery``
+    as a gap and bill the operator for a paid ``--force`` run that
+    changes nothing. Computing it here rather than in its own function is
+    what keeps it free — it rides the walk the other two already pay for,
+    and must never become a second pass over 35k files.
 
     The imports are function-local (like the rest of this module's) so a
     bare ``creek --help`` never pays to import the classification stack.
@@ -2189,7 +2194,7 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     """
     from creek.classify.praxis_pass import detect
     from creek.classify.privacy_pass import needs_tier
-    from creek.classify.tags_pass import extract
+    from creek.classify.tags_pass import has_unrecorded_tags
     from creek.vault.reader import iter_vault_fragments
 
     untiered = 0
@@ -2203,7 +2208,7 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
         recorded_none = str(fragment.praxis_potential) == PraxisPotential.NONE.value
         if recorded_none and detect(fragment, body) is PraxisPotential.EXPLICIT:
             backfillable += 1
-        if set(extract(body)) - set(fragment.tags):
+        if has_unrecorded_tags(fragment.tags, body):
             untagged += 1
     return _FillGapCounts(
         untiered=untiered,

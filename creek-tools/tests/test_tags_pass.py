@@ -54,6 +54,7 @@ from creek.classify.tags_pass import (
     TAGS_KEY,
     apply_tags,
     extract,
+    has_unrecorded_tags,
     merge,
 )
 from creek.models import (
@@ -253,7 +254,10 @@ class TestExtractPositives:
         candidates = [f"tag-a{i:02d}" for i in range(40)]
         body = " ".join(f"#{tag}" for tag in candidates)
 
-        assert extract(body) == candidates[:_MAX_TAGS]
+        result = extract(body)
+
+        assert result == candidates[:_MAX_TAGS]
+        assert len(result) == 32
 
 
 class TestExtractRejectsDiscordSnowflakes:
@@ -400,11 +404,17 @@ class TestMerge:
             "recovery",
         ]
 
-    def test_truncation_preserves_first_seen_order(self) -> None:
-        """At the cap, the tail is dropped and the head is untouched.
+    def test_a_list_exactly_at_the_cap_keeps_everything_and_gains_nothing(
+        self,
+    ) -> None:
+        """At the cap, the record is untouched and no candidate is admitted.
 
         Existing tags are first, so a fragment already at the ceiling
         loses the *new* candidates rather than the ones already on disk.
+        This is the equality case only; :class:`TestMergeBoundsGrowth`
+        sweeps both sides of the boundary, because a cap tested from one
+        side alone cannot tell "admitted nothing" from "deleted the
+        tail".
         """
         existing = [f"tag-a{i:02d}" for i in range(_MAX_TAGS)]
 
@@ -413,6 +423,233 @@ class TestMerge:
     def test_two_empty_lists_merge_to_an_empty_list(self) -> None:
         """The degenerate case is empty, not ``[""]``."""
         assert merge([], []) == []
+
+
+class TestMergeNeverTruncatesTheRecord:
+    """A recorded list past the cap is kept whole, not silently trimmed.
+
+    :data:`_MAX_TAGS` is a **growth ceiling**, not a length limit: it
+    bounds how many tags an automated pass may *add*, and says nothing
+    about how many an operator may have written by hand. Every other
+    test in this file exercises the cap at ``len(current) == _MAX_TAGS``
+    only, and a one-sided boundary is no boundary at all — a merge that
+    trims at the ceiling is indistinguishable there and deletes vault
+    content one item further along.
+
+    That deletion is unrecoverable and unattributable. ``tags`` is a
+    field operators hand-edit in Obsidian, both writers run over the
+    whole vault repeatedly, and :func:`apply_tags` writes the shortened
+    list straight back to the file while reporting the fragment as
+    successfully tagged.
+    """
+
+    def test_a_recorded_list_over_the_cap_keeps_every_tag(self) -> None:
+        """Forty recorded tags stay forty, and nothing new is admitted.
+
+        The module's never-lose rule stated at the one input shape that
+        can violate it. Asserted against the whole list rather than its
+        length, so an implementation that held the count at forty by
+        substituting candidates for the evicted tail fails too.
+        """
+        current = [f"tag-a{i:02d}" for i in range(40)]
+
+        result = merge(current, ["fresh-one", "fresh-two"])
+
+        assert result == current
+        assert "fresh-one" not in result
+
+    def test_apply_tags_leaves_an_over_cap_fragment_untouched(self) -> None:
+        """An over-cap fragment comes back unchanged and uncopied.
+
+        This is the shape that reaches disk. Returning a copy is exactly
+        what makes the classify engine rewrite the file, so a merge that
+        trims here does not merely compute a short list — it commits the
+        deletion to the operator's vault. Identity is asserted alongside
+        content because "same tags" and "no rewrite" are two different
+        promises and both are owed.
+        """
+        current = [f"tag-a{i:02d}" for i in range(40)]
+        fragment = _fragment(tags=current)
+        body = "notes on #alpha #beta #gamma #delta #epsilon"
+
+        result = apply_tags(fragment, body)
+
+        assert result.tags == current
+        assert result is fragment
+        assert fragment.tags == current
+
+    def test_an_over_cap_fragment_survives_a_second_pass(self) -> None:
+        """Running the documented backfill twice still holds all forty tags.
+
+        The module docstring's own remediation for an untagged vault is
+        an explicit, paid ``creek classify --method llm --force``, and
+        operators are told to re-run it. A merge that trims at the cap
+        makes that published command destructive on its first pass and
+        permanent on its second — no later run puts the eight deleted
+        tags back. Two passes are asserted so "the loss is recoverable
+        by re-running" cannot be claimed.
+        """
+        current = [f"tag-a{i:02d}" for i in range(40)]
+        body = "notes on #alpha #beta"
+
+        once = apply_tags(_fragment(tags=current), body)
+        twice = apply_tags(once, body)
+
+        assert twice.tags == current
+
+
+class TestMergeBoundsGrowth:
+    """The ceiling bounds what a pass may *add*, swept from both sides.
+
+    The bound itself still has to hold: without it one pathological body
+    — a hand-written tag-index note, a scraped page whose navigation
+    survived conversion — writes hundreds of entries into a single
+    fragment's YAML frontmatter. Stating the rule as "admit exactly
+    ``max(0, 32 - len(current))`` new tags" keeps that protection while
+    making it impossible to express as a deletion, and makes repeated
+    passes idempotent by construction.
+
+    Every expectation here is a **literal**. An expectation computed
+    from :data:`_MAX_TAGS` moves with the constant and therefore cannot
+    catch an off-by-one in the cap arithmetic, which is the whole class
+    of bug this covers.
+    """
+
+    @pytest.mark.parametrize(
+        ("existing_count", "expected_added"),
+        [(0, 32), (1, 31), (31, 1), (32, 0), (33, 0), (40, 0), (100, 0)],
+    )
+    def test_the_merge_admits_exactly_the_number_of_new_tags_the_cap_leaves_room_for(
+        self,
+        existing_count: int,
+        expected_added: int,
+    ) -> None:
+        """Room for new tags is ``max(0, 32 - len(current))``, exactly.
+
+        Swept across the boundary from both sides — 31, 32, 33 — because
+        the defect being pinned is a one-sided test, not a wrong
+        constant. Each case also asserts the recorded tags come back as a
+        prefix, which is what separates "admitted nothing" from "deleted
+        the tail": both leave the same *number* of new entries, and only
+        one of them is correct.
+        """
+        existing = [f"kept-{i:03d}" for i in range(existing_count)]
+        candidate = [f"fresh-{i:03d}" for i in range(200)]
+
+        result = merge(existing, candidate)
+
+        assert len(set(result) - set(existing)) == expected_added
+        assert result[: len(existing)] == existing
+
+    def test_a_short_list_never_grows_past_the_cap(self) -> None:
+        """Ten recorded tags plus two hundred candidates yields exactly 32.
+
+        The ceiling still binds in the direction it was written for. The
+        literal 32 is what makes this test able to fail: a ``<=`` read as
+        ``<``, or a stray ``+ 1`` in the room calculation, changes this
+        number and nothing else in the suite notices.
+        """
+        existing = [f"kept-{i:03d}" for i in range(10)]
+        candidate = [f"fresh-{i:03d}" for i in range(200)]
+
+        assert len(merge(existing, candidate)) == 32
+
+    @pytest.mark.parametrize("existing_count", [10, 40])
+    def test_repeated_merges_never_ratchet_the_list_upward(
+        self,
+        existing_count: int,
+    ) -> None:
+        """``merge(merge(c, x), x) == merge(c, x)``, under and over the cap.
+
+        Feeding a merged list back in is what the pipeline actually
+        does: every re-ingest and re-classify hands the previous result
+        back as *current*. Without this fixed point an under-cap list
+        would creep upward on each pass and an over-cap one downward,
+        and either way the frontmatter of an unchanged fragment churns
+        forever. Both sides of the ceiling are swept for the same reason
+        as above.
+        """
+        current = [f"kept-{i:03d}" for i in range(existing_count)]
+        candidate = [f"fresh-{i:03d}" for i in range(200)]
+
+        once = merge(current, candidate)
+
+        assert merge(once, candidate) == once
+
+    def test_apply_tags_never_grows_a_fragment_past_the_cap(self) -> None:
+        """A fifty-hashtag body cannot inflate a thirty-tag fragment past 32.
+
+        The security half of the ceiling. Fragment bodies are unbounded,
+        attacker-influenced content and this pass runs over every one of
+        them on both the ingest and the classify path, so "preserve
+        whatever is recorded" must not become a licence to append
+        whatever the body offers. The recorded thirty are asserted in
+        order in the same call, so satisfying the bound by evicting them
+        is not an option either.
+        """
+        existing = [f"kept-{i:03d}" for i in range(30)]
+        body = " ".join(f"#body-{i:03d}" for i in range(50))
+
+        result = apply_tags(_fragment(tags=existing), body)
+
+        assert len(result.tags) == 32
+        assert result.tags[:30] == existing
+
+
+class TestMergePreservationExceptions:
+    """The only three ways a recorded entry may differ from what was typed.
+
+    :func:`merge` preserves the *tag*, not the bytes: it returns
+    :func:`_normalise`'s spelling of each recorded entry. So an entry
+    can be re-spelled, can fold into an earlier entry sharing that
+    spelling, or can normalise away entirely — and none of the three is
+    a lost tag. Pinned so the never-lose rule asserted by
+    :class:`TestMergeNeverTruncatesTheRecord` is *exact*: an invariant
+    with undocumented exceptions is not an invariant, and the next
+    reader needs to know which shortfalls are the contract and which are
+    the bug.
+    """
+
+    def test_a_lone_recorded_entry_is_returned_re_spelled_not_verbatim(self) -> None:
+        """One ``Family_Business`` comes back as ``family-business``.
+
+        The exception that is easy to miss, because it needs no second
+        entry to trigger it and no entry is dropped: a *single*
+        non-canonical tag is still rewritten. Documenting only the
+        fold-into-a-duplicate and the normalises-to-empty cases would
+        make the preservation rule read as byte-for-byte, which it is
+        not — and a rule stated more strongly than the code honours it
+        is the kind of mismatch review is meant to catch.
+        """
+        assert merge(["Family_Business"], []) == ["family-business"]
+        assert merge(["Recovery"], []) == ["recovery"]
+
+    def test_two_spellings_of_one_recorded_tag_collapse_without_losing_it(
+        self,
+    ) -> None:
+        """``Recovery``/``recovery``/``RECOVERY`` are one tag, and it survives.
+
+        The tag is never lost — only the duplicate spellings are.
+        Counting this as a loss would force the merge to keep three
+        garden entries no reader could tell apart, which is the exact
+        vocabulary fragmentation the normaliser exists to prevent.
+        """
+        assert merge(["Recovery", "recovery", "RECOVERY"], []) == ["recovery"]
+
+    def test_a_recorded_entry_that_normalises_to_nothing_is_dropped(
+        self,
+    ) -> None:
+        """``---``, ``_`` and ``-`` are separators, not tags.
+
+        The only exception that removes an entry outright, and it removes
+        nothing that was ever a tag. Each normalises to the empty string,
+        and recording ``""`` in frontmatter would put an unnameable entry
+        in the Tag Garden that no lint, query or hand-edit could ever
+        reach. A real tag sits alongside them in the same call, so an
+        implementation that threw the whole list away on the first
+        offender fails too.
+        """
+        assert merge(["---", "_", "-", "recovery"], []) == ["recovery"]
 
 
 class TestApplyTags:
@@ -493,3 +730,64 @@ class TestApplyTags:
         assert after.pop(TAGS_KEY) == ["recovery"]
         assert before.pop(TAGS_KEY) == []
         assert after == before
+
+
+class TestHasUnrecordedTags:
+    """``has_unrecorded_tags`` answers the question ``creek fill`` asks.
+
+    :func:`creek.cli._scan_fill_gaps` compares a body's hashtags against
+    the recorded list with raw string sets, so a fragment carrying
+    ``tags: [Recovery]`` beside a body reading ``#recovery`` is reported
+    as a backfillable gap. The operator then pays for a ``creek classify
+    --method llm --force`` run over the vault that changes nothing,
+    because :func:`merge` already considers those two the same tag.
+
+    The comparison has to happen in normalised space, and normalisation
+    is knowledge only this module has — which is why the predicate lives
+    here rather than being re-derived at the call site.
+
+    The predicate was imported inside each test while it did not yet
+    exist, so a missing helper was reported as four precise failures
+    rather than one collection error that hid every other case in this
+    file. Now that it exists, the import sits with the module's others.
+    """
+
+    def test_a_case_only_difference_is_not_an_unrecorded_tag(self) -> None:
+        """``tags: [Recovery]`` already records the body's ``#recovery``.
+
+        The exact false positive that bills the operator for an empty
+        paid run. ``is False`` rather than ``not ...`` so a helper that
+        returned an empty list — falsy, but not an answer — fails here.
+        """
+        assert has_unrecorded_tags(["Recovery"], "a note about #recovery") is False
+
+    def test_an_underscore_spelling_is_not_an_unrecorded_tag(self) -> None:
+        """``family_business`` already records the body's ``#family-business``.
+
+        The second half of the normalisation. ``_`` → ``-`` has to be
+        applied to both sides or to neither, and hand-written Obsidian
+        frontmatter carries both spellings freely.
+        """
+        assert (
+            has_unrecorded_tags(["family_business"], "the #family-business again")
+            is False
+        )
+
+    def test_a_genuinely_missing_tag_is_reported(self) -> None:
+        """A body tag with no recorded counterpart is still a real gap.
+
+        The precision fix must not become a mute. This hint is the only
+        surface that tells an operator the tags axis is unbacked, so a
+        helper that answered ``False`` unconditionally would "fix" the
+        false positive by deleting the feature.
+        """
+        assert has_unrecorded_tags(["recovery"], "and also #grief") is True
+
+    def test_a_body_with_no_hashtags_reports_nothing(self) -> None:
+        """A plain note with nothing recorded is not a gap.
+
+        The degenerate shape both arguments can take at once — and the
+        shape 2000/2000 sampled fragments of the operator's vault
+        actually have, so it is the case this predicate answers most.
+        """
+        assert has_unrecorded_tags([], _NEUTRAL_BODY) is False

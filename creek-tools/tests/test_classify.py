@@ -24,7 +24,7 @@ from creek.classify.llm import (
     _strip_code_fences,
 )
 from creek.classify.llm import LLMClassifier as LLMClassifierDirect
-from creek.classify.llm.parsing import _apply_praxis
+from creek.classify.llm.parsing import _apply_praxis, _merge_textures
 from creek.classify.review import ReviewQueueGenerator as ReviewQueueGeneratorDirect
 from creek.classify.rules import (
     CONFIDENCE_SIGNALS,
@@ -3537,6 +3537,7 @@ class TestTextureCaps:
         result = classifier._apply_classification(_make_fragment(), data)
 
         assert result.emotional_texture == emitted[:_MAX_TEXTURES]
+        assert len(result.emotional_texture) == 5
 
     def test_truncates_a_runaway_tag(self) -> None:
         """A 500-character "tag" is truncated, not dropped.
@@ -3553,6 +3554,38 @@ class TestTextureCaps:
         result = classifier._apply_classification(_make_fragment(), data)
 
         assert result.emotional_texture == ["g" * _MAX_TEXTURE_CHARS]
+
+    def test_a_texture_tag_at_exactly_the_char_cap_survives_untouched(self) -> None:
+        """A 32-character tag is inside the bound and is not sliced.
+
+        :meth:`test_truncates_a_runaway_tag` computes its expectation
+        from the same constant the code slices with, so ``[:31]`` and
+        ``[:33]`` both satisfy it — a 500-character input cannot locate a
+        boundary. The literal 32 here, paired with the 33-character case
+        below, pins it from both sides.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["g" * 32]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["g" * 32]
+        assert len(result.emotional_texture[0]) == 32
+
+    def test_a_texture_tag_one_char_over_the_cap_loses_exactly_one_char(self) -> None:
+        """A 33-character tag comes back at 32, losing exactly one character.
+
+        The far side of the same boundary. Together with the 32-character
+        case above this is the only pair that can distinguish the real
+        cap from an off-by-one, and both use literals for that reason.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["g" * 33]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["g" * 32]
+        assert len(result.emotional_texture[0]) == 32
 
     def test_junk_items_are_dropped_but_the_list_survives(self) -> None:
         """A non-string item drops the ITEM, not the whole response.
@@ -3607,11 +3640,14 @@ class TestTextureCaps:
 
         assert result.emotional_texture == ["grief"]
 
-    def test_the_union_is_capped_too(self) -> None:
-        """A fragment already at the ceiling keeps its tags and gains none.
+    def test_a_union_at_the_cap_adds_nothing(self) -> None:
+        """A fragment exactly at the ceiling keeps its tags and gains none.
 
         Existing-first means the *new* candidates lose, so a re-classify
-        cannot evict tags already on disk.
+        cannot evict tags already on disk. This is the equality case
+        only; :class:`TestTextureMergeNeverTruncatesTheRecord` sweeps
+        past the ceiling, where "gains none" and "loses the tail" stop
+        looking alike.
         """
         classifier = LLMClassifier(config=LLMConfig())
         recorded = ["a", "b", "c", "d", "e"]
@@ -3619,6 +3655,121 @@ class TestTextureCaps:
         data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
 
         assert classifier._apply_classification(frag, data) is frag
+
+
+class TestTextureMergeNeverTruncatesTheRecord:
+    """A recorded texture list past the cap is kept whole (issue #878).
+
+    ``_MAX_TEXTURES`` is a **growth ceiling**, not a length limit: it
+    bounds what an untrusted model response may *add* to a fragment and
+    says nothing about what an operator hand-wrote in Obsidian.
+    :class:`TestTextureCaps` only ever exercises the equality case, and
+    at ``len(current) == _MAX_TEXTURES`` a union that trims is
+    indistinguishable from one that does not.
+
+    Without this class the codebase contradicts itself. The model layer
+    deliberately carries no validator so that merely *reading* a
+    hand-edited fragment never rewrites it — pinned by
+    ``test_a_hand_authored_ten_item_texture_list_is_not_truncated`` in
+    ``tests/test_models.py`` — yet the parser would delete the same
+    operator's sixth through tenth tags the first time a classify pass
+    touched the fragment, which is the very write the model layer
+    refused to make.
+    """
+
+    def test_a_recorded_texture_list_over_the_cap_keeps_every_tag(self) -> None:
+        """Ten recorded textures stay ten, and nothing new is admitted.
+
+        The never-lose rule at the one input shape that can violate it.
+        Asserted against the whole list rather than its length, so a
+        union that held the count at ten by substituting the response's
+        tags for the evicted tail fails too.
+        """
+        recorded = [f"mood-{i}" for i in range(10)]
+
+        assert _merge_textures(recorded, ["grief"]) == recorded
+
+    def test_a_hand_authored_over_cap_texture_list_survives_a_classification(
+        self,
+    ) -> None:
+        """A ten-texture fragment comes back unchanged and uncopied.
+
+        This is the shape that reaches disk. ``_apply_classification``
+        returns the input fragment only when ``updates`` is empty, so a
+        union that trims does not merely compute a short list — it
+        writes the deletion back over the operator's frontmatter while
+        the run reports success. Identity and content are both asserted
+        because "same tags" and "no rewrite" are separate promises.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        recorded = [f"mood-{i}" for i in range(10)]
+        frag = _make_texture_fragment(recorded)
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.emotional_texture == recorded
+        assert result is frag
+
+    def test_a_hand_authored_over_length_texture_tag_is_preserved_verbatim(
+        self,
+    ) -> None:
+        """A 200-character recorded tag comes back byte-for-byte.
+
+        ``_MAX_TEXTURE_CHARS`` bounds what the *response* may write; the
+        recorded side is never length-checked, and unlike
+        :func:`creek.classify.tags_pass.merge` it is not normalised
+        either. Whatever the operator typed is what survives, however
+        long and however oddly cased.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        recorded = ["m" * 200]
+        frag = _make_texture_fragment(recorded)
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.emotional_texture == ["m" * 200, "grief"]
+        assert len(result.emotional_texture[0]) == 200
+
+    @pytest.mark.parametrize(
+        ("recorded_count", "expected_added"),
+        [(0, 5), (1, 4), (4, 1), (5, 0), (6, 0), (10, 0)],
+    )
+    def test_the_texture_union_admits_only_what_the_cap_leaves_room_for(
+        self,
+        recorded_count: int,
+        expected_added: int,
+    ) -> None:
+        """Room for new textures is ``max(0, 5 - len(current))``, exactly.
+
+        Swept across the boundary from both sides — 4, 5, 6 — because
+        the defect being pinned is a one-sided test, not a wrong
+        constant. Each case also asserts the recorded tags come back as a
+        prefix, which is what separates "admitted nothing" from "deleted
+        the tail": both leave the same *number* of new entries.
+        """
+        recorded = [f"kept-{i}" for i in range(recorded_count)]
+        candidate = [f"fresh-{i}" for i in range(40)]
+
+        result = _merge_textures(recorded, candidate)
+
+        assert len(set(result) - set(recorded)) == expected_added
+        assert result[: len(recorded)] == recorded
+
+    def test_the_texture_union_never_grows_past_five(self) -> None:
+        """Two recorded textures plus forty candidates yields exactly 5.
+
+        The ceiling still binds in the direction it was written for — a
+        model that emits a paragraph of moods cannot inflate the
+        frontmatter. The literal 5 is what makes this able to fail: an
+        expectation read off ``_MAX_TEXTURES`` moves with the constant
+        and so cannot catch an off-by-one in the room calculation.
+        """
+        recorded = ["kept-0", "kept-1"]
+        candidate = [f"fresh-{i}" for i in range(40)]
+
+        assert len(_merge_textures(recorded, candidate)) == 5
 
 
 class TestTexturePrompt:

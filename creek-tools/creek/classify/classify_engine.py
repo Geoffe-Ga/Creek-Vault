@@ -714,16 +714,18 @@ def _record_tags(
     — :func:`_process_file`'s cyclomatic complexity is already at its
     working ceiling and does not need another ``if``. Comparing
     before/after is safe precisely because
-    :func:`~creek.classify.tags_pass.apply_tags` merges as a union: the
-    list can only ever grow (or be re-normalised in place), so this counts
-    real work and never churn.
+    :func:`~creek.classify.tags_pass.apply_tags` merges as a union that
+    never loses a tag: the list can only grow, or be re-canonicalised in
+    place — which can shorten it, when two spellings of one tag collapse
+    to the single tag they always named — so any difference is real work
+    and never churn.
 
     Args:
         before: The tags the fragment carried before the pass.
         fragment: The fragment after the pass.
         counts: Mutable per-run counters; mutated in place.
     """
-    if fragment.tags.copy() != before:
+    if fragment.tags != before:
         counts.tags_extracted += 1
 
 
