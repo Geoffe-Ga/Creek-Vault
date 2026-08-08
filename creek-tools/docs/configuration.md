@@ -99,16 +99,82 @@ ocr:
 
 ```yaml
 linking:
+  # Temporal proximity linker
   temporal_window_hours: 168
+
+  # Minimum sizes
   thread_min_fragments: 3
   eddy_min_fragments: 5
+
+  # Eddy (DBSCAN) detector thresholds
+  eddy_eps: 0.3
+  eddy_min_samples: 5
+  eddy_correlation_threshold: 0.3
+
+  # Thread detector thresholds
+  thread_window_days: 30
+  thread_similarity_threshold: 0.6
+  thread_union_without_embeddings: false
+
+  # Cluster-size guardrail
+  cluster_size_ceiling: 500
+  cluster_max_fraction: 0.10
+  cluster_split_max_depth: 3
+  eddy_split_eps_step: 0.05
+  thread_split_similarity_step: 0.1
+
+  # Message-stream segmentation
+  stream_platforms: [discord, email]
+  stream_episode_max_gap_hours: 24
+  stream_episode_max_span_days: 30
 ```
+
+### Windows and minimum sizes
 
 | Field                  | Default | Notes |
 |------------------------|---------|-------|
-| `temporal_window_hours`| `168`   | Sliding-window width for thread detection (1 week). |
+| `temporal_window_hours`| `168`   | Sliding-window width (1 week) for the **temporal proximity linker** only (`creek link --method temporal`). It has never influenced thread detection — see `thread_window_days` for that. |
 | `thread_min_fragments` | `3`     | Minimum chain length for a thread. |
 | `eddy_min_fragments`   | `5`     | Minimum cluster size for an eddy. |
+
+### Detector thresholds
+
+Previously hard-coded module constants, exposed by [ADR-0008](architecture/ADR/0008-bounding-cluster-degeneration-in-message-streams.md). Every default equals the constant it replaced, so a vault whose `creek_config.yaml` predates these keys clusters identically after the upgrade.
+
+| Field                             | Default | Notes |
+|-----------------------------------|---------|-------|
+| `eddy_eps`                        | `0.3`   | Maximum cosine **distance** for a DBSCAN neighbour — `0.3` means an edge at cosine similarity ≥ `0.70`. Range `(0.0, 1.0)`. Lowering it tightens every cluster but cannot, on its own, separate a continuous message stream (that is what `stream_platforms` is for). |
+| `eddy_min_samples`                | `5`     | Minimum neighbourhood size for a DBSCAN core point. Minimum `1`. |
+| `eddy_correlation_threshold`      | `0.3`   | Absolute Spearman ceiling above which a candidate cluster is judged *thread-like* (content drift correlates with chronological rank) and filtered out of the eddy set. Range `[0.0, 1.0]`. |
+| `thread_window_days`              | `30`    | Sliding-window width, in days, for **thread detection**. Distinct from `temporal_window_hours`. Minimum `1`. |
+| `thread_similarity_threshold`     | `0.6`   | Cosine similarity a pair must *strictly exceed* to join one thread. Range `[0.0, 1.0]`. |
+| `thread_union_without_embeddings` | `false` | Whether a pair missing an embedding may union on frequency agreement alone. On a *partially* embedded vault this fallback silently chains fragments the similarity gate would have rejected, so it is closed by default. (A vault with **no** embeddings at all still falls back to frequency agreement by design.) |
+
+### Cluster-size guardrail
+
+The last line of defence against a single eddy or thread swallowing the vault. It is a guardrail, not the cure — see ADR-0008.
+
+| Field                          | Default | Notes |
+|--------------------------------|---------|-------|
+| `cluster_size_ceiling`         | `500`   | Absolute member count below which a cluster is never split. The effective ceiling is `max(cluster_size_ceiling, floor(corpus_size × cluster_max_fraction))`, so the absolute floor dominates ordinary vaults and the guardrail stays inert until a corpus is large enough for degeneration to matter. Minimum `1`. |
+| `cluster_max_fraction`         | `0.10`  | Largest share of the corpus a single eddy or thread may hold. Range `(0.0, 1.0]`; **`1.0` is the documented opt-out** — one cluster may then span everything. |
+| `cluster_split_max_depth`      | `3`     | Re-clustering rounds allowed per oversized cluster. `0` disables splitting entirely, sending any oversized cluster straight to noise. Minimum `0`. |
+| `eddy_split_eps_step`          | `0.05`  | Amount `eddy_eps` is tightened by on each re-clustering round. Range `(0.0, 1.0)`. |
+| `thread_split_similarity_step` | `0.1`   | Amount `thread_similarity_threshold` is raised on each re-clustering round. Range `(0.0, 1.0)`. |
+
+A cluster still over the ceiling once **both** bounds are exhausted — the depth budget, and the tightening schedule leaving its valid range (epsilon may never reach `0.0`, similarity may never reach `1.0`) — is **discarded to noise**: its members carry no `eddies:` / `threads:` link at all. Each discard logs a `WARNING` naming the clustering domain and the size, and `creek link` reports the total as `N fragment(s) discarded as unsplittable`.
+
+### Message-stream segmentation
+
+A continuous chat stream violates the precondition both detectors rely on — clusters separated by low-density regions — so no threshold value can separate it. Stream fragments are instead partitioned into independent clustering domains (conversation episodes) *before* any similarity graph is built.
+
+| Field                          | Default              | Notes |
+|--------------------------------|----------------------|-------|
+| `stream_platforms`             | `[discord, email]`   | Source platforms whose fragments are cut into conversation episodes, keyed on `(platform, series, episode_index)` where `series` is the channel, else the conversation id, else the interlocutor. The default names the two platforms Creek already routes to `01-Fragments/Messages/`; chat *transcripts* (`claude`, `chatgpt`) stay long-form material in the shared domain. An **empty list disables segmentation**. Every value must name a `creek.models.SourcePlatform` member — a typo is rejected at load rather than silently disabling segmentation. |
+| `stream_episode_max_gap_hours` | `24`                 | Inactivity gap, in hours, that ends a conversation episode — the primary, conversational rule. Inclusive: a gap exactly this long does not cut. Minimum `1`. |
+| `stream_episode_max_span_days` | `30`                 | Maximum span, in days, of a single episode — the backstop for a channel that never falls idle, so a permanently-busy channel yields channel-month units rather than one multi-year blob. Inclusive. Minimum `1`. |
+
+Every fragment that is not from a `stream_platforms` platform lands in one shared domain, so cross-source resonance, cross-platform eddies and multi-year threads over long-form material behave exactly as before.
 
 ## `classification` — auto-classify thresholds
 

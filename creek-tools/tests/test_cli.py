@@ -1252,6 +1252,56 @@ def test_link_eddies_output_phrases_eddies_written(tmp_path: Path) -> None:
     assert "03-eddies" in output_lower
 
 
+def test_link_summary_reports_cluster_health() -> None:
+    """Issue #880: the largest cluster, splits and discards are operator-visible.
+
+    A single eddy holding 87% of the vault used to be invisible from the
+    CLI — the summary reported how many eddies were detected but never how
+    big any of them was. Discarded fragments carry no wiki-link at all, so
+    that count is named explicitly rather than folded into a total.
+    """
+    from creek.cli import _format_link_summary
+    from creek.link.link_engine import LinkSummary
+
+    rendered = _format_link_summary(
+        LinkSummary(
+            method="eddies",
+            fragment_count=700,
+            link_count=3,
+            eddies_detected=3,
+            eddies_written=3,
+            member_fragments_updated=36,
+            largest_cluster_fragments=12,
+            clusters_split=6,
+            oversized_discarded=521,
+        ),
+    )
+    assert "largest cluster: 12 fragment(s)" in rendered
+    assert "6 oversized cluster(s) re-clustered" in rendered
+    assert "521 fragment(s) discarded as unsplittable" in rendered
+
+
+def test_link_summary_stays_terse_for_a_healthy_run() -> None:
+    """No splits and no discards means no extra clauses beyond the largest."""
+    from creek.cli import _format_link_summary
+    from creek.link.link_engine import LinkSummary
+
+    rendered = _format_link_summary(
+        LinkSummary(
+            method="threads",
+            fragment_count=40,
+            link_count=2,
+            threads_detected=2,
+            threads_written=2,
+            member_fragments_updated=8,
+            largest_cluster_fragments=5,
+        ),
+    )
+    assert "largest cluster: 5 fragment(s)" in rendered
+    assert "re-clustered" not in rendered
+    assert "discarded" not in rendered
+
+
 def test_report_help() -> None:
     """Test that report --help shows subcommand help."""
     result = runner.invoke(app, ["report", "--help"])

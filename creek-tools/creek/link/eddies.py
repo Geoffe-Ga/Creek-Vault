@@ -9,9 +9,20 @@ periods.
 The algorithm mirrors the Creek pipeline's existing pure-numpy style
 (no ``scikit-learn`` dependency):
 
+0. Partition the corpus into independent clustering domains
+   (:mod:`creek.link.segments`). DBSCAN assumes clusters separated by
+   low-density regions; a continuous message stream has no such
+   separator, so one epsilon-graph over seven years of chat is a single
+   connected component whatever ``eps`` is chosen (issue #880). Message
+   streams are therefore cut into conversation episodes *before* any
+   similarity graph is built, and every other fragment shares one
+   domain, leaving cross-source clustering exactly as it was.
 1. Run DBSCAN over the fragment embedding vectors using cosine
-   distance. Each dense cluster of at least ``min_samples`` fragments is
-   a candidate eddy.
+   distance, per domain. Each dense cluster of at least ``min_samples``
+   fragments is a candidate eddy. A cluster still larger than the
+   configured ceiling is re-clustered at a tighter epsilon by
+   :mod:`creek.link.cluster_limits`, and discarded to noise if even that
+   fails — a guardrail, not the cure.
 2. For each candidate, compute the Spearman rank correlation between
    chronological order and *content drift* (cosine distance from the
    oldest fragment). Low |correlation| (below
@@ -19,10 +30,11 @@ The algorithm mirrors the Creek pipeline's existing pure-numpy style
    topic — an eddy. High |correlation| indicates a thread-like monotonic
    drift and is filtered out.
 3. Build an :class:`~creek.models.Eddy` per qualifying cluster with a
-   title derived from the most distinctive content words, ``formed``
-   set to the median fragment creation date, and ``threads`` populated
-   from any thread wiki-links already present on member fragments
-   (i.e. threads that flow through the eddy).
+   title and description derived by :mod:`creek.link.naming`, a
+   content-stable id derived from its membership, ``formed`` set to the
+   median fragment creation date, and ``threads`` populated from any
+   thread wiki-links already present on member fragments (i.e. threads
+   that flow through the eddy).
 
 The module also offers fragment-to-eddy assignment (adding wiki-links
 to fragment ``eddies`` frontmatter).
@@ -30,18 +42,24 @@ to fragment ``eddies`` frontmatter).
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import re
-from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from creek.config import LinkingConfig
+from creek.link import naming
+from creek.link.cluster_limits import SplitPolicy, Tightening, split_oversized
 from creek.link.neighbours import cosine_neighbours
+from creek.link.segments import partition
 from creek.models import Eddy
 from creek.time import effective_authored_at, effective_authored_date
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import date
 
+    from creek.link.segments import SegmentationConfig
     from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
@@ -50,193 +68,75 @@ _DEFAULT_EPS = 0.3
 _DEFAULT_MIN_SAMPLES = 5
 _DEFAULT_MIN_FRAGMENTS = 5
 _DEFAULT_CORRELATION_THRESHOLD = 0.3
-_TITLE_TOP_WORDS = 3
-_MIN_TITLE_WORD_LEN = 3
+_DEFAULT_SPLIT_EPS_STEP = 0.05
+_MAX_FALLBACK_TITLE_LEN = 50
 
 _UNVISITED = -1
 _NOISE = -2
 
-_STOPWORDS: frozenset[str] = frozenset(
-    {
-        "a",
-        "about",
-        "above",
-        "after",
-        "again",
-        "against",
-        "all",
-        "am",
-        "an",
-        "and",
-        "any",
-        "are",
-        "as",
-        "at",
-        "be",
-        "because",
-        "been",
-        "before",
-        "being",
-        "below",
-        "between",
-        "both",
-        "but",
-        "by",
-        "can",
-        "did",
-        "do",
-        "does",
-        "doing",
-        "don",
-        "down",
-        "during",
-        "each",
-        "few",
-        "for",
-        "from",
-        "further",
-        "had",
-        "has",
-        "have",
-        "having",
-        "he",
-        "her",
-        "here",
-        "hers",
-        "herself",
-        "him",
-        "himself",
-        "his",
-        "how",
-        "i",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "itself",
-        "just",
-        "me",
-        "more",
-        "most",
-        "my",
-        "myself",
-        "no",
-        "nor",
-        "not",
-        "now",
-        "of",
-        "off",
-        "on",
-        "once",
-        "only",
-        "or",
-        "other",
-        "our",
-        "ours",
-        "ourselves",
-        "out",
-        "over",
-        "own",
-        "s",
-        "same",
-        "she",
-        "should",
-        "so",
-        "some",
-        "such",
-        "t",
-        "than",
-        "that",
-        "the",
-        "their",
-        "theirs",
-        "them",
-        "themselves",
-        "then",
-        "there",
-        "these",
-        "they",
-        "this",
-        "those",
-        "through",
-        "to",
-        "too",
-        "under",
-        "until",
-        "up",
-        "very",
-        "was",
-        "we",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "while",
-        "who",
-        "whom",
-        "why",
-        "will",
-        "with",
-        "you",
-        "your",
-        "yours",
-        "yourself",
-        "yourselves",
-    },
-)
+
+@dataclass(frozen=True, slots=True)
+class _NamingContext:
+    """Corpus-wide facts every cluster in one run is measured against.
+
+    Bundled into one object so the naming and guardrail parameters travel
+    together through the detection call chain instead of as four parallel
+    arguments.
+
+    Attributes:
+        document_frequency: How many corpus fragments carry each title
+            content word, from :func:`creek.link.naming.document_frequency`.
+        corpus_size: Number of embedded fragments the run considered.
+        ceiling: Largest permitted cluster size for this corpus.
+    """
+
+    document_frequency: dict[str, int]
+    corpus_size: int
+    ceiling: int
 
 
-def _tokenize(text: str) -> list[str]:
-    """Tokenise *text* into lowercase alphabetic words.
+def _stable_eddy_id(frags: list[Fragment]) -> str:
+    """Return a deterministic ``eddy-<8hex>`` id for a cluster of *frags*.
+
+    Mirrors :func:`creek.link.threads._stable_thread_id` (#718): eddy
+    identity is derived from the sorted member fragment ids, so re-detecting
+    the same cluster on the same corpus yields the same id — and therefore
+    the same page filename, which lets :meth:`VaultWriter.write_eddy`
+    recognise the existing page instead of minting a fresh one on every run.
+    The model's random default (:func:`creek.models._generate_eddy_id`)
+    remains for eddies constructed by hand, which have no membership to hash.
+
+    Membership *changes* deliberately yield a new id: the cluster is a
+    different eddy. That matters more now than before, because segmentation
+    and splitting produce many smaller clusters (issue #880).
 
     Args:
-        text: Input string to tokenise.
+        frags: The fragments composing the eddy (non-empty).
 
     Returns:
-        A list of lowercase word tokens (no punctuation, no digits).
+        A stable ``eddy-`` prefixed id, 8 hex chars of a SHA-256 digest.
     """
-    return re.findall(r"[a-z]+", text.lower())
+    member_key = ",".join(sorted(f.id for f in frags))
+    digest = hashlib.sha256(member_key.encode("utf-8")).hexdigest()[:8]
+    return f"eddy-{digest}"
 
 
-def _content_words(text: str) -> list[str]:
-    """Extract content words from *text* (no stopwords, length-filtered).
+def _apply_unique_titles(eddies: list[Eddy]) -> None:
+    """Make every title in one detection run unique, in place.
+
+    :meth:`EddyDetector.assign_fragments_to_eddies` writes ``[[<title>]]``
+    onto each member fragment, so two eddies sharing a title would send both
+    memberships to whichever page Obsidian resolved first.
 
     Args:
-        text: Input string.
-
-    Returns:
-        A list of lowercase content words suitable for title heuristics.
+        eddies: The run's eddies, in emission order.
     """
-    return [
-        w
-        for w in _tokenize(text)
-        if w not in _STOPWORDS and len(w) >= _MIN_TITLE_WORD_LEN
-    ]
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two equal-length vectors.
-
-    Args:
-        a: First vector.
-        b: Second vector.
-
-    Returns:
-        Cosine similarity in ``[-1.0, 1.0]``; ``0.0`` if either vector
-        has zero norm.
-    """
-    import numpy as np  # lazy: numpy lives in the [embeddings] extra
-
-    va = np.asarray(a, dtype=np.float32)
-    vb = np.asarray(b, dtype=np.float32)
-    na = float(np.linalg.norm(va))
-    nb = float(np.linalg.norm(vb))
-    if 0.0 in (na, nb):
-        return 0.0
-    return float(np.dot(va, vb) / (na * nb))
+    for eddy, title in zip(
+        eddies,
+        naming.disambiguate([e.title for e in eddies]),
+        strict=True,
+    ):
+        eddy.title = title
 
 
 def _cosine_distance(a: list[float], b: list[float]) -> float:
@@ -249,7 +149,7 @@ def _cosine_distance(a: list[float], b: list[float]) -> float:
     Returns:
         Cosine distance; ``1.0`` when either vector has zero norm.
     """
-    return 1.0 - _cosine_similarity(a, b)
+    return 1.0 - naming.cosine(a, b)
 
 
 def _average_ranks(values: list[float]) -> list[float]:
@@ -345,6 +245,11 @@ class EddyDetector:
         correlation_threshold: Absolute Spearman-correlation ceiling. A
             cluster qualifies as an eddy only when its chronological vs
             content-drift correlation has absolute value below this.
+        split_policy: Cluster-size guardrail applied to every detected
+            cluster (issue #880).
+        split_eps_step: How much ``eps`` tightens per re-clustering round.
+        segmentation: Supplies the message-stream segmentation settings
+            consumed by :func:`creek.link.segments.partition`.
     """
 
     def __init__(
@@ -354,6 +259,9 @@ class EddyDetector:
         eps: float = _DEFAULT_EPS,
         min_samples: int = _DEFAULT_MIN_SAMPLES,
         correlation_threshold: float = _DEFAULT_CORRELATION_THRESHOLD,
+        split_policy: SplitPolicy | None = None,
+        split_eps_step: float = _DEFAULT_SPLIT_EPS_STEP,
+        segmentation: SegmentationConfig | None = None,
     ) -> None:
         """Initialise the detector.
 
@@ -370,12 +278,56 @@ class EddyDetector:
             correlation_threshold: Absolute Spearman correlation cutoff
                 for treating a cluster as an eddy (vs a thread-like
                 progression). Defaults to ``0.3``.
+            split_policy: Size ceiling and re-clustering budget. Defaults
+                to :class:`~creek.link.cluster_limits.SplitPolicy`'s own
+                defaults, whose absolute floor of 500 members keeps the
+                guardrail inert on ordinary corpora.
+            split_eps_step: Amount ``eps`` is tightened by on each
+                re-clustering round. Defaults to ``0.05``.
+            segmentation: Message-stream segmentation settings. Defaults
+                to :class:`creek.config.LinkingConfig`'s own defaults, so
+                a bare detector segments Discord and email exactly as the
+                configured pipeline does.
         """
         self.embeddings: dict[str, list[float]] = embeddings or {}
         self.eps = eps
         self.min_samples = min_samples
         self.correlation_threshold = correlation_threshold
+        self.split_policy = split_policy or SplitPolicy()
+        self.split_eps_step = split_eps_step
+        self.segmentation: SegmentationConfig = segmentation or LinkingConfig()
         self._eddy_members: dict[str, list[str]] = {}
+        self._clusters_split = 0
+        self._oversized_discarded = 0
+
+    @classmethod
+    def from_linking_config(
+        cls,
+        embeddings: dict[str, list[float]] | None,
+        config: LinkingConfig,
+    ) -> EddyDetector:
+        """Build a detector wired to the vault's linking configuration.
+
+        The single construction path for both orchestrators
+        (:mod:`creek.link.link_engine` and :mod:`creek.link.linker`), so the
+        same vault cannot cluster differently depending on which one ran.
+
+        Args:
+            embeddings: Mapping of fragment ID to embedding vector.
+            config: The vault's ``linking`` configuration section.
+
+        Returns:
+            A detector using every configured threshold.
+        """
+        return cls(
+            embeddings=embeddings,
+            eps=config.eddy_eps,
+            min_samples=config.eddy_min_samples,
+            correlation_threshold=config.eddy_correlation_threshold,
+            split_policy=SplitPolicy.from_linking_config(config),
+            split_eps_step=config.eddy_split_eps_step,
+            segmentation=config,
+        )
 
     @property
     def eddy_members(self) -> dict[str, list[str]]:
@@ -388,6 +340,28 @@ class EddyDetector:
         """
         return self._eddy_members.copy()
 
+    @property
+    def clusters_split(self) -> int:
+        """Clusters that exceeded the ceiling and were re-clustered.
+
+        Returns:
+            The count from the most recent :meth:`detect_eddies` call.
+        """
+        return self._clusters_split
+
+    @property
+    def oversized_discarded(self) -> int:
+        """Fragments dropped to noise because their cluster would not split.
+
+        Non-zero means those fragments carry no ``eddies:`` link at all —
+        the deliberate cost of refusing to emit an unusable mega-page, and
+        a number an operator should see.
+
+        Returns:
+            The count from the most recent :meth:`detect_eddies` call.
+        """
+        return self._oversized_discarded
+
     def detect_eddies(
         self,
         fragments: list[Fragment],
@@ -395,7 +369,8 @@ class EddyDetector:
     ) -> list[Eddy]:
         """Detect eddies across *fragments*.
 
-        Runs DBSCAN on fragment embeddings, then filters clusters that
+        Partitions the corpus into clustering domains, runs DBSCAN within
+        each, bounds any oversized cluster, then filters clusters that
         exhibit thread-like temporal progression. Each qualifying
         cluster of at least ``min_fragments`` fragments becomes an
         :class:`~creek.models.Eddy`.
@@ -408,7 +383,7 @@ class EddyDetector:
 
         Returns:
             A list of detected :class:`~creek.models.Eddy` objects
-            sorted by ``formed`` date ascending.
+            sorted by ``formed`` date ascending, with unique titles.
         """
         logger.info(
             "Detecting eddies among %d fragment(s) with eps=%.2f, min_samples=%d",
@@ -417,19 +392,115 @@ class EddyDetector:
             self.min_samples,
         )
         self._eddy_members = {}
+        self._clusters_split = 0
+        self._oversized_discarded = 0
         frag_by_id = {f.id: f for f in fragments if f.id in self.embeddings}
         if len(frag_by_id) < min_fragments:
             logger.info("Detected 0 eddies (insufficient embedded fragments)")
             return []
 
-        ids = list(frag_by_id.keys())
-        clusters = self._dbscan(ids)
-        eddies = self._materialise_eddies(clusters, frag_by_id, min_fragments)
+        corpus = list(frag_by_id.values())
+        context = _NamingContext(
+            document_frequency=naming.document_frequency(corpus),
+            corpus_size=len(corpus),
+            ceiling=self.split_policy.ceiling_for(len(corpus)),
+        )
+        eddies: list[Eddy] = []
+        for domain in partition(corpus, config=self.segmentation):
+            eddies.extend(self._detect_in_domain(domain, min_fragments, context))
+        _apply_unique_titles(eddies)
         eddies.sort(key=lambda e: e.formed)
-        logger.info("Detected %d eddies", len(eddies))
+        logger.info(
+            "Detected %d eddies (%d cluster(s) split, %d fragment(s) discarded)",
+            len(eddies),
+            self._clusters_split,
+            self._oversized_discarded,
+        )
         return eddies
 
-    def _dbscan(self, ids: list[str]) -> list[list[str]]:
+    def _detect_in_domain(
+        self,
+        domain: list[Fragment],
+        min_fragments: int,
+        context: _NamingContext,
+    ) -> list[Eddy]:
+        """Detect the eddies of one clustering domain.
+
+        Args:
+            domain: Fragments of a single domain — one conversation
+                episode, or the shared non-stream domain.
+            min_fragments: Minimum cluster size required to emit an eddy.
+            context: Corpus-wide naming and ceiling facts.
+
+        Returns:
+            The eddies found within *domain*.
+        """
+        frag_by_id = {f.id: f for f in domain}
+        clusters = self._bounded_clusters(
+            list(frag_by_id),
+            min_fragments,
+            context,
+            naming.structural_label(domain),
+        )
+        return self._materialise_eddies(clusters, frag_by_id, context)
+
+    def _bounded_clusters(
+        self,
+        ids: list[str],
+        min_fragments: int,
+        context: _NamingContext,
+        domain: str,
+    ) -> list[list[str]]:
+        """Cluster *ids*, splitting anything above the configured ceiling.
+
+        Splitting happens strictly *outside* :meth:`_dbscan`: it only ever
+        re-partitions a membership list DBSCAN has already produced, and it
+        passes the tightened epsilon as an argument rather than mutating
+        :attr:`eps`. The #790 brute-force-equivalence contract, which pins
+        raw ``_dbscan`` output, is therefore untouched.
+
+        Args:
+            ids: Fragment IDs of one domain (all have embeddings).
+            min_fragments: Minimum cluster size worth keeping.
+            context: Corpus-wide naming and ceiling facts.
+            domain: Human-readable domain name, used in discard warnings.
+
+        Returns:
+            Cluster memberships, none larger than ``context.ceiling``.
+        """
+        bounded: list[list[str]] = []
+        for members in self._dbscan(ids):
+            if len(members) < min_fragments:
+                continue
+            if len(members) <= context.ceiling:
+                bounded.append(members)
+                continue
+            self._clusters_split += 1
+            result = split_oversized(
+                members,
+                ceiling=context.ceiling,
+                policy=self.split_policy,
+                recluster=self._recluster,
+                tightening=Tightening.for_eddy_eps(self.eps, self.split_eps_step),
+                domain=domain,
+            )
+            self._oversized_discarded += len(result.discarded)
+            bounded.extend(sub for sub in result.accepted if len(sub) >= min_fragments)
+        return bounded
+
+    def _recluster(self, members: Sequence[str], eps: float) -> list[list[str]]:
+        """Re-run DBSCAN over *members* at a tightened epsilon.
+
+        Args:
+            members: Membership of one oversized cluster.
+            eps: Tightened cosine-distance radius for this round only.
+
+        Returns:
+            The subclusters found; noise points are simply absent.
+        """
+        return self._dbscan(list(members), eps=eps)
+
+    def _dbscan(self, ids: list[str], *, eps: float | None = None) -> list[list[str]]:
         """Run DBSCAN over the provided fragment IDs.
 
         Uses cosine distance against :attr:`embeddings` with parameters
@@ -441,11 +512,16 @@ class EddyDetector:
 
         Args:
             ids: Fragment IDs to cluster (all must have embeddings).
+            eps: Per-call radius override used by the splitter's
+                re-clustering rounds. ``None`` (the default) uses
+                :attr:`eps`. The override never mutates detector state, so
+                concurrent rounds cannot leak parameters into each other.
 
         Returns:
             A list of clusters, each a list of fragment IDs. Noise
             points are excluded.
         """
+        radius = self.eps if eps is None else eps
         n = len(ids)
         labels = [_UNVISITED] * n
         # Vectorised neighbour discovery (issue #790): a fragment's neighbours
@@ -453,7 +529,7 @@ class EddyDetector:
         # <= eps), computed in memory-bounded blocks rather than an O(N²)
         # pure-Python loop. Clusters are identical to the exhaustive path.
         vectors = [self.embeddings[fid] for fid in ids]
-        neighbour_cache = cosine_neighbours(vectors, 1.0 - self.eps)
+        neighbour_cache = cosine_neighbours(vectors, 1.0 - radius)
         cluster_id = 0
         for i in range(n):
             if labels[i] != _UNVISITED:
@@ -515,34 +591,33 @@ class EddyDetector:
         self,
         clusters: list[list[str]],
         frag_by_id: dict[str, Fragment],
-        min_fragments: int,
+        context: _NamingContext,
     ) -> list[Eddy]:
-        """Convert DBSCAN clusters into :class:`Eddy` objects.
+        """Convert bounded clusters into :class:`Eddy` objects.
 
-        Filters out clusters below *min_fragments* and clusters with
-        thread-like temporal progression (|Spearman| at or above
-        :attr:`correlation_threshold`). Side effect: populates
+        Filters out clusters with thread-like temporal progression
+        (|Spearman| at or above :attr:`correlation_threshold`). The
+        minimum-size floor has already been applied by
+        :meth:`_bounded_clusters`. Side effect: adds to
         :attr:`_eddy_members`.
 
         Args:
-            clusters: DBSCAN cluster memberships as lists of IDs.
-            frag_by_id: Fragment lookup table.
-            min_fragments: Minimum cluster size to keep.
+            clusters: Cluster memberships as lists of IDs.
+            frag_by_id: Fragment lookup table for this domain.
+            context: Corpus-wide naming facts.
 
         Returns:
             Constructed eddies for every qualifying cluster.
         """
         eddies: list[Eddy] = []
         for members in clusters:
-            if len(members) < min_fragments:
-                continue
             cluster_frags = sorted(
                 (frag_by_id[fid] for fid in members),
                 key=effective_authored_at,
             )
             if self._has_temporal_direction(cluster_frags):
                 continue
-            eddy = self._build_eddy(cluster_frags)
+            eddy = self._build_eddy(cluster_frags, context)
             eddies.append(eddy)
             self._eddy_members[eddy.id] = [f.id for f in cluster_frags]
         return eddies
@@ -572,44 +647,63 @@ class EddyDetector:
         correlation = _spearman_with_time(drifts)
         return abs(correlation) >= self.correlation_threshold
 
-    def _build_eddy(self, frags: list[Fragment]) -> Eddy:
+    @staticmethod
+    def _build_eddy(frags: list[Fragment], context: _NamingContext) -> Eddy:
         """Construct an :class:`Eddy` from its constituent fragments.
 
         Args:
             frags: Fragments belonging to the cluster, chronologically
                 sorted (non-empty).
+            context: Corpus-wide naming facts.
 
         Returns:
-            A populated :class:`~creek.models.Eddy`.
+            A populated :class:`~creek.models.Eddy`, including a
+            never-empty ``description`` — historically omitted here, which
+            is why generated pages shipped ``description: ''``.
         """
         return Eddy(
-            title=self._generate_title(frags),
+            id=_stable_eddy_id(frags),
+            title=EddyDetector._generate_title(frags, context),
             formed=_median_date(frags),
             fragment_count=len(frags),
-            threads=self._flowing_threads(frags),
+            threads=EddyDetector._flowing_threads(frags),
+            description=naming.cluster_description(
+                frags,
+                context.document_frequency,
+                context.corpus_size,
+            ),
         )
 
-    def _generate_title(self, frags: list[Fragment]) -> str:
-        """Generate a title from the cluster's distinctive content words.
+    @staticmethod
+    def _generate_title(frags: list[Fragment], context: _NamingContext) -> str:
+        """Generate a title for the cluster.
 
-        Uses TF-IDF-lite: content-word frequency inside the cluster
-        scaled by inverse document frequency across :attr:`embeddings`
-        (using fragment titles only when fragment objects are
-        available — falls back to raw counts when the corpus is small).
+        Delegates to :func:`creek.link.naming.cluster_title`, which applies
+        the inverse document frequency this method's docstring used to
+        claim and never implemented: a term carried by most of the corpus
+        — ``messages``, on a Discord-heavy vault — can no longer become a
+        topic label, and a cluster left with no surviving term is named
+        from its structure (dominant channel plus date span) instead.
+
+        A cluster whose member titles contain *no content words at all*
+        (pure punctuation, single letters) is a different case: there is
+        nothing for IDF to suppress, so the historical fallback to the
+        earliest member's own title is kept.
 
         Args:
             frags: Fragments in the cluster (non-empty).
+            context: Corpus-wide naming facts.
 
         Returns:
-            A short title string.
+            A short, non-empty title string.
         """
-        counts: Counter[str] = Counter()
-        for frag in frags:
-            counts.update(_content_words(frag.title))
-        if not counts:
-            return frags[0].title[:50] if frags else "Untitled Eddy"
-        top = [word for word, _ in counts.most_common(_TITLE_TOP_WORDS)]
-        return " ".join(word.capitalize() for word in top)
+        if not any(naming.content_words(f.title) for f in frags):
+            return frags[0].title[:_MAX_FALLBACK_TITLE_LEN]
+        return naming.cluster_title(
+            frags,
+            context.document_frequency,
+            context.corpus_size,
+        )
 
     @staticmethod
     def _flowing_threads(frags: list[Fragment]) -> list[str]:
