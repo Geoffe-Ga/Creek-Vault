@@ -48,6 +48,13 @@ DEFAULT_TOXIC_CONSECUTIVE_WEEKS: int = 3
 _VALID_PERIODS: frozenset[str] = frozenset({"weekly", "monthly"})
 """Accepted period strings for :meth:`WavelengthTracker.generate_report`."""
 
+_PHASE_MAP_SUBPATH: tuple[str, str] = ("05-Wavelength", "Phase-Maps")
+"""Vault-relative home of every phase-map report this module writes.
+
+Named once, next to :data:`_MODE_PROFILE_SUBPATH`, so the scaffold drift
+guard can derive it rather than re-typing it (#1025). It used to be
+spelled inline at all three report-writing call sites."""
+
 
 _NOTABLE_FRAGMENT_LIMIT: int = 5
 """Maximum number of Notable Fragments listed per report."""
@@ -692,7 +699,7 @@ class WavelengthTracker:
             msg = f"Unknown period {period!r}; expected one of {sorted(_VALID_PERIODS)}"
             raise ValueError(msg)
 
-        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir = vault_path.joinpath(*_PHASE_MAP_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
 
         snapshots = self._window_snapshots(fragments)
@@ -811,7 +818,7 @@ class WavelengthTracker:
             generated_on=date.today().isoformat(),
             tags=["wavelength", "wavelength-weekly"],
         )
-        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir = vault_path.joinpath(*_PHASE_MAP_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
         note_path = target_dir / f"{iso_year}-W{iso_week:02d}-wavelength.md"
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
@@ -873,7 +880,7 @@ class WavelengthTracker:
             generated_on=date.today().isoformat(),
             tags=["wavelength", "wavelength-monthly"],
         )
-        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir = vault_path.joinpath(*_PHASE_MAP_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
         note_path = target_dir / f"{month.year}-{month.month:02d}-wavelength.md"
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")

@@ -26,9 +26,12 @@ def test_classify_runs_twice_without_error(
     """Two classification passes must not raise and must not duplicate fragments.
 
     The original incarnation of this test asserted on
-    ``(synthetic_vault / "07-Review").exists()`` — but the
-    ``synthetic_vault`` fixture pre-creates that directory, so the
-    assertion was vacuous. The honest round-trip semantics require
+    ``(synthetic_vault / "07-Review").exists()`` — an assertion the old
+    ``synthetic_vault`` fixture made vacuous by pre-creating the
+    directory. ``07-Review`` was never real: no module in ``creek/`` or
+    ``creek_mcp/`` writes there, and issue #1025 removed it along with
+    the rest of the fixture's invented topology. The honest round-trip
+    semantics require
     INC-002 (review command) and INC-011 (classify --force flag) to
     land. Until then this test guards two real properties:
 

@@ -20,42 +20,21 @@ import pytest
 
 from creek.config import CreekConfig
 from creek.pipeline import Pipeline
+from creek.scaffold import scaffold_vault
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-VAULT_DIRS: list[str] = [
-    "00-Creek-Meta/Processing-Log",
-    "01-Fragments/Conversations",
-    "01-Fragments/Messages",
-    "01-Fragments/Writing",
-    "01-Fragments/Writing/Substack",
-    "01-Fragments/Journal",
-    "01-Fragments/Technical",
-    "01-Fragments/Notes",
-    "01-Fragments/Documents",
-    "01-Fragments/Data",
-    "01-Fragments/Decks",
-    "01-Fragments/Images",
-    "01-Fragments/Unsorted",
-    "02-Threads/Active",
-    "02-Threads/Dormant",
-    "02-Threads/Resolved",
-    "03-Eddies",
-    "04-Praxis/Daily",
-    "04-Praxis/Seasonal",
-    "04-Praxis/Situational",
-    "06-Frequencies",
-    "08-Decisions/Active",
-    "08-Decisions/Archive",
-]
-
-
 def _make_empty_vault(vault_path: Path) -> Path:
-    """Materialise the minimal vault directory layout."""
-    for d in VAULT_DIRS:
-        (vault_path / d).mkdir(parents=True, exist_ok=True)
+    """Materialise the vault layout ``creek init`` ships.
+
+    Built by the real scaffold rather than a local directory list: a
+    hand-copied list is what drifted from the template in issue #1025,
+    and every writer's ``mkdir(parents=True, exist_ok=True)`` hides the
+    difference until a user hits it.
+    """
+    scaffold_vault(vault_path)
     return vault_path
 
 

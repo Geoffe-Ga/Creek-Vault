@@ -59,6 +59,19 @@ if TYPE_CHECKING:
         Thread,
     )
 
+# Vault-relative roots this writer routes models into. Every destination is
+# assembled from one of these names rather than an inline string literal so
+# the scaffold drift guard (tests/test_vault_structure.py) can *derive* the
+# directories ``creek init`` has to ship. Retyping a destination anywhere is
+# how the scaffold and the writer drifted apart in the first place (#1025).
+_META_RELPART: str = "00-Creek-Meta"
+_PROCESSING_LOG_RELPARTS: tuple[str, str] = (_META_RELPART, "Processing-Log")
+_FRAGMENTS_RELPART: str = "01-Fragments"
+_THREADS_RELPART: str = "02-Threads"
+_EDDIES_RELPART: str = "03-Eddies"
+_PRAXIS_RELPART: str = "04-Praxis"
+_DECISIONS_RELPART: str = "08-Decisions"
+
 # Map source platform -> 01-Fragments subfolder.
 # This mapping must remain *total* across SourcePlatform — every enum
 # value has an entry. The totality is enforced by a unit test in
@@ -109,6 +122,9 @@ _PRAXIS_SUBFOLDER: dict[str, str] = {
 }
 
 # Decision statuses that are considered "active" (go to Active/)
+_ACTIVE_DECISION_SUBFOLDER: str = "Active"
+_ARCHIVED_DECISION_SUBFOLDER: str = "Archive"
+
 _MAX_FILENAME_LENGTH = 80
 """Maximum character length for sanitised filename components."""
 
@@ -646,7 +662,7 @@ class VaultWriter:
             msg = f"Vault path does not exist: {vault_path}"
             raise FileNotFoundError(msg)
 
-        required_dirs = ["00-Creek-Meta", "01-Fragments"]
+        required_dirs = [_META_RELPART, _FRAGMENTS_RELPART]
         for d in required_dirs:
             if not (vault_path / d).is_dir():
                 msg = f"Required vault directory missing: {d}"
@@ -667,7 +683,7 @@ class VaultWriter:
         # vault-writer ingest loop (Batch C, PR #193). A fresh AuditLog
         # per call would collapse the cache and re-introduce the O(N²)
         # read pattern that PERF-002 was supposed to eliminate.
-        processing_log_dir = vault_path / "00-Creek-Meta" / "Processing-Log"
+        processing_log_dir = vault_path.joinpath(*_PROCESSING_LOG_RELPARTS)
         self._provenance_log = AuditLog(processing_log_dir / PROVENANCE_FILENAME)
         # Legacy provenance.json migration: replays into the chained
         # JSONL on first VaultWriter construction, then unlinks. The
@@ -732,7 +748,7 @@ class VaultWriter:
         if slug:
             return self.vault_path / OTHER_AUTHORS_DIR / slug
         subfolder = _PLATFORM_SUBFOLDER[str(fragment.source.platform)]
-        return self.vault_path / "01-Fragments" / subfolder
+        return self.vault_path / _FRAGMENTS_RELPART / subfolder
 
     def update_fragment(
         self,
@@ -807,7 +823,7 @@ class VaultWriter:
         index so a tomb does not need to know which subfolder a fragment
         landed in.
         """
-        fragments_root = self.vault_path / "01-Fragments"
+        fragments_root = self.vault_path / _FRAGMENTS_RELPART
         if not fragments_root.is_dir():
             return None
         for subdir in sorted(p for p in fragments_root.iterdir() if p.is_dir()):
@@ -898,7 +914,7 @@ class VaultWriter:
             Path to the written (or existing duplicate) markdown file.
         """
         status_folder = str(thread.status).capitalize()
-        target_dir = self.vault_path / "02-Threads" / status_folder
+        target_dir = self.vault_path / _THREADS_RELPART / status_folder
         return self._write_model(
             thread,
             target_dir,
@@ -920,7 +936,7 @@ class VaultWriter:
         Returns:
             Path to the written (or existing duplicate) markdown file.
         """
-        target_dir = self.vault_path / "03-Eddies"
+        target_dir = self.vault_path / _EDDIES_RELPART
         return self._write_model(
             eddy,
             target_dir,
@@ -944,7 +960,7 @@ class VaultWriter:
             Path to the written (or existing duplicate) markdown file.
         """
         subfolder = _PRAXIS_SUBFOLDER.get(str(praxis.praxis_type), "Situational")
-        target_dir = self.vault_path / "04-Praxis" / subfolder
+        target_dir = self.vault_path / _PRAXIS_RELPART / subfolder
         return self._write_model(praxis, target_dir, body=_render_praxis_body(praxis))
 
     def write_decision(self, decision: Decision) -> Path:
@@ -961,9 +977,11 @@ class VaultWriter:
             Path to the written (or existing duplicate) markdown file.
         """
         subfolder = (
-            "Active" if str(decision.status) in _ACTIVE_DECISION_STATUSES else "Archive"
+            _ACTIVE_DECISION_SUBFOLDER
+            if str(decision.status) in _ACTIVE_DECISION_STATUSES
+            else _ARCHIVED_DECISION_SUBFOLDER
         )
-        target_dir = self.vault_path / "08-Decisions" / subfolder
+        target_dir = self.vault_path / _DECISIONS_RELPART / subfolder
         return self._write_model(
             decision,
             target_dir,

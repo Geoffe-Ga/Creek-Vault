@@ -15,6 +15,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
+from creek.cli import _consent_log_dir
 from creek.config import CreekConfig
 from creek.consent import ConsentManager
 from creek.pipeline import Pipeline, PipelineResult
@@ -27,9 +28,12 @@ def test_pipeline_skips_ingestion_without_consent(
 ) -> None:
     """Without a prior consent record, ingestion is gated and no fragments are written.
 
-    A ``ConsentManager`` rooted in the vault metadata directory is given
-    to the pipeline. Because no consent file exists, the pipeline should
-    log a warning and stop before ingestion, leaving the vault empty.
+    The ``ConsentManager`` is rooted at the *same* directory the CLI
+    uses (``creek.cli._consent_log_dir``) rather than an invented
+    ``00-Creek-Meta/Consent`` — issue #1025 retired the fictional paths
+    the fixture used to conjure. Because no consent file exists, the
+    pipeline should log a warning and stop before ingestion, leaving the
+    vault empty.
     """
     (synthetic_source / "private.md").write_text(
         "# Private content\nthat must not be ingested without consent\n",
@@ -37,8 +41,7 @@ def test_pipeline_skips_ingestion_without_consent(
     )
 
     config = CreekConfig()
-    consent_log = synthetic_vault / "00-Creek-Meta" / "Consent"
-    consent = ConsentManager(log_dir=consent_log)
+    consent = ConsentManager(log_dir=_consent_log_dir(synthetic_vault))
 
     pipeline = Pipeline(config=config, consent_manager=consent)
     result = pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
