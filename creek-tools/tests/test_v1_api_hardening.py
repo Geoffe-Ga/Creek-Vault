@@ -64,7 +64,8 @@ from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi.auth import BearerAuthMiddleware
-from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME
+from creek_mcp.httpapi.context import LIFESPAN_SCOPE, UnsupportedScopeError
+from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME, ERROR_LOGGER_NAME
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
 from creek_mcp.httpapi.middleware.ceiling import CeilingAdmissionMiddleware
@@ -82,21 +83,24 @@ from tests.v1_api_support import (
     OP_HEALTH,
     REFLECTIONS_PATH,
     STRONG_TOKEN,
+    WHEEL_PATH,
     build_app,
     client,
     contains_a_path,
     envelope,
     headers,
     seed_vault,
+    verifier,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from starlette.applications import Starlette
     from starlette.requests import Request
     from starlette.responses import Response
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _OK_STATUS: Final[int] = 200
 _INVALID_REQUEST_STATUS: Final[int] = 422
@@ -1043,6 +1047,101 @@ def test_a_handler_fault_becomes_the_published_500(
     assert not contains_a_path(response.text)
 
 
+def _error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return only the fault-logger records captured so far.
+
+    Args:
+        caplog: The capture fixture.
+
+    Returns:
+        The records emitted by the error logger.
+    """
+    return [record for record in caplog.records if record.name == ERROR_LOGGER_NAME]
+
+
+def test_the_error_logger_is_named_as_published() -> None:
+    """A stable name, distinct from the access logger's, for the fault stream.
+
+    Distinct because the two logs have different contents and therefore
+    different handling: the access line is five safe fields and is shipped
+    wherever the operator ships logs, while a traceback can carry whatever the
+    exception's own message carried — which may be vault material. An operator
+    who cannot route them separately cannot apply that difference.
+    """
+    assert ERROR_LOGGER_NAME == "creek_mcp.httpapi.error"
+    assert ERROR_LOGGER_NAME != ACCESS_LOGGER_NAME
+
+
+def test_a_handler_fault_is_logged_with_its_traceback(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cause reaches the operator; the caller still gets the bare envelope.
+
+    Discarding the exception from the *response* is deliberate — it is a map of
+    the server's internals. Discarding it from the *process* is not: it leaves
+    an operator holding a ``500`` and a correlation id with no traceback
+    anywhere to join them to, which is a fault that cannot be diagnosed at all.
+
+    So both halves are asserted in one place, because it is their *contrast*
+    that is the invariant: the sentinel the handler raised with is present in
+    the log and absent from the body.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for a raising one.
+        caplog: Captures the fault log.
+    """
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, _raise_boom)
+    caplog.set_level(logging.ERROR, logger=ERROR_LOGGER_NAME)
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+
+    records = _error_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
+    assert "Traceback (most recent call last)" in caplog.text
+    assert _SENTINEL_BODY in caplog.text
+    assert _field(record, "request_id") == envelope(response)["request_id"]
+
+    assert response.status_code == _INTERNAL_ERROR_STATUS
+    assert set(envelope(response)) == {"code", "message", "request_id"}
+    assert _SENTINEL_BODY not in response.text
+    assert "Traceback" not in response.text
+    assert "RuntimeError" not in response.text
+
+
+def test_the_fault_does_not_reach_the_access_logger(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The traceback lands on the fault logger and on no other.
+
+    The access log is where content leaks *sideways*, and its promise is that
+    it carries five fields and no sixth. Attaching a traceback to it — or
+    emitting a second access line for the fault — would break that promise
+    with material the exception chose, which is precisely the material the
+    access-log tests spend their time keeping out.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for a raising one.
+        caplog: Captures every logger.
+    """
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, _raise_boom)
+    caplog.set_level(logging.DEBUG)
+    with client(vault_path=vault) as test_client:
+        test_client.get(HEALTH_PATH, headers=headers())
+
+    access = _access_records(caplog)
+    assert len(access) == 1
+    assert _field(access[0], "status") == _INTERNAL_ERROR_STATUS
+    assert access[0].exc_info is None
+    assert _SENTINEL_BODY not in str(access[0].__dict__)
+    assert len(_error_records(caplog)) == 1
+
+
 # --------------------------------------------------------------------------- #
 # Access log
 # --------------------------------------------------------------------------- #
@@ -1256,3 +1355,181 @@ def test_the_request_id_is_not_derived_from_anything_the_caller_sent(
     assert envelope(first)["request_id"] != envelope(second)["request_id"]
     assert _SENTINEL_ID not in envelope(first)["request_id"]
     assert _SENTINEL_BODY not in envelope(first)["request_id"]
+
+
+# --------------------------------------------------------------------------- #
+# ASGI scope allowlist
+# --------------------------------------------------------------------------- #
+
+
+_WEBSOCKET_SCOPE: Final[str] = "websocket"
+"""The scope type a ``ws://`` route would arrive under.
+
+The probe of choice, because it is the one non-``http`` type Starlette's router
+*already serves*. A middleware that waves it through does not fail loudly; the
+router answers it — with a ``websocket.close`` today, and with a live socket the
+day anyone mounts a ``WebSocketRoute`` — having passed no authentication, no
+ceiling gate and no access line on the way. That is what makes a passthrough
+written for ``lifespan`` a hole rather than a no-op, and why the test has to
+name a type the framework understands.
+"""
+
+
+class _ScopeSpy:
+    """An ASGI app that records the scope types it was handed.
+
+    Attributes:
+        seen: The ``scope["type"]`` of every call, in arrival order.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.seen: list[str] = []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Record the scope type and answer nothing.
+
+        Args:
+            scope: The ASGI scope.
+            receive: Unused — nothing below reads a body here.
+            send: Unused — the spy exists to be *reached*, not to reply.
+        """
+        self.seen.append(str(scope["type"]))
+
+
+async def _no_messages() -> Message:
+    """Return a disconnect, so no layer can block waiting on the channel.
+
+    Returns:
+        A single ``http.disconnect`` message.
+    """
+    return {"type": "http.disconnect"}
+
+
+async def _discard(message: Message) -> None:
+    """Drop an outgoing ASGI message.
+
+    Args:
+        message: The message a layer tried to send. Deliberately unread: these
+            tests assert on what was *reached*, never on what was written.
+    """
+
+
+_LAYERS: Final[tuple[tuple[str, Callable[[ASGIApp], ASGIApp]], ...]] = (
+    ("access-log", AccessLogMiddleware),
+    ("boundary", ErrorBoundaryMiddleware),
+    ("concurrency", lambda app: ConcurrencyLimitMiddleware(app, max_concurrency=1)),
+    (
+        "timeout",
+        lambda app: RequestTimeoutMiddleware(app, timeout_seconds=_TINY_TIMEOUT),
+    ),
+    ("auth", lambda app: BearerAuthMiddleware(app, verifier=verifier())),
+    (
+        "body-size",
+        lambda app: BodySizeLimitMiddleware(app, max_body_bytes=_SMALL_LIMIT),
+    ),
+    ("ceiling", CeilingAdmissionMiddleware),
+)
+"""Every layer of the stack, as ``(id, factory)``, in mounted order."""
+
+_LAYER_IDS: Final[tuple[str, ...]] = tuple(name for name, _ in _LAYERS)
+_LAYER_FACTORIES: Final[tuple[Callable[[ASGIApp], ASGIApp], ...]] = tuple(
+    factory for _, factory in _LAYERS
+)
+
+
+def test_the_scope_tests_cover_the_whole_pinned_stack() -> None:
+    """The parametrization below *is* the stack, in order — not a subset.
+
+    The non-vacuity twin for the two tests that follow. A scope guard is only
+    as good as its least-covered layer: six middlewares refusing a ``websocket``
+    and a seventh waving it through is a stack that waves it through, and a
+    parametrization that silently stopped covering the seventh would keep
+    reporting six green.
+    """
+    spy = _ScopeSpy()
+    assert tuple(type(build(spy)) for build in _LAYER_FACTORIES) == _EXPECTED_STACK
+
+
+@pytest.mark.parametrize("build", _LAYER_FACTORIES, ids=_LAYER_IDS)
+def test_a_websocket_scope_never_reaches_the_app_below(
+    build: Callable[[ASGIApp], ASGIApp],
+) -> None:
+    """Every layer refuses a scope type it does not serve, rather than relaying.
+
+    The passthrough each middleware carries is justified by exactly one scope
+    type — ``lifespan``, whose handshake a middleware that assumed ``http``
+    would break. Written as "anything that is not ``http``", it denies by
+    omission: the allowlist is implicit, and the first ``websocket`` route ever
+    mounted inherits an unauthenticated, unceilinged, unlogged path through
+    all seven layers by default.
+
+    Args:
+        build: Wraps the spy in one layer of the stack.
+    """
+    spy = _ScopeSpy()
+    scope = {"type": _WEBSOCKET_SCOPE, "path": WHEEL_PATH}
+    with pytest.raises(UnsupportedScopeError):
+        run_async(build(spy), scope, _no_messages, _discard)
+    assert spy.seen == []
+
+
+@pytest.mark.parametrize("build", _LAYER_FACTORIES, ids=_LAYER_IDS)
+def test_a_lifespan_scope_still_passes_through(
+    build: Callable[[ASGIApp], ASGIApp],
+) -> None:
+    """The one allowed passthrough stays allowed.
+
+    The companion to the refusal above, and the reason the fix is an allowlist
+    rather than a blanket ``http``-only assertion: a layer that refused
+    ``lifespan`` would break startup, and every test in this suite would fail
+    at ``with client(...)`` rather than at the assertion that found the bug.
+
+    Args:
+        build: Wraps the spy in one layer of the stack.
+    """
+    spy = _ScopeSpy()
+    run_async(build(spy), {"type": LIFESPAN_SCOPE}, _no_messages, _discard)
+    assert spy.seen == [LIFESPAN_SCOPE]
+
+
+def test_a_websocket_scope_does_not_reach_the_assembled_app(
+    vault: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End to end: the router never sees it, and nothing goes out on the wire.
+
+    The layer-by-layer tests above prove each middleware refuses. This proves
+    the assembled application does — which is the claim that matters, because
+    it is the assembled application a server calls.
+
+    Args:
+        vault: A seeded vault.
+        caplog: Captures the access log, which must stay silent.
+    """
+    caplog.set_level(logging.DEBUG, logger=ACCESS_LOGGER_NAME)
+    sent: list[str] = []
+
+    async def observed_send(message: Message) -> None:
+        """Record any message the app tried to send.
+
+        Args:
+            message: The outgoing ASGI message.
+        """
+        sent.append(str(message["type"]))
+
+    app = build_app(vault_path=vault)
+    scope: dict[str, Any] = {
+        "type": _WEBSOCKET_SCOPE,
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "path": WHEEL_PATH,
+        "raw_path": WHEEL_PATH.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "client": _LOOPBACK,
+        "server": _LOOPBACK,
+    }
+    with pytest.raises(UnsupportedScopeError):
+        run_async(app, scope, _no_messages, observed_send)
+    assert sent == []
+    assert _access_records(caplog) == []

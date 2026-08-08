@@ -20,6 +20,13 @@ travels inward; freezing it would mean rebuilding and re-attaching it at four
 layers, and a rebuild is exactly where a field gets dropped. Nothing here is a
 security decision: :class:`creek_mcp.policy.CallerIdentity`, which *is* one,
 stays frozen and is constructed fresh at the single admission site.
+
+**It also owns which ASGI scopes the stack answers at all.** That belongs here
+for the same reason the record does: every layer has to agree, and seven copies
+of the rule are seven places for it to drift. :data:`HTTP_SCOPE` names what the
+stack acts on, :data:`LIFESPAN_SCOPE` names the one thing it relays, and
+:func:`pass_through` is the single site that decides between them and refuses
+everything else (#1124).
 """
 
 from __future__ import annotations
@@ -31,16 +38,32 @@ from uuid import uuid4
 from creek_mcp.tier_ceiling import TierCeiling
 
 if TYPE_CHECKING:
-    from starlette.types import Scope
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
 HTTP_SCOPE: Final[str] = "http"
 """The ASGI scope type every ``/v1`` middleware acts on.
 
-Stated once and imported by all seven. Each of them passes anything else —
-``lifespan`` above all — straight through untouched: a middleware that assumed
-``http`` would break the startup handshake, and the failure would surface as
-every request failing rather than as a middleware bug.
+Stated once and imported by all seven. Anything else goes to
+:func:`pass_through`, which is where the *allowlist* lives.
 """
+
+LIFESPAN_SCOPE: Final[str] = "lifespan"
+"""The one other scope type the ``/v1`` stack hands downward (#1124).
+
+A middleware that assumed ``http`` would break the startup handshake, and the
+failure would surface as every request failing rather than as a middleware bug.
+That is the whole justification for a passthrough, and it justifies exactly one
+scope type — so the passthrough names it, rather than being written as "anything
+that is not ``http``".
+
+The difference is not cosmetic. Denying by omission means the allowlist is
+implicit, and the first ``websocket`` route anyone mounts inherits a path
+through all seven layers that is unauthenticated, unceilinged and unlogged —
+answered by the router rather than refused, because ``websocket`` is a type
+Starlette already serves. There is no live exposure today, which is precisely
+why it is closed now rather than after there is one.
+"""
+
 
 SCOPE_KEY: Final[str] = "creek_mcp.httpapi.context"
 """Where the record lives on the ASGI scope.
@@ -136,3 +159,63 @@ def context_of(scope: Scope) -> RequestContext:
     """
     context: RequestContext = scope[SCOPE_KEY]
     return context
+
+
+class UnsupportedScopeError(RuntimeError):
+    """A scope type the ``/v1`` stack neither serves nor passes through.
+
+    Raised rather than relayed, and raised rather than answered. Relaying is
+    the hole itself. Answering is not available either: the contract's status
+    set is defined for ``http``, and there is no protocol-independent way to
+    refuse an arbitrary scope type — a ``websocket`` would need a
+    ``websocket.close``, and an unknown type has no defined refusal at all.
+
+    Reaching here at all means something was mounted that this stack was never
+    wired for, which is a deployment bug rather than a request-level failure:
+    the connection is never established, nothing is written to the wire, and
+    the ASGI server records the fault. That is a loud failure at wiring time
+    instead of a quiet bypass in production.
+
+    Attributes:
+        scope_type: The refused ``scope["type"]``. Server-supplied — an ASGI
+            server sets it, never the caller — so naming it in the message
+            carries nothing of the request.
+    """
+
+    def __init__(self, scope_type: str) -> None:
+        """Refuse *scope_type*, naming what the stack does serve.
+
+        Args:
+            scope_type: The ``scope["type"]`` that reached a middleware.
+        """
+        super().__init__(
+            f"the /v1 middleware stack serves {HTTP_SCOPE!r} scopes and passes "
+            f"{LIFESPAN_SCOPE!r} through; it refuses {scope_type!r} rather than "
+            "relay it past authentication, the ceiling gate and the access log"
+        )
+        self.scope_type = scope_type
+
+
+async def pass_through(
+    app: ASGIApp, scope: Scope, receive: Receive, send: Send
+) -> None:
+    """Hand a non-``http`` *scope* to *app*, if it is one the stack allows.
+
+    The single statement of the allowlist. Seven middlewares defer to it, so
+    the rule is written once and cannot be seven rules that drift — the same
+    reason :data:`HTTP_SCOPE` is a constant rather than seven string literals.
+
+    Args:
+        app: The next application in the stack.
+        scope: The ASGI scope, already known not to be ``http``.
+        receive: The ASGI receive channel.
+        send: The ASGI send channel.
+
+    Raises:
+        UnsupportedScopeError: For any scope type other than
+            :data:`LIFESPAN_SCOPE`.
+    """
+    scope_type = str(scope["type"])
+    if scope_type != LIFESPAN_SCOPE:
+        raise UnsupportedScopeError(scope_type)
+    await app(scope, receive, send)
