@@ -91,6 +91,17 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
    blocking finding (drop to Gate 1 via the owning specialist) until `CLEAN`.
 8. **Stay scoped.** Implement exactly the issue. Found an unrelated bug?
    `gh issue create` for it and reference in the PR — do not fix it here.
+   **Always apply a priority label** (`--label P1` etc.). An issue filed
+   without one is not "unprioritised": `pick-next.sh` ranks it at
+   `RALPH_DEFAULT_PRIORITY_RANK` (P1), so it jumps ahead of deliberately
+   triaged P2/P3 work on a judgement nobody made. Rubric:
+   - **P1** — correctness or security defect on a reachable production path.
+   - **P2** — a real defect that is latent, cosmetic, or has no production
+     caller.
+   - **P3** — chore, cleanup, or tracked tech debt.
+
+   Pick the tier for the bug you found, not for how much it obstructed you
+   while you worked around it.
 9. **Commit.** Conventional-commit subject (e.g. `feat(link): …`), body
    referencing the issue, ending with the repo trailer:
    `Co-Authored-By: Claude <noreply@anthropic.com>` (kept model-agnostic — a

@@ -70,6 +70,10 @@ So, concretely:
   (`./scripts/fix-all.sh` for autofixable lint/format — never bypass).
 - **Gate 2.5:** dispatch `code-review-orchestrator` over your diff; fix every
   blocker (drop to Gate 1 via the owning specialist) until `CLEAN`.
+- **Filing a follow-up?** Any issue you `gh issue create` for an unrelated bug
+  needs a priority label (`--label P2` etc.) — see PROMPT.md step 8 for the
+  rubric. Unlabelled is not neutral: `pick-next.sh` ranks it P1 by default, so
+  it preempts triaged work on a judgement nobody made (#1011).
 - Commit with a conventional-commit subject and the repo trailer, push your
   branch, and open the PR with `## Summary`, `## Test plan`, `Closes #RALPH_ISSUE`
   (and `Refs #<epic>` if named).
