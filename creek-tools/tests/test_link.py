@@ -2126,3 +2126,154 @@ class TestLinkingPipeline:
         )
         assert fragment.threads == []
         assert "[[Link]]" in updated.threads
+
+
+# ---- Issue #880: bounded, honestly-named clusters ----
+
+
+class TestIssue880Detectors:
+    """Regression tests for message-stream cluster degeneration (#880)."""
+
+    @staticmethod
+    def _embedded_pair_corpus() -> tuple[list[Fragment], dict[str, list[float]]]:
+        """Return three F1 fragments where only two carry an embedding.
+
+        Returns:
+            The fragments and a partial embedding map — the shape of a
+            vault whose embedding cache is mid-rebuild.
+        """
+        now = datetime(2026, 4, 1)
+        fragments = [
+            _make_fragment(
+                f"Kiln notes {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F1,
+                fid=f"frag-880t-{i}",
+            )
+            for i in range(3)
+        ]
+        return fragments, {
+            "frag-880t-0": [1.0, 0.0, 0.0],
+            "frag-880t-1": [1.0, 0.0, 0.0],
+        }
+
+    def test_eddy_id_is_stable_across_runs(self) -> None:
+        """Re-detecting the same cluster yields the same eddy id.
+
+        A random uuid meant every ``creek link`` run rewrote every eddy page
+        under a fresh filename. Segmentation and splitting produce many more,
+        smaller eddies, which multiplies that churn — so eddy identity now
+        mirrors the content-stable thread identity from #718.
+        """
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-880e-{i}" for i in range(6)]
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(ids, offsets, strict=True)
+        ]
+        embeddings = _dense_embeddings(ids)
+
+        first = EddyDetector(embeddings=embeddings).detect_eddies(fragments)
+        second = EddyDetector(embeddings=embeddings).detect_eddies(fragments)
+
+        assert len(first) == 1
+        assert [e.id for e in first] == [e.id for e in second]
+        assert first[0].id.startswith("eddy-")
+
+    def test_eddy_and_thread_pages_carry_a_description(self) -> None:
+        """Generated clusters never ship the empty description they used to.
+
+        Neither detector ever passed ``description``, so 212 of 214
+        linker-written pages in the demo vault shipped ``description: ''``.
+        """
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-880d-{i}" for i in range(6)]
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(ids, offsets, strict=True)
+        ]
+        eddies = EddyDetector(embeddings=_dense_embeddings(ids)).detect_eddies(
+            fragments,
+        )
+        assert eddies
+        assert all(eddy.description.strip() for eddy in eddies)
+
+        thread_frags, _ = self._embedded_pair_corpus()
+        threads = ThreadDetector(now=now).detect_threads(thread_frags)
+        assert threads
+        assert all(thread.description.strip() for thread in threads)
+
+    def test_missing_embedding_does_not_union_on_an_embedded_corpus(self) -> None:
+        """The fail-open is closed: an unembedded fragment does not chain.
+
+        ``_topic_consistent`` returned ``True`` on frequency overlap alone
+        whenever either embedding was absent, so a partially-embedded vault
+        unioned far more aggressively than its similarity gate implied. Two
+        of these three fragments are embedded; the third must not join them.
+        """
+        now = datetime(2026, 4, 1)
+        fragments, embeddings = self._embedded_pair_corpus()
+
+        threads = ThreadDetector(
+            embeddings=embeddings,
+            now=now,
+        ).detect_threads(fragments, min_fragments=3)
+
+        assert threads == []
+
+    def test_missing_embedding_may_union_when_explicitly_opted_in(self) -> None:
+        """The old permissive behaviour survives as a documented opt-in."""
+        now = datetime(2026, 4, 1)
+        fragments, embeddings = self._embedded_pair_corpus()
+
+        threads = ThreadDetector(
+            embeddings=embeddings,
+            now=now,
+            union_without_embeddings=True,
+        ).detect_threads(fragments, min_fragments=3)
+
+        assert len(threads) == 1
+        assert threads[0].fragment_count == 3
+
+    def test_no_embeddings_at_all_still_uses_frequency_only(self) -> None:
+        """A detector with no embeddings keeps its documented fallback.
+
+        Closing the fail-open must not break the frequency-only mode the
+        class docstring has always promised for an unembedded corpus.
+        """
+        now = datetime(2026, 4, 1)
+        fragments, _ = self._embedded_pair_corpus()
+
+        threads = ThreadDetector(now=now).detect_threads(fragments, min_fragments=3)
+
+        assert len(threads) == 1
+        assert threads[0].fragment_count == 3
+
+    def test_colliding_titles_are_disambiguated_within_a_run(self) -> None:
+        """Two clusters that would share a title get distinct wiki-link names.
+
+        ``assign_fragments_to_eddies`` interpolates the title straight into
+        ``[[...]]``, so a collision sends both memberships to whichever page
+        resolves first.
+        """
+        now = datetime(2026, 4, 1)
+        cluster_a = [f"frag-880u-a{i}" for i in range(6)]
+        cluster_b = [f"frag-880u-b{i}" for i in range(6)]
+        embeddings = {fid: [1.0, 0.0, 0.0] for fid in cluster_a}
+        embeddings.update({fid: [0.0, 1.0, 0.0] for fid in cluster_b})
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(cluster_a, offsets, strict=True)
+        ]
+        fragments.extend(
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(cluster_b, offsets, strict=True)
+        )
+
+        eddies = EddyDetector(embeddings=embeddings).detect_eddies(fragments)
+
+        assert len(eddies) == 2
+        assert len({eddy.title for eddy in eddies}) == 2

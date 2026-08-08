@@ -161,7 +161,7 @@ read the threat model below before doing anything else.
 | `llm`            | `LLMRoutingConfig`     | Per-stage provider+model routing (`default` / `classification` / `generation` / `frontend` + a `writing_desk` role map), or a legacy flat `LLMConfig` block. See [LLM providers](#llm-providers). |
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
-| `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
+| `linking`        | `LinkingConfig`        | Embedding/temporal/thread/eddy thresholds, message-stream segmentation, and the cluster-size guardrail. See [ADR-0008](docs/architecture/ADR/0008-bounding-cluster-degeneration-in-message-streams.md). |
 | `classification` | `ClassificationConfig` | Auto-classify sources, confidence threshold, review-required sources. |
 | `context`        | `ContextConfig`        | How non-user content (others' messages, collaborative docs) is handled. |
 | `redaction`      | `RedactionConfig`      | Pattern enable list, exclusion globs, allow-list. |

@@ -162,6 +162,87 @@ class TestLinkingConfig:
         cfg = LinkingConfig(cross_source_aggregation=True)
         assert cfg.cross_source_aggregation is True
 
+    def test_detector_threshold_defaults_match_previous_constants(self) -> None:
+        """Issue #880: the five formerly-hardcoded knobs keep their values.
+
+        These thresholds lived as module-private constants in
+        ``creek.link.eddies`` and ``creek.link.threads``. Exposing them must
+        not change what an existing vault — whose ``creek_config.yaml``
+        predates the keys entirely — computes.
+        """
+        cfg = LinkingConfig()
+        assert cfg.eddy_eps == 0.3
+        assert cfg.eddy_min_samples == 5
+        assert cfg.eddy_correlation_threshold == 0.3
+        assert cfg.thread_window_days == 30
+        assert cfg.thread_similarity_threshold == 0.6
+
+    def test_cluster_limit_defaults(self) -> None:
+        """Issue #880: cluster-ceiling defaults never fire on ordinary vaults."""
+        cfg = LinkingConfig()
+        assert cfg.cluster_size_ceiling == 500
+        assert cfg.cluster_max_fraction == 0.10
+        assert cfg.cluster_split_max_depth == 3
+        assert cfg.eddy_split_eps_step == 0.05
+        assert cfg.thread_split_similarity_step == 0.1
+
+    def test_segmentation_defaults(self) -> None:
+        """Issue #880: only Discord and email are segmented into episodes."""
+        cfg = LinkingConfig()
+        assert cfg.stream_platforms == ["discord", "email"]
+        assert cfg.stream_episode_max_gap_hours == 24
+        assert cfg.stream_episode_max_span_days == 30
+
+    def test_thread_union_without_embeddings_defaults_to_closed(self) -> None:
+        """Issue #880: a partially-embedded vault must not union on frequency."""
+        cfg = LinkingConfig()
+        assert cfg.thread_union_without_embeddings is False
+
+    def test_cluster_max_fraction_accepts_the_documented_opt_out(self) -> None:
+        """``1.0`` disables the ceiling — a cluster may span the whole corpus."""
+        cfg = LinkingConfig(cluster_max_fraction=1.0)
+        assert cfg.cluster_max_fraction == 1.0
+
+    def test_cluster_max_fraction_rejects_zero(self) -> None:
+        """A zero fraction would make every cluster oversized."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            LinkingConfig(cluster_max_fraction=0.0)
+
+    def test_cluster_split_max_depth_accepts_zero(self) -> None:
+        """Depth 0 disables splitting (oversized clusters go straight to noise)."""
+        cfg = LinkingConfig(cluster_split_max_depth=0)
+        assert cfg.cluster_split_max_depth == 0
+
+    def test_cluster_size_ceiling_rejects_zero(self) -> None:
+        """A ceiling below one fragment is nonsensical."""
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            LinkingConfig(cluster_size_ceiling=0)
+
+    def test_eddy_split_eps_step_rejects_one(self) -> None:
+        """A full-width step would drive epsilon past its valid range at once."""
+        with pytest.raises(ValueError, match="less than 1"):
+            LinkingConfig(eddy_split_eps_step=1.0)
+
+    def test_stream_episode_max_gap_hours_rejects_zero(self) -> None:
+        """A zero-hour gap would cut an episode at every message."""
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            LinkingConfig(stream_episode_max_gap_hours=0)
+
+    def test_stream_platforms_accepts_a_known_platform(self) -> None:
+        """Operators may opt extra conversational platforms into segmentation."""
+        cfg = LinkingConfig(stream_platforms=["discord", "chatgpt"])
+        assert cfg.stream_platforms == ["discord", "chatgpt"]
+
+    def test_stream_platforms_rejects_an_unknown_platform(self) -> None:
+        """A typo must fail loudly rather than silently segmenting nothing."""
+        with pytest.raises(ValueError, match="unknown source platform"):
+            LinkingConfig(stream_platforms=["discrod"])
+
+    def test_stream_platforms_accepts_an_empty_list(self) -> None:
+        """An empty list is the documented way to disable segmentation."""
+        cfg = LinkingConfig(stream_platforms=[])
+        assert cfg.stream_platforms == []
+
 
 class TestClassificationConfig:
     """Tests for ClassificationConfig model."""
@@ -609,6 +690,33 @@ class TestLoadConfig:
         assert cfg.ocr.engine == "pytesseract"  # default preserved
         assert cfg.linking.temporal_window_hours == 48
         assert cfg.linking.thread_min_fragments == 3  # default preserved
+
+    def test_loads_cluster_ceiling_override_keeping_sibling_defaults(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Issue #880: one override applies; unset siblings keep their defaults.
+
+        This is the behaviour-preservation guard for vaults whose
+        ``creek_config.yaml`` predates the #880 keys: an operator who tunes a
+        single knob must not silently re-tune the other twelve.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_data = {
+            "linking": {
+                "cluster_max_fraction": 0.05,
+                "stream_platforms": ["discord"],
+            },
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        cfg = load_config(config_file)
+        assert cfg.linking.cluster_max_fraction == 0.05
+        assert cfg.linking.stream_platforms == ["discord"]
+        assert cfg.linking.cluster_size_ceiling == 500
+        assert cfg.linking.eddy_eps == 0.3
+        assert cfg.linking.thread_window_days == 30
+        assert cfg.linking.stream_episode_max_gap_hours == 24
 
     def test_loads_cross_source_aggregation_flag(self, tmp_path: Path) -> None:
         """YAML ``linking.cross_source_aggregation: true`` is honoured."""

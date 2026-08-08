@@ -1914,7 +1914,8 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"{summary.eddies_detected} eddy(ies) detected, "
             f"{summary.eddies_written} eddy file(s) written to 03-Eddies/, "
             f"{summary.member_fragments_updated} fragment(s) updated with "
-            f"`eddies:` wiki-links."
+            f"`eddies:` wiki-links"
+            f"{_format_cluster_stats(summary)}."
         )
     elif summary.method == "temporal":
         body = (
@@ -1927,12 +1928,42 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"{summary.threads_written} page(s) written to "
             "02-Threads/{Active,Dormant,Resolved}/, "
             f"{summary.member_fragments_updated} fragment(s) updated with "
-            "`threads:` wiki-links."
+            "`threads:` wiki-links"
+            f"{_format_cluster_stats(summary)}."
         )
     else:
         msg = f"Unknown link method: {summary.method!r}"
         raise ValueError(msg)
     return f"[bold green]{body}[/bold green]"
+
+
+def _format_cluster_stats(summary: LinkSummary) -> str:
+    """Render the clustering-health clause for a link summary.
+
+    Issue #880: the largest cluster is the one number that tells an
+    operator whether detection degenerated — a single eddy holding 87% of
+    the vault used to be invisible from the CLI. Splits and discards are
+    reported only when they happened, so an ordinary run stays terse; a
+    discard is data loss (those fragments carry no wiki-link at all) and
+    therefore always named when non-zero.
+
+    Args:
+        summary: The link summary being rendered.
+
+    Returns:
+        A clause to append to the method's sentence, starting with ``", "``,
+        or an empty string when nothing was detected.
+    """
+    if summary.largest_cluster_fragments == summary.oversized_discarded == 0:
+        return ""
+    parts = [f"largest cluster: {summary.largest_cluster_fragments} fragment(s)"]
+    if summary.clusters_split:
+        parts.append(f"{summary.clusters_split} oversized cluster(s) re-clustered")
+    if summary.oversized_discarded:
+        parts.append(
+            f"{summary.oversized_discarded} fragment(s) discarded as unsplittable",
+        )
+    return ", " + ", ".join(parts)
 
 
 @app.command()

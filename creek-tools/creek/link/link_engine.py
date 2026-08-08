@@ -96,6 +96,17 @@ class LinkSummary:
             ``02-Threads/{status}/`` by the materialisation step. Equal to
             ``threads_detected`` when every write succeeds; smaller when a
             write fails. Only populated for ``method == "threads"``.
+        largest_cluster_fragments: Member count of the biggest eddy or
+            thread emitted. The operator-visible proof that no cluster
+            swallowed the vault (issue #880); ``0`` when nothing was
+            detected.
+        clusters_split: Clusters that exceeded the configured ceiling and
+            were re-clustered at a tighter parameter.
+        oversized_discarded: Fragments dropped to noise because their
+            cluster stayed above the ceiling even after the split budget
+            was spent. Those fragments carry no ``eddies:``/``threads:``
+            link at all, so a non-zero value is worth an operator's
+            attention.
     """
 
     method: str
@@ -107,6 +118,9 @@ class LinkSummary:
     member_fragments_updated: int = 0
     threads_detected: int = 0
     threads_written: int = 0
+    largest_cluster_fragments: int = 0
+    clusters_split: int = 0
+    oversized_discarded: int = 0
 
 
 def run_link(
@@ -221,7 +235,7 @@ def _run_threads(
         config=config,
         cache_path=cache_path,
     )
-    detector = ThreadDetector(embeddings=embeddings)
+    detector = ThreadDetector.from_linking_config(embeddings, config.linking)
     threads = detector.detect_threads(
         fragments,
         min_fragments=config.linking.thread_min_fragments,
@@ -232,6 +246,8 @@ def _run_threads(
             method="threads",
             fragment_count=len(fragments),
             link_count=0,
+            clusters_split=detector.clusters_split,
+            oversized_discarded=detector.oversized_discarded,
         )
 
     updated_fragments = detector.assign_fragments_to_threads(fragments, threads)
@@ -255,6 +271,9 @@ def _run_threads(
         threads_detected=len(threads),
         threads_written=len(written_paths),
         member_fragments_updated=fragments_updated,
+        largest_cluster_fragments=_largest_cluster(detector.thread_members),
+        clusters_split=detector.clusters_split,
+        oversized_discarded=detector.oversized_discarded,
     )
 
 
@@ -303,7 +322,7 @@ def _run_eddies(
         config=config,
         cache_path=cache_path,
     )
-    detector = EddyDetector(embeddings=embeddings)
+    detector = EddyDetector.from_linking_config(embeddings, config.linking)
     eddies = detector.detect_eddies(
         fragments,
         min_fragments=config.linking.eddy_min_fragments,
@@ -314,6 +333,8 @@ def _run_eddies(
             method="eddies",
             fragment_count=len(fragments),
             link_count=0,
+            clusters_split=detector.clusters_split,
+            oversized_discarded=detector.oversized_discarded,
         )
 
     updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
@@ -337,7 +358,24 @@ def _run_eddies(
         eddies_detected=len(eddies),
         eddies_written=len(written_paths),
         member_fragments_updated=fragments_updated,
+        largest_cluster_fragments=_largest_cluster(detector.eddy_members),
+        clusters_split=detector.clusters_split,
+        oversized_discarded=detector.oversized_discarded,
     )
+
+
+def _largest_cluster(members_by_id: dict[str, list[str]]) -> int:
+    """Return the member count of the biggest cluster in a membership map.
+
+    Args:
+        members_by_id: Cluster ID to member fragment IDs, as exposed by
+            :attr:`EddyDetector.eddy_members` /
+            :attr:`ThreadDetector.thread_members`.
+
+    Returns:
+        The largest membership size, or ``0`` when nothing was detected.
+    """
+    return max((len(members) for members in members_by_id.values()), default=0)
 
 
 def _materialise_link_models(
