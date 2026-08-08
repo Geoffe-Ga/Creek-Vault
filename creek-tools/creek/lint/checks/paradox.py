@@ -17,6 +17,7 @@ from datetime import datetime  # noqa: TC003  # used at runtime as a parameter t
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
 import frontmatter
+import yaml
 from pydantic import ValidationError
 
 from creek.config import load_config
@@ -38,7 +39,7 @@ def _load_fragments(vault_path: Path) -> list[Fragment]:
             try:
                 post = frontmatter.load(str(md_file))
                 fragments.append(Fragment.model_validate(post.metadata))
-            except (OSError, ValueError, ValidationError):
+            except (OSError, ValueError, ValidationError, yaml.YAMLError):
                 continue
     return fragments
 

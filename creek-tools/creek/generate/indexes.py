@@ -4,6 +4,20 @@ Generates Obsidian Dataview-powered index notes for frequencies, threads,
 eddies, temporal views, and source statistics. Each generated note contains
 YAML frontmatter and Dataview query blocks that dynamically aggregate
 vault content.
+
+Every write target is created on demand
+(``mkdir(parents=True, exist_ok=True)``), matching the convention in
+:mod:`creek.vault.writer`. A vault whose folders were renamed, removed, or
+never scaffolded is repaired rather than skipped: issue #1231 recorded the
+opposite behaviour, where a missing ``06-Frequencies/<F*>`` made the whole
+command exit ``0`` having written nothing.
+
+The generated notes are Dataview *queries*, not materialised content, so
+they do not depend on how many fragments a frequency holds. A frequency with
+zero fragments still gets an index; it simply renders an empty table in
+Obsidian. There is therefore no "skip" case at all, which is what keeps the
+missing-directory case unambiguous — if a note is absent, the generator
+never ran.
 """
 
 from __future__ import annotations
@@ -11,9 +25,38 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from creek.models import Frequency
+from creek.scaffold import VAULT_TEMPLATE_DIR
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_FREQUENCY_ROOT = "06-Frequencies"
+"""Vault-relative folder holding the per-frequency subdirectories."""
+
+
+def _canonical_frequency_dirname(freq_code: str) -> str:
+    """Return the folder name ``creek init`` deploys for *freq_code*.
+
+    The canonical names (``F1-Agency``, ``F10-Emptiness``, …) are read from
+    the packaged vault template — the same tree :func:`creek.scaffold
+    .scaffold_vault` copies — rather than restated here, so the two can never
+    drift. A template that carries no folder for *freq_code* falls back to the
+    bare code, which :meth:`IndexGenerator._find_frequency_subdir` also
+    matches, keeping the generator idempotent either way.
+
+    Args:
+        freq_code: Frequency code to resolve (e.g., ``"F1"``).
+
+    Returns:
+        The canonical subdirectory name for *freq_code*.
+    """
+    template_root = VAULT_TEMPLATE_DIR / _FREQUENCY_ROOT
+    if template_root.is_dir():
+        for child in sorted(template_root.iterdir()):
+            if child.is_dir() and child.name.startswith(f"{freq_code}-"):
+                return child.name
+    return freq_code
+
 
 FREQUENCY_NAMES: dict[Frequency, str] = {
     Frequency.F1: "Agency/Survival",
@@ -482,22 +525,25 @@ class IndexGenerator:
     def generate_frequency_indexes(self) -> list[Path]:
         """Generate one index note per frequency in 06-Frequencies/ subdirs.
 
-        Scans existing frequency subdirectories (F1 through F10) and creates
-        a markdown index note in each one containing ontology descriptions,
-        Dataview queries for fragments/threads, dosage comparison tables,
-        statistics, and cross-frequency developmental links.
+        Creates a markdown index note in each frequency subdirectory (F1
+        through F10) containing ontology descriptions, Dataview queries for
+        fragments/threads, dosage comparison tables, statistics, and
+        cross-frequency developmental links.
+
+        A frequency subdirectory that does not exist is **created** under its
+        canonical name rather than skipped (#1231), so the return value always
+        has one entry per frequency.
 
         Returns:
-            List of paths to the generated frequency index files.
+            List of paths to the generated frequency index files — one per
+            entry in :data:`FREQUENCY_NAMES`, in that order.
         """
-        freq_dir = self.vault_path / "06-Frequencies"
+        freq_dir = self.vault_path / _FREQUENCY_ROOT
         generated: list[Path] = []
 
         for freq, name in FREQUENCY_NAMES.items():
             freq_code = freq.value
-            subdir = self._find_frequency_subdir(freq_dir, freq_code)
-            if subdir is None:
-                continue
+            subdir = self._ensure_frequency_subdir(freq_dir, freq_code)
 
             color = FREQUENCY_COLORS[freq]
             frontmatter = {
@@ -553,6 +599,7 @@ class IndexGenerator:
         body += "```\n"
 
         note_path = self.vault_path / "02-Threads" / "Thread-Index.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
         note_path.write_text(_build_note(frontmatter, body), encoding="utf-8")
         return note_path
 
@@ -587,6 +634,7 @@ class IndexGenerator:
         body += "```\n"
 
         note_path = self.vault_path / "03-Eddies" / "Eddy-Map.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
         note_path.write_text(_build_note(frontmatter, body), encoding="utf-8")
         return note_path
 
@@ -628,6 +676,7 @@ class IndexGenerator:
         body += "```\n"
 
         note_path = self.vault_path / "00-Creek-Meta" / "Temporal-Index.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
         note_path.write_text(_build_note(frontmatter, body), encoding="utf-8")
         return note_path
 
@@ -662,6 +711,7 @@ class IndexGenerator:
         body += "```\n"
 
         note_path = self.vault_path / "00-Creek-Meta" / "Source-Index.md"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
         note_path.write_text(_build_note(frontmatter, body), encoding="utf-8")
         return note_path
 
@@ -685,12 +735,34 @@ class IndexGenerator:
         )
         return generated
 
+    @classmethod
+    def _ensure_frequency_subdir(cls, freq_dir: Path, freq_code: str) -> Path:
+        """Return the frequency subdirectory, creating it when it is absent.
+
+        A vault that was reorganised — or never scaffolded — has no
+        ``06-Frequencies/<F*>`` folder to write into. Rather than skip the
+        frequency and report success (#1231), the canonical folder is created
+        under the same name ``creek init`` would deploy.
+
+        Args:
+            freq_dir: The ``06-Frequencies`` directory path (need not exist).
+            freq_code: Frequency code to match (e.g., ``"F1"``).
+
+        Returns:
+            Path to an existing directory ready to be written into.
+        """
+        existing = cls._find_frequency_subdir(freq_dir, freq_code)
+        target = existing or freq_dir / _canonical_frequency_dirname(freq_code)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
     @staticmethod
     def _find_frequency_subdir(freq_dir: Path, freq_code: str) -> Path | None:
         """Find the subdirectory matching a frequency code.
 
-        Scans ``freq_dir`` for a subdirectory whose name starts with
-        the given frequency code (e.g., ``F1``).
+        Matches both the canonical suffixed form (``F1-Agency``) and the bare
+        code (``F1``), so a vault scaffolded either way is honoured rather
+        than duplicated.
 
         Args:
             freq_dir: The 06-Frequencies directory path.
@@ -702,6 +774,8 @@ class IndexGenerator:
         if not freq_dir.is_dir():
             return None
         for child in sorted(freq_dir.iterdir()):
-            if child.is_dir() and child.name.startswith(f"{freq_code}-"):
+            if not child.is_dir():
+                continue
+            if child.name == freq_code or child.name.startswith(f"{freq_code}-"):
                 return child
         return None
