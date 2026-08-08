@@ -23,10 +23,14 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
+from creek.vault.links import build_link_index
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.vault.links import LinkIndex
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +500,12 @@ class StaleReviewScanner:
 class BrokenLinkScanner:
     """Scan fragments for wiki-links and relative links to nonexistent files.
 
-    Builds a set of all known file stems in the vault and checks each
-    link target against it.
+    Wiki-links resolve through :func:`creek.vault.links.build_link_index`,
+    which knows every name a page can be linked by — filename stem,
+    frontmatter ``title``, and each ``aliases`` entry. Matching stems alone
+    (the behaviour before #887) called 99.2% of the demo vault's links
+    broken, because the linkers write date-prefixed filenames and put the
+    human-readable name in ``aliases``.
     """
 
     def scan(self, vault_path: Path) -> BrokenLinkResult:
@@ -513,13 +521,13 @@ class BrokenLinkScanner:
             A :class:`BrokenLinkResult` with broken link details.
         """
         fragment_files = _list_fragment_files(vault_path)
-        all_stems = {f.stem for f in _list_all_md_files(vault_path)}
+        link_index = build_link_index(vault_path)
 
         broken_links: dict[str, list[str]] = {}
         total_broken = 0
 
         for frag_file in fragment_files:
-            file_broken = self._check_file(frag_file, all_stems, vault_path)
+            file_broken = self._check_file(frag_file, link_index, vault_path)
             if file_broken:
                 broken_links[str(frag_file)] = file_broken
                 total_broken += len(file_broken)
@@ -533,14 +541,16 @@ class BrokenLinkScanner:
     def _check_file(
         self,
         frag_file: Path,
-        all_stems: set[str],
+        link_index: LinkIndex,
         vault_path: Path,
     ) -> list[str]:
         """Check a single file for broken links.
 
         Args:
             frag_file: Path to the fragment file.
-            all_stems: Set of all known file stems in the vault.
+            link_index: Vault-wide name → page index. A wiki-link is broken
+                only when nothing in the vault answers to its target under
+                any of its names.
             vault_path: Root of the vault for resolving relative paths.
 
         Returns:
@@ -550,7 +560,7 @@ class BrokenLinkScanner:
         broken: list[str] = [
             f"[[{target}]]"
             for target in _extract_wikilinks(content)
-            if target not in all_stems
+            if target not in link_index
         ]
 
         broken.extend(
