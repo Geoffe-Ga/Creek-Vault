@@ -5,7 +5,7 @@ description: >-
   when you consider adding noqa, type-ignore, pylint-disable, or similar
   bypasses. Fix the root cause instead. Covers complexity refactoring,
   type fixes, and argument reduction patterns.
-  Do NOT use for general code quality guidance (use vibe or stay-green).
+  Do NOT use for general code quality guidance (use stay-green).
 metadata:
   author: Geoff
   version: 1.0.0

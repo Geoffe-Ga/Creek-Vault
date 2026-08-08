@@ -116,16 +116,12 @@ CREEK_TOOLS_CLAUDE_MD = CREEK_TOOLS_DIR / "CLAUDE.md"
 # collapses to a subtree (or to nothing) instead of passing on an empty sweep.
 MINIMUM_TRACKED_MARKDOWN_FILES = 200
 
-# The only files allowed in the fence-exception list. Every one of them is
-# broken by the same CommonMark nesting trap and is tracked by issue #1193.
-# Growing this set is a deliberate edit to a test, not a config tweak.
-KNOWN_FENCE_EXCEPTIONS = frozenset(
-    {
-        ".claude/skills/architectural-decisions/references/examples.md",
-        ".claude/skills/spec-decomposition/references/templates.md",
-        "creek-tools/.claude/skills/architectural-decisions.md",
-    }
-)
+# The only files allowed in the fence-exception list. It is empty: the three
+# files issue #1193 owned were all broken by the same CommonMark nesting trap
+# and were all deleted by the context prune, so the fence check now runs
+# unexempted over every tracked Markdown file. Growing this set is a
+# deliberate edit to a test, not a config tweak.
+KNOWN_FENCE_EXCEPTIONS: frozenset[str] = frozenset()
 
 _ISSUE_REFERENCE = re.compile(r"#\d+")
 _H2_HEADING = re.compile(r"^## +\S")
@@ -600,15 +596,20 @@ def test_every_same_file_anchor_link_resolves_to_a_heading() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_fence_exceptions_file_exists_and_is_not_empty() -> None:
-    """The exception file exists and parses to at least one entry.
+def test_fence_exceptions_file_exists_and_parses() -> None:
+    """The exception file exists and parses.
 
-    Without this, deleting the file (or emptying it) would turn the
-    "entries must still be broken" and "reasons must cite an issue" tests
-    below into no-ops that pass by iterating nothing.
+    The list is legitimately empty: every file it once exempted has been
+    deleted. Emptiness is therefore no longer the failure mode it was --
+    with nothing exempted,
+    :func:`test_every_tracked_markdown_file_has_balanced_code_fences`
+    covers every tracked file directly, so a file cannot hide by being
+    dropped from this list. What still has to hold is that the file is
+    present and parseable: a missing or malformed list would make
+    ``load_fence_exceptions`` raise rather than silently exempt nothing.
     """
     assert EXCEPTIONS_FILE.is_file(), f"Missing {EXCEPTIONS_FILE}"
-    assert load_fence_exceptions(EXCEPTIONS_FILE)
+    assert load_fence_exceptions(EXCEPTIONS_FILE) == {}
 
 
 def test_no_fence_exception_names_an_untracked_file() -> None:

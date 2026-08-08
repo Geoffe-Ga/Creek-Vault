@@ -13,9 +13,8 @@ description: >-
   `COMMENTS` it files each actionable item as a follow-up GitHub issue and
   then squash-merges; on `CHANGES_REQUESTED` it loops until LGTM.
   Do NOT use for giving a review (use comprehensive-pr-review), debugging CI
-  failures themselves (use ci-debugging), general TDD work outside review
-  context (use stay-green), bug RCA (use bug-squashing-methodology), or
-  issue/branch/PR creation (use git-workflow).
+  failures themselves (use ci-debugging), or general TDD work outside review
+  context (use stay-green).
 metadata:
   author: Geoff
   version: 1.2.0
@@ -46,7 +45,7 @@ Before touching code, restate each review item as a 6-component micro-prompt so 
 - **Examples** — if the reviewer suggested code, paste it verbatim.
 - **Constraints** — keep blast radius small; preserve public API; add a regression test.
 
-If a comment is ambiguous on any component, reply asking for clarification rather than guessing. See `prompt-engineering` for the full framework.
+If a comment is ambiguous on any component, reply asking for clarification rather than guessing.
 
 ## Instructions
 
@@ -98,7 +97,7 @@ The Claude review is a single comment with sections (Strengths / Security Concer
 
 Also pull any **line-level** review threads via `mcp__github__pull_request_read` with `method: "get_review_comments"` and merge them into the same table — these come back with `isResolved` metadata so you can ignore already-resolved threads.
 
-Apply the prompt-engineering framing above. Drop or push back on items that are out of scope, factually wrong, or already addressed — reply with a short justification instead of changing code.
+Apply the 6-component framing above. Drop or push back on items that are out of scope, factually wrong, or already addressed — reply with a short justification instead of changing code.
 
 ### Step 3: Fix Locally with TDD — Never Push to Probe CI
 

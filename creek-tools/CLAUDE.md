@@ -352,8 +352,8 @@ creek-tools/
 
 Significant architectural decisions live in
 [`docs/architecture/ADR/`](docs/architecture/ADR/) as numbered Markdown
-files. Skill guidance for *how* to write a decision record lives at
-the repository-level `.claude/skills/architectural-decisions/SKILL.md`.
+files. Follow the numbering and structure of the existing records when
+adding one.
 
 ### 5.4 Slash commands (FEAT-016)
 
