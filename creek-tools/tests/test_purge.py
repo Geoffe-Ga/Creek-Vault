@@ -1100,7 +1100,7 @@ def test_fragment_purge_nul_byte_origin_key_is_noop(tmp_path: Path) -> None:
     """A NUL byte in ``source.origin_key`` is a no-op, never an error (#950).
 
     The journal-staging twin of the stub-pointer case: the same
-    unguarded ``Path.resolve()`` sits in ``_purge_journal_staged_entry``,
+    unguarded ``Path.resolve()`` sits in ``_purge_staged_source_entry``,
     so a NUL in the origin key aborts the purge of an intimate journal
     fragment with a bare :class:`ValueError` instead of skipping the
     unusable key and deleting the fragment.
@@ -1355,6 +1355,280 @@ def test_journal_purge_audit_records_count(tmp_path: Path) -> None:
     intent, outcome = entries
     assert intent.journal_staged_removed == 0
     assert outcome.journal_staged_removed == 1
+
+
+# ---------------------------------------------------------------------------
+# Engine tests — upload staged-source sweep (#1023)
+# ---------------------------------------------------------------------------
+
+_UPLOAD_STAGING_DIR = "00-Creek-Meta/adepthood/uploads"
+"""Where ``upload_tool`` stages uploaded document bytes (the ledger key root)."""
+
+_UPLOAD_SECRET = b"synthetic-upload-secret-1023"
+"""Synthetic marker standing in for uploaded document content — never real data."""
+
+
+def _write_upload_fragment_with_staged(
+    vault: Path,
+    frag_id: str,
+    title: str,
+    *,
+    origin_key: str | None = None,
+    write_staged: bool = True,
+) -> tuple[Path, Path]:
+    """Write a document fragment plus the staged upload bytes it points at.
+
+    Mirrors :func:`_write_journal_fragment_with_staged` for the upload
+    surface (#1023), with two deliberate differences that decide whether
+    these tests can catch a half-fix:
+
+    * The staged file is a ``.pdf``, not a ``.md``. A markdown staged
+      file would pass against a fix that widened the sweep but never
+      gave a non-markdown source an ``origin_key``.
+    * Its content is raw, non-UTF-8 bytes carrying
+      :data:`_UPLOAD_SECRET`, exactly as ``creek.upload`` stages an
+      uploaded document byte-for-byte.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID for the fragment's frontmatter.
+        title: Fragment title (also the staged file's stem by default).
+        origin_key: Vault-relative pointer recorded in the fragment's
+            ``source.origin_key``. Defaults to the canonical uploads
+            staging path for *title*.
+        write_staged: When ``False``, record the pointer but do not
+            create the staged file on disk.
+
+    Returns:
+        Tuple of ``(fragment_path, staged_path)``.
+    """
+    key = origin_key or f"{_UPLOAD_STAGING_DIR}/{title}.pdf"
+    staged_path = vault / key
+    if write_staged:
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        # 0xFF is invalid UTF-8: proof that a text-based sweep cannot
+        # even read what an upload leaves behind.
+        staged_path.write_bytes(b"%PDF-1.7\n\xff\x00" + _UPLOAD_SECRET + b"\n")
+
+    frag_path = vault / "01-Fragments" / "Notes" / f"{title}.md"
+    frag_post = frontmatter.Post(
+        content="A document fragment summary.\n",
+        id=frag_id,
+        title=title,
+        type="fragment",
+        source={
+            "platform": "document",
+            "origin_key": key,
+            "original_file": str(staged_path),
+        },
+        threads=[],
+        eddies=[],
+        privacy_tier="private",
+    )
+    frag_path.parent.mkdir(parents=True, exist_ok=True)
+    frag_path.write_text(frontmatter.dumps(frag_post), encoding="utf-8")
+    return frag_path, staged_path
+
+
+def _vault_files_containing_upload_secret(vault: Path) -> list[Path]:
+    """Return every vault file whose raw bytes still carry the upload secret.
+
+    Deliberately byte-based and extension-agnostic:
+    :func:`_vault_files_containing_secret` globs ``*.md`` and calls
+    ``read_text``, so it would both miss a staged ``.pdf`` and raise
+    :class:`UnicodeDecodeError` if it were pointed at one. The RTBF
+    contract is vault-wide and format-blind — after a purge,
+    :data:`_UPLOAD_SECRET` must appear in **no** file under the vault
+    root, whatever its suffix.
+
+    Args:
+        vault: Vault root to walk.
+
+    Returns:
+        Offending paths — empty when the purge honored the RTBF request.
+    """
+    return [
+        path
+        for path in sorted(vault.rglob("*"))
+        if path.is_file() and _UPLOAD_SECRET in path.read_bytes()
+    ]
+
+
+def test_fragment_purge_removes_an_upload_staged_source_file(tmp_path: Path) -> None:
+    """Purging an upload-sourced fragment deletes its staged bytes (#1023)."""
+    vault = _make_vault(tmp_path)
+    frag, staged = _write_upload_fragment_with_staged(vault, "frag-U", "report-one")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-U")
+
+    assert result.journal_staged_removed == 1
+    assert not frag.exists()
+    assert not staged.exists()
+    # The RTBF core: the uploaded document survives NOWHERE under the vault.
+    assert _vault_files_containing_upload_secret(vault) == []
+
+
+def test_source_purge_removes_an_upload_staged_source_file(tmp_path: Path) -> None:
+    """``purge_source("document")`` sweeps the staged upload too (#1023).
+
+    Pins the shared ``_purge_single`` path that serves both source-scoped
+    and daterange purges, not only the single-fragment path.
+    """
+    vault = _make_vault(tmp_path)
+    _frag, staged = _write_upload_fragment_with_staged(vault, "frag-U", "report-one")
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_source("document")
+
+    assert result.fragments_affected == 1
+    assert result.journal_staged_removed == 1
+    assert not staged.exists()
+    assert _vault_files_containing_upload_secret(vault) == []
+
+
+def test_vault_purge_wipes_the_uploads_staging_dir(tmp_path: Path) -> None:
+    """``purge_vault`` wipes *every* Adepthood staging root (#1023).
+
+    ``00-Creek-Meta/`` is exempt from the content-folder wipe, so both
+    staging dirs need an explicit sweep. Staged files are source
+    material, not fragments, so ``fragments_affected`` must still match
+    a twin vault that never had them.
+    """
+    vault = _make_vault(tmp_path)
+    _frag_a, staged_a = _write_upload_fragment_with_staged(
+        vault,
+        "frag-U1",
+        "report-one",
+    )
+    _frag_b, staged_b = _write_upload_fragment_with_staged(
+        vault,
+        "frag-U2",
+        "report-two",
+    )
+    _frag_j, staged_j = _write_journal_fragment_with_staged(
+        vault,
+        "frag-J1",
+        "entry-one",
+    )
+    twin = _make_vault(tmp_path / "twin")
+    for twin_id, twin_title in [("frag-U1", "report-one"), ("frag-U2", "report-two")]:
+        _write_upload_fragment_with_staged(
+            twin,
+            twin_id,
+            twin_title,
+            write_staged=False,
+        )
+    _write_journal_fragment_with_staged(
+        twin,
+        "frag-J1",
+        "entry-one",
+        write_staged=False,
+    )
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+    twin_result = PurgeEngine(twin).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.journal_staged_removed == 3
+    assert not staged_a.exists()
+    assert not staged_b.exists()
+    assert not staged_j.exists()
+    assert _vault_files_containing_upload_secret(vault) == []
+    assert _vault_files_containing_secret(vault) == []
+    # Staged files never inflate the fragment count.
+    assert result.fragments_affected == twin_result.fragments_affected
+
+
+def test_upload_staged_dry_run_previews_without_deleting(tmp_path: Path) -> None:
+    """Dry-run counts the staged upload it would delete but leaves it on disk.
+
+    The counter increments only *after* the containment and ``is_file()``
+    guards, so a dry run can never preview a deletion the real run would
+    refuse.
+    """
+    vault = _make_vault(tmp_path)
+    frag, staged = _write_upload_fragment_with_staged(vault, "frag-U", "report-one")
+
+    frag_result = PurgeEngine(vault, dry_run=True).purge_fragment("frag-U")
+
+    assert frag_result.journal_staged_removed == 1
+    assert frag.exists()
+    assert staged.exists()
+
+    vault_result = PurgeEngine(vault, dry_run=True).purge_vault(
+        VAULT_PURGE_CONFIRMATION,
+    )
+
+    assert vault_result.journal_staged_removed == 1
+    assert staged.exists()
+
+
+def test_an_origin_key_outside_every_staging_root_is_skipped(tmp_path: Path) -> None:
+    """Widening the sweep ADDS a staging root — it never drops the guard.
+
+    The twin of ``test_journal_staged_pointer_outside_vault_skipped`` for
+    the upload fixture. A pointer escaping the vault root and a pointer
+    at a vault file outside *every* staging root must both survive, each
+    with a zero counter, while the fragment itself is still deleted.
+    """
+    vault = _make_vault(tmp_path)
+    # Variant 1: the pointer escapes the vault root entirely.
+    frag_out, outside = _write_upload_fragment_with_staged(
+        vault,
+        "frag-out",
+        "escapee",
+        origin_key="../outside-secret.pdf",
+    )
+
+    result_out = PurgeEngine(vault).purge_fragment("frag-out")
+
+    assert result_out.journal_staged_removed == 0
+    assert not frag_out.exists()
+    assert outside.exists()
+    assert _UPLOAD_SECRET in outside.read_bytes()
+
+    # Variant 2: the pointer stays inside the vault but outside both
+    # staging roots (staging-dir scope guard).
+    frag_in, decoy = _write_upload_fragment_with_staged(
+        vault,
+        "frag-in",
+        "decoyed",
+        origin_key="01-Fragments/decoy.md",
+    )
+
+    result_in = PurgeEngine(vault).purge_fragment("frag-in")
+
+    assert result_in.journal_staged_removed == 0
+    assert not frag_in.exists()
+    assert decoy.exists()
+    assert _UPLOAD_SECRET in decoy.read_bytes()
+
+
+def test_a_subdirectory_in_a_staging_dir_does_not_abort_a_vault_purge(
+    tmp_path: Path,
+) -> None:
+    """A subdirectory under a staging dir must not abort the vault purge.
+
+    The wipe loop iterates the staging dir non-recursively, so an
+    ``unlink`` with no ``is_file()`` guard raises an ``OSError`` on any
+    subdirectory (``IsADirectoryError`` on Linux, ``PermissionError`` on
+    macOS) — and ``_run_audited`` then closes the audit
+    ``status="partial"`` and re-raises, aborting the whole RTBF request.
+    Verified load-bearing: deleting the ``is_file()`` guard fails this
+    test.
+    """
+    vault = _make_vault(tmp_path)
+    _frag, staged = _write_upload_fragment_with_staged(vault, "frag-U", "report-one")
+    (staged.parent / "nested").mkdir()
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    # The directory is not a staged file, so it is never counted.
+    assert result.journal_staged_removed == 1
+    assert not staged.exists()
+    entries = PurgeAuditLog(vault).read()
+    assert [entry.phase for entry in entries] == ["intent", "outcome"]
+    assert entries[1].status == "complete"
 
 
 # ---------------------------------------------------------------------------

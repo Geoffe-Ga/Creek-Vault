@@ -116,8 +116,6 @@ leak surface, to guard against a write this gate now refuses.
 
 from __future__ import annotations
 
-import hashlib
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -131,6 +129,7 @@ from creek.ingest.pipeline import derive_source_key, ledger_for_source, run_inge
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
+from creek_mcp.staged_names import safe_stem
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, write_tier_allowed
 
 if TYPE_CHECKING:
@@ -151,22 +150,10 @@ _JOURNAL_INBOX = JOURNAL_STAGING_RELDIR
 # Where JOURNAL-platform fragments are routed by the writer — recorded as the
 # audit ``created_path`` (mirrors ingest_tool's dir-level created_path).
 _FRAGMENT_ROUTING_DIR = Path("01-Fragments/Journal")
-_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _safe_stem(external_id: str) -> str:
-    """Return a filesystem-safe, *collision-free*, stable stem for *external_id*.
-
-    A readable slug prefix aids debugging, but the trailing hash of the RAW
-    external id is what guarantees the mapping is injective — two distinct ids
-    that slug to the same string (e.g. ``"a/b"`` and ``"a-b"``) still get
-    distinct stems, so the idempotency key never collides. Deterministic, so the
-    same external id always resolves to the same staged path (hence the same
-    ledger source-key → idempotent re-send / edit-in-place).
-    """
-    slug = _SLUG_RE.sub("-", external_id).strip("-")[:80]
-    digest = hashlib.sha256(external_id.encode("utf-8")).hexdigest()[:12]
-    return f"{slug}-{digest}" if slug else digest
+# The staged-name derivation now lives in creek_mcp.staged_names so this tool
+# and ``creek.upload`` cannot compute two different stems for one external id
+# (#1023). Aliased so the rest of the module reads unchanged.
+_safe_stem = safe_stem
 
 
 def _staged_path(vault_path: Path, external_id: str) -> Path:

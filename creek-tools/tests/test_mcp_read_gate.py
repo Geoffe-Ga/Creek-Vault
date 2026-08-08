@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import importlib
 import inspect
 import json
@@ -106,6 +107,7 @@ from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
 from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
+from creek_mcp.tools.upload import upload_tool
 from creek_mcp.tools.wheel import wheel_tool
 
 if TYPE_CHECKING:
@@ -125,7 +127,7 @@ if TYPE_CHECKING:
 # METADATA_ONLY (or upgrades a tracked gap to a gate it never grew) fails.
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 23
+_EXPECTED_TOOL_COUNT = 24
 
 _EXPECTED_PRIMITIVES = frozenset({"refuse_above_ceiling", "iter_admitted_fragments"})
 
@@ -178,6 +180,15 @@ _PINNED_GATE_ROWS = [
     # the behaviour from drifting apart — the property the deleted
     # ``test_journal_is_pinned_as_no_unsupplied_read`` used to hold.
     ("creek.journal", "creek_mcp.tools.journal", "refuse_above_ceiling"),
+    # ``creek.upload`` (#1023) is born gated, on the same rule and through the
+    # same primitive as ``creek.journal``: its idempotent update-in-place
+    # destroys whatever fragment an ``external_id`` already maps to, so you may
+    # only overwrite what you could have read. Pinned as its own row rather
+    # than left to layers (a)-(c) alone because the pair is the checkable part
+    # — ``write_tier_allowed`` also runs in that module, on the *incoming*
+    # tier, and a manifest re-pointed at it would read as a gate while
+    # answering a different question entirely.
+    ("creek.upload", "creek_mcp.tools.upload", "refuse_above_ceiling"),
     # #972 closed the redact gap, and this row is a re-point of the same kind
     # #968/#969/#970 made. The gap entry it replaces was recorded as
     # CALLER_NAMED_PATHS until the #932 review: the caller *does* name the
@@ -563,7 +574,7 @@ def test_tool_postures_cover_every_registered_tool(
 
 
 def test_registered_tool_count_is_pinned(registered_tools: dict[str, Tool]) -> None:
-    """The MCP surface is 23 tools; growing it is a deliberate act.
+    """The MCP surface is 24 tools; growing it is a deliberate act.
 
     A bare count is a cheap tripwire against the one edit the set-equality test
     above cannot see: adding a tool *and* a matching posture entry in a single
@@ -1295,6 +1306,21 @@ _JOURNAL_PROBE_TS = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
 # tidier response.
 _JOURNAL_REPLACEMENT_CANARY = "CANARY-RUNTIME-JOURNAL-REPLACEMENT-3a6c"
 
+# ``creek.upload``'s probe writes its own document, for the same reason
+# ``creek.journal``'s does: the gate resolves its target through the *upload*
+# source ledger, so a fragment that never arrived through this tool has no
+# record and the call would be a plain creation. The payload is deliberately a
+# ``.md``: it routes to the markdown ingestor, which needs nothing beyond the
+# standard library and ``python-frontmatter``, where a ``.png`` would need the
+# tesseract system binary and an ``.xlsx`` an optional extra — either would
+# make layer (f) environment-dependent.
+_UPLOAD_PROBE_EXTERNAL_ID = "runtime-probe-upload-1023"
+_UPLOAD_PROBE_FILENAME = "runtime-probe.md"
+# The refused caller's own bytes, which must reach no file in the vault — the
+# staged copy under 00-Creek-Meta/adepthood/uploads/ included, since that is
+# what makes the gate's position above ``_stage_upload`` checkable.
+_UPLOAD_REPLACEMENT_CANARY = "CANARY-RUNTIME-UPLOAD-REPLACEMENT-8f52"
+
 _PROBE_EXEMPT: dict[str, str] = {
     "creek.draft": (
         "draft_tool needs a DraftGenerator driven over a deployed skills tree; "
@@ -1621,6 +1647,88 @@ def _probe_journal(vault: Path) -> dict[str, Any]:
     return _journal_overwrite_at_open(vault)
 
 
+def _upload_b64(text: str) -> str:
+    """Return the base64 of *text*, derived here rather than hardcoded.
+
+    Args:
+        text: The document body to encode.
+
+    Returns:
+        The ASCII base64 string ``creek.upload`` takes as ``content_base64``.
+    """
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _seed_upload_canary(vault: Path) -> None:
+    """Upload one ``intimate`` document the later overwrite attempt targets.
+
+    The same argument :func:`_seed_journal_canary` makes, one tool over: the
+    gate resolves its target through the upload source ledger, keyed on the
+    staged file's stable path, so the fixture's own fragments are invisible to
+    it and a probe over them would be a plain creation. ``canary_vault`` is a
+    bare fragment vault, so the meta subtree is created first.
+
+    Seeded at ``ceiling=all`` so the intimate document is genuinely admitted
+    and genuinely stored — the probe below then attempts to destroy it from
+    ``ceiling=open``.
+
+    Args:
+        vault: The seeded canary vault, mutated in place.
+    """
+    for sub in ("00-Creek-Meta/State", "00-Creek-Meta/audit"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+    seeded = upload_tool(
+        vault_path=vault,
+        filename=_UPLOAD_PROBE_FILENAME,
+        content_base64=_upload_b64(
+            f"Intimate upload canary body {_RUNTIME_INTIMATE_CANARY}",
+        ),
+        external_id=_UPLOAD_PROBE_EXTERNAL_ID,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert seeded["status"] == "ok"
+    assert seeded["action"] == "created"
+
+
+def _upload_overwrite_at_open(vault: Path) -> dict[str, Any]:
+    """Re-send the seeded ``external_id`` as ``open`` bytes at ``ceiling=open``.
+
+    The incoming tier is ``open``, so the pre-existing ``write_tier_allowed``
+    gate admits it; only a gate that ranks the tier of the fragment being
+    *overwritten* refuses this call.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return upload_tool(
+        vault_path=vault,
+        filename=_UPLOAD_PROBE_FILENAME,
+        content_base64=_upload_b64(
+            f"Open replacement body {_UPLOAD_REPLACEMENT_CANARY}",
+        ),
+        external_id=_UPLOAD_PROBE_EXTERNAL_ID,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _probe_upload(vault: Path) -> dict[str, Any]:
+    """Upload an intimate document, then attempt to overwrite it at ``open``.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope for the overwrite attempt.
+    """
+    _seed_upload_canary(vault)
+    return _upload_overwrite_at_open(vault)
+
+
 _REDACT_PII_LINE = "Reach me at someone@example.com any time."
 """One real ``email`` match, so a redact scan of the file yields findings.
 
@@ -1740,6 +1848,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.state.render": _probe_state_render,
     "creek.state.read": _probe_state_read,
     "creek.journal": _probe_journal,
+    "creek.upload": _probe_upload,
     "creek.redact.scan": _probe_redact_scan,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
@@ -2189,6 +2298,81 @@ def test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched(
         reason=GENERIC_ABOVE_CEILING_REASON,
     ), (
         "creek.journal's refusal carries keys beyond the canonical four. Every "
+        "extra key is derived from a fragment the caller was not admitted to — "
+        f"including the id it resolved.\n\n{response}"
+    )
+
+
+def test_upload_probe_refuses_and_leaves_the_staged_document_untouched(
+    canary_vault: Path,
+) -> None:
+    """``creek.upload``'s evidence is the bytes on disk, not the envelope (#1023).
+
+    Read this as ``creek.journal``'s test one tool over, and for the same
+    reason: the shared assertion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling``
+    passes **vacuously** here. An above-ceiling overwrite is answered with the
+    canonical four-key refusal, which carries no content — and an *ungated*
+    tool would answer ``status="ok"`` with a fragment id and no canary either.
+    A green layer (f) is therefore not evidence that this write path is gated.
+
+    Two artifacts are checked because ``creek.upload`` writes two, and only one
+    of them is a fragment. The staged document under
+    ``00-Creek-Meta/adepthood/uploads/`` is the sharper of the pair: it holds
+    the caller's bytes verbatim with no frontmatter and hence no escalate-only
+    ratchet, so a gate placed below :func:`creek_mcp.tools.upload._stage_upload`
+    would return a correct-looking refusal over an intimate document it had
+    already overwritten. The seeded canary is asserted present in those bytes
+    first, as the positive control: without it every exclusion below would hold
+    over a vault where nothing was ever staged.
+    """
+    _seed_upload_canary(canary_vault)
+    staged_files = [
+        path
+        for path in sorted(
+            (canary_vault / "00-Creek-Meta" / "adepthood" / "uploads").rglob("*"),
+        )
+        if path.is_file()
+    ]
+    assert len(staged_files) == 1, (
+        "the upload probe's intimate document is not on disk as exactly one "
+        f"staged file, so every assertion below is vacuous: {staged_files}"
+    )
+    staged_before = staged_files[0].read_bytes()
+    assert _RUNTIME_INTIMATE_CANARY.encode() in staged_before
+    fragments_before = _fragment_bytes(canary_vault)
+
+    response = _upload_overwrite_at_open(canary_vault)
+
+    assert staged_files[0].read_bytes() == staged_before, (
+        "creek.upload restaged over an intimate document for a caller at "
+        "privacy_tier_ceiling=open. The refusal it returned is correct and "
+        "arrived too late: the staged bytes carry no privacy_tier of their "
+        "own, so nothing downstream could have restored them."
+    )
+    assert _fragment_bytes(canary_vault) == fragments_before, (
+        "creek.upload's update-in-place rewrote an intimate fragment for a "
+        "caller at privacy_tier_ceiling=open. The response envelope carries "
+        "no content either way, so nothing in layer (f)'s shared canary sweep "
+        "could have caught this."
+    )
+    leaked = [
+        path
+        for path in sorted(canary_vault.rglob("*"))
+        if path.is_file() and _UPLOAD_REPLACEMENT_CANARY.encode() in path.read_bytes()
+    ]
+    assert leaked == [], (
+        f"the refused caller's own bytes were written to the vault anyway: "
+        f"{leaked}. Swept over raw bytes rather than over *.md text, because "
+        "an upload's staged file can be a .docx or a .pdf that no text read "
+        "would survive."
+    )
+    assert response == refusal_response(
+        tool="creek.upload",
+        ceiling=TierCeiling.OPEN,
+        reason=GENERIC_ABOVE_CEILING_REASON,
+    ), (
+        "creek.upload's refusal carries keys beyond the canonical four. Every "
         "extra key is derived from a fragment the caller was not admitted to — "
         f"including the id it resolved.\n\n{response}"
     )

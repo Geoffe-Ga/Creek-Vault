@@ -4,7 +4,10 @@ Stdio transport per the FEAT-010 pre-decided choice. Five read tools
 landed in FEAT-010; FEAT-011 adds seven write tools — ``creek.save``,
 ``creek.ingest``, ``creek.classify``, ``creek.link``, ``creek.report``,
 ``creek.skills.refresh``, and ``creek.compile``. All share the same
-audit-log + tier-ceiling substrate.
+audit-log + tier-ceiling substrate. ``creek.upload`` (#1023) is the
+Adepthood byte-staging surface: it takes one document's base64 bytes and
+ingests them through the same ledger-backed pipeline ``creek.journal``
+uses for text.
 
 The bootstrap is a single function so it can be exercised by unit
 tests (``build_server``) and serve as the ``creek-tools-mcp`` entry
@@ -60,6 +63,7 @@ from creek_mcp.tools import (
     skills_refresh_tool,
     state_read_tool,
     state_render_tool,
+    upload_tool,
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
@@ -133,7 +137,7 @@ def _effective_consumer(default: str) -> str:
     while a local stdio call keeps the process-global ``CREEK_MCP_CONSUMER``.
     The rule itself is :func:`creek_mcp.policy.effective_consumer`; all this
     adds is MCP's answer to "who is calling", rebuilt for the request in flight.
-    Kept module-level under this exact name because the 23 tool closures below
+    Kept module-level under this exact name because the 24 tool closures below
     call it on every request.
     """
     return effective_consumer(_caller_identity(), default)
@@ -421,6 +425,27 @@ def build_server(
         return journal_ingest_tool(
             vault_path=vault,
             content=content,
+            external_id=external_id,
+            timestamp=timestamp,
+            tier=tier,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.upload")
+    def _upload(
+        filename: str,
+        content_base64: str,
+        external_id: str,
+        timestamp: str | None = None,
+        tier: str = "open",
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Stage one uploaded document's bytes and ingest it as a vault fragment."""
+        return upload_tool(
+            vault_path=vault,
+            filename=filename,
+            content_base64=content_base64,
             external_id=external_id,
             timestamp=timestamp,
             tier=tier,

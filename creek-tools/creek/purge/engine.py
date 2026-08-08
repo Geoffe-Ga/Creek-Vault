@@ -40,7 +40,7 @@ import frontmatter
 import yaml
 from pydantic import BaseModel, Field
 
-from creek.ingest.journal_staging import JOURNAL_STAGING_RELDIR
+from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
@@ -193,12 +193,16 @@ class PurgeResult(BaseModel):
             deleted under ``10-Liminal/Compost/intimate-stubs/`` because
             a purged note carried a ``saved_from.intimate_body_pointer``
             at them (GAP-012). Counted-only in a dry run.
-        journal_staged_removed: Number of staged journal source files
-            deleted under ``00-Creek-Meta/adepthood/journal/`` because
-            the fragment they produced was purged (issue #845). The
-            staged file holds the entry's full plaintext body, so
-            leaving it behind would defeat the RTBF request.
-            Counted-only in a dry run.
+        journal_staged_removed: Number of staged Adepthood source files
+            deleted under ``00-Creek-Meta/adepthood/journal/`` or
+            ``00-Creek-Meta/adepthood/uploads/`` because the fragment
+            they produced was purged (issues #845, #1023). The staged
+            file holds the entry's full plaintext body or the uploaded
+            document's bytes, so leaving it behind would defeat the
+            RTBF request. Counted-only in a dry run. The field keeps its
+            journal-era name because it is serialised into the
+            append-only ``purge.jsonl``, where a rename would break
+            every existing log.
     """
 
     operation: str
@@ -294,7 +298,7 @@ class PurgeEngine:
                 eddy_ids,
             )
             self._purge_intimate_stub(post, result)
-            self._purge_journal_staged_entry(post, result)
+            self._purge_staged_source_entry(post, result)
             if not self.dry_run:
                 frag_file.unlink()
             result.embeddings_removed = self._purge_cache_for(
@@ -535,7 +539,7 @@ class PurgeEngine:
                     continue
                 self._wipe_folder_contents(folder_path, result)
             result.fragments_affected = len(result.deleted_files)
-            self._wipe_journal_staging(result)
+            self._wipe_adepthood_staging(result)
             result.embeddings_removed = self._delete_cache_file()
 
         return self._run_audited(result, body)
@@ -653,7 +657,7 @@ class PurgeEngine:
             eddy_ids,
         )
         self._purge_intimate_stub(post, result)
-        self._purge_journal_staged_entry(post, result)
+        self._purge_staged_source_entry(post, result)
         if not self.dry_run:
             frag_file.unlink()
 
@@ -799,20 +803,43 @@ class PurgeEngine:
             return pointer
         return None
 
-    def _purge_journal_staged_entry(
+    def _in_any_staging_root(self, path: Path) -> bool:
+        """Report whether *path* lies inside an Adepthood staging root.
+
+        The containment guard behind :meth:`_purge_staged_source_entry`,
+        factored out so the guard reads as one condition however many
+        roots :data:`~creek.ingest.journal_staging.ADEPTHOOD_STAGING_RELDIRS`
+        grows to hold.
+
+        Args:
+            path: An already vault-contained absolute path (the output of
+                :meth:`_resolve_pointer_in_vault`).
+
+        Returns:
+            ``True`` when *path* is inside at least one staging root.
+        """
+        return any(
+            path.is_relative_to((self.vault_path / reldir).resolve())
+            for reldir in ADEPTHOOD_STAGING_RELDIRS
+        )
+
+    def _purge_staged_source_entry(
         self,
         post: frontmatter.Post,
         result: PurgeResult,
     ) -> None:
-        """Sweep the staged journal body a purged fragment points at (#845).
+        """Sweep the staged source a purged fragment points at (#845/#1023).
 
-        ``creek.journal`` (the MCP tool) stages each Adepthood entry's
-        full body as a markdown file under
-        ``00-Creek-Meta/adepthood/journal/`` and records that
-        vault-relative path in the fragment's ``source.origin_key``. A
-        scoped purge that deletes the fragment must follow that key and
-        delete the staged file too, or the full — often intimate —
-        entry body survives the right-to-be-forgotten request.
+        Adepthood stages the content it captures under the vault and
+        records the vault-relative path in the fragment's
+        ``source.origin_key``: ``creek.journal`` writes each entry's
+        full body as markdown under
+        ``00-Creek-Meta/adepthood/journal/``, and ``creek.upload``
+        writes each uploaded document's bytes verbatim under
+        ``00-Creek-Meta/adepthood/uploads/``. A scoped purge that
+        deletes the fragment must follow that key and delete the staged
+        file too, or the full — often intimate — source content
+        survives the right-to-be-forgotten request.
 
         The method is defensive, and now shares that defence with
         :meth:`_purge_intimate_stub` in both directions: a missing or
@@ -820,9 +847,11 @@ class PurgeEngine:
         and a key that resolves outside the vault root are all no-ops
         rather than errors (see :meth:`_resolve_pointer_in_vault`). A
         second containment guard additionally scopes deletion to the
-        staging directory itself, so a hand-edited or malicious
+        staging directories themselves
+        (:meth:`_in_any_staging_root`), so a hand-edited or malicious
         ``origin_key`` (``../x``, ``01-Fragments/other.md``) can never
-        steer a delete at an arbitrary vault file.
+        steer a delete at an arbitrary vault file. #1023 widened that
+        guard to every declared staging root; it never relaxed it.
 
         Args:
             post: Frontmatter of the fragment being purged.
@@ -839,13 +868,12 @@ class PurgeEngine:
         )
         if staged_path is None:
             return
-        staging_root = (self.vault_path / JOURNAL_STAGING_RELDIR).resolve()
-        if not staged_path.is_relative_to(staging_root):
+        if not self._in_any_staging_root(staged_path):
             logger.warning(
                 "Ignoring source.origin_key %r that resolves outside "
-                "the journal staging dir %s",
+                "the Adepthood staging dirs %s",
                 origin_key,
-                staging_root,
+                [str(reldir) for reldir in ADEPTHOOD_STAGING_RELDIRS],
             )
             return
         if not staged_path.is_file():
@@ -854,31 +882,45 @@ class PurgeEngine:
         if not self.dry_run:
             staged_path.unlink(missing_ok=True)
 
-    def _wipe_journal_staging(self, result: PurgeResult) -> None:
-        """Wipe every staged journal entry body during a vault purge (#845).
+    def _wipe_adepthood_staging(self, result: PurgeResult) -> None:
+        """Wipe every Adepthood staging root during a vault purge (#845/#1023).
 
         ``purge_vault`` deliberately preserves ``00-Creek-Meta/``
         (config marker, audit log), so the content-folder wipe never
         reaches the staged journal bodies under
-        ``00-Creek-Meta/adepthood/journal/`` — they must be swept
-        explicitly or full entry plaintext survives a whole-vault RTBF
+        ``00-Creek-Meta/adepthood/journal/`` or the staged upload bytes
+        under ``00-Creek-Meta/adepthood/uploads/`` — they must be swept
+        explicitly or full source plaintext survives a whole-vault RTBF
         request. Staged files are source material, not fragments, so
         they are counted on ``journal_staged_removed`` only — never
         appended to ``deleted_files`` and never inflating
         ``fragments_affected``.
+
+        The walk is non-recursive by design (the staging layouts are
+        flat), so anything that is not a file — a subdirectory an
+        operator or a future tool dropped in — is skipped rather than
+        unlinked. A bare ``unlink`` on a directory raises an
+        ``OSError`` (``IsADirectoryError`` on Linux, ``PermissionError``
+        on macOS), which :meth:`_run_audited` turns into a
+        ``status="partial"`` outcome and re-raises, aborting the entire
+        vault purge — so the guard is what stops one stray directory
+        from defeating a whole RTBF request.
 
         Args:
             result: Result accumulator; ``journal_staged_removed`` is
                 incremented per staged file removed (or counted-only in
                 a dry run).
         """
-        staging_dir = self.vault_path / JOURNAL_STAGING_RELDIR
-        if not staging_dir.is_dir():
-            return
-        for staged_file in sorted(staging_dir.iterdir()):
-            result.journal_staged_removed += 1
-            if not self.dry_run:
-                staged_file.unlink()
+        for reldir in ADEPTHOOD_STAGING_RELDIRS:
+            staging_dir = self.vault_path / reldir
+            if not staging_dir.is_dir():
+                continue
+            for staged_file in sorted(staging_dir.iterdir()):
+                if not staged_file.is_file():
+                    continue
+                result.journal_staged_removed += 1
+                if not self.dry_run:
+                    staged_file.unlink(missing_ok=True)
 
     def _find_fragment_by_id(
         self,

@@ -89,12 +89,16 @@ class PurgeAuditEntry(BaseModel):
             ``saved_from.intimate_body_pointer`` (GAP-012). Zero for
             notes that carry no pointer, dry-runs count what *would* be
             removed, and an already-missing stub does not increment it.
-        journal_staged_removed: Number of staged journal source files
-            deleted under ``00-Creek-Meta/adepthood/journal/`` because
-            the fragment they produced was purged, or because a
-            whole-vault purge swept the staging dir (issue #845). Zero
-            for fragments with no ``source.origin_key``; dry-runs count
-            what *would* be removed.
+        journal_staged_removed: Number of staged Adepthood source files
+            deleted under ``00-Creek-Meta/adepthood/journal/`` or
+            ``00-Creek-Meta/adepthood/uploads/`` because the fragment
+            they produced was purged, or because a whole-vault purge
+            swept the staging dirs (issues #845, #1023). Zero for
+            fragments with no ``source.origin_key``; dry-runs count
+            what *would* be removed. The field keeps its journal-era
+            name because it is serialised into the append-only
+            ``purge.jsonl``, where a rename would break every existing
+            log.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before

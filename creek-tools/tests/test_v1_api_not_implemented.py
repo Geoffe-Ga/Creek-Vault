@@ -332,6 +332,7 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
 @pytest.mark.parametrize(
     ("minor", "expected"),
     [
+        ("0.3", _UNSUPPORTED_STATUS),
         ("0.2", _UNSUPPORTED_STATUS),
         ("0.2.0", _INCOMPATIBLE_STATUS),
         ("0.2.1", _INCOMPATIBLE_STATUS),
@@ -340,17 +341,33 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
         ("v0.2", _INCOMPATIBLE_STATUS),
         ("", _INCOMPATIBLE_STATUS),
     ],
-    ids=["minor", "patch", "other-patch", "wrong-minor", "padded", "prefixed", "empty"],
+    ids=[
+        "current-minor",
+        "minor",
+        "patch",
+        "other-patch",
+        "wrong-minor",
+        "padded",
+        "prefixed",
+        "empty",
+    ],
 )
 def test_the_version_header_is_matched_strictly(
     vault: Path, minor: str, expected: int
 ) -> None:
     """``major.minor`` exactly — no liberal parsing, no whitespace repair.
 
-    ``0.2.0`` is the *full* contract version and is deliberately refused: the
-    header's published grammar is ``major.minor``, and a server that accepted
-    both spellings would let two clients disagree about which one is canonical
-    while both appearing to work.
+    Both served minors reach the handler: ``0.3`` is the current one and
+    ``0.2`` is retained by :data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS`
+    because no ``/v1`` wire shape changed when the contract moved. The ``0.2``
+    row is the tripwire for a *narrowed* window — if it ever goes red, a
+    contract bump shifted the supported set instead of widening it and every
+    existing client started getting ``incompatible_version``.
+
+    ``0.2.0`` spells a served minor with a patch component and is deliberately
+    refused: the header's published grammar is ``major.minor``, and a server
+    that accepted both spellings would let two clients disagree about which one
+    is canonical while both appearing to work.
 
     Args:
         vault: A seeded vault.

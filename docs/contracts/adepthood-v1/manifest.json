@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.2.0",
+  "contract_version": "0.3.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "abff9182a8c5fe4f4a32ad1d96118dfd14d85dbf7b1a48406ff2c34be3145426",
+      "sha256": "2956901a0c383882ad7f367a7c3e10990b72d415a60e45db149b17d14236f243",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "5c4618983b0196b4484b2604fedd6b9bbb02c54b6e414223b4c879fed689e7a1",
+      "sha256": "7c5abacac357729c9d976d509010cd42df4d76c177068af4cf43118c77c7397b",
       "state": "success"
     },
     {
@@ -209,7 +209,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "6858b7e7646166bc2ae3870edc3d31516d9a5acaba28fea3d353a838773443ef",
+      "sha256": "7eebce0435939cfe6a00f1687aa98edd3d666ac43aa258d9e0973edfc90a5a46",
       "state": null
     },
     {
@@ -237,7 +237,7 @@
       "capability": null,
       "model": "ErrorEnvelope",
       "path": "schemas/ErrorEnvelope.schema.json",
-      "sha256": "c1bb9eacb78da59fe790ba3df123bda365c62e3ddbcb89ca2bc0f9a7507414af",
+      "sha256": "28bca19dc4baf715b676906d291cb8d1155f435baee950a3e1a31656d9f2df31",
       "state": null
     },
     {

@@ -11,7 +11,7 @@
       "type": "string"
     },
     "Capability": {
-      "description": "The four capabilities ``/v1`` publishes at contract 0.2.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.",
+      "description": "The four capabilities ``/v1`` publishes.\n\nThe list is identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS`: contract 0.3 grew the *MCP* tool surface\n(``creek.upload``, #1023) and added no ``/v1`` route, so a ``0.2`` client\nand a ``0.3`` client are answered from the same four names.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.",
       "enum": [
         "capabilities",
         "journal-upsert",
