@@ -202,7 +202,24 @@ include = ["creek", "creek.*", "creek_mcp", "creek_mcp.*"]
 "creek.generate.exemplars" = ["*.yaml"]
 
 [tool.pytest.ini_options]
-minversion = "7.0"
+# pytest 9 is required: this config uses the `strict_markers` / `strict_config`
+# ini options introduced there. uv.lock pins 9.0.3, so this only bites an
+# unpinned fallback install, and it bites with a clear pytest error rather than
+# silently ignoring the strictness settings below.
+minversion = "9.0"
+
+# Strictness is set as INI OPTIONS, not only as the `--strict-markers` /
+# `--strict-config` flags in `addopts` below. Under pytest 9 those flags are
+# honoured when typed on the command line but do NOT take effect from
+# `addopts`: an unregistered marker degraded to a PytestUnknownMarkWarning and
+# the run still exited 0. That made the strictness illusory — a typo'd
+# `@pytest.mark.integraton` would silently drop a test out of the blocking
+# lane, which is precisely the "gate that looks green but tests nothing"
+# failure this suite's CI lanes exist to prevent. The flags stay in `addopts`
+# for anyone invoking pytest directly; these two lines are what actually bind.
+strict_markers = true
+strict_config = true
+
 addopts = [
     "-ra",
     "--strict-markers",
@@ -215,9 +232,22 @@ addopts = [
     "--cov-report=xml",
     "--cov-fail-under=90",
 ]
+# Lane markers. A test carries at most one of integration/e2e/live; anything
+# unmarked is a unit test. `--strict-markers` (above) makes a typo'd or retired
+# marker name a collection error rather than a silently-empty selection.
+#
+#   BLOCKING IN CI (.github/workflows/ci.yml, job `integration-e2e`):
+#     integration, e2e — both must be hermetic, or the merge gate is flaky.
+#   NOT IN CI:
+#     live  — needs credentials/services CI does not have (run it by hand).
+#     slow  — benchmarks, too slow for the merge path.
+#
+# Run each lane through ./scripts/test.sh (--integration/--e2e/--live), which
+# owns the marker expressions and the --no-cov policy for the non-unit lanes.
 markers = [
-    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
-    "e2e: marks tests as end-to-end tests (deselect with '-m \"not e2e\"')",
+    "integration: hermetic cross-component tests — no network, no API keys, no real vault; BLOCKING in CI (deselect with '-m \"not integration\"')",
+    "e2e: hermetic end-to-end journeys through the CLI against a synthetic vault; BLOCKING in CI (deselect with '-m \"not e2e\"')",
+    "live: opt-in smokes needing a real provider key or a reachable local service; never run in CI, and each skips cleanly when its credential/service is absent (deselect with '-m \"not live\"')",
     "slow: marks tests as slow benchmarks (deselect with '-m \"not slow\"')",
 ]
 testpaths = ["tests"]

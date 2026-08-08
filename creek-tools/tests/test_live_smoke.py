@@ -6,12 +6,14 @@ the things mocks paper over (valid model ids, stop-reason enums, usage field
 names) are exactly what drift. Each test here proves the full round-trip
 (auth → request → normalized ``Completion``) against the live API.
 
-These tests are ``integration``-marked, so the default test selection and CI
-never run (or bill) them. Each one also skips cleanly when its provider's
-API key is absent. To smoke a provider when onboarding a new model id::
+These tests are ``live``-marked, so neither the default test selection nor any
+CI lane runs (or bills) them — CI holds no provider credentials, and a gate
+that depends on a paid third-party API is a flaky gate. Each one also skips
+cleanly when its provider's API key is absent. To smoke a provider when
+onboarding a new model id::
 
-    ./scripts/test.sh --integration -k openai
-    CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --integration -k openai
+    ./scripts/test.sh --live -k openai
+    CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --live -k openai
 
 ``CREEK_SMOKE_MODEL`` overrides the provider's default model for the run;
 unset, each provider exercises its own ``DEFAULT_MODELS`` entry.
@@ -36,7 +38,7 @@ from creek.config import LLMConfig
 if TYPE_CHECKING:
     from creek.classify.llm.completion import Completion
 
-pytestmark = pytest.mark.integration
+pytestmark = pytest.mark.live
 
 _PROMPT = "Reply with exactly the word OK and nothing else."
 

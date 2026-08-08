@@ -135,8 +135,8 @@ system package without asking.
 2. Optional live smoke (only with the key + consent set), per the README — run
    it from the `creek-tools/` subproject directory (the `scripts/` live there,
    not at the repo root):
-   `cd <repo>/creek-tools && ./scripts/test.sh --integration -k anthropic` (or
-   `CREEK_SMOKE_MODEL=<id> ./scripts/test.sh --integration -k <provider>`).
+   `cd <repo>/creek-tools && ./scripts/test.sh --live -k anthropic` (or
+   `CREEK_SMOKE_MODEL=<id> ./scripts/test.sh --live -k <provider>`).
 3. Print a **per-stage summary table**: stage → provider → model → ready? Then
    tell the user the Intimate guarantee below is already in force.
 
