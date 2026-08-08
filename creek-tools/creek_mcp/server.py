@@ -14,10 +14,9 @@ point (``main``).
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
@@ -64,6 +63,7 @@ from creek_mcp.tools import (
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -78,6 +78,16 @@ if TYPE_CHECKING:
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
 
 SERVER_NAME = "creek-tools-mcp"
+
+DEFAULT_MCP_NETWORK_PORT: Final[int] = 8000
+"""Default ``--port`` for the MCP network transport.
+
+Named rather than left as a bare literal so the ``/v1`` HTTP adapter can assert
+it picked a *different* one (#1074). The two adapters are meant to run side by
+side on one host, so a shared default would make the second one to start fail
+with ``address already in use`` — a collision that is trivial to prevent and
+annoying to diagnose. The value itself is unchanged.
+"""
 
 
 def _current_access_token() -> AccessToken | None:
@@ -767,7 +777,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--port", type=int, default=8000, help="Network transport bind port."
+        "--port",
+        type=int,
+        default=DEFAULT_MCP_NETWORK_PORT,
+        help="Network transport bind port.",
     )
     parser.add_argument(
         "--tls-cert",
@@ -790,61 +803,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _is_loopback(host: str) -> bool:
-    """Return whether *host* is a loopback bind (safe for plaintext transport).
-
-    Loopback traffic never leaves the machine, so serving bearer-token auth
-    without TLS is acceptable there — and only there.
-
-    Args:
-        host: The ``--host`` value: an IP literal or a hostname.
-
-    Returns:
-        ``True`` for loopback IPs (``127.0.0.0/8``, ``::1``) and the literal
-        ``"localhost"`` (case-insensitive); ``False`` for everything else,
-        including ``""``, wildcard binds, other hostnames, and strings that
-        do not parse as an IP address at all.
-    """
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        # Not an IP literal (hostname, empty, garbage): assume routable.
-        return False
-
-
-def _require_transport_confidentiality(
-    parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> None:
-    """Refuse network configurations that would put bearer tokens on the wire.
-
-    Enforces, in order: ``--tls-cert``/``--tls-key`` come as a pair; both
-    files exist on disk; and a non-loopback ``--host`` is only served when
-    TLS is configured. Each violation exits via :meth:`argparse.ArgumentParser.error`
-    (nonzero exit, message on stderr) *before* any socket is opened (#837).
-
-    Args:
-        parser: The CLI parser, used to report errors in argparse style.
-        args: Parsed arguments carrying ``host``, ``tls_cert``, ``tls_key``.
-    """
-    if (args.tls_cert is None) != (args.tls_key is None):
-        parser.error(
-            "--tls-cert and --tls-key are required together; supply both "
-            "(or neither, for a loopback-only bind)"
-        )
-    if args.tls_cert is not None:
-        for flag, path in (("--tls-cert", args.tls_cert), ("--tls-key", args.tls_key)):
-            if not path.exists():
-                parser.error(f"{flag}: file not found: {path}")
-        return
-    if not _is_loopback(args.host):
-        parser.error(
-            f"refusing to serve on non-loopback host {args.host!r} without TLS: "
-            "bearer tokens would transit the network in cleartext. Bind "
-            "127.0.0.1, terminate TLS in a reverse proxy, or pass "
-            "--tls-cert/--tls-key"
-        )
+# Back-compat aliases for the posture gate that moved to
+# ``creek_mcp.transport_posture`` in #1074, so ``/v1`` and MCP share one
+# implementation instead of two that can drift. Kept under the original private
+# names because they are reached by name from ``main`` and from
+# ``tests/test_mcp_remote.py``; the move is behaviour-preserving, and the proof
+# is that not one of those tests needed editing. Retiring the aliases once
+# nothing imports them is tracked as a follow-up.
+_is_loopback = is_loopback
+_require_transport_confidentiality = require_transport_confidentiality
 
 
 def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
