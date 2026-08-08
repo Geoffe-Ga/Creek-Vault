@@ -94,7 +94,11 @@ The compost note records:
 - **Links to referencing fragments** — wiki-links so the compost stays reachable.
 - **Verifier metadata** — `embedding_similarity` and `verifier_reasoning` round-trip into frontmatter so the operator can audit decisions later.
 
-Output: `10-Liminal/Compost/<id>.md` (canonical) or `10-Liminal/Compost/Review/<id>.md` (ambiguous, awaiting triage). CLI: `creek report --type compost`.
+Output: `10-Liminal/Compost/<id>.md` (canonical) or `10-Liminal/Compost/Review/<id>.md` (ambiguous, awaiting triage).
+
+Detection (#882): `creek compost scan [--vault PATH] [--no-llm] [--dry-run] [--embedding-threshold 0.7]`. The production entry point — runs the embedding gate over the vault, prints the candidate counts and the resulting LLM-call estimate *before* verifying so the cost is refusable, then files confirmed candidates canonically and ambiguous ones to the review queue. `--no-llm` runs the gate alone and files every hit to the review queue: an embedding match on its own is a suspicion, not a finding, so it is never asserted as canonical compost. Without `--no-llm` an unavailable provider is a hard refusal rather than a silent downgrade, because this command writes to the vault. Intimate-tier fragments are dropped before the gate and never reach a provider. Re-scanning is idempotent — sources already carrying a compost note are skipped and reported, spending no LLM calls.
+
+`creek fill --with-compost` then regenerates `10-Liminal/Compost/_Compost-Report.md`, the Dataview overview across whatever the scan filed.
 
 Calibration (FEAT-028): `creek compost calibrate [--fixture FIXTURE.yaml] [--json PATH] [--floor-recall 0.8] [--floor-precision 0.85] [--no-verifier]`. Runs the two-stage detector against a hand-labelled fixture (default: `tests/fixtures/compost-calibration.yaml`, 20+ positives × 20+ false-positive-risk negatives) and reports recall, precision, F1, false-positive rate, and per-stage hit counts (embedding-passed / verifier-yes / verifier-no / routed-to-review). `--floor-recall` and `--floor-precision` exit non-zero on a regression so a CI job can gate on detector quality. `--no-verifier` runs embedding-only for offline calibration.
 
