@@ -605,3 +605,114 @@ def test_resend_after_purge_restages_cleanly(tmp_path: Path) -> None:
     assert resent["status"] == "ok"
     assert len(_fragments(vault)) == 1
     assert staged.is_file()
+
+
+# ---- Review findings on PR #1230 ----
+
+
+def test_resending_an_id_under_a_new_extension_is_refused(tmp_path: Path) -> None:
+    """One ``external_id`` maps to one fragment, whatever the filename says.
+
+    The staged path carries the extension (``route_to_ingestor`` dispatches on
+    it), so the ledger key does too. A re-send under a different extension
+    therefore lands on a path with no ledger record and reads as a *creation* —
+    silently forking the id into a second live fragment and orphaning the
+    first one's staged bytes, which a purge by the returned ``fragment_id``
+    would then leave on disk. That is a hole in the RTBF coverage this tool
+    exists to provide, so the fork is refused instead.
+    """
+    vault = _vault(tmp_path)
+
+    first = upload_tool(
+        vault_path=vault,
+        filename="notes.txt",
+        content_base64=_b64(b"The original document body."),
+        external_id="u-swap",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert first["status"] == "ok"
+    assert len(_staged(vault)) == 1
+
+    second = upload_tool(
+        vault_path=vault,
+        filename="notes.md",
+        content_base64=_b64(b"A different body under the same id."),
+        external_id="u-swap",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert second["status"] == "refused"
+    assert set(second) == {"status", "tool", "tier_ceiling", "reason"}
+    assert ".txt" in second["reason"]
+    # No second fragment, and no second staged file to orphan.
+    assert len(_fragments(vault)) == 1
+    assert len(_staged(vault)) == 1
+    assert _leaking_files(vault, b"A different body under the same id.") == []
+
+
+def test_an_intimate_upload_is_not_reachable_through_a_changed_extension(
+    tmp_path: Path,
+) -> None:
+    """The #970 gate surveys the whole id, not just the incoming path.
+
+    Ranking only the exact target path would admit an ``open`` caller at an id
+    whose intimate fragment happens to be staged under another extension —
+    the overwrite gate would see no ledger record there and read a creation.
+    """
+    vault = _vault(tmp_path)
+
+    seeded = upload_tool(
+        vault_path=vault,
+        filename="tender.txt",
+        content_base64=_b64(b"Something intimate."),
+        external_id="u-mixed",
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert seeded["status"] == "ok"
+
+    attempt = upload_tool(
+        vault_path=vault,
+        filename="tender.md",
+        content_base64=_b64(b"Benign replacement."),
+        external_id="u-mixed",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert attempt["status"] == "refused"
+    # The generic reason: it must not disclose the protected tier, and must not
+    # fall through to the extension-conflict reason, which would.
+    assert attempt["reason"] == GENERIC_ABOVE_CEILING_REASON
+    assert len(_staged(vault)) == 1
+    assert _leaking_files(vault, b"Benign replacement.") == []
+
+
+def test_a_missing_vault_is_refused_without_writing_anything(tmp_path: Path) -> None:
+    """The 'vault unavailable' refusal must not recreate the vault it denies.
+
+    ``SourceLedger.load`` returns an EMPTY ledger rather than raising when the
+    vault is gone, so the #970 gate read the call as a creation and let it
+    through to staging, whose ``mkdir(parents=True)`` rebuilt the tree and
+    wrote the caller's bytes into a vault the very same response called
+    unavailable. Every other refusal in this module is side-effect-free.
+    """
+    missing = tmp_path / "gone"
+    payload = b"Bytes that must never reach disk."
+
+    result = upload_tool(
+        vault_path=missing,
+        filename="notes.txt",
+        content_base64=_b64(payload),
+        external_id="u-novault",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert set(result) == {"status", "tool", "tier_ceiling", "reason"}
+    assert result["reason"] == "vault unavailable"
+    # Nothing was created: not the vault, not the staging tree, not the audit log.
+    assert not missing.exists()

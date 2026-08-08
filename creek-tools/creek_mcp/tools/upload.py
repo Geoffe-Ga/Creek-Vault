@@ -158,8 +158,8 @@ def _resolve_fragment_id(vault_path: Path, staged: Path) -> str | None:
     return record.fragment_id if record is not None else None
 
 
-def _existing_tier(vault_path: Path, fragment_id: str) -> PrivacyTier:
-    """Return the CURRENT vault tier of *fragment_id*, failing closed.
+def _existing_tier(vault_path: Path, fragment_ids: list[str]) -> PrivacyTier:
+    """Return the most sensitive CURRENT vault tier across *fragment_ids*.
 
     A deliberate local twin of :func:`creek_mcp.tools.journal._existing_tier`,
     whose docstring carries the full rationale (read the tier out of the
@@ -171,15 +171,53 @@ def _existing_tier(vault_path: Path, fragment_id: str) -> PrivacyTier:
     manifest's AST check; de-duplicating the pair into a shared helper is a
     follow-up, not a change to make while the gate ordering is in flight.
 
+    Takes the whole set an ``external_id`` owns rather than one id, because
+    the same id can hold staged files under several extensions and the gate
+    must rank against the most sensitive of them.
+
     Args:
         vault_path: Vault root.
-        fragment_id: The id the upload ledger resolved for this staged file.
+        fragment_ids: Every id the upload ledger resolved for this
+            ``external_id``.
 
     Returns:
-        The fragment's current tier, or ``INTIMATE`` when the id resolves to
-        no readable fragment.
+        The most sensitive current tier, or ``INTIMATE`` when none of the ids
+        resolves to a readable fragment.
     """
-    return max_source_tier(source_tiers(vault_path, [fragment_id]))
+    return max_source_tier(source_tiers(vault_path, fragment_ids))
+
+
+def _staged_for_id(vault_path: Path, external_id: str) -> list[Path]:
+    """Return every staged upload bound to *external_id*, whatever its extension.
+
+    The staged filename is ``<stem><suffix>``, so the ledger — which keys on
+    that path — actually keys identity on ``(external_id, extension)`` rather
+    than on ``external_id`` alone. This function recovers the id-only view the
+    tool's contract promises, and is what stops a re-send under a changed
+    extension from silently forking into a second, unrelated fragment while
+    orphaning the first one's staged bytes (a hole in the RTBF coverage this
+    tool exists to provide).
+
+    Matching is on the full name, not :attr:`Path.stem`: ``safe_stem`` permits
+    ``.`` in its slug, so ``Path("a.b-<digest>.pdf").stem`` is ``a.b-<digest>``
+    and a stem comparison would mis-group unrelated ids.
+
+    Args:
+        vault_path: Vault root.
+        external_id: The caller's idempotency key.
+
+    Returns:
+        Sorted staged paths, or ``[]`` when the staging dir does not exist.
+    """
+    stem = safe_stem(external_id)
+    staging = vault_path / UPLOAD_STAGING_RELDIR
+    if not staging.is_dir():
+        return []
+    return sorted(
+        path
+        for path in staging.iterdir()
+        if path.is_file() and (path.name == stem or path.name.startswith(f"{stem}."))
+    )
 
 
 def _refuse_unadmitted_overwrite(
@@ -187,11 +225,17 @@ def _refuse_unadmitted_overwrite(
 ) -> dict[str, Any] | None:
     """Refuse an upload that would destroy content *ceiling* cannot read (#970).
 
+    The tier surveyed is the **most sensitive** across every fragment this
+    ``external_id`` already owns, not merely the one at the incoming
+    extension's path. Surveying only the exact target path would let a caller
+    at ``ceiling=open`` reach an id whose intimate fragment is staged under a
+    different extension, and be admitted as a creation.
+
     Args:
         vault_path: Vault root.
         external_id: The caller's idempotency key.
-        filename: The caller's original filename, needed to derive the staged
-            path the ledger keys on.
+        filename: Accepted for signature symmetry with the staging helpers;
+            the survey is id-wide and deliberately does not depend on it.
         ceiling: The caller's admission ceiling.
 
     Returns:
@@ -200,10 +244,67 @@ def _refuse_unadmitted_overwrite(
         at every ceiling. Otherwise the canonical four-key refusal, which
         names neither the resolved fragment nor its tier.
     """
-    staged = _upload_staged_path(vault_path, external_id, filename)
-    existing_id = _resolve_fragment_id(vault_path, staged)
-    existing = None if existing_id is None else _existing_tier(vault_path, existing_id)
+    del filename
+    ids = [
+        fragment_id
+        for staged in _staged_for_id(vault_path, external_id)
+        if (fragment_id := _resolve_fragment_id(vault_path, staged)) is not None
+    ]
+    existing = None if not ids else _existing_tier(vault_path, ids)
     return refuse_above_ceiling(tool=TOOL_NAME, content_tier=existing, ceiling=ceiling)
+
+
+def _refuse_extension_conflict(
+    vault_path: Path, external_id: str, filename: str, ceiling: TierCeiling
+) -> dict[str, Any] | None:
+    """Refuse a re-send that would fork *external_id* onto a second extension.
+
+    The contract is that one ``external_id`` maps to one fragment. Because the
+    ingestor is chosen from the staged file's suffix, the staged path — and so
+    the ledger key — must carry that suffix, so a re-send under a different
+    extension lands on a path with no ledger record and reads as a *creation*.
+    The result would be two live fragments for one id, with the earlier one's
+    staged bytes orphaned: still on disk, but no longer reachable from the
+    ``fragment_id`` the caller holds, so a purge by that id leaves them behind.
+
+    Refusing is the honest resolution. Genuinely re-typing a document means
+    purging the existing fragment or choosing a new id, and either is one
+    explicit call the caller can make.
+
+    Runs **after** the #970 gate so it cannot answer a question that gate would
+    have refused: the existence of a conflicting upload is disclosed only to a
+    caller already admitted to that id's content.
+
+    Args:
+        vault_path: Vault root.
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename, whose extension decides the
+            staged path.
+        ceiling: The caller's admission ceiling, echoed in the refusal.
+
+    Returns:
+        ``None`` when no conflicting extension is staged, otherwise a
+        structured refusal naming the extension already bound to the id.
+    """
+    target = _upload_staged_path(vault_path, external_id, filename)
+    conflicting = [
+        staged for staged in _staged_for_id(vault_path, external_id) if staged != target
+    ]
+    if not conflicting:
+        return None
+    bound = ", ".join(
+        sorted({staged.suffix or "(no extension)" for staged in conflicting})
+    )
+    return refusal_response(
+        tool=TOOL_NAME,
+        ceiling=ceiling,
+        reason=(
+            f"external_id is already bound to {bound}; re-sending it as "
+            f"{target.suffix or '(no extension)'} would create a second fragment "
+            "and orphan the first one's staged bytes. Purge the existing fragment "
+            "or use a new external_id."
+        ),
+    )
 
 
 def _refuse_with_audit(
@@ -460,7 +561,11 @@ def upload_tool(
             which passes any string of 64 characters or fewer through
             verbatim, so a small document handed to it would be logged whole.
         external_id: The Adepthood-side stable id — the idempotency key. The
-            same id updates in place; a new id creates a new fragment.
+            same id updates in place; a new id creates a new fragment. One id
+            maps to exactly one fragment: because the ingestor is chosen from
+            the staged file's extension, re-sending an id under a *different*
+            extension is refused rather than allowed to fork into a second
+            fragment that would orphan the first one's staged bytes.
         timestamp: ISO-8601 upload time, accepted for contract symmetry with
             ``creek.journal`` and echoed in the response only. It is **not**
             written into the staged file — a binary document has nowhere to
@@ -494,6 +599,22 @@ def upload_tool(
     # ``upload_tier`` is narrowed to the parsed tier.
     if not isinstance(upload_tier, PrivacyTier):
         return upload_tier
+
+    # A missing vault is refused BEFORE anything can recreate it. ``run_ingest``
+    # would eventually raise ``FileNotFoundError`` and yield the same refusal,
+    # but not before ``_stage_upload``'s ``mkdir(parents=True)`` had rebuilt the
+    # staging tree and written the caller's bytes into a vault this very
+    # response calls unavailable — ``SourceLedger.load`` returns an EMPTY ledger
+    # rather than raising when the vault is gone, so the #970 gate reads the
+    # call as a creation and admits it. Every other refusal here is
+    # side-effect-free; this one was not. It is also above the audit append,
+    # which would otherwise mint ``00-Creek-Meta/audit/`` in the same way.
+    if not vault_path.is_dir():
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason="vault unavailable",
+        )
 
     # The payload is represented by its LENGTH and nothing else. Putting
     # ``content_base64`` in here would put the document in the audit log.
@@ -531,6 +652,21 @@ def upload_tool(
             consumer=consumer,
         )
         return refusal
+
+    # Below the #970 gate, so a conflicting extension is disclosed only to a
+    # caller already admitted to this id's content; above the staging write,
+    # so the refusal leaves no second staged file behind.
+    conflict = _refuse_extension_conflict(
+        vault_path, external_id, filename, privacy_tier_ceiling
+    )
+    if conflict is not None:
+        MCPAuditLog(vault_path).append(
+            tool=TOOL_NAME,
+            args=audit_args,
+            tier_ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+        )
+        return conflict
 
     staged = _stage_upload(vault_path, external_id, filename, raw)
     source_type = route_to_ingestor(staged)
