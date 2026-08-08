@@ -1468,6 +1468,12 @@ _OVERRIDE_CALL_NAMES = frozenset(
         "generate_all_profiles",
         "generate_rhetorical_patterns",
         "VoiceProfileGenerator",
+        # #879: the second half of the voice report. It walks the same
+        # corpus ``VoiceProfileGenerator`` does, but *copies fragment
+        # bodies into the vault* rather than rendering a profile, so a
+        # ceiling silently dropped at this call site is a verbatim
+        # above-ceiling body written to ``07-Voice/Register-Samples/``.
+        "generate_register_samples",
     },
 )
 """Callables whose new privacy parameter must never be left at its default."""
