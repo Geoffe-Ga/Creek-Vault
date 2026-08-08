@@ -509,6 +509,118 @@ check "the adopted lane is the BRANCH tip, not the tag's object" \
   "$( (cd "$SDIR" 2>/dev/null && git rev-parse HEAD) 2>/dev/null || true)"
 run release 304 >/dev/null 2>&1
 
+# --- assign must REATTACH to a remote branch release deleted locally (#1180) --
+# `release` ends with `git branch -D` (fleet.sh's cmd_release), so the local ref
+# is gone while the PR's branch is very much alive on the remote. A later
+# `assign` for the same issue then found no `refs/heads/<branch>`, took the
+# else-path, and cut a BRAND NEW branch of the same name off `origin/main` —
+# tracking `origin/main`, carrying none of the PR's commits, and looking
+# perfectly healthy in `fleet.sh list`.
+#
+# OBSERVED LIVE (2026-08-06, PR #1117 re-attached after its lane was released to
+# free a slot): `sync` answered "Already up to date." — of course it did, the
+# lane WAS main — and `git status -sb` read `issue/1074-…...origin/main`. The
+# next step in the normal flow is a push, which is either rejected
+# (non-fast-forward) or, if somebody reaches for `--force`, destroys every commit
+# on the PR branch. Only the loop's no-force-push rule kept this from being data
+# loss.
+#
+# The round trip below is that incident: commit on the lane, push it, release,
+# re-assign. It FAILS against the pre-fix HEAD with the lane sitting on
+# `origin/main`'s tip and no PRWORK.txt anywhere.
+REMOTE_BRANCH="issue/501-tracer-skeleton"
+D501="$(run assign 501 'Tracer Skeleton' 2>/dev/null)"
+(
+  cd "$D501"
+  echo "the PR's work" > PRWORK.txt
+  git add -A && git commit -qm "the commit the PR is made of"
+  git push -q origin "HEAD:refs/heads/$REMOTE_BRANCH"
+)
+PR_TIP="$( (cd "$D501" && git rev-parse HEAD) )"
+run release 501 >/dev/null 2>&1
+# The precondition the whole case rests on: release really did delete the local
+# ref, so the re-assign genuinely has nothing local to reattach to.
+if (cd "$REPO" && git show-ref --verify --quiet "refs/heads/$REMOTE_BRANCH"); then
+  bad "release left the local ref behind — the #1180 round trip is not being exercised"
+else
+  ok "release deleted the local ref (the precondition for #1180)"
+fi
+if (cd "$WORK/upstream" && git show-ref --verify --quiet "refs/heads/$REMOTE_BRANCH"); then
+  ok "the PR's branch survives on the remote after release"
+else
+  bad "the PR's branch survives on the remote after release"
+fi
+
+D501B="$(run assign 501 'Tracer Skeleton' 2>/dev/null || true)"
+D501B="${D501B:-$WORK/assign-missing}"
+check "re-assign lands on the PR's tip, not on origin/main" \
+  "$PR_TIP" "$( (cd "$D501B" 2>/dev/null && git rev-parse HEAD) 2>/dev/null || true)"
+[[ -f "$D501B/PRWORK.txt" ]] && ok "re-assigned lane carries the PR's commits" \
+  || bad "re-assigned lane carries the PR's commits"
+# The wrong upstream is what turns the silent wrong-state into a push failure —
+# and it is the tell the incident report singled out ("## issue/1074-…...origin/main").
+check "re-assign tracks origin/<branch>, not origin/main" "origin/$REMOTE_BRANCH" \
+  "$( (cd "$D501B" 2>/dev/null &&
+       git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}') 2>/dev/null || true)"
+run release 501 >/dev/null 2>&1
+
+# The other half of the contract: a genuinely new issue has no remote branch, so
+# it must still be cut from origin/main exactly as before. Without this, "prefer
+# the remote" could degenerate into "never create a branch".
+D502="$(run assign 502 'brand new work' 2>/dev/null || true)"
+D502="${D502:-$WORK/assign-missing-new}"
+check "a genuinely new issue still branches from origin/main" \
+  "$( (cd "$REPO" && git rev-parse origin/main) )" \
+  "$( (cd "$D502" 2>/dev/null && git rev-parse HEAD) 2>/dev/null || true)"
+run release 502 >/dev/null 2>&1
+
+# FAIL CLOSED on an unreadable remote. Creating a fresh branch off `main` when a
+# remote branch MAY exist is precisely the failure above, so an lookup that
+# errors (network blip, expired credential, dead remote) must abort — not fall
+# through to the else-path and silently branch from main.
+#
+# A pass-through `git` shim that breaks ONLY `ls-remote`: the `fetch origin main`
+# a few lines earlier in cmd_assign must still succeed, or the abort would prove
+# nothing about the lookup. Absolute path to the real git baked in at generation
+# time, because the shim shadows `git` on PATH and would otherwise re-exec itself.
+REAL_GIT="$(command -v git)"
+cat > "$BIN/git" <<STUB
+#!/usr/bin/env bash
+# fleet.sh invokes it as \`git -C <root> ls-remote …\`; the bare form is covered too.
+if [[ "\${1:-}" == "ls-remote" || "\${3:-}" == "ls-remote" ]]; then
+  echo "fatal: could not read from remote repository" >&2
+  exit 128
+fi
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$BIN/git"
+rc=0
+(cd "$REPO" && PATH="$BIN:$PATH" "$FLEET" assign 503 'unreadable remote') >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] && ok "assign aborts when the remote branch lookup is unreadable" \
+  || bad "assign aborts when the remote branch lookup is unreadable"
+if run path 503 >/dev/null 2>&1; then
+  bad "an unreadable remote lookup left a worktree behind"
+else
+  ok "an unreadable remote lookup left no worktree behind"
+fi
+if (cd "$REPO" && git show-ref --verify --quiet 'refs/heads/issue/503-unreadable-remote'); then
+  bad "an unreadable remote lookup branched off main anyway — the #1180 failure, fail-open"
+else
+  ok "an unreadable remote lookup created no branch off main"
+fi
+# A refused assign must still release the lock, exactly like the cap refusal above.
+[[ -d "$LOCKDIR" ]] && bad "the unreadable-remote refusal left the assign lock behind" \
+  || ok "the unreadable-remote refusal leaves no assign lock behind"
+rm -f "$BIN/git"
+
+# `usage()` prints a FIXED LINE RANGE of fleet.sh's header comment. Documenting
+# the reattachment above grew that header, and a range left behind truncates
+# `--help` mid-sentence — the silent kind of rot, since `usage` still exits 0.
+# The "Exit codes:" line is the header's last, immediately above `set -euo`.
+check "help prints the whole header (usage()'s line range still reaches the end)" \
+  "Exit codes: 0 ok · 1 usage/not-found · 2 tooling missing · 3 merge conflict." \
+  "$( (run --help 2>&1 || true) | grep -v '^[[:space:]]*$' | tail -n 1)"
+
 # Nothing above may leak a lane: every adopt either released cleanly or refused.
 check "fleet ends with only the two long-lived lanes" "105 201" "$(run active)"
 

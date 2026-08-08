@@ -35,8 +35,13 @@
 #   count            Print the number of active worktrees.
 #   free             Print how many more workers may be started right now.
 #   path <N>         Print the worktree path for issue N (empty + exit 1 if none).
-#   assign <N> <slug>  Create (or reuse) a worktree for issue N off origin/main;
-#                      prints its absolute path. Refuses if the fleet is full.
+#   assign <N> <slug>  Create (or reuse) a worktree for issue N; prints its
+#                      absolute path. Prefers, in order: an existing LOCAL
+#                      branch, then a branch of that name on `origin` (a lane
+#                      `release` deleted locally while its PR lived on — #1180),
+#                      and only then a fresh branch off origin/main. Aborts if
+#                      the remote lookup is unreadable, and refuses if the fleet
+#                      is full.
 #   adopt <N> <PR>   The bot-PR variant of assign: create (or reuse) a worktree
 #                      for issue N attached to PR's EXISTING head branch (e.g.
 #                      Dependabot's), so fixes push to that branch instead of
@@ -46,7 +51,9 @@
 #                      branch by MERGE (no history rewrite ⇒ a plain push updates
 #                      the PR; no force-push, ever). Exit 0 clean, exit 3 on
 #                      conflict (merge aborted, worktree left clean).
-#   release <N>      Remove issue N's worktree and delete its local branch.
+#   release <N>      Remove issue N's worktree and delete its LOCAL branch. The
+#                      remote branch is never touched, so a released lane can be
+#                      re-assigned later and reattaches to it (see assign).
 #   reconcile        Release worktrees whose PR merged/closed or whose issue is
 #                      closed, then `git worktree prune`. Needs the gh CLI.
 #
@@ -207,8 +214,35 @@ acquire_assign_lock() {
   die "assign: could not acquire lock (stale $lock?); remove it if no assign is running" 1
 }
 
+# Does `origin` carry a branch of this name? Prints `found` or `absent`, and
+# returns NON-ZERO when the answer is UNREADABLE — a network blip, an expired
+# credential, a dead remote. The caller must treat that third outcome as an
+# abort, never as `absent`: branching off `main` when a remote branch MAY exist
+# is precisely the failure this function was added to prevent (#1180).
+#
+# `ls-remote` without `--exit-code`, because that flag conflates the two answers
+# this function must keep apart: it exits 2 for "no such ref" and non-zero for a
+# transport failure, and the caller needs "absent" and "unreadable" to take
+# OPPOSITE actions. Empty output with exit 0 is the unambiguous "absent".
+#
+# The pattern is FULLY QUALIFIED (`refs/heads/<branch>`) and the answer is then
+# matched EXACTLY: ls-remote patterns are tail-matched on path components, so a
+# bare `issue/9-x` would also be answered by `refs/heads/wip/issue/9-x` — a
+# different branch, whose commits are not this PR's. awk with a string compare
+# rather than grep, because a branch name is not a regex (`+`, `.` and `[` are
+# all legal in a git ref).
+remote_branch_state() { # remote_branch_state <root> <branch>
+  local root="$1" branch="$2" out
+  out="$(git -C "$root" ls-remote --heads origin "refs/heads/$branch" 2>/dev/null)" || return 1
+  if awk -v want="refs/heads/$branch" '$2 == want { hit = 1 } END { exit !hit }' <<<"$out"; then
+    printf 'found\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
 cmd_assign() {
-  local issue="$1" slug="${2:-}" root dir branch base lock
+  local issue="$1" slug="${2:-}" root dir branch base lock remote_state
   [[ -n "$issue" ]] || die "assign: usage: assign <issue> <slug>"
   [[ "$issue" =~ ^[0-9]+$ ]] || die "assign: issue must be numeric, got '$issue'"
   root="$(repo_root)"
@@ -246,7 +280,41 @@ cmd_assign() {
     # Branch already exists (prior tick) — attach a worktree to it.
     git -C "$root" worktree add "$dir" "$branch" >&2
   else
-    git -C "$root" worktree add "$dir" -b "$branch" "$base" >&2
+    # NO LOCAL REF IS NOT THE SAME AS NO BRANCH (#1180). `cmd_release` below ends
+    # with `git branch -D`, so a lane that was released — to free a slot for a
+    # hotter issue, or because its PR was stalled — leaves the PR's branch alive
+    # on the REMOTE and nothing at all locally. Re-assigning that issue used to
+    # fall straight through to the `-b … origin/main` path below and cut a BRAND
+    # NEW branch of the same name off `main`: tracking `origin/main`, carrying
+    # none of the PR's commits, and indistinguishable from a healthy lane in
+    # `fleet.sh list`. `sync` then answers "Already up to date." — of course it
+    # does, the lane IS main — and the next push is either rejected
+    # (non-fast-forward) or, if somebody reaches for `--force`, destroys every
+    # commit on the PR branch. Only the loop's no-force-push rule kept the live
+    # occurrence (2026-08-06, PR #1117's lane) from being data loss.
+    #
+    # FAIL CLOSED on an unreadable answer. The whole defect is "we assumed no
+    # branch existed when one did", so an answer we cannot read must abort rather
+    # than repeat the assumption. `die` exits, which fires the EXIT trap
+    # `acquire_assign_lock` installed, so the lock is released on this path too.
+    remote_state="$(remote_branch_state "$root" "$branch")" ||
+      die "assign: could not read origin for '$branch'; refusing to guess whether a released lane's branch is still there (branching off main would orphan its PR's commits)"
+    if [[ "$remote_state" == "found" ]]; then
+      # Explicit refspec, exactly as `cmd_adopt` fetches a bot branch: the
+      # tracking ref may not exist yet in this clone, and `--track` needs it.
+      # `+` accepts a force-push upstream; it updates only refs/remotes.
+      git -C "$root" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" ||
+        die "assign: could not fetch origin/$branch"
+      # FULLY QUALIFIED start point for the reason cmd_adopt's divergence guard
+      # documents: a tag sharing the branch's name outranks the branch in
+      # `git rev-parse`'s disambiguation, so an unqualified `origin/$branch`
+      # could resolve to a different object than the one intended. `--track`
+      # sets the upstream to `origin/$branch` — NOT `origin/main`, which is the
+      # wrong-upstream tell the incident report singled out.
+      git -C "$root" worktree add --track -b "$branch" "$dir" "refs/remotes/origin/$branch" >&2
+    else
+      git -C "$root" worktree add "$dir" -b "$branch" "$base" >&2
+    fi
   fi
 
   # Success: release the lock now and clear the trap so a later exit does not try
@@ -424,7 +492,10 @@ cmd_reconcile() {
 }
 
 usage() {
-  sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'
+  # Line range = the header comment block, ending at the "Exit codes:" line just
+  # above `set -euo pipefail`. Growing the header without moving this range
+  # truncates `--help` mid-sentence; test_fleet.sh pins the last line.
+  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 
