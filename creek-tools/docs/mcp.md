@@ -611,6 +611,16 @@ dicts become `{"keys": [...]}`. A draft request for an
 trail. Hash chaining is provided by `creek.audit.AuditLog`; FEAT-012
 adds the per-entry `entry_hash` and a verifier on top — see below.
 
+**The one exception is a handshake against a vault that does not exist**
+(#1108). The log lives under `00-Creek-Meta/`, which is also the marker
+`creek.handshake` reads to decide `available` — so writing the entry would
+create the directory whose absence the entry records, and the *next* handshake
+would then report `available: true` for a vault nobody initialised. Rather than
+scaffold a vault in order to file the paperwork about its not existing, that one
+call is recorded to the server's process log instead, naming the tool, the path
+probed, the consumer and the ceiling. Every call against a real vault — every
+tool, `creek.handshake` included — is audited exactly as described above.
+
 #### Tamper-evidence (FEAT-012)
 
 Every entry carries two integrity fields:
