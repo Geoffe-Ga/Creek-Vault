@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ EXPECTED_TOOLS = {
     "creek.reflect",
     "creek.wheel",
     "creek.journal",
+    "creek.upload",
     "creek.state.read",
     "creek.state.render",
     "creek.lint",
@@ -200,6 +202,71 @@ def test_call_tool_journal_ingests_entry_idempotently(vault: Path) -> None:
     assert first["tool"] == "creek.journal"
     assert second["fragment_id"] == first["fragment_id"]
     assert len(sorted((vault / "01-Fragments").rglob("*.md"))) == 1
+
+
+def test_upload_is_registered_and_advertised_as_a_capability(vault: Path) -> None:
+    """``creek.upload`` reaches the handshake through registration alone (#1023).
+
+    Worth asserting separately from the set-equality above because the two
+    statements are made by different code. ``handshake_tool`` never holds a
+    tool list of its own — ``build_server`` derives ``capabilities`` from
+    ``server.list_tools()`` — so a name that appears there appears *because*
+    the closure was registered. Hardcoding ``creek.upload`` into the handshake
+    would satisfy this test while the tool itself was missing, which is exactly
+    the regression the derivation exists to prevent.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    names = {tool.name for tool in asyncio.run(server.list_tools())}
+    assert "creek.upload" in names
+    structured = _structured(
+        asyncio.run(
+            server.call_tool("creek.handshake", {"privacy_tier_ceiling": "open"}),
+        ),
+    )
+    capabilities = structured["capabilities"]
+    assert isinstance(capabilities, list)
+    assert "creek.upload" in capabilities
+    assert structured["contract_version"] == CONTRACT_VERSION
+
+
+def test_upload_over_the_server_surface_ingests_bytes(vault: Path) -> None:
+    """End-to-end: ``creek.upload`` stages bytes and ingests them, idempotently.
+
+    Driven through ``call_tool`` rather than through ``upload_tool`` because
+    the registered closure is the only path a remote consumer has: it is what
+    binds the vault, resolves the per-call consumer, and decides which
+    arguments the tool even accepts. ``tests/test_mcp_upload.py`` owns the
+    tool's behaviour; what is proved here is that the wiring reaches it.
+
+    The second identical send is the wiring's own idempotency claim: it can
+    only answer ``unchanged`` if the ledger-backed pipeline — not a bespoke
+    per-call write — is what the closure hands the bytes to.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    payload = {
+        "filename": "notes.txt",
+        "content_base64": base64.b64encode(
+            b"An uploaded note that arrived as bytes.",
+        ).decode("ascii"),
+        "external_id": "srv-1",
+        "timestamp": "2026-06-20T10:00:00+00:00",
+        "tier": "personal",
+        "privacy_tier_ceiling": "personal",
+    }
+    first = _structured(asyncio.run(server.call_tool("creek.upload", payload)))
+    second = _structured(asyncio.run(server.call_tool("creek.upload", payload)))
+    assert first["status"] == "ok"
+    assert first["tool"] == "creek.upload"
+    assert first["source_type"] == "document"
+    assert first["fragment_id"]
+    assert second["action"] == "unchanged"
+    assert second["fragment_id"] == first["fragment_id"]
 
 
 def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None:

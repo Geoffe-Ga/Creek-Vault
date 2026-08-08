@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.2.0`
+- **Contract version**: `0.3.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -39,7 +39,7 @@ remote tier ceiling in order to demo a capability early — see
 ## Versioning
 
 `/v1` in the route path is the HTTP major. Below that, exactly one
-`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.2.0`
+`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.3.0`
 — covers both the MCP surface and `/v1`, because the epic's premise is one
 behavioral implementation: a shape change in a shared `creek_mcp.tools.*`
 function changes what both adapters can honestly promise at the same moment.
@@ -63,6 +63,17 @@ test (`test_adr_publishes_the_runtime_contract_version`,
 the version string an Adepthood client reads off this document is the
 version string the running server actually speaks. The bump is owed the
 first time any of #1073–#1077 changes a wire shape.
+
+**The bump arrived from the other adapter, and `0.2` stayed served.** Because
+one `CONTRACT_VERSION` covers both surfaces, #1023 — which adds the
+`creek.upload` MCP tool and touches no `/v1` shape — moves the constant to
+`0.3.0`. `SUPPORTED_CONTRACT_MINORS` was widened to `("0.3", "0.2")` in the
+same change rather than shifted, so an existing client still sending
+`X-Creek-Contract-Version: 0.2` is served exactly as before. This is the case
+the constant was always shaped for: a shared version string means an
+MCP-surface change can move the number a `/v1` client negotiates against, and
+the compatibility window — not the number — is what keeps that honest instead
+of breaking.
 
 **Wire mechanism.** Every `/v1` **capability** endpoint requires an
 `X-Creek-Contract-Version: <major.minor>` request header; a missing or
@@ -700,3 +711,4 @@ restating the other.
 | `0.2.0` | 2026-07-31 | #1074 mounts the routes: the tracer serves a real `GET /v1/capabilities` and answers `501 unsupported_capability` on journal, reflection and wheel. No wire shape changes, so no version moves. Two clarifications recorded above rather than left implicit: the advertised capability list tracks what is actually implemented during the epic's build-out, and the issue's provisional `not_implemented` spelling is superseded by `unsupported_capability` — the `ErrorCode` member this ADR already publishes for exactly that meaning at exactly that status. |
 | `0.2.0` | 2026-08-01 | #1117 review fixes: `creek-tools-api` now starts uvicorn with `access_log=False` (its own access logger was republishing the caller's address and the concrete request path alongside the audited middleware), and `GET /v1/capabilities`'s readiness probe now runs in a worker thread rather than on the event loop. Neither changes a wire shape, so no version moves. See [Serving: uvicorn's own logging and the readiness probe](#serving-uvicorns-own-logging-and-the-readiness-probe). |
 | `0.2.0` | 2026-08-01 | #1117 third review round: the audit append behind `GET /v1/capabilities` no longer re-reads the whole log per request — `creek_mcp.audit` now shares one `AuditLog` per path so the chain-hash cache it already maintains survives between requests, removing a per-request cost that grew with log length inside the exclusive write lock. Test-only alongside it: the semaphore-release-on-timeout test was rewritten (the original could not fail), a sibling case for release on client disconnect was added, the 401-uniformity sweep now compares header *values* and not only names, and the ceiling gate's handler-level probe was extended from one route to all five. Row (c) of the capabilities state table above is corrected from `—` to `[]` in the `capabilities` column, matching `docs/api.md` and the code. No wire shape changes, so no version moves. |
+| `0.3.0` | 2026-08-08 | #1023 adds the `creek.upload` MCP tool — one document's base64 bytes staged under `00-Creek-Meta/adepthood/uploads/` and routed to an ingestor by extension. The MCP tool surface grew, so the shared contract minor moves; **no `/v1` wire shape changes**, and `SUPPORTED_CONTRACT_MINORS` is widened to `("0.3", "0.2")` rather than shifted, so existing `/v1` clients negotiating `0.2` keep being served unchanged. See [Versioning](#versioning). |

@@ -193,10 +193,16 @@ surface and MCP.
 
 The three capability routes — `PUT /v1/journal-entries/{external_id}`,
 `POST /v1/reflections` and `GET /v1/wheel` — require
-`X-Creek-Contract-Version: <major.minor>`, for example `0.2`. The comparison is
+`X-Creek-Contract-Version: <major.minor>`, for example `0.3`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
+
+That set is a **window, and it widens before it narrows**. It currently holds
+both `0.3` and `0.2`: the move to contract `0.3.0` came from the MCP surface
+(`creek.upload`, #1023) and changed no `/v1` shape, so a client still sending
+`0.2` is served exactly as before. Read the window off `GET /v1/capabilities`
+rather than assuming the newest minor is the only one accepted.
 
 **Two routes are exempt.** `GET /v1/capabilities` requires nothing on this axis
 because the negotiation endpoint must never itself be able to fail to

@@ -74,10 +74,11 @@ _PROBE_PATHS: Final[tuple[str, ...]] = (
 
 _PROBE_METHODS: Final[tuple[str, ...]] = ("GET", "POST", "PUT", "DELETE")
 
-# Every word a capability-disclosing 401 would carry. ``0.2`` covers the
-# contract minor, ``capabilit`` covers both spellings, ``tier`` covers the
-# ceiling model.
+# Every word a capability-disclosing 401 would carry. ``0.3`` and ``0.2`` cover
+# both served contract minors, ``capabilit`` covers both spellings, ``tier``
+# covers the ceiling model.
 _FORBIDDEN_IN_401: Final[tuple[str, ...]] = (
+    "0.3",
     "0.2",
     "contract_version",
     "ontology",

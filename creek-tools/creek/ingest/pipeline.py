@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from creek.ingest.base import Ingestor, ParsedFragment
     from creek.ingest.ledger import LedgerRecord, SourceLedger
-    from creek.models import Fragment
+    from creek.models import Fragment, PrivacyTier
     from creek.vault.writer import VaultWriter
 
 
@@ -81,6 +81,71 @@ def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None
     from creek.ingest.ledger import SourceLedger
 
     return SourceLedger.load(vault_path, source=source_type)
+
+
+def resolve_ledger(
+    source_type: str,
+    vault_path: Path,
+    ledger_source: str | None,
+) -> SourceLedger | None:
+    """Return the ledger for this run, honouring an explicit override (#1023).
+
+    With no override this is exactly :func:`ledger_for_source`, so the
+    ``creek ingest`` CLI keeps its current non-ledgered semantics for every
+    non-markdown source type — deliberately preserved, since widening
+    :func:`ledger_for_source` itself would switch on ledger-backed identity
+    *and* directory tombing for existing CLI users.
+
+    An explicit *ledger_source* is how a caller that owns a stable staging
+    path — ``creek.upload``, whose staged files live at a fixed
+    vault-relative location — opts a non-markdown source type into
+    ledger-backed identity. That is what earns the uploaded document its
+    ``source.origin_key``, and therefore its coverage by the RTBF purge
+    sweep, which keys on exactly that field.
+
+    Args:
+        source_type: Registry key of the ingestor being run.
+        vault_path: Vault root holding ``00-Creek-Meta/State/ingest/``.
+        ledger_source: Ledger name to force, or ``None`` for the default.
+
+    Returns:
+        The resolved :class:`SourceLedger`, or ``None`` when this run is
+        unledgered.
+    """
+    if ledger_source is None:
+        return ledger_for_source(source_type, vault_path)
+    from creek.ingest.ledger import SourceLedger
+
+    return SourceLedger.load(vault_path, source=ledger_source)
+
+
+def stamp_declared_tier(fragment: Fragment, declared: PrivacyTier | None) -> None:
+    """Merge a caller-declared privacy tier onto *fragment* (#1023).
+
+    This is the *only* out-of-band tier channel into an ingested fragment:
+    no ingestor in :mod:`creek.ingest` emits ``privacy_tier``, and a staged
+    binary document (``.docx`` / ``.pdf`` / ``.xlsx``) has no frontmatter
+    to carry one, so without this every uploaded document would land at
+    ``unclassified``.
+
+    The merge is :func:`creek.classify.privacy_pass.escalate` — never a
+    plain assignment. A source that already declares a *higher* tier (an
+    uploaded ``.md`` whose own frontmatter says ``privacy_tier:
+    intimate``) must never be lowered to the caller's declared tier, and
+    an assignment would do exactly that. In the other direction
+    ``UNCLASSIFIED`` ranks below every real tier, so a declared ``open``
+    still supersedes the ingest default.
+
+    Args:
+        fragment: The assembled fragment, before it is written.
+        declared: The caller's declared tier, or ``None`` to declare nothing.
+    """
+    if declared is None:
+        return
+    # Deferred import: creek.classify pulls heavy deps; keep import light.
+    from creek.classify.privacy_pass import escalate
+
+    fragment.privacy_tier = escalate(fragment.privacy_tier, declared)
 
 
 def attach_origin_key(
@@ -270,6 +335,8 @@ def run_ingest(
     reclassify_threshold: float = 0.0,
     since: datetime | None = None,
     incremental: bool = False,
+    ledger_source: str | None = None,
+    privacy_tier: PrivacyTier | None = None,
 ) -> IngestRunResult:
     """Run one ingestor and persist its output idempotently to the vault.
 
@@ -287,6 +354,17 @@ def run_ingest(
             edited unit is flagged for re-classification (#675).
         since: Incremental cutoff (#677) — only units newer than this are kept.
         incremental: Ledger-driven incremental mode (#677).
+        ledger_source: Force a specific ledger name instead of the one
+            :func:`ledger_for_source` would pick, opting a non-markdown
+            source type into ledger-backed identity (#1023). **Hazard:**
+            combining this with a *directory* ``input_path`` arms
+            :func:`tomb_missing_units` for that ledger, soft-tombing every
+            previously-ledgered unit the pass does not see; ``creek.upload``
+            always passes a single file, which can never tomb.
+        privacy_tier: Tier the caller declares for this content (#1023).
+            Merged onto each fragment with
+            :func:`creek.classify.privacy_pass.escalate`, so it can only
+            raise the tier, never lower one the source already declared.
 
     Returns:
         An :class:`IngestRunResult` with the write tallies and any errors.
@@ -296,7 +374,7 @@ def run_ingest(
     writer = VaultWriter(vault_path=vault_path)
 
     ingest_result = ingestor_cls().ingest(input_path)
-    ledger = ledger_for_source(source_type, vault_path)
+    ledger = resolve_ledger(source_type, vault_path, ledger_source)
     filtering = since is not None or incremental
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
@@ -313,6 +391,7 @@ def run_ingest(
                 f"{parsed.source_path}: {exc}",
             )
             continue
+        stamp_declared_tier(assembled.fragment, privacy_tier)
         attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
         origin_key = assembled.fragment.source.origin_key
         # Record the key as seen BEFORE any incremental skip, so an unchanged

@@ -76,13 +76,16 @@ runtime version string it is a prefix of. Compatibility is negotiated at minor
 granularity: a patch bump is invisible to the consumer, a minor bump is not.
 """
 
-SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (CONTRACT_MINOR,)
+SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (CONTRACT_MINOR, "0.2")
 """Every contract minor this server can still serve.
 
-One entry today. It is a *list* on the wire because the compatibility window is
-expected to widen before it ever narrows: a server that has moved to ``0.3``
-may keep answering ``0.2`` clients, and the client needs to see that without a
-second round trip.
+The widening this constant's shape anticipated has happened: contract 0.3
+(#1023) added the ``creek.upload`` *MCP* tool and changed no ``/v1`` wire
+shape, so ``0.2`` is retained and every client already sending
+``X-Creek-Contract-Version: 0.2`` keeps being served. It is a *list* on the
+wire because the compatibility window is expected to widen before it ever
+narrows, and the client needs to see the whole window without a second round
+trip. Drop an entry only when a ``/v1`` shape actually stops being served.
 """
 
 OK_STATUS: Final[str] = "ok"
@@ -130,7 +133,12 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The four capabilities ``/v1`` publishes at contract 0.2.
+    """The four capabilities ``/v1`` publishes.
+
+    The list is identical for every minor in
+    :data:`SUPPORTED_CONTRACT_MINORS`: contract 0.3 grew the *MCP* tool surface
+    (``creek.upload``, #1023) and added no ``/v1`` route, so a ``0.2`` client
+    and a ``0.3`` client are answered from the same four names.
 
     The values are also the directory names of the example matrix in
     :mod:`creek_mcp.api.bundle`, so the advertised capability list and the
@@ -228,7 +236,7 @@ class NoteKind(StrEnum):
 
 
 class ErrorCode(StrEnum):
-    """The nine wire error codes, closed at contract 0.2.
+    """The nine wire error codes, closed at contract 0.3 and unchanged since 0.2.
 
     There is deliberately **no** ``care_escalation`` member: an escalation is a
     successful, 200-shaped :class:`CareEscalationResponse`, because a person in

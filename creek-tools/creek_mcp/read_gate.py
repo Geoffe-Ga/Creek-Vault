@@ -36,7 +36,7 @@ of the primitives below inherits it:
    to key a model call.
 
 **Who calls these primitives, and why the rest still do not.**
-:func:`refuse_above_ceiling` has two production callers.
+:func:`refuse_above_ceiling` has three production callers.
 ``creek_mcp.tools.state_read`` adopted it in #969, and that adoption is the
 shape the primitives were written for — the tool addresses a *single* cached
 artifact, so there is nothing to partially admit, and its refusal has no
@@ -50,6 +50,11 @@ admission is decided by ``tier_allowed`` through this primitive, not by
 ``write_tier_allowed``, which ranks the incoming entry and knows nothing about
 the fragment on disk. Caller-addressed and singular again: you cannot
 overwrite half a body, so there is nothing to partially admit.
+``creek_mcp.tools.upload`` adopted it in #1023 on that identical argument,
+with one edge journal does not have: its staged bytes are a document rather
+than markdown, so they carry no ``privacy_tier`` frontmatter and no
+escalate-only ratchet, which is what forces the gate above the staging write
+rather than merely above the fragment write.
 
 The other refusing tools are deliberately *not* retrofitted.
 ``creek.reflect`` and ``creek.compile`` keep their own refusal reasons and
@@ -412,6 +417,42 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "fragment, so refused means 'above your ceiling OR unresolvable'."
         ),
         gate_module="creek_mcp.tools.journal",
+        gate_symbol="refuse_above_ceiling",
+    ),
+    "creek.upload": ToolPosture(
+        posture=ReadPosture.GATED,
+        rationale=(
+            "creek.journal's gate applied to document bytes instead of text "
+            "(#1023). The uploaded bytes are the caller's own and "
+            "write_tier_allowed gates the tier they create, but the idempotent "
+            "update-in-place destroys the fragment an external_id already maps "
+            "to — so it refuses on THAT fragment's current vault tier: you may "
+            "only overwrite what you could have read (#970). A write gate "
+            "asking a read question, hence refuse_above_ceiling (tier_allowed) "
+            "rather than write_tier_allowed; the target is caller-addressed "
+            "and singular, and you cannot overwrite half a document. Ordering "
+            "is load-bearing twice over. The overwrite gate sits ABOVE "
+            "_stage_upload, because a staged .docx or .pdf carries no "
+            "frontmatter and therefore no escalate-only ratchet at all — a "
+            "gate placed below staging would return a correct refusal over an "
+            "already-overwritten intimate document, with nothing downstream "
+            "able to restore it. And write_tier_allowed sits above "
+            "base64.b64decode, so a refused intimate upload never turns a byte "
+            "of above-ceiling content into memory. Two fail-closed rules, not "
+            "one: no ledger record at all passes content_tier=None and CREATES "
+            "(creation must keep working at every ceiling), while a record "
+            "whose fragment no longer resolves reduces max_source_tier([]) to "
+            "intimate and is refused, so any divergence from the writer's own "
+            "id index fails safe. Consequences to know: the refusal is the "
+            "same existence-AND-rank oracle creek.journal already accepts on "
+            "its own targets, blurred the same way — purged, orphaned, "
+            "schema-invalid and deleted-out-of-band all collapse into the "
+            "identical refusal as a genuine above-ceiling document. And the "
+            "ledger this gate resolves through is upload.jsonl, not "
+            "markdown.jsonl, so a journal external_id and an upload "
+            "external_id can never collide however alike they look."
+        ),
+        gate_module="creek_mcp.tools.upload",
         gate_symbol="refuse_above_ceiling",
     ),
     "creek.lint": ToolPosture(
