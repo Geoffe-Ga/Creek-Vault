@@ -5146,7 +5146,6 @@ def _resolve_vault(vault: Path | None) -> Path:
 def clean_orphans(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     age_days: int = typer.Option(30, help="Minimum age in days for orphan detection"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Identify fragments with zero incoming/outgoing links after N days."""
     from creek.clean.hygiene import OrphanScanner
@@ -5154,8 +5153,7 @@ def clean_orphans(
     vault_path = _resolve_vault(vault)
     result = OrphanScanner(age_days=age_days).scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Orphan Scan[/bold] ({mode})")
+    console.print("\n[bold]Orphan Scan[/bold]")
     console.print(f"Total fragments: {result.total_fragments}")
     console.print(f"Orphans found: {len(result.orphan_paths)}")
 
@@ -5171,7 +5169,6 @@ def clean_orphans(
 def clean_stale_reviews(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     age_days: int = typer.Option(14, help="Maximum age in days for review items"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Find review queue items older than N days."""
     from creek.clean.hygiene import StaleReviewScanner
@@ -5179,8 +5176,7 @@ def clean_stale_reviews(
     vault_path = _resolve_vault(vault)
     result = StaleReviewScanner(age_days=age_days).scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Stale Review Scan[/bold] ({mode})")
+    console.print("\n[bold]Stale Review Scan[/bold]")
     console.print(f"Total review files: {result.total_review_files}")
     console.print(f"Stale files: {len(result.stale_paths)}")
 
@@ -5195,7 +5191,6 @@ def clean_stale_reviews(
 @clean_app.command(name="broken-links")
 def clean_broken_links(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Scan fragments for wiki-links pointing to nonexistent files."""
     from creek.clean.hygiene import BrokenLinkScanner
@@ -5203,8 +5198,7 @@ def clean_broken_links(
     vault_path = _resolve_vault(vault)
     result = BrokenLinkScanner().scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Broken Link Scan[/bold] ({mode})")
+    console.print("\n[bold]Broken Link Scan[/bold]")
     console.print(f"Files scanned: {result.total_files_scanned}")
     console.print(f"Broken links: {result.total_broken}")
 
@@ -5223,7 +5217,6 @@ def clean_broken_links(
 @clean_app.command(name="duplicates")
 def clean_duplicates(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Execute normalized dedup sweep and output review report."""
     from creek.clean.hygiene import DuplicateScanner
@@ -5231,8 +5224,7 @@ def clean_duplicates(
     vault_path = _resolve_vault(vault)
     result = DuplicateScanner().scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Duplicate Scan[/bold] ({mode})")
+    console.print("\n[bold]Duplicate Scan[/bold]")
     console.print(f"Total fragments: {result.total_fragments}")
     console.print(f"Duplicate candidates: {len(result.candidates)}")
 

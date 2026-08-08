@@ -7,6 +7,8 @@ Two adjacent command groups handle vault hygiene:
 
 `clean` finds problems and reports them. `purge` deletes things. They're separate tools because mistaking one for the other would be expensive.
 
+`clean` has **no write mode at all** — no `--apply`, no `--fix`. Its scanners expose `scan()` and nothing else. Until #1039 the four scan subcommands each carried an `--apply` flag that printed a red `APPLY` banner and then changed nothing; the flag was removed rather than implemented. Acting on a `clean` report means running `creek purge`, by hand, on the entries you chose.
+
 > Purge does best-effort deletion. It is **not** anti-forensic — modern SSDs and copy-on-write filesystems retain old block contents even after a successful unlink. See the [threat model](security/threat-model.md) for the full set of guarantees Creek does and doesn't make.
 
 ---
@@ -20,6 +22,8 @@ Identifies fragments with **zero incoming and outgoing links** that are older th
 ```bash
 creek clean orphans --vault ~/Obsidian/Creek-Vault --age-days 30
 ```
+
+Links are resolved by every name a page answers to — filename stem, frontmatter `title`, and each `aliases` entry — not by filename alone (#1225, the same fix #887 made for `broken-links`). A fragment linked as `[[Messages]]` credits the page whose file is `2020-09-26-Messages.md`, so it is not reported. A link that only points at its own file does not rescue the page from the list.
 
 Output is a markdown report — orphans are not deleted automatically. Pipe the IDs into `creek purge fragment` if you want them gone.
 
