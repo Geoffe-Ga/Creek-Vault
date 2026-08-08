@@ -102,7 +102,7 @@ def _stub_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli_mod,
         "_build_compost_similarity_fn",
-        lambda _config: lambda _text: 0.95,
+        lambda _config, _vault_path: lambda _text: 0.95,
     )
 
 

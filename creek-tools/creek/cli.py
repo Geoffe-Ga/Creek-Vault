@@ -5781,16 +5781,27 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     return LLMCompostVerifier(provider=provider)
 
 
-def _build_compost_similarity_fn(config: CreekConfig) -> Callable[[str], float]:
+def _build_compost_similarity_fn(
+    config: CreekConfig,
+    vault_path: Path,
+) -> Callable[[str], float]:
     """Build the embedding-gate closure ``creek compost scan`` scores fragments with.
 
     Split out of the command body so tests can substitute a deterministic
     stub — the real closure loads a sentence-transformers model, which is far
     too heavy for CLI wiring tests.
 
+    ``compost.exemplars_relpath`` is resolved against *vault_path*, matching
+    the field's own "vault-relative" contract and the handling its sibling
+    ``compost.review_queue_relpath`` already gets. Resolving it against the
+    process CWD instead would make the command depend on the operator's shell
+    location: a ``FileNotFoundError`` when run from elsewhere, or — worse,
+    silently — whatever same-named file happened to sit in that directory.
+
     Args:
         config: The loaded Creek config; supplies the embedding settings and,
             when set, ``compost.exemplars_relpath``.
+        vault_path: Vault root that ``exemplars_relpath`` hangs off.
 
     Returns:
         A closure mapping fragment text to its maximum cosine similarity
@@ -5799,11 +5810,8 @@ def _build_compost_similarity_fn(config: CreekConfig) -> Callable[[str], float]:
     from creek.generate.compost_embedding import load_exemplars, make_similarity_fn
     from creek.link.embeddings import EmbeddingLinker
 
-    exemplars_path = (
-        Path(config.compost.exemplars_relpath)
-        if config.compost.exemplars_relpath
-        else None
-    )
+    relpath = config.compost.exemplars_relpath
+    exemplars_path = vault_path / relpath if relpath else None
     exemplars = load_exemplars(exemplars_path)
     return make_similarity_fn(exemplars, EmbeddingLinker(config=config.embeddings))
 
@@ -5951,6 +5959,9 @@ def compost_scan(
     provider. Re-running is idempotent: sources already carrying a compost
     note are skipped and reported, so a second scan spends no LLM calls on
     them.
+
+    Setting `compost.llm_verification: false` in `creek_config.yaml` has the
+    same effect as passing `--no-llm` on every run.
     """
     from creek.generate.compost_scan import run_compost_scan
 
@@ -5963,8 +5974,13 @@ def compost_scan(
             update={"embedding_threshold": embedding_threshold},
         )
 
-    verifier = None if no_llm else _build_scan_verifier(config)
-    similarity_fn = _build_compost_similarity_fn(config)
+    # `--no-llm` is the per-run form of `compost.llm_verification: false`;
+    # either one declares an offline pass, so honour whichever is set rather
+    # than building (and then refusing on) a provider the operator never
+    # asked for.
+    verify_with_llm = not no_llm and compost_config.llm_verification
+    verifier = _build_scan_verifier(config) if verify_with_llm else None
+    similarity_fn = _build_compost_similarity_fn(config, vault_path)
 
     result = run_compost_scan(
         vault_path,
