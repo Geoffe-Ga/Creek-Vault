@@ -254,6 +254,34 @@ def _refuse_unadmitted_overwrite(
     return refuse_above_ceiling(tool=TOOL_NAME, content_tier=existing, ceiling=ceiling)
 
 
+def _discard_unreferenced(vault_path: Path, staged: Path) -> None:
+    """Delete *staged* when the ingest it was written for produced no fragment.
+
+    An ingest can refuse after the bytes are on disk — ``run_ingest`` reports
+    ``written=0`` for content the binary heuristic drops or an extension no
+    ingestor claims, and can report ``errors`` for a malformed document. The
+    staged file is then left with **no ledger record**, and therefore no
+    ``source.origin_key`` on any fragment.
+
+    That is not merely untidy: the RTBF sweep finds staged bytes *through*
+    ``origin_key`` (:meth:`creek.purge.engine.PurgeEngine._purge_staged_source_entry`),
+    so an unreferenced staged file is unreachable by every purge the vault
+    offers — a copy of the caller's document that survives the erasure meant
+    to remove it. Deleting it here is what keeps "every staged upload is
+    purgeable" true for the refusal paths as well as the happy one.
+
+    Keyed on the ledger rather than on "did this call create the file", so a
+    re-send whose ingest fails over an *already-recorded* staged file leaves
+    that file alone — its fragment still references it.
+
+    Args:
+        vault_path: Vault root.
+        staged: The staged path the failed ingest was pointed at.
+    """
+    if _resolve_fragment_id(vault_path, staged) is None:
+        staged.unlink(missing_ok=True)
+
+
 def _refuse_extension_conflict(
     vault_path: Path, external_id: str, filename: str, ceiling: TierCeiling
 ) -> dict[str, Any] | None:
@@ -287,8 +315,13 @@ def _refuse_extension_conflict(
         structured refusal naming the extension already bound to the id.
     """
     target = _upload_staged_path(vault_path, external_id, filename)
+    # Ledger-backed only. An unreferenced staged file is not a fragment anyone
+    # can purge, so treating it as a conflict would refuse with a remedy —
+    # "purge the existing fragment" — that cannot be carried out.
     conflicting = [
-        staged for staged in _staged_for_id(vault_path, external_id) if staged != target
+        staged
+        for staged in _staged_for_id(vault_path, external_id)
+        if staged != target and _resolve_fragment_id(vault_path, staged) is not None
     ]
     if not conflicting:
         return None
@@ -681,6 +714,7 @@ def upload_tool(
         run=run,
     )
     if isinstance(result, dict):
+        _discard_unreferenced(vault_path, staged)
         return result
 
     fragment_id = _resolve_fragment_id(vault_path, staged)

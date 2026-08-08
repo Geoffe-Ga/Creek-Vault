@@ -716,3 +716,69 @@ def test_a_missing_vault_is_refused_without_writing_anything(tmp_path: Path) -> 
     assert result["reason"] == "vault unavailable"
     # Nothing was created: not the vault, not the staging tree, not the audit log.
     assert not missing.exists()
+
+
+def test_a_failed_ingest_leaves_no_unpurgeable_staged_bytes(tmp_path: Path) -> None:
+    """A refusal must not strand a copy of the document no purge can reach.
+
+    ``run_ingest`` reports ``written=0`` for content the binary heuristic
+    drops, so the bytes are already staged when the refusal is decided. Left
+    there they carry no ledger record, hence no ``source.origin_key`` on any
+    fragment — and the RTBF sweep finds staged bytes only through that key.
+    The document would survive every purge the vault offers.
+    """
+    vault = _vault(tmp_path)
+    secret = b"unroutable\x00binary\x00secret"
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="mystery.bin",
+        content_base64=_b64(secret),
+        external_id="u-orphan",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert _fragments(vault) == []
+    assert _staged(vault) == []
+    assert _leaking_files(vault, secret) == []
+
+
+def test_a_corrected_extension_after_a_failed_ingest_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """The idempotency contract has to survive a failed first attempt.
+
+    A caller whose first upload was refused must be able to retry the same
+    ``external_id`` with a working filename. If the failed attempt's staged
+    file lingered, the extension-conflict gate would refuse the retry and
+    advise purging a fragment that was never created — so the only remedy
+    would be abandoning the id, quietly breaking "the same id updates in
+    place" for exactly the callers who need the retry.
+    """
+    vault = _vault(tmp_path)
+
+    refused = upload_tool(
+        vault_path=vault,
+        filename="notes.bin",
+        content_base64=_b64(b"unroutable\x00bytes"),
+        external_id="u-retry",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert refused["status"] == "refused"
+
+    retried = upload_tool(
+        vault_path=vault,
+        filename="notes.txt",
+        content_base64=_b64(b"The same document, correctly typed."),
+        external_id="u-retry",
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert retried["status"] == "ok"
+    assert retried["action"] == "created"
+    assert len(_fragments(vault)) == 1
+    assert len(_staged(vault)) == 1
