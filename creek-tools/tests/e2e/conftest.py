@@ -2,6 +2,17 @@
 
 Provides a synthetic vault + synthetic source-dir factory so each test
 gets isolated, on-disk state without re-implementing directory layout.
+
+The vault is built by the *real* scaffold — the same code path
+``creek init`` runs — rather than a hand-written directory list. The
+list this replaced (issue #1025) had drifted into fiction: it created
+``05-Voice/``, ``06-Wavelength/`` and ``07-Review/``, none of which any
+production module has ever written to, while omitting most of the tree
+that production does write to. Nothing ever failed, because every writer
+calls ``mkdir(parents=True, exist_ok=True)`` and quietly conjured
+whatever the fixture had forgotten. Deriving the fixture from
+:func:`creek.scaffold.scaffold_vault` means an e2e test now runs against
+the vault a user actually gets.
 """
 
 from __future__ import annotations
@@ -10,53 +21,18 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from creek.scaffold import scaffold_vault
+
 if TYPE_CHECKING:
     from pathlib import Path
-
-_VAULT_DIRS = (
-    "00-Creek-Meta/Processing-Log",
-    "00-Creek-Meta/Indexes",
-    "00-Creek-Meta/Audit",
-    "00-Creek-Meta/Consent",
-    # 01-Fragments subfolders mirror creek/vault/writer.py's
-    # _PLATFORM_SUBFOLDER mapping. Keep this in sync when adding a new
-    # SourcePlatform value.
-    "01-Fragments/Conversations",
-    "01-Fragments/Messages",
-    "01-Fragments/Writing",
-    "01-Fragments/Writing/Substack",
-    "01-Fragments/Journal",
-    "01-Fragments/Technical",
-    "01-Fragments/Notes",
-    "01-Fragments/Documents",
-    "01-Fragments/Data",
-    "01-Fragments/Decks",
-    "01-Fragments/Images",
-    "01-Fragments/Unsorted",
-    "02-Threads/Active",
-    "02-Threads/Dormant",
-    "02-Threads/Resolved",
-    "03-Eddies",
-    "04-Praxis/Daily",
-    "04-Praxis/Seasonal",
-    "04-Praxis/Situational",
-    "05-Voice/Profiles",
-    "05-Voice/Exemplars",
-    "05-Voice/Patterns",
-    "06-Wavelength/Reports",
-    "07-Review",
-    "08-Decisions/Active",
-    "08-Decisions/Archive",
-    "08-Decisions/Frameworks",
-)
 
 
 @pytest.fixture()
 def synthetic_vault(tmp_path: Path) -> Path:
-    """Create the canonical empty Creek vault directory tree."""
-    for d in _VAULT_DIRS:
-        (tmp_path / "vault" / d).mkdir(parents=True, exist_ok=True)
-    return tmp_path / "vault"
+    """Create a canonical Creek vault via the ``creek init`` code path."""
+    vault = tmp_path / "vault"
+    scaffold_vault(vault)
+    return vault
 
 
 @pytest.fixture()

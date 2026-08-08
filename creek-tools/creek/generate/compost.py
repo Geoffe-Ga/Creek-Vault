@@ -43,6 +43,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CANONICAL_RELDIR: str = "10-Liminal/Compost"
+"""Vault-relative folder holding confirmed compost notes.
+
+Lives beside the code that writes into it so the scaffold drift guard
+can derive the directory ``creek init`` must ship (#1025).
+:mod:`creek.generate.compost_scan` re-exports it for its own callers."""
+
 _DORMANCY_DAYS: int = 180
 """Threads without new fragments for this many days become compost."""
 
@@ -485,7 +492,7 @@ class CompostTracker:
         if candidate.for_review:
             target_dir = vault_path / review_queue_relpath
         else:
-            target_dir = vault_path / "10-Liminal" / "Compost"
+            target_dir = vault_path / CANONICAL_RELDIR
         target_dir.mkdir(parents=True, exist_ok=True)
 
         today = self._now.date()
@@ -580,7 +587,7 @@ class CompostTracker:
         Returns:
             Path to the generated report file.
         """
-        compost_dir = vault_path / "10-Liminal" / "Compost"
+        compost_dir = vault_path / CANONICAL_RELDIR
         compost_dir.mkdir(parents=True, exist_ok=True)
         report_path = compost_dir / "_Compost-Report.md"
 

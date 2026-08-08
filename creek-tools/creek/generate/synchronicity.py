@@ -89,6 +89,12 @@ def _share_project(title_a: str, title_b: str) -> bool:
     return bool(_extract_proper_nouns(title_a) & _extract_proper_nouns(title_b))
 
 
+_SYNCHRONICITY_SUBPATH: tuple[str, str] = ("10-Liminal", "Synchronicities")
+"""Vault-relative home of the reflection notes this module writes.
+
+Named once so the scaffold drift guard can derive it instead of
+re-typing it (#1025)."""
+
 _LEGACY_TUPLE_ARITY: int = 3
 """Pre-FEAT-024 resonance tuple shape: (id_a, id_b, similarity)."""
 
@@ -335,7 +341,7 @@ class SynchronicityDetector:
         frag_a = fragments[sync.fragment_a_id]
         frag_b = fragments[sync.fragment_b_id]
 
-        target_dir = vault_path / "10-Liminal" / "Synchronicities"
+        target_dir = vault_path.joinpath(*_SYNCHRONICITY_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
         note_path = target_dir / f"{sync.id}.md"
 
@@ -453,7 +459,7 @@ def _existing_synchronicity_pairs(vault_path: Path) -> set[frozenset[str]]:
     ``sync-<uuid>`` filename is not stable across runs.
     """
     pairs: set[frozenset[str]] = set()
-    sync_dir = vault_path / "10-Liminal" / "Synchronicities"
+    sync_dir = vault_path.joinpath(*_SYNCHRONICITY_SUBPATH)
     if not sync_dir.is_dir():
         return pairs
     for note in sync_dir.glob("*.md"):

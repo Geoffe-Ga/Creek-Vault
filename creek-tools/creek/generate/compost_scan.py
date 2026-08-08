@@ -40,7 +40,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
-from creek.generate.compost import CompostTracker
+from creek.generate.compost import CANONICAL_RELDIR, CompostTracker
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import Thread
 from creek.vault.reader import iter_vault_fragments
@@ -56,9 +56,6 @@ if TYPE_CHECKING:
     from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
-
-CANONICAL_RELDIR: str = "10-Liminal/Compost"
-"""Vault-relative folder holding confirmed compost notes."""
 
 _FRAGMENTS_RELDIR: str = "01-Fragments"
 """Vault-relative folder the scan reads fragments from."""
