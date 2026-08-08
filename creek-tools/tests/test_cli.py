@@ -2182,6 +2182,71 @@ def test_report_voice_summary_stamps_a_narrowed_tier_ceiling(
     assert _load_register_summary(vault)["tier_ceiling"] == "open"
 
 
+def test_report_voice_narrowed_rerun_retracts_a_wider_runs_sample(
+    tmp_path: Path,
+) -> None:
+    """A narrower ``--include-tier`` re-run deletes what a wider run wrote.
+
+    ``docs/generation.md`` states this as a privacy remedy, not a
+    convenience: "A narrower ``--include-tier`` prunes what a wider run
+    wrote. This is the only way to retract above-ceiling copies after a
+    broad run." Nothing else retracts a persisted sample — there is no
+    un-persist flag, and deleting the source fragment is precisely the
+    move that used to leave its verbatim body behind. If this does not
+    hold, the documented remedy for "I ran ``report --type voice``
+    unfiltered on a vault I meant to keep narrow" does not exist.
+
+    ``test_report_voice_register_samples_honour_the_tier_ceiling`` cannot
+    catch a regression here: it proves only that a narrow ceiling excludes
+    on **write**, starting from an empty folder. Retraction is a different
+    path. The copy is already on disk; this run never sees the fragment at
+    all, because the ceiling drops it during ``collect_exemplars`` and so
+    its id never reaches ``keep_ids``; and the only thing entitling the
+    prune to delete the file is the digest the *wider* run recorded in
+    ``_Summary.md``. Break that manifest round-trip — write it under
+    another key, record ids the next run cannot reproduce, skip it when
+    the ceiling changes — and the above-ceiling copy becomes permanent
+    while every write-side ceiling test stays green.
+
+    The ``open`` fragment is the control at both ends: it proves the wide
+    run wrote more than the sample under test, and that the narrow re-run
+    *retracted* rather than merely emptied the samples tree.
+    """
+    vault = _voice_vault(tmp_path)
+    # A title sharing no substring with the id, so the title assertion
+    # below proves something the id assertion does not: the summary
+    # wikilinks a departed exemplar by both, and the title is the half a
+    # deleted body copy does not take with it.
+    retracted_title = "Midnight at the cannery"
+    _write_voice_fragment(
+        vault,
+        "frag-wide-only",
+        tier="personal",
+        title=retracted_title,
+    )
+    _write_voice_fragment(vault, "frag-both-runs", tier="open")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-both-runs.md", "frag-wide-only.md"]
+    wide = _load_register_summary(vault)
+    assert wide["tier_ceiling"] == "all"
+    assert wide["exemplar_count"] == 2
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _copied_names(vault) == ["frag-both-runs.md"]
+    residue = _samples_text(vault)
+    assert "frag-wide-only" not in residue
+    assert retracted_title not in residue
+    # The control is still named in the tree it survived, so the
+    # retraction cannot have been a wipe of the samples folder.
+    assert "frag-both-runs" in residue
+    narrowed = _load_register_summary(vault)
+    assert narrowed["tier_ceiling"] == "open"
+    assert narrowed["exemplar_count"] == 1
+
+
 def _write_wavelength_fragment(vault: Path, frag_id: str) -> None:
     """Write one fragment carrying a classified wavelength phase (#719)."""
     from creek.models import (

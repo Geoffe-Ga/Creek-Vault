@@ -1224,3 +1224,200 @@ class TestGenerateRegisterSamples:
         from creek.generate import voice as voice_module
 
         assert "generate_register_samples" in voice_module.__all__
+
+
+# ---- Manifest corruption is fail-safe (Issue #879) ----
+
+
+_MANIFEST_REGISTER_DIR = ("07-Voice", "Register-Samples", "analytical")
+"""Vault-relative samples folder the manifest-corruption tests operate in."""
+
+
+def _seed_pruneable_register(vault_path: Path) -> tuple[Path, Path]:
+    """Leave a register in the exact state its stale copy is prune-eligible in.
+
+    Runs one full save of two analytical exemplars — so both copies are on
+    disk **and** both are fingerprinted in ``_Summary.md``'s manifest —
+    then deletes one fragment's source file, dropping it out of the
+    corpus. A second ``generate_register_samples`` therefore *would*
+    delete ``frag-manifest-stale.md``, which is what makes "the copy
+    survived" an assertion about the manifest read rather than about a
+    prune that was never going to fire in this fixture anyway.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault``
+            fixture.
+
+    Returns:
+        The ``(register_dir, stale_copy)`` pair the callers assert on.
+    """
+    from creek.generate.voice import generate_register_samples
+
+    for frag_id in ("frag-manifest-keep", "frag-manifest-stale"):
+        _write_fragment(
+            vault_path,
+            _build_fragment(
+                frag_id=frag_id,
+                title=f"Manifest fixture {frag_id}",
+                register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.CONVICTION,
+            ),
+            body_words=400,
+        )
+
+    generate_register_samples(vault_path)
+
+    register_dir = vault_path.joinpath(*_MANIFEST_REGISTER_DIR)
+    stale_copy = register_dir / "frag-manifest-stale.md"
+    assert stale_copy.is_file(), "the seeding run wrote no copy to go stale"
+    (vault_path / "01-Fragments" / "Journal" / "frag-manifest-stale.md").unlink()
+    return register_dir, stale_copy
+
+
+def _rewrite_manifest(register_dir: Path, value: object) -> None:
+    """Replace the summary's recorded manifest with *value*, keeping the rest.
+
+    Rewriting through ``frontmatter`` rather than by hand keeps every
+    other key the prune and the operator rely on intact, so the only
+    variable in the test is the shape of the manifest itself.
+
+    Args:
+        register_dir: The register's samples folder.
+        value: The hand-edited value to store under ``exemplar_digests``.
+    """
+    summary_path = register_dir / "_Summary.md"
+    post = frontmatter.load(str(summary_path))
+    post.metadata["exemplar_digests"] = value
+    summary_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+class TestManifestCorruptionIsFailSafe:
+    """A manifest the prune cannot trust must disarm it, not crash or over-delete.
+
+    ``_read_sample_manifest`` answers the only question that entitles the
+    collector to ``unlink`` a file in a folder the operator also keeps
+    notes in: "did I write this?". Its two defensive branches — an
+    unreadable ``_Summary.md`` and a recorded value that is not a list —
+    both answer "I cannot tell", and the contract is that "I cannot tell"
+    means *delete nothing*. The cost is a stale copy; the cost of the
+    other direction is an operator's file.
+
+    Both branches were reachable only through fixtures nothing exercised,
+    which leaves two regressions invisible: a refactor that lets the read
+    raise takes down the whole command — and ``creek fill`` runs it
+    unattended — while one that drops the type check turns a hand-edited
+    manifest into a deletion list.
+
+    Every test here goes through the real save path, so what is pinned is
+    the prune's observable safety rather than a private helper's return
+    value.
+    """
+
+    def test_prunes_the_stale_copy_when_the_manifest_is_intact(
+        self,
+        vault: Path,
+    ) -> None:
+        """Baseline: an uncorrupted manifest DOES delete the stale copy.
+
+        Not a duplicate of the CLI-level prune tests but the control that
+        makes the three below non-vacuous: it establishes that in this
+        exact fixture the prune is armed and reaches this file. Without
+        it, "the copy survived" would be equally true of an implementation
+        that never prunes anything at all.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+
+        generate_register_samples(vault)
+
+        assert not stale_copy.exists()
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_unreadable_summary_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """Malformed summary YAML degrades to a no-op prune, not a traceback.
+
+        ``_Summary.md`` is an ordinary note inside the vault: an operator
+        edit, a half-written file from an interrupted run, or a merge
+        conflict marker all land here as YAML that ``frontmatter.load``
+        refuses. Uncaught, that exception escapes ``save_exemplars`` and
+        kills ``creek report --type voice`` and the unattended ``creek
+        fill`` step with it — over a file whose only job is to say which
+        copies are deletable.
+
+        The rewritten summary is the control: it proves the run carried on
+        past the unreadable manifest and completed the save, rather than
+        the copy surviving because nothing ran.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        (register_dir / "_Summary.md").write_text(
+            "---\nexemplar_digests: [\n---\n\nbroken\n",
+            encoding="utf-8",
+        )
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        rewritten = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert rewritten["exemplar_count"] == 1
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_a_scalar_manifest_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """A manifest that is a bare string prunes nothing.
+
+        The shape a hand-edit produces when someone strips the YAML list
+        dashes, or a note is authored by something that never read the
+        schema. Nothing about it is a record of authorship, so the prune
+        must treat it as no record at all — the file the collector cannot
+        prove it wrote is the file it must not delete.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        _rewrite_manifest(register_dir, "oops")
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        rewritten = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert rewritten["exemplar_count"] == 1
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_a_mapping_manifest_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """A manifest that is a mapping prunes nothing — the guard's live case.
+
+        The scalar case above cannot on its own prove the ``isinstance``
+        check earns its keep: iterating a string yields single characters,
+        which match no digest, so deleting the check would leave that test
+        green. A mapping is the shape where the check is load-bearing —
+        iterating it yields exactly the digest keys, so a prune that
+        skipped the type test would read this as a perfectly good manifest
+        and delete the copy. Keeping the real digests as the keys is the
+        whole point: a placeholder would prove nothing.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        seeded = frontmatter.load(str(register_dir / "_Summary.md"))
+        recorded = seeded["exemplar_digests"]
+        assert isinstance(recorded, list), "the seeding run recorded no manifest"
+        _rewrite_manifest(register_dir, dict.fromkeys(recorded, True))
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        assert (register_dir / "frag-manifest-keep.md").is_file()

@@ -367,10 +367,12 @@ def test_report_voice_include_tier_open_writes_no_audit(tmp_path: Path) -> None:
 
     Worth pinning because the in-code ``NB (#968)`` note at ``creek/cli.py``
     used to claim the opposite, that a typed ``--include-tier open`` writes
-    an entry. That comment is corrected as part of #879; whether the log
-    *should* be able to tell "scanned unfiltered" apart from "narrowed to
-    open" is a real gap in the audit trail, and is a separate change tracked
-    as issue #1218.
+    an entry. That comment is corrected as part of #879.
+
+    This test pins CURRENT behaviour, and that behaviour is a known gap:
+    the log cannot tell "scanned unfiltered" apart from "narrowed to open".
+    Issue #1218 is expected to INVERT it. When #1218 lands, change this
+    test — do not route around it.
     """
     vault = _make_voice_vault(tmp_path)
 

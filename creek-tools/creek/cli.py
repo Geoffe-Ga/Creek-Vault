@@ -2607,6 +2607,20 @@ def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
     # nothing left to profile, but the samples tree may still hold verbatim
     # copies of the fragments that left it, and this is the call that prunes
     # them (#879).
+    #
+    # This is a SECOND full walk of 01-Fragments, and knowingly so. It cannot
+    # share ``generate_all_profiles``' walk without a refactor: below,
+    # ``_persist_fragment`` copies a fragment's source file only while the
+    # collector's ``_records`` cache holds its entry, and only
+    # ``collect_exemplars`` fills that cache — so saving through a collector
+    # that never walked writes a full set of valid-looking samples with empty
+    # bodies. Measured on synthetic vaults (1k/5k fragments, linear scaling):
+    # the redundant walk takes ``_report_voice`` from 1.0x to 1.8x one corpus
+    # parse (~16s of ~39s projected at 35k). The trade is bounded because
+    # ``creek fill`` already makes ~12 full-corpus parse passes, so this is
+    # ~7% of its parse budget and less of its wall clock, which belongs to
+    # embedding inference and DBSCAN. ``save_exemplars`` itself is O(1) in
+    # vault size (<=7 registers x 20 copies). Sharing the walk is issue #1220.
     pruned: list[Path] = []
     summaries = generate_register_samples(
         vault_path,

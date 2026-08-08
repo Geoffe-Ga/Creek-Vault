@@ -426,19 +426,27 @@ def _load_fragment_with_body(
 def _sample_digest(stem: str) -> str:
     """Return the manifest fingerprint of a sample filename *stem*.
 
-    The manifest records fingerprints rather than the ids themselves for
-    two reasons, both of which come from where it lives — the frontmatter
-    of ``_Summary.md``, an ordinary ``.md`` file inside the vault:
+    The manifest records fingerprints rather than the ids themselves
+    because of where it lives — the frontmatter of ``_Summary.md``, an
+    ordinary ``.md`` file inside the vault. ``creek purge`` rewrites
+    **every** ``.md`` in the vault in place, replacing a purged id with
+    ``[purged]`` (``creek/purge/engine.py``). A plaintext manifest is
+    therefore edited out from under the prune by the very command whose
+    leftovers the prune exists to remove, leaving the copy undeletable. A
+    digest survives that rewrite untouched, so the copy stays deletable.
 
-    * ``creek purge`` rewrites **every** ``.md`` in the vault in place,
-      replacing a purged id with ``[purged]``
-      (``creek/purge/engine.py``). A plaintext manifest is therefore
-      edited out from under the prune by the very command whose
-      leftovers the prune exists to remove. A digest survives that
-      rewrite untouched, so the copy stays deletable.
-    * A one-way digest gives purge nothing to have to erase. Storing the
-      ids in a file purge could not reach would have traded one residue
-      for another.
+    **This is a stability property, not an erasure guarantee.** The digest
+    is unsalted SHA-256 over a low-entropy, enumerable value: fragment ids
+    come verbatim from exports, so anyone holding a candidate id list can
+    confirm membership by recomputing the digest, including after a purge.
+    The manifest is therefore best understood as a *confirmable* record of
+    which ids this folder once held, not as an anonymised one. It is
+    accepted because the alternative — a plaintext ledger somewhere purge
+    cannot reach — is strictly worse residue, and because the prune it
+    enables removes the fragment *bodies*, which are the sensitive part.
+    Domain-separating the digest (HMAC under a per-vault key) would close
+    the confirmation gap and is the obvious upgrade if that judgement ever
+    changes.
 
     Args:
         stem: The sample filename stem — equivalently the fragment id,
@@ -906,6 +914,13 @@ class VoiceExemplarCollector:
             if _sample_digest(candidate.stem) not in manifest:
                 continue
             candidate.unlink()
+            # Named, not just counted. The CLI reports a total, but a total
+            # scrolls past inside an unattended ``creek fill`` and cannot
+            # answer "which file did it take?". WARNING is the level rather
+            # than INFO because creek configures no logging handlers, so
+            # INFO is swallowed by ``logging.lastResort`` and a silent
+            # deletion is one nobody can audit (#879).
+            logger.warning("Pruned stale voice register sample: %s", candidate)
             if on_prune is not None:
                 on_prune(candidate)
 
