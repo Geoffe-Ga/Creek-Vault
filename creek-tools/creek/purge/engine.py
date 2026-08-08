@@ -44,7 +44,7 @@ from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,18 @@ _VAULT_CONTENT_FOLDERS: tuple[str, ...] = (
 
 VAULT_PURGE_CONFIRMATION = "I understand this is irreversible"
 """Exact phrase required to confirm a full-vault purge."""
+
+_VOICE_RELDIR: str = "07-Voice"
+"""Vault folder holding the voice subsystem's derived artifacts (#1211)."""
+
+_VOICE_SAMPLES_RELDIR: tuple[str, ...] = ("07-Voice", "Register-Samples")
+"""Where ``save_exemplars`` copies exemplar fragment files byte for byte."""
+
+_VOICE_LEXICON_RELDIR: tuple[str, ...] = ("07-Voice", "Lexicon")
+"""Where the glossary and per-domain metaphor notes quote source sentences."""
+
+_VOICE_PROFILE_GLOB: str = "*-profile.md"
+"""Top-level ``07-Voice`` notes whose ``### Sample Passages`` are exemplar bodies."""
 
 VAULT_MARKER_RELPATH = ("00-Creek-Meta", "creek_config.yaml")
 """Relative path to the file that proves a directory is a Creek vault (GAP-003).
@@ -164,6 +176,36 @@ def _str_list(value: object) -> list[str]:
     return []
 
 
+def _read_bytes_for_match(path: Path) -> bytes:
+    """Read *path* as raw bytes for a containment test, never for rewriting.
+
+    Bytes rather than text on purpose: the caller is deciding whether a
+    derived artifact still holds a purged fragment's content, and a
+    ``read_text`` would raise on the first undecodable byte — turning a
+    file that *might* hold the erased body into one the sweep skips
+    silently. An unreadable file yields ``b""``, which matches nothing,
+    and is logged so a skipped artifact stays distinguishable from a
+    clean one.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The file's bytes, or ``b""`` when it cannot be read.
+    """
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        # Type name only, never str(exc): an OSError message can quote a
+        # title-derived filename, and through it vault content.
+        logger.warning(
+            "Skipping unreadable derived artifact during purge: %s (%s)",
+            path,
+            type(exc).__name__,
+        )
+        return b""
+
+
 class PurgeResult(BaseModel):
     """Outcome of a single purge operation.
 
@@ -203,6 +245,16 @@ class PurgeResult(BaseModel):
             journal-era name because it is serialised into the
             append-only ``purge.jsonl``, where a rename would break
             every existing log.
+        voice_artifacts_removed: Number of derived ``07-Voice/`` notes
+            deleted because they carried the purged fragment's own
+            content (#1211) — the ``Register-Samples`` copy of its file,
+            the ``<register>-profile.md`` quoting its body, and the
+            ``Lexicon`` notes quoting its sentences. Counted-only in a
+            dry run. Deliberately **not** appended to
+            :attr:`deleted_files` and never inflates
+            :attr:`fragments_affected`: these are derived copies, not
+            fragments, and the same rule already governs
+            :attr:`journal_staged_removed`.
     """
 
     operation: str
@@ -220,6 +272,7 @@ class PurgeResult(BaseModel):
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
+    voice_artifacts_removed: int = 0
 
 
 class PurgeEngine:
@@ -281,6 +334,11 @@ class PurgeEngine:
             result.deleted_files.append(str(frag_file))
             result.affected_fragment_ids.append(fragment_id)
             result.fragments_affected = 1
+            # Strictly before the scrub: the lexicon's only link back to
+            # this fragment is a ``[[<id>]]`` wikilink, and the scrub
+            # rewrites it to ``[[[purged]]]``. Swept afterwards, the
+            # sweep would be blind to exactly the notes quoting the body.
+            self._purge_voice_artifacts(fragment_id, post.content, result)
             # One vault walk applies both the wiki-link and provenance scrubs.
             wiki_count, prov_count = self._scrub_references(
                 title=title,
@@ -640,6 +698,12 @@ class PurgeEngine:
         if isinstance(frag_id, str):
             result.affected_fragment_ids.append(frag_id)
         result.fragments_affected += 1
+        # Before the scrub, for the reason spelled out in purge_fragment.
+        self._purge_voice_artifacts(
+            frag_id if isinstance(frag_id, str) else "",
+            post.content,
+            result,
+        )
         # One vault walk applies both the wiki-link and provenance scrubs.
         wiki_count, prov_count = self._scrub_references(
             title=title,
@@ -881,6 +945,202 @@ class PurgeEngine:
         result.journal_staged_removed += 1
         if not self.dry_run:
             staged_path.unlink(missing_ok=True)
+
+    def _purge_voice_artifacts(
+        self,
+        fragment_id: str,
+        body: str,
+        result: PurgeResult,
+    ) -> None:
+        """Sweep the ``07-Voice/`` artifacts derived from a purged fragment (#1211).
+
+        The voice subsystem does not merely *reference* a fragment, it
+        **copies its body**, so scrubbing references leaves the erased
+        content on disk in three shapes:
+        ``Register-Samples/<register>/<id>.md`` is a ``shutil.copy2`` of
+        the fragment file; ``<register>-profile.md`` renders each
+        exemplar body verbatim under ``### Sample Passages``; and
+        ``Lexicon/glossary.md`` plus ``Lexicon/Metaphors/<domain>.md``
+        quote whole source sentences.
+
+        Each match is **deleted rather than edited**. A derived note is a
+        function of the corpus: excising one passage would leave the
+        purged fragment's statistical residue (its n-grams, its
+        contribution to every count in the note) behind while the note
+        went on advertising a total it no longer has. All four artifacts
+        are regenerated by ``creek report --type voice`` / ``--type
+        lexicon``, so deletion costs a re-run and buys a clean erasure.
+
+        The sweep is scoped to those declared locations, never a blanket
+        ``07-Voice`` walk. ``07-Voice/Drafts/`` in particular holds the
+        operator's own writing, which the existing provenance scrub
+        handles and which a fragment purge has no mandate to delete.
+
+        Args:
+            fragment_id: Id of the fragment being purged. Empty string
+                skips the id-keyed passes.
+            body: The fragment's body text, used to attribute a profile's
+                sample passages — see :meth:`_voice_profiles_quoting` for
+                why that pass has to be content-keyed.
+            result: Result accumulator; ``voice_artifacts_removed`` is
+                incremented per artifact actually removed (or that would
+                be removed in a dry run).
+        """
+        voice_root = self.vault_path / _VOICE_RELDIR
+        if not voice_root.is_dir():
+            return
+        contained_root = voice_root.resolve()
+        seen: set[Path] = set()
+        for candidate in self._iter_voice_artifacts(fragment_id, body):
+            target = self._contained_voice_artifact(candidate, contained_root)
+            # Checked before the counter so a dry run never previews a
+            # deletion the real run would refuse, and de-duplicated
+            # because two passes can name the same note.
+            if target is None or target in seen:
+                continue
+            seen.add(target)
+            result.voice_artifacts_removed += 1
+            if not self.dry_run:
+                target.unlink(missing_ok=True)
+
+    @staticmethod
+    def _contained_voice_artifact(
+        candidate: Path,
+        contained_root: Path,
+    ) -> Path | None:
+        """Resolve *candidate* and confirm it is a file inside the voice root.
+
+        Deletion targets the **resolved** path so a symlinked copy loses
+        its content rather than just its link — an RTBF sweep that
+        unlinked the alias would leave the body on disk. Resolving first
+        is also what makes containment meaningful: a register folder
+        symlinked out of the vault would otherwise steer the sweep at an
+        arbitrary file.
+
+        Args:
+            candidate: A path produced by one of the artifact passes.
+            contained_root: The already-resolved ``07-Voice`` directory.
+
+        Returns:
+            The resolved path to delete, or ``None`` meaning *refuse* —
+            unresolvable, outside the voice root, or not a file.
+        """
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError):
+            logger.warning(
+                "Ignoring voice artifact %s that cannot be resolved to a path",
+                candidate,
+            )
+            return None
+        if not resolved.is_relative_to(contained_root):
+            # The resolved victim is deliberately left out of the message:
+            # naming it would turn the log into a filesystem oracle.
+            logger.warning(
+                "Ignoring voice artifact %s that resolves outside %s",
+                candidate,
+                contained_root,
+            )
+            return None
+        if not resolved.is_file():
+            return None
+        return resolved
+
+    def _iter_voice_artifacts(
+        self,
+        fragment_id: str,
+        body: str,
+    ) -> Iterator[Path]:
+        """Yield every ``07-Voice`` artifact attributable to one fragment.
+
+        Args:
+            fragment_id: Id of the fragment being purged.
+            body: Its body text.
+
+        Yields:
+            Candidate paths, before any containment or existence check.
+        """
+        yield from self._voice_sample_copies(fragment_id)
+        yield from self._voice_lexicon_notes(fragment_id)
+        yield from self._voice_profiles_quoting(body)
+
+    def _voice_sample_copies(self, fragment_id: str) -> Iterator[Path]:
+        """Yield the exemplar copies named after *fragment_id*.
+
+        ``VoiceExemplarCollector._persist_fragment`` writes
+        ``f"{fragment.id}.md"``, so the filename **stem** is the recorded
+        link — and it is the one link the reference scrub cannot destroy,
+        which is exactly why #879's own prune matches on it too.
+
+        Args:
+            fragment_id: Id of the fragment being purged.
+
+        Yields:
+            One candidate per register folder.
+        """
+        # A separator in the id would make the join a subpath rather than
+        # a filename; the containment guard would catch an escape, but
+        # refusing here keeps the sweep from naming a file the collector
+        # could never have written.
+        if not fragment_id or {"/", "\\", "\x00"} & set(fragment_id):
+            return
+        samples_root = self.vault_path.joinpath(*_VOICE_SAMPLES_RELDIR)
+        if not samples_root.is_dir():
+            return
+        for register_dir in sorted(samples_root.iterdir()):
+            if register_dir.is_dir():
+                yield register_dir / f"{fragment_id}.md"
+
+    def _voice_lexicon_notes(self, fragment_id: str) -> Iterator[Path]:
+        """Yield lexicon notes that quote *fragment_id*'s sentences.
+
+        ``creek.generate.lexicon._render_context_line`` renders every
+        usage as ``- [[<fragment_id>]] — <sentence>``, so the wikilink is
+        a recorded, exact link from the id the caller holds to the note
+        holding its prose.
+
+        Args:
+            fragment_id: Id of the fragment being purged.
+
+        Yields:
+            Every glossary or metaphor note carrying that wikilink.
+        """
+        if not fragment_id:
+            return
+        lexicon_root = self.vault_path.joinpath(*_VOICE_LEXICON_RELDIR)
+        if not lexicon_root.is_dir():
+            return
+        needle = f"[[{fragment_id}]]".encode()
+        for note in sorted(lexicon_root.rglob("*.md")):
+            if needle in _read_bytes_for_match(note):
+                yield note
+
+    def _voice_profiles_quoting(self, body: str) -> Iterator[Path]:
+        """Yield register profiles whose sample passages contain *body*.
+
+        This pass is content-keyed because nothing else is available: a
+        profile note records the exemplar **bodies** and no fragment ids
+        at all, so there is no provenance to key on (issue #1211's
+        recorded design finding). The match is nonetheless exact rather
+        than heuristic — ``VoiceProfileGenerator._render_profile_body``
+        emits each passage verbatim, so the body appears as a contiguous
+        substring. Reaching it still starts from the id: the caller
+        resolved the id to the fragment file that supplied this body.
+
+        Args:
+            body: The purged fragment's body text.
+
+        Yields:
+            Every top-level ``<register>-profile.md`` quoting that body.
+        """
+        stripped = body.strip()
+        if not stripped:
+            return
+        voice_root = self.vault_path / _VOICE_RELDIR
+        needle = stripped.encode()
+        for profile in sorted(voice_root.glob(_VOICE_PROFILE_GLOB)):
+            if needle in _read_bytes_for_match(profile):
+                yield profile
 
     def _wipe_adepthood_staging(self, result: PurgeResult) -> None:
         """Wipe every Adepthood staging root during a vault purge (#845/#1023).
@@ -1431,6 +1691,7 @@ class PurgeEngine:
             provenance_scrubbed=result.provenance_scrubbed,
             intimate_stubs_removed=result.intimate_stubs_removed,
             journal_staged_removed=result.journal_staged_removed,
+            voice_artifacts_removed=result.voice_artifacts_removed,
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,

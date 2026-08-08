@@ -5307,6 +5307,10 @@ def _render_purge_result(result: PurgeResult) -> None:
         console.print(
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
         )
+    if result.voice_artifacts_removed:
+        console.print(
+            f"Voice artifacts removed: {result.voice_artifacts_removed}",
+        )
 
     if result.deleted_files:
         table = Table(title="Deleted files")
