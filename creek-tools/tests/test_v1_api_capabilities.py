@@ -11,14 +11,19 @@ epic #1071 exists to stop happening at the application layer.
 Two properties in here are load-bearing beyond the obvious.
 
 **The double-call honesty test.** ``handshake_tool`` audits every call, and
-:meth:`creek_mcp.audit.MCPAuditLog.append` does ``mkdir(parents=True,
-exist_ok=True)``. So calling it against a vault that has no ``00-Creek-Meta``
-*creates* ``00-Creek-Meta/audit/`` as a side effect — and the second call would
-then find the marker and report ``available: true`` for a vault that was never
-initialised. The handler must therefore probe with
-:func:`creek_mcp.tools.handshake.vault_available` and must not call
-``handshake_tool`` at all when the marker is absent. Calling twice is the only
-way to see this; one call passes either way.
+:meth:`creek_mcp.audit.MCPAuditLog.append` did ``mkdir(parents=True,
+exist_ok=True)`` unconditionally. So calling it against a vault that has no
+``00-Creek-Meta`` *created* ``00-Creek-Meta/audit/`` as a side effect — and the
+second call then found the marker and reported ``available: true`` for a vault
+that was never initialised. Calling twice is the only way to see this; one call
+passes either way.
+
+This module's answer was to probe with
+:func:`creek_mcp.tools.handshake.vault_available` and not call
+``handshake_tool`` at all when the marker is absent. #1108 closed the hole in
+the tool itself, so the endpoint is now honest twice over. The test below stays
+exactly as it was: it pins the endpoint's observable contract, which is what the
+ADR published, and it must keep passing however readiness comes to be decided.
 
 **Advertised equals implemented.** The response's ``capabilities`` list must
 equal :data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`, not
@@ -224,7 +229,11 @@ def test_repeated_calls_never_conjure_the_creek_marker(bare: Path) -> None:
     directory on first write. So a handler that reached for the tool against a
     vault with no ``00-Creek-Meta`` would *create* ``00-Creek-Meta/audit/`` as
     a side effect and then, on the very next call, find the marker and report
-    ``available: true`` for a vault nobody ever initialised.
+    ``available: true`` for a vault nobody ever initialised. Two independent
+    things now stop that — this handler's probe, and (since #1108) the tool's
+    own refusal to write an audit entry into a vault that does not exist — and
+    this test is deliberately blind to which one is doing the work, because the
+    published contract is about the endpoint's answer, not its mechanism.
 
     A single call cannot see this: the first response is honest either way.
     That is exactly why it has to be two, and why the directory is asserted

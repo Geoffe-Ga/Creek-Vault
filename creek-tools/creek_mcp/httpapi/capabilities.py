@@ -15,14 +15,18 @@ is the endpoint an operator uses to *find out* the vault is broken; answering
 :class:`pydantic.ValidationError` subclasses) and the YAML parse error — rather
 than a bare ``except Exception`` that would also swallow a bug in this module.
 
-**It probes rather than calling the tool against an absent vault.**
-:meth:`creek_mcp.audit.MCPAuditLog.append` does ``mkdir(parents=True,
-exist_ok=True)``, so entering :func:`creek_mcp.tools.handshake.handshake_tool`
-against a directory with no ``00-Creek-Meta`` *creates* ``00-Creek-Meta/audit/``
-as a side effect — and the very next call would then find the marker and report
-``available: true`` for a vault nobody ever initialised. So readiness is decided
-by :func:`creek_mcp.tools.handshake.vault_available`, which has no side effect,
-and the tool is entered only once a vault genuinely exists.
+**It probes rather than calling the tool against an absent vault.** Readiness is
+decided by :func:`creek_mcp.tools.handshake.vault_available`, which has no side
+effect, and the tool is entered only once a vault genuinely exists. That began
+as a workaround: the tool's audit append reached ``mkdir(parents=True,
+exist_ok=True)``, so entering it against a directory with no ``00-Creek-Meta``
+*created* ``00-Creek-Meta/audit/``, and the next call found the marker and
+reported ``available: true`` for a vault nobody ever initialised. #1108 fixed
+that at the source — the tool now records an absent-vault call to the process
+log rather than to a log it would have to scaffold a vault to write. The probe
+stays as the cheaper path and as defence in depth for a contract state that must
+survive polling, but it is no longer the only thing standing between this
+endpoint and a lie.
 
 **Advertised equals implemented.** The ``capabilities`` list is
 :data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`, not ``set(Capability)``.
@@ -122,8 +126,9 @@ def _negotiate(vault: Path, context: RequestContext) -> bool:
     """Enter the handshake tool for a vault already known to exist.
 
     Reached only after :func:`~creek_mcp.tools.handshake.vault_available` has
-    said yes, so the tool's audit append cannot conjure the marker whose
-    absence would have been reported.
+    said yes. Since #1108 the tool is safe to enter against an absent vault on
+    its own, so this ordering is no longer load-bearing for correctness; it is
+    kept because there is nothing to negotiate about a vault that is not there.
 
     Args:
         vault: The vault root, already probed.
