@@ -613,3 +613,73 @@ class TestGenerateGarden:
         content = path.read_text(encoding="utf-8")
         # With no previous history, all tags are "new"
         assert "### New Tags" in content
+
+
+# ---- The Tag Garden is reachable once ``tags`` has a producer (#878) ----
+
+
+class TestTagGardenIsReachableOnceFragmentsCarryTags:
+    """The reader was always fine; the vault was always empty (issue #878).
+
+    ``Fragment.tags`` defaulted to ``[]`` and had essentially no
+    production writer, so on the operator's 35,330-fragment vault
+    ``00-Creek-Meta/Tag-Garden.md`` read ``*No tags found in vault.*`` and
+    every section below it was blank. **No production change is needed
+    here** — this class is the regression proof that the whole generator
+    (scan → growth → clusters → render) lights up the moment the ingest
+    and classify passes start writing the field, and that a future change
+    to the tags pass cannot silently re-empty the garden.
+
+    It reuses the module's existing ``vault`` fixture and
+    ``_write_fragment`` helper deliberately: seeding through the same
+    on-disk shape every other test in this file uses is what keeps the
+    assertion honest.
+    """
+
+    def test_a_tagged_vault_renders_a_populated_garden(
+        self,
+        generator: TagGardenGenerator,
+        vault: Path,
+    ) -> None:
+        """All-Tags, Clusters and Growing Tags are all non-empty (AC-2).
+
+        One rendered document, four assertions, each pinned to a
+        different section so a partial regression cannot pass:
+
+        * the "no tags" sentinel is **absent** — the exact string the
+          operator's real vault showed;
+        * the All-Tags table names the seeded tags;
+        * ``recovery`` and ``writing`` co-occur on three fragments and so
+          form a cluster row;
+        * ``recovery`` grew 2 → 4 against the seeded history, which is
+          the only section that can distinguish "the baseline was loaded
+          and compared" from "the tag exists somewhere in the file".
+
+        The history entry states ``tier_ceiling: all`` because since #968
+        an entry that records none is skipped as a non-comparable
+        baseline, and ``all`` is what the ``generator`` fixture runs at.
+        """
+        history_path = vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
+        history_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "tag_counts": {"recovery": 2},
+                        "timestamp": "2026-01-01T00:00:00",
+                        "tier_ceiling": "all",
+                    },
+                ],
+            ),
+            encoding="utf-8",
+        )
+        for name in ("note1", "note2", "note3"):
+            _write_fragment(vault, name, ["recovery", "writing"])
+        _write_fragment(vault, "note4", ["recovery"])
+
+        content = generator.generate_garden().read_text(encoding="utf-8")
+
+        assert "No tags found in vault." not in content
+        assert "recovery" in content
+        assert "writing" in content
+        assert "| Tag A | Tag B | Co-occurrences |" in content
+        assert "| recovery | 2 | 4 | +100% |" in content

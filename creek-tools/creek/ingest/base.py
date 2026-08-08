@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 import chardet
 from pydantic import BaseModel, ConfigDict, Field
 
+from creek.classify.tags_pass import apply_tags
 from creek.models import Fragment, FragmentLevel
 
 logger = logging.getLogger(__name__)
@@ -395,6 +396,21 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
     2. Falls back to the source file stem for the title when an ingestor
        didn't supply one (e.g. ``DiscordIngestor``'s frontmatter omits it).
     3. Validates the dict into a ``Fragment`` and pairs it with the body.
+    4. Runs the issue #878 hashtag pass
+       (:func:`creek.classify.tags_pass.apply_tags`) so ``tags`` carries
+       the body's hashtags — unioned with, and re-normalising, whatever
+       the source's own frontmatter already declared.
+
+    Step 4 lives here rather than in each ingestor because this function
+    is the **universal ingest chokepoint**: every adapter and every CLI
+    surface funnels through it (``creek/pipeline.py:498`` for ``creek
+    process``, ``creek/ingest/pipeline.py:309`` for ``creek ingest`` /
+    ``creek sync`` / the MCP tool, ``creek/ingest/discord.py:839`` for
+    Discord capture). Wiring it once here is what makes ``tags``
+    populated for markdown, Discord, ChatGPT, Substack and the rest in
+    one place, and it is why the ``creek process`` path needs no separate
+    call further down the pipeline — nothing between here and the write
+    mutates the body the hashtags come from.
 
     Args:
         parsed: A parsed fragment produced by an ingestor's four-stage
@@ -431,6 +447,7 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
     frontmatter_dict.setdefault("title", Path(parsed.source_path).stem or "Untitled")
 
     fragment = Fragment.model_validate(frontmatter_dict)
+    fragment = apply_tags(fragment, body)
     return IngestedFragment(fragment=fragment, body=body)
 
 

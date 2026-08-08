@@ -21,6 +21,7 @@ from creek.classify.llm.calibration import _apply_wavelength
 from creek.classify.llm.parsing import (
     _apply_frequency,
     _apply_praxis,
+    _apply_texture,
     _apply_voice,
     _split_reasoning_and_yaml,
     validate_response,
@@ -292,6 +293,12 @@ class LLMClassifier:
         # ``Fragment.model_config`` sets ``use_enum_values=True``, so the
         # attribute is a plain ``str`` at runtime.
         _apply_praxis(data, updates, PraxisPotential(fragment.praxis_potential))
+        # Issue #878: ``emotional_texture`` merges as a union, so it needs the
+        # list the fragment already carries — a model that saw only part of a
+        # long fragment must not be able to delete a tag an earlier run (or the
+        # operator) recorded. Copied into a fresh ``list`` so the merge can
+        # never alias, and therefore never mutate, the input fragment's field.
+        _apply_texture(data, updates, fragment.emotional_texture.copy())
         if not updates:
             return fragment
         return fragment.model_copy(update=updates)

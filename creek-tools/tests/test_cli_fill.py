@@ -644,3 +644,188 @@ def test_praxis_hint_failure_never_crashes_fill(
         )
 
     assert any("praxis" in record.getMessage().lower() for record in caplog.records)
+
+
+# ---- Issue #878: the tags-backfill hint ------------------------------------
+#
+# Same detector shape as the #877 praxis hint above, and for the same reason:
+# it cannot be "the ``tags`` key is absent" (``Fragment.model_dump`` always
+# writes it) and it must not be "the list is empty" (plenty of fragments
+# genuinely have no hashtags, so that nag would be permanent and instantly
+# ignored). The one shape that proves work is outstanding is **the free
+# hashtag extractor finds a tag the disk does not record**. Costs zero tokens,
+# and goes quiet the moment the operator acts on it.
+
+_TAGS_SIGNAL_BODY = "notes from the week ahead\n\n#gardening"
+"""A body carrying exactly one extractable hashtag."""
+
+_TAGS_QUIET_BODY = "a plain note about the walk to the shops and the weather"
+"""A body carrying no hashtag at all."""
+
+
+def _seed_tagged_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    body: str,
+    tags: str,
+) -> None:
+    """Write a fragment with a chosen body and inline ``tags`` list.
+
+    Built from a literal frontmatter template so the on-disk value is
+    exactly what the test names, independent of ``Fragment`` defaults. A
+    real ``privacy_tier`` is stamped so the sibling #876 untiered hint
+    stays silent and cannot pollute the captured output.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem).
+        body: Markdown body the hashtag extractor scans.
+        tags: The ``tags`` value already on disk, as inline YAML
+            (e.g. ``"[]"`` or ``"[gardening]"``).
+    """
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "A note"\n'
+        f"source:\n  platform: markdown\n  author: self\n"
+        f"privacy_tier: open\ntags: {tags}\n---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_count_tags_backfillable_counts_only_provable_gaps(
+    tmp_path: Path,
+) -> None:
+    """Only "hashtag present but not recorded" counts as backfillable.
+
+    Three fragments spanning three distinct states so the count cannot be
+    right by accident:
+
+    * hashtag + ``tags: []`` — the real gap, the only one counted;
+    * hashtag + already recorded — nothing owed;
+    * no hashtag + ``tags: []`` — genuinely has no tags to extract.
+
+    Counting the last two would make the hint permanent, which is the
+    failure mode this detector is designed around.
+    """
+    from creek.cli import _count_tags_backfillable_fragments
+
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(vault, "frag-gap", body=_TAGS_SIGNAL_BODY, tags="[]")
+    _seed_tagged_fragment(
+        vault, "frag-done", body=_TAGS_SIGNAL_BODY, tags="[gardening]"
+    )
+    _seed_tagged_fragment(vault, "frag-quiet", body=_TAGS_QUIET_BODY, tags="[]")
+
+    assert _count_tags_backfillable_fragments(vault) == 1
+
+
+def test_count_tags_backfillable_is_zero_without_a_fragments_dir(
+    tmp_path: Path,
+) -> None:
+    """A vault with no ``01-Fragments`` counts zero rather than exploding."""
+    from creek.cli import _count_tags_backfillable_fragments
+
+    assert _count_tags_backfillable_fragments(tmp_path / "empty-vault") == 0
+
+
+def test_fill_hints_when_tags_can_be_backfilled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hint reports a COUNT and leaks nothing about the fragments.
+
+    Printed ahead of the ``offer is None`` early return, like the #876
+    untiered and #877 praxis hints it sits beside, so it still fires on
+    the vault that most needs it (fully classified, no LLM upgrade to
+    offer).
+
+    It reports a **count only**. Naming a fragment id, quoting a body
+    excerpt, or — worst of all — printing the tags themselves would turn
+    an advisory line into an unaudited disclosure of vault content
+    through stdout, which the config-oracle rule (#846 / #848) forbids.
+    All three are asserted absent.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(vault, "frag-gap", body=_TAGS_SIGNAL_BODY, tags="[]")
+    _seed_tagged_fragment(vault, "frag-quiet", body=_TAGS_QUIET_BODY, tags="[]")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "tag" in out.lower()
+    assert "1" in out
+    # …and nothing about the fragment itself leaks.
+    assert "frag-gap" not in out
+    assert "gardening" not in out
+    assert "week ahead" not in out
+
+
+def test_tags_hint_is_silent_when_every_hashtag_is_already_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A backfilled vault gets no hint — the nag must not be permanent.
+
+    The vault here is the steady state after one ``creek classify`` run:
+    every hashtag the extractor can see is already recorded, and the rest
+    of the fragments genuinely have none. Any implementation that keyed
+    off "tags == []" would print here forever and train the operator to
+    ignore the line.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(
+        vault, "frag-done", body=_TAGS_SIGNAL_BODY, tags="[gardening]"
+    )
+    _seed_tagged_fragment(vault, "frag-quiet", body=_TAGS_QUIET_BODY, tags="[]")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    assert "tag" not in capsys.readouterr().out.lower()
+
+
+def test_tags_hint_failure_never_crashes_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken tags count is swallowed by its own best-effort guard.
+
+    Contract note for the implementation: the hint must call the
+    module-level ``_count_tags_backfillable_fragments`` (this test
+    patches it there) and log its own WARNING naming ``tags``, rather
+    than sharing another hint's guard — otherwise one failing scan
+    silently suppresses the others too.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    def _boom(*_a: object) -> int:
+        raise OSError("unreadable fragment")
+
+    monkeypatch.setattr(cli_mod, "_count_tags_backfillable_fragments", _boom)
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+
+    with caplog.at_level(logging.WARNING):
+        # Must not raise.
+        _maybe_upgrade_classification(
+            tmp_path, cli_mod._load_config_for_vault(tmp_path), upgrade=False
+        )
+
+    assert any("tag" in record.getMessage().lower() for record in caplog.records)

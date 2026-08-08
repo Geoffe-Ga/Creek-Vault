@@ -103,6 +103,45 @@ structurally unreachable. The policy lives in
 actually raised — the observability that was missing when this field had
 an invisible (in fact absent) producer.
 
+Tags pass (issue #878)
+----------------------
+
+Same shape, one axis over: :attr:`~creek.models.Fragment.tags` had no
+real producer either, so 2000/2000 sampled fragments of the operator's
+35,330-fragment vault read ``tags: []`` and the Tag Garden read "*No tags
+found in vault.*". The policy lives in :mod:`creek.classify.tags_pass`
+and there are exactly **two** call sites for it in the whole toolchain:
+
+* :func:`creek.ingest.base.assemble_ingested_fragment`, the universal
+  ingest chokepoint, which tags everything arriving from now on; and
+* this engine, beside the praxis pass, which is the *backfill* half —
+  and the half that matters today, because the operator's vault was
+  ingested long before ``tags`` had any producer at all.
+
+There is deliberately **no third call** in
+:func:`creek.pipeline.run_pipeline` (``creek/pipeline.py:655``), where
+the praxis pass does need one. Praxis is a classification verdict, so it
+has to run after the LLM dispatch; tags come from the body, which no
+stage between ingest and write mutates. The ingest chokepoint is
+therefore strictly earlier and strictly sufficient for the ``creek
+process`` path, and a second call there would be pure duplication.
+
+* **Union-merge, never replace.** :func:`~creek.classify.tags_pass.merge`
+  keeps every tag already on record and appends what the body yields, so
+  a re-classify can never delete a tag an operator hand-wrote in Obsidian
+  (or the ``low-priority`` literal
+  :mod:`creek.clean.context` appends). That makes the pass idempotent: a
+  second run over an unchanged vault reports ``0``.
+* **NOT on the preserved short-circuit**, for the same reason as praxis
+  and more so — :func:`_write_tier_only` is not widened, and ``tags`` is
+  a field operators curate by hand. An ``llm``/``manual``-stamped vault
+  backfills it only under an explicit ``creek classify --method llm
+  --force``; ``creek fill`` surfaces the outstanding count
+  (:func:`creek.cli._hint_tags_backfill`).
+
+:attr:`ClassifySummary.tags_extracted` reports how many fragments the run
+actually gained a tag on.
+
 Known residual (not fixable by ordering)
 ----------------------------------------
 
@@ -167,6 +206,7 @@ from creek.classify.reatomize import (
     classify_reatomize,
 )
 from creek.classify.rules import RuleClassifier
+from creek.classify.tags_pass import apply_tags
 from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
@@ -293,6 +333,15 @@ class ClassifySummary:
             module docstring). Like :attr:`privacy_tiers_assigned` this
             counts the decision, not the bytes — a fragment whose write
             then fails is counted here *and* reported on :attr:`errors`.
+        tags_extracted: Fragments this run added at least one
+            :attr:`~creek.models.Fragment.tags` entry to (issue #878).
+            Counts *fragments changed*, not tags written, and only
+            genuine additions: re-deriving a hashtag the fragment already
+            records is not work the operator needs reported, so the merge
+            being a union makes a second run over an unchanged vault
+            report ``0``. Fragments the resume short-circuit preserved are
+            **not** counted — they are not given tags at all without
+            ``--force`` (see the module docstring).
     """
 
     total: int
@@ -306,6 +355,7 @@ class ClassifySummary:
     # compiles unchanged.
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
+    tags_extracted: int = 0
 
 
 @dataclass
@@ -323,6 +373,7 @@ class _RunCounts:
     skipped: int = 0
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
+    tags_extracted: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -522,6 +573,7 @@ def run_classify(
         errors=tuple(counts.errors),
         privacy_tiers_assigned=counts.privacy_tiers_assigned,
         praxis_marked=counts.praxis_marked,
+        tags_extracted=counts.tags_extracted,
     )
 
 
@@ -649,6 +701,32 @@ def _record_praxis(
     """
     if fragment.praxis_potential != before:
         counts.praxis_marked += 1
+
+
+def _record_tags(
+    before: list[str],
+    fragment: Fragment,
+    counts: _RunCounts,
+) -> None:
+    """Tally a fragment this run added a tag to (issue #878).
+
+    Kept as its own function for the same reason as :func:`_record_praxis`
+    — :func:`_process_file`'s cyclomatic complexity is already at its
+    working ceiling and does not need another ``if``. Comparing
+    before/after is safe precisely because
+    :func:`~creek.classify.tags_pass.apply_tags` merges as a union that
+    never loses a tag: the list can only grow, or be re-canonicalised in
+    place — which can shorten it, when two spellings of one tag collapse
+    to the single tag they always named — so any difference is real work
+    and never churn.
+
+    Args:
+        before: The tags the fragment carried before the pass.
+        fragment: The fragment after the pass.
+        counts: Mutable per-run counters; mutated in place.
+    """
+    if fragment.tags != before:
+        counts.tags_extracted += 1
 
 
 def _assert_classifiers_available(tier_classifiers: TierClassifiers | None) -> None:
@@ -945,6 +1023,15 @@ def _process_file(
     praxis_before = new_fragment.praxis_potential
     new_fragment = apply_praxis(new_fragment, body)
 
+    # #878: extract the body's hashtags into ``tags``. Unconditional for the
+    # same reason as the praxis pass above — ``apply_tags`` is pure and
+    # returns the same object when the union adds nothing, so this adds no
+    # branch here. Placed beside praxis rather than in ``_prepare_fragment``
+    # so the #876 tier-then-router ordering stays untouched; the merge is a
+    # union, so it is order-independent with respect to everything around it.
+    tags_before = new_fragment.tags.copy()
+    new_fragment = apply_tags(new_fragment, body)
+
     # #876: classification may have hardened the fragment's voice signals
     # (confessional + conviction is one of the INTIMATE triggers), which the
     # pre-pass could not see. Take the stricter of the two verdicts —
@@ -966,6 +1053,7 @@ def _process_file(
 
     with lock:
         _record_praxis(praxis_before, new_fragment, counts)
+        _record_tags(tags_before, new_fragment, counts)
 
         # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
         # True we run the orchestrator on the root fragment and persist any

@@ -301,6 +301,63 @@ class TestGenerateWeeklyReport:
         # `enthusiasm` appears twice across the test fragments.
         assert "enthusiasm" in body
 
+    def test_texture_cloud_renders_in_descending_order_from_vault(
+        self,
+        tracker: WavelengthTracker,
+        vault_path: Path,
+    ) -> None:
+        """Textures seeded on disk render as a counted, ordered cloud (AC-4).
+
+        Issue #878. ``_render_emotional_texture_cloud``
+        (``creek/generate/wavelength.py:1123``) was never a broken
+        consumer — it was a *starved* one: ``Fragment.emotional_texture``
+        had no producer, so every real weekly and monthly report read
+        "_No emotional texture tags recorded._". This is the regression
+        proof that the whole path lights up once the field is populated,
+        and it deliberately round-trips the fragments through the vault
+        rather than passing them in memory, because the on-disk
+        frontmatter is where the operator's textures will actually live.
+
+        The rendered substring pins counts *and* descending order in one
+        assertion: ``grief`` (3) must precede ``resolve`` (2), which must
+        precede ``wonder`` (1).
+        """
+        base = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+        seeded = [
+            _make_fragment(
+                frag_id="frag-texture-1",
+                created=base,
+                emotional_texture=["grief", "resolve", "wonder"],
+            ),
+            _make_fragment(
+                frag_id="frag-texture-2",
+                created=base.replace(day=21),
+                emotional_texture=["grief", "resolve"],
+            ),
+            _make_fragment(
+                frag_id="frag-texture-3",
+                created=base.replace(day=22),
+                emotional_texture=["grief"],
+            ),
+        ]
+        frags_dir = vault_path / "01-Fragments"
+        frags_dir.mkdir(parents=True, exist_ok=True)
+        for fragment in seeded:
+            post = frontmatter.Post(
+                content=fragment.title,
+                **fragment.model_dump(mode="json"),
+            )
+            (frags_dir / f"{fragment.id}.md").write_text(
+                frontmatter.dumps(post),
+                encoding="utf-8",
+            )
+
+        path = tracker.generate_weekly_report(vault_path, week_of=date(2026, 4, 20))
+
+        body = frontmatter.load(str(path)).content
+        assert "No emotional texture tags recorded." not in body
+        assert "grief(3) resolve(2) wonder(1)" in body
+
     def test_mode_distribution_lists_observed_modes(
         self,
         tracker: WavelengthTracker,

@@ -545,6 +545,80 @@ class TestFragment:
         assert restored.emotional_texture == original.emotional_texture
         assert restored.tags == original.tags
 
+    def test_tags_and_texture_round_trip_verbatim_through_json(self) -> None:
+        """``tags`` and ``emotional_texture`` survive a JSON dump unchanged.
+
+        Issue #878 gives both fields real producers for the first time, so
+        the serialisation path they take to disk stops being theoretical.
+        Asserted as exact lists, in order, on both sides of the round
+        trip: order is load-bearing (the extractors emit first-seen order
+        precisely so a re-ingest does not churn frontmatter), and a
+        reordering serialiser would silently rewrite every fragment in the
+        vault on the next run.
+        """
+        original = Fragment(
+            id="frag-000000000018",
+            title="Tagged and textured",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            emotional_texture=["grief", "resolve", "wonder"],
+            tags=["recovery", "project/creek", "family-business"],
+        )
+
+        dump = original.model_dump(mode="json")
+
+        assert dump["emotional_texture"] == ["grief", "resolve", "wonder"]
+        assert dump["tags"] == ["recovery", "project/creek", "family-business"]
+        restored = Fragment.model_validate(dump)
+        assert restored.emotional_texture == original.emotional_texture
+        assert restored.tags == original.tags
+
+    def test_a_hand_authored_ten_item_texture_list_is_not_truncated(self) -> None:
+        """There is NO model-level validator on ``emotional_texture`` (#878).
+
+        A deliberate non-decision, pinned so nobody adds one later. The
+        LLM-response caps (``_MAX_TEXTURES`` = 5, ``_MAX_TEXTURE_CHARS`` =
+        32) live in :mod:`creek.classify.llm.parsing` and bound what an
+        *untrusted model response* may write. Lifting them onto the model
+        would apply them to every ``Fragment.model_validate`` in the
+        codebase — including the vault reader — and so would silently
+        delete half of a list an operator hand-wrote in Obsidian the next
+        time any command merely *read* the file.
+
+        Ten items and a 200-character item together, so both caps are
+        tested for absence in one construction.
+        """
+        textures = [f"mood-{i}" for i in range(9)]
+        textures.append("m" * 200)
+
+        frag = Fragment(
+            id="frag-000000000019",
+            title="Hand edited",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            emotional_texture=textures,
+        )
+
+        assert frag.emotional_texture == textures
+        reloaded = Fragment.model_validate(frag.model_dump(mode="json"))
+        assert reloaded.emotional_texture == textures
+
+    def test_hand_authored_tags_are_not_renormalised_by_the_model(self) -> None:
+        """``tags`` normalisation belongs to the pass, not the model (#878).
+
+        ``creek.classify.tags_pass`` lowercases and dash-normalises tags
+        on the two writer paths that own them. The model must leave the
+        value verbatim: a validator here would rewrite an operator's
+        ``Recovery`` on every read, in every command, with no audit trail
+        and no way to opt out.
+        """
+        frag = Fragment(
+            id="frag-000000000020",
+            title="Hand edited",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            tags=["Recovery", "Family_Business"],
+        )
+
+        assert frag.tags == ["Recovery", "Family_Business"]
+
 
 class TestFragmentHierarchy:
     """Tests for the FEAT-020 hierarchical fragment data model.
