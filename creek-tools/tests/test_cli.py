@@ -9,12 +9,15 @@ import frontmatter
 import pytest
 from typer.testing import CliRunner
 
-from creek.cli import app
+from creek.cli import app, console
 from creek.ingest.base import IngestResult
 
 runner = CliRunner()
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Must match ``_TEST_TERMINAL_COLUMNS`` in ``tests/conftest.py``.
+_PINNED_TERMINAL_COLUMNS = 200
 
 
 def _strip_ansi(text: str) -> str:
@@ -27,6 +30,25 @@ def _strip_ansi(text: str) -> str:
     keeps the tests environment-independent.
     """
     return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def test_cli_console_width_is_pinned_at_import_time() -> None:
+    """creek's console must not freeze at 80 columns in an xdist worker (#1141).
+
+    Rich caches ``COLUMNS`` into ``Console._width`` at construction and then
+    returns that cached value from every ``size`` lookup, so a console built
+    while ``COLUMNS=80`` stays 80 columns wide no matter what a fixture sets
+    afterwards. :mod:`creek.cli` builds its console at import — i.e. during
+    collection — and on Linux every pytest-xdist worker inherits
+    ``COLUMNS=80`` from readline's C-level ``putenv``. The result was Rich
+    hard-wrapping CLI output mid-phrase and splitting the substrings the CLI
+    tests assert on.
+
+    ``tests/conftest.py`` closes the window by pinning the width in
+    ``pytest_configure``, which runs before collection. This asserts that the
+    pin actually reached the console, rather than trusting the ordering.
+    """
+    assert console.width == _PINNED_TERMINAL_COLUMNS
 
 
 def test_help() -> None:

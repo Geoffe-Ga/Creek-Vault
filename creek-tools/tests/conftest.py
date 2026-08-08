@@ -6,6 +6,9 @@ Provides auto-use fixtures that:
   models or require GPU access, and
 - pin the terminal width so Rich/Typer CLI output renders deterministically
   regardless of the ambient terminal or whether stdout is a TTY (GAP-013).
+  The width is pinned in :func:`pytest_configure` as well as in the fixture,
+  because a Rich console caches its width at construction and creek's console
+  is constructed at collection time -- see that hook's docstring (#1141).
 
 Also provides the opt-in :func:`short_write` fixture (issue #987), which
 simulates partial ``os.write`` returns so the vault/save writers can be
@@ -33,16 +36,47 @@ _TEST_TERMINAL_LINES = "50"
 _DIMS = 384
 
 
+def pytest_configure() -> None:
+    """Pin the terminal width *before* any test module is imported (#1141).
+
+    The autouse :func:`_pin_terminal_width` fixture below is not sufficient on
+    its own, and the gap is only visible under ``pytest-xdist``.
+
+    A ``rich.console.Console`` resolves ``COLUMNS`` **twice**: once in
+    ``Console.__init__``, which caches the value in the private ``_width``, and
+    again per render in ``Console.size`` -- but ``size`` returns the cached
+    ``_width`` verbatim whenever it is not ``None``. So a console constructed
+    while ``COLUMNS`` is set has its width frozen for the life of the process,
+    and no later ``setenv`` can widen it. :mod:`creek.cli` builds exactly such
+    a module-level console, at import time, which is *collection* time -- long
+    before any fixture runs.
+
+    That only bites in a worker. On Linux, GNU readline (pulled in
+    transitively by pytest via :mod:`pdb`) calls ``putenv("COLUMNS=80")`` at
+    the C level when it finds no TTY. C-level ``putenv`` does not show up in
+    the parent's :data:`os.environ` snapshot, but it *is* inherited by every
+    subprocess -- so each xdist worker starts life with ``COLUMNS=80`` already
+    in its environment, freezes every module-level console at 80 columns, and
+    hard-wraps CLI output mid-phrase. The serial run never sees it because
+    nothing re-execs. macOS never sees it either, because its Python links
+    libedit rather than GNU readline.
+
+    Setting the variable here closes that window: ``pytest_configure`` runs
+    before collection, so every console built during collection caches the
+    pinned width instead of the inherited 80.
+    """
+    os.environ["COLUMNS"] = _TEST_TERMINAL_COLUMNS
+    os.environ["LINES"] = _TEST_TERMINAL_LINES
+
+
 @pytest.fixture(autouse=True)
 def _pin_terminal_width(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin terminal width/height so Rich CLI output never wraps (GAP-013).
+    """Keep terminal width/height pinned for every test (GAP-013).
 
-    Rich resolves its render width from the ``COLUMNS`` environment variable
-    on every render (not just at ``Console`` construction), so setting it here
-    deterministically controls output width for the module-level ``Console``
-    in :mod:`creek.cli` and any other Rich/Typer output -- whether stdout is a
-    real TTY or a pipe. ``monkeypatch`` restores the prior environment after
-    each test.
+    :func:`pytest_configure` above is what binds for consoles constructed at
+    import time; this fixture is the per-test backstop for everything built
+    later -- consoles Typer creates on demand, and any code that reads
+    ``COLUMNS`` itself -- and it restores whatever a test changed.
     """
     monkeypatch.setenv("COLUMNS", _TEST_TERMINAL_COLUMNS)
     monkeypatch.setenv("LINES", _TEST_TERMINAL_LINES)
