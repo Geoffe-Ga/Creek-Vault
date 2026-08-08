@@ -1950,13 +1950,20 @@ class TestLLMClassifierAnthropicDispatch:
         mock_call.assert_called_once()
 
 
-# ---- Integration test (requires running Ollama) ----
+# ---- Live smoke (requires a running Ollama) ----
 
 
-class TestLLMClassifierIntegration:
-    """Integration tests for LLMClassifier with real Ollama."""
+class TestLLMClassifierLive:
+    """Live smoke for LLMClassifier against a real Ollama instance.
 
-    @pytest.mark.integration
+    ``live``, not ``integration``: ``LLMClassifier.available`` performs an
+    outbound HTTP probe of the Ollama endpoint, so this needs a reachable
+    service. The blocking ``integration`` lane is hermetic by definition, and
+    CI runs no Ollama. Every other LLMClassifier test in this module mocks
+    ``httpx.Client`` and stays in the unit lane.
+    """
+
+    @pytest.mark.live
     def test_classify_with_real_ollama(self) -> None:
         """classify should work with a real Ollama instance."""
         config = LLMConfig()

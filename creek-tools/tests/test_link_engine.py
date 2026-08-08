@@ -727,3 +727,135 @@ def test_run_link_eddies_preserves_extra_frontmatter_and_body(
         assert any(
             isinstance(entry, str) and entry.startswith("[[") for entry in eddies_field
         ), f"Fragment {frag.id} lost its eddy wiki-link"
+
+
+# ----- Issue #880: cluster-limit and segmentation plumbing -------------------
+
+
+def test_run_link_eddies_reports_largest_cluster(tmp_path: Path) -> None:
+    """``LinkSummary`` carries the largest detected cluster size.
+
+    Issue #880: ``docs/linking.md`` has advertised a ``largest: N fragments``
+    line since the linker shipped, and no code ever produced the number —
+    which is exactly the statistic that would have made the 30,795-fragment
+    mega-eddy visible without opening the vault.
+    """
+    vault = tmp_path / "vault"
+    fragments = _embedded_eddy_fragments(vault, count=8)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+
+    assert summary.eddies_detected == 1
+    assert summary.largest_cluster_fragments == len(fragments)
+    assert summary.clusters_split == 0
+    assert summary.oversized_discarded == 0
+
+
+def test_run_link_honours_configured_cluster_ceiling(tmp_path: Path) -> None:
+    """A configured ceiling reaches the detector and bounds what is emitted.
+
+    Issue #880: ``run_link`` used to construct ``EddyDetector(embeddings=...)``
+    with embeddings only, so every threshold fell back to a module constant
+    and no configured value could change the outcome. Here the ceiling is set
+    below the single dense cluster, which is eight identical vectors and
+    therefore cannot be split by any epsilon — so the guardrail's
+    discard-to-noise path fires and is reported.
+    """
+    vault = tmp_path / "vault"
+    fragments = _embedded_eddy_fragments(vault, count=8)
+    config = CreekConfig()
+    config.linking.cluster_size_ceiling = 1
+    config.linking.cluster_max_fraction = 0.5
+
+    summary = run_link(
+        vault_path=vault,
+        config=config,
+        method="eddies",
+        rebuild=False,
+    )
+
+    assert summary.eddies_detected == 0
+    assert summary.clusters_split == 1
+    assert summary.oversized_discarded == len(fragments)
+    assert summary.largest_cluster_fragments == 0
+
+
+def _embedded_message_stream(vault: Path) -> list[Fragment]:
+    """Seed *vault* with two Discord channels ten days apart, one dense blob.
+
+    Every fragment carries the same title and an identical embedding, so
+    without segmentation DBSCAN sees exactly one cluster spanning both
+    channels — the shape of the #880 mega-eddy in miniature.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        The created fragments in creation order.
+    """
+    from datetime import datetime, timedelta
+
+    base = datetime(2026, 4, 1, 9, 0)
+    fragments: list[Fragment] = []
+    for channel_index, channel in enumerate(("stagecraft", "starlight")):
+        for message in range(5):
+            authored = base + timedelta(days=10 * channel_index, hours=message)
+            frag = Fragment(
+                id=f"frag-880-{channel_index}-{message:02d}",
+                title="messages",
+                source=FragmentSource(
+                    platform=SourcePlatform.DISCORD,
+                    channel=channel,
+                ),
+                created=authored,
+                authored_at=authored,
+            )
+            _write_fragment(vault=vault, fragment=frag, body="body")
+            fragments.append(frag)
+
+    config = CreekConfig()
+    linker = EmbeddingLinker(config=config.embeddings)
+    vectors = {frag.id: [1.0, 0.0, 0.0] for frag in fragments}
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(linker.build_cache_entries(fragments, vectors), cache_path)
+    return fragments
+
+
+def test_run_link_honours_configured_stream_platforms(tmp_path: Path) -> None:
+    """The configured stream-platform list reaches the detector, both ways.
+
+    Issue #880: with the default list, two Discord channels ten days apart
+    are two conversation episodes and therefore two eddies. Emptying the
+    list — the documented way to disable segmentation — collapses them back
+    into the single ten-fragment blob the bug produced. Neither outcome is
+    reachable unless ``run_link`` actually passes the configuration to
+    ``EddyDetector``, which it previously did not.
+    """
+    vault = tmp_path / "vault"
+    fragments = _embedded_message_stream(vault)
+
+    segmented = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+    assert segmented.eddies_detected == 2
+    assert segmented.largest_cluster_fragments == len(fragments) // 2
+
+    unsegmented_config = CreekConfig()
+    unsegmented_config.linking.stream_platforms = []
+    unsegmented = run_link(
+        vault_path=vault,
+        config=unsegmented_config,
+        method="eddies",
+        rebuild=False,
+    )
+    assert unsegmented.eddies_detected == 1
+    assert unsegmented.largest_cluster_fragments == len(fragments)

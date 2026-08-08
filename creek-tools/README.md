@@ -161,7 +161,7 @@ read the threat model below before doing anything else.
 | `llm`            | `LLMRoutingConfig`     | Per-stage provider+model routing (`default` / `classification` / `generation` / `frontend` + a `writing_desk` role map), or a legacy flat `LLMConfig` block. See [LLM providers](#llm-providers). |
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
-| `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
+| `linking`        | `LinkingConfig`        | Embedding/temporal/thread/eddy thresholds, message-stream segmentation, and the cluster-size guardrail. See [ADR-0008](docs/architecture/ADR/0008-bounding-cluster-degeneration-in-message-streams.md). |
 | `classification` | `ClassificationConfig` | Auto-classify sources, confidence threshold, review-required sources. |
 | `context`        | `ContextConfig`        | How non-user content (others' messages, collaborative docs) is handled. |
 | `redaction`      | `RedactionConfig`      | Pattern enable list, exclusion globs, allow-list. |
@@ -228,11 +228,11 @@ For the Writing Desk voice roles (`voice_drafter` / `voice_line_editor`), an exp
 **Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model id is only proven by a real call. With the provider's key (and consent) in the env, one command makes a single tiny live request and asserts the normalized round-trip:
 
 ```bash
-./scripts/test.sh --integration -k openai                                  # smoke the provider's default model
-CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --integration -k gemini # smoke a candidate model id
+./scripts/test.sh --live -k openai                                  # smoke the provider's default model
+CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --live -k gemini # smoke a candidate model id
 ```
 
-Each smoke skips cleanly when its key is absent, and the `integration` marker keeps them out of the default test selection and CI entirely.
+Each smoke skips cleanly when its key is absent, and the `live` marker keeps them out of the default test selection and CI entirely — CI holds no provider credentials, and a merge gate that depends on a paid third-party API is a flaky gate.
 
 ---
 
@@ -258,7 +258,10 @@ All quality gates run from `creek-tools/` via the project scripts:
 ./scripts/check-all.sh          # Run all 7 gates (lint, format, typecheck, complexity, security, tests, coverage)
 ./scripts/fix-all.sh             # Auto-fix lint + format
 ./scripts/test.sh                # Unit tests (default)
-./scripts/test.sh --all          # Unit + integration + e2e
+./scripts/test.sh --integration  # Hermetic cross-component lane (blocking in CI)
+./scripts/test.sh --e2e          # Hermetic end-to-end lane (blocking in CI)
+./scripts/test.sh --live         # Live API/service smokes (needs keys; not in CI)
+./scripts/test.sh --all          # Every lane, live smokes included
 ./scripts/test.sh --coverage     # With coverage report
 ./scripts/lint.sh --fix          # Ruff lint with auto-fix
 ./scripts/format.sh --check      # Format check

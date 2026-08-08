@@ -101,16 +101,26 @@ class LinkingPipeline:
             window_hours=self.linking_config.temporal_window_hours,
         )
 
-        # Stage 3: Thread detection (uses embeddings for semantic clustering)
-        thread_detector = ThreadDetector(embeddings=embeddings)
+        # Stage 3: Thread detection (uses embeddings for semantic clustering).
+        # Issue #880: build through ``from_linking_config`` so this pipeline
+        # and ``creek.link.link_engine`` cannot cluster the same vault
+        # differently — every threshold comes from the same config section.
+        thread_detector = ThreadDetector.from_linking_config(
+            embeddings,
+            self.linking_config,
+        )
         threads = thread_detector.detect_threads(
             fragments,
             min_fragments=self.linking_config.thread_min_fragments,
         )
         fragments = thread_detector.assign_fragments_to_threads(fragments, threads)
 
-        # Stage 4: Eddy detection (uses embeddings for density clustering)
-        eddy_detector = EddyDetector(embeddings=embeddings)
+        # Stage 4: Eddy detection (uses embeddings for density clustering).
+        # Issue #880: same single construction path as stage 3.
+        eddy_detector = EddyDetector.from_linking_config(
+            embeddings,
+            self.linking_config,
+        )
         eddies = eddy_detector.detect_eddies(
             fragments,
             min_fragments=self.linking_config.eddy_min_fragments,

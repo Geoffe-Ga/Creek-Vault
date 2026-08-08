@@ -33,7 +33,10 @@ install -r requirements-dev.txt` still works as an unpinned fallback.
 ./scripts/check-all.sh          # Run ALL quality checks (do this before every commit)
 ./scripts/fix-all.sh            # Auto-fix linting + formatting
 ./scripts/test.sh               # Run unit tests
-./scripts/test.sh --all         # Run all test types (unit, integration, e2e)
+./scripts/test.sh --all         # Run all lanes (unit, integration, e2e, live)
+./scripts/test.sh --integration # Hermetic cross-component lane (blocking in CI)
+./scripts/test.sh --e2e         # Hermetic end-to-end lane (blocking in CI)
+./scripts/test.sh --live        # Live API/service smokes (needs keys; not in CI)
 ./scripts/test.sh --coverage    # Unit tests with coverage report
 ./scripts/coverage.sh           # Coverage report (--html for HTML output)
 ./scripts/lint.sh               # Ruff linting (--fix to auto-fix)
@@ -75,7 +78,9 @@ pytest tests/test_main.py::test_main_runs -v
 ### creek-tools
 - **Python >=3.11** (CI tests 3.11, 3.12, 3.13)
 - Package source: `creek/` (flat layout, not src/)
-- Tests: `tests/` (pytest with markers: `integration`, `e2e`)
+- Tests: `tests/` (pytest lane markers: `integration`, `e2e` — both hermetic
+  and blocking in CI; `live` — needs real keys/services, never run in CI;
+  `slow` — benchmarks. See the `markers` table in `pyproject.toml`.)
 - Config: `pyproject.toml` contains all tool configs (pytest, coverage, mypy, ruff, bandit)
 - CI: `/.github/workflows/ci.yml` (at repo root; jobs use `working-directory: creek-tools`)
 - Pre-commit: `creek-tools/.pre-commit-config.yaml` (install with `pre-commit install -c creek-tools/.pre-commit-config.yaml`)

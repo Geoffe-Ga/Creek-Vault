@@ -711,10 +711,24 @@ class DiscordIngestor(Ingestor):
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Generate YAML frontmatter metadata for a Discord fragment.
 
-        Produces frontmatter with source platform, channel, timestamps,
-        and participant information. FEAT-031: the message's source-side
-        ``timestamp`` (preserved with its native offset) lands on
-        ``authored_at``.
+        Produces frontmatter with a title, source platform, channel,
+        timestamps, and participant information. FEAT-031: the message's
+        source-side ``timestamp`` (preserved with its native offset) lands
+        on ``authored_at``.
+
+        Issue #880: the ``title`` key is emitted here rather than left to
+        :func:`creek.ingest.base.assemble_ingested_fragment`'s filename-stem
+        fallback. :meth:`discover` only ever reads
+        ``<channel_dir>/messages.json``, so that fallback gave *every*
+        Discord fragment in every vault the title ``messages`` — and since
+        :class:`~creek.models.Fragment` carries no body, a fragment's title
+        is the only text the linker ever sees. 30,795 identical titles are
+        what named a mega-eddy ``Messages``. Naming the channel and the day
+        gives the linker something that actually distinguishes one
+        conversation from another.
+
+        No fragment id churns: :func:`creek.ingest.base.generate_fragment_id`
+        hashes source path, timestamp and content, never the title.
 
         Args:
             fragment: The parsed fragment.
@@ -722,17 +736,23 @@ class DiscordIngestor(Ingestor):
         Returns:
             A dict of frontmatter key-value pairs.
         """
+        channel = fragment.metadata.get("channel_name", "unknown")
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        # The source-side day when the export carried one, so the title
+        # agrees with ``authored_at`` rather than with the LA-anchored
+        # ingest timestamp (FEAT-031).
+        titled_on = (authored_at or fragment.timestamp).date()
         frontmatter_dict: dict[str, Any] = {
+            "title": f"{channel} {titled_on.isoformat()}",
             "source": {
                 "platform": "discord",
-                "channel": fragment.metadata.get("channel_name", "unknown"),
+                "channel": channel,
                 "channel_id": fragment.metadata.get("channel_id", "unknown"),
             },
             "created": fragment.timestamp.isoformat(),
             "authors": fragment.metadata.get("authors", []),
             "message_count": fragment.metadata.get("message_count", 0),
         }
-        authored_at: datetime | None = fragment.metadata.get("authored_at")
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()
         return frontmatter_dict

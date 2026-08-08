@@ -473,6 +473,141 @@ class LinkingConfig(BaseModel):
     introduced by FEAT-022.
     """
 
+    # ---- Detector thresholds (issue #880) ----
+    #
+    # Every default below is the exact value of the module-private constant
+    # it replaces, so a vault whose creek_config.yaml predates these keys
+    # clusters identically after the upgrade.
+
+    eddy_eps: float = Field(default=0.3, gt=0.0, lt=1.0)
+    """Maximum cosine *distance* for a DBSCAN neighbour in eddy detection.
+
+    ``0.3`` means an edge exists between two fragments at cosine similarity
+    ``>= 0.70``. Lowering it tightens every cluster; it cannot, on its own,
+    separate a continuous message stream (see ``stream_platforms``).
+    """
+
+    eddy_min_samples: int = Field(default=5, ge=1)
+    """Minimum neighbourhood size for a DBSCAN core point in eddy detection."""
+
+    eddy_correlation_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    """Absolute Spearman ceiling above which a cluster is thread-like.
+
+    A candidate eddy whose content drift correlates with chronological rank
+    at or above this value is a directional progression, and is filtered out
+    of the eddy set rather than emitted as a topic cluster.
+    """
+
+    thread_window_days: int = Field(default=30, ge=1)
+    """Sliding-window width, in days, for thread detection.
+
+    Distinct from ``temporal_window_hours``, which feeds only the temporal
+    *proximity* linker and has never influenced threads.
+    """
+
+    thread_similarity_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Cosine similarity a pair must strictly exceed to join one thread."""
+
+    thread_union_without_embeddings: bool = False
+    """Whether a pair missing an embedding may union on frequency alone.
+
+    When the detector has *no* embeddings at all, thread detection falls
+    back to frequency agreement by design. On a *partially* embedded vault
+    the same fallback fires per pair, silently chaining fragments the
+    similarity gate would have rejected — so it is closed by default and
+    must be opted into.
+    """
+
+    # ---- Cluster-size guardrail (issue #880) ----
+
+    cluster_size_ceiling: int = Field(default=500, ge=1)
+    """Absolute member count below which a cluster is never split.
+
+    The effective ceiling is ``max(cluster_size_ceiling, floor(corpus_size *
+    cluster_max_fraction))``: the absolute floor dominates ordinary vaults,
+    so the guardrail stays inert until a corpus is large enough for
+    degeneration to matter.
+    """
+
+    cluster_max_fraction: float = Field(default=0.10, gt=0.0, le=1.0)
+    """Largest share of the corpus a single eddy or thread may hold.
+
+    ``1.0`` is the documented opt-out: one cluster may then span everything.
+    """
+
+    cluster_split_max_depth: int = Field(default=3, ge=0)
+    """Re-clustering rounds allowed per oversized cluster.
+
+    ``0`` disables splitting entirely, sending any oversized cluster
+    straight to noise.
+    """
+
+    eddy_split_eps_step: float = Field(default=0.05, gt=0.0, lt=1.0)
+    """Amount ``eddy_eps`` is tightened by on each re-clustering round."""
+
+    thread_split_similarity_step: float = Field(default=0.1, gt=0.0, lt=1.0)
+    """Amount ``thread_similarity_threshold`` is raised on each round."""
+
+    # ---- Message-stream segmentation (issue #880) ----
+
+    stream_platforms: list[str] = Field(
+        default_factory=lambda: ["discord", "email"],
+    )
+    """Source platforms whose fragments are cut into conversation episodes.
+
+    A continuous chat stream violates the precondition both detectors rely
+    on — clusters separated by low-density regions — so it is partitioned
+    into independent clustering domains *before* any similarity graph is
+    built. The default names the two platforms Creek already routes to the
+    ``01-Fragments/Messages/`` subfolder. An empty list disables
+    segmentation. Values must be :class:`~creek.models.SourcePlatform`
+    members.
+    """
+
+    stream_episode_max_gap_hours: int = Field(default=24, ge=1)
+    """Inactivity gap, in hours, that ends a conversation episode.
+
+    The conversational rule: people stop talking, and that silence is the
+    real topic boundary. Inclusive — a gap exactly this long does not cut.
+    """
+
+    stream_episode_max_span_days: int = Field(default=30, ge=1)
+    """Maximum span, in days, of a single conversation episode.
+
+    The backstop for a channel that never falls idle, so a permanently-busy
+    channel yields channel-month units rather than one multi-year blob.
+    Inclusive — a span exactly this long does not cut.
+    """
+
+    @field_validator("stream_platforms")
+    @classmethod
+    def _validate_stream_platforms(cls, value: list[str]) -> list[str]:
+        """Reject platform names that no ingestor can ever produce.
+
+        Args:
+            value: The configured platform values.
+
+        Returns:
+            The value unchanged when every entry names a
+            :class:`~creek.models.SourcePlatform` member.
+
+        Raises:
+            ValueError: If any entry is not a known source platform — a
+                typo would otherwise disable segmentation silently.
+        """
+        from creek.models import SourcePlatform
+
+        known = {platform.value for platform in SourcePlatform}
+        unknown = [name for name in value if name not in known]
+        if unknown:
+            msg = (
+                f"unknown source platform(s) in stream_platforms: "
+                f"{', '.join(sorted(unknown))}; "
+                f"valid values are {', '.join(sorted(known))}"
+            )
+            raise ValueError(msg)
+        return value
+
 
 class ClassificationConfig(BaseModel):
     """Classification pipeline configuration."""

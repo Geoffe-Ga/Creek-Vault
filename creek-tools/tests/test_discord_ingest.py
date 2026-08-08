@@ -9,12 +9,16 @@ custom emoji), and full pipeline integration.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from creek.ingest.base import ParsedFragment, RawDocument
+from creek.ingest.base import (
+    ParsedFragment,
+    RawDocument,
+    assemble_ingested_fragment,
+)
 from creek.ingest.discord import (
     DiscordIngestor,
     _build_message_index,
@@ -879,6 +883,87 @@ class TestDiscordIngestorGenerateFrontmatter:
         ingestor = DiscordIngestor()
         fm = ingestor.generate_frontmatter(self._fragment())
         assert fm["message_count"] == 3
+
+    def test_title_names_the_channel_and_date(self) -> None:
+        """Issue #880: the title names the conversation, not the export file.
+
+        ``generate_frontmatter`` emitted no ``title`` at all, so
+        ``assemble_ingested_fragment`` fell back to the source filename
+        stem — and ``discover`` only ever reads ``<channel>/messages.json``,
+        so every Discord fragment in every vault was titled ``messages``.
+        With 30,795 of them, that one word became the linker's only text
+        signal and named the mega-eddy ``Messages``.
+        """
+        ingestor = DiscordIngestor()
+        fm = ingestor.generate_frontmatter(self._fragment())
+        assert fm["title"] == "knowledge-sharing 2024-11-10"
+
+    def test_title_falls_back_to_the_channel_default(self) -> None:
+        """A channel-less export still gets a dated, non-filename title."""
+        frag = ParsedFragment(
+            content="test",
+            metadata={},
+            source_path="/fake/messages.json",
+            timestamp=datetime(2024, 11, 10, 14, 0, 0, tzinfo=LA_TZ),
+        )
+        ingestor = DiscordIngestor()
+        fm = ingestor.generate_frontmatter(frag)
+        assert fm["title"] == "unknown 2024-11-10"
+
+    def test_title_uses_the_source_side_authored_date(self) -> None:
+        """FEAT-031: the date in the title is the message's own, not LA's."""
+        frag = ParsedFragment(
+            content="test",
+            metadata={
+                "channel_name": "knowledge-sharing",
+                "authored_at": datetime(2024, 11, 11, 1, 0, 0, tzinfo=UTC),
+            },
+            source_path="/fake/messages.json",
+            timestamp=datetime(2024, 11, 10, 17, 0, 0, tzinfo=LA_TZ),
+        )
+        ingestor = DiscordIngestor()
+        fm = ingestor.generate_frontmatter(frag)
+        assert fm["title"] == "knowledge-sharing 2024-11-11"
+
+    def test_title_does_not_change_the_fragment_id(self) -> None:
+        """Issue #880: adding a title must not re-key any existing vault.
+
+        ``generate_fragment_id`` hashes source path, timestamp and content
+        and never the title, so an already-ingested Discord corpus keeps
+        every one of its fragment ids — and therefore its filenames, its
+        resonance edges and its frontmatter links — across this change.
+        """
+        parsed = self._fragment()
+        ingestor = DiscordIngestor()
+        frontmatter = ingestor.generate_frontmatter(parsed)
+
+        titled = ParsedFragment(
+            content=parsed.content,
+            metadata={
+                **parsed.metadata,
+                "markdown": "body",
+                "frontmatter": dict(frontmatter),
+            },
+            source_path=parsed.source_path,
+            timestamp=parsed.timestamp,
+        )
+        legacy_frontmatter = {k: v for k, v in frontmatter.items() if k != "title"}
+        untitled = ParsedFragment(
+            content=parsed.content,
+            metadata={
+                **parsed.metadata,
+                "markdown": "body",
+                "frontmatter": legacy_frontmatter,
+            },
+            source_path=parsed.source_path,
+            timestamp=parsed.timestamp,
+        )
+
+        new = assemble_ingested_fragment(titled).fragment
+        old = assemble_ingested_fragment(untitled).fragment
+        assert old.title == "messages"  # the pre-fix filename-stem fallback
+        assert new.title != old.title
+        assert new.id == old.id
 
     def test_missing_metadata_uses_defaults(self) -> None:
         """Should use default values when metadata keys are missing."""
