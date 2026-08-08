@@ -272,3 +272,121 @@ def test_author_default_writes_no_audit(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert not (vault / PRIVACY_AUDIT_RELPATH).exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #879 — ``report --type voice`` now writes vault content
+# ---------------------------------------------------------------------------
+#
+# ``report --type voice`` began copying fragment bodies into
+# ``07-Voice/Register-Samples/`` in #879, so the ceiling it runs under is
+# now visible in the artifact rather than only in a rendered profile. The
+# audit polarity that governs it is ``report``'s, not ``mine``'s, and it
+# runs backwards from every other surface in this module: on ``report`` an
+# ABSENT ``--include-tier`` means UNFILTERED, and the flag NARROWS.
+
+
+def _make_voice_vault(tmp_path: Path) -> Path:
+    """Build a vault with one exemplar-eligible confessional fragment."""
+    vault = tmp_path / "vault"
+    folder = vault / "01-Fragments" / "Journal"
+    folder.mkdir(parents=True)
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    (folder / "frag-voice.md").write_text(
+        '---\ntype: fragment\nid: frag-voice\ntitle: "A settled note"\n'
+        "source:\n  platform: journal\n  author: self\n"
+        "frequency:\n  primary: F5\n"
+        "wavelength:\n  phase: rising\n  mode: express\n"
+        "voice:\n  voice_register: confessional\n  confidence: conviction\n"
+        "privacy_tier: open\n---\nThe creek of thought flows downstream.\n",
+        encoding="utf-8",
+    )
+    return vault
+
+
+def test_report_voice_with_include_tier_writes_audit(tmp_path: Path) -> None:
+    """``report --type voice --include-tier personal`` records ``report.voice``.
+
+    The ``command`` field has to carry the report *type*, not a bare
+    ``report``: the entry is invocation-level (``fragment_ids`` is
+    intentionally empty, because ``report`` iterates vault content itself
+    rather than taking a caller-supplied id list), so the type string is
+    the only thing that tells an operator which artifact was elevated.
+    """
+    vault = _make_voice_vault(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "voice",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "personal",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    audit_path = vault / PRIVACY_AUDIT_RELPATH
+    assert audit_path.exists()
+    entries = list(AuditLog(audit_path).read())
+    assert len(entries) == 1
+    assert entries[0]["command"] == "report.voice"
+    assert entries[0]["include_tier"] == "personal"
+    assert entries[0]["fragment_ids"] == []
+
+
+def test_report_voice_without_include_tier_writes_no_audit(
+    tmp_path: Path,
+) -> None:
+    """A bare ``report --type voice`` writes no privacy-override entry.
+
+    An absent flag is not an elevation the operator performed, even though
+    on ``report`` it is the *widest* scan available (#968). The entry
+    records what was typed.
+    """
+    vault = _make_voice_vault(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "voice", "--vault", str(vault)],
+    )
+    assert result.exit_code == 0, result.output
+    assert not (vault / PRIVACY_AUDIT_RELPATH).exists()
+
+
+def test_report_voice_include_tier_open_writes_no_audit(tmp_path: Path) -> None:
+    """``--include-tier open`` records nothing: ``open`` does not elevate.
+
+    The audit is gated on ``privacy_filter.override_elevates``, which
+    returns ``False`` for both ``None`` and ``OPEN`` by construction, so on
+    ``report`` — where the flag NARROWS — the widest scan available and the
+    narrowest are alike unaudited and indistinguishable in the log.
+
+    Worth pinning because the in-code ``NB (#968)`` note at ``creek/cli.py``
+    used to claim the opposite, that a typed ``--include-tier open`` writes
+    an entry. That comment is corrected as part of #879.
+
+    This test pins CURRENT behaviour, and that behaviour is a known gap:
+    the log cannot tell "scanned unfiltered" apart from "narrowed to open".
+    Issue #1218 is expected to INVERT it. When #1218 lands, change this
+    test — do not route around it.
+    """
+    vault = _make_voice_vault(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "voice",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "open",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not (vault / PRIVACY_AUDIT_RELPATH).exists()

@@ -39,6 +39,11 @@ _EXPECTED_ORDER = [
     "report/paradox",
     "report/synchronicity",
     "report/mode-profiles",
+    # #879: ``creek fill`` is the "make my vault prod-ready" command, so the
+    # voice report belongs in it — without this step the register samples are
+    # only ever written by an operator who knows to run
+    # ``creek report --type voice`` by hand.
+    "report/voice",
     "report/wavelength",
     "index",
 ]
@@ -72,6 +77,7 @@ def _install_recorders(
         ("_report_paradox", "report/paradox"),
         ("_report_synchronicity", "report/synchronicity"),
         ("_report_mode_profiles", "report/mode-profiles"),
+        ("_report_voice", "report/voice"),
     ):
         monkeypatch.setattr(cli_mod, name, rec(label))
     monkeypatch.setattr(
@@ -111,6 +117,47 @@ def test_fill_runs_all_steps_in_dependency_order(
 
     assert result.exit_code == 0, result.output
     assert calls == _EXPECTED_ORDER
+
+
+def test_fill_voice_step_states_the_unfiltered_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``report/voice`` step declares ``PrivacyTierOverride.ALL`` (#879).
+
+    ``creek fill`` has no ``--include-tier`` of its own, and on the report
+    surface an absent flag means *unfiltered*, so the step has to say
+    ``ALL`` out loud rather than inherit a default nobody typed — the same
+    contract every other step in ``_build_fill_steps`` already keeps. The
+    step is fetched from the plan and invoked directly rather than through
+    ``creek fill`` so the assertion is about the argument, not about the
+    command happening to reach it.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: Fixture used to capture the override the step passes.
+    """
+    from creek.classify.privacy_filter import PrivacyTierOverride
+
+    seen: list[object] = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_report_voice",
+        lambda _vault, override: seen.append(override),
+    )
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    steps = dict(
+        cli_mod._build_fill_steps(
+            vault,
+            cli_mod._load_config_for_vault(vault),
+            with_compost=False,
+        )
+    )
+
+    assert "report/voice" in steps
+    steps["report/voice"]()
+
+    assert seen == [PrivacyTierOverride.ALL]
 
 
 def test_fill_step_failure_is_non_fatal(
