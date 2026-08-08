@@ -9,9 +9,12 @@ what :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware`
 does) cannot cancel a task inside it. The per-request timeout would silently
 stop working, and the failure would look like a hang rather than a bug.
 
-Each also passes non-``http`` scopes straight through. A middleware that
-assumed ``http`` would break the ``lifespan`` handshake the test client
-performs on entry, and the whole suite would fail at ``with client(...)``.
+Each also relays a ``lifespan`` scope straight through — a middleware that
+assumed ``http`` would break the handshake the test client performs on entry,
+and the whole suite would fail at ``with client(...)``. It relays *only* that
+one, via :func:`creek_mcp.httpapi.context.pass_through`, and refuses every
+other scope type rather than waving it past authentication, the ceiling gate
+and the access log (#1124).
 
 The order is pinned as data by ``tests/test_v1_api_hardening.py``, because
 every property the modules below promise depends on it:

@@ -33,7 +33,7 @@ import logging
 from time import perf_counter
 from typing import TYPE_CHECKING, Final
 
-from creek_mcp.httpapi.context import HTTP_SCOPE, bind_context
+from creek_mcp.httpapi.context import HTTP_SCOPE, bind_context, pass_through
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -90,7 +90,7 @@ class AccessLogMiddleware:
             send: The ASGI send channel, wrapped to observe the status line.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         context = bind_context(scope)
         started_at = perf_counter()

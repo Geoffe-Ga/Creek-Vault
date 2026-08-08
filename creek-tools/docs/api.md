@@ -344,6 +344,35 @@ audit entry per request would put a hash-chained write on an unauthenticated
 path (a denial-of-service amplifier) and would pollute the tool-invocation
 trail.
 
+### Fault logging
+
+A `500` also writes one `ERROR` record, with the traceback, to a **second**
+logger: `creek_mcp.httpapi.error`. It carries the `request_id` and nothing
+else about the request — route and consumer are already on the access line,
+joined by that same id.
+
+The response body does not change: the caller still gets exactly
+`{code, message, request_id}` with the constant `internal_error` message, and
+never the traceback, the exception class or a source path. The traceback is for
+the operator; without it a `500` is a fault that can be counted but not
+diagnosed.
+
+**Route the two loggers separately.** The access line is five fields chosen to
+be safe to ship. A traceback carries whatever the exception's own message
+carried, which can include vault content — so it wants its own handler,
+destination and retention rather than inheriting the access log's.
+
+### ASGI scopes
+
+The server answers `http` and relays `lifespan`. Any other scope type — a
+`websocket`, or anything a future server introduces — is **refused at the
+outermost middleware** rather than passed down. A passthrough written as
+"anything that is not `http`" would hand the first `websocket` route anyone
+mounted a path through the whole stack with no authentication, no ceiling gate
+and no access line, and the router would answer it rather than error. There is
+no `ws://` surface today; the allowlist is what keeps that true by
+construction.
+
 ## OpenAPI
 
 ```bash

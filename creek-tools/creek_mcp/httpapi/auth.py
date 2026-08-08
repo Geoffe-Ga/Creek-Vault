@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Final
 from starlette.datastructures import Headers
 
 from creek_mcp.api.models import ErrorCode
-from creek_mcp.httpapi.context import HTTP_SCOPE, context_of
+from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
@@ -148,7 +148,7 @@ class BearerAuthMiddleware:
             send: The ASGI send channel.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         context = context_of(scope)
         token = _presented_token(scope)

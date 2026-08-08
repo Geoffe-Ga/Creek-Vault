@@ -8,11 +8,21 @@ internals handed to a remote consumer, and the third of them can carry vault
 content that arrived in the exception's own message.
 
 So the boundary answers :attr:`~creek_mcp.api.models.ErrorCode.INTERNAL_ERROR`
-with the constant table entry, and discards the exception. Nothing about it is
-logged here either: the access line already records the ``500`` with its
-correlation id, and an operator wanting the traceback runs the server with
-``debug`` disabled but their own handler attached — a decision that belongs to
-deployment, not to this module.
+with the constant table entry, and discards the exception *from the response*.
+
+**Discarding it from the process too was a bug (#1122).** An operator was left
+with a ``500``, a correlation id, and no traceback anywhere — a fault that
+cannot be diagnosed at all, only counted. So the exception is logged here,
+server-side, on :data:`ERROR_LOGGER_NAME`, and the envelope going back to the
+caller is byte-for-byte what it was: the two are different audiences, and the
+whole point is that only one of them gets the internals.
+
+**Not on the access logger.** That log's promise is five safe fields and no
+sixth; a traceback carries whatever the exception's own message carried, which
+can be vault content. Two loggers is what lets an operator ship one off-host
+and hold the other. The record carries the ``request_id`` and nothing else
+about the request — route and consumer are already on the access line, joined
+by that id, and a second copy is a second thing to keep true.
 
 It sits second from the top: below the access log, so the ``500`` it produces is
 still counted, and above everything else, so a fault in any other middleware is
@@ -21,14 +31,27 @@ enveloped too.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import logging
+from typing import TYPE_CHECKING, Final
 
 from creek_mcp.api.models import ErrorCode
-from creek_mcp.httpapi.context import HTTP_SCOPE, context_of
+from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
+
+ERROR_LOGGER_NAME: Final[str] = "creek_mcp.httpapi.error"
+"""The logger a ``/v1`` fault's traceback lands on. Stable, and published.
+
+Deliberately not :data:`~creek_mcp.httpapi.middleware.access_log.ACCESS_LOGGER_NAME`.
+An operator routes the two differently because their contents differ in kind,
+and a single logger would force the traceback to be handled at the access log's
+classification or the access log at the traceback's.
+"""
+
+_ERROR_LOGGER: Final[logging.Logger] = logging.getLogger(ERROR_LOGGER_NAME)
+"""The fault logger itself."""
 
 
 class ErrorBoundaryMiddleware:
@@ -51,7 +74,7 @@ class ErrorBoundaryMiddleware:
             send: The ASGI send channel.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         context = context_of(scope)
         try:
@@ -65,6 +88,18 @@ class ErrorBoundaryMiddleware:
             if context.started:
                 # The response is already on the wire; replacing it now would
                 # raise inside the handler for the original fault and bury it.
+                # Not logged here either: this path does not *discard* the
+                # exception, it keeps unwinding, and the ASGI server records
+                # it. Logging it as well would report one fault twice.
                 raise
+            # ``exception`` rather than ``error``: it is what attaches the
+            # traceback, which is the entire point. The id is passed lazily
+            # and repeated in ``extra`` so it stays machine-readable for an
+            # operator shipping JSON logs, exactly as the access line does.
+            _ERROR_LOGGER.exception(
+                "unhandled fault answering /v1 request_id=%s",
+                context.request_id,
+                extra={"request_id": context.request_id},
+            )
             refusal = error_response(ErrorCode.INTERNAL_ERROR, context)
             await refusal(scope, receive, send)
