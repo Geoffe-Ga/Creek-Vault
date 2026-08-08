@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from creek.generate import indexes
 from creek.generate.indexes import (
     FREQUENCY_COLORS,
     FREQUENCY_NAMES,
@@ -644,10 +645,15 @@ class TestGenerateAll:
 class TestEdgeCases:
     """Tests for edge cases and error handling."""
 
-    def test_missing_frequency_subdirs_creates_files_only_for_existing(
+    def test_missing_frequency_subdirs_are_created_not_skipped(
         self, tmp_path: Path
     ) -> None:
-        """If some frequency subdirs are missing, only generate for existing ones."""
+        """A partial ``06-Frequencies`` scaffold is filled in, not silently skipped.
+
+        Issue #1231: this test previously asserted ``len(result) == 2`` — it
+        pinned the silent no-op. A missing folder must be created (or
+        reported), never quietly passed over.
+        """
         # Create vault with only some frequency subdirs
         (tmp_path / "06-Frequencies").mkdir()
         (tmp_path / "06-Frequencies" / "F1-Agency").mkdir()
@@ -659,7 +665,120 @@ class TestEdgeCases:
 
         gen = IndexGenerator(tmp_path)
         result = gen.generate_frequency_indexes()
-        assert len(result) == 2
+
+        assert len(result) == 10
+        assert all(path.is_file() for path in result)
+        # The two pre-existing folders are reused, not duplicated.
+        assert (tmp_path / "06-Frequencies" / "F1-Agency" / "F1-Index.md").is_file()
+        assert (
+            tmp_path / "06-Frequencies" / "F2-Receptivity" / "F2-Index.md"
+        ).is_file()
+        matches_f1 = [
+            child
+            for child in (tmp_path / "06-Frequencies").iterdir()
+            if child.name.startswith("F1") and not child.name.startswith("F10")
+        ]
+        assert len(matches_f1) == 1, matches_f1
+
+    def test_empty_frequency_root_is_populated(self, tmp_path: Path) -> None:
+        """An empty ``06-Frequencies`` yields ten indexes under canonical folders."""
+        (tmp_path / "06-Frequencies").mkdir()
+
+        result = IndexGenerator(tmp_path).generate_frequency_indexes()
+
+        assert len(result) == 10
+        assert (tmp_path / "06-Frequencies" / "F1-Agency" / "F1-Index.md").is_file()
+        f10 = tmp_path / "06-Frequencies" / "F10-Emptiness" / "F10-Index.md"
+        assert f10.is_file()
+
+    def test_absent_frequency_root_is_created(self, tmp_path: Path) -> None:
+        """A vault with no ``06-Frequencies`` at all still gets its indexes."""
+        result = IndexGenerator(tmp_path).generate_frequency_indexes()
+
+        assert len(result) == 10
+        assert (tmp_path / "06-Frequencies").is_dir()
+
+    def test_frequency_indexes_are_idempotent_after_self_healing(
+        self, tmp_path: Path
+    ) -> None:
+        """A second run reuses the folders the first run created."""
+        gen = IndexGenerator(tmp_path)
+        first = gen.generate_frequency_indexes()
+        second = gen.generate_frequency_indexes()
+
+        assert [path.parent.name for path in first] == [
+            path.parent.name for path in second
+        ]
+        assert len(list((tmp_path / "06-Frequencies").iterdir())) == 10
+
+    def test_bare_frequency_folder_name_is_honoured(self, tmp_path: Path) -> None:
+        """A vault scaffolded with a bare ``F1`` folder is used as-is (#1231/#1025)."""
+        (tmp_path / "06-Frequencies" / "F1").mkdir(parents=True)
+
+        IndexGenerator(tmp_path).generate_frequency_indexes()
+
+        assert (tmp_path / "06-Frequencies" / "F1" / "F1-Index.md").is_file()
+        assert not (tmp_path / "06-Frequencies" / "F1-Agency").exists()
+
+    def test_thread_index_creates_its_directory(self, tmp_path: Path) -> None:
+        """``generate_thread_index`` mkdirs ``02-Threads`` like every other writer."""
+        written = IndexGenerator(tmp_path).generate_thread_index()
+
+        assert written.is_file()
+        assert written == tmp_path / "02-Threads" / "Thread-Index.md"
+
+    def test_eddy_map_creates_its_directory(self, tmp_path: Path) -> None:
+        """``generate_eddy_map`` mkdirs ``03-Eddies`` like every other writer."""
+        written = IndexGenerator(tmp_path).generate_eddy_map()
+
+        assert written.is_file()
+        assert written == tmp_path / "03-Eddies" / "Eddy-Map.md"
+
+    def test_temporal_index_creates_its_directory(self, tmp_path: Path) -> None:
+        """``generate_temporal_index`` mkdirs ``00-Creek-Meta``."""
+        written = IndexGenerator(tmp_path).generate_temporal_index()
+
+        assert written.is_file()
+
+    def test_source_index_creates_its_directory(self, tmp_path: Path) -> None:
+        """``generate_source_index`` mkdirs ``00-Creek-Meta``."""
+        written = IndexGenerator(tmp_path).generate_source_index()
+
+        assert written.is_file()
+
+    def test_absent_template_tree_falls_back_to_the_bare_code(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no packaged template to read, folders are named by code alone."""
+        monkeypatch.setattr(indexes, "VAULT_TEMPLATE_DIR", tmp_path / "no-template")
+        vault = tmp_path / "vault"
+
+        result = IndexGenerator(vault).generate_frequency_indexes()
+
+        assert len(result) == 10
+        assert (vault / "06-Frequencies" / "F1" / "F1-Index.md").is_file()
+
+    def test_template_without_a_matching_folder_falls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template missing one frequency still yields that frequency's index."""
+        template = tmp_path / "template"
+        (template / "06-Frequencies" / "F2-Receptivity").mkdir(parents=True)
+        monkeypatch.setattr(indexes, "VAULT_TEMPLATE_DIR", template)
+        vault = tmp_path / "vault"
+
+        result = IndexGenerator(vault).generate_frequency_indexes()
+
+        assert len(result) == 10
+        assert (vault / "06-Frequencies" / "F1" / "F1-Index.md").is_file()
+        assert (vault / "06-Frequencies" / "F2-Receptivity" / "F2-Index.md").is_file()
+
+    def test_generate_all_on_a_bare_vault(self, tmp_path: Path) -> None:
+        """``generate_all`` on an empty directory writes every index note."""
+        result = IndexGenerator(tmp_path).generate_all()
+
+        assert len(result) == 14
+        assert all(path.is_file() for path in result)
 
     def test_frequency_index_content_structure(self, generator: IndexGenerator) -> None:
         """Frequency index notes should have well-structured content."""
