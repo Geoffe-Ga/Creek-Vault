@@ -11,17 +11,32 @@ and hands it over.
 Three properties of that routing rule, none of them visible at the call
 site, all of them load-bearing:
 
-- **The tier is derived from the seed's *source fragments* only.** The
-  ``## Threads`` and ``## Eddies`` prompt sections render compiled-page
-  bodies and frontmatter descriptions with **no tier filtering at all**
+- **The tier is derived from every fragment the prompt carries, not just
+  the seed's ``source_fragments``.** The ``## Threads`` and ``## Eddies``
+  sections render compiled-page bodies and frontmatter descriptions with
+  no tier filtering of their own
   (``creek.generate.drafts.DraftGenerator._compose_thread_section`` /
   ``._compose_eddy_section``, fed by
   :func:`creek.generate.drafts._load_threads_by_id` /
-  :func:`creek.generate.drafts._load_eddies_by_id`), so whatever reaches
-  the model through those sections does **not** raise the routing tier.
-  That is a pre-existing residual in the #931 family, deliberately out
-  of scope for #958, and stated here rather than left for the next
-  reader to rediscover.
+  :func:`creek.generate.drafts._load_eddies_by_id`) — and they *cannot*
+  filter, because neither :class:`~creek.models.Thread` nor
+  :class:`~creek.models.Eddy` carries a ``privacy_tier`` to filter on.
+  Until #1013 that let a compiled page summarising ``intimate``
+  fragments reach a cloud provider on a draft routed ``open``: the #931
+  laundering shape, where a derived artifact carries above-ceiling
+  content past a source-tier computation that cannot see it.
+
+  :func:`_compiled_source_ids` closes it by surveying what those pages
+  already record — :attr:`~creek.models.CompiledPage.provenance`, the
+  fragment ids behind each claim — and folding those ids into the same
+  survey the seed's own sources go through. A named thread or eddy whose
+  sources cannot be enumerated (no compiled page, or a page recording no
+  provenance) fails closed to ``intimate``.
+
+  The blast radius is deliberate and worth knowing: a vault whose
+  compiled pages predate provenance recording will route every threaded
+  draft to the local model. That is the safe direction, but it is a
+  behaviour change, not a no-op.
 - **The ceiling alone is not sufficient** — which is the whole reason
   the sources are surveyed at all.
   :func:`creek.generate.drafts._render_fragment_section` emits
@@ -65,6 +80,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 from creek.classify.privacy_filter import max_source_tier, source_tiers
+from creek.generate.compile_routing import load_compiled_pages
 from creek.generate.drafts import DraftGenerator
 from creek.generate.mining import IdeaMiner
 from creek.models import Phase, PrivacyTier
@@ -158,9 +174,9 @@ def _source_routing_tier(
     Args:
         vault_path: Vault root; source fragments are read from
             ``01-Fragments`` by the shared survey.
-        idea: The mined seed about to be drafted. Only its
-            ``source_fragments`` are consulted — see the module docstring
-            for why its ``threads`` / ``eddies`` do not raise the tier.
+        idea: The mined seed about to be drafted. Its ``source_fragments``
+            *and* the provenance behind any ``threads`` / ``eddies`` it
+            names are surveyed — see :func:`_compiled_source_ids`.
         ceiling: The caller's declared ceiling.
 
     Returns:
@@ -168,10 +184,61 @@ def _source_routing_tier(
         with. It is a routing signal only and **must never** be echoed
         back to the caller in any form.
     """
-    if not idea.source_fragments:
+    compiled_ids, opaque = _compiled_source_ids(vault_path, idea)
+    if opaque:
+        return routing_tier(ceiling, PrivacyTier.INTIMATE)
+    if not idea.source_fragments and not compiled_ids:
         return routing_tier(ceiling, None)
-    tiers = source_tiers(vault_path, idea.source_fragments)
+    tiers = source_tiers(vault_path, [*idea.source_fragments, *compiled_ids])
     return routing_tier(ceiling, max_source_tier(tiers))
+
+
+def _compiled_source_ids(
+    vault_path: Path,
+    idea: IdeaSeed,
+) -> tuple[list[str], bool]:
+    """Return the fragment ids behind this prompt's compiled sections (#1013).
+
+    The ``## Threads`` and ``## Eddies`` sections render compiled-page bodies,
+    and neither :class:`~creek.models.Thread` nor :class:`~creek.models.Eddy`
+    carries a ``privacy_tier`` — so those sections cannot be tier-*filtered*,
+    only tier-*accounted*. What they do carry is
+    :attr:`~creek.models.CompiledPage.provenance`, the fragment ids each claim
+    was synthesised from, which is exactly the evidence the source survey
+    needs to see them.
+
+    Returns:
+        ``(fragment_ids, opaque)``. ``opaque`` is ``True`` when some named
+        thread or eddy contributes prompt text whose sources cannot be
+        enumerated — the page is missing, or records no provenance. Both cases
+        are treated identically by the caller, which fails closed: a page with
+        no provenance is *unknown*, not *empty*, and reading it as empty would
+        reopen this hole for every page compiled before provenance existed.
+
+        Callers must not skip an unresolvable id and survey the rest, which
+        would silently clear a prompt on the strength of its safe half.
+    """
+    if not idea.threads and not idea.eddies:
+        return [], False
+    index = load_compiled_pages(vault_path)
+    ids: list[str] = []
+    opaque = False
+    for lookup, target_ids in (
+        (index.thread, idea.threads),
+        (index.eddy, idea.eddies),
+    ):
+        for target_id in target_ids:
+            page = lookup(target_id)
+            page_ids = (
+                [fid for entry in page.provenance for fid in entry.fragment_ids]
+                if page is not None
+                else []
+            )
+            if not page_ids:
+                opaque = True
+                continue
+            ids.extend(page_ids)
+    return ids, opaque
 
 
 def draft_tool(
