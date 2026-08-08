@@ -5812,7 +5812,13 @@ def _build_compost_similarity_fn(
 
     relpath = config.compost.exemplars_relpath
     exemplars_path = vault_path / relpath if relpath else None
-    exemplars = load_exemplars(exemplars_path)
+    try:
+        exemplars = load_exemplars(exemplars_path)
+    except (FileNotFoundError, ValueError) as exc:
+        # Same failure mode, same message as `compost_calibrate` — a config
+        # typo should read as a config typo, not as a Python traceback.
+        console.print(f"[red]Failed to load exemplars: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
     return make_similarity_fn(exemplars, EmbeddingLinker(config=config.embeddings))
 
 
@@ -5979,7 +5985,12 @@ def compost_scan(
     # than building (and then refusing on) a provider the operator never
     # asked for.
     verify_with_llm = not no_llm and compost_config.llm_verification
-    verifier = _build_scan_verifier(config) if verify_with_llm else None
+
+    # A dry run never calls the verifier, so it must not require one to exist.
+    # Demanding credentials to print a cost estimate would defeat the estimate:
+    # not-yet-configured is exactly when an operator wants to see the number.
+    # `will_verify` keeps the quoted count honest despite the skipped build.
+    verifier = _build_scan_verifier(config) if verify_with_llm and not dry_run else None
     similarity_fn = _build_compost_similarity_fn(config, vault_path)
 
     result = run_compost_scan(
@@ -5988,5 +5999,6 @@ def compost_scan(
         config=compost_config,
         verifier=verifier,
         dry_run=dry_run,
+        will_verify=verify_with_llm,
     )
     _render_compost_scan(result, dry_run=dry_run)

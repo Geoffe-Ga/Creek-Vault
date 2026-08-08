@@ -140,6 +140,31 @@ def test_exemplars_relpath_resolves_against_the_vault_not_the_cwd(
     assert [e.title for e in captured_exemplars] == [_SENTINEL_TITLE]
 
 
+def test_missing_exemplars_file_reports_a_friendly_error(
+    tmp_path: Path,
+    captured_exemplars: list[CompostExemplar],
+) -> None:
+    """A misconfigured exemplar path fails the way ``calibrate`` does.
+
+    ``compost_calibrate`` catches ``FileNotFoundError``/``ValueError`` from
+    ``load_exemplars`` and prints "Failed to load exemplars" before exiting 2.
+    ``scan`` hitting the identical failure mode should not dump a raw
+    traceback at the operator — a config typo is a one-time discovery cost
+    only if the message says what to fix.
+    """
+    del captured_exemplars
+    vault = _write_vault(tmp_path)
+    (vault / _EXEMPLARS_RELPATH).unlink()
+
+    result = runner.invoke(
+        app,
+        ["compost", "scan", "--vault", str(vault), "--no-llm"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Failed to load exemplars" in result.output
+
+
 def test_llm_verification_false_in_config_skips_the_verifier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

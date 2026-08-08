@@ -238,6 +238,38 @@ def test_scan_dry_run_reports_the_estimate_and_writes_nothing(
     assert _notes_in(vault, _CANONICAL_RELDIR) == []
 
 
+def test_dry_run_estimates_without_a_configured_provider(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` quotes the cost even when no provider is configured.
+
+    The estimate exists so an operator can see what a run would cost and bail.
+    The moment they most plausibly want that number is *before* they have set
+    up credentials — so eagerly building (and refusing on) a verifier the
+    dry-run path never calls defeats the feature's whole purpose.
+
+    The count must still be the one a *real* run would incur. Reporting 0 LLM
+    calls just because no verifier object was constructed would be a quieter
+    bug than the refusal it replaced.
+    """
+
+    def _raise(_cfg: object) -> object:
+        msg = "ANTHROPIC_API_KEY is not set"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("creek.classify.llm.build_provider", _raise)
+
+    result = runner.invoke(
+        app,
+        ["compost", "scan", "--vault", str(vault), "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "LLM calls this run: 1" in " ".join(result.output.split())
+    assert _notes_in(vault, _CANONICAL_RELDIR) == []
+
+
 def test_scan_writes_a_canonical_note_for_a_confirmed_candidate(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,

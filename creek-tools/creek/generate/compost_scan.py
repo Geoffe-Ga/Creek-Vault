@@ -354,6 +354,7 @@ def run_compost_scan(
     verifier: SupportsVerifyCompost | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
+    will_verify: bool | None = None,
 ) -> CompostScanResult:
     """Scan *vault_path* for compost candidates and write their notes.
 
@@ -386,6 +387,12 @@ def run_compost_scan(
             Defaults to :func:`creek.time.now_la` via ``CompostTracker``.
         dry_run: When ``True``, return the plan and write nothing. No
             verification request is issued either.
+        will_verify: Whether a real run *would* verify, for ``llm_calls``.
+            Defaults to ``verifier is not None``, which is right whenever the
+            verifier was actually built. A dry run deliberately skips building
+            one — so an operator with no credentials can still get an estimate
+            — and must pass this explicitly, or the plan would quote 0 calls
+            for a run that will make many.
 
     Returns:
         A :class:`CompostScanResult` describing what was planned and written.
@@ -413,7 +420,8 @@ def run_compost_scan(
     )
     fresh = [c for c in candidates if c.source_id not in seen]
     skipped_existing = len(candidates) - len(fresh)
-    plan = _build_plan(fresh, verifying=verifier is not None)
+    verifying = (verifier is not None) if will_verify is None else will_verify
+    plan = _build_plan(fresh, verifying=verifying)
 
     if dry_run:
         return CompostScanResult(
