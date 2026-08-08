@@ -49,7 +49,7 @@ jobs:
       DISPATCH_TOKEN: ${{ secrets.ADEPTHOOD_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install pinned graphify
@@ -109,7 +109,7 @@ jobs:
         run: echo "ANTHROPIC_API_KEY secret not set — graph stays code-only. Add the secret to enable the semantic layer."
       - uses: actions/checkout@v4
         if: env.HAS_KEY == 'true'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: env.HAS_KEY == 'true'
         with:
           python-version: "3.12"
