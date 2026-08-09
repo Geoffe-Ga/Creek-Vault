@@ -84,6 +84,7 @@ from creek.generate.twist import (
     target_profile_from_spec,
     twist_dimensions,
 )
+from creek.link.embeddings import EmbeddingModelUnavailableError
 from creek.models import (
     CompiledPage,
     Eddy,
@@ -1181,31 +1182,61 @@ class DraftGenerator:
 
         Returns:
             A :class:`GroundingReport`, or ``None`` when the guard is
-            not configured on this generator.
+            not configured on this generator — or when the embedding
+            model turned out to be unloadable at scoring time.
         """
         if self._embedding_fn is None or self._grounding_thresholds is None:
             return None
         source_texts = [
             fragments[fid][1] for fid in source_fragments if fid in fragments
         ]
-        report = score_draft(
-            body,
-            source_texts=source_texts,
-            embedding_fn=self._embedding_fn,
-            thresholds=self._grounding_thresholds,
-        )
-        print(report.summary_line(), file=sys.stderr)
-        # The non-``None`` invariant is established by the guard above; assert
-        # it so ``_warn_ungrounded_biographical``'s non-optional
-        # ``embedding_fn`` contract is explicit and mypy's narrowing is pinned.
-        assert self._embedding_fn is not None
-        self._warn_ungrounded_biographical(
-            body=body,
-            source_texts=source_texts,
-            embedding_fn=self._embedding_fn,
-            thresholds=self._grounding_thresholds,
-        )
+        try:
+            report = score_draft(
+                body,
+                source_texts=source_texts,
+                embedding_fn=self._embedding_fn,
+                thresholds=self._grounding_thresholds,
+            )
+            print(report.summary_line(), file=sys.stderr)
+            # The non-``None`` invariant is established by the guard above;
+            # assert it so ``_warn_ungrounded_biographical``'s non-optional
+            # ``embedding_fn`` contract is explicit and mypy's narrowing is
+            # pinned.
+            assert self._embedding_fn is not None
+            self._warn_ungrounded_biographical(
+                body=body,
+                source_texts=source_texts,
+                embedding_fn=self._embedding_fn,
+                thresholds=self._grounding_thresholds,
+            )
+        except EmbeddingModelUnavailableError as exc:
+            self._disable_grounding(exc)
+            return None
         return report
+
+    def _disable_grounding(self, exc: EmbeddingModelUnavailableError) -> None:
+        """Turn the grounding guard off for the rest of this run, loudly.
+
+        The production ``embedding_fn`` loads a sentence-transformer on
+        first call, so "the model is missing" surfaces mid-draft rather
+        than at construction time. Losing the guard must not lose the
+        draft: the generator drops back to its dormant behaviour (no
+        scores stamped, no veto applied) and says so on stderr, mirroring
+        :meth:`creek.author.agents.RetrievalAgent.retrieve`'s
+        degrade-to-empty handling of the same typed error.
+
+        Clearing both attributes also makes the failure sticky, so the
+        later guard entry points short-circuit on their existing
+        ``is None`` checks instead of re-raising the same load failure
+        once per pass.
+
+        Args:
+            exc: The typed load failure, whose message already carries
+                the model name and the operator's remediation.
+        """
+        self._embedding_fn = None
+        self._grounding_thresholds = None
+        print(f"grounding guard skipped: {exc}", file=sys.stderr)
 
     def _warn_ungrounded_biographical(
         self,
@@ -1376,19 +1407,24 @@ class DraftGenerator:
 
         Returns:
             One finding per ungrounded biographical sentence; empty when the
-            guard is dormant or the body is clean.
+            guard is dormant, the embedding model is unloadable, or the body
+            is clean.
         """
         if self._embedding_fn is None or self._grounding_thresholds is None:
             return []
         corpus = [fragments[fid][1] for fid in source_fragments if fid in fragments]
         if self.voice_core.strip():
             corpus.append(self.voice_core)
-        return scan_biographical_sentences(
-            body,
-            source_texts=corpus,
-            embedding_fn=self._embedding_fn,
-            threshold=self._grounding_thresholds.grounding_lower,
-        )
+        try:
+            return scan_biographical_sentences(
+                body,
+                source_texts=corpus,
+                embedding_fn=self._embedding_fn,
+                threshold=self._grounding_thresholds.grounding_lower,
+            )
+        except EmbeddingModelUnavailableError as exc:
+            self._disable_grounding(exc)
+            return []
 
     def _cohesion_llm(self, prompt: str) -> str:
         """Call the shared draft LLM for the cohesion hop, returning the body.
@@ -2105,6 +2141,16 @@ class DraftGenerator:
         thresholds = self._grounding_thresholds
 
         def _still_grounded(body: str) -> bool:
+            # No ``EmbeddingModelUnavailableError`` handling here, unlike the
+            # two guard entry points that embed before this one. The veto is
+            # built only from ``_apply_voice_fidelity``, which ``save_draft``
+            # calls after ``generate_draft`` / ``generate_seeded_draft`` have
+            # already run ``_build_guard_report``; the other caller,
+            # ``save_outline_draft``, passes no source fragments and exits
+            # above. So an unloadable model has always already tripped
+            # ``_disable_grounding``, and the ``_embedding_fn is None`` check
+            # above returns before this closure is ever built. Catching it
+            # here again would be a branch nothing can reach.
             report = score_draft(
                 body,
                 source_texts=source_texts,

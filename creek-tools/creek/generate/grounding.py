@@ -25,6 +25,15 @@ Surfaces:
   per-paragraph annotations list under the keys exported below — these
   are also what the ``draft-grounding`` lint check reads.
 
+Both surfaces are conditional on the embedding model actually loading.
+``creek draft`` and the MCP ``creek.draft`` tool wire the guard via
+:func:`default_embedding_fn`, which loads a sentence-transformer on
+first call; when that fails,
+:meth:`creek.generate.drafts.DraftGenerator._disable_grounding` skips
+the guard for the rest of the run, prints ``grounding guard skipped:``
+to stderr, and the draft is saved with no scores rather than lost
+(#1040).
+
 The module deliberately exposes its embedding callable so tests (and
 future callers) can inject a deterministic stub instead of loading the
 full sentence-transformer at unit-test time.
