@@ -65,6 +65,14 @@ def build_verifier(
 ) -> ConsumerTokenVerifier:
     """Return the verifier for the configured consumers, or refuse to build one.
 
+    A consumer may hold an ordered set of currently-valid tokens (#895), so a
+    ``/v1`` deployment rotates a secret through the same environment variable
+    and the same parser the MCP surface uses — there is nothing adapter-local
+    to keep in step. The map's *values* are token sequences rather than single
+    tokens, which changes nothing here: the truthiness check below asks
+    whether any consumer is configured at all, and an empty map is still the
+    only way to answer "no".
+
     Args:
         environ: Environment mapping to read, or ``None`` for
             :data:`os.environ`. Tests always pass one explicitly, so no test
@@ -77,11 +85,13 @@ def build_verifier(
     Raises:
         ValueError: When no consumer tokens are configured, naming the setting
             the operator must set; or, propagated unchanged from
-            :func:`creek_mcp.remote_auth.load_consumer_tokens`, when a
-            configured token is below the shared length floor. That second
-            message names the consumer, the observed and required lengths and
-            the rotation recipe — and never the token value, because a startup
-            error lands in logs, terminals and process supervisors.
+            :func:`creek_mcp.remote_auth.load_consumer_tokens`, when the
+            configuration cannot be read unambiguously — a token below the
+            shared length floor (#838), a consumer named twice, or one token
+            value configured for two consumers (#895). Those messages name the
+            consumers, the observed and required lengths and the rotation
+            recipe — and never a token value, because a startup error lands in
+            logs, terminals and process supervisors.
     """
     tokens = load_consumer_tokens(environ)
     if not tokens:

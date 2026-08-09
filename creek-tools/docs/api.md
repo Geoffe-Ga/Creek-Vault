@@ -94,7 +94,7 @@ lock-step, which is what this epic exists to prevent.
 
 | Variable | Meaning |
 |---|---|
-| `CREEK_MCP_CONSUMER_TOKENS` | `consumer=token` pairs, `;`-separated. Required — there is no anonymous access. |
+| `CREEK_MCP_CONSUMER_TOKENS` | `consumer=token` entries, `;`-separated; a consumer's value may itself be a `,`-separated set of currently-valid tokens (`adepthood=<old>,<new>`) while rotating a secret (#895). Required — there is no anonymous access. |
 | `CREEK_MCP_TOKEN_TTL_SECONDS` | Lifetime stamped on a verified token (default 3600). |
 | `CREEK_CONFIG` | Path to `creek_config.yaml` (also settable with `--config`). |
 
@@ -111,11 +111,25 @@ Generate and rotate:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-**Rotation is the only logout.** `CREEK_MCP_TOKEN_TTL_SECONDS` bounds how long
-an individually captured `AccessToken` object stays valid; it does **not** revoke
-the underlying shared secret, because the bearer is re-verified and re-issued on
-every request. To revoke a consumer, remove or replace its entry in
-`CREEK_MCP_CONSUMER_TOKENS` and restart.
+**Revocation and rotation are different operations, and both end in a
+restart.** `CREEK_MCP_TOKEN_TTL_SECONDS` bounds how long an individually
+captured `AccessToken` object stays valid; it does **not** revoke the
+underlying shared secret, because the bearer is re-verified and re-issued on
+every request.
+
+- **Revocation** is immediate and hard: remove a consumer's entry (or a
+  single token from its `,`-separated set) from `CREEK_MCP_CONSUMER_TOKENS`
+  and restart. The credential stops working the moment the restarted process
+  is serving — there is no overlap and no grace period.
+- **Rotation** replaces a secret without downtime by holding two
+  currently-valid tokens for one consumer at once (`adepthood=<old>,<new>`)
+  while the consumer redeploys onto the new one, then dropping the old one.
+  It still costs two restarts, but the consumer is never locked out
+  mid-swap. Follow the numbered runbook in
+  [`docs/mcp.md`](mcp.md#rotating-a-consumers-secret-no-downtime); see also
+  [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
+  the credential is still a static, long-lived secret rather than something
+  short-lived.
 
 ### The authenticated consumer *is* the audit identity
 

@@ -35,6 +35,7 @@ from creek_mcp.httpapi.middleware import ceiling as ceiling_middleware
 from creek_mcp.remote_auth import ConsumerTokenVerifier
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     import httpx
@@ -263,19 +264,28 @@ def snapshot(root: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def verifier(tokens: dict[str, str] | None = None) -> ConsumerTokenVerifier:
+def verifier(
+    tokens: Mapping[str, Sequence[str]] | None = None,
+) -> ConsumerTokenVerifier:
     """Return a verifier over the suite's two consumers, or over *tokens*.
 
     Args:
-        tokens: An explicit ``{consumer: token}`` map, or ``None`` for the
-            two-consumer default.
+        tokens: An explicit ``{consumer: (token, ...)}`` map, or ``None`` for
+            the two-consumer default. The value is a **sequence** of tokens and
+            never a bare ``str``: since #895 a consumer may hold an ordered set
+            of currently-valid tokens so a rotation needs no cutover, and
+            :class:`~creek_mcp.remote_auth.ConsumerTokenVerifier` refuses a bare
+            string at runtime as well as in its signature — ``str`` is itself a
+            ``Sequence[str]``, so one would otherwise be read as one
+            single-character token per letter, each of which
+            ``hmac.compare_digest`` accepts.
 
     Returns:
         A :class:`creek_mcp.remote_auth.ConsumerTokenVerifier` — the *same*
         registry the MCP surface uses, never a second one.
     """
     if tokens is None:
-        tokens = {CONSUMER: STRONG_TOKEN, OTHER_CONSUMER: OTHER_TOKEN}
+        tokens = {CONSUMER: (STRONG_TOKEN,), OTHER_CONSUMER: (OTHER_TOKEN,)}
     return ConsumerTokenVerifier(tokens)
 
 
