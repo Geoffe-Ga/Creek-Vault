@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Self
+from typing import Final, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -192,6 +192,56 @@ MAX_LOOP_ROUNDS: int = 5
 CREEK_SKILLS_DIRNAME: str = "creek-skills"
 DEFAULT_REGISTER: str = "confessional"
 
+# The privacy tier vocabulary a channel override may name. Mirrored from
+# :class:`creek_mcp.tier_ceiling.TierCeiling` without importing it — crawdad
+# has no Python dependency on creek-tools. Enforced at config-parse time by
+# :meth:`AttachmentConfig._validate_channel_tiers`.
+_VALID_CHANNEL_TIERS: Final[frozenset[str]] = frozenset(
+    {"open", "personal", "intimate", "all"}
+)
+
+# The only channel tiers whose messages bot-capture may write to the vault
+# (#1052).
+#
+# A capture record carries no tier field (``capture.py::_record_for``), and the
+# creek-tools side that reads the capture dir
+# (``stage_capture_as_data_package``) drops channel metadata, so a captured
+# message lands downstream as ``unclassified`` — which ranks WITH ``personal``
+# (``creek_mcp/tier_ceiling.py``, #961). Capture may therefore carry only
+# content whose ceiling the record can represent: ``open`` (narrower than
+# ``personal`` once landed) and ``personal`` (exact). ``intimate`` must be
+# refused, and so must ``all``, which admits intimate content by definition.
+#
+# Written out explicitly rather than derived as
+# ``_VALID_CHANNEL_TIERS - {"intimate", "all"}``: a subtraction would silently
+# auto-admit any tier added to the vocabulary later, when the safe default for
+# an unreviewed tier is refusal.
+#
+# The value coincides with ``workflows.WORKFLOW_ADMITTED_CEILINGS`` but is
+# deliberately NOT derived from it, and neither is canonical for the other:
+# that set draws its line at the cloud composer, this one at what a capture
+# record can represent. The reasoning above stands on its own if the workflow
+# set ever changes.
+#
+# Membership (``in``), never a rank comparison: ``crawdad.loop`` owns the
+# single tier-ordering table and a second one must not exist. The values stay
+# plain ``str`` rather than ``intents.PrivacyTierCeiling`` members because
+# ``channel_privacy_tiers`` is a ``dict[int, str]`` of operator-written YAML
+# and this module deliberately owns the tier vocabulary without importing
+# ``crawdad.intents``. (A ``StrEnum`` member would in fact match a plain string
+# here — ``str.__hash__`` precedes ``Enum.__hash__`` in the MRO — so this is a
+# layering choice, not a correctness workaround.)
+CAPTURE_ADMITTED_TIERS: Final[frozenset[str]] = frozenset({"open", "personal"})
+
+# The ceiling assumed for a channel with no ``channel_privacy_tiers`` entry.
+# Ingest writes are personal by default per FEAT-011, so a missing entry never
+# silently relaxes the ceiling. Named rather than inlined because
+# :func:`crawdad.bot._channel_tier` and :data:`CAPTURE_ADMITTED_TIERS` jointly
+# decide whether an operator who never wrote a ``channel_privacy_tiers`` block
+# keeps bot-capture: that promise holds only while this value is a member of
+# that set, which ``test_default_channel_tier_is_capture_admitted`` pins.
+DEFAULT_CHANNEL_TIER: Final[str] = "personal"
+
 
 class AttachmentConfig(BaseModel):
     """Per-attachment limits and staging-path config (FEAT-027).
@@ -294,16 +344,15 @@ class AttachmentConfig(BaseModel):
         downstream, but a bogus override in ``crawdad.yaml`` would
         surface as a confusing MCP error at runtime instead of a clear
         config error at startup. Restrict the value set to the four
-        ``TierCeiling`` values (mirrored from
-        :class:`creek_mcp.tier_ceiling.TierCeiling` without importing it
-        — crawdad has no Python dependency on creek-tools).
+        ``TierCeiling`` values (:data:`_VALID_CHANNEL_TIERS`, mirrored
+        from :class:`creek_mcp.tier_ceiling.TierCeiling` without
+        importing it — crawdad has no Python dependency on creek-tools).
         """
-        allowed: frozenset[str] = frozenset({"open", "personal", "intimate", "all"})
         for channel_id, tier in value.items():
-            if tier not in allowed:
+            if tier not in _VALID_CHANNEL_TIERS:
                 msg = (
                     f"channel_privacy_tiers[{channel_id}] = {tier!r} is not a valid "
-                    f"tier ceiling; expected one of {sorted(allowed)}."
+                    f"tier ceiling; expected one of {sorted(_VALID_CHANNEL_TIERS)}."
                 )
                 raise ValueError(msg)
         return value
