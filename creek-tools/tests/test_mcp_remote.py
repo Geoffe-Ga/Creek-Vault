@@ -23,6 +23,16 @@ Security properties under test:
   shorter than 32 chars fails ``load_consumer_tokens`` (and the network
   transport, via ``parser.error``) with a rotation recipe that names the
   consumer and lengths but never echoes the token value.
+- **Rotation needs no cutover** (#895) — a consumer may hold an *ordered set* of
+  currently-valid tokens, so the old and the new secret both authenticate for as
+  long as the operator leaves the window open, and dropping the old one revokes
+  it on the very next request. The configuration is refused outright for a
+  repeated consumer name (previously a silent last-wins), for a token value
+  reused anywhere in the configuration, and for a bare ``str`` map value —
+  ``str`` is itself a ``Sequence[str]``, so one would otherwise be read as one
+  single-character token per letter, each of which ``compare_digest`` accepts.
+  ``rotation_notice()`` tells the operator which consumers are mid-rotation, by
+  name and count only, so it cannot echo a value by construction.
 
 No real/production token material is hardcoded — every token is a test literal.
 """
@@ -53,7 +63,7 @@ from creek_mcp.remote_auth import (
 from creek_mcp.server import build_server, main
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from mcp.server.fastmcp import FastMCP
@@ -94,26 +104,71 @@ def _fake_token(consumer: str) -> AccessToken:
 _STRONG_TOKEN = "unit-test-strong-token-" + "a" * 20
 
 
+def _window_token(tag: str) -> str:
+    """Return a distinct, floor-clearing test token tagged with *tag* (#895).
+
+    The rotation-window tests need several tokens that differ from each other
+    and from :data:`_STRONG_TOKEN`, and all of which clear the 32-char floor so
+    a rotation test never trips the length gate by accident. Spelled as a
+    concatenation, matching the convention above, so a secret scanner reads a
+    constructed string rather than a credential.
+
+    Args:
+        tag: A short word distinguishing this token from its siblings.
+
+    Returns:
+        A constructed test string of at least 32 characters.
+    """
+    return f"unit-test-{tag}-token-" + "x" * 24
+
+
+# The rotation-window cast. Every one is a test literal, not a real credential.
+_OLD_TOKEN = _window_token("old")  # the secret being retired
+_NEW_TOKEN = _window_token("new")  # the secret replacing it
+_THIRD_TOKEN = _window_token("third")
+_FOURTH_TOKEN = _window_token("fourth")
+_FIFTH_TOKEN = _window_token("fifth")
+
+# 7 chars, well under the 32-char floor. Test literal, not a real credential.
+_WEAK_TOKEN = "hunter2"
+
+_ALL_TEST_TOKENS = (
+    _STRONG_TOKEN,
+    _OLD_TOKEN,
+    _NEW_TOKEN,
+    _THIRD_TOKEN,
+    _FOURTH_TOKEN,
+    _FIFTH_TOKEN,
+    _WEAK_TOKEN,
+)
+"""Every token literal a refusal message or a notice must never echo."""
+
+
 # --------------------------------------------------------------------------- #
 # load_consumer_tokens — parsing
 # --------------------------------------------------------------------------- #
 
 
 def test_load_consumer_tokens_parses_pairs() -> None:
-    """Well-formed ``consumer=token`` pairs parse into a map."""
+    """Well-formed ``consumer=token`` pairs parse into a map.
+
+    Today's single-token format is unchanged on the wire and now lands as a
+    one-element tuple (#895), so an operator who has never rotated anything
+    parses exactly as before.
+    """
     adepthood_token = "adepthood-strong-token-" + "a" * 20  # 43 chars, test literal
     crawdad_token = "crawdad-strong-token-" + "b" * 20  # 41 chars, test literal
     env = {CONSUMER_TOKENS_ENV: f"adepthood={adepthood_token};crawdad={crawdad_token}"}
     assert load_consumer_tokens(env) == {
-        "adepthood": adepthood_token,
-        "crawdad": crawdad_token,
+        "adepthood": (adepthood_token,),
+        "crawdad": (crawdad_token,),
     }
 
 
 def test_load_consumer_tokens_skips_blank_and_tokenless_entries() -> None:
     """Blank segments and ``name=`` entries with no token are dropped."""
     env = {CONSUMER_TOKENS_ENV: f" adepthood = {_STRONG_TOKEN} ; ; missing= ;=orphan"}
-    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
 
 
 def test_load_consumer_tokens_rejects_sub_minimum_token() -> None:
@@ -132,25 +187,147 @@ def test_load_consumer_tokens_rejects_sub_minimum_token() -> None:
 def test_load_consumer_tokens_accepts_minimum_length_token() -> None:
     """A token at or above the 32-char minimum is accepted and returned intact."""
     env = {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN}"}
-    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
 
 
 def test_load_consumer_tokens_accepts_exact_boundary_token() -> None:
     """A token of exactly 32 chars sits on the floor and is accepted."""
     boundary_token = "a" * 32
     env = {CONSUMER_TOKENS_ENV: f"adepthood={boundary_token}"}
-    assert load_consumer_tokens(env) == {"adepthood": boundary_token}
+    assert load_consumer_tokens(env) == {"adepthood": (boundary_token,)}
 
 
 def test_load_consumer_tokens_skips_blanks_without_raising() -> None:
     """Blank and bare ``name=`` entries stay silently skipped, not length-checked."""
     env = {CONSUMER_TOKENS_ENV: f";;missing=;=orphan;adepthood={_STRONG_TOKEN}"}
-    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
 
 
 def test_load_consumer_tokens_empty_when_unset() -> None:
     """An unset env var yields an empty map (caller treats as 'network denied')."""
     assert load_consumer_tokens({}) == {}
+
+
+# --------------------------------------------------------------------------- #
+# load_consumer_tokens — the rotation window (#895)
+#
+# One consumer, several currently-valid tokens, comma-separated inside its own
+# ``consumer=`` segment. The ``;`` separator still means "next consumer"; the
+# ``,`` separator means "another token this same consumer may present".
+# --------------------------------------------------------------------------- #
+
+
+def test_load_consumer_tokens_parses_an_ordered_token_set() -> None:
+    """``adepthood=old,new`` yields both tokens, in configured order.
+
+    Order is asserted with a tuple rather than a set: the configured order is
+    the operator's statement of which secret is the incumbent and which is the
+    replacement, and it is what a notice or a future report would read.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_NEW_TOKEN}"}
+    assert load_consumer_tokens(env) == {"adepthood": (_OLD_TOKEN, _NEW_TOKEN)}
+
+
+def test_load_consumer_tokens_strips_whitespace_around_comma_segments() -> None:
+    """Whitespace around a comma is operator formatting, never token material.
+
+    The single-token form already strips, so a multi-token form that did not
+    would silently produce a token nobody can present.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood= {_OLD_TOKEN} , {_NEW_TOKEN} "}
+    assert load_consumer_tokens(env) == {"adepthood": (_OLD_TOKEN, _NEW_TOKEN)}
+
+
+def test_load_consumer_tokens_drops_empty_comma_segments() -> None:
+    """A doubled or trailing comma leaves no empty token behind.
+
+    Dropping has to happen *before* the length floor runs, or a trailing comma
+    would be reported to the operator as a zero-character token.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},,{_NEW_TOKEN},"}
+    assert load_consumer_tokens(env) == {"adepthood": (_OLD_TOKEN, _NEW_TOKEN)}
+
+
+def test_load_consumer_tokens_skips_a_consumer_whose_segments_are_all_empty() -> None:
+    """``missing=,,`` is the multi-token spelling of ``missing=``: skipped, not raised.
+
+    The single-token parser already skips ``name=`` silently; the comma form
+    must reach the same verdict rather than registering a consumer with no
+    tokens (which the verifier refuses outright).
+    """
+    env = {CONSUMER_TOKENS_ENV: f"missing=,,;adepthood={_STRONG_TOKEN}"}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
+
+
+def test_load_consumer_tokens_applies_the_floor_to_every_token() -> None:
+    """The 32-char floor is per comma segment — one weak token in a set still raises.
+
+    A rotation is exactly when a fresh secret gets typed in, so the floor has to
+    hold on the *new* token and not only on whichever one happens to be first.
+    The message names the consumer, the observed and required lengths and the
+    rotation recipe, and echoes neither of the two configured values.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN},{_WEAK_TOKEN}"}
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "'adepthood'" in message  # consumer named via repr
+    assert "7" in message  # observed length of the rejected token
+    assert "32" in message  # the enforced minimum
+    assert "secrets.token_urlsafe(32)" in message  # the rotation recipe
+    assert _WEAK_TOKEN not in message  # NEVER echo the token value
+    assert _STRONG_TOKEN not in message  # nor the compliant one beside it
+
+
+def test_load_consumer_tokens_rejects_a_repeated_consumer_name() -> None:
+    """``adepthood=a;adepthood=b`` is a loud error, never a silent last-wins.
+
+    The pre-#895 parser wrote both entries into one dict key, so the first
+    token vanished without a word. Now that a consumer can legitimately hold
+    several tokens, either silent reading is indefensible: overwriting throws
+    away a credential the operator believes is live, and accumulating quietly
+    invents a rotation window they never asked for. The message names the
+    consumer and points at the comma form that expresses the intent properly.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};adepthood={_NEW_TOKEN}"}
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert "comma" in message.lower()  # the supported spelling is named
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+    assert _NEW_TOKEN not in message
+
+
+def test_load_consumer_tokens_rejects_a_value_shared_by_two_consumers() -> None:
+    """One secret configured for two consumers destroys attribution, so it is refused.
+
+    ``verify_token`` scans every consumer without breaking, so a shared value
+    resolves to whichever consumer the scan saw last — every audit line that
+    call produced would then name the wrong caller. The message names both
+    consumers and never the value they share.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};crawdad={_OLD_TOKEN}"}
+    with pytest.raises(ValueError) as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert "crawdad" in message
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+
+
+def test_load_consumer_tokens_rejects_a_value_repeated_within_one_consumer() -> None:
+    """A duplicate inside one set is a rotation that rotated nothing.
+
+    Same rule and same message as the cross-consumer case: every configured
+    token value is globally unique, stated once so the two cannot drift.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_OLD_TOKEN}"}
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +337,7 @@ def test_load_consumer_tokens_empty_when_unset() -> None:
 
 def test_verify_token_returns_access_token_for_valid_bearer() -> None:
     """A known token resolves to its consumer's :class:`AccessToken`."""
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     token = asyncio.run(verifier.verify_token("secret123"))
     assert token is not None
     assert token.client_id == "adepthood"
@@ -169,7 +346,7 @@ def test_verify_token_returns_access_token_for_valid_bearer() -> None:
 
 def test_verify_token_rejects_unknown_bearer() -> None:
     """An unknown token yields ``None`` (401 at the middleware)."""
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     assert asyncio.run(verifier.verify_token("wrong")) is None
 
 
@@ -181,7 +358,7 @@ def test_verify_token_rejects_against_empty_map() -> None:
 
 def test_verify_token_rejects_non_ascii_bearer_cleanly() -> None:
     """A non-ASCII bearer is rejected (``None``), never a ``TypeError`` (#776)."""
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     # hmac.compare_digest raises TypeError on a non-ASCII str; the byte-compare
     # must reject cleanly instead of crashing verification.
     assert asyncio.run(verifier.verify_token("nön-ascii-tökén")) is None
@@ -323,7 +500,7 @@ def test_streamable_http_rejects_unauthenticated_request(vault: Path) -> None:
     server = build_server(
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
-        token_verifier=ConsumerTokenVerifier({"adepthood": "secret123"}),
+        token_verifier=ConsumerTokenVerifier({"adepthood": ("secret123",)}),
     )
     client = TestClient(server.streamable_http_app())
     path = server.settings.streamable_http_path
@@ -359,7 +536,7 @@ def _network_server(vault: Path, token: str) -> FastMCP:
     server = build_server(
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
-        token_verifier=ConsumerTokenVerifier({"adepthood": token}),
+        token_verifier=ConsumerTokenVerifier({"adepthood": (token,)}),
     )
     server.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False
@@ -477,7 +654,7 @@ def _verified_token_at_fixed_now(monkeypatch: pytest.MonkeyPatch) -> AccessToken
     lands.
     """
     monkeypatch.setattr(remote_auth_mod, "_now", lambda: _FIXED_NOW)
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     token = asyncio.run(verifier.verify_token("secret123"))
     assert token is not None
     return token
@@ -506,6 +683,318 @@ def test_token_ttl_invalid_env_falls_back_to_default(
     monkeypatch.setenv(_TOKEN_TTL_ENV, raw_ttl)
     token = _verified_token_at_fixed_now(monkeypatch)
     assert token.expires_at == 1_000_000 + _DEFAULT_TTL_SECONDS
+
+
+# --------------------------------------------------------------------------- #
+# ConsumerTokenVerifier — the rotation window (#895)
+#
+# The #837 TTL bounds a *captured* AccessToken object; it does nothing to the
+# wire credential, which the SDK's bearer middleware re-verifies fresh on every
+# request. Rotating that credential used to mean a hard cutover: swap the env
+# value, restart, and break every consumer still holding the old secret. A
+# consumer may now hold an ordered set of currently-valid tokens instead, so the
+# operator opens a window, lets consumers redeploy, and then closes it.
+#
+# The window is only a window if closing it works, so the revocation test below
+# is load-bearing: without it this feature is a permanent widening of the
+# credential surface wearing a rotation's clothes.
+# --------------------------------------------------------------------------- #
+
+
+def test_every_token_in_the_window_verifies_as_the_same_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old and new both authenticate, as one identity, each with a finite expiry.
+
+    Same ``client_id`` for both is the point: a window that changed the caller's
+    name for its duration would rewrite every audit line written while it was
+    open. ``expires_at`` is asserted exactly rather than as "not ``None``", so
+    the multi-token path cannot quietly issue the never-expiring token #837
+    removed.
+    """
+    monkeypatch.delenv(_TOKEN_TTL_ENV, raising=False)
+    monkeypatch.setattr(remote_auth_mod, "_now", lambda: _FIXED_NOW)
+    verifier = ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN, _NEW_TOKEN)})
+    for presented in (_OLD_TOKEN, _NEW_TOKEN):
+        token = asyncio.run(verifier.verify_token(presented))
+        assert token is not None
+        assert token.client_id == "adepthood"
+        assert token.scopes == [REMOTE_SCOPE]
+        assert token.token == presented
+        assert token.expires_at == 1_000_000 + _DEFAULT_TTL_SECONDS
+
+
+def test_retiring_a_token_revokes_it_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping the old token from the set is what closes the window.
+
+    This is the assertion that makes the feature a *bounded* rotation rather
+    than a permanent widening of the credential surface: the retired secret
+    authenticates while it is configured and stops the moment it is not.
+    """
+    monkeypatch.setattr(remote_auth_mod, "_now", lambda: _FIXED_NOW)
+
+    during = ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN, _NEW_TOKEN)})
+    assert asyncio.run(during.verify_token(_OLD_TOKEN)) is not None
+
+    after = ConsumerTokenVerifier({"adepthood": (_NEW_TOKEN,)})
+    assert asyncio.run(after.verify_token(_OLD_TOKEN)) is None
+    assert asyncio.run(after.verify_token(_NEW_TOKEN)) is not None
+
+
+def test_verifier_refuses_a_bare_string_token_value() -> None:
+    """A bare ``str`` map value is refused at runtime, not only by the type checker.
+
+    The signature is ``Mapping[str, Sequence[str]]`` and **not**
+    ``Mapping[str, str | Sequence[str]]``, because that union is unsound: ``str``
+    already *is* a ``Sequence[str]``, so the union collapses and mypy would wave
+    through ``{"adepthood": "secret123"}``. The runtime guard is the half that
+    protects a caller who never runs mypy — notably ``tests/v1_api_support.py``,
+    which builds verifiers from literal maps.
+    """
+    with pytest.raises(TypeError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": _OLD_TOKEN})
+    message = str(excinfo.value)
+    assert "adepthood" in message  # the offending key is named
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+
+
+def test_a_single_character_of_a_configured_token_never_authenticates() -> None:
+    """The security complement of the guard above, observed rather than asserted.
+
+    Iterating a bare ``str`` value yields one single-character "token" per
+    letter, and ``compare_digest`` accepts each of them, so a 43-character
+    secret would degrade into an alphabet of valid credentials. Refusing the
+    bare string is the fix; this sweeps every distinct character of a correctly
+    configured token to show the consequence is really gone.
+    """
+    verifier = ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN,)})
+    for character in sorted(set(_OLD_TOKEN)):
+        assert asyncio.run(verifier.verify_token(character)) is None
+
+
+def test_verifier_refuses_one_value_shared_by_two_consumers() -> None:
+    """Global token uniqueness is the *verifier's* rule, not only the parser's.
+
+    ``tests/v1_api_support.py`` and the wire tests in this module construct
+    verifiers directly from literal maps, never going through
+    ``load_consumer_tokens``, so the constructor is the narrowest ceiling this
+    invariant can sit under. Asserting it here rather than only at the parser
+    is what stops a direct caller from configuring an ambiguous identity.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN,), "crawdad": (_OLD_TOKEN,)})
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert "crawdad" in message
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+
+
+def test_verifier_refuses_an_empty_token_set_for_a_named_consumer() -> None:
+    """A named consumer holding no tokens authenticates nobody — say so, loudly.
+
+    Silently keeping the entry would leave a consumer in the configuration that
+    can never connect, which reads to an operator as an auth outage rather than
+    as the typo it is.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": ()})
+    assert "adepthood" in str(excinfo.value)
+
+
+def test_verifier_refuses_an_empty_iterable_that_is_not_a_sequence() -> None:
+    """The same refusal for an empty value that is *truthy* — pinning the ordering.
+
+    Not a second reading of the empty-tuple case above: ``()`` is falsy both
+    before and after materialisation, so it is refused under either ordering of
+    ``_token_set``'s emptiness check and cannot tell the two apart. An empty
+    iterable that is *not* a ``Sequence`` — a spent iterator, an exhausted
+    generator — is **truthy**, so it is only caught when the value is
+    materialised *before* it is tested. Under the reversed order it would slip
+    past the refusal and land as an empty tuple, leaving the named consumer
+    able to authenticate nobody: a silent auth outage in place of the loud
+    "can never authenticate" error. This pins that ordering, not the branch.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": iter(())})
+    assert "adepthood" in str(excinfo.value)
+
+
+def test_verifier_over_no_consumers_at_all_stays_legal() -> None:
+    """``ConsumerTokenVerifier({})`` is still constructible, and refuses everything.
+
+    "No consumers configured" is a different statement from "this consumer has
+    no tokens": the callers treat the empty map as *network mode denied* and
+    refuse to serve on it, so making the constructor raise would turn a handled
+    posture into a crash.
+    """
+    verifier = ConsumerTokenVerifier({})
+    assert verifier.rotation_notice() is None
+    assert asyncio.run(verifier.verify_token(_OLD_TOKEN)) is None
+
+
+def test_verify_token_compares_against_every_configured_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scan never breaks early — not even when the very first token matches.
+
+    Newly load-bearing now the loop is nested consumer → tokens: a ``break`` on
+    either level would make verification time depend on *where* in the
+    configuration the presented token sits, which is a positional oracle over
+    the token set. Counted through ``remote_auth.hmac.compare_digest`` so the
+    property is measured rather than read off the source.
+
+    Args:
+        monkeypatch: Installs the counting wrapper over the real compare.
+    """
+    comparisons: list[tuple[bytes, bytes]] = []
+    real_compare = remote_auth_mod.hmac.compare_digest
+
+    def _counting(left: bytes, right: bytes) -> bool:
+        """Record the comparison, then delegate to the real constant-time one."""
+        comparisons.append((left, right))
+        return real_compare(left, right)
+
+    # Built before the patch, so only verification's own comparisons are counted.
+    verifier = ConsumerTokenVerifier(
+        {"adepthood": (_OLD_TOKEN, _NEW_TOKEN), "crawdad": (_THIRD_TOKEN,)}
+    )
+    monkeypatch.setattr(remote_auth_mod.hmac, "compare_digest", _counting)
+    token = asyncio.run(verifier.verify_token(_OLD_TOKEN))
+
+    assert token is not None
+    assert token.client_id == "adepthood"
+    # Three configured tokens across two consumers => three comparisons, even
+    # though the first one matched.
+    assert len(comparisons) == 3
+
+
+# --------------------------------------------------------------------------- #
+# rotation_notice — telling the operator a window is open, without a secret
+# --------------------------------------------------------------------------- #
+
+_NO_WINDOW_MAPS: list[dict[str, tuple[str, ...]]] = [
+    {},
+    {"adepthood": (_STRONG_TOKEN,)},
+    {"adepthood": (_STRONG_TOKEN,), "crawdad": (_OLD_TOKEN,)},
+]
+
+_NO_WINDOW_IDS = ["no-consumers", "one-consumer", "two-consumers"]
+
+
+@pytest.mark.parametrize("tokens", _NO_WINDOW_MAPS, ids=_NO_WINDOW_IDS)
+def test_rotation_notice_is_none_when_no_window_is_open(
+    tokens: Mapping[str, Sequence[str]],
+) -> None:
+    """One token per consumer is the steady state, and the steady state is silent.
+
+    A notice printed on every start is a notice operators stop reading, at which
+    point the one that matters — "you left a window open three months ago" —
+    goes unread too.
+
+    Args:
+        tokens: A configuration in which no consumer holds more than one token.
+    """
+    assert ConsumerTokenVerifier(tokens).rotation_notice() is None
+
+
+def test_rotation_notice_names_every_consumer_in_a_window() -> None:
+    """Each multi-token consumer is named with its count; settled ones are not.
+
+    Naming only the consumers mid-rotation is what makes the notice actionable:
+    it is a to-do list of windows still to close, not an inventory of the
+    configuration.
+    """
+    verifier = ConsumerTokenVerifier(
+        {
+            "adepthood": (_OLD_TOKEN, _NEW_TOKEN),
+            "crawdad": (_THIRD_TOKEN, _FOURTH_TOKEN, _FIFTH_TOKEN),
+            "settled": (_STRONG_TOKEN,),
+        }
+    )
+    notice = verifier.rotation_notice()
+    assert notice is not None
+    assert "adepthood" in notice
+    assert "2" in notice  # adepthood's token count
+    assert "crawdad" in notice
+    assert "3" in notice  # crawdad's token count
+    assert "settled" not in notice  # a single-token consumer is not in a window
+
+
+def test_rotation_notice_carries_no_token_value() -> None:
+    """The notice takes names and counts, so it cannot echo a secret by construction.
+
+    It is printed at startup, which means it lands in logs, terminals and
+    process supervisors — the same audience the #838 rejection message is
+    written for, and the same reason it must stay value-free.
+    """
+    verifier = ConsumerTokenVerifier(
+        {
+            "adepthood": (_OLD_TOKEN, _NEW_TOKEN),
+            "crawdad": (_THIRD_TOKEN, _FOURTH_TOKEN),
+        }
+    )
+    notice = verifier.rotation_notice()
+    assert notice is not None
+    for configured in _ALL_TEST_TOKENS:
+        assert configured not in notice
+
+
+# --------------------------------------------------------------------------- #
+# Cross-cutting: no refusal on ANY of the new paths ever echoes a token
+# --------------------------------------------------------------------------- #
+
+_RAISING_CONFIGURATIONS: list[Callable[[], object]] = [
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN},{_WEAK_TOKEN}"}
+    ),
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};adepthood={_NEW_TOKEN}"}
+    ),
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};crawdad={_OLD_TOKEN}"}
+    ),
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_OLD_TOKEN}"}
+    ),
+    lambda: ConsumerTokenVerifier({"adepthood": _OLD_TOKEN}),
+    lambda: ConsumerTokenVerifier({"adepthood": ()}),
+    lambda: ConsumerTokenVerifier(
+        {"adepthood": (_OLD_TOKEN,), "crawdad": (_OLD_TOKEN,)}
+    ),
+]
+
+_RAISING_IDS = [
+    "parser-weak-token-inside-a-set",
+    "parser-repeated-consumer-name",
+    "parser-value-shared-across-consumers",
+    "parser-value-repeated-within-one-set",
+    "verifier-bare-string-value",
+    "verifier-empty-token-set",
+    "verifier-value-shared-across-consumers",
+]
+
+
+@pytest.mark.parametrize("configure", _RAISING_CONFIGURATIONS, ids=_RAISING_IDS)
+def test_no_rejection_message_ever_echoes_a_token(
+    configure: Callable[[], object],
+) -> None:
+    """Every refusal on the #895 surface names configuration, never credentials.
+
+    Swept as one parametrize rather than left to each test's own assertion so a
+    path added later is a path that has to be added here too. Startup errors
+    land in logs, terminals and process supervisors, so a message that echoed
+    the value it rejected would publish the secret it exists to protect.
+
+    Args:
+        configure: A zero-argument call that must raise.
+    """
+    with pytest.raises((TypeError, ValueError)) as excinfo:
+        configure()
+    message = str(excinfo.value)
+    for configured in _ALL_TEST_TOKENS:
+        assert configured not in message, message
 
 
 # --------------------------------------------------------------------------- #

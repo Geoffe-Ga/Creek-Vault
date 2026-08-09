@@ -1231,7 +1231,16 @@ def test_workflow_admitted_ceilings_is_open_and_personal() -> None:
     exact set (not a membership spot-check) so widening the cap is a
     deliberate, reviewable edit to this assertion rather than a silent
     addition nobody notices.
+
+    #1152: the workflow cap and the router/dispatcher cap are the SAME
+    boundary — every ``ToolResult`` body, whoever produced it, is
+    relayed to a cloud LLM composer and posted into a Discord message.
+    Identity (``is``), not equality: two frozensets that agree today
+    are two places to widen tomorrow, and only one of them would show
+    up in a reviewer's diff.
     """
+    from crawdad.intents import COMPOSER_ADMITTED_CEILINGS
+
     assert (
         frozenset({PrivacyTierCeiling.OPEN, PrivacyTierCeiling.PERSONAL})
         == WORKFLOW_ADMITTED_CEILINGS
@@ -1239,6 +1248,7 @@ def test_workflow_admitted_ceilings_is_open_and_personal() -> None:
     assert isinstance(WORKFLOW_ADMITTED_CEILINGS, frozenset)
     assert PrivacyTierCeiling.INTIMATE not in WORKFLOW_ADMITTED_CEILINGS
     assert PrivacyTierCeiling.ALL not in WORKFLOW_ADMITTED_CEILINGS
+    assert WORKFLOW_ADMITTED_CEILINGS is COMPOSER_ADMITTED_CEILINGS
 
 
 @pytest.mark.parametrize("tier", _REFUSED_TIERS, ids=_REFUSED_TIER_IDS)

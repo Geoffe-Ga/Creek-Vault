@@ -305,8 +305,16 @@ async def test_crawdad_client_on_message_forwards_workflow_runner(
 
     monkeypatch.setattr("crawdad.bot.handle_message", _spy)
 
-    async def _workflow_runner(_name: str, _inputs: dict[str, str]) -> str:
-        return "ran"  # pragma: no cover - identity check only
+    from crawdad.dispatcher import WorkflowRunReport
+    from crawdad.intents import PrivacyTierCeiling
+
+    async def _workflow_runner(
+        _name: str, _inputs: dict[str, str]
+    ) -> WorkflowRunReport:
+        report = WorkflowRunReport(
+            reply="ran", privacy_tier_ceiling=PrivacyTierCeiling.OPEN
+        )
+        return report  # pragma: no cover - identity check only
 
     client = CrawDadClient(
         config=config,
@@ -742,18 +750,23 @@ async def test_handle_message_forwards_workflow_runner_to_loop(
     runner instead of soft-erroring with "workflow running is
     unavailable".
     """
+    from crawdad.dispatcher import WorkflowRunReport
     from crawdad.history import ConversationHistory
     from crawdad.intents import (
         RUN_WORKFLOW_INTENT_TYPE,
         Intent,
+        PrivacyTierCeiling,
         RouterResponse,
     )
 
     runner_calls: list[tuple[str, dict[str, str]]] = []
 
-    async def _workflow_runner(name: str, inputs: dict[str, str]) -> str:
+    async def _workflow_runner(name: str, inputs: dict[str, str]) -> WorkflowRunReport:
         runner_calls.append((name, inputs))
-        return "workflow walked: morning-pages"
+        return WorkflowRunReport(
+            reply="workflow walked: morning-pages",
+            privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
+        )
 
     # Router emits a run_workflow intent, then signals compose.
     router_responses = iter(

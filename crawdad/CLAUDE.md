@@ -108,6 +108,15 @@ Four gates, each must pass before the next:
   - `allowed_channel_ids` — channels the bot will respond in.
   - `max_loop_rounds` — optional FEAT-036 override for the agent-loop
     round cap (default `MAX_LOOP_ROUNDS = 5`, bounded `[1, 50]`).
+  - `capture_enabled` — bot-capture toggle (#687), default `False`.
+    Opt-in per deployment; see [§5.2](#52-bot-capture-boundary).
+  - `capture_subpath` — vault-relative dir the capture writer appends
+    to, default `discord-capture`. Must stay inside the vault (same
+    absolute/`..` validation as `attachments.staging_subpath`).
+  - `attachments.channel_privacy_tiers` — per-channel declared ceiling
+    (`open` / `personal` / `intimate` / `all`), validated at
+    config-parse time. See [§5.2](#52-bot-capture-boundary) for how
+    bot-capture reads it.
 
 Both allowlists must be non-empty — an empty list is a configuration
 error, not "open to everyone".
@@ -125,6 +134,63 @@ it means:
 - Do *not* feed user-controlled content into `crawdad.yaml`.
 - Multi-user / shared deployments are out of scope for v1.0; revisit
   this assumption before broadening access.
+
+See also [§5.2 Bot-capture boundary](#52-bot-capture-boundary) for the
+narrower trust boundary bot-capture applies on top of this one.
+
+### 5.2 Bot-capture boundary
+
+Bot-capture (#687) writes messages to `<vault>/<capture_subpath>/` for
+later Tier-A ingest. A message is captured only when **both** hold:
+
+1. It passes `_passes_allowlist` — the same gate the command path
+   uses: not the bot's own message, not `author.bot`, and both
+   `allowed_user_ids` and `allowed_channel_ids` admit it. **The
+   capture boundary is the command boundary** (#1052) — before this
+   fix, capture ran ahead of the allowlist gate and logged strangers,
+   other bots, and channels the operator never allowlisted.
+2. The channel's declared privacy tier (`_channel_tier`, reading
+   `attachments.channel_privacy_tiers`) is in `CAPTURE_ADMITTED_TIERS`
+   = `{"open", "personal"}`:
+
+   | Declared tier | Captured? |
+   |---|---|
+   | `open` | yes (narrower than needed once landed) |
+   | `personal` | yes (exact match) |
+   | unset (no `channel_privacy_tiers` entry) | yes — `_channel_tier` falls back to `personal` |
+   | `intimate` | **no** |
+   | `all` | **no** — admits intimate content by definition |
+
+   A capture record carries no tier field, and the creek-tools side
+   that stages the capture dir drops channel metadata, so a captured
+   message lands downstream as `unclassified`, which ranks *with*
+   `personal` (`creek_mcp/tier_ceiling.py`, #961). Writing an
+   `intimate` channel into capture would be a silent privacy
+   de-escalation — capture must not carry content whose ceiling it
+   cannot represent.
+
+The tier gate is **capture-scoped only**. `channel_privacy_tiers` has
+never gated whether the bot *replies* in a channel and still does not
+— an `intimate` channel still gets `/crawdad` and free-text replies;
+it is just never written to the capture log.
+
+The gate (`_capture_allowed`) is evaluated *inside*
+`CrawDadClient._capture_message`'s `try`, so a gate that raises (a
+malformed message, an attribute that errors) fails closed to "not
+captured" while the command path keeps running unaffected — capture
+is best-effort and must never take a command turn down with it.
+
+**Standing constraint for future work:** `MessageCapture.backfill` has
+no production caller today. If it is ever wired in (#1057), it MUST
+evaluate `_capture_allowed` **per message inside the history loop**,
+not once per channel — a channel's history contains messages from
+non-allowlisted users and other bots that a channel-level check would
+wave through.
+
+`CAPTURE_ADMITTED_TIERS` may only widen once #1262 lands: carrying the
+tier end-to-end from the capture record through staging into fragment
+frontmatter, so an `intimate` channel can be captured faithfully
+instead of refused outright.
 
 ## 6. MCP subprocess resilience
 

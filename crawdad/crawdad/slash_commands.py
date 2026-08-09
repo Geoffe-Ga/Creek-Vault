@@ -34,6 +34,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
+from crawdad.dispatcher import WorkflowRunReport
 from crawdad.mcp_client import MCPUnavailableError
 
 if TYPE_CHECKING:
@@ -59,13 +60,19 @@ LoopRunner = Callable[[str], Awaitable[str]]
 RegisterSwitcher = Callable[[str], bool]
 
 # ADAPT-003: async callable that runs a named workflow end-to-end and
-# returns the user-facing reply. The CLI builds one by closing over the
+# reports the user-facing reply. The CLI builds one by closing over the
 # per-session registry, walker, composer, and MCP client — see
 # :func:`crawdad.cli._build_workflow_runner`. Workflow runners receive
 # a ``name`` plus an ``inputs`` dict (currently always empty until the
 # Discord slash command grows a free-text input parameter; the kwarg
 # keeps the signature future-proof for FEAT-015-style follow-ups).
-WorkflowRunner = Callable[[str, dict[str, str]], Awaitable[str]]
+#
+# It returns a :class:`~crawdad.dispatcher.WorkflowRunReport` rather than
+# a bare string (#1152) because the *other* consumer of this same closure
+# — ``IntentDispatcher._handle_run_workflow`` — has to stamp its
+# ``ToolResult`` with the ceiling the walk actually used. This surface
+# only ever wants ``report.reply``.
+WorkflowRunner = Callable[[str, dict[str, str]], Awaitable[WorkflowRunReport]]
 
 # Async callable that posts a message back to the Discord user.
 # Wraps ``discord.Interaction.followup.send`` in production; tests
@@ -370,12 +377,14 @@ async def _reply_workflow_run(
         await replier(_WORKFLOW_RUNNER_MISSING_REPLY)
         return
     try:
-        reply = await workflow_runner(cleaned, {})
+        report = await workflow_runner(cleaned, {})
     except Exception as exc:
         _LOGGER.warning("workflow %r failed: %s", cleaned, exc)
         await replier(f"workflow `{cleaned}` could not run: {exc}")
         return
-    await replier(reply)
+    # ``.reply`` only: posting the report itself would put its ``repr``
+    # — privacy tier included — into a user-visible Discord message.
+    await replier(report.reply)
 
 
 async def handle_help(replier: Replier) -> None:
