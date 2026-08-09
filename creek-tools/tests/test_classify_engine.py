@@ -2759,29 +2759,48 @@ def test_second_run_extracts_no_tags_and_changes_none(tmp_path: Path) -> None:
     assert _tags_map(vault) == after_first
 
 
-@pytest.mark.parametrize(
-    ("force", "expected_tags", "expected_extracted"),
-    [(False, [], 0), (True, ["gardening"], 1)],
-)
-def test_preserved_fragment_gets_tags_only_under_force(
+# ---- Issue #1207: the free, non-destructive tags backfill -------------------
+#
+# #878 left the preserved short-circuit deliberately untagged, which made the
+# operator's 35k-fragment vault — every file of it stamped
+# ``classification_method: llm`` — reachable only through a paid
+# ``creek classify --method llm --force``. The free alternative,
+# ``--method rules --force``, is destructive: ``_classify_one`` returns
+# ``rules.classify(...)`` (``classify_engine.py:1299``), which at
+# ``rules.py:574`` does ``fragment.model_copy(update=updates)`` over
+# ``frequency`` / ``wavelength`` / ``voice`` and then re-stamps
+# ``classification_method: rules``.
+#
+# #1207 closes that with a SIBLING narrow writer — ``_write_tags_only`` beside
+# ``_write_tier_only`` — rather than by widening the tier writer. A writer
+# whose scope is its name is auditable; one whose scope is a parameter is not,
+# and these run over already-classified user vaults. ``_write_tier_only``'s
+# #876 promise ("changes ONLY the privacy-tier fields") is therefore unchanged.
+#
+# The hard constraint is non-destructiveness, and it is what the tests below
+# actually assert: tags land, every other frontmatter field is byte-identical,
+# no classification re-runs, and no LLM is called.
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_preserved_fragment_gains_tags_without_force(
     tmp_path: Path,
     force: bool,
-    expected_tags: list[str],
-    expected_extracted: int,
 ) -> None:
-    """A preserved ``llm``-stamped fragment gains tags only with ``--force``.
+    """A preserved ``llm``-stamped fragment gains tags with or without ``--force``.
 
-    The same deliberate asymmetry the #877 praxis pass carries.
-    ``_write_tier_only`` is the narrow writer used on the OPS-001 resume
-    short-circuit, and it is **not** widened to carry tags: the #876 tier
-    exception exists because an untiered fragment is a live cloud-egress
-    hole, whereas a missing tag is a missing feature. Widening that
-    writer would rewrite the ``tags`` axis of every already-curated
-    fragment in a mature vault without the operator asking — and unlike
-    praxis, ``tags`` is a field operators hand-edit in Obsidian.
+    This **reverses** #878's residual (and the test that pinned it). The
+    reasoning that justified the asymmetry for praxis does not survive
+    contact with the tags axis: hashtag extraction is a lossless
+    mechanical restatement of literal author-written syntax, not a
+    judgment, and ``tags_pass.merge`` is a union that cannot drop a tag
+    an operator hand-wrote. So the free pass can run on the short-circuit
+    without threatening either of the two things OPS-001 protects —
+    operator curation and paid tokens.
 
-    ``creek fill`` surfaces the outstanding count instead (see
-    ``tests/test_cli_fill.py``).
+    The tier still lands on the same run, which is what proves the
+    short-circuit was genuinely taken rather than the fragment quietly
+    reclassified.
     """
     from creek.models import Authorship
 
@@ -2807,6 +2826,256 @@ def test_preserved_fragment_gets_tags_only_under_force(
         force=force,
     )
 
-    assert _tags_map(vault) == {"frag-tags-presrv1": expected_tags}
-    assert summary.tags_extracted == expected_extracted
+    assert _tags_map(vault) == {"frag-tags-presrv1": ["gardening"]}
+    assert summary.tags_extracted == 1
     assert summary.preserved_llm == (0 if force else 1)
+
+
+def _seed_preserved_tagged_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    tags: list[str] | None = None,
+    tier: str | None = "open",
+) -> Path:
+    """Write one ``llm``-stamped fragment carrying :data:`_TAGS_SIGNAL_BODY`.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem).
+        tags: Tags already recorded on the fragment; ``None`` for none.
+        tier: ``privacy_tier`` to stamp. Pass ``"open"`` so the #876 pass
+            has nothing to do and the tags write is the *only* mutation
+            the run can make; pass ``None`` to leave the fragment
+            untiered and exercise both writers on one file.
+
+    Returns:
+        Path to the freshly-written file.
+    """
+    from creek.models import Authorship, PrivacyTier
+
+    fragment = Fragment(
+        id=frag_id,
+        title="Week notes",
+        source=FragmentSource(
+            platform=SourcePlatform.MARKDOWN,
+            author=Authorship.SELF,
+        ),
+        tags=tags or [],
+    )
+    if tier is not None:
+        fragment = fragment.model_copy(update={"privacy_tier": PrivacyTier(tier)})
+    return _write_fragment(
+        vault=vault,
+        fragment=fragment,
+        body=_TAGS_SIGNAL_BODY,
+        method="llm",
+    )
+
+
+def test_preserved_tags_backfill_touches_no_other_frontmatter_field(
+    tmp_path: Path,
+) -> None:
+    """The backfill rewrites ``tags`` and leaves every other byte alone.
+
+    This is the point of the whole issue, not a nicety: the writer runs
+    over already-classified user vaults, so "adds tags" is worth nothing
+    unless "and changes nothing else" is provable. The expectation is
+    built by re-serialising the file's own frontmatter with **only**
+    ``tags`` substituted, so any extra key, any dropped key, any
+    re-ordering, any re-stamped ``classification_method`` /
+    ``classified_at``, and any change to the markdown body all fail the
+    comparison.
+
+    The fragment is seeded with a real ``privacy_tier`` so the #876 pass
+    owns nothing here and the tags write is the only mutation available.
+    """
+    vault = tmp_path / "vault"
+    path = _seed_preserved_tagged_fragment(vault, "frag-tags-narrow1")
+    before = frontmatter.load(str(path))
+    expected = frontmatter.dumps(
+        frontmatter.Post(
+            content=before.content,
+            **{**before.metadata, "tags": ["gardening"]},
+        ),
+    )
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert summary.preserved_llm == 1
+    assert summary.classified == 0
+    assert path.read_text(encoding="utf-8") == expected
+
+
+def test_preserved_tags_backfill_is_idempotent_to_the_byte(
+    tmp_path: Path,
+) -> None:
+    """A second backfill over an unchanged vault rewrites nothing.
+
+    Unlike the non-preserved path — where ``classified_at`` is
+    legitimately re-stamped every run, so only the id→tags mapping can be
+    compared — the preserved path must not touch the file at all once the
+    tags are recorded. A byte comparison is therefore both available and
+    the strongest available statement of idempotence.
+    """
+    vault = tmp_path / "vault"
+    path = _seed_preserved_tagged_fragment(vault, "frag-tags-idemp01")
+
+    first = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+    after_first = path.read_text(encoding="utf-8")
+
+    second = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert first.tags_extracted == 1
+    assert second.tags_extracted == 0
+    assert path.read_text(encoding="utf-8") == after_first
+
+
+def test_preserved_tags_backfill_keeps_the_tier_written_on_the_same_run(
+    tmp_path: Path,
+) -> None:
+    """Both narrow writers can fire on one file without clobbering each other.
+
+    An untiered, ``llm``-stamped fragment carrying a hashtag is the one
+    input that makes the #876 tier writer and the #1207 tags writer both
+    run over the same file in the same pass. Each composes on the
+    frontmatter the previous one left behind, so a tags write built from
+    the frontmatter as originally *read* would silently revert the tier —
+    re-opening the cloud-egress hole #876 exists to close. Both fields
+    are asserted on one run.
+    """
+    vault = tmp_path / "vault"
+    _seed_preserved_tagged_fragment(vault, "frag-tags-both001", tier=None)
+
+    summary = run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _tags_map(vault) == {"frag-tags-both001": ["gardening"]}
+    assert _tier_map(vault) == {"frag-tags-both001": "personal"}
+    assert summary.privacy_tiers_assigned == 1
+    assert summary.tags_extracted == 1
+
+
+def test_preserved_tags_backfill_never_drops_a_recorded_tag(
+    tmp_path: Path,
+) -> None:
+    """Hand-written tags survive the backfill, re-spelled but never lost.
+
+    ``tags`` is a field operators edit in Obsidian, and the backfill now
+    runs unasked over every preserved fragment in a mature vault, so the
+    union contract has to hold at the engine boundary and not only in
+    ``tags_pass``. Recorded-first ordering is asserted too: a merge that
+    appended the extractor's output ahead of the operator's would churn
+    the frontmatter of every curated fragment.
+    """
+    vault = tmp_path / "vault"
+    _seed_preserved_tagged_fragment(
+        vault,
+        "frag-tags-keep001",
+        tags=["Week_Notes"],
+    )
+
+    run_classify(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="rules",
+        force=False,
+    )
+
+    assert _tags_map(vault) == {"frag-tags-keep001": ["week-notes", "gardening"]}
+
+
+def test_preserved_tags_backfill_makes_no_llm_call(tmp_path: Path) -> None:
+    """The backfill is free: an ``llm``-stamped vault costs zero calls.
+
+    The acceptance criterion of #1207, asserted at the only boundary that
+    can prove it — the provider call itself. Before this change the same
+    vault could only gain tags through ``creek classify --method llm
+    --force``, which re-sends every fragment to the configured provider.
+    """
+    vault = tmp_path / "vault"
+    _seed_preserved_tagged_fragment(vault, "frag-tags-free001")
+
+    with patch.object(
+        LLMClassifier,
+        "classify_with_reasoning",
+        autospec=True,
+    ) as classify_call:
+        summary = run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="llm",
+            force=False,
+        )
+
+    assert classify_call.call_count == 0
+    assert summary.tags_extracted == 1
+    assert _tags_map(vault) == {"frag-tags-free001": ["gardening"]}
+
+
+def test_tags_only_write_failure_lands_on_errors_without_aborting(
+    tmp_path: Path,
+) -> None:
+    """An ``OSError`` from the tags-only writer is recorded, not fatal.
+
+    Contract note for the implementation: this test patches
+    ``creek.classify.classify_engine._write_tags_only`` — the sibling of
+    ``_write_tier_only``, narrow by *name* rather than by parameter. The
+    same contract the tier writer honours applies: one unwritable file
+    must not abort a 35k-file run, so the failure is appended to
+    ``summary.errors`` naming the fragment, and the rest of the vault
+    still backfills.
+    """
+    from creek.models import Authorship
+
+    vault = tmp_path / "vault"
+    _seed_preserved_tagged_fragment(vault, "frag-tags-ioerr01")
+    _write_fragment(
+        vault=vault,
+        fragment=Fragment(
+            id="frag-tags-ioerr02",
+            title="Week notes",
+            source=FragmentSource(
+                platform=SourcePlatform.MARKDOWN,
+                author=Authorship.SELF,
+            ),
+        ),
+        body=_TAGS_SIGNAL_BODY,
+    )
+
+    with patch(
+        "creek.classify.classify_engine._write_tags_only",
+        side_effect=OSError("read-only file system"),
+    ):
+        summary = run_classify(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="rules",
+            force=False,
+        )
+
+    assert len(summary.errors) == 1
+    assert "read-only file system" in summary.errors[0]
+    assert "frag-tags-ioerr01" in summary.errors[0]
+    # The run continued: the non-preserved fragment still got its tags
+    # through the ordinary write path, which this patch does not touch.
+    assert _tags_map(vault)["frag-tags-ioerr02"] == ["gardening"]

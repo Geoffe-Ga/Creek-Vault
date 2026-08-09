@@ -12,7 +12,13 @@ vault.*``, which left three consumers structurally unreachable:
 :mod:`creek.generate.compost`. This module is the shared,
 side-effect-free policy layer that both writers — the ingest chokepoint
 :func:`creek.ingest.base.assemble_ingested_fragment` and the ``creek
-classify`` engine — call to close that hole:
+classify`` engine — call to close that hole. Since #1207 the engine calls
+it on the OPS-001 resume short-circuit as well, through the narrow
+sibling writer
+:func:`creek.classify.classify_engine._write_tags_only`, so a vault
+already stamped ``classification_method: llm``/``manual`` backfills this
+axis for free rather than through a paid ``--force`` re-classification.
+The functions:
 
 * :func:`extract` — pull hashtags out of a markdown body.
 * :func:`merge` — union two tag lists, never losing one.
@@ -77,20 +83,6 @@ wrote and collides two runaway tokens onto one garden entry.
 Known residuals
 ---------------
 
-* **Preserved fragments need ``--force``.** The classify engine runs this
-  pass only on fragments it actually (re-)classifies; the OPS-001 resume
-  short-circuit's narrow writer
-  (:func:`creek.classify.classify_engine._write_tier_only`) is
-  deliberately *not* widened to carry tags. So a vault already stamped
-  ``classification_method: llm``/``manual`` backfills this axis only
-  under an explicit, paid ``creek classify --method llm --force``. That
-  is the same call #877 made for praxis, and the #876 tier exception does
-  not transfer: an untiered fragment is a live cloud-egress hole, whereas
-  a missing tag is a missing feature — and unlike praxis, ``tags`` is a
-  field operators hand-edit, so rewriting the axis of every curated
-  fragment in a mature vault is not something to do unasked. ``creek
-  fill`` surfaces the outstanding count (see
-  :func:`creek.cli._hint_tags_backfill`).
 * **Removing a hashtag does not un-tag the fragment.** The merge only
   ever adds, so deleting ``#recovery`` from a body leaves ``recovery`` on
   the frontmatter; the operator removes it by hand. That is the price of
