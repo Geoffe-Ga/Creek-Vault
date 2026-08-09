@@ -37,6 +37,15 @@ dependencies = [
     # (see docs/decisions/2026-07-31-adepthood-http-application-api.md,
     # "HTTP framework", reason 1). FastAPI is deliberately not adopted.
     "starlette>=1.3.1",
+    # creek_mcp.httpapi.middleware.limits imports Semaphore, WouldBlock and
+    # fail_after from anyio at module scope to shed load and enforce the
+    # request deadline (#1074), so anyio is a direct dependency rather than
+    # something starlette happens to drag in — a starlette release that
+    # stopped depending on it would break the /v1 limits middleware with no
+    # lockfile signal (#1123). Floor matches the uv.lock resolution. A floor,
+    # never a ceiling: anyio is also starlette's own concurrency backend, so a
+    # ceiling here could deadlock resolution against the ASGI stack.
+    "anyio>=4.13.0",
     # At-rest volume key (creek.confidential): Argon2id / AES-GCM / HKDF are
     # imported unconditionally, so cryptography is a direct base dependency —
     # not left to transitive resolution via mcp -> pyjwt[crypto] (#758).
@@ -191,6 +200,19 @@ constraint-dependencies = [
     # so the floor lives here rather than [project].dependencies.
     # Fixed in 2.13.0 (#861).
     "torch>=2.13.0",
+    # NOT a CVE. rpds-py switched from SemVer to CalVer at 2026.5.1 —
+    # the line runs 0.29.0, 0.30.0, 2026.5.1, with no 0.31 or 1.0 in
+    # between — and raised requires-python to >=3.11, which this project
+    # already declares. Transitive-only via mcp → jsonschema (and via
+    # referencing); both consumers declare open floors (>=0.25.0 and
+    # >=0.7.0), so nothing forced the lock off 0.30.0 for eight months.
+    # Keep this a BARE FLOOR: any SemVer-shaped ceiling — <1.0, ~=0.30,
+    # or a <2026.7 written as if the month were a minor version —
+    # excludes every subsequent CalVer release permanently. Express a
+    # bound, if one is ever needed, in CalVer (#1185). Held identical to
+    # crawdad/pyproject.toml so both projects resolve the same native
+    # extension on the shared MCP path.
+    "rpds-py>=2026.6.3",
 ]
 
 [tool.setuptools.packages.find]
