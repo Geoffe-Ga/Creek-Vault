@@ -322,6 +322,7 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
 @pytest.mark.parametrize(
     ("minor", "expected"),
     [
+        ("0.4", _OK_STATUS),
         ("0.3", _OK_STATUS),
         ("0.2", _OK_STATUS),
         ("0.2.0", _INCOMPATIBLE_STATUS),
@@ -333,7 +334,8 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
     ],
     ids=[
         "current-minor",
-        "minor",
+        "previous-minor",
+        "oldest-served-minor",
         "patch",
         "other-patch",
         "wrong-minor",
@@ -353,12 +355,15 @@ def test_the_version_header_is_matched_strictly(
     sharper: the gate either lets the request through to the route or refuses
     it with ``409``.
 
-    Both served minors reach the handler: ``0.3`` is the current one and
-    ``0.2`` is retained by :data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS`
-    because no ``/v1`` wire shape changed when the contract moved. The ``0.2``
-    row is the tripwire for a *narrowed* window — if it ever goes red, a
-    contract bump shifted the supported set instead of widening it and every
-    existing client started getting ``incompatible_version``.
+    All three served minors reach the handler: ``0.4`` is the current one, and
+    ``0.3`` and ``0.2`` are retained by
+    :data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS` because no ``/v1``
+    wire shape changed when the contract moved either time (``creek.upload``
+    in #1023, the ``creek.purge.*`` ``partial`` status in #1246 — both
+    MCP-only). The ``0.3`` and ``0.2`` rows are the tripwire for a *narrowed*
+    window — if either goes red, a contract bump shifted the supported set
+    instead of widening it and existing clients started getting
+    ``incompatible_version``.
 
     ``0.2.0`` spells a served minor with a patch component and is deliberately
     refused: the header's published grammar is ``major.minor``, and a server

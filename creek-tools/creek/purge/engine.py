@@ -298,6 +298,37 @@ class PurgeResult(BaseModel):
     voice_artifacts_removed: int = 0
     voice_body_undecodable: list[str] = Field(default_factory=list)
 
+    @property
+    def outcome_status(self) -> PurgeOutcomeStatus:
+        """Whether this result describes a complete erasure or a partial one.
+
+        "The operation finished" and "everything it promised to erase is
+        gone" are different claims. A body that returned normally can
+        still have left a derived copy behind: an undecodable fragment
+        body skips the content-keyed voice sweep, so a
+        ``07-Voice/<register>-profile.md`` may still quote it.
+
+        This property is the single definition of that distinction for
+        the two surfaces that report a *verdict* — the audit ``outcome``
+        line (:meth:`PurgeEngine._run_audited`) and the MCP tool payload
+        (#1246), which disagreed for as long as each carried its own
+        copy of the predicate. The CLI reports the same shortfall by
+        naming the ids straight off :attr:`voice_body_undecodable`,
+        because a human reading it needs *which fragments*, not a
+        one-word verdict.
+
+        A raising body is *also* partial, but that verdict cannot be
+        read off a result — the exception aborts before the accumulator
+        is complete — so :meth:`PurgeEngine._run_audited` records it
+        directly. This property describes results that survived to be
+        returned.
+
+        Returns:
+            ``"partial"`` when any fragment is named in
+            :attr:`voice_body_undecodable`, otherwise ``"complete"``.
+        """
+        return "partial" if self.voice_body_undecodable else "complete"
+
 
 class PurgeEngine:
     """Execute right-to-be-forgotten deletions against a vault.
@@ -1683,7 +1714,9 @@ class PurgeEngine:
         A body that returns normally can still have left the erasure
         incomplete: an undecodable fragment body skips the content-keyed
         voice sweep (see :meth:`_voice_match_body`). That is recorded on
-        ``voice_body_undecodable`` and downgrades the outcome to
+        ``voice_body_undecodable``, and :attr:`PurgeResult.outcome_status`
+        — the single definition of the distinction, shared with the MCP
+        tool payload — downgrades the outcome to
         ``status="partial"`` too, because "the operation finished" and
         "everything it promised to erase is gone" are different claims
         and the audit log must not conflate them.
@@ -1726,15 +1759,16 @@ class PurgeEngine:
                 failure_reason=failure_reason,
             )
             raise
-        if result.voice_body_undecodable:
+        status = result.outcome_status
+        if status == "partial":
             self._write_outcome_audit(
                 result,
                 operation_id,
-                status="partial",
+                status=status,
                 failure_reason=_VOICE_BODY_UNDECODABLE,
             )
             return result
-        self._write_outcome_audit(result, operation_id, status="complete")
+        self._write_outcome_audit(result, operation_id, status=status)
         return result
 
     def _write_intent_audit(

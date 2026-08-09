@@ -2,7 +2,7 @@
 
 - **Status**: Draft — pending agreement
 - **Date**: 2026-06-30
-- **Contract version**: `0.3.0` (draft)
+- **Contract version**: `0.4.0` (draft)
 - **Ontology version**: `aptitude-wavelength/2026-05-23` (see [Ontology version](#ontology-version))
 - **Driving issues**: [#748](https://github.com/Geoffe-Ga/Creek-Vault/issues/748) (epic), [#749](https://github.com/Geoffe-Ga/Creek-Vault/issues/749) (this doc)
 - **Mirrors**: [`geoffe-ga/adepthood#950`](https://github.com/geoffe-ga/adepthood/issues/950) (Adepthood's required side)
@@ -248,6 +248,7 @@ phase.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.4.0` | 2026-08-08 | `creek.purge.*` gains a third status, `partial` (#1246). An erasure that finished but fell short — a fragment whose body is not valid UTF-8 skips the content-keyed `07-Voice` sweep, so a profile may still quote it — used to be reported over MCP as unqualified `ok`, while `purge.jsonl` recorded `status="partial"` and the CLI said so in red. The payload is now derived from `PurgeResult` rather than a hand-picked subset, so all six previously-dropped fields reach the caller (`embeddings_removed`, `provenance_scrubbed`, `intimate_stubs_removed`, `journal_staged_removed`, `voice_artifacts_removed`, `voice_body_undecodable` — the last names the fragments the sweep could not reach). A tool's return shape moved, so the contract minor moves. `refused` and `ok` keep their spellings; a client that does not know `partial` falls through its branches rather than reading an incomplete erasure as a clean one. No `/v1` shape changed — `creek.purge.*` is elevated-token-gated and out of the Adepthood surface — so the HTTP adapter keeps serving `0.3` and `0.2` alongside `0.4` (`SUPPORTED_CONTRACT_MINORS`). |
 | `0.3.0` | 2026-08-08 | `creek.upload` joins the tool surface (#1023): one document's base64 bytes are staged under `00-Creek-Meta/adepthood/uploads/`, routed to an ingestor by extension, and ingested through the `upload` ledger so the staged bytes carry an `origin_key` and fall inside the RTBF purge sweep. A capability was added, so the contract minor moves. Nothing existing changed shape: the `/v1` HTTP adapter keeps serving contract minor `0.2` alongside `0.3` (`SUPPORTED_CONTRACT_MINORS`), and no existing tool's arguments or return shape were touched. |
 | `0.2.0` | 2026-07-30 | `unclassified` (untiered) content now ranks with `personal`, not `open`, on the MCP ceiling — matching `creek.classify.privacy_filter` since #876 (#961). `open`-ceiling consumers no longer read untiered content; remedy is `creek classify`. See the amendment note under [Tier ceiling semantics](#tier-ceiling-semantics). |
 | `0.1.0` | 2026-06-30 | Initial draft, mirroring `adepthood#950`. Enumerates capabilities, maps to existing (`creek.ingest`, `creek.classify`) and planned (`creek.handshake`/`reflect`/`wheel`) tools, fixes tier/care/auth/transport semantics, pins ontology version. |
