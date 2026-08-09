@@ -17,6 +17,10 @@ that does not exist, because its output still has to be read.
 This module is the single answer to "does this wiki-link resolve, and to
 what". Callers build one :class:`LinkIndex` per run and query it.
 
+``OrphanScanner`` — ``creek clean``'s own orphan check, distinct from the
+``orphan-compiled`` lint check — was the last stem-based holdout and adopted
+this index in #1225.
+
 Resolution follows Obsidian: an exact-case match wins, and a case-insensitive
 match is the fallback. The frontmatter is read **header-only** — a 35k-file
 vault must never pay to load every body into memory just to learn a page's
