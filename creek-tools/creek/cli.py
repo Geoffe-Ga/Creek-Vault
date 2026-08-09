@@ -2700,11 +2700,14 @@ def _report_unnamed(vault_path: Path, override: PrivacyTierOverride) -> None:
 
     Args:
         vault_path: Vault root.
-        override: Unused. ``unnamed`` is not exposed over MCP and is outside
-            #968's scope; the parameter exists only to satisfy
+        override: Unused. ``unnamed`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — UnnamedDigestGenerator.generate_weekly_digest
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
             :data:`_REPORT_DISPATCH`'s uniform signature.
     """
-    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+    del override  # served at ceiling=all only; see the docstring above.
 
     from datetime import date as _date
     from datetime import timedelta as _timedelta
@@ -2984,11 +2987,14 @@ def _report_fingerprint(vault_path: Path, override: PrivacyTierOverride) -> None
 
     Args:
         vault_path: Vault root.
-        override: Unused. ``fingerprint`` is not exposed over MCP and is
-            outside #968's scope; the parameter exists only to satisfy
+        override: Unused. ``fingerprint`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — build_fingerprint
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
             :data:`_REPORT_DISPATCH`'s uniform signature.
     """
-    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+    del override  # served at ceiling=all only; see the docstring above.
 
     from creek.config import load_config
     from creek.generate.ai_style.fingerprint import (
@@ -3270,11 +3276,14 @@ def _report_paradox(vault_path: Path, override: PrivacyTierOverride) -> None:
 
     Args:
         vault_path: Vault root.
-        override: Unused. ``paradox`` is not exposed over MCP and is outside
-            #968's scope; the parameter exists only to satisfy
+        override: Unused. ``paradox`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — generate_paradoxes
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
             :data:`_REPORT_DISPATCH`'s uniform signature.
     """
-    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+    del override  # served at ceiling=all only; see the docstring above.
 
     from creek.generate.paradox import generate_paradoxes
 
@@ -3302,11 +3311,14 @@ def _report_synchronicity(vault_path: Path, override: PrivacyTierOverride) -> No
 
     Args:
         vault_path: Vault root.
-        override: Unused. ``synchronicity`` is not exposed over MCP and is
-            outside #968's scope; the parameter exists only to satisfy
+        override: Unused. ``synchronicity`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — generate_synchronicities
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
             :data:`_REPORT_DISPATCH`'s uniform signature.
     """
-    del override  # not MCP-exposed; out of #968's scope, not half-wired.
+    del override  # served at ceiling=all only; see the docstring above.
 
     from creek.generate.synchronicity import generate_synchronicities
 
