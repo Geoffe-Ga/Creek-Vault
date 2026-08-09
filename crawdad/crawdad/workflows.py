@@ -110,7 +110,11 @@ from pydantic import (
 )
 
 from crawdad.dispatcher import ToolResult
-from crawdad.intents import PrivacyTierCeiling
+from crawdad.intents import (
+    COMPOSER_ADMITTED_CEILINGS,
+    PrivacyTierCeiling,
+    cap_ceiling,
+)
 
 if TYPE_CHECKING:
     from crawdad.mcp_client import MCPClient
@@ -145,10 +149,15 @@ _LEGACY_CEILING_KEY = "privacy_tier_floor"
 
 # The only privacy tier ceilings an authored workflow may request.
 #
-# CrawDad relays every :class:`~crawdad.dispatcher.ToolResult` body to a
-# cloud LLM composer and then posts the reply into a Discord message, so
-# ``intimate`` / ``all`` must never be requestable by a workflow file.
-# ``ALL`` subsumes ``intimate``, so the admitted set is the complement.
+# An alias of :data:`crawdad.intents.COMPOSER_ADMITTED_CEILINGS` — the
+# same object, not an equal copy (#1152). The authored-workflow cap and
+# the router/dispatcher cap are the SAME boundary: whichever path
+# produced it, every :class:`~crawdad.dispatcher.ToolResult` body is
+# relayed to a cloud LLM composer and then posted into a Discord
+# message, so ``intimate`` / ``all`` must never be requestable by
+# either. ``ALL`` subsumes ``intimate``, so the admitted set is the
+# complement. Two frozensets that agree today would be two places to
+# widen tomorrow, and only one of them would land in a reviewer's diff.
 #
 # The value coincides with ``creek_mcp.policy.REMOTE_ADMITTED_CEILINGS``
 # (``{OPEN, PERSONAL}`` — "intimate content is not reachable over the
@@ -157,17 +166,17 @@ _LEGACY_CEILING_KEY = "privacy_tier_floor"
 # the cloud composer. The reasoning above stands on its own if the
 # server-side set ever changes.
 #
-# This walker check is the ONLY gate on this path, not a redundant second
-# copy of the server's: CrawDad reaches the MCP server over **stdio**,
-# which ``creek_mcp/server.py::_caller_identity`` classifies as a LOCAL
-# caller (``is_remote=False``), so the server-side remote cap never fires
-# here. (Prose reference only — crawdad has no Python dependency on
-# creek-tools.)
+# The server-side cap does not back this one up: CrawDad reaches the MCP
+# server over **stdio**, which ``creek_mcp/server.py::_caller_identity``
+# classifies as a LOCAL caller (``is_remote=False``), so the remote cap
+# never fires here. (Prose reference only — crawdad has no Python
+# dependency on creek-tools.)
 #
-# Membership (``in``), never a rank comparison: ``crawdad.loop`` owns the
-# single tier-ordering table and a second one must not exist.
-WORKFLOW_ADMITTED_CEILINGS: Final[frozenset[PrivacyTierCeiling]] = frozenset(
-    {PrivacyTierCeiling.OPEN, PrivacyTierCeiling.PERSONAL}
+# Membership (``in``), never a rank comparison: ``crawdad.intents`` owns
+# the single tier-ordering table (:data:`~crawdad.intents.CEILING_RANK`)
+# and a second one must not exist.
+WORKFLOW_ADMITTED_CEILINGS: Final[frozenset[PrivacyTierCeiling]] = (
+    COMPOSER_ADMITTED_CEILINGS
 )
 
 # ``\w`` matches the YAML-friendly subset we accept inside placeholder
@@ -843,9 +852,9 @@ class WorkflowWalker:
 
         ANY step-level declaration is refused, not just a widening one.
         Deciding "is this wider?" would need a tier-ordering comparison
-        (``crawdad.loop`` owns the only such table), and admitting a
-        narrowing value would teach authors that per-step ceilings are a
-        supported feature when they are not.
+        (:data:`crawdad.intents.CEILING_RANK` is the only such table),
+        and admitting a narrowing value would teach authors that
+        per-step ceilings are a supported feature when they are not.
 
         Today such a key is silently overwritten by
         :func:`_build_call_arguments`. That is safe, but it gives the
@@ -950,7 +959,13 @@ class WorkflowWalker:
         return ToolResult(
             intent_type=step.tool,
             body=body,
-            privacy_tier_ceiling=workflow.privacy_tier_ceiling,
+            # Already guaranteed admitted by
+            # :meth:`WorkflowWalker._check_privacy_ceiling`, which
+            # refused anything above the cap before the session opened.
+            # Re-capped anyway so this stamp is self-evidently within
+            # the cap at its own line rather than by reference to a
+            # guard several frames up. Idempotent.
+            privacy_tier_ceiling=cap_ceiling(workflow.privacy_tier_ceiling),
         )
 
 

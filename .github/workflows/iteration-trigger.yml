@@ -8,17 +8,28 @@ name: Iteration Trigger
 #
 # The "cleared to squash merge" line this job emits is a merge instruction, so it
 # must enforce the SAME invariants as scripts/ralph/pr-ready.sh or it becomes a
-# second code path that falsifies it. It therefore mirrors three of them, and
+# second code path that falsifies it. It therefore mirrors four of them, and
 # names the blocker instead of clearing when any fails:
 #   * no `do-not-auto-merge` hold on the PR;
 #   * the head is current with its base (compare API `behind_by == 0`);
 #   * the verdict carries the `<!-- creek-review pr=N -->` provenance marker for
 #     THIS PR (#1181) — the marker pr-ready.sh's MARKER_RE parses, read from the
-#     same comment the verdict came from.
-# All three fail closed on an unreadable answer.
+#     same comment the verdict came from;
+#   * the verdict was posted by an account the review pipeline can authenticate
+#     as (#1199) — the same two-member allowlist pr-ready.sh's
+#     VERDICT_AUTHORS_JQ holds, byte for byte, applied INSIDE the comment
+#     selector so a forged comment is skipped rather than picked and refused.
+#     Unlike the other three this one does not reach the blocker chain at all:
+#     an unaccepted author means no verdict was found, so the step takes the
+#     "No Claude review from an accepted author yet" early exit and no summary
+#     is ever composed. test_pr_ready.sh reads the allowlist out of THIS file's
+#     `CLAUDE=` assignment and compares it with pr-ready.sh's constant.
+# All four fail closed on an unreadable answer.
 #
-# AND EVERY ONE OF THEM REWRITES `VERDICT`, NOT JUST `ACTION` (#1202). `VERDICT`
-# is computed from the review comment ABOVE the clearance chain, so a branch that
+# AND EVERY ONE THAT REACHES THE CLEARANCE CHAIN REWRITES `VERDICT`, NOT JUST
+# `ACTION` (#1202) — the first three; the authorship one never gets that far,
+# because a thread with no accepted-author verdict produces no summary at all.
+# `VERDICT` is computed from the review comment ABOVE the chain, so a branch that
 # refuses while leaving it alone still posts `**VERDICT**: LGTM` + `**CI**: N/N
 # Green` — and those two fields are the ONLY ones the merge path reads
 # (`.claude/skills/await-claude-review/SKILL.md` Step 4a; its item 5 says in as
@@ -91,10 +102,66 @@ jobs:
           fi
 
           # Find the latest Claude review comment via the deterministic
-          # "## Verdict: <verdict>" line that code-review.yml appends.
-          CLAUDE=$(jq -c '[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last // empty' comments.json)
+          # "## Verdict: <verdict>" line that code-review.yml appends — AND by
+          # its AUTHOR (#1199). The verdict line is a public, documented literal,
+          # so without the author filter this job cleared "You are cleared to
+          # squash merge" off whatever verdict-shaped comment posted last, from
+          # anybody who can comment. It is the path that WINS when it and
+          # pr-ready.sh disagree (await-claude-review Step 3 says this summary
+          # short-circuits per-event classification), so an author filter there
+          # alone would have moved the hole one file over instead of closing it.
+          #
+          # THE ALLOWLIST IS THE SAME SET, BYTE FOR BYTE, as pr-ready.sh's
+          # VERDICT_AUTHORS_JQ, and test_pr_ready.sh cuts THIS assignment out of
+          # this file and greps inside it — deliberately not the whole file, so
+          # the bytes cannot sit in a comment while the selector goes unguarded.
+          # Two members because code-review.yml's Post-review step sets its
+          # GH_TOKEN from the GEOFFE_GA_PAT secret with the GITHUB_TOKEN secret
+          # as fallback. That expression is described rather than quoted on
+          # purpose: an Actions dollar-double-brace expression is interpolated
+          # ANYWHERE inside a `run:` block, shell comments included, so writing
+          # it out here would splice a real token into the script the runner
+          # executes. Read the literal bytes in code-review.yml's `env:`, where
+          # they belong. `Geoffe-Ga` when the PAT exists, `github-actions[bot]`
+          # when it does not. Filtering happens INSIDE the select, so a forged
+          # comment is SKIPPED and a genuine earlier verdict still governs — not
+          # picked and then rejected, which would let anyone bury a real refusal
+          # under a later fake LGTM. Exact equality via `index` on the array,
+          # never `test()`: as a regex, `github-actions[bot]` is
+          # `github-actions` followed by the class `[bot]`, which matches the
+          # registrable login `github-actionsb`. Both sides are downcased:
+          # logins are unique case-insensitively, so folding admits no account
+          # that could not already match, and it hedges the fleet-wide unmark an
+          # unexpected casing from the API would otherwise cause.
+          #
+          # THE REST ENDPOINT DISAGREES WITH pr-ready.sh's PAYLOAD ABOUT BOTH THE
+          # FIELD NAME AND THE BOT'S LOGIN, so this expression is deliberately NOT
+          # a copy of that one and must never be made into one. Measured live
+          # against PR #943, the same account three ways:
+          #   gh pr view 943 --json author    -> .author.login           app/dependabot
+          #   gh pr view 943 --json comments  -> .comments[].author.login  dependabot
+          #   gh api repos/../issues/943/comments -> .[].user.login    dependabot[bot]
+          # This file reads the third, so it is `.user.login` (not
+          # `.author.login`) and the bot is `github-actions[bot]` (not the bare
+          # slug pr-ready.sh's GraphQL payload returns). Copying either half
+          # across breaks the file it lands in — silently, and on every lane at
+          # once, because a filter that matches nothing skips every verdict. The
+          # suite pins the field name and the per-payload spelling separately from
+          # the set. `?` and `// ""` because a deleted account leaves `user:
+          # null`: under this step's `set -euo pipefail` a jq error would abort
+          # the step, and an unattributable comment must simply not be selected.
+          CLAUDE=$(jq -c '(["Geoffe-Ga","github-actions[bot]"] | map(ascii_downcase)) as $authors
+                          | [.[] | select((.body | test("(^|\\n)## Verdict:"))
+                                          and (((.user.login? // "") | ascii_downcase) as $a
+                                               | $authors | index($a)))]
+                          | last // empty' comments.json)
           if [ -z "$CLAUDE" ]; then
-            echo "No Claude review yet - skipping"
+            # No verdict from an accepted author. Either none has been posted
+            # yet (the ordinary case) or the only verdict-shaped comments came
+            # from accounts this pipeline cannot post as, which is #1199's
+            # forgery reaching its dead end: no summary is composed, so nothing
+            # ever says "cleared to squash merge" on the strength of it.
+            echo "No Claude review from an accepted author yet - skipping"
             exit 0
           fi
           ID=$(jq -r '.id'   <<<"$CLAUDE")
