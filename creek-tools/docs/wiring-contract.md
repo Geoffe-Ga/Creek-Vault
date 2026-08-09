@@ -119,22 +119,43 @@ executable staleness probe** and must declare exactly one of:
 The allowlist only ever shrinks, exactly as `DORMANT_CONFIG_FIELDS` does in
 `tests/test_config_contract.py`.
 
-## Known drift (strict xfails)
+## Closed drift: the two retyped copies (#1252 / #1253)
 
-Two parity assertions describe real, filed drift, and are the argument for
-deriving rather than retyping. They are strict `xfail`s: the day either is
-fixed, the test fails and the marker must come off.
+Two parity assertions used to be strict `xfail`s describing real, filed drift.
+Both are now real tests, because the copies they described are gone.
 
-1. **`creek.link` cannot reach the threads linker.**
-   `creek_mcp.tools.link._VALID_METHODS` is a retyped copy of
-   `creek.cli._LINK_METHODS` that lost `"threads"`. An MCP caller asking for it
-   gets *"unknown method 'threads'"*.
-2. **`creek.report` exposes 6 of 11 report types.** `unnamed`, `fingerprint`,
-   `paradox`, `synchronicity` and `wavelength` have no route over MCP.
+1. **`creek.link` could not reach the threads linker.**
+   `creek_mcp.tools.link._VALID_METHODS` was a retyped copy of
+   `creek.cli._LINK_METHODS` that had lost `"threads"`, so an MCP caller asking
+   for the linker #880 fixed got *"unknown method 'threads'"*.
+2. **`creek.report` exposed 6 of 11 report types.** `unnamed`, `fingerprint`,
+   `paradox`, `synchronicity` and `wavelength` were not refused over MCP — they
+   were absent, which reads to a caller as "no such report type".
 
-By contrast `creek.ingest` (derives from `INGESTOR_REGISTRY`) and `creek.save`
-(derives from the `SaveTarget` enum) have no drift at all. That is the whole
-argument in one line.
+Both are fixed the same way, and the fix is the derivation rather than the
+missing strings: [`creek/surface_modes.py`](../creek/surface_modes.py) is now
+the single declaration of both vocabularies, and each frontend reads it.
+Adding a mode there reaches every surface at once.
+
+Two follow-on rules came out of it, and both are enforced:
+
+- **Reachable is not the same as served.** Four report types
+  (`unnamed`, `fingerprint`, `paradox`, `synchronicity`) have generators that
+  accept no `PrivacyTierOverride`, so `creek.report` serves them only at
+  `privacy_tier_ceiling=all` and refuses them below it **by name**, naming the
+  generator a reader would have to widen. Dropping a type from the advertised
+  set is what produced #1253; a refusal that explains itself is not.
+- **The parity tests compare advertised sets, not constants.** Both frontends
+  now import the same tuple, so `set(X) == set(X)` would pass whatever the
+  surfaces actually do. `test_cli_and_mcp_agree_on_link_methods` and
+  `test_cli_and_mcp_agree_on_report_types` parse each surface's own rejection
+  message instead, and `test_report_error_message_lists_exactly_the_declared_types`
+  holds `REPORT_TYPES` against `_REPORT_DISPATCH` plus the `wavelength` special
+  case so the declaration cannot drift from the dispatcher either.
+
+`creek.ingest` (derives from `INGESTOR_REGISTRY`) and `creek.save` (derives
+from the `SaveTarget` enum) never had drift at all. That is the whole argument
+in one line.
 
 ## The fixture
 

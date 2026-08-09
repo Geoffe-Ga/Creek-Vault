@@ -80,11 +80,10 @@ def _install_recorders(
         ("_report_voice", "report/voice"),
     ):
         monkeypatch.setattr(cli_mod, name, rec(label))
-    monkeypatch.setattr(
-        cli_mod,
-        "_report_wavelength",
-        lambda _vault, _period: rec("report/wavelength")(),
-    )
+    # ``rec`` already accepts any signature; spelling ``_report_wavelength``'s
+    # out again would just be a third place to update when it changes (#1253
+    # added the ``override`` argument and broke exactly that).
+    monkeypatch.setattr(cli_mod, "_report_wavelength", rec("report/wavelength"))
 
     class _FakeIndex:
         def __init__(self, *, vault_path: Path) -> None:

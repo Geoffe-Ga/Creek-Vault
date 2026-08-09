@@ -4,6 +4,12 @@ Wraps :func:`creek.link.link_engine.run_link`. Links land back in
 fragment / thread / eddy frontmatter; the tool reports counts only.
 ``affected_fragment_ids`` stays empty because the linker does not
 report per-ID changes back to the caller.
+
+The accepted methods come from :data:`creek.surface_modes.LINK_METHODS`, the
+same declaration ``creek link`` reads. Until #1252 this module carried a
+retyped copy that had lost ``"threads"``, which put the entire thread half of
+#880 — the fix for one thread swallowing 94% of a corpus — out of an MCP
+caller's reach, with *"unknown method 'threads'"* as the only symptom.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from creek.config import load_config
 from creek.link.link_engine import run_link
+from creek.surface_modes import LINK_METHODS
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
@@ -19,7 +26,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 TOOL_NAME = "creek.link"
-_VALID_METHODS = ("embeddings", "temporal", "eddies")
 
 
 def link_tool(
@@ -37,13 +43,11 @@ def link_tool(
     linker does not produce new tiered content, so the ceiling is not
     a gate here — every caller can re-link.
     """
-    if method not in _VALID_METHODS:
+    if method not in LINK_METHODS:
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
-            reason=(
-                f"unknown method {method!r}; supported: {', '.join(_VALID_METHODS)}"
-            ),
+            reason=(f"unknown method {method!r}; supported: {', '.join(LINK_METHODS)}"),
         )
     config = load_config()
     summary = run_link(
