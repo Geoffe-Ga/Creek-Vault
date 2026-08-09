@@ -18,7 +18,9 @@ CrawDad v1.0 ships:
 - Voice-skill activation per session from `<vault>/creek-skills/`.
 - The six `/crawdad` slash commands (FEAT-016): `reflect`, `checkin`,
   `surface`, `draft`, `save`, `workflow`.
-- A user + channel allowlist; non-allowlisted callers get no response.
+- A user + channel allowlist; non-allowlisted callers get no response
+  — and, as of #1052, no bot-capture record either (see
+  [Bot capture](#bot-capture) below).
 - A graceful "creek-tools is unreachable" reply when the MCP
   subprocess dies.
 
@@ -69,8 +71,34 @@ allowed_channel_ids:
 | `attachments` | no | see source | Per-attachment limits, allow/deny lists, channel privacy tiers (FEAT-027/035). |
 | `consent` | no | see source | Conversational consent tokens + TTL (FEAT-034). |
 | `max_loop_rounds` | no | `5` | FEAT-036 agent-loop round cap, bounded `[1, 50]`. Raise when a single user turn legitimately needs more router/dispatcher passes (multi-source ingest, large re-classification asks, long workflow chains); the upper bound prevents pathological runaway loops. |
+| `capture_enabled` | no | `False` | Bot-capture toggle (#687) — see [Bot capture](#bot-capture) below. |
+| `capture_subpath` | no | `discord-capture` | Vault-relative dir bot-capture writes into. Must stay inside the vault. |
 
 Secrets are **never** in `crawdad.yaml` — they come only from the environment.
+
+### Bot capture
+
+Bot-capture logs the channels CrawDad is in to `<vault>/<capture_subpath>/`
+for later ingest — it is off by default (`capture_enabled: false`). When on,
+the bot captures **only messages it would also respond to**: the same
+user + channel allowlists as the command path, never another bot or
+webhook, and never its own replies.
+
+It also **never** captures a channel declared `intimate` or `all` in
+`attachments.channel_privacy_tiers` — those channels still get normal
+`/crawdad` and free-text replies, they are just never logged to the
+vault, because a captured message currently can't carry its channel's
+privacy tier with it. #1262 tracks carrying that tier end-to-end so
+`intimate` channels can be captured faithfully instead of refused.
+
+**Upgrading from a pre-#1052 build.** If you ran with
+`capture_enabled: true` before this fix, `<vault>/discord-capture/`
+may already hold records from non-allowlisted users, other bots, or
+an `intimate` channel — the old capture path bypassed all three
+gates. These records are still ingestible today. #1264 tracks the
+fix; until then the manual mitigation is deleting the offending
+channel subdirectories under `discord-capture/` before running
+`creek sync`.
 
 ### LLM provider selection
 

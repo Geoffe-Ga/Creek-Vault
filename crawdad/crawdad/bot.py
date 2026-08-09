@@ -29,6 +29,7 @@ from crawdad.attachments import (
     format_attachment_summary,
     process_attachments,
 )
+from crawdad.config import CAPTURE_ADMITTED_TIERS, DEFAULT_CHANNEL_TIER
 from crawdad.consent import (
     PendingBatch,
     PendingBatchStore,
@@ -270,10 +271,48 @@ def _passes_allowlist(
     Returns ``True`` when the caller should keep processing the
     message, ``False`` when the message should be silently dropped
     (per FEAT-013 §non-allowlisted callers get no response).
+
+    Two callers share this gate: :func:`handle_message` (the command
+    path) and :func:`_capture_allowed` (bot-capture, #1052), so
+    "silently dropped" now means no reply *and* no capture record.
     """
     if message.author.id == bot_user_id or message.author.bot:
         return False
     return config.is_allowed(user_id=message.author.id, channel_id=message.channel.id)
+
+
+def _capture_allowed(
+    message: _MessageLike,
+    *,
+    config: CrawDadConfig,
+    bot_user_id: int,
+) -> bool:
+    """Whether *message* may be written to the bot-capture log (#1052).
+
+    The capture boundary is the command boundary **plus** a tier gate.
+    Reusing :func:`_passes_allowlist` is the point: capture used to run
+    ahead of it and so logged messages the bot would never answer —
+    strangers, other bots, and channels the operator never allowlisted.
+    Anything the command path refuses, capture refuses for the same
+    reason.
+
+    The extra condition is the channel's privacy tier, which the command
+    path deliberately does not consult (the bot still *talks* in an
+    ``intimate`` channel): a capture record carries no tier of its own,
+    so only tiers in :data:`~crawdad.config.CAPTURE_ADMITTED_TIERS` may
+    be written. :func:`_channel_tier` fails closed to ``personal`` for a
+    channel with no override, so an operator who never wrote a
+    ``channel_privacy_tiers`` block keeps capture.
+
+    Fail-closed contract: this returns ``True`` only when every gate
+    affirmatively passes. Callers must treat a raised exception as a
+    refusal — see :meth:`CrawDadClient._capture_message`, which
+    evaluates this inside its ``try``.
+    """
+    if not _passes_allowlist(message, config=config, bot_user_id=bot_user_id):
+        return False
+    tier = _channel_tier(channel_id=message.channel.id, config=config)
+    return tier in CAPTURE_ADMITTED_TIERS
 
 
 def _empty_skills() -> VoiceSkillStack:
@@ -710,12 +749,15 @@ def _format_scan_section(body: str) -> str:
 def _channel_tier(*, channel_id: int, config: CrawDadConfig) -> str:
     """Return the privacy tier ceiling for *channel_id*.
 
-    Falls back to ``personal`` when the channel is absent from
+    Falls back to :data:`~crawdad.config.DEFAULT_CHANNEL_TIER`
+    (``personal``) when the channel is absent from
     :attr:`AttachmentConfig.channel_privacy_tiers` — ingest writes
     default to personal per FEAT-011, so a missing entry never
     silently relaxes the ceiling.
     """
-    return config.attachments.channel_privacy_tiers.get(channel_id, "personal")
+    return config.attachments.channel_privacy_tiers.get(
+        channel_id, DEFAULT_CHANNEL_TIER
+    )
 
 
 def _resolve_skills(
@@ -865,7 +907,7 @@ class CrawDadClient(discord.Client):
         if self.user is None:
             _LOGGER.debug("on_message before client ready; dropping event")
             return
-        await self._capture_message(message)
+        await self._capture_message(message, bot_user_id=self.user.id)
         await handle_message(
             cast("_MessageLike", message),
             config=self._config,
@@ -882,21 +924,36 @@ class CrawDadClient(discord.Client):
             workflow_runner=self._workflow_runner,
         )
 
-    async def _capture_message(self, message: discord.Message) -> None:
+    async def _capture_message(
+        self, message: discord.Message, *, bot_user_id: int
+    ) -> None:
         """Append the message to the bot-capture log, never disturbing commands.
 
-        No-op when capture is disabled. The bot's own messages are skipped (it
-        would only re-capture its own replies). A capture write failure is logged
-        and swallowed — capture is best-effort and must never break the command
-        path (#687).
+        No-op when capture is disabled, and no-op unless :func:`_capture_allowed`
+        admits the message — capture answers to the command path's own gate
+        (self-suppression, the ``author.bot`` filter, both allowlists) plus the
+        channel-tier gate, so it can no longer log what the bot would refuse to
+        answer or record a channel whose ceiling the capture file cannot carry
+        (#1052).
+
+        The gate is evaluated *inside* the ``try`` on purpose: a gate that raises
+        (a malformed message, a Discord object that errors on attribute access)
+        must fail closed to "not captured" and still leave the command path
+        running. A capture write failure is likewise logged and swallowed —
+        capture is best-effort and must never break the command path (#687).
         """
         if self._message_capture is None:
             return
-        if self.user is not None and message.author.id == self.user.id:
-            return
         try:
+            if not _capture_allowed(
+                cast("_MessageLike", message),
+                config=self._config,
+                bot_user_id=bot_user_id,
+            ):
+                return
             await self._message_capture.on_message(message)
         except Exception:
-            # Best-effort capture: any failure (bad message shape, disk error)
-            # is logged and swallowed so it can never break the command path.
+            # Best-effort capture: any failure (bad message shape, disk error,
+            # or a gate that raised) is logged and swallowed so it can never
+            # break the command path — and a raising gate never admits.
             _LOGGER.exception("bot-capture failed; continuing command path")
