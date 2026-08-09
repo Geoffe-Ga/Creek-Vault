@@ -54,8 +54,6 @@ from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tools.journal import journal_ingest_tool
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -176,20 +174,29 @@ async def _parsed_body(request: Request) -> JournalUpsertRequest | None:
 
 
 def _upsert(
-    vault: Path,
+    request: Request,
     external_id: str,
     parsed: JournalUpsertRequest,
     context: RequestContext,
-) -> dict[str, Any]:
-    """Run the journal tool for this request, off the event loop.
+) -> dict[str, Any] | None:
+    """Resolve the vault and run the journal tool, both off the event loop.
 
     Every blocking call the route makes is reachable from here and nowhere
-    else — the staging write, the ledger read, the whole ingest run and an audit
-    append that holds an ``fcntl`` lock across an ``fsync`` — so one caller's
-    slow write cannot stall every other connection this process is serving.
+    else — the config read and YAML parse behind
+    :func:`~creek_mcp.httpapi.vault.configured_vault`, the staging write, the
+    ledger read, the whole ingest run and an audit append that holds an
+    ``fcntl`` lock across an ``fsync`` — so one caller's slow write cannot
+    stall every other connection this process is serving.
+
+    Resolution belongs *inside* this seam rather than at the call site because
+    the app is built without a ``vault_path`` in the production entry point, so
+    ``configured_vault`` reads and parses ``creek_config.yaml`` on every
+    request. Hoisting only the tool would leave that file read on the loop —
+    the same narrowed hoist :mod:`creek_mcp.httpapi.capabilities` documents and
+    avoids.
 
     Args:
-        vault: The resolved vault root.
+        request: The request in flight, which names the vault to resolve.
         external_id: The already-validated path segment.
         parsed: The validated request body.
         context: The request's context, supplying the *admitted* ceiling and the
@@ -199,8 +206,13 @@ def _upsert(
             gate.
 
     Returns:
-        The tool's return dict, success or refusal.
+        The tool's return dict, success or refusal — or ``None`` when there is
+        no readable vault to run against, which the caller renders as the
+        ``unavailable`` refusal.
     """
+    vault = configured_vault(request)
+    if vault is None:
+        return None
     return journal_ingest_tool(
         vault_path=vault,
         content=parsed.content,
@@ -221,27 +233,37 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
 
     Returns:
         The ``200`` carrying :class:`~creek_mcp.api.models.JournalUpsertResponse`,
-        or the published refusal for the tool's reason.
+        or the published refusal for the tool's reason, or ``internal_error``
+        when the entry was written but cannot be honestly described.
     """
     if result.get("status") != OK_STATUS:
         reason = str(result.get("reason", ""))
         return error_response(journal_refusal_code(reason), context)
-    fragment_id = result.get("fragment_id")
+    if result.get("fragment_id") is None:
+        # `journal_ingest_tool` reports `ok` with a null `fragment_id` when
+        # `_resolve_fragment_id` comes back empty right after a successful
+        # write: the ledger and the writer disagree about what was just
+        # written. This must be checked *before* construction and cannot be
+        # left to the guard below, because `str(None)` raises nothing — it
+        # mints the literal id ``"None"``, which the caller can store, quote
+        # back and never resolve. Fabricating an id is precisely what this
+        # module's docstring forbids, and there is no honest success to render,
+        # so it is a server fault by the taxonomy's own definition.
+        return error_response(ErrorCode.INTERNAL_ERROR, context)
     try:
         payload = JournalUpsertResponse(
             status=OK_STATUS,
             tier_ceiling=WireTierCeiling(result["tier_ceiling"]),
             external_id=str(result["external_id"]),
-            fragment_id=str(fragment_id),
+            fragment_id=str(result["fragment_id"]),
             action=JournalAction(result["action"]),
             tier=WireTierCeiling(result["tier"]),
         )
     except (ValidationError, ValueError, KeyError):
-        # The tool reported success in a shape this contract cannot express —
-        # most plausibly an unresolved ``fragment_id``, which means the ledger
-        # and the writer disagree about what was just written. Not something to
-        # paper over with a fabricated id, and not something the caller can act
-        # on, so it is a server fault by the taxonomy's own definition.
+        # A success in some *other* shape this contract cannot express: a key
+        # the tool did not set, or a `tier_ceiling`/`action`/`tier` value the
+        # wire enums cannot name. Nothing the caller can act on, so it lands in
+        # the same server-fault bucket as the unresolved id above.
         return error_response(ErrorCode.INTERNAL_ERROR, context)
     return json_response(payload.model_dump(mode="json"), HTTP_OK)
 
@@ -249,11 +271,24 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
 async def handle_journal_upsert(request: Request) -> Response:
     """Create or update one journal entry, idempotently.
 
-    Four steps, in this order and for this reason: the path segment is checked
+    Three steps, in this order and for this reason: the path segment is checked
     before the body, because an id that cannot be a key makes the body moot; the
-    body is validated before the vault is resolved, because a malformed request
-    should not depend on the server's configuration to be refused; and the tool
-    is entered last, once there is a vault to enter it against.
+    body is validated before anything touches the disk, because a malformed
+    request should not depend on the server's configuration to be refused; and
+    everything blocking — resolving the vault included — happens last, in one
+    worker thread.
+
+    **Nothing here reads the filesystem.** Both checks above are pure, and
+    resolving the vault is not: with no ``vault_path`` on the app — the
+    production default, since :func:`creek_mcp.httpapi.cli.main` never passes
+    one — it reads and parses ``creek_config.yaml`` per request. Done on the
+    loop it would stall every other connection this process is serving and
+    leave :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware`
+    unable to fire for that window, since its cancel scope is evaluated on the
+    loop. So it sits inside :func:`_upsert` with the rest of the blocking work,
+    matching :mod:`creek_mcp.httpapi.capabilities`. The refusal is unchanged —
+    an unreadable configuration is still ``unavailable``; only the thread that
+    decides it moved.
 
     Args:
         request: The request in flight.
@@ -268,8 +303,7 @@ async def handle_journal_upsert(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    vault = configured_vault(request)
-    if vault is None:
+    result = await run_in_threadpool(_upsert, request, external_id, parsed, context)
+    if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    result = await run_in_threadpool(_upsert, vault, external_id, parsed, context)
     return _render(result, context)

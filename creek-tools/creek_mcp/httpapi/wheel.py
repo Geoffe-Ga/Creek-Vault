@@ -51,8 +51,6 @@ from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.tools.wheel import wheel_tool
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -80,23 +78,33 @@ def wheel_refusal_code(reason: str) -> ErrorCode:
     return ErrorCode.INTERNAL_ERROR
 
 
-def _tally(vault: Path, context: RequestContext) -> dict[str, Any]:
-    """Run the wheel tool for this request, off the event loop.
+def _tally(request: Request, context: RequestContext) -> dict[str, Any] | None:
+    """Resolve the vault and run the wheel tool, both off the event loop.
 
-    The whole corpus walk and the audit append — which takes a thread lock and
-    an ``fcntl`` exclusive lock across an ``fsync`` — are blocking, and on a
-    large vault the walk dominates. Called inline they would stop the event
-    loop, so one caller's wheel would stall every other connection this process
-    is serving.
+    The config read and YAML parse behind
+    :func:`~creek_mcp.httpapi.vault.configured_vault`, the whole corpus walk and
+    the audit append — which takes a thread lock and an ``fcntl`` exclusive lock
+    across an ``fsync`` — are all blocking, and on a large vault the walk
+    dominates. Called inline they would stop the event loop, so one caller's
+    wheel would stall every other connection this process is serving.
+
+    Resolution belongs *inside* this seam rather than at the call site: the app
+    is built without a ``vault_path`` in the production entry point, so
+    ``configured_vault`` reads and parses ``creek_config.yaml`` on every
+    request. Hoisting only the tool would leave that file read on the loop.
 
     Args:
-        vault: The resolved vault root.
+        request: The request in flight, which names the vault to resolve.
         context: The request's context, supplying the *admitted* ceiling and the
             authenticated consumer.
 
     Returns:
-        The tool's return dict.
+        The tool's return dict, or ``None`` when there is no readable vault to
+        tally, which the caller renders as the ``unavailable`` refusal.
     """
+    vault = configured_vault(request)
+    if vault is None:
+        return None
     return wheel_tool(
         vault_path=vault,
         privacy_tier_ceiling=context.ceiling,
@@ -138,6 +146,17 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
 async def handle_wheel(request: Request) -> Response:
     """Return the aggregate APTITUDE frequency distribution of the admitted corpus.
 
+    **Every blocking step happens in the worker**, vault resolution included.
+    With no ``vault_path`` on the app — the production default, since
+    :func:`creek_mcp.httpapi.cli.main` never passes one —
+    :func:`~creek_mcp.httpapi.vault.configured_vault` reads and parses
+    ``creek_config.yaml`` per request; done on the loop it would stall every
+    other connection and leave
+    :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware`
+    unable to fire for that window, since its cancel scope is evaluated on the
+    loop. The refusal is unchanged — an unreadable configuration is still
+    ``unavailable``; only the thread that decides it moved.
+
     Args:
         request: The request in flight.
 
@@ -145,8 +164,7 @@ async def handle_wheel(request: Request) -> Response:
         The published wheel, or the refusal an unreadable configuration earns.
     """
     context = context_of(request.scope)
-    vault = configured_vault(request)
-    if vault is None:
+    result = await run_in_threadpool(_tally, request, context)
+    if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    result = await run_in_threadpool(_tally, vault, context)
     return _render(result, context)

@@ -58,7 +58,6 @@ from creek_mcp.tools.reflect import reflect_tool
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from starlette.requests import Request
     from starlette.responses import Response
@@ -169,15 +168,22 @@ def _default_llm_factory() -> _LLMFactory:
 
 
 def _reflect(
-    vault: Path,
+    request: Request,
     parsed: ReflectionRequest,
     context: RequestContext,
     build_factory: Callable[[], _LLMFactory],
-) -> dict[str, Any]:
-    """Run the reflect tool for this request, off the event loop.
+) -> dict[str, Any] | None:
+    """Resolve the vault and run the reflect tool, both off the event loop.
+
+    Resolution belongs *inside* this seam rather than at the call site: the app
+    is built without a ``vault_path`` in the production entry point, so
+    :func:`~creek_mcp.httpapi.vault.configured_vault` reads and parses
+    ``creek_config.yaml`` on every request. Hoisting only the tool would leave
+    that file read on the loop, which is the narrowed hoist
+    :mod:`creek_mcp.httpapi.capabilities` documents and avoids.
 
     Args:
-        vault: The resolved vault root.
+        request: The request in flight, which names the vault to resolve.
         parsed: The validated request body.
         context: The request's context, supplying the *admitted* ceiling and
             the authenticated consumer.
@@ -188,9 +194,14 @@ def _reflect(
             provider failure.
 
     Returns:
-        The tool's return dict, or a synthetic refusal when the factory itself
-        could not be built.
+        The tool's return dict, a synthetic refusal when the factory itself
+        could not be built, or ``None`` when there is no readable vault to
+        reflect against, which the caller renders as the ``unavailable``
+        refusal.
     """
+    vault = configured_vault(request)
+    if vault is None:
+        return None
     try:
         factory = build_factory()
     except (RuntimeError, OSError, ValueError) as exc:
@@ -293,6 +304,19 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
 async def handle_reflection(request: Request) -> Response:
     """Return anchored margin notes for one entry, or the escalation it earns.
 
+    **Only body validation happens on the loop**, because only it is pure.
+    Resolving the vault is not: with no ``vault_path`` on the app — the
+    production default, since :func:`creek_mcp.httpapi.cli.main` never passes
+    one — :func:`~creek_mcp.httpapi.vault.configured_vault` reads and parses
+    ``creek_config.yaml`` per request. Done on the loop it would stall every
+    other connection this process is serving and leave
+    :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware`
+    unable to fire for that window, since its cancel scope is evaluated on the
+    loop. So it sits inside :func:`_reflect` with the model call and the audit
+    append, matching :mod:`creek_mcp.httpapi.capabilities`. The refusal is
+    unchanged — an unreadable configuration is still ``unavailable``; only the
+    thread that decides it moved.
+
     Args:
         request: The request in flight.
 
@@ -303,9 +327,8 @@ async def handle_reflection(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    vault = configured_vault(request)
-    if vault is None:
-        return error_response(ErrorCode.UNAVAILABLE, context)
     build_factory = request.app.state.reflect_llm_factory or _default_llm_factory
-    result = await run_in_threadpool(_reflect, vault, parsed, context, build_factory)
+    result = await run_in_threadpool(_reflect, request, parsed, context, build_factory)
+    if result is None:
+        return error_response(ErrorCode.UNAVAILABLE, context)
     return _render(result, context)

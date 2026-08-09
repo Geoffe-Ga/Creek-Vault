@@ -80,10 +80,13 @@ from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CONSUMER,
     HEALTH_PATH,
+    JOURNAL_PATH,
     JOURNAL_TEMPLATE,
     OP_HEALTH,
     REFLECTIONS_PATH,
     STRONG_TOKEN,
+    VALID_JOURNAL_BODY,
+    VALID_REFLECTION_BODY,
     WHEEL_PATH,
     build_app,
     client,
@@ -1038,6 +1041,133 @@ def test_the_event_loop_serves_another_request_while_the_handshake_blocks(
     assert not holder.is_alive()
     assert health.status_code == _OK_STATUS
     assert order == ["health", "capabilities"]
+
+
+def _config_read_probe(monkeypatch: pytest.MonkeyPatch, vault: Path) -> _SeamProbe:
+    """Swap the per-request configuration read for a probe that reports its thread.
+
+    :func:`~creek_mcp.httpapi.vault.configured_vault` falls through to
+    ``load_config`` — a file read and a YAML parse — whenever the app was built
+    without an explicit ``vault_path``, which is exactly what
+    :func:`creek_mcp.httpapi.cli.main` does. So every content route inherits the
+    handshake's hazard, and every content test below drives it the same way:
+    ``vault_path=None`` on the app is what reaches this seam at all.
+
+    Args:
+        monkeypatch: Swaps ``load_config`` on the shared resolver module.
+        vault: The vault the stubbed configuration names.
+
+    Returns:
+        The installed probe, whose ``ran_on_the_event_loop`` is the assertion.
+    """
+    probe = _SeamProbe(SimpleNamespace(vault_path=vault))
+    monkeypatch.setattr(vault_module, "load_config", probe)
+    return probe
+
+
+def _silent_llm_factory() -> Callable[[Any], Callable[[str], str]]:
+    """Return a tier-keyed LLM factory whose model finds nothing.
+
+    ``POST /v1/reflections`` cannot be driven without one, and the reflection's
+    *content* is irrelevant to where the config read happened — so this is the
+    cheapest factory that keeps the request on the success path.
+
+    Returns:
+        A factory returning a completion callable that answers with no notes.
+    """
+
+    def _for_tier(_tier: Any) -> Callable[[str], str]:
+        """Return the completion callable for any routing tier.
+
+        Args:
+            _tier: The tier the tool derived, which this stub ignores.
+
+        Returns:
+            The stub completion callable.
+        """
+
+        def _complete(_prompt: str) -> str:
+            """Answer with a well-formed turn carrying no notes.
+
+            Args:
+                _prompt: The composed prompt, unused.
+
+            Returns:
+                The serialised turn.
+            """
+            return '{"notes": []}'
+
+        return _complete
+
+    return _for_tier
+
+
+def test_the_journal_upsert_resolves_its_vault_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``PUT /v1/journal-entries/{external_id}`` must not read config on the loop.
+
+    The route already hoists the ingest run into a worker, so the *slow* part
+    looks handled — but resolving which vault to run against is itself a file
+    read and a YAML parse, and doing it before the hoist puts it back on the
+    loop for every request. Same failure as the handshake's, on a route that
+    writes.
+
+    A status assertion alone cannot see this: the blocking arrangement returns
+    the identical ``200``. What separates them is which thread ran the read, so
+    that is what is asserted — and the ``200`` is the non-vacuity half, proving
+    the probe's answer was consumed by the production path.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps the configuration read for a probe.
+    """
+    probe = _config_read_probe(monkeypatch, vault)
+    with client(vault_path=None) as test_client:
+        response = test_client.put(
+            JOURNAL_PATH, json=VALID_JOURNAL_BODY, headers=headers()
+        )
+
+    assert response.status_code == _OK_STATUS
+    assert probe.ran_on_the_event_loop is False
+
+
+def test_the_wheel_resolves_its_vault_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /v1/wheel`` must not read config on the loop either.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps the configuration read for a probe.
+    """
+    probe = _config_read_probe(monkeypatch, vault)
+    with client(vault_path=None) as test_client:
+        response = test_client.get(WHEEL_PATH, headers=headers())
+
+    assert response.status_code == _OK_STATUS
+    assert probe.ran_on_the_event_loop is False
+
+
+def test_the_reflection_route_resolves_its_vault_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POST /v1/reflections`` must not read config on the loop either.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps the configuration read for a probe.
+    """
+    probe = _config_read_probe(monkeypatch, vault)
+    with client(
+        vault_path=None, reflect_llm_factory=_silent_llm_factory
+    ) as test_client:
+        response = test_client.post(
+            REFLECTIONS_PATH, json=VALID_REFLECTION_BODY, headers=headers()
+        )
+
+    assert response.status_code == _OK_STATUS
+    assert probe.ran_on_the_event_loop is False
 
 
 # --------------------------------------------------------------------------- #

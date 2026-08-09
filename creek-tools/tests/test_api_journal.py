@@ -604,6 +604,49 @@ def test_an_ingest_failure_does_not_echo_the_underlying_message(
     assert "secret-name" not in response.text
 
 
+def _no_source_ledger(*_args: object, **_kwargs: object) -> None:
+    """Stand in for a source ledger that has no record of the staged entry.
+
+    Args:
+        *_args: ``ledger_for_source``'s source type and vault path, unused.
+        **_kwargs: Ditto, by keyword.
+    """
+
+
+def test_a_written_entry_whose_fragment_id_will_not_resolve_is_a_fault(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unresolved ``fragment_id`` is a ``500``, never the literal ``"None"``.
+
+    :func:`~creek_mcp.tools.journal.journal_ingest_tool` answers ``status: ok``
+    with ``fragment_id=None`` when the source ledger cannot map the staged entry
+    back to a fragment immediately after a successful write — the writer and the
+    ledger disagree about what was just written. ``str(None)`` raises nothing, so
+    a projection that guarded only with ``try``/``except`` would answer ``200``
+    carrying the id ``"None"``: something the caller can store, quote back and
+    never resolve. Minting an id no vault object answers to is the one thing
+    this module's docstring says it must not do, so the check is explicit and
+    precedes construction rather than being inferred from a failure to validate.
+
+    Driven through the real tool rather than a substitute, because the property
+    is that the race is *reachable*: ``ledger_for_source`` answering ``None`` is
+    exactly how ``_resolve_fragment_id`` comes back empty on a successful write.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Removes the source ledger the resolver reads.
+    """
+    monkeypatch.setattr(
+        "creek_mcp.tools.journal.ledger_for_source", _no_source_ledger, raising=True
+    )
+    response = _put(vault)
+
+    assert response.status_code == 500
+    assert envelope(response)["code"] == ErrorCode.INTERNAL_ERROR.value
+    assert "None" not in response.text
+    assert "fragment_id" not in response.text
+
+
 # --------------------------------------------------------------------------- #
 # HTTP <-> MCP parity
 # --------------------------------------------------------------------------- #

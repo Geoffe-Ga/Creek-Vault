@@ -44,6 +44,19 @@ malformed ``vault_path`` and every :class:`pydantic.ValidationError` are
 def configured_vault(request: Request) -> Path | None:
     """Return the vault *request* should read, resolving config if need be.
 
+    **Blocking. Call it from a worker thread, never from a handler coroutine.**
+    The fallback is a file read and a YAML parse, and it is not the rare arm:
+    ``app.state.vault_path`` is ``None`` for the production entry point, since
+    :func:`creek_mcp.httpapi.cli.main` builds the app without one. A caller that
+    resolves the vault before entering
+    :func:`~starlette.concurrency.run_in_threadpool` therefore does file I/O on
+    the event loop for every request, stalling every other connection the
+    process is serving and leaving
+    :class:`~creek_mcp.httpapi.middleware.limits.RequestTimeoutMiddleware`
+    unable to fire for that window — its cancel scope is evaluated on the loop.
+    Every ``/v1`` route calls this from inside its own threadpool-wrapped
+    worker, and ``tests/test_v1_api_hardening.py`` pins each one.
+
     Args:
         request: The request in flight.
 
