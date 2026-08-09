@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 import yaml
+from typer.testing import CliRunner
 
+from creek.cli import app
 from creek.generate.lexicon import generate_lexicon
 from creek.generate.voice import (
     VoiceProfileGenerator,
@@ -217,6 +219,120 @@ def test_audit_entry_records_the_voice_artifact_count(voice_vault: Path) -> None
     assert outcome.voice_artifacts_removed == 4
 
 
+# ---- Undecodable bodies (#910 meets #1211) ----
+
+
+def _corrupt_body_bytes(vault: Path, frag_id: str) -> None:
+    """Make a seeded fragment's *body* invalid UTF-8, frontmatter intact.
+
+    The bytes go at the end of the file, past the closing ``---``, so the
+    YAML block still parses and the fragment still matches the purge
+    criteria — the file is undecodable only where the voice sweep needs
+    to read it.
+    """
+    frag_file = vault / "01-Fragments" / "Journal" / f"{frag_id}.md"
+    frag_file.write_bytes(frag_file.read_bytes() + b"\xff\xfe")
+
+
+def test_an_undecodable_body_names_the_fragment_it_could_not_sweep(
+    voice_vault: Path,
+) -> None:
+    """A body the sweep cannot decode is reported, never silently skipped.
+
+    The loader that feeds every purge decision hands back a *lossy* body
+    for a non-UTF-8 file (U+FFFD per bad byte). Matching that against a
+    profile that quotes the real bytes finds nothing — so without this
+    report an incomplete erasure would be indistinguishable from a
+    complete one.
+    """
+    _corrupt_body_bytes(voice_vault, "frag-a")
+
+    result = PurgeEngine(voice_vault).purge_fragment("frag-a")
+
+    assert result.voice_body_undecodable == ["frag-a"]
+
+
+def test_an_undecodable_body_downgrades_the_audit_outcome_to_partial(
+    voice_vault: Path,
+) -> None:
+    """The compliance log must not certify an erasure that fell short."""
+    _corrupt_body_bytes(voice_vault, "frag-a")
+    engine = PurgeEngine(voice_vault)
+
+    engine.purge_fragment("frag-a")
+
+    outcome = [e for e in engine.audit_log.read() if e.phase == "outcome"][-1]
+    assert outcome.status == "partial"
+    assert outcome.failure_reason == "UnicodeDecodeError"
+
+
+def test_a_decodable_body_still_certifies_the_erasure_as_complete(
+    voice_vault: Path,
+) -> None:
+    """The partial downgrade is scoped to the failure; the normal path is clean."""
+    engine = PurgeEngine(voice_vault)
+
+    result = engine.purge_fragment("frag-a")
+
+    assert result.voice_body_undecodable == []
+    outcome = [e for e in engine.audit_log.read() if e.phase == "outcome"][-1]
+    assert outcome.status == "complete"
+    assert outcome.failure_reason is None
+
+
+def test_the_link_keyed_passes_still_erase_an_undecodable_fragment(
+    voice_vault: Path,
+) -> None:
+    """Neither id-keyed pass reads the body, so neither may degrade with it.
+
+    The ``Register-Samples`` copy is keyed on the filename stem and the
+    lexicon notes on a ``[[<id>]]`` wikilink. All three go. Only the
+    content-keyed profile — the one pass with no recorded link to key on
+    — is left behind, and that shortfall is the one the result reports.
+    """
+    _corrupt_body_bytes(voice_vault, "frag-a")
+
+    result = PurgeEngine(voice_vault).purge_fragment("frag-a")
+
+    samples = voice_vault / "07-Voice" / "Register-Samples" / "analytical"
+    assert not (samples / "frag-a.md").exists()
+    assert not (voice_vault / "07-Voice" / "Lexicon" / "glossary.md").exists()
+    assert not (
+        voice_vault / "07-Voice" / "Lexicon" / "Metaphors" / "water.md"
+    ).exists()
+    assert result.voice_artifacts_removed == 3
+    # The single documented survivor, reported rather than concealed.
+    assert _files_containing(voice_vault, SENTINEL) == [
+        "07-Voice/analytical-profile.md",
+    ]
+
+
+def test_the_undecodable_warning_names_the_id_and_nothing_else(
+    voice_vault: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operator gets the id; the log never gets the body or the path.
+
+    A purge log outlives the request that produced it, so quoting the
+    content being erased — or a path pointing at it — would defeat the
+    erasure it is reporting on.
+    """
+    _corrupt_body_bytes(voice_vault, "frag-a")
+
+    with caplog.at_level("WARNING", logger="creek.purge.engine"):
+        PurgeEngine(voice_vault).purge_fragment("frag-a")
+
+    sweep_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "voice-profile" in record.getMessage()
+    ]
+    assert len(sweep_warnings) == 1
+    assert "frag-a" in sweep_warnings[0]
+    assert SENTINEL not in sweep_warnings[0]
+    assert str(voice_vault) not in sweep_warnings[0]
+
+
 # ---- Boundaries ----
 
 
@@ -405,3 +521,45 @@ def test_sweep_is_a_no_op_when_the_vault_has_no_voice_folder(
 
     assert result.fragments_affected == 1
     assert result.voice_artifacts_removed == 0
+
+
+# ---- What the operator is told ----
+
+
+def _purge_via_cli(vault: Path, frag_id: str) -> str:
+    """Run ``creek purge fragment`` and return its rendered output."""
+    invocation = CliRunner().invoke(
+        app,
+        ["purge", "fragment", frag_id, "--vault", str(vault), "--yes"],
+    )
+    assert invocation.exit_code == 0, invocation.output
+    return invocation.output
+
+
+def test_the_cli_tells_the_operator_to_regenerate_the_swept_reports(
+    voice_vault: Path,
+) -> None:
+    """A swept profile or glossary is shared, so its loss outlives one fragment.
+
+    Deleting the note that quoted the purged fragment also drops every
+    *other* fragment's retained content from it until the report runs
+    again — so the follow-up command is named where the count is, not
+    left to be discovered.
+    """
+    output = _purge_via_cli(voice_vault, "frag-a")
+
+    assert "Voice artifacts removed: 4" in output
+    assert "creek report --type voice" in output
+    assert "creek report --type lexicon" in output
+
+
+def test_the_cli_says_so_when_the_voice_sweep_fell_short(
+    voice_vault: Path,
+) -> None:
+    """An incomplete erasure must be visible where the operator is looking."""
+    _corrupt_body_bytes(voice_vault, "frag-a")
+
+    output = _purge_via_cli(voice_vault, "frag-a")
+
+    assert "INCOMPLETE" in output
+    assert "frag-a" in output
