@@ -31,6 +31,17 @@ name: Ralph Tooling Tests
 # assertions are as coupled to that file as the round trip is to the emitter, so
 # a PR that edits only iteration-trigger.yml must run this suite as well.
 #
+# creek-tools/scripts/pr-status.sh is here because test_pr_status.sh is a suite
+# whose SUBJECT lives outside scripts/ralph/. Every other suite tests a sibling,
+# so `scripts/ralph/**` alone happened to cover both the test and the thing it
+# tests; pr-status.sh breaks that coincidence. Without this path a change to the
+# script under test — the job-name-agnostic CI parser the fleet reads its verdict
+# from — would run no suite at all, which is the unwired-gate failure in its
+# other direction: the suite exists and is listed, and still never sees the diff
+# that could break it. tests/test_ralph_tooling_workflow.py derives this rule
+# from the filesystem (suite `test_<x>.sh` → script `<x>.sh`) rather than from a
+# list, so the next out-of-tree subject cannot be forgotten here.
+#
 # .claude/skills/await-claude-review/SKILL.md is the third file here, and it is
 # the CONSUMER half of that same merge contract (#1202). Its Step 4a decides the
 # merge from `**VERDICT**` + `**CI**` alone, so iteration-trigger.yml's refusal
@@ -43,6 +54,7 @@ on:
   push:
     paths:
       - "scripts/ralph/**"
+      - "creek-tools/scripts/pr-status.sh"
       - ".github/workflows/ralph-recap-tests.yml"
       - ".github/workflows/code-review.yml"
       - ".github/workflows/iteration-trigger.yml"
@@ -50,6 +62,7 @@ on:
   pull_request:
     paths:
       - "scripts/ralph/**"
+      - "creek-tools/scripts/pr-status.sh"
       - ".github/workflows/ralph-recap-tests.yml"
       - ".github/workflows/code-review.yml"
       - ".github/workflows/iteration-trigger.yml"
@@ -81,13 +94,21 @@ jobs:
         # guards the reviewer-availability probe that stops a sync from spending
         # an LGTM the quota cannot replace — and its polarity is INVERTED with
         # respect to main-health.sh's, which is exactly the property an
-        # unwired suite would stop pinning.
+        # unwired suite would stop pinning. test_pr_status.sh (issue #1141)
+        # guards the ONE reader the fleet asks "is this PR green?" — its cases
+        # assert that pr-status.sh, watch-pr.sh and pr-ready.sh name no CI job,
+        # so a rename inside ci.yml cannot silently turn the loop's verdict
+        # blind. "Listed explicitly" is only a rule if a new suite must join the
+        # list to merge, so tests/test_ralph_tooling_workflow.py derives the
+        # expected set from `scripts/ralph/test_*.sh` on disk and fails on any
+        # suite this block omits.
         run: |
           git config --global user.email ci@example.com
           git config --global user.name ci
           bash scripts/ralph/test_fleet.sh
           bash scripts/ralph/test_pick_next.sh
           bash scripts/ralph/test_pr_ready.sh
+          bash scripts/ralph/test_pr_status.sh
           bash scripts/ralph/test_watch_pr.sh
           bash scripts/ralph/test_main_health.sh
           bash scripts/ralph/test_review_quota.sh

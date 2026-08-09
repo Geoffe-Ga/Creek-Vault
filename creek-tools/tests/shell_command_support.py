@@ -31,6 +31,8 @@ REPO_ROOT = CREEK_TOOLS_DIR.parent
 SCRIPTS_DIR = CREEK_TOOLS_DIR / "scripts"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOWS_DIR / "ci.yml"
+RALPH_WORKFLOW = WORKFLOWS_DIR / "ralph-recap-tests.yml"
+RALPH_SCRIPTS_DIR = REPO_ROOT / "scripts" / "ralph"
 PRE_COMMIT_CONFIG = CREEK_TOOLS_DIR / ".pre-commit-config.yaml"
 
 
