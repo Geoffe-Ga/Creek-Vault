@@ -159,6 +159,26 @@ rename at your leisure; `intimate`/`all` values now get refused at
 requiring intimate protection); both keys present fails to parse and
 the workflow drops out of the listing.
 
+**The same cap covers the router**, not just authored workflows. The
+Haiku router also emits a `privacy_tier_ceiling` per intent, and its
+prompt contains raw tool-result bodies (vault fragments `creek ingest`
+built from third-party exports), so that value is untrusted input. The
+dispatcher therefore clamps every intent to the same `{open, personal}`
+set — one shared constant, `crawdad.intents.COMPOSER_ADMITTED_CEILINGS`
+— before any MCP call is made. Nothing else would: CrawDad speaks MCP
+over stdio, so the server sees a *local* caller and applies no remote
+cap.
+
+Note the difference in behaviour. A workflow declaring `intimate`/`all`
+is **refused** (the operator authored the file and can fix it, and a
+refusal is a visible Discord reply). A router intent above the cap is
+**clamped down to `personal` and logged at `WARNING`** — the call still
+goes out, just narrowed. Refusing there would let one poisoned vault
+fragment silence the bot for good, since the agent loop does not catch
+that error class; clamping gives the same confidentiality plus an
+operator-visible warning. Neither path can ever *widen* a ceiling: an
+`open` request stays `open`.
+
 **No per-step ceilings** — a step's `args:` may not set its own
 `privacy_tier_ceiling` (or the deprecated `privacy_tier_floor`); the
 workflow-level value applies to every step, and a step that tries is
