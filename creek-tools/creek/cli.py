@@ -4579,6 +4579,7 @@ def draft(
     from creek.generate.ai_style.fingerprint import load_fingerprint
     from creek.generate.ai_style.preamble import build_style_preamble
     from creek.generate.drafts import DraftGenerator
+    from creek.generate.grounding import GroundingThresholds, default_embedding_fn
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
@@ -4616,6 +4617,13 @@ def draft(
         privacy_override=override,
         bypass_compiled=bypass_compiled,
         ontology_twist=ontology_twist,
+        # FEAT-032 grounding guard. Both kwargs are required together — the
+        # generator skips the guard entirely if either is missing, which is
+        # exactly how it stayed dormant on this path until #1040. The model
+        # loads lazily inside the factory, so an offline host pays nothing
+        # here and the generator degrades with a warning when it does.
+        embedding_fn=default_embedding_fn(vault_config.embeddings),
+        grounding_thresholds=GroundingThresholds.from_config(vault_config.draft),
         fingerprint=fingerprint,
         ai_style_config=ai_style,
         voice_guard_no_llm=no_llm,

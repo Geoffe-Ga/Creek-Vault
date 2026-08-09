@@ -80,8 +80,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 from creek.classify.privacy_filter import max_source_tier, source_tiers
+from creek.config import load_config, resolve_config_path
 from creek.generate.compile_routing import load_compiled_pages
 from creek.generate.drafts import DraftGenerator
+from creek.generate.grounding import GroundingThresholds, default_embedding_fn
 from creek.generate.mining import IdeaMiner
 from creek.models import Phase, PrivacyTier
 from creek_mcp.audit import MCPAuditLog
@@ -327,10 +329,22 @@ def draft_tool(
             ceiling=privacy_tier_ceiling,
             reason=str(exc),
         )
+    # The vault's own ``creek_config.yaml`` (not the bare process-wide
+    # ``load_config()`` the other tool wrappers use) so an operator's
+    # calibrated grounding thresholds apply to MCP drafts too. The
+    # missing-file warning is suppressed because this is a per-call hot path,
+    # not a setup surface — ``creek init`` is where a missing config is worth
+    # saying out loud, and :mod:`creek.lint.checks.draft_grounding` resolves
+    # the same section the same quiet way.
+    config = load_config(resolve_config_path(vault_path, None), warn_on_missing=False)
     generator = DraftGenerator(
         llm=llm,
         skills_root=skills_dir,
         privacy_override=override,
+        # FEAT-032 grounding guard — supplied as a pair, because
+        # ``DraftGenerator`` skips the guard when either is missing (#1040).
+        embedding_fn=default_embedding_fn(config.embeddings),
+        grounding_thresholds=GroundingThresholds.from_config(config.draft),
     )
     try:
         draft = generator.generate_draft(idea, vault_path=vault_path)

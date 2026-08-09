@@ -8,11 +8,18 @@ any draft whose stored scores fall outside the configured
 ``draft.derivative_upper`` / ``draft.grounding_fraction_lower``
 thresholds.
 
-Drafts written before issue #355 (and any markdown file that simply
-lacks the scores) are skipped silently — re-running ``creek draft``
-will backfill the metric. The check never deletes, rewrites, or
-auto-redrafts: it only surfaces, in keeping with the non-negotiable
-lint rules pinned by :mod:`creek.lint`.
+Drafts that lack the scores are skipped silently — re-running
+``creek draft`` will backfill the metric. Two populations land there:
+drafts written before issue #355, and drafts written on a host where
+the embedding model could not load (the guard says so on stderr at
+draft time and stamps nothing). Until #1040 wired the guard into the
+production draft paths, *every* draft landed there and this check
+reported every vault clean; that history is why the skip branch is
+worth naming rather than leaving implicit.
+
+The check never deletes, rewrites, or auto-redrafts: it only surfaces,
+in keeping with the non-negotiable lint rules pinned by
+:mod:`creek.lint`.
 """
 
 from __future__ import annotations
