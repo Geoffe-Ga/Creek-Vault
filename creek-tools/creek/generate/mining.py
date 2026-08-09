@@ -40,6 +40,8 @@ from pydantic import ValidationError
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
+    raw_privacy_tier,
+    within_ceiling,
 )
 from creek.generate.compile_routing import (
     COMPILE_GAPS_RELPATH,
@@ -399,6 +401,47 @@ def _liminal_kind(md_file: Path, liminal_root: Path) -> str | None:
     return kind
 
 
+def _admitted_liminal_entry(
+    md_file: Path,
+    liminal_root: Path,
+    ceiling: PrivacyTierOverride,
+) -> tuple[Fragment, str, str] | None:
+    """Return one admitted ``(fragment, body, kind)`` entry, or ``None`` to skip.
+
+    The per-file half of :func:`_load_liminal_fragments` — see that function
+    for why the tier is read off the raw frontmatter (#1079). ``None`` covers
+    every reason a ``10-Liminal`` file contributes nothing: it is a
+    Synchronicities reflection note, it does not parse, it is above the
+    ceiling, or it is not a valid fragment.
+
+    The ceiling is checked *before* validation deliberately. An above-ceiling
+    note should not be parsed into a model at all, and ``_validate_fragment``
+    logs the path of anything it rejects.
+
+    Args:
+        md_file: The candidate note.
+        liminal_root: ``<vault>/10-Liminal``, used to derive *kind*.
+        ceiling: The admission ceiling, already defaulted.
+
+    Returns:
+        The entry, with :func:`~creek.classify.privacy_filter.raw_privacy_tier`
+        materialised onto the fragment, or ``None``.
+    """
+    kind = _liminal_kind(md_file, liminal_root)
+    if kind is None:
+        return None
+    post = _safe_post(md_file)
+    if post is None or not within_ceiling(post.metadata, ceiling):
+        return None
+    fragment = _validate_fragment(post, md_file)
+    if fragment is None:
+        return None
+    declared = fragment.model_copy(
+        update={"privacy_tier": raw_privacy_tier(post.metadata)},
+    )
+    return declared, post.content, kind
+
+
 def _load_liminal_fragments(
     liminal_root: Path,
     *,
@@ -410,21 +453,64 @@ def _load_liminal_fragments(
     ``"Unnamed"`` or ``"Compost"``. The Synchronicities subfolder is
     excluded because its records are reflection notes, not fragments.
 
-    ``privacy_override`` is forwarded to the shared tier filter.
+    **The tier is read off the raw frontmatter, not off the validated model**
+    (#1079). ``10-Liminal`` notes are the one corpus two tools admit
+    independently: ``## Liminal Watch`` gates the same physical file through
+    :func:`creek.generate.state._admitted_liminal_notes`, which reads
+    :func:`~creek.classify.privacy_filter.within_ceiling` on the raw
+    frontmatter, while this loader reached the same file through the model.
+    A note with *no* ``privacy_tier`` key at all therefore came out
+    ``intimate`` on one side (fail-closed, absent means unvouched-for) and
+    ``unclassified`` on the other (the model's default, which ranks with
+    ``personal`` per #876/#961) — so one ``10-Liminal/Unnamed`` note needed
+    ``ceiling=intimate`` for its stem and only ``ceiling=open`` for its
+    generated id, inside one rendered document. That is the "two tools that
+    disagree about the same file" bug class
+    :mod:`creek.classify.privacy_filter` names in its own module docstring.
+
+    The divergence is closed by tightening this side up to the report's
+    reader rather than by loosening the report's down to this one, so the
+    change is a strict narrowing at every ceiling:
+
+    * :func:`~creek.classify.privacy_filter.raw_privacy_tier` is materialised
+      onto the loaded fragment, which is what makes every downstream reader —
+      :func:`~creek.classify.privacy_filter.filter_fragments_by_tier` below,
+      :func:`~creek.classify.privacy_filter.tier_of` in
+      :meth:`creek.generate.state.StateReportGenerator._content_tier` — see
+      one tier for one file instead of each re-deriving its own. It is a
+      narrowing because a raw read never answers *below* the model's: a
+      missing key escalates ``unclassified`` to ``intimate``, and an
+      unrecognised value never reaches here at all (the model refuses to
+      validate it, so :func:`_validate_fragment` has already dropped the
+      note).
+    * ``within_ceiling`` is applied as a hard rank cutoff *in addition to*
+      the body-level filter below, because the two answer different
+      questions: the filter *summarises* a personal body as
+      ``[Personal-tier summary: <title>]`` rather than excluding the note, so
+      at ``ceiling=open`` a personal liminal **title** entered the corpus
+      while the report refused the same file outright.
+
+    ``tests/test_liminal_tier_reader_agreement.py`` pins the two call sites
+    against each other note by note, at every ceiling.
+
+    Args:
+        liminal_root: ``<vault>/10-Liminal``.
+        privacy_override: The admission ceiling. ``None`` means ``OPEN``,
+            matching what it already meant to the body-level filter.
+
+    Returns:
+        The admitted ``(fragment, body, kind)`` tuples, each fragment
+        carrying the tier its raw frontmatter declares.
     """
     if not liminal_root.exists():
         return []
-    collected: list[tuple[Fragment, str, str]] = []
-    for md_file in sorted(liminal_root.rglob("*.md")):
-        kind = _liminal_kind(md_file, liminal_root)
-        if kind is None:
-            continue
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        fragment = _validate_fragment(post, md_file)
-        if fragment is not None:
-            collected.append((fragment, post.content, kind))
+    ceiling = privacy_override or PrivacyTierOverride.OPEN
+    collected = [
+        entry
+        for md_file in sorted(liminal_root.rglob("*.md"))
+        if (entry := _admitted_liminal_entry(md_file, liminal_root, ceiling))
+        is not None
+    ]
     kind_by_id: dict[str, str] = {f.id: kind for f, _body, kind in collected}
     pairs = [(f, body) for f, body, _kind in collected]
     filtered = list(filter_fragments_by_tier(pairs, override=privacy_override))

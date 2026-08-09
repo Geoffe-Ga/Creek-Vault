@@ -536,6 +536,13 @@ def _admitted_liminal_notes(
     serve both: the paradox note fails closed to ``intimate`` because nobody
     vouched for it, not because it was classified.
 
+    This is one of two readers admitting ``10-Liminal`` notes into one
+    document; the other is
+    ``creek.generate.mining._load_liminal_fragments``, which backs
+    ``## Suggested questions`` and calls the same two functions for the same
+    reason (#1079). ``tests/test_liminal_tier_reader_agreement.py`` asserts
+    the two agree note by note rather than leaving it to coincidence.
+
     Sorting is unchanged from FEAT-007 and is applied before admission so the
     displayed order does not shift with the ceiling. ``st_mtime`` is
     best-effort — CI containers and fresh clones flatten it to the checkout
@@ -1075,20 +1082,28 @@ class StateReportGenerator:
         tiers — the maximum over the fragments naming each title — so it can
         narrow precisely.
 
-        **Fragments are intersected by id** with the admitted slice. The miner
-        reads ``privacy_tier`` off the validated :class:`~creek.models.Fragment`,
-        which defaults a *missing* key to ``unclassified`` and so admits at
-        ``ceiling=personal`` a file this report's raw-frontmatter cutoff failed
-        closed to ``intimate``. Without the intersection a wavelength-window
-        seed could carry such a fragment's **title**. Note the intersection is
-        by id and not by object: the miner's copy of an admitted fragment may
-        carry a summarised body, which is stricter and is kept.
+        **Fragments are intersected by id** with the admitted slice.
+        ``creek.generate.mining._load_fragments`` reads ``privacy_tier`` off
+        the validated :class:`~creek.models.Fragment`, which defaults a
+        *missing* key to ``unclassified`` and so admits at ``ceiling=personal``
+        a file this report's raw-frontmatter cutoff failed closed to
+        ``intimate``. Without the intersection a wavelength-window seed could
+        carry such a fragment's **title**. Note the intersection is by id and
+        not by object: the miner's copy of an admitted fragment may carry a
+        summarised body, which is stricter and is kept.
 
-        **Liminal fragments are left as the miner filtered them**, and that is
-        the one axis this report cannot narrow: they come from ``10-Liminal``
-        subfolders (notably ``Compost``) that ``_load_liminal_watch`` does not
-        walk, so there is no admitted list to intersect against. They are
-        instead accounted for on the stamp — see :meth:`_content_tier`.
+        **Liminal fragments are left as the miner filtered them**, and since
+        #1079 that is no longer a gap: ``_load_liminal_fragments`` applies the
+        same :func:`~creek.classify.privacy_filter.within_ceiling` cutoff on
+        the same raw frontmatter that :func:`_admitted_liminal_notes` reads,
+        and materialises
+        :func:`~creek.classify.privacy_filter.raw_privacy_tier` onto the
+        fragment it returns, so the two halves of this document cannot admit
+        one ``10-Liminal`` note at two different ceilings. An intersection
+        would be unavailable anyway: the miner walks ``10-Liminal`` subfolders
+        (notably ``Compost``) that ``_load_liminal_watch`` does not, so there
+        is no admitted list to intersect against. Those are accounted for on
+        the stamp instead — see :meth:`_content_tier`.
 
         Returns:
             The snapshot to hand :func:`phase_filtered_seeds`.
@@ -1560,15 +1575,18 @@ class StateReportGenerator:
         the stamp, which is the same fail-open the hyperedge intersection
         closed. Its tier is added here instead.
 
-        That tier is read off the validated model rather than the raw
-        frontmatter, because the snapshot no longer holds the file. The
-        divergence is one case, and it does not fail open: a liminal note with
-        *no* ``privacy_tier`` key resolves to ``unclassified`` here where a raw
-        read would say ``intimate``, and
-        :func:`~creek.classify.privacy_filter.tier_sensitivity` ranks
-        ``unclassified`` *with* ``personal`` — so the stamp still refuses the
-        artifact at ``ceiling=open``, which is the only ceiling at which the
-        section did not render.
+        That tier is read through :func:`~creek.classify.privacy_filter.tier_of`
+        because the snapshot no longer holds the file — but it is nonetheless
+        the *raw* tier, not the model's default. Since #1079
+        ``creek.generate.mining._load_liminal_fragments`` materialises
+        :func:`~creek.classify.privacy_filter.raw_privacy_tier` onto every
+        fragment it returns, so a liminal note with *no* ``privacy_tier`` key
+        arrives here already reading ``intimate`` rather than the
+        ``unclassified`` the model would default it to. Before that it read
+        one rank low, and a stamp that under-reports is a read gate that fails
+        open: an untiered ``10-Liminal/Compost`` note is admitted only from
+        ``ceiling=intimate`` upward, yet stamped the artifact ``unclassified``,
+        which ``ceiling=personal`` would then have been allowed to read.
 
         **Addition two is the lint summary**, derived from the *rendered
         strings* rather than from a flag the section sets. A flag would create
