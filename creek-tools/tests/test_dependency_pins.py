@@ -58,19 +58,44 @@ Two independent guards per package:
 * **locked version** — ``uv.lock`` is what CI installs and what
   pip-audit actually inspects, so the resolved entry must already be
   at or above the patched version.
+
+The file also carries the *undeclared-dependency* guard (issue #1123).
+``anyio`` motivated it: ``creek_mcp.httpapi.middleware.limits`` imports
+``Semaphore``, ``WouldBlock`` and ``fail_after`` from it at module scope,
+yet the package appeared nowhere in ``pyproject.toml`` — it worked only
+because ``starlette`` happened to drag it in, so a starlette release that
+stopped depending on anyio would have broken the ``/v1`` limits
+middleware with no lockfile signal at all. Rather than fix that one
+import and wait for the next, ``test_every_import_time_module_is_declared``
+walks every import executed when ``creek`` or ``creek_mcp`` is imported
+and insists something in ``[project]`` declares it.
+
+Import-*time* is the whole of the rule, and it is what separates a
+defect from a design. ``creek.clean.semantic_dedup`` does ``import
+faiss`` inside a function behind a probed, memoised availability check
+and degrades to a dense matmul when it is missing; that package is
+deliberately undeclared and must stay that way. An import at module
+scope has no such escape — the interpreter runs it or the module does
+not load — so it is a hard requirement and belongs in the manifest.
 """
 
 from __future__ import annotations
 
+import ast
+import sys
 import tomllib
+from importlib.metadata import packages_distributions
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from packaging.specifiers import SpecifierSet
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -97,6 +122,18 @@ _TORCH_PATCHED_VERSION = Version("2.13.0")
 #: (CVE-2026-69247 / GHSA-g6cj-pr64-35w5); the advisory range opens at
 #: 44.0.0, so every release from 44.0.0 up to 49.x is vulnerable.
 _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
+
+#: The anyio floor. No CVE here — the floor simply records the version
+#: the lock already resolved when anyio was declared (issue #1123), the
+#: same rule the neighbouring uvicorn declaration follows. Inventing a
+#: lower bound would claim compatibility with releases this project has
+#: never run.
+_ANYIO_DECLARED_FLOOR = Version("4.13.0")
+
+#: The packages whose import-time dependencies must all be declared.
+#: Both are shipped in the wheel, so anything they import at module
+#: scope has to be installable from the manifest alone.
+_IMPORT_ROOTS = ("creek", "creek_mcp")
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -577,4 +614,253 @@ def test_locked_cryptography_at_or_above_patched_release() -> None:
         f"{_CRYPTOGRAPHY_PATCHED_VERSION} (PYSEC-2026-3552 / "
         "CVE-2026-69247); pip-audit inspects the lock, so relock after "
         "raising the floor"
+    )
+
+
+def _anyio_specifier() -> SpecifierSet:
+    """Return the ``anyio`` specifier from ``[project].dependencies``.
+
+    anyio is a direct dependency here —
+    ``creek_mcp.httpapi.middleware.limits`` imports ``Semaphore``,
+    ``WouldBlock`` and ``fail_after`` from it at module scope — so it
+    belongs alongside the other declared runtime dependencies rather
+    than being left to arrive transitively via starlette.
+
+    Returns:
+        The specifier set attached to the ``anyio`` entry in
+        ``[project].dependencies``. Fails the calling test if the entry
+        is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    dependencies: list[str] = pyproject["project"]["dependencies"]
+    for entry in dependencies:
+        requirement = Requirement(entry)
+        if requirement.name == "anyio":
+            return requirement.specifier
+    pytest.fail("anyio is not declared in [project].dependencies of pyproject.toml")
+
+
+def _locked_anyio_version() -> Version:
+    """Return the resolved ``anyio`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``anyio`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``anyio`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "anyio":
+            return Version(str(package["version"]))
+    pytest.fail("anyio has no [[package]] entry in uv.lock")
+
+
+def _declared_distributions() -> set[str]:
+    """Return every distribution name ``[project]`` declares, canonicalised.
+
+    Both ``dependencies`` and every ``optional-dependencies`` extra
+    count: an import reached only through an extra is still declared,
+    which is exactly the arrangement ``creek.ingest.documents`` and the
+    cloud LLM providers rely on.
+
+    ``[tool.uv].constraint-dependencies`` is deliberately excluded. A uv
+    constraint tightens the resolution of a package already in the graph;
+    it does not put one there, so it can never satisfy a direct import
+    (DEP-003).
+
+    Returns:
+        Canonical (PEP 503) names of the declared distributions.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    project = pyproject["project"]
+    entries: list[str] = list(project["dependencies"])
+    extras: dict[str, list[str]] = project.get("optional-dependencies", {})
+    for extra in extras.values():
+        entries.extend(extra)
+    return {canonicalize_name(Requirement(entry).name) for entry in entries}
+
+
+def _import_time_statements(
+    module: ast.Module,
+) -> Iterator[ast.Import | ast.ImportFrom]:
+    """Yield the import statements executed when *module* is imported.
+
+    Descends into ``if`` (so ``if TYPE_CHECKING:`` blocks count — a
+    type-only import still needs the package installed to type-check),
+    ``try`` and ``with``, but never into a function or class body. An
+    import nested in a function runs only if that function is called, so
+    it can legitimately be optional; one at module scope cannot.
+
+    Args:
+        module: The parsed source of a single file.
+
+    Yields:
+        Each import statement reachable at module scope.
+    """
+    pending: list[ast.stmt] = list(module.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            yield node
+        elif isinstance(node, ast.If):
+            pending.extend(node.body)
+            pending.extend(node.orelse)
+        elif isinstance(node, ast.Try):
+            pending.extend(node.body)
+            pending.extend(node.orelse)
+            pending.extend(node.finalbody)
+            for handler in node.handlers:
+                pending.extend(handler.body)
+        elif isinstance(node, ast.With):
+            pending.extend(node.body)
+
+
+def _top_level_names(node: ast.Import | ast.ImportFrom) -> list[str]:
+    """Return the top-level module names an import statement reaches for.
+
+    Args:
+        node: An ``import x.y`` or ``from x.y import z`` statement.
+
+    Returns:
+        The distinct root module names, e.g. ``["anyio"]`` for
+        ``from anyio import Semaphore``. Relative imports resolve within
+        this package and yield nothing.
+    """
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".", 1)[0] for alias in node.names]
+    if node.level or node.module is None:
+        return []
+    return [node.module.split(".", 1)[0]]
+
+
+def _import_time_modules() -> dict[str, set[str]]:
+    """Map each import-time top-level module to the files importing it.
+
+    Returns:
+        Module name to the set of repo-relative paths that import it at
+        module scope. Keys include stdlib and first-party names; the
+        caller filters.
+    """
+    imported: dict[str, set[str]] = {}
+    for root in _IMPORT_ROOTS:
+        for path in sorted((_PACKAGE_ROOT / root).rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for statement in _import_time_statements(tree):
+                for name in _top_level_names(statement):
+                    importers = imported.setdefault(name, set())
+                    importers.add(str(path.relative_to(_PACKAGE_ROOT)))
+    return imported
+
+
+def _providing_distributions(module: str) -> set[str]:
+    """Return the canonical distributions that provide *module*.
+
+    Import names and distribution names differ often enough that a
+    string comparison would be wrong (``frontmatter`` ships in
+    ``python-frontmatter``, ``yaml`` in ``PyYAML``, ``PIL`` in
+    ``pillow``), so the installed metadata answers the question. Reading
+    it at runtime also means a newly-added package needs no table here.
+
+    Args:
+        module: A top-level import name.
+
+    Returns:
+        Canonical names of the installed distributions providing
+        ``module``. When nothing in the environment claims it, falls
+        back to the module's own canonicalised name so a
+        partially-installed checkout still reports something actionable
+        rather than crashing.
+    """
+    providers = packages_distributions().get(module)
+    if providers is None:
+        return {canonicalize_name(module)}
+    return {canonicalize_name(name) for name in providers}
+
+
+def test_anyio_is_declared_as_a_direct_dependency() -> None:
+    """``anyio`` appears in ``[project].dependencies``.
+
+    ``creek_mcp.httpapi.middleware.limits`` imports it at module scope;
+    before issue #1123 it reached the environment only because starlette
+    happened to depend on it, so a starlette release that dropped anyio
+    would have broken the ``/v1`` limits middleware with no signal from
+    the lockfile.
+    """
+    specifier = _anyio_specifier()
+    assert str(specifier), (
+        "anyio is declared without a version specifier; the floor must "
+        "record the version the lock resolves so a relock cannot drift "
+        "silently below it"
+    )
+
+
+def test_anyio_floor_tracks_the_locked_resolution() -> None:
+    """The declared floor is the resolved version, not a looser guess.
+
+    The neighbouring uvicorn declaration sets the precedent: the floor
+    matches what ``uv.lock`` already resolves. A lower bound would claim
+    support for releases this project has never run.
+    """
+    specifier = _anyio_specifier()
+    assert str(_ANYIO_DECLARED_FLOOR) in specifier, (
+        f"anyio specifier {specifier!r} rejects {_ANYIO_DECLARED_FLOOR}, "
+        "the version uv.lock resolves"
+    )
+    assert "4.12.0" not in specifier, (
+        f"anyio specifier {specifier!r} admits 4.12.0; the floor must be "
+        f">={_ANYIO_DECLARED_FLOOR}, the resolution the project actually runs"
+    )
+
+
+def test_locked_anyio_satisfies_the_declared_floor() -> None:
+    """``uv.lock`` resolves anyio at or above the declared floor.
+
+    A declaration added without a relock leaves the lock stale, and CI
+    installs from the lock — the very drift this guard exists to stop.
+    """
+    locked = _locked_anyio_version()
+    assert locked >= _ANYIO_DECLARED_FLOOR, (
+        f"uv.lock pins anyio {locked}, below the declared floor "
+        f"{_ANYIO_DECLARED_FLOOR}; run `uv lock` after changing pyproject"
+    )
+    assert str(locked) in _anyio_specifier(), (
+        f"uv.lock pins anyio {locked}, which the declared specifier "
+        f"{_anyio_specifier()!r} rejects; the lock is stale"
+    )
+
+
+def test_every_import_time_module_is_declared() -> None:
+    """No module imported at import time is missing from ``[project]``.
+
+    The generalisation of the anyio defect (#1123). Every third-party
+    package that ``creek`` or ``creek_mcp`` imports at module scope must
+    be declared in ``dependencies`` or an ``optional-dependencies``
+    extra, so the next undeclared import fails here instead of surviving
+    to review — or to a transitive bump in production.
+
+    Function-local imports are exempt by construction: they are how this
+    codebase expresses genuinely optional packages (``faiss`` in
+    ``creek.clean.semantic_dedup``), and they cannot break at import
+    time.
+    """
+    declared = _declared_distributions()
+    undeclared: dict[str, set[str]] = {}
+    for module, importers in _import_time_modules().items():
+        if module in sys.stdlib_module_names or module in _IMPORT_ROOTS:
+            continue
+        if _providing_distributions(module) & declared:
+            continue
+        undeclared[module] = importers
+    report = "; ".join(
+        f"{module} (imported by {', '.join(sorted(paths))})"
+        for module, paths in sorted(undeclared.items())
+    )
+    assert not undeclared, (
+        f"import-time dependencies missing from pyproject.toml: {report}. "
+        "Declare each in [project].dependencies (or the extra that owns "
+        "it) and run `uv lock`, or move the import inside the function "
+        "that needs it if the package is genuinely optional"
     )

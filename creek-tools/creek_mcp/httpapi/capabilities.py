@@ -273,10 +273,12 @@ async def handle_capabilities(request: Request) -> Response:
     that cannot fire, not a cancellation.
 
     :func:`starlette.concurrency.run_in_threadpool` rather than
-    :func:`anyio.to_thread.run_sync`: ``starlette`` is a declared dependency of
-    this package and ``anyio`` reaches it only as a transitive, so importing
-    anyio directly here would deepen an undeclared-dependency defect that is
-    tracked separately.
+    :func:`anyio.to_thread.run_sync`: the two are the same call — the former
+    wraps the latter — and this is a Starlette endpoint, so it uses the
+    framework's own helper and inherits whatever thread-limiter policy
+    Starlette applies to the rest of the app. The undeclared-dependency
+    argument this comment used to make no longer holds: anyio has been a
+    declared dependency since #1123.
 
     Args:
         request: The request in flight.
