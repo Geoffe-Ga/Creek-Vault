@@ -14,11 +14,13 @@ the framework-free half of the surface beside :mod:`creek_mcp.api.models`, is
 what lets the published OpenAPI document outlive whatever serves it.
 
 **Exposed versus implemented.** :data:`ROUTES` says which endpoints exist;
-:data:`IMPLEMENTED_CAPABILITIES` says which of them actually answer. At #1074
-that is the handshake alone — the other three are wired to an honest ``501``
-rather than to a fabricated ``200``, because a stub that looks like success is
-one a consumer integrates against and only discovers in production. #1075—#1077
-each move one capability from the first set into the second.
+:data:`IMPLEMENTED_CAPABILITIES` says which of them actually answer. #1075—#1077
+moved the last three capabilities from the first set into the second, so the two
+now coincide. The distinction is not obsolete: while a capability was unbuilt it
+was wired to an honest ``501`` rather than to a fabricated ``200``, because a
+stub that looks like success is one a consumer integrates against and only
+discovers in production. A fifth capability published before its handler exists
+gets exactly that treatment, from the same constant, with no code change.
 """
 
 from __future__ import annotations
@@ -180,14 +182,16 @@ gate for the same reason — an operator debugging a version mismatch must not
 also lose their monitoring probe.
 """
 
-IMPLEMENTED_CAPABILITIES: Final[frozenset[Capability]] = frozenset(
-    {Capability.CAPABILITIES}
-)
+IMPLEMENTED_CAPABILITIES: Final[frozenset[Capability]] = frozenset(Capability)
 """The capabilities this server actually answers for, as opposed to publishes.
 
-A *strict* subset of ``set(Capability)`` at #1074: the handshake is built, and
-``journal-upsert`` / ``reflections`` / ``wheel`` are mounted to an honest
-``501``. One constant drives both the advertised list in ``GET
+Equal to ``set(Capability)`` since #1077 — spelled ``frozenset(Capability)``
+rather than as four names, so a capability added to the enum is advertised only
+once a handler exists for it: :func:`creek_mcp.httpapi.handlers._handler_for`
+raises at import if it does not, which is the failure mode worth having.
+
+It was a *strict* subset for the whole of #1074—#1076, and the machinery that
+made that safe is unchanged. One constant drives both the advertised list in ``GET
 /v1/capabilities`` and which routes get the stub, so the two cannot disagree —
 adding a capability here without wiring a handler, or wiring a handler without
 adding it here, turns ``tests/test_v1_api_capabilities.py`` red.

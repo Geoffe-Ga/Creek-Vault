@@ -29,7 +29,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from creek_mcp import policy
-from creek_mcp.api.models import CONTRACT_MINOR
+from creek_mcp.api.models import CONTRACT_MINOR, Capability
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.middleware import ceiling as ceiling_middleware
 from creek_mcp.remote_auth import ConsumerTokenVerifier
@@ -157,6 +157,47 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
 
 VERSIONED_IDS: Final[tuple[str, ...]] = ("journal-upsert", "reflections", "wheel")
 """Stable parametrize ids for :data:`VERSIONED`."""
+
+STUB_METHOD: Final[str] = "POST"
+"""The verb of the route the honesty-stub tests mount a synthetic stub on."""
+
+STUB_PATH: Final[str] = REFLECTIONS_PATH
+"""The path of that route.
+
+#1077 built the last capability, so *no* entry in the real route table reaches
+:class:`~creek_mcp.httpapi.handlers.UnimplementedHandler` any more. The stub is
+still the machinery that keeps the *next* capability honest, and an unexercised
+guard rots, so the tests that used to sweep the genuinely-unbuilt routes now
+substitute one handler and drive the same path. ``reflections`` is chosen
+because it was the last route to be built, so the substitution reproduces the
+exact state the suite was asserting the day before.
+"""
+
+STUB_CAPABILITY: Final[Capability] = Capability.REFLECTIONS
+"""The capability :data:`STUB_PATH` serves, for the stamp assertion."""
+
+
+def stubbed_client(vault_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Return a client over an app whose :data:`STUB_PATH` is the honest ``501``.
+
+    Args:
+        vault_path: The vault the app is built over.
+        monkeypatch: The active monkeypatch fixture; the substitution is undone
+            with the test, so no other module sees a stubbed route table.
+
+    Returns:
+        A test client over the substituted application.
+    """
+    from creek_mcp.httpapi import handlers as handlers_module
+
+    stub = handlers_module.unimplemented(STUB_CAPABILITY)
+    monkeypatch.setattr(
+        handlers_module,
+        "HANDLERS",
+        {**handlers_module.HANDLERS, OP_REFLECTIONS: stub},
+    )
+    return TestClient(build_app(vault_path=vault_path))
+
 
 VALID_JOURNAL_BODY: Final[dict[str, Any]] = {
     "content": "a sentence the server must never echo",

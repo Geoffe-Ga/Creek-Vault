@@ -478,8 +478,16 @@ def _vary_cases() -> tuple[tuple[str, dict[str, str], str, int], ...]:
 
     Returns:
         One case per published status an intermediary could cache: the
-        ``401``, the routing ``404``, the ceiling ``422``, the honest ``501``
-        and the ``200``.
+        ``401``, the routing ``404``, the ceiling ``422``, the vault-object
+        ``403`` and the ``200``.
+
+        The ``501`` this sweep used to carry is gone: #1077 built the last
+        capability, so no route answers ``unsupported_capability`` any more
+        (``tests/test_v1_api_not_implemented.py`` drives the stub directly
+        instead). It is replaced by the ``403`` an above-ceiling journal write
+        earns — a *reachable* refusal, and a more interesting one to cache
+        wrongly, since it is the one status whose correctness depends on the
+        ceiling the response varies on.
     """
     return (
         ("/v1/capabilities", headers(token=None), "GET", _UNAUTHENTICATED_STATUS),
@@ -490,7 +498,7 @@ def _vary_cases() -> tuple[tuple[str, dict[str, str], str, int], ...]:
             "GET",
             _INVALID_REQUEST_STATUS,
         ),
-        ("/v1/wheel", headers(), "GET", 501),
+        ("/v1/journal-entries/vary-probe", headers(ceiling="open"), "PUT", 403),
         ("/v1/capabilities", headers(), "GET", 200),
     )
 
@@ -498,7 +506,7 @@ def _vary_cases() -> tuple[tuple[str, dict[str, str], str, int], ...]:
 @pytest.mark.parametrize(
     ("path", "request_headers", "method", "expected"),
     _vary_cases(),
-    ids=["401", "404", "422", "501", "200"],
+    ids=["401", "404", "422", "403", "200"],
 )
 def test_vary_is_set_on_every_response(
     vault: Path,
@@ -522,8 +530,11 @@ def test_vary_is_set_on_every_response(
         method: HTTP method.
         expected: The status this case must produce.
     """
+    # ``PUT`` is the one case needing a body; the others take none, and a
+    # body on a ``GET`` would be refused before the header under test is set.
+    body = {"content": "vary probe", "tier": "personal"} if method == "PUT" else None
     with client(vault_path=vault) as test_client:
-        response = test_client.request(method, path, headers=request_headers)
+        response = test_client.request(method, path, headers=request_headers, json=body)
     assert response.status_code == expected
     assert CEILING_HEADER.lower() in response.headers.get("vary", "").lower()
 

@@ -79,11 +79,13 @@ Stands in for a real ``external_id``: consumer-side identifying material that
 the caller chose and the operator never should see in a log.
 """
 
-_UNSUPPORTED_STATUS: Final[int] = 501
-"""What ``PUT /v1/journal-entries/{external_id}`` answers until #1075 lands.
+_SERVED_STATUS: Final[int] = 200
+"""What ``PUT /v1/journal-entries/{external_id}`` answers since #1075 built it.
 
 Asserted so that a run which never reached the server cannot pass by simply
-logging nothing.
+logging nothing — and now a stronger non-vacuity claim than the ``501`` it
+replaced, because the request travels the whole route rather than stopping at
+the stub.
 """
 
 _LOOPBACK: Final[str] = "127.0.0.1"
@@ -329,7 +331,7 @@ def test_a_served_request_leaves_no_path_identifier_on_the_process_streams(
     config = build_uvicorn_config(_built_app(vault), _args_for(_EPHEMERAL_PORT))
     response = _serve_one_request(config, _sentinel_path())
     captured = capsys.readouterr()
-    assert response.status_code == _UNSUPPORTED_STATUS
+    assert response.status_code == _SERVED_STATUS
     assert _SENTINEL_ID not in captured.out
     assert _SENTINEL_ID not in captured.err
 
@@ -365,5 +367,5 @@ def test_the_stream_capture_sees_the_identifier_when_uvicorn_logs_it(
     )
     response = _serve_one_request(config, _sentinel_path())
     captured = capsys.readouterr()
-    assert response.status_code == _UNSUPPORTED_STATUS
+    assert response.status_code == _SERVED_STATUS
     assert _SENTINEL_ID in captured.out

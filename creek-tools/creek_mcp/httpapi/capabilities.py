@@ -36,12 +36,10 @@ until it has already written the integration.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 from starlette.concurrency import run_in_threadpool
-from yaml import YAMLError
 
-from creek.config import load_config
 from creek_mcp.api.models import (
     CONTRACT_MINOR,
     SUPPORTED_CONTRACT_MINORS,
@@ -60,6 +58,7 @@ from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.errors import HTTP_OK, json_response
+from creek_mcp.httpapi.vault import UNREADABLE_CONFIG, configured_vault
 from creek_mcp.tools.handshake import handshake_tool, vault_available
 
 if TYPE_CHECKING:
@@ -69,16 +68,6 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from creek_mcp.httpapi.context import RequestContext
-
-_UNREADABLE_CONFIG: Final = (OSError, ValueError, YAMLError)
-"""What "the vault is not usable" looks like when it is raised rather than returned.
-
-:class:`FileNotFoundError` and a permission error are :class:`OSError`; a
-malformed ``vault_path`` and every :class:`pydantic.ValidationError` are
-:class:`ValueError`; an unparseable document is a :class:`yaml.YAMLError`.
-Deliberately not ``Exception``: a bug in this module must surface as a ``500``
-from the error boundary, not as a vault that quietly reports itself missing.
-"""
 
 
 def _implemented_capabilities() -> list[Capability]:
@@ -96,30 +85,6 @@ def _implemented_capabilities() -> list[Capability]:
         for capability in Capability
         if capability in IMPLEMENTED_CAPABILITIES
     ]
-
-
-def _configured_vault(request: Request) -> Path | None:
-    """Return the vault this request should read, resolving config if need be.
-
-    Resolved per request rather than once at construction: an operator who
-    fixes a broken ``creek_config.yaml`` gets a working handshake on the next
-    call rather than after a restart.
-
-    Args:
-        request: The request in flight.
-
-    Returns:
-        The explicitly configured vault path, the one the config names, or
-        ``None`` when the configuration cannot be read at all.
-    """
-    configured: Path | None = request.app.state.vault_path
-    if configured is not None:
-        return configured
-    try:
-        resolved = load_config().vault_path
-    except _UNREADABLE_CONFIG:
-        return None
-    return resolved
 
 
 def _negotiate(vault: Path, context: RequestContext) -> bool:
@@ -150,7 +115,7 @@ def _negotiate(vault: Path, context: RequestContext) -> bool:
             privacy_tier_ceiling=context.ceiling,
             consumer=context.consumer,
         )
-    except _UNREADABLE_CONFIG:
+    except UNREADABLE_CONFIG:
         return False
     return bool(negotiated["available"])
 
@@ -162,7 +127,8 @@ def _vault_is_usable(request: Request, context: RequestContext) -> bool:
     syscall the handshake makes is reachable from here and nowhere else, so
     :func:`handle_capabilities` can hoist the lot off the event loop with a
     single :func:`~starlette.concurrency.run_in_threadpool` call. The three
-    seams underneath are all filesystem I/O — :func:`_configured_vault` reads
+    seams underneath are all filesystem I/O —
+    :func:`~creek_mcp.httpapi.vault.configured_vault` reads
     and parses ``creek_config.yaml``, ``vault_available`` stats the marker, and
     :func:`_negotiate` reaches :meth:`creek_mcp.audit.MCPAuditLog.append`,
     which takes a thread lock and an ``fcntl`` exclusive lock across a full
@@ -178,7 +144,7 @@ def _vault_is_usable(request: Request, context: RequestContext) -> bool:
         ``True`` only when the marker directory exists *and* the handshake tool
         confirms it.
     """
-    vault = _configured_vault(request)
+    vault = configured_vault(request)
     if vault is None or not vault_available(vault):
         return False
     return _negotiate(vault, context)
@@ -294,7 +260,7 @@ async def handle_capabilities(request: Request) -> Response:
     across an ``fsync``. Called inline it would stop the event loop, so one
     consumer's slow audit log would stall every other connection this process is
     serving, on the endpoint every client calls *first*. Exception behaviour is
-    unchanged: the ``_UNREADABLE_CONFIG`` catches sit inside that function and
+    unchanged: the ``UNREADABLE_CONFIG`` catches sit inside that function and
     anything they do not catch propagates back out through the ``await``.
 
     It is also what lets

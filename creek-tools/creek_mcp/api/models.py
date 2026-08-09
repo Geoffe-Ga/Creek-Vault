@@ -88,12 +88,18 @@ narrows, and the client needs to see the whole window without a second round
 trip. Drop an entry only when a ``/v1`` shape actually stops being served.
 """
 
-OK_STATUS: Final[str] = "ok"
+OK_STATUS: Final[Literal["ok"]] = "ok"
 """The sole success status on the journal-upsert and wheel envelopes.
 
 Both carry ``status: "ok"`` and nothing else, because every non-success outcome
 is an :class:`ErrorEnvelope` with its own HTTP status. A second success-ish
 status value would give a consumer two places to look for failure.
+
+Typed ``Literal["ok"]`` rather than ``str`` so a handler can *build* a response
+from it: :attr:`JournalUpsertResponse.status` and :attr:`WheelResponse.status`
+are themselves ``Literal["ok"]``, and a plain ``str`` constant would not satisfy
+them under strict typing — leaving a handler to spell the literal a second time,
+which is the drift this constant exists to prevent.
 """
 
 

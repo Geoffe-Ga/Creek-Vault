@@ -63,6 +63,7 @@ from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
 from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
+from creek_mcp.httpapi import vault as vault_module
 from creek_mcp.httpapi.auth import BearerAuthMiddleware
 from creek_mcp.httpapi.context import LIFESPAN_SCOPE, UnsupportedScopeError
 from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME, ERROR_LOGGER_NAME
@@ -79,10 +80,13 @@ from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CONSUMER,
     HEALTH_PATH,
+    JOURNAL_PATH,
     JOURNAL_TEMPLATE,
     OP_HEALTH,
     REFLECTIONS_PATH,
     STRONG_TOKEN,
+    VALID_JOURNAL_BODY,
+    VALID_REFLECTION_BODY,
     WHEEL_PATH,
     build_app,
     client,
@@ -104,6 +108,7 @@ if TYPE_CHECKING:
 
 _OK_STATUS: Final[int] = 200
 _INVALID_REQUEST_STATUS: Final[int] = 422
+_TEMPORARILY_UNAVAILABLE_STATUS: Final[int] = 503
 _UNAVAILABLE_STATUS: Final[int] = 503
 _INTERNAL_ERROR_STATUS: Final[int] = 500
 _UNSUPPORTED_STATUS: Final[int] = 501
@@ -298,19 +303,39 @@ def test_a_body_at_exactly_the_limit_is_accepted(vault: Path) -> None:
     """The cap is inclusive, so a body of exactly *n* bytes reaches the route.
 
     Without this, an off-by-one that refused everything would satisfy both
-    tests above. ``501`` is the proof it got past the limit: it is the
-    capability gate's answer, which lives below the router.
+    tests above. What proves it got through is which *layer* answered: the
+    body-size gate refuses with ``invalid_request`` before the router runs,
+    whereas this body travels all the way into the reflection route and is
+    refused by the LLM factory, which answers ``temporarily_unavailable``.
+    Two different codes, so the boundary is unambiguous.
+
+    Until #1077 the proof was a ``501`` from the capability gate; that gate has
+    no unbuilt route left to answer for, so the evidence moved one layer deeper
+    — which is a strictly stronger claim about how far the body travelled.
+
+    The factory is injected and raises deterministically, so the assertion does
+    not depend on whether a local provider happens to be running.
 
     Args:
         vault: A seeded vault.
     """
-    with client(vault_path=vault, max_body_bytes=_SMALL_LIMIT) as test_client:
+
+    def _refusing_factory() -> object:
+        msg = "no provider in this test"
+        raise RuntimeError(msg)
+
+    with client(
+        vault_path=vault,
+        max_body_bytes=_SMALL_LIMIT,
+        reflect_llm_factory=_refusing_factory,
+    ) as test_client:
         response = test_client.post(
             REFLECTIONS_PATH,
             content=_body_of_exactly(_SMALL_LIMIT),
             headers={**headers(ceiling="open"), "Content-Type": "application/json"},
         )
-    assert response.status_code == _UNSUPPORTED_STATUS
+    assert response.status_code == _TEMPORARILY_UNAVAILABLE_STATUS
+    assert envelope(response)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
 
 
 def test_an_oversize_body_writes_no_log_line_carrying_its_content(
@@ -938,8 +963,11 @@ def test_every_blocking_seam_of_the_readiness_probe_runs_off_the_event_loop(
     looks wrong at the call site, and no other test in the suite can tell.
 
     ``vault_path=None`` is what routes the request through ``load_config`` at
-    all; with a vault configured on the app, ``_configured_vault`` returns early
-    and that seam is never reached.
+    all; with a vault configured on the app,
+    :func:`~creek_mcp.httpapi.vault.configured_vault` returns early and that
+    seam is never reached. ``load_config`` is patched on
+    :mod:`creek_mcp.httpapi.vault`, which has owned resolution for every route
+    since #1075; the other two seams stay on the handshake's own module.
 
     Args:
         vault: A seeded vault, named by the stubbed configuration.
@@ -950,8 +978,9 @@ def test_every_blocking_seam_of_the_readiness_probe_runs_off_the_event_loop(
         "vault_available": _SeamProbe(True),
         "handshake_tool": _SeamProbe({"available": True}),
     }
-    for name, probe in probes.items():
-        monkeypatch.setattr(capabilities_module, name, probe)
+    monkeypatch.setattr(vault_module, "load_config", probes["load_config"])
+    for name in ("vault_available", "handshake_tool"):
+        monkeypatch.setattr(capabilities_module, name, probes[name])
 
     with client(vault_path=None) as test_client:
         response = test_client.get(CAPABILITIES_PATH, headers=headers())
@@ -1012,6 +1041,133 @@ def test_the_event_loop_serves_another_request_while_the_handshake_blocks(
     assert not holder.is_alive()
     assert health.status_code == _OK_STATUS
     assert order == ["health", "capabilities"]
+
+
+def _config_read_probe(monkeypatch: pytest.MonkeyPatch, vault: Path) -> _SeamProbe:
+    """Swap the per-request configuration read for a probe that reports its thread.
+
+    :func:`~creek_mcp.httpapi.vault.configured_vault` falls through to
+    ``load_config`` — a file read and a YAML parse — whenever the app was built
+    without an explicit ``vault_path``, which is exactly what
+    :func:`creek_mcp.httpapi.cli.main` does. So every content route inherits the
+    handshake's hazard, and every content test below drives it the same way:
+    ``vault_path=None`` on the app is what reaches this seam at all.
+
+    Args:
+        monkeypatch: Swaps ``load_config`` on the shared resolver module.
+        vault: The vault the stubbed configuration names.
+
+    Returns:
+        The installed probe, whose ``ran_on_the_event_loop`` is the assertion.
+    """
+    probe = _SeamProbe(SimpleNamespace(vault_path=vault))
+    monkeypatch.setattr(vault_module, "load_config", probe)
+    return probe
+
+
+def _silent_llm_factory() -> Callable[[Any], Callable[[str], str]]:
+    """Return a tier-keyed LLM factory whose model finds nothing.
+
+    ``POST /v1/reflections`` cannot be driven without one, and the reflection's
+    *content* is irrelevant to where the config read happened — so this is the
+    cheapest factory that keeps the request on the success path.
+
+    Returns:
+        A factory returning a completion callable that answers with no notes.
+    """
+
+    def _for_tier(_tier: Any) -> Callable[[str], str]:
+        """Return the completion callable for any routing tier.
+
+        Args:
+            _tier: The tier the tool derived, which this stub ignores.
+
+        Returns:
+            The stub completion callable.
+        """
+
+        def _complete(_prompt: str) -> str:
+            """Answer with a well-formed turn carrying no notes.
+
+            Args:
+                _prompt: The composed prompt, unused.
+
+            Returns:
+                The serialised turn.
+            """
+            return '{"notes": []}'
+
+        return _complete
+
+    return _for_tier
+
+
+def test_the_journal_upsert_resolves_its_vault_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``PUT /v1/journal-entries/{external_id}`` must not read config on the loop.
+
+    The route already hoists the ingest run into a worker, so the *slow* part
+    looks handled — but resolving which vault to run against is itself a file
+    read and a YAML parse, and doing it before the hoist puts it back on the
+    loop for every request. Same failure as the handshake's, on a route that
+    writes.
+
+    A status assertion alone cannot see this: the blocking arrangement returns
+    the identical ``200``. What separates them is which thread ran the read, so
+    that is what is asserted — and the ``200`` is the non-vacuity half, proving
+    the probe's answer was consumed by the production path.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps the configuration read for a probe.
+    """
+    probe = _config_read_probe(monkeypatch, vault)
+    with client(vault_path=None) as test_client:
+        response = test_client.put(
+            JOURNAL_PATH, json=VALID_JOURNAL_BODY, headers=headers()
+        )
+
+    assert response.status_code == _OK_STATUS
+    assert probe.ran_on_the_event_loop is False
+
+
+def test_the_wheel_resolves_its_vault_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /v1/wheel`` must not read config on the loop either.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps the configuration read for a probe.
+    """
+    probe = _config_read_probe(monkeypatch, vault)
+    with client(vault_path=None) as test_client:
+        response = test_client.get(WHEEL_PATH, headers=headers())
+
+    assert response.status_code == _OK_STATUS
+    assert probe.ran_on_the_event_loop is False
+
+
+def test_the_reflection_route_resolves_its_vault_off_the_event_loop(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POST /v1/reflections`` must not read config on the loop either.
+
+    Args:
+        vault: A seeded vault, named by the stubbed configuration.
+        monkeypatch: Swaps the configuration read for a probe.
+    """
+    probe = _config_read_probe(monkeypatch, vault)
+    with client(
+        vault_path=None, reflect_llm_factory=_silent_llm_factory
+    ) as test_client:
+        response = test_client.post(
+            REFLECTIONS_PATH, json=VALID_REFLECTION_BODY, headers=headers()
+        )
+
+    assert response.status_code == _OK_STATUS
+    assert probe.ran_on_the_event_loop is False
 
 
 # --------------------------------------------------------------------------- #
@@ -1337,10 +1493,15 @@ def test_the_request_id_is_not_derived_from_anything_the_caller_sent(
     the one variable field of the error envelope a channel for exactly the
     material every other assertion in this suite keeps out of it.
 
+    Driven through a *refusal*, because only an error envelope carries a
+    ``request_id`` at all. A ``personal`` entry under an ``open`` ceiling is the
+    smallest reachable one now that #1075 has built this route; before it, the
+    route's ``501`` served the same purpose.
+
     Args:
         vault: A seeded vault.
     """
-    sent: dict[str, Any] = {"content": _SENTINEL_BODY, "tier": "open"}
+    sent: dict[str, Any] = {"content": _SENTINEL_BODY, "tier": "personal"}
     with client(vault_path=vault) as test_client:
         first = test_client.put(
             f"/v1/journal-entries/{_SENTINEL_ID}",
